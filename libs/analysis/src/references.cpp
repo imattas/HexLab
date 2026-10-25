@@ -2178,13 +2178,19 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                 const auto *src = architecture_register(instruction, 1, RegisterBank::mips_gpr, 64);
                 const auto shift = immediate_value(instruction, 2);
                 std::optional<Address> target;
-                if (dst && src && shift && *shift < 64) {
+                if (dst && dst->width == 64 && dst->index != 0 && src && src->width == 64 &&
+                    shift && *shift < 64) {
                     const auto base = registers.find(src->index);
-                    if (base != registers.end() && base->second.space == instruction.address.space)
+                    if (base != registers.end() && base->second.space == instruction.address.space &&
+                        (*shift == 0 || base->second.offset <= (UINT64_MAX >> *shift)))
                         target = Address{base->second.space, base->second.offset << *shift};
                 }
                 erase_written();
-                if (dst && target) registers[dst->index] = *target;
+                if (dst && dst->index != 0 && target) {
+                    registers[dst->index] = *target;
+                    if (riscv_target_segment(*image, *target, OperandAccess::address))
+                        result.immediate_targets[{fact->id, 2}] = *target;
+                }
                 propagated = true;
             }
             if (!propagated) {
@@ -2260,7 +2266,8 @@ RegisterReferenceFacts powerpc_reference_facts(const Image *image, const Relocat
                 const auto *dst = architecture_register(instruction, 0, RegisterBank::ppc_gpr, width);
                 const auto immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
                 std::optional<Address> target;
-                if (dst && immediate && immediate->is_signed) {
+                if (dst && dst->width == width && immediate && immediate->is_signed &&
+                    immediate->encoded_width == 16 && immediate->effective_width == width) {
                     std::uint64_t base_value = 0;
                     AddressSpaceId space = instruction.address.space;
                     bool known = false;
@@ -2274,7 +2281,12 @@ RegisterReferenceFacts powerpc_reference_facts(const Image *image, const Relocat
                         }
                     } else if (const auto *zero = std::get_if<ImmediateOperand>(&instruction.operands[1]);
                                zero && zero->value == 0) known = true;
-                    if (known) target = Address{space, add(base_value, 0, std::bit_cast<std::int64_t>(immediate->value), width)};
+                    if (known) {
+                        // Decoder immediates are normalized to their semantic
+                        // values, including ADDIS's 16-bit shift.
+                        target = Address{space, add(base_value, 0,
+                            std::bit_cast<std::int64_t>(immediate->value), width)};
+                    }
                 }
                 erase_written();
                 if (dst && target) {
@@ -2287,12 +2299,16 @@ RegisterReferenceFacts powerpc_reference_facts(const Image *image, const Relocat
                        instruction.operands.size() == 3) {
                 const auto *dst = architecture_register(instruction, 0, RegisterBank::ppc_gpr, width);
                 const auto *src = architecture_register(instruction, 1, RegisterBank::ppc_gpr, width);
-                const auto immediate = immediate_value(instruction, 2);
+                const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
                 std::optional<Address> target;
-                if (dst && src && immediate) {
+                if (dst && dst->width == width && src && src->width == width &&
+                    immediate && !immediate->is_signed && immediate->encoded_width == 16 &&
+                    immediate->effective_width == width) {
                     if (const auto base = registers.find(src->index);
                         base != registers.end() && base->second.space == instruction.address.space)
-                        target = Address{base->second.space, base->second.offset | *immediate};
+                        // ORIS is likewise decoded with its immediate already
+                        // shifted into the high halfword.
+                        target = Address{base->second.space, base->second.offset | immediate->value};
                 }
                 erase_written();
                 if (dst && target) {
@@ -2308,7 +2324,8 @@ RegisterReferenceFacts powerpc_reference_facts(const Image *image, const Relocat
             if (!propagated) {
                 for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
                     const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[i]);
-                    if (!memory || i >= instruction.access.size() || memory->address_width != width || memory->scale != 1)
+                    if (!memory || i >= instruction.access.size() || memory->address_width != width ||
+                        memory->scale != 1 || memory->data_width == 0 || memory->data_width > width)
                         continue;
                     std::uint64_t base_value = 0, index_value = 0;
                     AddressSpaceId space = instruction.address.space;
