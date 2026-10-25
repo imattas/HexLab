@@ -23,3 +23,10 @@
 - Compile supported Windows Debug targets serially; no tests and no GUI launch.
 - Root updates only capability rows supported by source review/build evidence, then commits and pushes to `feat/foundation`.
 - Confirm the GUI stayed closed and `out/` stayed untouched.
+
+## Progress
+
+- Objective-C metadata view integrated with lazy page-selection scanning, per-snapshot cached rows, status/provenance, and navigation. A review found the cached snapshot was held as a raw pointer; it now retains a `shared_ptr` owner to prevent stale cache reuse. Windows Debug builds of `hexlab_desktop_components` and `hexlab` passed; no GUI or tests run.
+- MSVC special-name rendering covers `??_7`, `??_8`, and selected `??_R0/R2/R3/R4` forms. Independent review caught and corrected the vbtable `7B@` suffix. Windows Debug builds of `hexlab_symbols` and `hexlab_cli` passed; broader productions remain unsupported.
+- Linux AArch64 scheduling now handles partial-resume rollback and deferred stops; source review and x86-host Clang syntax-only compilation passed. Native Linux/AArch64 ptrace runtime validation remains outstanding.
+- Capability inventory and install documentation list were updated. The GUI stayed closed, `out/` was untouched, and no tests were run.

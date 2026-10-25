@@ -706,7 +706,7 @@ struct MainFrame::Impl {
     VirtualTable *macho_metadata;
     VirtualTable *macho_objc = nullptr;
     std::shared_ptr<const std::vector<MachOObjCViewRow>> macho_objc_rows;
-    const DocumentSnapshot *macho_objc_source = nullptr;
+    std::shared_ptr<const DocumentSnapshot> macho_objc_source;
     PeView *pe_view = nullptr;
     MinidumpView *minidump_view = nullptr;
     wxButton *macho_open_slice;
@@ -1877,7 +1877,7 @@ struct MainFrame::Impl {
             show_macho_objc_placeholder();
             return;
         }
-        if (macho_objc_source != doc.get()) {
+        if (macho_objc_source.get() != doc.get()) {
             std::vector<MachOObjCViewRow> rows;
             if (doc->image && doc->metadata_view().macho) {
                 auto scanned = scan_macho_objc_classes(*doc->image, doc->metadata_view());
@@ -1891,7 +1891,7 @@ struct MainFrame::Impl {
                                 "image metadata", "No loaded Mach-O image is available.", {}});
             }
             macho_objc_rows = std::make_shared<const std::vector<MachOObjCViewRow>>(std::move(rows));
-            macho_objc_source = doc.get();
+            macho_objc_source = doc;
         }
         display_macho_objc_rows(doc, macho_objc_rows);
     }
@@ -2036,7 +2036,7 @@ struct MainFrame::Impl {
         };
         if (metadata_pages && metadata_pages->GetCurrentPage() == macho_objc)
             populate_macho_objc();
-        else if (macho_objc_source == doc.get() && macho_objc_rows)
+        else if (macho_objc_source.get() == doc.get() && macho_objc_rows)
             display_macho_objc_rows(doc, macho_objc_rows);
         else
             show_macho_objc_placeholder();
