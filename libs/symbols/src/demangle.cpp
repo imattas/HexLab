@@ -587,7 +587,8 @@ class Msvc {
                 return checked(name + "::" + label);
             }
             const auto name = scoped();
-            if (!take('6') || !take('B') || !take('@') || at_ != s_.size()) throw Failure{DemangleStatus::malformed};
+            const char table_kind = code == '7' ? '6' : '7';
+            if (!take(table_kind) || !take('B') || !take('@') || at_ != s_.size()) throw Failure{DemangleStatus::malformed};
             return checked(name + (code == '7' ? "::`vftable'" : "::`vbtable'"));
         }
         throw Failure{DemangleStatus::unsupported};
