@@ -1,0 +1,63 @@
+# Reference coverage baseline
+
+This is a dated requirements inventory for the full HexLab goal, not a completion report. It supplements the broad `capabilities.csv` and the encoding-specific `x64-coverage.csv`. Sources were checked on 2026-10-19. No proprietary implementation or processor-module source was copied.
+
+`reference-matrix.csv` contains 147 normalized obligations: 83 processor entries, 37 format entries, 12 decompiler choices and 15 debugger interface identifiers. These counts describe our rows, not an assertion about the number of processors or packaged backends in IDA. `reference-sources.csv` maps every source ID to a publisher, URL, retrieval date and limitation.
+
+`processor-variant-matrix.csv` expands the highest-variance processor families into 85 concrete generation, execution-mode, core-family, and extension obligations. It covers ARM/AArch64, x86/x64, MIPS, PowerPC/POWER, Hexagon, and RISC-V. Every child is marked `not_assessed`; the family-level state does not imply child support. This is a first variant pass, not an exhaustive audit of all processor families or every extension combination.
+
+## Sources and interpretation
+
+| Source | What it establishes | What still needs verification |
+| --- | --- | --- |
+| [Processor list](https://docs.hex-rays.com/core/disassembler/specification/supported-processors.md) | Named families and selected variants, modes, and extensions for disassembly requirements | Remaining nested chip variants, data-unit sizes and supported combinations |
+| [Format list](https://docs.hex-rays.com/core/disassembler/specification/supported-file-formats.md) | Published loader families; the publisher explicitly says the list is incomplete | Additional loaders and exact format/CPU/relocation combinations |
+| [Decompiler choices](https://hex-rays.com/decompiler) | The IDA Pro section lists 12 choices | ABI, instruction semantics, language constructs and unsupported variants within each choice |
+| [Debugger interface](https://python.docs.hex-rays.com/ida_idd/index.html) | Named backend identifiers and capability flags | Which identifiers represent current shipped, historical or beta backends, plus exact target/host combinations |
+| [Product workflows](https://hex-rays.com/ida-pro) | Extension, headless, recognition, collaborative and deobfuscation workflows | Detailed behavioral contracts and release-specific differences |
+
+The debugger rows intentionally remain interface inventory, not claims that every identifier names a current supported product. The product page and API reference are different kinds of evidence. Likewise, decoder-family support does not imply decompiler or debugger support.
+
+Console names from the processor page are normalized into their underlying ISA obligations; console container handling is a separate loader requirement. Shared families and explicit instruction-extension entries are separate rows when they create distinct verification work. They are not used to inflate a completion percentage. Nested vendor chip lists remain linked to the source rather than being declared covered by one family row.
+
+## Current implementation mapping
+
+The x64 processor row has partial implementation evidence; stage4 has also started an original scalar x86-32 decoder, with cache/analysis/frontend integration and a native Win32 oracle still pending. Raw and PE format rows are also partial at the family level: the verified raw configuration is x86-64, while PE metadata loading is broader than current instruction decoding. All decompiler and debugger rows remain absent. These states derive from the repository's implementation and tests, not from what the reference product supports.
+
+The existing address model is byte-addressed and the current image factory rejects non-byte address units. Therefore a new processor cannot be considered supported just because an opcode decoder compiles: architecture-specific address units and mappings must work through loaders, navigation, storage, formatting, types and export. The existing checks remain evidence for their tested variants only.
+
+Stage-3 evidence now covers persistent bookmarks, typed references, self-contained projects, graph rendering, shared editing/search commands and per-document actor jobs. `docs/project-analysis-validation.md` maps those checks to the accepted scope. This adds no processor, decompiler or debugger coverage. Incremental ownership/reference rebuilds remain conservative and are reported as such.
+
+Typed decoded references now include a bounded RV32/RV64 address-flow slice: AUIPC establishes an image-mapped address, ADDI propagates it within one recovered basic block, and subsequent loads/stores resolve only when their full access width fits a mapped segment with the required read/write permission. Instruction sources remain gated by executable-byte policy. This is not general register-value propagation, and RISC-V relocation-pair data references remain outside this evidence; details are in `docs/riscv-reference-validation.md`.
+
+AArch64 address-value propagation follows recovered basic-block edges. At a control-flow merge, a register value is retained only when every predecessor has the same value; cyclic or incomplete predecessor graphs fall back to block-local analysis. The bounded producer supports ADR/ADRP, MOVZ/MOVN seeds, known-input MOVK lane updates, immediate W-register ADD/SUB with architectural wraparound, and X-register immediate ADD/SUB. A 64-bit LDR may seed from a mapped full-width pointer slot when no relocation covers it. The direct reference remains attached to the exact immediate-producing instruction; a full multi-instruction propagation chain is not serialized. Relocation-covered/runtime-populated slots, unknown MOVK inputs, register arithmetic, invalid shifts, and ambiguous joins remain unresolved.
+
+A32 and Thumb now have a block-local address-propagation slice: A32 PC-relative immediate ADD/SUB and Thumb ADR seed mapped register addresses, and immediate ADD/SUB can update them. Loads/stores through the resulting base plus an immediate offset produce references only when the complete access range and required permissions are mapped. The tests cover A32 PC+8 and Thumb aligned-PC address formation followed by register-based loads. Values do not flow across block edges; shifted-register offsets, writeback, register-valued arithmetic, merges, and multi-register transfers remain unsupported.
+
+Flat x86-32 and x86-64 reference propagation now retains bounded pointer-width values written to resolved writable image slots. Exact pointer-width `mov` stores from a tracked register or immediate can be reloaded later in the same recovered CFG, including through equal predecessor states; the resulting indirect call/jump target is accepted only when it maps to executable bytes. Overlapping or unknown writes invalidate the affected facts, unknown calls discard abstract memory, CFG joins retain only equal values, and cyclic/incomplete or predecessor-free non-entry blocks do not use file bytes as a substitute for unknown runtime memory. Actual function entries may use the file image as initial memory. Static image reads are disabled along a path after its first memory write to avoid reviving stale file contents. Tracking is capped at 1,024 slots per block and 65,536 retained facts across the CFG; reaching the global cap disables further memory propagation. Segmented x86, sub-pointer stores, arbitrary memory aliasing, and general memory SSA remain unsupported.
+
+Reference provenance distinguishes `dataflow` targets from addresses encoded directly by an instruction. The label is emitted whenever bounded cross-instruction reference facts resolve a memory operand, address-forming immediate, or indirect control-flow target; it applies to current x86, RISC-V, AArch64, A32/Thumb, MIPS, PowerPC, and 6502 fact producers. The source instruction identity remains attached, and the provenance kind survives reference-cache serialization.
+
+Reference payload version 12 can also retain up to 32 unique producer instruction IDs. The x86/x64 register propagator carries these through recognized register moves, `lea`, and add/sub address construction. It also tracks exact pointer-width stores to resolved writable slots and carries their producer IDs through reloads and CFG joins when all paths agree on the stored value. Memory-address references include the tracked base/index producers, and indirect calls through a tracked spill include both address and stored-value producers. The consuming instruction remains in `instruction_id`. At a join, the bounded vector is a set of contributing definitions, not a path-ordered trace. Static bytes, unsupported instructions, and non-x86 architecture fact producers do not yet provide producer chains. Derived-cache version 22 invalidates older reference indexes; existing `AnalysisKey` checks continue to reject indexes from another input or revision. Existing architecture-specific iteration, CFG, memory, cancellation, record-count, and payload-size limits still apply.
+
+Known absolute memory operands remain references even when their target is outside the current image mapping; this preserves useful external-data cross-references. PC-relative and register-derived accesses remain subject to mapped-range and permission checks. A source-backed unresolved Mach-O relocation takes precedence over sequence-level address propagation and remains an unresolved reference.
+
+## Acceptance obligations behind each row
+
+Each processor entry must eventually split into concrete execution modes, byte order, address/data units and instruction extensions. Required evidence includes literal decode fixtures, invalid/truncated cases, typed operands and modifiers, control-flow effects, register/memory effects, independent oracles and lifting equivalence. A family label alone cannot satisfy this obligation.
+
+Each format entry must split into image/object/archive variants and supported processor combinations. Verify section mapping, sparse/zero-filled regions, symbols, imports, exports, relocation semantics, embedded members, malformed bounds and format detection. A generic raw loader is not evidence that a specialized format is supported. Archives also require bounded member enumeration, selection and nested-container limits.
+
+Each decompiler entry requires semantic lifting, bit widths, memory/flags, calling conventions, data-flow/SSA, variable/type recovery, structuring and source mappings on independently checked corpora. Mnemonic output or successful disassembly does not count as pseudocode equivalence.
+
+Each debugger entry requires actual target control, stop/resume state transitions, stepping, exceptions, breakpoints, register/memory/module/thread lifetimes, cleanup and remote disconnect behavior where applicable. Capability negotiation must expose unavailable operations. A recorded-trace backend and a process-control backend require different tests.
+
+The broad workflow inventory also retains obligations for reusable signatures and function recognition, data/type import, native and Python extensions, reusable headless services, collaboration/exchange and semantics-checked deobfuscation. These are implementation requirements in HexLab's approved architecture; the matrix does not prescribe proprietary service protocols, licensing behavior or binary plugin/database compatibility.
+
+## Coverage gaps and maintenance
+
+The processor variant matrix expands several high-variance families, but does not complete the reference audit. Other processor families still need equivalent child rows; x86 AVX-512 and other extension families need concrete subset rows; and variant combinations, data-unit sizes, and address models still require verification. The public format list is expressly nonexhaustive. Host/target matrices are still open. Beta announcements are not silently treated as released capabilities, and conflicting documentation must be resolved before a support claim.
+
+Before implementing a family, expand its row into a mode/extension matrix against primary architecture/format specifications and documented reference behavior. Preserve the parent row as partial until every required child is verified. Add newly discovered requirements to the inventory rather than shrinking the goal to the original list. Refresh source dates before a release-equivalence audit.
+
+No row in this reference inventory was promoted to verified. The full goal remains incomplete. Project/interactive-analysis implementation still depends on review of its written specification and subsequent implementation plan; this documentation work does not substitute for either approval.

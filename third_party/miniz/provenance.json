@@ -1,0 +1,23 @@
+{
+  "name": "miniz",
+  "version": "3.1.2",
+  "repository": "https://github.com/richgel999/miniz",
+  "tag": "3.1.2",
+  "commit": "77d0dce8627735138c51770d1799a1ef48f2117d",
+  "license": "MIT",
+  "license_files": ["LICENSE"],
+  "files": {
+    "miniz.c": "sha256:F23204EFEE2BFAFFB72A974D2E28C64C3C1D9787144B5C5890F129C465E467BD",
+    "miniz_tinfl.c": "sha256:2296EBD21EF9AF5EBBEFD5B454D4BB67D8FB4AF2D24945E7FB32114374F75A76",
+    "miniz.h": "sha256:F0B67217BDD8E45B74EB9B7C2C7AE20ED6760A1D76F3276B93617039EBD082DF",
+    "miniz_common.h": "sha256:F1BA29821C8CAEF83585B328196AA346C5DA7C82890A70A3D10D77C6CEC0ED39",
+    "miniz_tdef.h": "sha256:D62DA02953C3834DFCBDE4DB026C6D9345013EF9B0E53185131016A3A4E48C33",
+    "miniz_tinfl.h": "sha256:DA4850920FDF09F8877D9AFFABE1EBBA1852CE4B1EBBD121F2BA7A7EA8E57E5D",
+    "miniz_zip.h": "sha256:B062A5DEF545445C73FD1D664E35A89165DFB0D996AB848F507244E819CFCF04",
+    "LICENSE": "sha256:0115478D567121238CF6CC1C0C361926CF07A49D9E4C9E66DA97FAC6A01646B3"
+  },
+  "local_changes": [
+    "CMake compiles only the inflate API, without archive, stdio, time, deflate, or zlib-compatible aliases.",
+    "HexLab streams decompressed output through a fixed 64 KiB buffer and enforces a configured output cap and cancellation checks."
+  ]
+}

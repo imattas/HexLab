@@ -1,0 +1,7 @@
+# x86 String Instruction Semantics
+
+`evaluate_x86_string_iteration` models one iteration of decoded `MOVS`, `CMPS`, `STOS`, `LODS`, or `SCAS`. It consumes the decoded operand width, address width, and F2/F3 repeat prefix, then returns updated source/destination indices, count, accumulator and modeled status flags. The caller supplies values read from memory and performs any indicated store, so the same semantics can be reused by tests, emulators, and execution engines without coupling the processor library to an image or process memory implementation.
+
+Index movement follows DF and wraps at the decoded address width. Address-size 16 updates preserve the containing register's upper bits; address-size 32 updates retain the architectural zero-extension behavior used in 64-bit mode. Repeat-prefixed operations with a zero address-sized count do not access memory or change state. `REP`/`REPE` and `REPNE` comparisons stop according to ZF after each iteration.
+
+The helper returns effective offsets and the associated segment-register identities separately, including fixed ES destinations and source overrides. `execute_x86_string_instruction` layers a caller-owned read/write callback pair over that model and runs repeated iterations up to a caller-supplied budget. Callback addresses are effective offsets; the caller applies segment bases and owns the memory map. A failed read or write reports the access, offset, and segment identity while preserving state from the last completed iteration. The auxiliary-carry flag remains unmodeled.

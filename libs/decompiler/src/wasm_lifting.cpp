@@ -1,0 +1,486 @@
+#include "hexlab/decompiler/wasm_lifting.hpp"
+
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <map>
+#include <optional>
+#include <set>
+#include <string_view>
+#include <vector>
+#include <iterator>
+
+namespace hexlab::decompiler {
+namespace {
+using Stack = std::vector<ExpressionPtr>;
+
+ValueType integer(unsigned bits, bool sign = false) { return {TypeKind::integer, static_cast<std::uint16_t>(bits), sign}; }
+ValueType floating(unsigned bits) { return {TypeKind::floating, static_cast<std::uint16_t>(bits), false}; }
+ValueType boolean() { return {TypeKind::boolean, 1, false}; }
+std::optional<ValueType> wasm_value_type(std::uint8_t code) {
+    switch (code) {
+    case 0x7f: return integer(32);
+    case 0x7e: return integer(64);
+    case 0x7d: return floating(32);
+    case 0x7c: return floating(64);
+    default: return {};
+    }
+}
+ExpressionPtr constant(std::uint64_t value, ValueType type) {
+    return std::make_shared<Expression>(Expression{type, ConstantValue{value, type}});
+}
+ExpressionPtr unary(std::string op, ExpressionPtr value, ValueType type) {
+    return std::make_shared<Expression>(Expression{type, UnaryValue{std::move(op), std::move(value)}});
+}
+ExpressionPtr binary(std::string op, ExpressionPtr left, ExpressionPtr right, ValueType type) {
+    return std::make_shared<Expression>(Expression{type, BinaryValue{std::move(op), std::move(left), std::move(right)}});
+}
+std::optional<std::uint64_t> immediate(const Instruction &i, std::size_t n = 0) {
+    if (n >= i.operands.size()) return {};
+    if (const auto *v = std::get_if<ImmediateOperand>(&i.operands[n])) return v->value;
+    return {};
+}
+struct OpInfo { unsigned pops; ValueType input, output; std::string_view op; bool comparison = false; };
+std::optional<OpInfo> numeric(std::uint8_t op) {
+    const auto i32 = integer(32), i64 = integer(64), f32 = floating(32), f64 = floating(64), b = boolean();
+    if (op == 0x45) return OpInfo{1, i32, b, "eqz"};
+    if (op == 0x50) return OpInfo{1, i64, b, "eqz"};
+    if (op >= 0x46 && op <= 0x4f) return OpInfo{2, i32, b, std::array<std::string_view,10>{"eq","ne","lt_s","lt_u","gt_s","gt_u","le_s","le_u","ge_s","ge_u"}[op-0x46], true};
+    if (op >= 0x51 && op <= 0x5a) return OpInfo{2, i64, b, std::array<std::string_view,10>{"eq","ne","lt_s","lt_u","gt_s","gt_u","le_s","le_u","ge_s","ge_u"}[op-0x51], true};
+    if (op >= 0x5b && op <= 0x60) return OpInfo{2, f32, b, std::array<std::string_view,6>{"eq","ne","lt","gt","le","ge"}[op-0x5b], true};
+    if (op >= 0x61 && op <= 0x66) return OpInfo{2, f64, b, std::array<std::string_view,6>{"eq","ne","lt","gt","le","ge"}[op-0x61], true};
+    if (op >= 0x67 && op <= 0x69) return OpInfo{1, i32, i32, std::array<std::string_view,3>{"clz","ctz","popcnt"}[op-0x67]};
+    if (op >= 0x6a && op <= 0x78) return OpInfo{2, i32, i32, std::array<std::string_view,15>{"add","sub","mul","div_s","div_u","rem_s","rem_u","and","or","xor","shl","shr_s","shr_u","rotl","rotr"}[op-0x6a]};
+    if (op >= 0x79 && op <= 0x7b) return OpInfo{1, i64, i64, std::array<std::string_view,3>{"clz","ctz","popcnt"}[op-0x79]};
+    if (op >= 0x7c && op <= 0x8a) return OpInfo{2, i64, i64, std::array<std::string_view,15>{"add","sub","mul","div_s","div_u","rem_s","rem_u","and","or","xor","shl","shr_s","shr_u","rotl","rotr"}[op-0x7c]};
+    if (op >= 0x8b && op <= 0x98) return OpInfo{(op==0x8b||op==0x8c||op==0x8d||op==0x8e||op==0x8f||op==0x90||op==0x91)?1u:2u,f32,f32,std::array<std::string_view,14>{"abs","neg","ceil","floor","trunc","nearest","sqrt","add","sub","mul","div","min","max","copysign"}[op-0x8b]};
+    if (op >= 0x99 && op <= 0xa6) return OpInfo{(op<=0x9f)?1u:2u,f64,f64,std::array<std::string_view,14>{"abs","neg","ceil","floor","trunc","nearest","sqrt","add","sub","mul","div","min","max","copysign"}[op-0x99]};
+    return {};
+}
+struct ConversionInfo { ValueType input, output; std::string_view operation; };
+std::optional<ConversionInfo> conversion(std::uint8_t op) {
+    const auto i32=integer(32), i64=integer(64), f32=floating(32), f64=floating(64);
+    switch (op) {
+    case 0xa7: return ConversionInfo{i64,i32,"wasm_i32_wrap_i64"};
+    case 0xa8: return ConversionInfo{f32,i32,"wasm_i32_trunc_f32_s_trap"};
+    case 0xa9: return ConversionInfo{f32,i32,"wasm_i32_trunc_f32_u_trap"};
+    case 0xaa: return ConversionInfo{f64,i32,"wasm_i32_trunc_f64_s_trap"};
+    case 0xab: return ConversionInfo{f64,i32,"wasm_i32_trunc_f64_u_trap"};
+    case 0xac: return ConversionInfo{i32,i64,"wasm_i64_extend_i32_s"};
+    case 0xad: return ConversionInfo{i32,i64,"wasm_i64_extend_i32_u"};
+    case 0xae: return ConversionInfo{f32,i64,"wasm_i64_trunc_f32_s_trap"};
+    case 0xaf: return ConversionInfo{f32,i64,"wasm_i64_trunc_f32_u_trap"};
+    case 0xb0: return ConversionInfo{f64,i64,"wasm_i64_trunc_f64_s_trap"};
+    case 0xb1: return ConversionInfo{f64,i64,"wasm_i64_trunc_f64_u_trap"};
+    case 0xb2: return ConversionInfo{i32,f32,"wasm_f32_convert_i32_s"};
+    case 0xb3: return ConversionInfo{i32,f32,"wasm_f32_convert_i32_u"};
+    case 0xb4: return ConversionInfo{i64,f32,"wasm_f32_convert_i64_s"};
+    case 0xb5: return ConversionInfo{i64,f32,"wasm_f32_convert_i64_u"};
+    case 0xb6: return ConversionInfo{f64,f32,"wasm_f32_demote_f64"};
+    case 0xb7: return ConversionInfo{i32,f64,"wasm_f64_convert_i32_s"};
+    case 0xb8: return ConversionInfo{i32,f64,"wasm_f64_convert_i32_u"};
+    case 0xb9: return ConversionInfo{i64,f64,"wasm_f64_convert_i64_s"};
+    case 0xba: return ConversionInfo{i64,f64,"wasm_f64_convert_i64_u"};
+    case 0xbb: return ConversionInfo{f32,f64,"wasm_f64_promote_f32"};
+    case 0xbc: return ConversionInfo{f32,i32,"wasm_i32_reinterpret_f32"};
+    case 0xbd: return ConversionInfo{f64,i64,"wasm_i64_reinterpret_f64"};
+    case 0xbe: return ConversionInfo{i32,f32,"wasm_f32_reinterpret_i32"};
+    case 0xbf: return ConversionInfo{i64,f64,"wasm_f64_reinterpret_i64"};
+    default: return {};
+    }
+}
+struct MemoryOpInfo {
+    bool store = false;
+    ValueType stack_type;
+    ValueType access_type;
+    unsigned maximum_alignment_exponent = 0;
+};
+std::optional<MemoryOpInfo> memory_op(std::uint8_t op) {
+    switch (op) {
+    case 0x28: return MemoryOpInfo{false, integer(32), integer(32), 2};
+    case 0x29: return MemoryOpInfo{false, integer(64), integer(64), 3};
+    case 0x2a: return MemoryOpInfo{false, floating(32), floating(32), 2};
+    case 0x2b: return MemoryOpInfo{false, floating(64), floating(64), 3};
+    case 0x2c: return MemoryOpInfo{false, integer(32), integer(8, true), 0};
+    case 0x2d: return MemoryOpInfo{false, integer(32), integer(8), 0};
+    case 0x2e: return MemoryOpInfo{false, integer(32), integer(16, true), 1};
+    case 0x2f: return MemoryOpInfo{false, integer(32), integer(16), 1};
+    case 0x30: return MemoryOpInfo{false, integer(64), integer(8, true), 0};
+    case 0x31: return MemoryOpInfo{false, integer(64), integer(8), 0};
+    case 0x32: return MemoryOpInfo{false, integer(64), integer(16, true), 1};
+    case 0x33: return MemoryOpInfo{false, integer(64), integer(16), 1};
+    case 0x34: return MemoryOpInfo{false, integer(64), integer(32, true), 2};
+    case 0x35: return MemoryOpInfo{false, integer(64), integer(32), 2};
+    case 0x36: return MemoryOpInfo{true, integer(32), integer(32), 2};
+    case 0x37: return MemoryOpInfo{true, integer(64), integer(64), 3};
+    case 0x38: return MemoryOpInfo{true, floating(32), floating(32), 2};
+    case 0x39: return MemoryOpInfo{true, floating(64), floating(64), 3};
+    case 0x3a: return MemoryOpInfo{true, integer(32), integer(8), 0};
+    case 0x3b: return MemoryOpInfo{true, integer(32), integer(16), 1};
+    case 0x3c: return MemoryOpInfo{true, integer(64), integer(8), 0};
+    case 0x3d: return MemoryOpInfo{true, integer(64), integer(16), 1};
+    case 0x3e: return MemoryOpInfo{true, integer(64), integer(32), 2};
+    default: return {};
+    }
+}
+Error unsupported(std::string why) { return {ErrorCode::unsupported, "WebAssembly lift unsupported: " + std::move(why)}; }
+Result<std::pair<std::uint64_t, std::uint64_t>> memory_immediates(const Instruction &instruction,
+                                                                  const MemoryOpInfo &info,
+                                                                  const WasmMetadata *metadata) {
+    if (!metadata || static_cast<std::uint64_t>(metadata->imported_memories) + metadata->defined_memories != 1)
+        return unsupported("scalar memory operation requires exactly one validated module memory");
+    const auto alignment = immediate(instruction, 0);
+    const auto offset = immediate(instruction, 1);
+    if (!alignment || !offset)
+        return unsupported("memory alignment or offset immediate unavailable");
+    if (*alignment > info.maximum_alignment_exponent)
+        return unsupported("memory alignment exceeds the access natural alignment");
+    if (*offset > std::numeric_limits<std::uint32_t>::max())
+        return unsupported("memory offset exceeds the Wasm32 address width");
+    return std::pair{*alignment, *offset};
+}
+}
+
+Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const FunctionSnapshot &snapshot) {
+    return lift_wasm_function(function, snapshot, nullptr);
+}
+
+Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const FunctionSnapshot &snapshot,
+                                           const WasmMetadata *metadata) {
+    std::map<std::uint64_t, std::shared_ptr<const BasicBlock>> blocks;
+    for (const auto &b : snapshot.blocks) {
+        if (!b) return Error{ErrorCode::invalid_argument, "WebAssembly snapshot contains a null block"};
+        blocks.emplace(b->id.value, b);
+    }
+    std::vector<const InstructionFact *> code;
+    for (const auto id : function.blocks) {
+        const auto it = blocks.find(id.value);
+        if (it == blocks.end()) return Error{ErrorCode::invalid_argument, "WebAssembly function block is missing from snapshot"};
+        for (const auto &fact : it->second->instructions) {
+            if (!fact) return Error{ErrorCode::invalid_argument, "WebAssembly block contains a null instruction"};
+            if (fact->instruction.context.architecture != Architecture::wasm)
+                return unsupported("function contains a non-wasm instruction");
+            code.push_back(fact.get());
+        }
+    }
+    std::sort(code.begin(), code.end(), [](auto a, auto b) {
+        const auto aa = a->instruction.address, bb = b->instruction.address;
+        return aa.space.value != bb.space.value ? aa.space.value < bb.space.value : aa.offset < bb.offset;
+    });
+    if (code.empty()) return unsupported("empty or unavailable function body");
+
+    const auto function_index = static_cast<std::uint32_t>(function.entry.space.value);
+    const WasmFunctionType *function_signature = nullptr;
+    if (metadata && function.entry.space.value <= UINT32_MAX &&
+        function_index < metadata->function_type_indices.size()) {
+        const auto type_index = metadata->function_type_indices[function_index];
+        if (type_index < metadata->function_types.size())
+            function_signature = &metadata->function_types[type_index];
+    }
+    const auto parameter_type = [&](std::uint64_t index) -> std::optional<ValueType> {
+        if (!function_signature || index >= function_signature->parameter_types.size()) return {};
+        return wasm_value_type(function_signature->parameter_types[static_cast<std::size_t>(index)]);
+    };
+    const auto parameter_name = [&](std::uint64_t index) {
+        if (metadata) {
+            const auto named = std::find_if(metadata->local_names.begin(), metadata->local_names.end(),
+                [&](const WasmLocalName &item) {
+                    return item.function_index == function_index && item.local_index == index;
+                });
+            if (named != metadata->local_names.end()) return named->name;
+        }
+        return "arg" + std::to_string(index);
+    };
+
+    constexpr std::size_t max_instructions = 100000;
+    constexpr std::size_t max_blocks = 16384;
+    constexpr std::size_t max_nesting = 128;
+    constexpr std::size_t max_stack = 128;
+    if (code.size() > max_instructions) return Error{ErrorCode::resource_limit, "WebAssembly function exceeds the instruction limit"};
+
+    struct Label {
+        std::uint8_t kind;
+        std::size_t opener, end, else_index;
+        std::optional<ValueType> result_type;
+    };
+    std::vector<Label> labels;
+    std::vector<std::size_t> nesting;
+    std::map<std::size_t, std::size_t> label_for_opener;
+    std::map<std::size_t, std::size_t> label_for_end;
+    std::size_t function_end = code.size();
+    for (std::size_t n=0;n<code.size();++n) {
+        if (code[n]->instruction.bytes.empty()) return unsupported("instruction bytes unavailable");
+        const auto op=std::to_integer<std::uint8_t>(code[n]->instruction.bytes[0]);
+        if (op==2||op==3||op==4) {
+            auto bt=immediate(code[n]->instruction);
+            if (!bt) return unsupported("block type immediate unavailable");
+            const auto signed_bt=static_cast<std::int64_t>(*bt);
+            std::optional<ValueType> result_type;
+            if (signed_bt == -1) result_type = integer(32);
+            else if (signed_bt == -2) result_type = integer(64);
+            else if (signed_bt == -3) result_type = floating(32);
+            else if (signed_bt == -4) result_type = floating(64);
+            else if (signed_bt != -64)
+                return unsupported("indexed or unsupported block result type");
+            if (nesting.size() >= max_nesting) return Error{ErrorCode::resource_limit, "WebAssembly control nesting exceeds 128 labels"};
+            label_for_opener[n]=labels.size(); labels.push_back({op,n,code.size(),code.size(),result_type}); nesting.push_back(labels.size()-1);
+        } else if (op==5) {
+            if (nesting.empty() || labels[nesting.back()].kind != 4 || labels[nesting.back()].else_index != code.size()) return unsupported("malformed else nesting");
+            labels[nesting.back()].else_index=n;
+        } else if (op==0x0b && !nesting.empty()) {
+            auto &label=labels[nesting.back()]; label.end=n; label_for_end[n]=nesting.back(); nesting.pop_back();
+        } else if (op==0x0b) {
+            if (n + 1 != code.size()) return unsupported("instructions follow the function end");
+            function_end = n;
+        }
+    }
+    if (!nesting.empty()) return unsupported("unterminated structured control");
+    for (const auto &label : labels)
+        if (label.kind == 4 && label.result_type && label.else_index == code.size())
+            return unsupported("a result-typed if requires an else arm");
+
+    if (function_end != code.size()-1) return unsupported("function has no final end operator");
+    struct Edge { std::size_t target; BlockEdgeKind kind; std::optional<std::size_t> label; };
+    std::set<std::size_t> boundaries{0, code.size()};
+    std::vector<std::vector<std::size_t>> active_labels(code.size());
+    struct TableTarget { std::optional<std::uint64_t> value; std::size_t label; std::size_t target; };
+    const auto table_targets = [&](std::size_t n) -> Result<std::vector<TableTarget>> {
+        const auto &instruction = code[n]->instruction;
+        const auto count = immediate(instruction, 0);
+        if (!count || *count > 8 || instruction.operands.size() != *count + 2)
+            return unsupported("br_table count or target vector is malformed or exceeds the decoded bound");
+        std::vector<TableTarget> targets;
+        targets.reserve(static_cast<std::size_t>(*count) + 1);
+        for (std::size_t operand = 0; operand <= *count; ++operand) {
+            const auto depth = immediate(instruction, operand + 1);
+            if (!depth || *depth >= active_labels[n].size())
+                return unsupported("br_table target depth is unavailable or targets the implicit function label");
+            const auto label = active_labels[n][active_labels[n].size() - 1 - static_cast<std::size_t>(*depth)];
+            const auto target = labels[label].kind == 3 ? labels[label].opener + 1 : labels[label].end + 1;
+            if (target >= code.size()) return unsupported("br_table target falls outside the function body");
+            targets.push_back({operand < *count ? std::optional<std::uint64_t>{operand} : std::nullopt, label, target});
+        }
+        return targets;
+    };
+    for (std::size_t n=0;n<code.size();++n) {
+        const auto op=std::to_integer<std::uint8_t>(code[n]->instruction.bytes[0]);
+        if (op==2||op==3||op==4||op==5||op==0x0b) { boundaries.insert(n); boundaries.insert(n+1); }
+        if (op==0x0c||op==0x0d||op==0x0e) { boundaries.insert(n); boundaries.insert(n+1); }
+        for (std::size_t li=0;li<labels.size();++li) if (labels[li].opener<n&&n<labels[li].end) active_labels[n].push_back(li);
+        std::sort(active_labels[n].begin(),active_labels[n].end(),[&](auto a,auto b){return labels[a].opener<labels[b].opener;});
+        if (op==0x0c||op==0x0d) {
+            auto depth=immediate(code[n]->instruction); if(!depth)return unsupported("branch depth unavailable");
+            if(*depth>=active_labels[n].size())return unsupported("branch depth targets the implicit function label or is invalid");
+            const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(*depth)];
+            const auto target=labels[li].kind==3?labels[li].opener+1:labels[li].end+1;
+            if(target>=code.size())return unsupported("branch target falls outside the function body");
+            boundaries.insert(target);
+        } else if (op == 0x0e) {
+            auto targets = table_targets(n); if (!targets) return targets.error();
+            for (const auto &target : targets.value()) boundaries.insert(target.target);
+        }
+    }
+    if (boundaries.size() > max_blocks + 1) return Error{ErrorCode::resource_limit, "WebAssembly CFG exceeds the block limit"};
+    std::vector<std::size_t> starts(boundaries.begin(),boundaries.end());
+    starts.pop_back();
+    std::map<std::size_t,std::size_t> block_at;
+    for(std::size_t bi=0;bi<starts.size();++bi)block_at.emplace(starts[bi],bi);
+    const auto block_for=[&](std::size_t instruction)->std::optional<std::size_t>{auto it=block_at.find(instruction);return it==block_at.end()?std::nullopt:std::optional<std::size_t>{it->second};};
+    std::vector<std::vector<Edge>> successors(starts.size());
+    const auto add_edge=[&](std::size_t from,std::size_t target,BlockEdgeKind kind,std::optional<std::size_t> label={}) -> bool {
+        auto to=block_for(target);if(!to)return false;successors[from].push_back({*to,kind,label});return true;
+    };
+    std::vector<std::optional<std::size_t>> opener_label(code.size()),end_label(code.size());
+    for(const auto &[n,li]:label_for_opener)opener_label[n]=li;
+    for(const auto &[n,li]:label_for_end)end_label[n]=li;
+    for(std::size_t bi=0;bi<starts.size();++bi){
+        const auto finish=bi+1<starts.size()?starts[bi+1]:code.size(),n=finish-1;
+        const auto op=std::to_integer<std::uint8_t>(code[n]->instruction.bytes[0]);
+        const auto fallthrough=n+1;
+        if(op==0x0f||op==0x00||(op==0x0b&&n==function_end))continue;
+        if(op==0x0c||op==0x0d){const auto depth=*immediate(code[n]->instruction);const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(depth)];const auto target=labels[li].kind==3?labels[li].opener+1:labels[li].end+1;if(!add_edge(bi,target,op==0x0c?BlockEdgeKind::jump:BlockEdgeKind::conditional_true,li))return unsupported("branch target is not a block boundary");if(op==0x0d&&fallthrough<code.size()&&!add_edge(bi,fallthrough,BlockEdgeKind::conditional_false))return unsupported("conditional fallthrough is not a block boundary");continue;}
+        if (op == 0x0e) { auto targets = table_targets(n); if (!targets) return targets.error(); for (const auto &target : targets.value()) if (!add_edge(bi, target.target, BlockEdgeKind::jump, target.label)) return unsupported("br_table target is not a block boundary"); continue; }
+        if(op==4){const auto li=*opener_label[n];const auto false_target=labels[li].else_index<code.size()?labels[li].else_index+1:labels[li].end+1;if(fallthrough>=code.size()||!add_edge(bi,fallthrough,BlockEdgeKind::conditional_true)||false_target>=code.size()||!add_edge(bi,false_target,BlockEdgeKind::conditional_false))return unsupported("if target is outside the function body");continue;}
+        if(op==5){const auto li=active_labels[n].back();const auto target=labels[li].end+1;if(target>=code.size()||!add_edge(bi,target,BlockEdgeKind::jump,li))return unsupported("else target is outside the function body");continue;}
+        if(fallthrough<code.size()&&!add_edge(bi,fallthrough,BlockEdgeKind::fallthrough))return unsupported("fallthrough is not a block boundary");
+    }
+
+    using Shape=std::vector<ValueType>;
+    std::vector<std::optional<Shape>> entries(starts.size()),exits(starts.size());
+    // A branch to a loop label has the loop's parameter types (empty in this
+    // MVP subset); block/if labels take their result value. The normal end of
+    // every typed label produces its result value.
+    std::vector<std::optional<Shape>> branch_shapes(labels.size()),end_shapes(labels.size());
+    std::vector<std::vector<std::size_t>> predecessors(starts.size());
+    std::vector<std::size_t> work{0};std::vector<bool> queued(starts.size());queued[0]=true;entries[0]=Shape{};
+    const auto shape_pop=[&](Shape &stack,ValueType expected)->Result<ValueType>{if(stack.empty())return unsupported("operand stack underflow");auto actual=stack.back();stack.pop_back();if(expected.kind!=TypeKind::unknown&&actual!=expected)return unsupported("operand stack type mismatch");return actual;};
+    while(!work.empty()){
+        const auto bi=work.back();work.pop_back();queued[bi]=false;
+        Shape stack=*entries[bi];const auto begin=starts[bi],finish=bi+1<starts.size()?starts[bi+1]:code.size();
+        for(std::size_t n=begin;n<finish;++n){const auto op=std::to_integer<std::uint8_t>(code[n]->instruction.bytes[0]);
+            if(op==2||op==3||op==4){
+                const auto li=*opener_label[n];
+                if(op==4){auto c=shape_pop(stack,integer(32));if(!c)return c.error();}
+                Shape end_shape=stack;
+                if(labels[li].result_type)end_shape.push_back(*labels[li].result_type);
+                if(end_shapes[li]&&*end_shapes[li]!=end_shape)return unsupported("control label receives incompatible operand stacks");
+                end_shapes[li]=end_shape;
+                Shape branch_shape=labels[li].kind==3?stack:end_shape;
+                if(branch_shapes[li]&&*branch_shapes[li]!=branch_shape)return unsupported("control label branch shape is inconsistent");
+                branch_shapes[li]=std::move(branch_shape);
+                continue;
+            }
+            if(op==1||op==5)continue;
+            if(op==0x0b){if(end_label[n]){if(!end_shapes[*end_label[n]]||*end_shapes[*end_label[n]]!=stack)return unsupported("block end has an incompatible operand stack");}else if(stack.size()>1)return unsupported("function end has extra stack values");continue;}
+            if(op==0x0f){if(stack.size()>1)return unsupported("return has extra operand stack values");continue;}
+            if(op==0x00)return unsupported("unreachable trap semantics");
+            if(op==0x1a){auto v=shape_pop(stack,{});if(!v)return v.error();continue;}
+            if(op==0x1b){auto c=shape_pop(stack,integer(32));if(!c)return c.error();auto a=shape_pop(stack,{});if(!a)return a.error();auto b=shape_pop(stack,a.value());if(!b)return b.error();stack.push_back(a.value());continue;}
+            if(op==0x0c||op==0x0d){if(op==0x0d){auto c=shape_pop(stack,integer(32));if(!c)return c.error();}continue;}
+            if(op==0x0e){auto c=shape_pop(stack,integer(32));if(!c)return c.error();continue;}
+            if (op == 0x20) {
+                const auto index = immediate(code[n]->instruction);
+                if (!index || !parameter_type(*index))
+                    return unsupported("local.get requires an available typed function parameter");
+                stack.push_back(*parameter_type(*index));
+                continue;
+            }
+            if(op>=0x21&&op<=0x24)return unsupported("local writes, declared locals and globals require local dataflow support");
+            if(op>=0x10&&op<=0x11)return unsupported("call signatures are unavailable to the function-local lifter");
+            if (op >= 0x28 && op <= 0x3e) {
+                const auto info = memory_op(op);
+                if (!info) return unsupported("memory opcode metadata is unavailable");
+                auto args = memory_immediates(code[n]->instruction, *info, metadata);
+                if (!args) return args.error();
+                if (info->store) {
+                    auto value = shape_pop(stack, info->stack_type);
+                    if (!value) return value.error();
+                    auto address = shape_pop(stack, integer(32));
+                    if (!address) return address.error();
+                } else {
+                    auto address = shape_pop(stack, integer(32));
+                    if (!address) return address.error();
+                    stack.push_back(info->stack_type);
+                }
+                continue;
+            }
+            if(op==0x3f||op==0x40)return unsupported("memory.size and memory.grow are not modeled");
+            if(op==0x41||op==0x42||op==0x43||op==0x44){stack.push_back(op==0x41?integer(32):op==0x42?integer(64):op==0x43?floating(32):floating(64));}
+            else if(auto info=numeric(op)){for(unsigned p=0;p<info->pops;++p){auto v=shape_pop(stack,info->input);if(!v)return v.error();}stack.push_back(info->output);}
+            else if(auto cv=conversion(op)){auto v=shape_pop(stack,cv->input);if(!v)return v.error();stack.push_back(cv->output);}
+            else if(op>=0xa7&&op<=0xbf)return unsupported("numeric conversion or reinterpret opcode is not modeled");
+            else return unsupported("opcode/effect is not in the typed scalar subset: "+code[n]->instruction.mnemonic_override);
+            if(stack.size()>max_stack)return Error{ErrorCode::resource_limit,"WebAssembly operand stack exceeds 128 values"};
+        }
+        exits[bi]=stack;
+        for(const auto &edge:successors[bi]){
+            Shape edge_shape=stack;
+            if(edge.label){if(!branch_shapes[*edge.label])return unsupported("branch reaches a label before its stack shape is known");if(*branch_shapes[*edge.label]!=edge_shape)return unsupported("branch would trim or reshape the operand stack at its target");}
+            auto &inputs=predecessors[edge.target];if(std::find(inputs.begin(),inputs.end(),bi)==inputs.end())inputs.push_back(bi);
+            if(!entries[edge.target]){entries[edge.target]=edge_shape;if(!queued[edge.target]){work.push_back(edge.target);queued[edge.target]=true;}}
+            else if(*entries[edge.target]!=edge_shape)return unsupported("operand stack shapes disagree at a control-flow join");
+        }
+    }
+
+    LiftedFunction out{function.id,function.entry,{},{}};
+    std::vector<std::vector<std::uint32_t>> output_versions(starts.size()),phi_versions(starts.size());
+    std::array<std::uint32_t,256> versions{};
+    for(std::size_t bi=0;bi<starts.size();++bi)if(entries[bi]){
+        if(exits[bi]&&!successors[bi].empty()){output_versions[bi].resize(exits[bi]->size());for(std::size_t slot=0;slot<exits[bi]->size();++slot)output_versions[bi][slot]=++versions[slot];}
+        if(predecessors[bi].size()>1){phi_versions[bi].resize(entries[bi]->size());for(std::size_t slot=0;slot<entries[bi]->size();++slot)phi_versions[bi][slot]=++versions[slot];}
+    }
+    for(std::size_t bi=0;bi<starts.size();++bi)if(entries[bi]){
+        const auto begin=starts[bi],finish=bi+1<starts.size()?starts[bi+1]:code.size(),last=finish-1;
+        const BlockId id{static_cast<std::uint64_t>(bi+1)};
+        LiftedBlock lifted{id,code[begin]->instruction.address,{},{}};
+        for(const auto &edge:successors[bi]){const auto target_addr=code[starts[edge.target]]->instruction.address;lifted.successors.push_back({code[last]->instruction.address,target_addr,BlockId{static_cast<std::uint64_t>(edge.target+1)},edge.kind});}
+        for(std::size_t slot=0;slot<phi_versions[bi].size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};LiftedBlock::Phi phi{reg,phi_versions[bi][slot],{}};for(const auto pred:predecessors[bi]){if(slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor has no stack value for join"};phi.inputs.push_back({BlockId{static_cast<std::uint64_t>(pred+1)},output_versions[pred][slot]});}lifted.phis.push_back(std::move(phi));}
+        Stack stack;
+        if(!predecessors[bi].empty())for(std::size_t slot=0;slot<entries[bi]->size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};if(predecessors[bi].size()>1)stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,phi_versions[bi][slot]}}));else{const auto pred=predecessors[bi].front();if(slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack value is unavailable"};stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,output_versions[pred][slot]}}));}}
+        auto pop=[&](ValueType expected)->Result<ExpressionPtr>{if(stack.empty())return unsupported("operand stack underflow");auto v=stack.back();stack.pop_back();if(expected.kind!=TypeKind::unknown&&v->type!=expected)return unsupported("operand stack type mismatch");return v;};
+        auto emit=[&](std::size_t n,Statement statement){const auto *fact=code[n];lifted.instructions.push_back({{fact->instruction.address,fact->id},std::move(statement)});};
+        for(std::size_t n=begin;n<finish;++n){const auto *fact=code[n];const auto &i=fact->instruction;const auto op=std::to_integer<std::uint8_t>(i.bytes[0]);
+            if(op==0x41||op==0x42||op==0x43||op==0x44){auto v=immediate(i);if(!v)return unsupported("constant immediate unavailable");stack.push_back(constant(*v,op==0x41?integer(32):op==0x42?integer(64):op==0x43?floating(32):floating(64)));continue;}
+            if(op==0x00)return unsupported("unreachable trap semantics");
+            if(op==0x01)continue;
+            if(op==2||op==3){continue;}
+            if(op==4){auto cond=pop(integer(32));if(!cond)return cond.error();const auto li=*opener_label[n];const auto yes=code[n+1]->instruction.address;const auto target=labels[li].else_index<code.size()?labels[li].else_index+1:labels[li].end+1;emit(n,Branch{"wasm_if",yes,code[target]->instruction.address,cond.value()});continue;}
+            if(op==5){const auto li=active_labels[n].back();const auto target=labels[li].end+1;emit(n,Branch{"true",code[target]->instruction.address,{}});continue;}
+            if(op==0x0b){if(n==function_end){if(stack.size()>1)return unsupported("function end has extra stack values");emit(n,Return{stack.empty()?ExpressionPtr{}:stack.back()});}continue;}
+            if(op==0x0f){if(stack.size()>1)return unsupported("return has extra operand stack values");emit(n,Return{stack.empty()?ExpressionPtr{}:stack.back()});continue;}
+            if(op==0x0c||op==0x0d){auto depth=immediate(i);if(!depth)return unsupported("branch depth unavailable");const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(*depth)];const auto target=labels[li].kind==3?labels[li].opener+1:labels[li].end+1;if(op==0x0c)emit(n,Branch{"true",code[target]->instruction.address,{}});else{auto cond=pop(integer(32));if(!cond)return cond.error();emit(n,Branch{"br_if",code[target]->instruction.address,n+1<code.size()?std::optional<Address>{code[n+1]->instruction.address}:std::nullopt,cond.value()});}continue;}
+            if(op==0x0e){auto selector=pop(integer(32));if(!selector)return selector.error();auto targets=table_targets(n);if(!targets)return targets.error();LiftedBlock::SwitchDispatch dispatch;dispatch.selector=selector.value();for(const auto &target:targets.value()){const auto target_block=block_for(target.target);if(!target_block)return unsupported("br_table target is not a basic block");const auto address=code[starts[*target_block]]->instruction.address;if(target.value)dispatch.cases.push_back({*target.value,address});else dispatch.default_target=address;}lifted.switch_dispatch=std::move(dispatch);continue;}
+            if(op==0x1a){auto v=pop({});if(!v)return v.error();continue;}
+            if(op==0x1b){auto cond=pop(integer(32));if(!cond)return cond.error();auto when_true=pop({});if(!when_true)return when_true.error();auto when_false=pop(when_true.value()->type);if(!when_false)return when_false.error();auto alternatives=binary("pair",when_true.value(),when_false.value(),when_true.value()->type);stack.push_back(binary("select_if",cond.value(),alternatives,when_true.value()->type));continue;}
+            if (op == 0x20) {
+                const auto index = immediate(i);
+                const auto type = index ? parameter_type(*index) : std::optional<ValueType>{};
+                if (!index || !type)
+                    return unsupported("local.get requires an available typed function parameter");
+                stack.push_back(std::make_shared<Expression>(Expression{*type, VariableValue{parameter_name(*index)}}));
+                continue;
+            }
+            if(op>=0x21&&op<=0x24)return unsupported("local writes, declared locals and globals require local dataflow support");
+            if(op>=0x10&&op<=0x11)return unsupported("call signatures are unavailable to the function-local lifter");
+            if (op >= 0x28 && op <= 0x3e) {
+                const auto info = memory_op(op);
+                if (!info) return unsupported("memory opcode metadata is unavailable");
+                auto args = memory_immediates(i, *info, metadata);
+                if (!args) return args.error();
+
+                ExpressionPtr stored;
+                if (info->store) {
+                    auto value = pop(info->stack_type);
+                    if (!value) return value.error();
+                    stored = value.value();
+                }
+                auto address = pop(integer(32));
+                if (!address) return address.error();
+                const auto effective_address = args.value().second
+                    ? binary("add", address.value(), constant(args.value().second, integer(32)), integer(32))
+                    : address.value();
+
+                // The common MemoryValue requires a register base. A reserved
+                // Wasm stack pseudo-register carries the exact effective i32
+                // address, preserving its wrapping addition and SSA inputs.
+                const RegisterOperand address_register{RegisterBank::wasm_stack, 255, 32, false};
+                emit(n, Assign{address_register, effective_address});
+                MemoryValue memory;
+                memory.type = info->access_type;
+                memory.base = address_register;
+                auto location = std::make_shared<Expression>(Expression{info->access_type, std::move(memory)});
+
+                if (info->store) {
+                    if (info->access_type.bits < info->stack_type.bits) {
+                        const auto operation = "trunc" + std::to_string(info->access_type.bits);
+                        stored = unary(operation, std::move(stored), info->access_type);
+                    }
+                    emit(n, Store{std::move(location), std::move(stored)});
+                } else {
+                    ExpressionPtr loaded = std::move(location);
+                    if (info->access_type.bits < info->stack_type.bits) {
+                        const auto operation = info->access_type.is_signed ? "sext" : "zext";
+                        loaded = unary(std::string(operation) + std::to_string(info->access_type.bits),
+                                       std::move(loaded), info->stack_type);
+                    }
+                    stack.push_back(std::move(loaded));
+                }
+                continue;
+            }
+            if(op==0x3f||op==0x40)return unsupported("memory.size and memory.grow are not modeled");
+            auto info=numeric(op);if(info){if(info->pops==1){auto a=pop(info->input);if(!a)return a.error();stack.push_back(unary(std::string(info->op),a.value(),info->output));}else{auto b=pop(info->input);if(!b)return b.error();auto a=pop(info->input);if(!a)return a.error();stack.push_back(binary(std::string(info->op),a.value(),b.value(),info->output));}continue;}
+            if(auto cv=conversion(op)){auto v=pop(cv->input);if(!v)return v.error();stack.push_back(unary(std::string(cv->operation),v.value(),cv->output));continue;}
+            if(op>=0xa7&&op<=0xbf)return unsupported("numeric conversion or reinterpret opcode is not modeled");
+            return unsupported("opcode/effect is not in the typed scalar subset: "+i.mnemonic_override);
+        }
+        if(!output_versions[bi].empty()){
+            std::vector<LiftedInstruction> copies;copies.reserve(output_versions[bi].size());
+            const auto *origin=code[last];
+            for(std::size_t slot=0;slot<output_versions[bi].size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),exits[bi]->at(slot).bits,false};copies.push_back({{origin->instruction.address,origin->id},Assign{reg,stack[slot],output_versions[bi][slot]}});}
+            if(!lifted.instructions.empty()&&(std::holds_alternative<Branch>(lifted.instructions.back().statement)||std::holds_alternative<Return>(lifted.instructions.back().statement)))lifted.instructions.insert(lifted.instructions.end()-1,std::make_move_iterator(copies.begin()),std::make_move_iterator(copies.end()));else lifted.instructions.insert(lifted.instructions.end(),std::make_move_iterator(copies.begin()),std::make_move_iterator(copies.end()));
+        }
+        out.blocks.push_back(std::move(lifted));
+    }
+    return out;
+}
+} // namespace hexlab::decompiler

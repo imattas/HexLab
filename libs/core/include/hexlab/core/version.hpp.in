@@ -1,0 +1,7 @@
+#pragma once
+#include <string_view>
+#include "hexlab/core/core_export.hpp"
+namespace hexlab {
+inline constexpr std::string_view version = "@PROJECT_VERSION@";
+HEXLAB_CORE_EXPORT std::string_view build_version() noexcept;
+}

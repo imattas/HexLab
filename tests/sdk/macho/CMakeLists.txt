@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.24)
+project(HexLabInstalledMachOConsumer LANGUAGES CXX)
+if(NOT IS_ABSOLUTE "${HEXLAB_PREFIX}")
+  message(FATAL_ERROR "Supply absolute installed HEXLAB_PREFIX")
+endif()
+add_executable(macho_consumer main.cpp)
+target_compile_features(macho_consumer PRIVATE cxx_std_20)
+target_include_directories(macho_consumer PRIVATE "${HEXLAB_PREFIX}/include")
+foreach(component IN ITEMS core image processors loaders analysis database workspace sqlite3)
+  find_library(installed_${component} NAMES hexlab_${component}
+    PATHS "${HEXLAB_PREFIX}/lib" NO_DEFAULT_PATH REQUIRED)
+  target_link_libraries(macho_consumer PRIVATE "${installed_${component}}")
+endforeach()

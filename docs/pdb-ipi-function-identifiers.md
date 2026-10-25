@@ -1,0 +1,49 @@
+# PDB CodeView IPI function identifiers
+
+`parse_pdb_ids` reads the separate CodeView IPI stream (MSF stream 4) and
+retains the stream's type-index range. It decodes `LF_FUNC_ID` (0x1601) and
+`LF_MFUNC_ID` (0x1602) records as named references to TPI function types.
+Each result carries its IPI index, leaf, parent scope or owner class, TPI
+function-type index, name, and exact byte offset/length in stream 4. Unknown
+well-framed ID leaves remain as `unsupported` records with their original
+leaf and byte extent.
+
+The parser validates the 56-byte minimum TPI/IPI header, declared header and
+record extents, sequential record count, per-record length, required fixed
+fields, and NUL-terminated names. Names are capped at 4096 bytes, ID indices
+at two million records, and cancellation is checked between records. Malformed
+fixed fields and unterminated names return errors that include the stream
+offset; unknown leaves do not make the rest of the IPI stream unreadable.
+
+`import_pdb_function_ids` joins supported IDs to an already parsed TPI stream
+and `PdbTypeImportResult`. Global function IDs must refer to `LF_PROCEDURE`;
+member function IDs must refer to `LF_MFUNCTION` whose owner agrees with the
+ID's aggregate. For this owner check, an `LF_MFUNC_ID` forward aggregate is
+resolved to a completed local TPI aggregate only by an exact, unique CodeView
+unique name. Duplicate definitions with that identity, missing unique names,
+and external namespace selectors stay unresolved; display names are never used
+to guess owner identity. Parent scopes must name a supported IPI function ID. Missing,
+mismatched, cyclic, or unrepresentable references remain visible with
+per-record diagnostics instead of producing a partial signature. Signatures
+are keyed by exact TPI indices and never by display names. Procedure and member
+function signatures remain in the same root-TPI index map.
+
+Module `S_LPROC32_ID` and `S_GPROC32_ID` symbols can carry one of these IPI
+indices directly. The PDB symbol reader preserves the index as IPI-domain data
+instead of treating it as a TPI index. During desktop import, an exact resolved
+index supplies its source-named function signature; the prototype is assigned
+to the module procedure's address only when the selected PDB uniquely matches
+the loaded PE GUID+age and the name and section-relative address match the
+PE-bound symbol. Existing address assignments are preserved. The PE symbol
+view and CLI inspection output identify each available procedure type reference
+as TPI or IPI.
+
+This is a bounded IPI function-name/type join, not complete IPI decoding. It
+does not parse `LF_BUILDINFO`, `LF_SUBSTR_LIST`, `LF_STRING_ID`, UDT source-line
+records, ID records in object-file sections, or linker-generated ID forms.
+Unresolved records are reported to callers, and unresolved or ambiguous
+procedure references are left unassigned.
+
+The record IDs and field layouts were cross-checked against Microsoft's
+[`cvinfo.h`](https://github.com/microsoft/microsoft-pdb/blob/master/include/cvinfo.h)
+and LLVM's [CodeView type-record reference](https://www.llvm.org/docs/PDB/CodeViewTypes.html).

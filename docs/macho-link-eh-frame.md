@@ -1,0 +1,9 @@
+# Mach-O linker DWARF unwind metadata
+
+The static Mach-O linker preserves bounded `__TEXT,__eh_frame` contributions from 64-bit little-endian x86-64 and ARM64 `MH_OBJECT` inputs. It places the merged bytes in a distinct output `__TEXT,__eh_frame` section after merged `__text`, then relocates address fields before writing the `MH_EXECUTE` image. Contributions retain input object order and are aligned to at least eight bytes. Their source section ordinal and output offset are retained for relocation target resolution.
+
+The currently accepted record framing is standard 32-bit DWARF EH record lengths, CIE ID zero, and FDE CIE back-references to an earlier CIE record boundary. A zero length terminator is accepted only when all remaining bytes are zero. Extended 64-bit lengths, malformed/out-of-range records, FDEs without a preceding CIE, duplicate nonempty `__eh_frame` sections in one object, and non-regular section types are rejected. Each input contribution is limited to 64 MiB and the merged data is subject to the linker's configured output byte limit.
+
+For x86-64, the linker permits absolute `UNSIGNED` 32/64-bit fields and 32-bit PC-relative `SIGNED` fields in `__eh_frame`. For ARM64, it permits absolute `UNSIGNED` 32/64-bit fields. These use the linker's existing symbol resolution and checked relocation arithmetic. All other relocation encodings in `__eh_frame`, including instruction, scattered, and unsupported width/flag combinations, are rejected with an unsupported-form diagnostic. Link inputs without `__eh_frame` retain the existing one-section `__TEXT` command layout.
+
+This path preserves DWARF CIE/FDE bytes and applies supported object relocations; it does not synthesize `__unwind_info` or compact-unwind tables, garbage-collect FDEs, rewrite augmentation encodings, or support extended-length records. Existing runtime unwind parser constraints still apply to the resulting metadata. No upstream linker implementation was copied.

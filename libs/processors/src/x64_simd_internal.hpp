@@ -1,0 +1,11 @@
+#pragma once
+#include "x64_internal.hpp"
+
+namespace hexlab::x64_detail {
+// Handles the selected 0F SIMD opcode families after prefixes and the second
+// opcode byte have been consumed. Returns false for unrelated opcodes.
+bool simd(State &, std::uint8_t opcode, bool extended);
+bool vex_simd(State &, std::uint8_t opcode, unsigned map, unsigned pp, unsigned vvvv, bool l, bool w);
+bool evex_simd(State &, std::uint8_t opcode, unsigned map, unsigned pp, unsigned vvvv, bool w,
+               unsigned vector_bits, unsigned mask, bool zeroing, bool reg_high, bool rm_high, bool broadcast);
+} // namespace hexlab::x64_detail

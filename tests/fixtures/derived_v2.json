@@ -1,0 +1,21 @@
+{
+  "origin": "Unchanged accepted stage4a installed X86ModeDebug CLI; authored raw32 INC CALL RET RET HELLO; ready before explicit function command",
+  "cache_kind": 2,
+  "engine_version": 2,
+  "bytes": 1893,
+  "sha256": "f24811a72ab59984b8d005d4f0130fb339fbdbde34278e58759d0243188a0248",
+  "input_hex": "40e801000000c3c348454c4c4f00",
+  "raw_base": "0x1000",
+  "architecture": "x86-32",
+  "schema": 1,
+  "producer_hashes": {
+    "hexlab_cli.exe": "d6b774c1459c2386610dba412cdf161a41bda07b0f67b3fc860c5fe74ddc7719",
+    "hexlab_core.dll": "98ff9c282ee1337462198f256d8c4388ec96f15ab0596ddc3897c950a02c2fea",
+    "hexlab_image.dll": "958e2afbb79c003c7abef1923f7c07b0927dd86e677712ab49227916b173036e",
+    "hexlab_processors.dll": "d40a5769347bfa2c7592ea609695807747462744e45c589261b789cef57f7e2b",
+    "hexlab_analysis.dll": "c2a3a267b52ba80af57c0aaf8f2dc6cb4047fb546402709a90e2893d830a1ead",
+    "hexlab_database.dll": "6ea43c3484a84fc0528a9fbc76c1686881c3efd1343d3c4fd9299c6eafc6045e",
+    "hexlab_workspace.dll": "5041536f11b522068d331cc32762bac787f0f1e963ed0977f7dde9cad129a078"
+  },
+  "purpose": "Genuine stage4a HXDC v2 incompatibility/readonly-history regression; payload not hand synthesized"
+}

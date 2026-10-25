@@ -1,0 +1,45 @@
+name: Windows release package
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-package-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure desktop distribution
+        run: cmake --preset windows-desktop
+      - name: Build Release multi-file ZIP
+        run: cmake --build --preset windows-desktop --config Release --target package --parallel 4
+      - name: Write SHA-256 checksum
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem -LiteralPath 'out/build/windows-desktop/packages' -Filter 'HexLab-*-Windows-*.zip' -File)
+          if ($archives.Count -ne 1) {
+            throw "Expected one Windows release ZIP, found $($archives.Count)."
+          }
+          $archive = $archives[0]
+          $hash = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash *$($archive.Name)" | Set-Content -LiteralPath "$($archive.FullName).sha256" -Encoding ascii
+      - name: Upload multi-file release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: HexLab-Windows-x64-Release-${{ github.sha }}
+          path: |
+            out/build/windows-desktop/packages/HexLab-*-Windows-*.zip
+            out/build/windows-desktop/packages/HexLab-*-Windows-*.zip.sha256
+          if-no-files-found: error
+          retention-days: 14

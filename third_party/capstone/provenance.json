@@ -1,0 +1,14 @@
+{
+  "name": "Capstone",
+  "version": "5.0.9",
+  "repository": "https://github.com/capstone-engine/capstone",
+  "commit": "022575848782a4801fd150fdbc927effcbca0864",
+  "license": "BSD-3-Clause",
+  "license_files": ["LICENSE.TXT", "LICENSE_LLVM.TXT"],
+  "enabled_architectures": ["ARM", "ARM64", "MIPS", "PPC", "X86", "MOS65XX", "RISCV"],
+  "local_changes": [
+    "Added as an offline, static-only CMake subdirectory with non-selected architectures and upstream tools/tests disabled.",
+    "HexLab adapter uses Capstone only when its typed decoder reports unsupported; it retains length and text but creates no operands or flow facts.",
+    "Generic opaque instructions stop reachable and function analysis because their control-flow semantics are untrusted."
+  ]
+}

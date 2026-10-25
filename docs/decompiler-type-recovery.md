@@ -1,0 +1,421 @@
+# Decompiler type recovery
+
+`hexlab/decompiler/type_recovery.hpp` exposes an opt-in type recovery pass for
+the lifted IR. It derives integer widths from IR values and register operands,
+propagates signedness through sign extension and arithmetic shifts, and marks
+register values used as memory bases as pointers. Copies and supported
+pointer-plus/minus-value expressions carry those facts across SSA versions.
+At a phi, pointer evidence is carried only when every incoming SSA value is
+known to be a pointer. A mixed or incomplete join therefore remains an integer
+or unknown type instead of inheriting pointer status from only one edge. This
+is conservative: it may leave a pointer-valued phi unknown when one input lacks
+evidence, but avoids assigning pointer semantics to a value that can also be an
+integer.
+
+Callers may supply an `AbiDescription` to map integer/floating register
+positions and stack offsets to ABI argument positions and to state pointer
+width. Helpers provide ordered integer and stack slot maps for x86-64 Windows,
+x86-64 System V, AArch64, ARM32 AAPCS, RISC-V ILP32/LP64, and MIPS32 O32 /
+MIPS64 N64. The ARM32 and RISC-V/MIPS additions currently describe integer
+argument and return registers, caller-saved integer registers, and stack
+slots; they do not claim complete floating-point, vector, aggregate, or
+multi-register ABI classification. AArch64 additionally supports scalar
+floating-point registers and the limited HFA handling described below. In
+particular, those helpers should be
+selected only for the named data model and calling convention, rather than
+treated as automatic platform detection. The CLI and desktop pseudocode view
+select these integer profiles for matching image architectures; 32-bit x86
+uses the cdecl stack profile. Stack offsets are relative to the incoming value
+of the configured stack base. Reads through SSA stack-pointer values derived
+by constant copies or additions/subtractions are normalized back to that
+incoming base before matching a stack argument slot. Cyclic, contradictory,
+indexed, or otherwise untraceable addresses do not contribute parameters.
+Stack-frame normalization also recognizes RISC-V `sp` (x2) and MIPS `sp`
+(r29), so those integer profiles can resolve locals and incoming stack slots
+through constant stack-pointer adjustments. ARM32 uses r13 as the stack base.
+Callers can extend the map with floating register slots when their
+ABI separates floating-point argument positions.
+A `types::Type` function prototype
+constrains argument register variables and supplies the function result type.
+Without a prototype, return expressions or the ABI integer return register
+supply a best-effort result type. When the lifted function has an explicit
+return statement and its result type is known, the pass also proposes an
+`inferred_prototype`: it uses the recovered return type (or `void` for a bare
+return) and the contiguous prefix of ABI argument slots observed in the IR.
+Value-returning functions with unknown or conflicting return evidence do not
+receive a prototype with a guessed `void` result. If `AbiDescription::arguments` is
+provided, its ordered slots control parameter order and can interleave integer
+and floating register classes with exact stack locations. The slot class
+supplies floating classification while the observed register or load width
+supplies size; integer slots retain pointer and signedness evidence from the
+IR. Vector slots infer a type only when lane metadata provides a supported,
+internally consistent shape. A missing slot also ends the prefix, even when a
+later slot is observed, since the prototype arity and skipped parameter type
+are ambiguous. Parameters are named `arg0`, `arg1`, and so on. When the
+ordered map is absent, the older integer-register plus exact-stack-offset
+heuristic is retained. This is a reviewable heuristic candidate; callers
+should not treat it as debug information or a confirmed signature. Results
+are deterministic and do not mutate the lifted function.
+For multiple value-return paths, the candidate result type is retained only
+when every observed path has known, matching type evidence; mixed bare/value
+returns or conflicting/unknown typed paths remain untyped and suppress inferred
+prototypes.
+
+Without an explicit prototype, x86-64 argument inference now uses the ABI's
+floating register evidence as well as integer evidence. Windows x64 treats each
+of the first four positions as one shared GPR/XMM choice, stops at the first
+unobserved position, and continues into stack slots only after that prefix.
+Conflicting GPR and XMM evidence for one position suppresses the candidate.
+System V AMD64 can infer a contiguous register prefix when only one register
+class is observed. When both GPR and SSE classes are observed, their independent
+allocation does not reveal source parameter order, so the pass leaves the
+candidate prototype unresolved. This does not infer vector ABI classes,
+variadic promotions, or aggregate classification.
+
+Signed integer `slt` comparisons in instruction expressions and recovered switch
+selectors add signedness evidence to direct register
+operands, and that evidence follows zero-displacement same-width copies within
+the same register bank.
+`ult` comparisons in those expressions add unsigned interpretation evidence; when the same copied
+SSA value is used by both forms, the pass leaves its inferred scalar type
+unknown instead of choosing one interpretation. Explicit prototype or type
+assignments remain authoritative. Existing `sext`/`zext` operations continue to
+provide extension-derived signedness evidence, while direct conflicting uses
+can still leave an unconstrained variable unknown. This currently covers typed
+IR comparison operators, not architecture flag predicates or register values
+nested inside other arithmetic expressions.
+
+Vector lane metadata (`element_kind`, `element_bits`, and `lanes`) now produces
+an immutable homogeneous vector type when its total width matches the IR value.
+Typed vector ABI slots and vector return registers carry that recovered type
+into candidate prototypes. Opaque vectors, conflicting vector phis, and
+unsupported lane kinds remain untyped with a diagnostic; the pass does not
+guess their element type or ABI position.
+
+`format_pseudocode_with_types` composes stack-slot and type recovery with
+structured pseudocode formatting. When an explicit prototype or conservative
+inferred prototype is available, the function header includes its recovered
+return and parameter declarations in ABI slot order. Inferred integer types
+retain their observed width in the displayed fixed-width name. If any function
+parameter or result needs an unsupported declarator, the formatter keeps the
+generic function header instead of omitting that parameter. It also emits
+declarations for locals with concrete recovered types before the basic-block
+body, while leaving unsupported local declarators and uncertain slots out of
+the declaration list. The output remains heuristic pseudocode and retains
+instruction-origin comments; it does not become confirmed source debug data.
+
+Each `RecoveredVariable` includes a stable display name and, for an observed
+incoming ABI register slot, its parameter index. Parameter names use ABI slot
+order (`arg0`, `arg1`, ...); other values use deterministic register-bank,
+index, and SSA-version names. `TypeRecoveryResult::stack_variables` contains
+typed records for slots accepted by `recover_stack_variables`, including the
+canonical frame register, SSA version, and frame-relative offset. These
+records let the Variables view use the same name and type as pseudocode's
+recovered stack references. Register names remain metadata at this stage; the
+machine-level assignment formatter still prints register destinations.
+
+For pointer variables, direct memory accesses through a base register with a
+non-negative constant displacement and no index contribute observed fields to
+the pointee type. The pass uses each access width, creates unsigned integer
+members at the observed byte offsets, and carries the layout across pointer
+copies and phi inputs when all phi inputs are pointer-classified. Constant
+pointer copies and `pointer +/- constant` assignments share field evidence in
+both directions, translating offsets between each pointer view and its
+enclosing object. A field accessed through an interior pointer therefore
+contributes its enclosing-object offset to the original pointer's recovered
+structure while retaining its local offset in the interior view. A valid
+non-overlapping layout becomes a recovered structure. A run of at least three
+contiguous same-width fields is represented as an array member; shorter runs,
+sparse accesses, and different-width fields remain separate members. This is
+a shape heuristic based only on observed accesses and can mistake adjacent
+record fields for an array. Unsupported widths, oversized offsets, or
+overlapping members keep the conservative `byte*` pointee. Member names are
+synthetic, signedness and semantic types are unknown, and aliasing between
+different base registers is not resolved. Alias field propagation is bounded
+by the number of SSA facts; if a non-zero-offset cycle prevents convergence,
+aggregate layouts are suppressed and a diagnostic explains why.
+If one pointer fact observes different access widths at the same byte offset,
+the layout is ambiguous and aggregate inference for that pointer is suppressed.
+This prevents a wider partial or overlapping access from silently replacing a
+narrower observation. The ambiguity follows proven pointer copies, phis, and
+constant-offset aliases; explicit prototype types remain authoritative.
+In typed pseudocode, a constant-offset memory access through a recovered
+pointer-to-structure prints as `base->field_N` only when the access width
+matches that exact member. Constant offsets into a recovered array member print
+as `base->field_N[index]` only for an exact element-width access. Unknown,
+ambiguous, partial-width, or overlapping accesses keep the ordinary memory
+expression.
+When a pointer-width load into a pointer-classified value, or a pointer-valued
+store, uses a constant-offset slot, that member is recovered as `void*` rather
+than an integer. The pointer-field classification propagates through proven
+constant pointer copies and offset aliases only when the same field extent is
+present in the destination layout. When a classified pointer member is loaded
+and that value is independently dereferenced at constant offsets, the member
+can point to a recovered nested structure. This follows observed pointer loads
+to a maximum of four nested pointee levels and one million combined observation,
+layout, comparison, and type-emission work items per recovery. Cycles, excess
+depth/work, missing child layouts, and conflicting observations
+leave the affected pointer member as `void*`; these cases never create recursive
+type ownership. Dynamic, partial-width, and ambiguous pointer slots remain
+unsupported.
+
+Stack locals can now retain scalar floating-point types when typed floating
+loads or same-width floating stores provide evidence. Floating and integer
+observations of the same slot make its scalar kind ambiguous, so the pass
+leaves the local's type unknown rather than choosing one based on access order.
+The desktop variable list and typed pseudocode declarations use the recovered
+floating type through the existing stack-variable metadata path.
+
+Indexed pointer accesses can provide array-element evidence when an integral
+load/store uses an index whose effective byte scale exactly matches the access
+width. This includes ARM-style `index << n` addressing represented as an LSL
+index shift with the default scale of one. The recovered pointer element type
+uses the observed access width. Other shift operations, subtractive indices,
+nonzero displacements, mismatched scales, and conflicting element widths do not
+produce this evidence; the pointer remains a byte pointer or uses its separately
+recovered structure layout.
+
+Stack locals can now retain pointee layout across a pointer spill and reload.
+A full-width pointer store into a recovered stack slot carries the stored
+pointer's observed fields into the local type; constant stack-slot loads are
+linked to their destination SSA values, so dereferences after a reload can
+also contribute those fields back to the local. A slot becomes a pointer only
+when its stored value or every observed reload is pointer-classified. Conflicting
+full-width pointer and non-pointer stores discard pointer and aggregate evidence
+for that local. Conflicting access widths, shifted or indexed stack addresses,
+and layouts that fail normal non-overlap validation remain conservative.
+
+The optimizer also exposes `eliminate_dead_code` for SSA functions. It removes
+unused assignments only when their expression consists of constants, register
+references, and pure unary or binary operations. Dead phi nodes and chains are
+removed iteratively. Memory loads and explicit effects are retained.
+
+Floating prototype constraints preserve the type graph's floating kind, and a
+configured floating return register can provide a floating return type when
+width evidence exists. Scalar floating evidence from typed IR register and
+memory values, floating intrinsic results, and copies now propagates through
+SSA assignments. Intrinsic floating result facts apply only to floating
+register banks, so an instruction's integer or status-register side effects do
+not inherit the floating result type. Floating return expressions retain that
+evidence, while a phi that mixes floating and non-floating inputs remains
+untyped. Typed
+homogeneous vectors preserve their element kind,
+lane width, count, and total width through register recovery and persistent
+type records.
+`recover_interprocedural_types` accepts a set of lifted functions with one ABI
+description per function and returns results in the same order. It resolves
+direct calls and indirect calls whose target is proven to be one supplied
+function entry through bounded SSA value flow.
+Register argument and scalar return propagation also supports calls between
+ABI descriptions over the same register file: call arguments are read from the
+callee's declared argument registers, and the callee's return register is used
+for its modeled result. A caller that targets different conventions invalidates
+the union of their caller-saved registers at calls, which is conservative but
+can discard values preserved by an individual target. The ABI-aware `to_ssa`
+overload snapshots register arguments and each configured stack-base register;
+known scalar, pointer, floating, and typed-vector return values get a new SSA
+definition at the call. Register and stack-passed argument types are propagated
+through a bounded fixed point. Stack arguments require a unique reaching store
+in the same basic block as an exact direct call, matching caller/callee ABI
+slot maps, and a stack address resolved through constant stack-pointer
+adjustments. The scan
+rejects unknown memory clobbers, overlapping stores, and source values without
+a recovered type. All known non-recursive call sites for a parameter must
+agree; an unknown recursive edge waits for a concrete seed from the same call
+component. This avoids inventing a type when independent callers disagree.
+Indirect calls, cross-register-file calls, cross-ABI stack arguments, and
+aggregate return conventions without a modeled scalar return register are not
+propagated. Register arguments from a known callee prototype can now constrain
+the caller's matching SSA value when no conflicting local type evidence exists;
+conflicting formal types for the same call input remain ambiguous and are not
+applied.
+
+For compatible direct calls, a register argument whose callee parameter is a
+pointer to a recovered structure can carry the callee's bounded field layout
+back into the caller's SSA value. Explicit pointer-to-structure prototypes use
+the same path. This lets the caller's typed pseudocode show fields it only
+passes through to a helper. Layouts from conflicting callee signatures for the
+same SSA value are discarded; explicit caller types and conflicting scalar,
+floating, or vector evidence remain authoritative. The transfer is limited to
+register-passed arguments with matching ABI slot maps and complete structures
+up to 1 MiB. It copies only supported scalar and pointer fields, caps arrays at
+4096 elements and nested pointee depth at four, with a separate one-million-
+item per-function transfer budget and a cap of 4096 distinct caller values.
+Stack-passed pointer layouts, unions, unsupported field kinds, and pointers with
+unresolved named pointee definitions remain
+unsupported. All propagated shapes remain heuristic observations and do not
+establish a confirmed source declaration.
+The pass caps the function set at 4,096, aggregate blocks at 100,000,
+instructions at 500,000, direct call edges at 250,000, tracked ABI registers
+at 256, and iterations at 32. Existing locally recovered parameter types are
+not replaced by conflicting call-site guesses. Allocation and limit failures
+return resource-limit errors. CFG edges, phis, phi inputs, and switch cases each
+have aggregate budgets of one million. An iteration-limit diagnostic
+accompanies the latest conservative results.
+
+Register maps require register operands representable by the current register
+model. This pass is intentionally conservative and incomplete: stack arguments
+are inferred only when a configured slot is read through a statically
+traceable constant stack-pointer alias, and the ordered ABI map must provide
+every preceding slot before one can be included. Dynamic stack allocation,
+stack realignment, register save/restore conventions, and red zones are not
+modeled. `AbiDescription::call_stack_adjustment` accounts for implicit call
+stack shifts: x64 uses 8 bytes for the return address and AArch64 uses 0 for
+its link-register call. Custom ABIs default to 0 and must set this value when
+their call mechanics shift the stack. Call clobbers for other conventions and
+general aliasing between ordinary register assignments remain unsupported. Constant-offset aggregate inference recovers one nested pointer-to-structure level when both the pointer slot and the loaded pointee have direct evidence. It does not recover deeper nesting or unions. A pointer base use
+is evidence of pointer semantics, not proof of a particular pointee type.
+Unconstrained integer values are represented as signed or unsigned integer
+types according to available IR evidence; this is not equivalent to full C
+integer-promotion or ABI classification.
+
+Recovered stack locals carry a width-aware integer name (`u32`/`i32`) when the
+access width and signedness are known; pointer and floating locals retain their
+recovered type kind. The desktop pseudocode variable list shows these locals
+with their first access address, and shows ABI-constrained `argN` variables at
+the function entry. Integer names encode their width; other recovered types
+include the observed width in bits in the view.
+
+An explicit project type assignment at a stack access can refine that recovered
+local's declaration when the access maps to exactly one local. Assignments at
+the local's other unambiguous access sites must agree by type identity; a
+conflict suppresses the declaration rather than choosing an assignment or the
+IR heuristic. Sites that access multiple recovered locals do not transfer a
+type to any one of them. This uses project assignments as reviewed evidence.
+Imported debug variables can also name and type a recovered stack local when
+the active location at an actual access site is a single direct DWARF
+base-register-plus-offset operation that exactly matches the recovered frame
+register and byte offset, or a PDB frame-relative defrange that exactly matches
+the owning procedure and frame-pointer offset. DWARF types use their project
+type IDs. PDB types are applied only when one imported project type has the
+exact display name and size recorded by the PDB. The mapping must be unique
+across all accesses; conflicting names or types are left on the recovered
+local instead of merged. Register-resident PDB parameters can replace an
+inferred `argN` name only when the PC-entry register matches exactly one ABI
+argument slot. Imported DWARF function prototypes already carry their source
+parameter names and types. CFA-relative and other unmatched, composite,
+indirect, or changing locations remain separate debug metadata and do not
+alter pseudocode variables.
+
+Stack-slot ambiguity is scoped to the overlapping byte ranges. If two accesses
+describe partially overlapping storage, those slots are omitted while
+independent non-overlapping locals in the same frame remain available. A
+frame-derived value included in a captured call argument snapshot marks that
+frame as escaped, so its stack accesses are not presented as private locals.
+When distinct proven frame bases contain the same relative offset, recovered
+names receive a deterministic frame suffix so their storage and type evidence
+cannot be merged by the common `local_N` display name.
+
+The desktop pseudocode view also accepts a function-type assignment at the
+recovered entry as an explicit prototype. Imported DWARF prototypes and
+user-assigned function types constrain variable recovery and replace the
+generic function header when the declarators are supported. Windows x64 uses
+the prototype's source argument positions to select the matching GPR or XMM
+register; System V AMD64 maps scalar integer and floating parameters through
+their independent register sequences. Unsupported aggregate or stack-slot
+classification does not change the displayed prototype or invent register
+types. An explicit `ms_abi` or `sysv_abi` function convention on the assigned
+prototype selects the corresponding x64 register convention even when it
+differs from the convention inferred from the image format. Other explicit
+conventions retain the image-format default until a matching recovery map is
+implemented.
+
+AArch64 AAPCS64 prototypes map scalar floating-point arguments to v0-v7
+independently from x0-x7. Scalar floating results use v0. Explicit prototypes
+also classify homogeneous floating-point aggregates (HFAs) with one to four
+contiguous members of the same supported floating type into consecutive SIMD
+argument registers; caller evidence for each member is propagated to the
+callee's aggregate parameter. Prototype slots that cannot be classified stop
+at the first unsupported parameter. HFA stack spills and aggregates with
+padding, unions, mixed member types, or more than four members remain
+unsupported. Multi-register HFA returns and ambiguous mixed-class argument
+evidence without a prototype are left unresolved. Without a prototype,
+argument inference is emitted only when evidence occupies a contiguous prefix
+of one register class; seeing both integer and SIMD classes leaves source
+parameter ordering ambiguous.
+
+
+## Native call outputs
+
+`prepare_call_effects(function, abi)` annotates calls before `to_ssa` using
+`AbiDescription::caller_saved_registers`. Windows x64 covers RAX, RCX, RDX,
+R8-R11 and XMM0-XMM5; System V AMD64 covers RAX, RCX, RDX, RSI, RDI, R8-R11
+and XMM0-XMM15. Both invalidate represented x86 flags. Callee-saved GPRs and
+the stack pointer retain their register state. Other ABI helpers keep an empty
+caller-saved map and retain their existing conservative behavior.
+
+The pass deduplicates exact register outputs and includes overlapping register
+views present in the IR: GPR widths and high bytes, flags widths, and XMM/YMM
+views. Represented whole YMM registers on Windows also become unknown because
+the ABI preserves only the lower XMM6-XMM15 halves; their separate low XMM
+views remain preserved. No value is inferred for any volatile output, and
+partial SIMD preservation is not reconstructed as an expression.
+
+`Call::register_writes` and its parallel `register_output_versions` describe
+these outputs. SSA captures selected ABI argument registers before defining
+outputs, then creates normal definitions and join phis. A modeled typed return
+uses the matching output version, rather than defining the return register
+twice. Type recovery records volatile outputs independently from incoming
+arguments; explicit result types constrain the modeled return. Dead-code
+elimination retains definitions used by call argument snapshots. Call-summary
+validation, write summaries, and constant invalidation account for these
+outputs, while existing call optimization barriers remain in effect.
+
+Native CLI and desktop paths prepare call effects before SSA, as does each
+interprocedural type-recovery iteration. Unknown targets still have the ABI's
+volatile outputs when the caller ABI is known. Unknown conventions, x87 state,
+AVX-512 registers, aggregate/multiple-register returns, and general alias
+semantics for ordinary assignments are not added by this pass.
+
+
+Argument snapshots preserve live machine values but do not alone establish
+source parameters. Candidate prototypes and `argN` identities require an
+actual expression/memory-address read, a used phi feeding such a read, an
+explicit parameter constraint, or a compatible known direct callee parameter.
+Interprocedural recovery carries known callee use back to the corresponding
+snapshot value and waits for candidate signatures as well as result types to
+stabilize. Unknown calls therefore do not invent four Windows or six System V
+parameters merely because those register slots were captured.
+
+`Call::abi_upper_half_writes` preserves the provenance of Windows-generated
+whole-YMM unknown values across repeated preparation. These outputs leave
+separate preserved low XMM6-XMM15 views intact. An explicit whole-YMM write
+has no such marker and invalidates overlapping low XMM views as well.
+
+Interprocedural recovery can also accept caller-supplied `ExternalFunctionPrototype`
+records for exact callable addresses whose bodies are outside the recovered set.
+A direct call uses that record only when the address is unique, the prototype is
+an explicit function type, and the target ABI shares the caller's register file.
+Supported ABI register slots constrain the caller's argument values; a modeled
+scalar, pointer, floating, or vector result constrains the target ABI return
+register. The call's volatile-register effects include the external ABI, so
+cross-ABI facts are not kept live across a call that may clobber them. Conflicting
+records at one address suppress type propagation, while their represented
+caller-saved effects remain conservative.
+
+Indirect targets are resolved from exact pointer-width integer or pointer constants either directly or through SSA register copies and phis whose every incoming path resolves to the same callable entry across all participating address spaces. Target analysis accounts for the union of caller-saved registers across known ABIs on the same register file, so values that may be clobbered across a call do not create false targets. Cyclic or conflicting joins, dynamic loads, arithmetic transformations, and offsets that match multiple entries remain unresolved. The matched entry can be a recovered body or an external prototype binding, allowing it to join the same bounded caller/callee prototype fixed point as direct calls. Resolution is limited to 128 definition steps and 500,000 SSA definitions per function, with a 250,000-call graph edge cap. Stack-passed
+arguments are propagated only for an exact ABI match when a bounded backward scan
+finds a direct register store to the exact outgoing slot with matching width and
+class; intervening calls, unknown memory effects, partial overlaps, or non-register
+stores stop that proof. Aggregate returns without a modeled result register remain
+untyped. Targets in a different register file and unsupported slot classes are
+left unresolved.
+
+Explicit prototypes can also model a bounded single-register aggregate return
+for x86-64 Windows, System V AMD64, and AArch64. The result must fit in one
+integer result register and have a complete structure/array layout containing
+only non-overlapping integer, boolean, enum, and pointer fields. Bitfields,
+unions, virtual bases, floating/vector members, unresolved members, and larger
+aggregates remain unresolved because they require ABI-specific register
+classification or hidden-result-pointer handling. A one-member AAPCS64 HFA is
+associated with v0; larger HFAs still require multiple result-register support.
+This path is prototype-driven and does not guess aggregate returns from
+observed register widths.
+
+For System V AMD64, the same call-result path also handles the exact SSE
+one-eightbyte aggregate case: a complete structure containing one `float` or
+`double` at byte offset zero and having the same 4- or 8-byte extent is
+associated with the floating return register (XMM0). Mixed-class layouts,
+multiple SSE eightbytes, arrays, bitfields, and padded or unresolved members
+remain unsupported because they need the complete SysV eightbyte classifier
+and, for some cases, more than one call-result register.

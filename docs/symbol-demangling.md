@@ -1,0 +1,123 @@
+# C++ symbol presentation
+
+HexLab keeps imported and user-provided symbol spellings unchanged. The reusable
+`hexlab::symbols::demangle_cpp_name` helper returns a bounded presentation
+result; it never replaces names in loader metadata, project storage, or symbol
+identity/index keys. Workspace-generated labels and CLI ELF, Mach-O, and PE PDB
+symbol rows display a demangled spelling only when parsing succeeds.
+
+The current parser recognizes common Itanium ABI `_Z` names: length-prefixed
+identifiers, nested namespaces/classes, template identifier arguments, common
+operator names, ordinary function parameter lists, and built-in, pointer,
+reference, rvalue-reference, const, and volatile types. Function and
+member-function pointer declarators preserve C++ precedence, rendering forms
+such as `int (*)(float)` and `int (Widget::*)(float)`. Template arguments
+support bounded integer literals and recursive `X <expression> E` arithmetic,
+comparison, bitwise, logical, assignment, and unary expression forms. The
+supported expression operands are themselves integer literals; calls, casts,
+conditional expressions, template-parameter references inside expressions,
+and other expression productions remain unsupported. Vendor-qualified types
+using `U <source-name> <type>` are presented as a GNU-style
+`__attribute__((name))` suffix. It recognizes a
+bounded subset of Microsoft decorated free and member functions. In addition
+to `?name@scope@@Y...` global functions, it parses ordinary
+`?method@Class@@...` and nested namespace/class names, access and
+static/virtual member-function classes, `const`/`volatile` and
+lvalue/rvalue-ref-qualified members, common scalar/pointer/reference types,
+bounded rank/dimension encoded array types, and simple type-parameter
+class/function template names. Template arguments now recurse through nested
+class/struct/union/enum types and nested template instantiations. The bounded
+integral non-type subset recognizes MSVC `$0` arguments using single-digit
+biased values or rebased hexadecimal `A`Ã¢â‚¬â€œ`P` nibbles terminated by `@`, with
+the optional `?` negative marker (for example, `?$Buffer@$03@@` presents as
+`Buffer<4>`). Common overloaded
+operators are rendered from their Microsoft operator codes, including arithmetic,
+comparisons, shifts, logical/bitwise operators, indexing, calls, comma,
+compound assignments, allocation, and deallocation. Unknown special names remain
+unsupported. It renders recognized calling-convention markers. The raw spelling
+remains available in CLI output next to the rendered form.
+
+The bounded special-member subset also recognizes ordinary MSVC constructor
+(`?0`), destructor (`?1`), and conversion-operator (`?B`) names. Constructors
+and destructors must be non-static class members and use the encoded `@`
+return-type placeholder; conversion targets use the existing bounded type
+grammar. These names retain the original spelling on unsupported or malformed
+encodings, like other parser results.
+
+The result status distinguishes ordinary names (`not_mangled`), successful
+parses (`demangled`), recognized-prefix encodings that this grammar cannot
+interpret (`unsupported`), malformed encodings (`malformed`), and configured
+input/output/depth/component caps (`resource_limit`). Every unsuccessful result
+contains the original input unchanged. Default caps are 4096 input bytes,
+16384 rendered bytes, nesting depth 32, and 128 components. The Itanium
+parser counts components across the complete parse and separately limits its
+substitution dictionary to 256 entries and 64 KiB of retained strings by default
+(`max_substitutions` and `max_substitution_bytes`).
+
+This is not a complete implementation of either ABI. The Itanium substitutions
+described below, array/function/member-pointer types, and selected template
+parameters are recognized; vendor extensions, local names, many
+expression-valued template arguments, and broad operator/type encodings remain
+incomplete, including Itanium local names, expression calls/casts/conditionals,
+template parameter references inside expressions, and unrecognized vendor
+qualifiers. Microsoft
+thunks and other special names,
+non-integral template values (including pointers, member pointers, symbol
+references, `auto` values, and parameter packs), template backreferences,
+pointer-to-member and function-pointer types, and many calling-convention/type
+codes are unsupported in the Microsoft grammar. The Itanium pointer forms
+described above are supported. Malformed numeric values, missing hexadecimal terminators,
+and configured size/depth/component overflows retain the original symbol text.
+Array ranks and dimensions use ABI-encoded integer forms and remain bounded by
+the configured nesting/component limits. The parser deliberately
+does not invoke platform demangling libraries or external processes, so results
+are consistent across platforms and unsupported names safely remain raw.
+
+## Itanium compression and backreferences
+
+The Itanium parser supports all seven standard abbreviations: `St` (`std`),
+`Sa` (`std::allocator`), `Sb` (`std::basic_string`), `Ss` (the complete char
+basic_string specialization), and `Si`/`So`/`Sd` (the corresponding char
+basic_istream/basic_ostream/basic_iostream specializations). The complete forms
+are rendered explicitly, including character traits and allocator arguments.
+`St` works in both unscoped standard names and nested prefixes; allocator and
+basic_string template prefixes require template arguments.
+
+General substitutions use `S_` for dictionary entry zero and `S<seq-id>_` for
+entry `seq-id + 1`, with checked uppercase base-36 decoding. Missing terminators,
+invalid digits, noncanonical leading zeroes, forward/out-of-range references,
+and substitutions used in incompatible name/template/type positions preserve
+the original symbol with a failure status. Index arithmetic and configured
+dictionary caps are checked before lookup; no storage is allocated by index.
+
+The dictionary follows component-before-composite ordering for supported name
+prefixes, template prefixes/specializations, and non-builtin compound types.
+Builtins, terminal function/operator names, repeated entities, and predefined
+standard abbreviations do not consume new slots. Entries retain structured
+function/array/member-pointer declarators, including their insertion point,
+rather than flattened display strings. Reusing a type therefore preserves
+parentheses, indirection and qualifier placement. Member-function types retain
+their owning-class identity separately from namespace function types.
+
+Function-template names consume their encoded return type before parameters.
+Supported decimal `T_`/`T<number>_` references retain type structure and remain
+distinct dictionary entities from their concrete display types. Nested type
+arguments restore the enclosing template-argument scope. Non-type arguments
+and packs remain presentation-only and cannot be substituted as a type.
+
+Every intermediate string and expanded backreference is bounded by the output
+limit, and retained dictionary strings have a separate aggregate byte budget.
+Parsing depth and total component work remain bounded even when a symbol uses
+many references. Unsupported productions fail the complete parse; no partial
+presentation replaces raw identity. Local/lambda/special names, dependent
+qualified/template-template names, ref-qualified function-type encodings,
+expression calls/casts/conditionals, and vendor qualifier template arguments
+remain outside this slice. Incomplete/cv-qualified array declarators and other
+unproven qualifier forms also fail closed.
+
+Source review covered substitution ordering, kind checks, standard forms,
+base-36 overflow and indexes, nested template scope, declarator reuse, member
+function identity, and intermediate/output/dictionary limits against the
+[Itanium ABI compression rules](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-compression).
+No tests were added or run for this slice; serial symbols/consumer compilation
+is a separate integration check.

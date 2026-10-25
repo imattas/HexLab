@@ -1,0 +1,16 @@
+{
+  "name": "Zydis",
+  "version": "4.1.1",
+  "repository": "https://github.com/zyantific/zydis",
+  "commit": "a2278f1d254e492f6a6b39f6cb5d1f5d515659dc",
+  "license": "MIT",
+  "dependency": {
+    "name": "Zycore",
+    "version": "1.5.2",
+    "repository": "https://github.com/zyantific/zycore",
+    "commit": "0b2432ced0884fd152b471d97ecf0258ff4d859f",
+    "license": "MIT"
+  },
+  "local_changes": "None to upstream source; HexLab integration is maintained outside third_party/zydis.",
+  "purpose": "Static x86/x64 decode and Intel-format fallback for unsupported typed scalar instructions."
+}

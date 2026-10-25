@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "product": "HexLab",
+  "version": "@PROJECT_VERSION@",
+  "target": {
+    "operating_system": "@CMAKE_SYSTEM_NAME@",
+    "architecture": "@HEXLAB_PACKAGE_ARCH@",
+    "pointer_bits": @HEXLAB_PACKAGE_POINTER_BITS@
+  },
+  "layout": {
+    "tools_directory": "@CMAKE_INSTALL_BINDIR@",
+    "runtime_directory": "@HEXLAB_PACKAGE_RUNTIME_DIRECTORY@",
+    "headers_directory": "@CMAKE_INSTALL_INCLUDEDIR@",
+    "documentation_directory": "@CMAKE_INSTALL_DATADIR@/hexlab/docs",
+    "runtime_search_directory": "@HEXLAB_PACKAGE_RUNTIME_DIRECTORY@"
+  },
+  "tools": [
+@HEXLAB_PACKAGE_TOOLS@
+  ],
+  "runtime_targets": [
+@HEXLAB_PACKAGE_RUNTIME_TARGETS@
+  ],
+  "desktop_included": @HEXLAB_PACKAGE_HAS_DESKTOP@,
+  "native_plugin_abi": {
+    "major": @HEXLAB_PLUGIN_ABI_MAJOR@,
+    "minor": @HEXLAB_PLUGIN_ABI_MINOR@,
+    "query_symbol": "hexlab_plugin_query"
+  }
+}

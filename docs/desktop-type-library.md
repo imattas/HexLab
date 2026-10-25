@@ -1,0 +1,11 @@
+# Desktop type-library workflow
+
+The Type & Symbols workspace exposes **Type Library...** for HXTL portable libraries. Export writes the current named type definitions, declaration kind and available source provenance, plus address-based type assignments, to a user-selected `.hxtl` file. The bundle includes the current input size and SHA-256 and the encoded loader-recipe SHA-256. Publication uses a same-directory temporary and the project protected-path list; overwriting an existing destination follows the file dialog's confirmation.
+
+Import reads at most 16 MiB and decodes the HXTL bundle before offering a preview. The preview reports new, identical and conflicting definitions and the assignment totals. The user chooses **Keep existing rows** or **Replace conflicting rows**. The keep policy omits conflicting definitions and occupied assignment locations; replace updates those rows. Identical definitions and assignments are omitted. New definitions may reference other definitions in the same bundle or existing project types; missing named references stop import with a validation error.
+
+Assignments are applied only when the library's complete input and recipe identity matches the open project. A missing or mismatched identity skips every bundled assignment while leaving definitions eligible for import, and the preview explains the skipped count. This is a strict identity check; the GUI does not offer a force-apply option. Legacy definition-only HXTL files remain importable.
+
+The selected changes are assembled into one `ImportPortableTypes` project command, checked against the current project snapshot, and submitted through the standard project command path. The workspace transaction therefore applies the import atomically and records it in ordinary project undo/history. Type graph validation is bounded to 262,144 visited nodes, assignment and definition limits are enforced by the HXTL codec, and the encoded file is capped at 16 MiB.
+
+Unsupported cases: export stops if an assignment has a non-address location or refers to a missing type row. The bundle format represents address assignments only; it does not export debug variables or arbitrary project metadata. Import does not bypass source-identity checks for assignments.

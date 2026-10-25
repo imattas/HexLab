@@ -1,0 +1,149 @@
+id,area,reference_family,hexlab_state,variant_audit,hexlab_evidence,source_id,next_stage
+processor.wasm,processor,WASM,absent,open,,P01,8
+processor.3dnow,processor,3DNow!,absent,open,,P01,8
+processor.arm,processor,ARM,absent,open,,P01,4
+processor.aarch64,processor,AArch64,absent,open,,P01,4
+processor.arc,processor,ARC,absent,open,,P01,8
+processor.avr,processor,AVR,absent,open,,P01,8
+processor.pdp11,processor,PDP-11,absent,open,,P01,8
+processor.fr,processor,FR,absent,open,,P01,8
+processor.mos6502,processor,6502/65C02,partial,partial,"libs/processors/src/m6502.cpp; tests/processor_modes_tests.cpp; tests/raw_profiles_tests.cpp; tests/function_tests.cpp; tests/reference_tests.cpp; tests/decompiler/m6502_lifting_tests.cpp; docs/m6502.md; NMOS 6502 legal-opcode slice integrated; 65C02 extensions and undocumented opcodes remain",P01,8
+processor.w65c816,processor,65C816,absent,open,,P01,8
+processor.z80,processor,Z80,absent,open,,P01,8
+processor.h8,processor,H8,absent,open,,P01,8
+processor.h8500,processor,H8/500,absent,open,,P01,8
+processor.hd630x,processor,HD6301/HD6303,absent,open,,P01,8
+processor.hd64180,processor,HD64180,absent,open,,P01,8
+processor.i8080,processor,8080,absent,open,,P01,8
+processor.i8085,processor,8085,absent,open,,P01,8
+processor.i196,processor,80196,absent,open,,P01,8
+processor.i8051,processor,8051,absent,open,,P01,8
+processor.i860,processor,860XR,absent,open,,P01,8
+processor.i960,processor,960,absent,open,,P01,8
+processor.x86,processor,x86,partial,partial,tests/x86_32_decoder_tests.cpp; docs/x86-32-coverage.csv; raw/PE32 recovery/cache/editing and CLI/wx selection integrated; selected Win32 CPU oracle and Release/install acceptance passed; x86-16 absent,P01,4
+processor.x87,processor,x87,partial,partial,libs/processors/src/x64_x87.cpp; tests/x86_16_decoder_tests.cpp; tests/x86_32_decoder_tests.cpp; docs/x87-decoder-coverage.md; D8-DF decode and stack register/effect coverage,P01,8
+processor.x86_simd,processor,x86 SIMD,partial,partial,libs/processors/src/x64_simd.cpp; tests/x64_simd_tests.cpp; docs/x64-simd-coverage.md; SSE2 integer subset and scalar single/double operations tested,P01,8
+processor.jvm,processor,JVM,absent,open,,P01,8
+processor.kr1878,processor,KR1878,absent,open,,P01,8
+processor.cli,processor,.NET CLI,absent,open,,P01,8
+processor.m740,processor,740,absent,open,,P01,8
+processor.m16c,processor,M16C,absent,open,,P01,8
+processor.mcore,processor,MCore,absent,open,,P01,8
+processor.mn102,processor,MN102,absent,open,,P01,8
+processor.m68k,processor,68K,absent,open,,P01,8
+processor.m68xx,processor,68xx,absent,open,,P01,8
+processor.m6812,processor,6812,absent,open,,P01,8
+processor.hcs12,processor,HCS12/XGATE,absent,open,,P01,8
+processor.m68hc16,processor,68HC16,absent,open,,P01,8
+processor.cr16,processor,CR16,absent,open,,P01,8
+processor.v850,processor,V850,absent,open,,P01,8
+processor.rh850,processor,RH850,absent,open,,P01,8
+processor.ebc,processor,EBC,absent,open,,P01,8
+processor.spu,processor,SPU,absent,open,,P01,8
+processor.msp430,processor,MSP430,absent,open,,P01,8
+processor.pic8,processor,PIC 12/14/16/18,absent,open,,P01,8
+processor.pic16,processor,PIC24/dsPIC,absent,open,,P01,8
+processor.c39,processor,C39,absent,open,,P01,8
+processor.sam8,processor,SAM8,absent,open,,P01,8
+processor.st7,processor,ST7,absent,open,,P01,8
+processor.st20,processor,ST20,absent,open,,P01,8
+processor.tlcs900,processor,TLCS900,absent,open,,P01,8
+processor.unsp,processor,unSP,absent,open,,P01,8
+processor.spc700,processor,SPC700,absent,open,,P01,8
+processor.xa,processor,XA,absent,open,,P01,8
+processor.riscv,processor,RISC-V,partial,partial,"RV32I and RV64I base-integer decode; RV64M/integer C; ELF32/ELF64 and raw CLI/desktop integration; tests/riscv64_decoder_tests.cpp, processor_modes_tests.cpp, raw_profiles_tests.cpp, elf_flow_tests.cpp; docs/riscv64-coverage.md",R01,4
+processor.rl78,processor,RL78,absent,open,,P01,8
+processor.xscale,processor,XScale,absent,open,,P01,8
+processor.z8,processor,Z8,absent,open,,P01,8
+processor.z180,processor,Z180,absent,open,,P01,8
+processor.z380,processor,Z380,absent,open,,P01,8
+processor.s390,processor,S390/S390x,absent,open,,P01,8
+processor.x64,processor,x64,partial,partial,tests/processor_tests.cpp; docs/x64-coverage.csv,P01,2;4
+processor.ad218x,processor,AD218x,absent,open,,P01,8
+processor.dalvik,processor,Dalvik,absent,open,,P01,8
+processor.alpha,processor,Alpha,absent,open,,P01,8
+processor.dsp56k,processor,DSP56K,absent,open,,P01,8
+processor.tms320,processor,TMS320,absent,open,,P01,8
+processor.parisc,processor,PA-RISC,absent,open,,P01,8
+processor.superh,processor,SuperH,absent,open,,P01,8
+processor.rx,processor,RX,absent,open,,P01,8
+processor.powerpc,processor,PowerPC/POWER,partial,partial,libs/processors/src/ppc.cpp; tests/ppc_tests.cpp; docs/powerpc.md; PPC32/PPC64 endian-aware integer slice,P01,8
+processor.tricore,processor,TriCore,absent,open,,P01,8
+processor.ia64,processor,IA-64,absent,open,,P01,8
+processor.mips,processor,MIPS32,partial,open,libs/processors/src/mips32.cpp; tests/processor_tests.cpp; tests/elf_image_tests.cpp; docs/mips32.md; ELF32 little-endian decode; delay-slot-aware reachability and function recovery; remaining variants partial,P01,8
+processor.mips64,processor,MIPS64,partial,open,libs/processors/src/mips64.cpp; libs/decompiler/src/mips64_lifting.cpp; tests/mips64_tests.cpp; tests/decompiler/mips64_lifting_tests.cpp; docs/mips64.md; ELF64 little/big-endian selected integer including trapping DADDI and HILO decode plus shared-SSA lifting,P01,8
+processor.m32r,processor,M32R,absent,open,,P01,8
+processor.m7700,processor,M7700,absent,open,,P01,8
+processor.m7900,processor,M7900,absent,open,,P01,8
+processor.nec78k,processor,78K0/78K0S,absent,open,,P01,8
+processor.st9,processor,ST9+,absent,open,,P01,8
+processor.st10,processor,ST10,absent,open,,P01,8
+processor.sparc,processor,SPARC,absent,open,,P01,8
+processor.c166,processor,C166,absent,open,,P01,8
+processor.xtensa,processor,Xtensa,absent,open,,P01,8
+processor.f2mc,processor,F2MC,absent,open,,P01,8
+processor.hexagon,processor,Hexagon,absent,open,,P01,8
+format.mz,format,DOS MZ,absent,open,,F01,8
+format.com,format,DOS COM,absent,open,,F01,8
+format.dos_driver,format,DOS driver,absent,open,,F01,8
+format.ne,format,NE,absent,open,,F01,8
+format.lx,format,LX,absent,open,,F01,8
+format.le,format,LE,absent,open,,F01,8
+format.pe,format,PE,partial,partial,AMD64 and ARM64 live-context unwind evaluation; tests/pe_live_unwind_tests.cpp; docs/pe-live-unwind.md; tests/loader_tests.cpp; docs/binary-analysis-validation.md,F01,2;4
+format.ce_pe,format,Windows CE PE,absent,open,,F01,8
+format.macho,format,Mach-O,partial,partial,"thin32/64 and FAT32/64 image/object loaders; symbols/relocations; dyld and compact-unwind metadata; x86_64 and arm64 linked-image runtime compact-unwind evaluation; tests/macho_image_tests.cpp; tests/macho_unwind_tests.cpp; docs/macho-analysis-validation.md; docs/macho-compact-unwind.md",F01,4
+format.dyld_cache,format,Dyld cache,absent,open,,F01,8
+format.dex,format,DEX,absent,open,,F01,8
+format.epoc,format,EPOC,absent,open,,F01,8
+format.dmp,format,DMP,absent,open,,F01,8
+format.xbe,format,XBE,absent,open,,F01,8
+format.ihex,format,Intel HEX,absent,open,,F01,8
+format.mos_hex,format,MOS HEX,absent,open,,F01,8
+format.nlm,format,NLM,absent,open,,F01,8
+format.coff,format,COFF,absent,open,,F01,8
+format.raw,format,Raw bytes,partial,partial,tests/loader_tests.cpp; docs/binary-analysis-validation.md,F01,2;4
+format.omf,format,OMF,absent,open,,F01,8
+format.omf_library,format,OMF library,absent,open,,F01,8
+format.srec,format,S-record,absent,open,,F01,8
+format.zip,format,ZIP,absent,open,,F01,8
+format.jar,format,JAR,absent,open,,F01,8
+format.elf,format,ELF,partial,partial,"ELF32/ELF64 executable, shared, and relocatable images; dynamic symbols/relocations, versioning and debug metadata; bounded DWARF v4 and common v5 compile-unit import with workspace persistence; tests/elf_image_tests.cpp; tests/project_command_tests.cpp; tests/elf_relocation_tests.cpp; docs/elf-analysis-validation.md; docs/dwarf-v5-import.md",F01,4
+format.w32run,format,W32RUN,absent,open,,F01,8
+format.aout,format,a.out,absent,open,,F01,8
+format.palm,format,Palm,absent,open,,F01,8
+format.aiaff,format,AIAFF,absent,open,,F01,8
+format.pef,format,PEF,absent,open,,F01,8
+format.qnx,format,QNX,absent,open,,F01,8
+format.n64,format,N64,absent,open,,F01,8
+format.smc,format,SMC,absent,open,,F01,8
+format.lod,format,DSP LOD,absent,open,,F01,8
+format.psx,format,PSX,absent,open,,F01,8
+format.psyq_object,format,PsyQ object,absent,open,,F01,8
+format.psyq_library,format,PsyQ library,absent,open,,F01,8
+decompiler.x86,decompiler,x86-32,absent,open,,D01,5;8
+decompiler.x64,decompiler,x86-64,absent,open,,D01,5;8
+decompiler.arm,decompiler,ARM32,absent,open,,D01,5;8
+decompiler.aarch64,decompiler,ARM64,absent,open,,D01,5;8
+decompiler.mips32,decompiler,MIPS32+nM,absent,open,,D01,5;8
+decompiler.mips64,decompiler,MIPS64,partial,open,libs/decompiler/src/mips64_lifting.cpp; tests/decompiler/mips64_lifting_tests.cpp; docs/mips64.md; selected integer and memory operations including DADDI overflow preservation; control-flow; atomic and 64-bit HI/LO effects,D01,5;8
+decompiler.ppc32,decompiler,PPC32,absent,open,,D01,5;8
+decompiler.ppc64,decompiler,PPC64,absent,open,,D01,5;8
+decompiler.arc,decompiler,ARC,absent,open,,D01,5;8
+decompiler.riscv32,decompiler,RISC-V32,absent,open,,D01,5;8
+decompiler.riscv64,decompiler,RISC-V64,absent,open,,D01,5;8
+decompiler.v850,decompiler,V850,absent,open,,D01,5;8
+debugger.windows,debugger,Windows user mode,partial,partial,"Win32 x86/x64 debugger backend; tests/debugger/debugger_tests.cpp; ARM64 architecture detection and native context/software breakpoint path added but ARM64-conditional code is uncompiled on the available host; docs/debugger-stepping.md",B01,6
+debugger.linux,debugger,Linux user mode,absent,open,,B01,6;8
+debugger.macos_x86,debugger,macOS x86 user mode,absent,open,,B01,6;8
+debugger.iphone,debugger,iPhone,absent,open,,B01,6;8
+debugger.bochs,debugger,Bochs,absent,open,,B01,6;8
+debugger.m6812,debugger,6812 emulator,absent,open,,B01,6;8
+debugger.gdb,debugger,GDB remote,absent,open,,B01,6;8
+debugger.windbg,debugger,WinDbg,absent,open,,B01,6;8
+debugger.dosbox,debugger,DOSBox,absent,open,,B01,6;8
+debugger.arm_linux,debugger,ARM Linux,absent,open,,B01,6;8
+debugger.replay,debugger,Trace replay,absent,open,,B01,6;8
+debugger.pin,debugger,PIN tracer,absent,open,,B01,6;8
+debugger.dalvik,debugger,Dalvik,absent,open,,B01,6;8
+debugger.xnu,debugger,XNU kernel,absent,open,,B01,6;8
+debugger.macos_arm,debugger,macOS ARM user mode,absent,open,,B01,6;8

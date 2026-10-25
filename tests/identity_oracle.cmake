@@ -1,0 +1,11 @@
+execute_process(COMMAND "${CHECKER}" --write-oracle "${FIXTURE}" RESULT_VARIABLE result OUTPUT_VARIABLE own ERROR_VARIABLE error TIMEOUT 20)
+if(NOT "${result}" STREQUAL "0")
+  message(FATAL_ERROR "Identity fixture failed: ${result}; ${error}")
+endif()
+execute_process(COMMAND "${POWERSHELL}" -NoProfile -File "${CMAKE_CURRENT_LIST_DIR}/identity_oracle.ps1" -Path "${FIXTURE}"
+  RESULT_VARIABLE result OUTPUT_VARIABLE platform ERROR_VARIABLE error TIMEOUT 20)
+string(STRIP "${own}" own)
+string(STRIP "${platform}" platform)
+if(NOT "${result}" STREQUAL "0" OR NOT own STREQUAL platform)
+  message(FATAL_ERROR "Identity mismatch: own=${own}; platform=${platform}; ${error}")
+endif()
