@@ -22,6 +22,11 @@ ExpressionPtr un(std::string op,ExpressionPtr a,ValueType t){return std::make_sh
 std::optional<std::uint64_t> imm(const Instruction &i,std::size_t n=0){if(n>=i.operands.size())return{};if(auto *v=std::get_if<ImmediateOperand>(&i.operands[n]))return v->value;return{};}
 bool target(const Instruction &i){return i.flow==FlowKind::jump||i.flow==FlowKind::conditional_branch;}
 Error no(std::string s){return {ErrorCode::unsupported,"JVM lift unsupported: "+std::move(s)};}
+bool jvm_may_throw(std::uint8_t opcode) {
+    return (opcode >= 0x2e && opcode <= 0x35) || (opcode >= 0x4f && opcode <= 0x56) ||
+           opcode == 0x6c || opcode == 0x6d || opcode == 0x70 || opcode == 0x71 ||
+           (opcode >= 0xb2 && opcode <= 0xc3) || opcode == 0xc5 || opcode == 0xbf;
+}
 struct MemberReference { std::string owner, name, descriptor; };
 struct DynamicCallSite { std::string name, descriptor; std::uint64_t bootstrap_index = 0; };
 Result<std::string> cp_utf8(const JvmMetadata &metadata, std::uint64_t index) {
@@ -276,25 +281,45 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             for (std::size_t slot = 0; slot < stack.size(); ++slot) evidence(stack[slot], references->stack[slot]);
         }
         if (code && !src.instructions.empty()) {
-            const auto source = src.instructions.back()->instruction.address;
-            for (const auto &handler : code->exception_table) {
-                const auto start = code->begin.offset + handler.start_pc;
-                const auto end = code->begin.offset + handler.end_pc;
-                const auto target_address = Address{source.space, code->begin.offset + handler.handler_pc};
-                if (source.offset < start || source.offset >= end ||
-                    std::none_of(src.successors.begin(), src.successors.end(), [&](const auto &edge) {
-                        return edge.kind == BlockEdgeKind::exception && edge.target == target_address;
-                    })) continue;
-                LiftedBlock::ExceptionHandlerDispatch dispatch;
-                dispatch.target = target_address;
-                dispatch.catch_all = handler.catch_type == 0;
-                if (handler.catch_type && handler.catch_type < metadata->constant_pool.size() &&
-                    metadata->constant_pool[handler.catch_type].tag == 7) {
-                    const auto name_index = metadata->constant_pool[handler.catch_type].first;
-                    if (name_index < metadata->constant_pool.size() && metadata->constant_pool[name_index].tag == 1)
-                        dispatch.catch_type = metadata->constant_pool[name_index].text;
+            for (const auto &fact : src.instructions) {
+                if (!fact || fact->instruction.bytes.empty()) continue;
+                const auto &source = fact->instruction.address;
+                const auto opcode = std::to_integer<std::uint8_t>(fact->instruction.bytes.front());
+                if (!jvm_may_throw(opcode)) continue;
+                for (const auto &handler : code->exception_table) {
+                    const auto start = code->begin.offset + handler.start_pc;
+                    const auto end = code->begin.offset + handler.end_pc;
+                    const auto target_address = Address{source.space, code->begin.offset + handler.handler_pc};
+                    if (source.offset < start || source.offset >= end ||
+                        std::none_of(src.successors.begin(), src.successors.end(), [&](const auto &edge) {
+                            return edge.kind == BlockEdgeKind::exception && edge.target == target_address;
+                        })) continue;
+                    std::optional<std::string> catch_type;
+                    if (handler.catch_type) {
+                        if (handler.catch_type >= metadata->constant_pool.size() ||
+                            metadata->constant_pool[handler.catch_type].tag != 7)
+                            return no("exception table catch type is not a valid CONSTANT_Class");
+                        auto name = cp_class_name(*metadata, handler.catch_type);
+                        if (!name) return name.error();
+                        catch_type = std::move(name.value());
+                    }
+                    const auto existing = std::find_if(dst.exception_handlers.begin(), dst.exception_handlers.end(),
+                        [&](const auto &dispatch) {
+                            return dispatch.target == target_address && dispatch.catch_type == catch_type &&
+                                   dispatch.catch_all == (handler.catch_type == 0);
+                        });
+                    if (existing == dst.exception_handlers.end()) {
+                        LiftedBlock::ExceptionHandlerDispatch dispatch;
+                        dispatch.target = target_address;
+                        dispatch.catch_type = std::move(catch_type);
+                        dispatch.catch_all = handler.catch_type == 0;
+                        dispatch.protected_throw_sites.push_back(source);
+                        dst.exception_handlers.push_back(std::move(dispatch));
+                    } else if (std::find(existing->protected_throw_sites.begin(), existing->protected_throw_sites.end(),
+                                         source) == existing->protected_throw_sites.end()) {
+                        existing->protected_throw_sites.push_back(source);
+                    }
                 }
-                dst.exception_handlers.push_back(std::move(dispatch));
             }
         }
         auto pop=[&](ValueType want)->Result<ExpressionPtr>{if(stack.empty())return no("operand stack underflow");auto v=stack.back();stack.pop_back();if(v->type!=want)return no("operand stack type mismatch");return v;};
@@ -522,13 +547,20 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                     const bool exact_new = receiver && initialized &&
                         receiver->kind == JvmVerificationKind::uninitialized &&
                         receiver->descriptor == initialized->descriptor && !signature.value().result;
+                    const bool constructor_chain = method && metadata && method->name == "<init>" && receiver &&
+                        receiver->kind == JvmVerificationKind::uninitialized_this && !signature.value().result &&
+                        (member.value().owner == metadata->class_name ||
+                         (!metadata->super_name.empty() && member.value().owner == metadata->super_name));
+                    const auto initialized_this = constructor_chain ? reference_class(metadata->class_name) : Reference{};
                     const auto initialize_alias = [&](Reference &value) {
                         if (!value || (value->kind != JvmVerificationKind::uninitialized &&
                                        value->kind != JvmVerificationKind::uninitialized_this)) return;
                         if (receiver && *value != *receiver) return;
-                        // Constructor chaining through uninitializedThis and
-                        // uncertain receivers need full verifier flow analysis.
-                        value = exact_new ? initialized : Reference{};
+                        // `new` aliases initialize only through the exact
+                        // allocated class. `uninitializedThis` initializes
+                        // only after this class or its direct superclass
+                        // constructor returns normally.
+                        value = exact_new ? initialized : constructor_chain ? initialized_this : Reference{};
                     };
                     for (auto &entry : identities) initialize_alias(entry.second);
                     for (auto &value : references->locals) initialize_alias(value);
@@ -695,6 +727,33 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         default: return {};
         }
     };
+    struct HandlerCatchEvidence {
+        bool seen = false;
+        bool consistent = true;
+        Reference type;
+    };
+    std::map<std::pair<std::uint32_t, std::uint64_t>, HandlerCatchEvidence> handler_catch_evidence;
+    if (code && metadata) for (const auto &handler : code->exception_table) {
+        const auto target_address = Address{code->begin.space, code->begin.offset + handler.handler_pc};
+        if (!address_positions.contains({target_address.space.value, target_address.offset})) continue;
+        Reference caught;
+        if (!handler.catch_type) {
+            caught = reference_class("java/lang/Throwable");
+        } else {
+            auto name = cp_class_name(*metadata, handler.catch_type);
+            if (!name || name.value().empty() || name.value().starts_with("["))
+                return no("exception handler has an invalid catch class");
+            caught = reference_class(name.value());
+        }
+        auto &evidence = handler_catch_evidence[{target_address.space.value, target_address.offset}];
+        if (!evidence.seen) {
+            evidence.seen = true;
+            evidence.type = std::move(caught);
+        } else if (evidence.type != caught) {
+            evidence.consistent = false;
+            evidence.type.reset();
+        }
+    }
     const auto verifier_value_type = [](JvmVerificationKind kind) -> std::optional<ValueType> {
         switch (kind) {
         case JvmVerificationKind::integer: return int32();
@@ -731,10 +790,15 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
     reference_entries[*entry] = initial;
     work.push_back(*entry);
     for (std::size_t bi = 0; bi < count; ++bi) if (handler_entries[bi]) {
-        // Exception-local merges and catch assignability need a verifier. Do
-        // not seed them from a frame whose incoming values we cannot prove.
+        // The handler stack value has the catch type only when every ordered
+        // table clause reaching this target agrees exactly. A mixed-type
+        // handler needs hierarchy-aware common-supertype computation.
         ReferenceState handler;
-        handler.stack.resize(1);
+        const auto evidence = handler_catch_evidence.find({sources[bi]->begin.space.value,
+                                                           sources[bi]->begin.offset});
+        if (evidence != handler_catch_evidence.end() && evidence->second.consistent)
+            handler.stack.push_back(evidence->second.type);
+        else handler.stack.emplace_back();
         reference_entries[bi] = std::move(handler);
         work.push_back(bi);
     }

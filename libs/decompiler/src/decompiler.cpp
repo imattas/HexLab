@@ -4400,18 +4400,34 @@ std::string format_pseudocode(const LiftedFunction &function) {
             }, instruction.statement);
             out << " // 0x" << std::hex << instruction.origin.address.offset << std::dec << '\n';
         }
+        std::set<std::pair<std::uint32_t, std::uint64_t>> emitted_exception_targets;
         for (const auto &edge : block.successors) {
             if (edge.kind != BlockEdgeKind::exception) continue;
-            out << "    exceptional_successor ";
-            if (edge.target) out << address_label(*edge.target); else out << "unresolved";
-            auto handler = std::find_if(block.exception_handlers.begin(), block.exception_handlers.end(),
-                [&](const auto &candidate) { return edge.target && candidate.target == *edge.target; });
-            if (handler != block.exception_handlers.end()) {
-                if (handler->catch_all) out << " catch_all";
-                else if (handler->catch_type) out << " catch " << *handler->catch_type;
-                else out << " catch <opaque>";
+            if (edge.target && !emitted_exception_targets.emplace(edge.target->space.value, edge.target->offset).second)
+                continue;
+            const auto emit_handler = [&](const LiftedBlock::ExceptionHandlerDispatch *handler) {
+                out << "    exceptional_successor ";
+                if (edge.target) out << address_label(*edge.target); else out << "unresolved";
+                if (handler) {
+                    if (handler->catch_all) out << " catch_all";
+                    else if (handler->catch_type) out << " catch " << *handler->catch_type;
+                    else out << " catch <opaque>";
+                    if (!handler->protected_throw_sites.empty()) {
+                        out << " from ";
+                        for (std::size_t i = 0; i < handler->protected_throw_sites.size(); ++i) {
+                            if (i) out << ", ";
+                            out << address_label(handler->protected_throw_sites[i]);
+                        }
+                    }
+                }
+                out << ";\n";
+            };
+            bool described = false;
+            for (const auto &handler : block.exception_handlers) if (edge.target && handler.target == *edge.target) {
+                emit_handler(&handler);
+                described = true;
             }
-            out << ";\n";
+            if (!described) emit_handler(nullptr);
         }
     }
     out << "}\n";
