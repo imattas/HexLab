@@ -190,6 +190,11 @@ struct LiftedBlock {
         Address target{{0}, 0};
         std::optional<std::string> catch_type;
         bool catch_all = false;
+        // Decoded instructions in this block whose exception-table coverage
+        // routes to this handler clause. The CFG edge is block-level, while
+        // this preserves the bytecode-level source sites without pretending
+        // their local states are interchangeable.
+        std::vector<Address> protected_throw_sites;
     };
     std::vector<ExceptionHandlerDispatch> exception_handlers;
     struct PhiInput { BlockId predecessor; std::uint32_t version = 0; };
