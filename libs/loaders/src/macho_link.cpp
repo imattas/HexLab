@@ -6,6 +6,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <tuple>
 
 namespace hexlab {
 namespace {
@@ -84,9 +85,15 @@ std::uint32_t apply_arm64_relocation(std::uint8_t type, std::uint32_t instructio
         return (instruction & 0x9f00001fu) | (static_cast<std::uint32_t>(pages & 3) << 29) |
                (static_cast<std::uint32_t>((pages >> 2) & 0x7ffff) << 5);
     }
-    require(type == 4, "Unsupported ARM64 Mach-O relocation type " + std::to_string(type), ErrorCode::unsupported);
+    require(type == 4 || type == 6,
+            "Unsupported ARM64 Mach-O relocation type " + std::to_string(type), ErrorCode::unsupported);
     unsigned scale = 0;
-    if ((instruction & 0x7fc00000u) == 0x11000000u) {
+    if (type == 6) {
+        require((instruction & 0xffc00000u) == 0xf9400000u &&
+                    (instruction & 0x003ffc00u) == 0,
+                "ARM64 GOT_LOAD_PAGEOFF12 requires LDR X with a zero immediate", ErrorCode::unsupported);
+        scale = 3;
+    } else if ((instruction & 0x7fc00000u) == 0x11000000u) {
         require((instruction & (1u << 22)) == 0 && (instruction & 0x003ffc00u) == 0,
                 "ARM64 PAGEOFF12 ADD must have a zero, unshifted immediate", ErrorCode::unsupported);
         scale = 0;
@@ -109,7 +116,18 @@ std::int64_t difference(std::uint64_t target, std::uint64_t place) {
             ErrorCode::unsupported);
     return static_cast<std::int64_t>(target) - static_cast<std::int64_t>(place);
 }
-struct Relocation { std::size_t object = 0; std::uint32_t source_section = 0; MachORelocation row; };
+struct Relocation {
+    std::size_t object = 0;
+    std::uint32_t source_section = 0;
+    MachORelocation row;
+    std::optional<std::size_t> got_entry;
+};
+struct GotEntry {
+    std::size_t object = 0;
+    std::uint32_t section = 0;
+    std::uint64_t value = 0, output_offset = 0;
+    std::int64_t addend = 0;
+};
 struct ReadOnlyContribution {
     std::uint32_t source_section = 0;
     std::uint64_t alignment = 1, output_offset = 0;
@@ -392,9 +410,10 @@ std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entr
                 } else {
                     require(row.length == 2 && row.field_size == 4,
                             "ARM64 instruction relocation must address a 32-bit instruction", ErrorCode::unsupported);
-                    require((row.type == 2 || row.type == 3) == row.pc_relative,
+                    require((row.type == 2 || row.type == 3 || row.type == 5 || row.type == 7) == row.pc_relative,
                             "ARM64 relocation has incompatible PC-relative flag", ErrorCode::unsupported);
-                    require(row.type == 2 || row.type == 3 || row.type == 4,
+                    require(row.type == 2 || row.type == 3 || row.type == 4 ||
+                                row.type == 5 || row.type == 6 || row.type == 7,
                             "Unsupported ARM64 Mach-O relocation type " + std::to_string(row.type), ErrorCode::unsupported);
                 }
             } else {
@@ -417,11 +436,105 @@ std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entr
                 require(row.pair && *row.pair < metadata.relocations.size(),
                         "ARM64 ADDEND relocation has no paired primary record");
                 const auto &primary = metadata.relocations[static_cast<std::size_t>(*row.pair)];
-                require(primary.table == row.table && primary.type >= 3 && primary.type <= 4 &&
+                require(primary.table == row.table && primary.type >= 3 && primary.type <= 6 &&
                             !primary.auxiliary && primary.offset == row.offset,
-                        "ARM64 ADDEND must pair with PAGE21 or PAGEOFF12 at the same offset", ErrorCode::unsupported);
+                        "ARM64 ADDEND must pair with PAGE21/PAGEOFF12 or GOT_LOAD_PAGE21/GOT_LOAD_PAGEOFF12 at the same offset",
+                        ErrorCode::unsupported);
             }
         }
+    }
+    std::vector<GotEntry> got_entries;
+    std::map<std::tuple<std::size_t, std::uint32_t, std::uint64_t, std::int64_t>, std::size_t> got_indices;
+    const auto got_symbol_target = [&](std::size_t object_index, const MachORelocation &row) {
+        require(object_index < objects.size() && row.table < objects[object_index].metadata.relocation_tables.size(),
+                "Mach-O GOT relocation has an invalid table", ErrorCode::malformed);
+        const auto &object = objects[object_index];
+        const auto &table = object.metadata.relocation_tables[row.table];
+        require(row.external && table.symbol_table.has_value(),
+                "ARM64 GOT relocation must reference an external symbol", ErrorCode::unsupported);
+        const auto symbol = std::find_if(object.metadata.symbols.begin(), object.metadata.symbols.end(), [&](const auto &s) {
+            return s.table_command == *table.symbol_table && s.index == row.symbol_number;
+        });
+        require(symbol != object.metadata.symbols.end(), "ARM64 GOT relocation references an unknown symbol", ErrorCode::malformed);
+        const auto supported = [&](const Object &target_object, const MachOSymbol &target_symbol) {
+            return target_symbol.state == MachOSymbolState::defined &&
+                (target_symbol.section == target_object.text_section || read_only_contribution(target_object, target_symbol.section) ||
+                 (target_object.data_section && target_symbol.section == target_object.data_section) ||
+                 (target_object.bss_section && target_symbol.section == target_object.bss_section));
+        };
+        const auto definition = definitions.find(symbol->name);
+        require(definition != definitions.end() && supported(objects[definition->second.object], *definition->second.symbol),
+                "ARM64 GOT symbol is unresolved or outside supported output sections: " + symbol->name,
+                ErrorCode::unsupported);
+        return std::tuple{definition->second.object, definition->second.symbol->section,
+                          definition->second.symbol->value};
+    };
+    for (auto &relocation : relocations) {
+        const auto type = relocation.row.type;
+        if (!arm64 || (type != 5 && type != 6 && type != 7)) continue;
+        std::int64_t addend = 0;
+        if (type == 5 || type == 6) {
+            if (relocation.row.pair) {
+                require(*relocation.row.pair < objects[relocation.object].metadata.relocations.size(),
+                        "ARM64 GOT relocation has an invalid ADDEND pair", ErrorCode::malformed);
+                const auto &companion = objects[relocation.object].metadata.relocations[
+                    static_cast<std::size_t>(*relocation.row.pair)];
+                if (companion.type == 10 && companion.auxiliary)
+                    addend = sign_extend_bits(companion.symbol_number, 24);
+            }
+        }
+        const auto [target_object, target_section, target_value] = got_symbol_target(relocation.object, relocation.row);
+        const auto key = std::tuple{target_object, target_section, target_value, addend};
+        auto [found, inserted] = got_indices.emplace(key, got_entries.size());
+        if (inserted) {
+            require(got_entries.size() < limits.max_relocations,
+                    "ARM64 synthesized GOT exceeds relocation limit", ErrorCode::resource_limit);
+            got_entries.push_back({target_object, target_section, target_value, 0, addend});
+        }
+        relocation.got_entry = found->second;
+    }
+    if (arm64) {
+        std::map<std::tuple<std::size_t, std::uint32_t, std::uint32_t>, const Relocation *> got_pages;
+        for (const auto &relocation : relocations) {
+            if (relocation.row.type != 5) continue;
+            const auto key = std::tuple{relocation.object, relocation.source_section, relocation.row.offset};
+            require(got_pages.emplace(key, &relocation).second,
+                    "ARM64 GOT_LOAD_PAGE21 relocation is ambiguous at one instruction", ErrorCode::unsupported);
+        }
+        for (const auto &relocation : relocations) {
+            if (relocation.row.type != 6) continue;
+            const auto &object = objects[relocation.object];
+            require(relocation.row.offset >= 4, "ARM64 GOT_LOAD_PAGEOFF12 has no preceding PAGE21",
+                    ErrorCode::unsupported);
+            const auto page_key = std::tuple{relocation.object, relocation.source_section,
+                                             relocation.row.offset - 4};
+            const auto page = got_pages.find(page_key);
+            require(page != got_pages.end() && page->second->got_entry == relocation.got_entry,
+                    "ARM64 GOT_LOAD_PAGEOFF12 must immediately follow a PAGE21 relocation to the same symbol/addend",
+                    ErrorCode::unsupported);
+            auto page_bytes = object.storage->read_at(*page->second->row.file_place, 4);
+            auto load_bytes = object.storage->read_at(*relocation.row.file_place, 4);
+            if (!page_bytes) throw Failure{page_bytes.error()};
+            if (!load_bytes) throw Failure{load_bytes.error()};
+            const auto instruction = [](std::span<const std::byte> bytes) {
+                std::uint32_t value = 0;
+                for (std::size_t i = 0; i < 4; ++i)
+                    value |= std::to_integer<std::uint32_t>(bytes[i]) << (i * 8);
+                return value;
+            };
+            require((instruction(page_bytes.value().bytes) & 31u) ==
+                        ((instruction(load_bytes.value().bytes) >> 5) & 31u),
+                    "ARM64 GOT_LOAD_PAGEOFF12 base register does not match adjacent PAGE21 destination",
+                    ErrorCode::unsupported);
+        }
+    }
+    for (auto &got : got_entries) {
+        const auto offset = align_to(const_size, 8);
+        require(offset <= limits.max_output_bytes && 8 <= limits.max_output_bytes - offset,
+                "ARM64 synthesized GOT exceeds output limit", ErrorCode::resource_limit);
+        got.output_offset = offset;
+        const_size = offset + 8;
+        const_alignment = std::max<std::uint64_t>(const_alignment, 8);
     }
     require(code_size <= limits.max_output_bytes, "Mach-O merged text exceeds output limit", ErrorCode::resource_limit);
     require(code_size <= SIZE_MAX, "Mach-O merged text exceeds addressable memory", ErrorCode::resource_limit);
@@ -542,6 +655,12 @@ std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entr
         }
         throw Failure{{ErrorCode::unsupported, "Mach-O symbol or relocation target is outside supported output sections"}};
     };
+    for (const auto &got : got_entries) {
+        const auto value = add_signed(linked_address(got.object, got.section, got.value), got.addend);
+        require(value <= max_user_address, "ARM64 GOT symbol plus addend exceeds supported user address range",
+                ErrorCode::unsupported);
+        put(constants, static_cast<std::size_t>(got.output_offset), value, 8);
+    }
     const auto relocation_target = [&](std::size_t object_index, const MachORelocation &symbol_row) {
         require(object_index < objects.size() && symbol_row.table < objects[object_index].metadata.relocation_tables.size(),
                 "Mach-O relocation symbol has an invalid table", ErrorCode::malformed);
@@ -617,6 +736,29 @@ std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entr
                 put(source_bytes, field_at, static_cast<std::uint32_t>(static_cast<std::int32_t>(value)), 4);
             } else {
                 put(source_bytes, field_at, std::bit_cast<std::uint64_t>(value), 8);
+            }
+            continue;
+        }
+        if (arm64 && (row.type == 5 || row.type == 6 || row.type == 7)) {
+            require(reloc.got_entry && *reloc.got_entry < got_entries.size(),
+                    "ARM64 GOT relocation has no synthesized slot", ErrorCode::malformed);
+            const auto got_address = const_address + got_entries[*reloc.got_entry].output_offset;
+            if (row.type == 5 || row.type == 6) {
+                require(relocation_bits <= UINT32_MAX,
+                        "ARM64 GOT instruction relocation field exceeds 32 bits", ErrorCode::malformed);
+                const auto relocated = apply_arm64_relocation(row.type == 5 ? 3 : 6,
+                    static_cast<std::uint32_t>(relocation_bits), got_address, place, std::nullopt);
+                put(source_bytes, field_at, relocated, 4);
+            } else {
+                const auto implicit_addend = sign_extend(relocation_bits, 4);
+                auto value = difference(got_address, place);
+                require((implicit_addend >= 0 && value <= INT64_MAX - implicit_addend) ||
+                            (implicit_addend < 0 && value >= INT64_MIN - implicit_addend),
+                        "ARM64 POINTER_TO_GOT relocation overflows", ErrorCode::unsupported);
+                value += implicit_addend;
+                require(value >= INT32_MIN && value <= INT32_MAX,
+                        "ARM64 POINTER_TO_GOT relocation is out of 32-bit PC-relative range", ErrorCode::unsupported);
+                put(source_bytes, field_at, static_cast<std::uint32_t>(static_cast<std::int32_t>(value)), 4);
             }
             continue;
         }

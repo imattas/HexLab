@@ -42,6 +42,7 @@ MachORelocationKind kind(std::uint32_t cpu, std::uint8_t type, bool pc) {
         if (type == 0) return K::absolute;
         if (type == 1) return K::subtractor;
         if (type == 2) return K::branch;
+        if (type >= 5 && type <= 7) return K::got;
         if (type == 10) return K::addend;
     } else if ((cpu == 12 || cpu == 18) && type == 1) {
         return K::pair; // Known payload layout; foreign ISA formulas remain unsupported.

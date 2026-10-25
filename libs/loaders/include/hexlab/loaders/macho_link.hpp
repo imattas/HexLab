@@ -19,7 +19,8 @@ struct MachOLinkLimits {
 // __DATA_CONST,__const contributions into the output __const mapping. Supported x86-64 relocations may be
 // stored in file-backed sections and target any merged section, including paired
 // SUBTRACTOR/UNSIGNED records. ARM64 accepts UNSIGNED, SUBTRACTOR/UNSIGNED,
-// BRANCH26, PAGE21, PAGEOFF12, and supported PAGE21/PAGEOFF12 ADDEND companions.
+// BRANCH26, PAGE21, PAGEOFF12, locally resolved GOT_LOAD_PAGE21/
+// GOT_LOAD_PAGEOFF12/POINTER_TO_GOT, and supported ADDEND companions.
 // Dynamic linking and unsupported relocation families are rejected.
 HEXLAB_LOADERS_EXPORT Result<std::vector<std::byte>> link_macho64_executable(
     std::span<const std::shared_ptr<const ByteStorage>>, std::string_view entry_symbol = "_start",
