@@ -1,5 +1,6 @@
 #include "hexlab/decompiler/type_recovery.hpp"
 #include "hexlab/analysis/abi.hpp"
+#include "hexlab/types/layout.hpp"
 #include "expression_type_context.hpp"
 
 #include <algorithm>
@@ -689,6 +690,150 @@ std::vector<AbiArgumentSlot> aapcs64_prototype_slots(const types::TypePtr &proto
     }
     return slots;
 }
+
+std::vector<AbiArgumentSlot> sysv64_prototype_slots(const types::TypePtr &prototype) {
+    std::vector<AbiArgumentSlot> slots;
+    if (!prototype || prototype->kind() != types::Kind::function || prototype->parameters().size() > 256)
+        return slots;
+    const auto classified = classify_abi_signature(CallingConvention::sysv_x86_64, *prototype);
+    if (classified.arguments.size() != prototype->parameters().size()) return slots;
+    for (std::size_t parameter_index = 0; parameter_index < classified.arguments.size(); ++parameter_index) {
+        const auto &placement = classified.arguments[parameter_index];
+        if (!placement.supported || placement.locations.empty()) {
+            slots.push_back({AbiValueClass::integer, {}, {},
+                static_cast<std::uint16_t>(parameter_index), {}, {}, {}, false});
+            continue;
+        }
+        const auto parameter_type = unqualified_type(prototype->parameters()[parameter_index].type);
+        const bool aggregate = parameter_type &&
+            (parameter_type->kind() == types::Kind::structure || parameter_type->kind() == types::Kind::union_type);
+        for (std::size_t component = 0; component < placement.locations.size(); ++component) {
+            const auto &location = placement.locations[component];
+            std::optional<RegisterOperand> reg;
+            if (location.kind == AbiLocationKind::register_) reg = classified_register(location.register_name);
+            if ((location.kind == AbiLocationKind::register_ && !reg) ||
+                (location.kind == AbiLocationKind::stack &&
+                 location.stack_offset > static_cast<std::uint64_t>(INT64_MAX))) {
+                while (!slots.empty() && slots.back().parameter_index == parameter_index)
+                    slots.pop_back();
+                slots.push_back({AbiValueClass::integer, {}, {},
+                    static_cast<std::uint16_t>(parameter_index), {}, {}, {}, false});
+                break;
+            }
+            const auto value_class = parameter_type && parameter_type->kind() == types::Kind::vector
+                ? AbiValueClass::vector
+                : parameter_type && parameter_type->kind() == types::Kind::floating
+                    ? AbiValueClass::floating
+                    : (reg && reg->bank == RegisterBank::xmm) ? AbiValueClass::floating : AbiValueClass::integer;
+            std::optional<std::uint8_t> offset, size;
+            std::optional<std::uint8_t> component_index;
+            if (aggregate) {
+                if (location.value_offset > UINT8_MAX || location.size > UINT8_MAX) continue;
+                offset = static_cast<std::uint8_t>(location.value_offset);
+                size = static_cast<std::uint8_t>(location.size);
+                if (component <= UINT8_MAX) component_index = static_cast<std::uint8_t>(component);
+            }
+            slots.push_back({value_class, reg,
+                location.kind == AbiLocationKind::stack &&
+                    location.stack_offset <= static_cast<std::uint64_t>(INT64_MAX)
+                    ? std::optional<std::int64_t>{static_cast<std::int64_t>(location.stack_offset)}
+                    : std::nullopt,
+                static_cast<std::uint16_t>(parameter_index), component_index, offset, size});
+        }
+    }
+    return slots;
+}
+
+std::optional<types::TypePtr> sysv64_component_type(const types::TypePtr &input,
+    std::uint8_t component_offset, std::uint8_t component_size, AbiValueClass value_class) {
+    const auto root = unqualified_type(input);
+    if (!root || component_size == 0 || component_offset > root->size().value_or(0) ||
+        component_size > root->size().value_or(0) - component_offset)
+        return {};
+    if (value_class == AbiValueClass::vector && root->kind() == types::Kind::vector &&
+        component_offset == 0 && root->size() == component_size)
+        return root;
+
+    struct Leaf { std::uint64_t offset; types::TypePtr type; };
+    std::vector<Leaf> leaves;
+    std::size_t work = 0;
+    bool valid = true;
+    const auto collect = [&](const types::TypePtr &candidate, std::uint64_t base, unsigned depth,
+                             auto &&self) -> void {
+        if (!valid || !candidate || depth > 8 || work++ >= 256) { valid = false; return; }
+        const auto type = unqualified_type(candidate);
+        if (!type || !type->size() || !*type->size()) { valid = false; return; }
+        if (type->kind() == types::Kind::floating || type->kind() == types::Kind::vector) {
+            leaves.push_back({base, type});
+            return;
+        }
+        if (type->kind() == types::Kind::array) {
+            if (!type->element() || !type->count() || type->count() > 32) { valid = false; return; }
+            const auto element = unqualified_type(type->element());
+            if (!element || !element->size() || !*element->size() ||
+                type->count() > *type->size() / *element->size() ||
+                type->count() * *element->size() != *type->size()) { valid = false; return; }
+            for (std::uint64_t index = 0; index < type->count(); ++index)
+                self(type->element(), base + index * *element->size(), depth + 1, self);
+            return;
+        }
+        if (type->kind() == types::Kind::structure) {
+            const auto layout = types::layout(*type, types::Abi::x86_64);
+            if (!layout || type->members().size() != layout.value().members.size()) { valid = false; return; }
+            for (std::size_t index = 0; index < type->members().size(); ++index) {
+                const auto &member = type->members()[index];
+                if (!member.has_fixed_offset() || member.bit_width || member.bit_offset || !member.type) {
+                    valid = false;
+                    return;
+                }
+                self(member.type, base + layout.value().members[index].offset, depth + 1, self);
+            }
+            return;
+        }
+        valid = false;
+    };
+    collect(root, 0, 0, collect);
+    if (!valid) return {};
+    const auto begin = static_cast<std::uint64_t>(component_offset);
+    const auto end = begin + component_size;
+    std::vector<Leaf> members;
+    for (const auto &leaf : leaves) {
+        if (!leaf.type || !leaf.type->size()) return {};
+        const auto leaf_end = leaf.offset + *leaf.type->size();
+        if (leaf_end <= begin || leaf.offset >= end) continue;
+        if (leaf.offset < begin || leaf_end > end) return {};
+        members.push_back(leaf);
+    }
+    if (members.empty()) return {};
+    std::sort(members.begin(), members.end(), [](const Leaf &left, const Leaf &right) {
+        return left.offset < right.offset;
+    });
+    if (value_class == AbiValueClass::integer) {
+        std::uint64_t cursor = begin;
+        for (const auto &member : members) {
+            if (member.offset != cursor || *member.type->size() > end - cursor) return {};
+            cursor += *member.type->size();
+        }
+        if (cursor != end) return {};
+        auto value = types::Type::integer("sysv_aggregate_piece", component_size, 1, false);
+        return value ? std::optional<types::TypePtr>{value.value()} : std::nullopt;
+    }
+    if (members.size() == 1 && members.front().offset == begin &&
+        *members.front().type->size() == component_size)
+        return members.front().type;
+    const auto lane = members.front().type;
+    if (lane->kind() != types::Kind::floating || !lane->size() || !*lane->size()) return {};
+    std::uint64_t cursor = begin;
+    for (const auto &member : members) {
+        if (member.type->kind() != types::Kind::floating || member.type->size() != lane->size() ||
+            member.offset != cursor || *member.type->size() > end - cursor)
+            return {};
+        cursor += *member.type->size();
+    }
+    if (cursor != end) return {};
+    const auto vector = types::Type::vector(lane, members.size(), component_size);
+    return vector ? std::optional<types::TypePtr>{vector.value()} : std::nullopt;
+}
 } // namespace
 
 AbiDescription x86_64_windows_abi() {
@@ -1119,6 +1264,11 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 for (std::size_t i = 0; i < parameters.size(); ++i) {
                     const auto &placement = classified.arguments[i];
                     const auto &parameter_type = parameters[i].type;
+                    const auto unqualified_parameter = unqualified_type(parameter_type);
+                    if (abi.name == "x86-64 System V" && unqualified_parameter &&
+                        (unqualified_parameter->kind() == types::Kind::structure ||
+                         unqualified_parameter->kind() == types::Kind::union_type))
+                        continue;
                     // A single, proven placement can constrain the matching
                     // incoming value. Split aggregates require component type
                     // recovery and are intentionally left to the existing
@@ -1142,7 +1292,25 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 }
             }
         }
-        if (abi.name == "AArch64 AAPCS64") {
+        if (abi.name == "x86-64 System V") {
+            for (const auto &slot : sysv64_prototype_slots(prototype)) {
+                if (!slot.parameter_index || *slot.parameter_index >= parameters.size()) continue;
+                const auto &parameter_type = parameters[*slot.parameter_index].type;
+                if (!parameter_type) continue;
+                if (slot.reg) {
+                    auto component_type = parameter_type;
+                    if (slot.component_offset && slot.component_size) {
+                        const auto projected = sysv64_component_type(parameter_type, *slot.component_offset,
+                                                                     *slot.component_size, slot.value_class);
+                        if (!projected) continue;
+                        component_type = *projected;
+                    }
+                    constrain_register(*slot.reg, component_type);
+                } else if (slot.stack_offset) {
+                    constrain_stack_slot(*slot.stack_offset, parameter_type);
+                }
+            }
+        } else if (abi.name == "AArch64 AAPCS64") {
             const auto slots = aapcs64_prototype_slots(prototype);
             std::vector<bool> mapped(parameters.size(), false);
             for (const auto &slot : slots) {
@@ -1792,6 +1960,13 @@ static Result<TypeRecoveryResult> recover_types_impl(
             if (abi.name == "AArch64 AAPCS64") {
                 for (const auto &slot : aapcs64_prototype_slots(prototype))
                     if (slot.reg && *slot.reg == fact.reg && slot.parameter_index)
+                        return static_cast<std::size_t>(*slot.parameter_index);
+            } else if (abi.name == "x86-64 System V") {
+                for (const auto &slot : sysv64_prototype_slots(prototype))
+                    if (slot.reg && slot.reg->bank == fact.reg.bank &&
+                        slot.reg->index == fact.reg.index && slot.reg->high_byte == fact.reg.high_byte &&
+                        (slot.reg->bank == RegisterBank::gpr || slot.reg->width == fact.reg.width) &&
+                        slot.parameter_index)
                         return static_cast<std::size_t>(*slot.parameter_index);
             } else if (abi.shared_integer_float_argument_positions) {
                 for (std::size_t position = 0; position < parameters.size(); ++position) {
@@ -2964,6 +3139,9 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         if (abi.name == "AArch64 AAPCS64" && prototype && prototype->kind() == types::Kind::function) {
             return aapcs64_prototype_slots(prototype);
         }
+        if (abi.name == "x86-64 System V" && prototype && prototype->kind() == types::Kind::function) {
+            return sysv64_prototype_slots(prototype);
+        }
         if (abi.name == "MIPS64 Linux N64 hard-float scalar profile" &&
             prototype && prototype->kind() == types::Kind::function) {
             std::vector<AbiArgumentSlot> slots;
@@ -3003,7 +3181,10 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         for (std::size_t i = 0; i < lhs.size(); ++i)
             if (lhs[i].value_class != rhs[i].value_class || lhs[i].reg != rhs[i].reg ||
                 lhs[i].stack_offset != rhs[i].stack_offset || lhs[i].parameter_index != rhs[i].parameter_index ||
-                lhs[i].component_index != rhs[i].component_index) return false;
+                lhs[i].component_index != rhs[i].component_index ||
+                lhs[i].component_offset != rhs[i].component_offset ||
+                lhs[i].component_size != rhs[i].component_size ||
+                lhs[i].supported != rhs[i].supported) return false;
         return true;
     };
     const auto same_register_file = [&](const AbiDescription &left, const AbiDescription &right) {
@@ -3048,27 +3229,21 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         if (!aggregate || !aggregate->size() || (*aggregate->size() == 0) ||
             (aggregate->kind() != types::Kind::structure && aggregate->kind() != types::Kind::array))
             return {};
-        if (abi.name != "x86-64 Windows" && abi.name != "x86-64 System V" &&
-            abi.name != "AArch64 AAPCS64") return {};
+        if (abi.name == "x86-64 System V") {
+            const auto signature = types::Type::function(type, {}, false);
+            if (!signature) return {};
+            const auto classified = classify_abi_signature(CallingConvention::sysv_x86_64, *signature.value());
+            if (!classified.result.supported || classified.result.indirect ||
+                classified.result.locations.size() != 1 ||
+                classified.result.locations.front().role != AbiLocationRole::value)
+                return {};
+            return classified_register(classified.result.locations.front().register_name);
+        }
+        if (abi.name != "x86-64 Windows" && abi.name != "AArch64 AAPCS64") return {};
         if (abi.name == "AArch64 AAPCS64") {
             const auto hfa = hfa_float_elements(aggregate);
             if (hfa) return hfa->size() == 1 ? abi.floating_return_register
                                              : std::optional<RegisterOperand>{};
-        }
-        // The SysV AMD64 ABI returns a one-eightbyte structure containing a
-        // single float/double in XMM0. Keep this exact case separate from the
-        // integer-class aggregate path below; mixed or multi-eightbyte SSE
-        // aggregates need the full ABI eightbyte classifier and multiple
-        // result-register versions in the IR.
-        if (abi.name == "x86-64 System V" && abi.floating_return_register &&
-            aggregate->kind() == types::Kind::structure && aggregate->size() &&
-            (*aggregate->size() == 4 || *aggregate->size() == 8) && aggregate->members().size() == 1) {
-            const auto &member = aggregate->members().front();
-            const auto member_type = unqualified_type(member.type);
-            if (member.has_fixed_offset() && member.offset == 0 && !member.bit_width && !member.bit_offset &&
-                member_type && member_type->kind() == types::Kind::floating && member_type->size() &&
-                *member_type->size() == *aggregate->size())
-                return abi.floating_return_register;
         }
         if (!result || !result->width || *aggregate->size() > result->width / 8) return {};
 
@@ -3679,6 +3854,7 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                 if (!target_slots || !target_abi) continue;
                 for (std::size_t slot_index = 0; slot_index < target_slots->size(); ++slot_index) {
                     const auto &argument_slot = (*target_slots)[slot_index];
+                    if (!argument_slot.supported) continue;
                     const auto parameter_index = argument_slot.parameter_index.value_or(static_cast<std::uint16_t>(slot_index));
                     if (signature && parameter_index >= signature->parameters().size()) continue;
                     if (!signature && argument_slot.component_index) continue;
@@ -3713,12 +3889,22 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                     if (known_input_keys.insert(actual_key).second) known_inputs.push_back(*actual);
                     if (!signature) continue;
                     auto parameter_type = signature->parameters()[parameter_index].type;
-                    if (argument_slot.component_index) {
+                    if (argument_slot.component_offset && argument_slot.component_size) {
+                        const auto projected_component = sysv64_component_type(parameter_type,
+                            *argument_slot.component_offset, *argument_slot.component_size,
+                            argument_slot.value_class);
+                        if (!projected_component) continue;
+                        parameter_type = *projected_component;
+                    } else if (argument_slot.component_index) {
                         const auto components = hfa_float_elements(parameter_type);
                         if (!components || *argument_slot.component_index >= components->size()) continue;
                         parameter_type = (*components)[*argument_slot.component_index];
                     }
-                    if (!matches_slot_class(argument_slot.value_class, unqualified_type(parameter_type))) continue;
+                    const auto classified_component = unqualified_type(parameter_type);
+                    const auto slot_class = argument_slot.component_offset && classified_component &&
+                        classified_component->kind() == types::Kind::vector
+                        ? AbiValueClass::vector : argument_slot.value_class;
+                    if (!matches_slot_class(slot_class, classified_component)) continue;
                     if (!typed_argument_candidates.contains(actual_key) && typed_argument_candidates.size() >= 4096) {
                         typed_argument_budget_exhausted = true;
                         continue;

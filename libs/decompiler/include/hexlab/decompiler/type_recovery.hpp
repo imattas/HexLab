@@ -19,11 +19,18 @@ struct AbiArgumentSlot {
     // Null means register slot.
     std::optional<std::int64_t> stack_offset;
     // When one source parameter occupies multiple physical registers (for
-    // example an AAPCS64 HFA), each slot points back to the same parameter.
-    // `component_index` identifies the homogeneous member carried by this
-    // register; ordinary one-register slots leave both fields unset.
+    // example an AAPCS64 HFA or a split SysV AMD64 aggregate), each slot points
+    // back to the same parameter. `component_index` identifies the physical
+    // component; ordinary one-register slots leave it unset.
     std::optional<std::uint16_t> parameter_index;
     std::optional<std::uint8_t> component_index;
+    // Byte range carried by this register when the ABI splits one source
+    // aggregate. Unset for ordinary scalar slots and whole-parameter HFA slots.
+    std::optional<std::uint8_t> component_offset;
+    std::optional<std::uint8_t> component_size;
+    // False placeholders preserve declared parameter positions when the
+    // classifier cannot establish a location.
+    bool supported = true;
 };
 
 // ABI positions are explicit and ordered. Stack locations are offsets from
