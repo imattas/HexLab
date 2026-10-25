@@ -681,6 +681,7 @@ public:
     Status continue_event(std::uint64_t sequence, ContinueStatus disposition) override {
         WaitScope scope(*this);
         if (!pending_ || *pending_ != sequence) return Error{ErrorCode::invalid_argument, "event sequence does not match pending event"};
+        auto rollback = recover_resume_rollback(); if (!rollback) return rollback;
         if (exited_) { clear(); return std::monostate{}; }
         auto configured = ensure_hardware_breakpoints_configured(); if (!configured) return configured;
         auto safe = require_all_threads_stopped(); if (!safe) return safe;
@@ -702,6 +703,7 @@ public:
     Status continue_thread_event(std::uint64_t sequence, ThreadId thread, ContinueStatus disposition) override {
         WaitScope scope(*this);
         if (!pending_ || *pending_ != sequence) return Error{ErrorCode::invalid_argument, "event sequence does not match pending event"};
+        auto rollback = recover_resume_rollback(); if (!rollback) return rollback;
         if (thread != static_cast<ThreadId>(pending_thread_) || !tracked_.contains(pending_thread_))
             return Error{ErrorCode::invalid_argument, "selected thread does not own the pending stop event"};
         if (exited_) return Error{ErrorCode::busy, "the process exit event cannot resume a thread"};
@@ -725,9 +727,15 @@ public:
         if (exited_) return Error{ErrorCode::busy, "the process exit event cannot resume a thread"};
         if (actions.empty() || actions.size() > max_inspection_threads)
             return Error{ErrorCode::invalid_argument, "thread resume schedule must contain 1 to 4096 actions"};
-        auto configured = ensure_hardware_breakpoints_configured(); if (!configured) return configured;
+        // ThreadResumeAction has no signal-delivery field. Do not silently
+        // discard a real signal stop when acknowledging it through a schedule.
+        if (pending_signal_ != 0)
+            return Error{ErrorCode::unsupported, "AArch64 thread schedules cannot deliver a pending signal; use signal-aware continue"};
+        auto rollback_state = recover_resume_rollback(); if (!rollback_state) return rollback_state;
         auto safe = require_all_threads_stopped(); if (!safe) return safe;
         const auto owner = pending_thread_;
+        if (owner <= 0 || !tracked_.contains(owner) || !stopped_.contains(owner))
+            return Error{ErrorCode::invalid_argument, "pending event owner is not a stopped thread owned by this session"};
         std::set<pid_t> selected;
         std::vector<const ThreadResumeAction*> runnable;
         for (const auto &action : actions) {
@@ -761,6 +769,7 @@ public:
                     return static_cast<pid_t>(action->thread) == step_thread_;
                 }))
                 return Error{ErrorCode::busy, "cannot continue an AArch64 thread while its single-step result is pending"};
+            auto configured = ensure_hardware_breakpoints_configured(); if (!configured) return configured;
 
             // Resume non-owner threads first and the event owner last. If any
             // ptrace request fails, stop every thread already resumed before
@@ -781,9 +790,13 @@ public:
             for (const auto tid : order) {
                 if (ptrace(PTRACE_CONT, tid, nullptr, nullptr) != 0) {
                     const auto error = sys_error("PTRACE_CONT scheduled AArch64 thread");
+                    rollback_threads_ = resumed;
                     auto rollback = stop_threads_for_rollback(resumed);
-                    if (!rollback)
+                    if (!rollback) {
+                        resume_blocked_ = true;
                         return Error{error.code, error.message + "; resume rollback failed: " + rollback.error().message};
+                    }
+                    rollback_threads_.clear();
                     return error;
                 }
                 stopped_.erase(tid);
@@ -802,6 +815,7 @@ public:
             return Error{ErrorCode::unsupported, "cannot preserve a pending software-breakpoint event while scheduling another thread"};
         if (pending_hardware_execute_ && tid != owner)
             return Error{ErrorCode::unsupported, "cannot step over an AArch64 hardware breakpoint on a different thread"};
+        auto configured = ensure_hardware_breakpoints_configured(); if (!configured) return configured;
         if (selected_action->kind == ThreadResumeKind::single_step) {
             if (pending_breakpoint_) {
                 auto stepped = begin_breakpoint_step(tid, *pending_breakpoint_); if (!stepped) return stepped;
@@ -827,6 +841,7 @@ public:
     Status single_step_event(std::uint64_t sequence, ContinueStatus disposition) override {
         WaitScope scope(*this);
         if (!pending_ || *pending_ != sequence) return Error{ErrorCode::invalid_argument, "event sequence does not match pending event"};
+        auto rollback = recover_resume_rollback(); if (!rollback) return rollback;
         auto configured = ensure_hardware_breakpoints_configured(); if (!configured) return configured;
         const auto tid = pending_thread_;
         const int signal = disposition == ContinueStatus::handled ? 0 : pending_signal_;
@@ -1772,12 +1787,26 @@ private:
             const int delivered = tid == event_thread ? signal : 0;
             if (ptrace(PTRACE_CONT, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(delivered))) != 0) {
                 const auto error = sys_error("PTRACE_CONT target thread");
+                rollback_threads_ = resumed;
                 auto rollback = stop_threads_for_rollback(resumed);
-                if (!rollback) return Error{error.code, error.message + "; resume rollback failed: " + rollback.error().message};
+                if (!rollback) {
+                    resume_blocked_ = true;
+                    return Error{error.code, error.message + "; resume rollback failed: " + rollback.error().message};
+                }
+                rollback_threads_.clear();
                 return error;
             }
             stopped_.erase(tid); resumed.push_back(tid);
         }
+        return std::monostate{};
+    }
+    Status recover_resume_rollback() {
+        if (!resume_blocked_) return std::monostate{};
+        auto stopped = stop_threads_for_rollback(rollback_threads_);
+        if (!stopped) return Error{stopped.error().code,
+            "resume rollback is still incomplete: " + stopped.error().message};
+        rollback_threads_.clear();
+        resume_blocked_ = false;
         return std::monostate{};
     }
     Status stop_threads_for_rollback(const std::vector<pid_t>& threads) {
@@ -1785,7 +1814,8 @@ private:
         for (const auto tid : threads) {
             if (stopped_.contains(tid) || interrupting_.contains(tid)) continue;
             if (ptrace(PTRACE_INTERRUPT, tid, nullptr, nullptr) == 0) interrupting_.insert(tid);
-            else if (errno != ESRCH) return sys_error("PTRACE_INTERRUPT during resume rollback");
+            else if (errno == ESRCH || errno == EIO) interrupting_.insert(tid);
+            else return sys_error("PTRACE_INTERRUPT during resume rollback");
         }
         for (const auto tid : threads) {
             if (stopped_.contains(tid)) continue;
@@ -1855,9 +1885,9 @@ private:
         }
         return std::monostate{};
     }
-    void clear() { initial_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; pid_ = 0; tracked_.clear(); stopped_.clear(); seized_.clear(); deferred_.clear(); interrupting_.clear(); hardware_unconfigured_threads_.clear(); hardware_configuration_error_.clear(); hardware_step_state_.reset(); pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_hardware_execute_address_ = 0; initial_ = false; exited_ = false; step_breakpoint_.reset(); step_thread_ = 0; step_pending_ = false; breakpoints_.clear(); originals_.clear(); extra_originals_.clear(); ids_.clear(); enabled_.clear(); hardware_breakpoints_.clear(); }
+    void clear() { initial_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; pid_ = 0; tracked_.clear(); stopped_.clear(); seized_.clear(); deferred_.clear(); interrupting_.clear(); rollback_threads_.clear(); resume_blocked_ = false; hardware_unconfigured_threads_.clear(); hardware_configuration_error_.clear(); hardware_step_state_.reset(); pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_hardware_execute_address_ = 0; initial_ = false; exited_ = false; step_breakpoint_.reset(); step_thread_ = 0; step_pending_ = false; breakpoints_.clear(); originals_.clear(); extra_originals_.clear(); ids_.clear(); enabled_.clear(); hardware_breakpoints_.clear(); }
     pid_t pid_ = 0, pending_thread_ = 0, step_thread_ = 0; int pending_signal_ = 0; bool initial_ = false, exited_ = false, step_pending_ = false; std::uint64_t seq_ = 0; BreakpointId next_id_ = 1; int last_signal_ = SIGTRAP;
-    std::set<pid_t> tracked_, stopped_, seized_, interrupting_; std::map<pid_t, int> deferred_; std::optional<std::uint64_t> pending_, pending_breakpoint_, step_breakpoint_;
+    std::set<pid_t> tracked_, stopped_, seized_, interrupting_; std::map<pid_t, int> deferred_; std::vector<pid_t> rollback_threads_; bool resume_blocked_ = false; std::optional<std::uint64_t> pending_, pending_breakpoint_, step_breakpoint_;
     std::map<std::uint64_t, std::byte> breakpoints_, originals_; std::map<std::uint64_t, std::array<std::byte, 3>> extra_originals_; std::map<BreakpointId, std::uint64_t> ids_; std::set<std::uint64_t> enabled_;
     std::vector<Aarch64HardwareBreakpoint> hardware_breakpoints_;
     std::set<pid_t> hardware_unconfigured_threads_;
