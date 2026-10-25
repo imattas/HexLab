@@ -18,3 +18,4 @@ CMakeUserPresets.json
 /build/
 /src/
 /3rdparty/
+/.build-*/
