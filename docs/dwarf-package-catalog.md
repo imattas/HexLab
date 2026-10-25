@@ -30,6 +30,14 @@ resolver never opens `DW_AT_dwo_name`, `DW_AT_comp_dir`, `.debug_sup` filenames,
 or package paths itself. This keeps untrusted DIE strings from becoming file
 access instructions.
 
+ELF import can combine its explicitly selected external, embedded, and
+checksum-verified supplementary DWP type indexes when signatures have one
+owner. This allows nested signature chains to cross packages while preserving
+the same shared request, byte, and cycle budget. If a signature appears in
+more than one candidate package, ELF import keeps its existing exact-membership
+precedence behavior and skips the cross-package catalog rather than choosing a
+duplicate definition by package order.
+
 The catalog does not change the supported DWARF forms. It resolves type-unit
 signature references only; unresolved non-type cross-unit references, missing
 or ambiguous package identities, compressed or relocated sections, and forms
