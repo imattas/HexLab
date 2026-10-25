@@ -121,6 +121,23 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata) {
                     out << '\n';
                     ++emitted;
                 }
+                for (std::size_t state = 0; state < info.unwind_map.size(); ++state) {
+                    if (emitted >= pe_exception_output_limit) break;
+                    const auto &entry = info.unwind_map[state];
+                    out << "        FH3 unwind state=" << state << " to=" << entry.to_state;
+                    if (entry.action_rva) out << " action=0x" << std::hex << entry.action_rva << std::dec;
+                    emit_source(entry.source);
+                    out << '\n';
+                    ++emitted;
+                }
+                for (const auto &entry : info.ip_to_state) {
+                    if (emitted >= pe_exception_output_limit) break;
+                    out << "        FH3 IP-state RVA=0x" << std::hex << entry.ip_rva << std::dec
+                        << " state=" << entry.state;
+                    emit_source(entry.source);
+                    out << '\n';
+                    ++emitted;
+                }
                 for (const auto &block : info.try_blocks) {
                     if (emitted >= pe_exception_output_limit) break;
                     out << "        FH3 try states=" << block.try_low << ".." << block.try_high
@@ -128,6 +145,19 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata) {
                     emit_source(block.source);
                     out << '\n';
                     ++emitted;
+                    for (const auto &handler : block.handlers) {
+                        if (emitted >= pe_exception_output_limit) break;
+                        out << "          FH3 handler="
+                            << handler.decorated_type_name.value_or("<catch-all/unknown>")
+                            << " adjectives=0x" << std::hex << handler.adjectives
+                            << " target=0x" << handler.handler_rva << std::dec
+                            << " object-offset=" << handler.catch_object_offset
+                            << " frame-offset=" << handler.frame_offset;
+                        emit_source(handler.source);
+                        if (handler.type_descriptor_source) emit_source(*handler.type_descriptor_source);
+                        out << '\n';
+                        ++emitted;
+                    }
                 }
                 if (info.exception_spec_types && emitted < pe_exception_output_limit) {
                     const auto &list = *info.exception_spec_types;
@@ -142,6 +172,7 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata) {
                         out << "          type=" << type.decorated_type_name.value_or("<unknown>")
                             << " adjectives=0x" << std::hex << type.adjectives << std::dec;
                         emit_source(type.source);
+                        if (type.type_descriptor_source) emit_source(*type.type_descriptor_source);
                         out << '\n';
                         ++emitted;
                     }

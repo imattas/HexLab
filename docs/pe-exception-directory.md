@@ -47,6 +47,14 @@ exception-specification list now retains its count, image-relative type-array
 RVA, per-entry adjectives, decorated TypeDescriptor names, and source spans.
 Its rows, descriptors, and names share the per-function 1 MiB metadata budget;
 the loader does not enforce the specification during exception dispatch.
+The image API `plan_pe_fh3_exception` now maps a live instruction pointer
+through the FH3 IP-to-state table, follows validated predecessor states to
+return source-backed cleanup action addresses, and lists active try-block
+handlers with handler/catch-object addresses and descriptor provenance. It
+selects a handler only for an exact decorated-name match or catch-all after all
+earlier candidates are provably different. Unknown types, unsupported handler
+adjectives, conversions, and rethrow behavior remain ambiguous; it never calls
+cleanup or catch code. This is a metadata plan, not a runtime dispatcher.
 Dynamic handler behavior remains uninterpreted. For
 `__CxxFrameHandler4`, the loader preserves the one-byte FuncInfo header and
 unknown flag bit, decodes the optional BBT value, optional unwind/try map RVAs,

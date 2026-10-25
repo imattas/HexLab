@@ -462,6 +462,146 @@ Result<PeRegisterContext> unwind_pe_frame(const PeMetadata &metadata, Architectu
     return failure(ErrorCode::unsupported, "PE live unwinding supports AMD64 and ARM64 only");
 }
 
+Result<PeFh3ExceptionPlan> plan_pe_fh3_exception(const PeMetadata &metadata, std::uint64_t module_base,
+        std::uint64_t instruction_pointer, std::uint64_t establisher_frame,
+        std::optional<std::string_view> exception_decorated_type) {
+    if (instruction_pointer < module_base ||
+        instruction_pointer - module_base > std::numeric_limits<std::uint32_t>::max())
+        return failure(ErrorCode::out_of_bounds, "instruction pointer is outside the PE RVA range");
+    const auto rva = static_cast<std::uint32_t>(instruction_pointer - module_base);
+    const PeRuntimeFunction *runtime = nullptr;
+    for (const auto &row : metadata.exception_functions) {
+        if (row.begin_rva <= rva && rva < row.end_rva) { runtime = &row; break; }
+    }
+    if (!runtime || !runtime->unwind_info || !runtime->unwind_info->handler_payload ||
+        !runtime->unwind_info->handler_payload->cxx_func_info)
+        return failure(ErrorCode::unsupported, "no FH3 metadata is associated with the live runtime function");
+
+    const auto &fh3 = *runtime->unwind_info->handler_payload->cxx_func_info;
+    if (fh3.magic != 0x19930522u)
+        return failure(ErrorCode::unsupported, "FH3 FuncInfo version is unsupported");
+    if (fh3.max_state < 0 || static_cast<std::size_t>(fh3.max_state) != fh3.unwind_map.size() ||
+        fh3.ip_to_state.size() > 1'000'000 || fh3.try_blocks.size() > 1'000'000)
+        return failure(ErrorCode::malformed, "FH3 state or table extents are inconsistent");
+
+    PeFh3ExceptionPlan plan;
+    plan.function_begin_rva = runtime->begin_rva;
+    plan.establisher_frame = establisher_frame;
+    const auto ip_entry = std::upper_bound(fh3.ip_to_state.begin(), fh3.ip_to_state.end(), rva,
+        [](std::uint32_t address, const PeCxxIpToStateEntry &row) { return address < row.ip_rva; });
+    if (ip_entry != fh3.ip_to_state.begin()) plan.state = std::prev(ip_entry)->state;
+    if (plan.state < -1 || (plan.state >= 0 && plan.state >= fh3.max_state))
+        return failure(ErrorCode::malformed, "FH3 live IP state exceeds the unwind map");
+
+    if (plan.state >= 0) {
+        auto current = plan.state;
+        for (std::size_t depth = 0; current >= 0; ++depth) {
+            if (depth >= max_unwind_operations)
+                return failure(ErrorCode::resource_limit, "FH3 unwind action chain exceeds 512 entries");
+            if (static_cast<std::size_t>(current) >= fh3.unwind_map.size())
+                return failure(ErrorCode::malformed, "FH3 unwind action state exceeds the unwind map");
+            const auto &row = fh3.unwind_map[static_cast<std::size_t>(current)];
+            if (row.to_state < -1 || row.to_state >= current)
+                return failure(ErrorCode::malformed, "FH3 unwind map has an invalid predecessor state");
+            if (row.action_rva) {
+                auto address = add(module_base, row.action_rva);
+                if (!address) return address.error();
+                plan.cleanup_actions.push_back({current, address.value(), row.source});
+            }
+            current = row.to_state;
+        }
+    }
+
+    std::uint64_t handler_count = 0;
+    if (plan.state >= 0) {
+        for (std::size_t try_index = 0; try_index < fh3.try_blocks.size(); ++try_index) {
+            const auto &try_block = fh3.try_blocks[try_index];
+            if (try_block.try_low < 0 || try_block.try_low > try_block.try_high ||
+                try_block.try_high >= fh3.max_state || try_block.catch_high < try_block.try_high ||
+                try_block.catch_high >= fh3.max_state)
+                return failure(ErrorCode::malformed, "FH3 try-block state range is invalid");
+            if (try_block.handlers.size() > 1'000'000 - handler_count)
+                return failure(ErrorCode::resource_limit, "FH3 handler count exceeds the metadata budget");
+            handler_count += try_block.handlers.size();
+            if (plan.state < try_block.try_low || plan.state > try_block.try_high) continue;
+            for (std::size_t handler_index = 0; handler_index < try_block.handlers.size(); ++handler_index) {
+                const auto &handler = try_block.handlers[handler_index];
+                PeFh3CatchCandidate candidate;
+                candidate.try_index = static_cast<std::uint32_t>(try_index);
+                candidate.handler_index = static_cast<std::uint32_t>(handler_index);
+                candidate.decorated_type_name = handler.decorated_type_name;
+                candidate.source = handler.source;
+                candidate.type_descriptor_source = handler.type_descriptor_source;
+                auto handler_address = add(module_base, handler.handler_rva);
+                if (!handler_address) return handler_address.error();
+                candidate.handler_address = handler_address.value();
+                const auto offset = static_cast<std::int64_t>(handler.catch_object_offset);
+                if (offset >= 0) {
+                    auto address = add(establisher_frame, static_cast<std::uint64_t>(offset));
+                    if (!address) return address.error();
+                    candidate.catch_object_address = address.value();
+                } else {
+                    const auto magnitude = static_cast<std::uint64_t>(-offset);
+                    if (magnitude > establisher_frame)
+                        return failure(ErrorCode::overflow, "FH3 catch-object address underflows the frame");
+                    candidate.catch_object_address = establisher_frame - magnitude;
+                }
+
+                if (handler.adjectives != 0)
+                    candidate.disposition = PeFh3CatchDisposition::unsupported_adjectives;
+                else if (!handler.type_descriptor_rva || *handler.type_descriptor_rva == 0)
+                    candidate.disposition = PeFh3CatchDisposition::catch_all;
+                else if (!exception_decorated_type)
+                    candidate.disposition = PeFh3CatchDisposition::type_unknown;
+                else if (handler.decorated_type_name &&
+                         *handler.decorated_type_name == *exception_decorated_type)
+                    candidate.disposition = PeFh3CatchDisposition::exact_type;
+                else if (handler.decorated_type_name)
+                    candidate.disposition = PeFh3CatchDisposition::different_type;
+                else
+                    candidate.disposition = PeFh3CatchDisposition::type_unknown;
+                plan.handlers.push_back(std::move(candidate));
+            }
+        }
+    }
+
+    bool uncertain_match = false;
+    for (const auto &candidate : plan.handlers) {
+        switch (candidate.disposition) {
+        case PeFh3CatchDisposition::different_type:
+            break;
+        case PeFh3CatchDisposition::type_unknown:
+        case PeFh3CatchDisposition::unsupported_adjectives:
+            uncertain_match = true;
+            break;
+        case PeFh3CatchDisposition::catch_all:
+        case PeFh3CatchDisposition::exact_type:
+            if (uncertain_match) {
+                plan.dispatch = PeFh3DispatchDisposition::ambiguous;
+                plan.dispatch_source = candidate.source;
+                plan.dispatch_diagnostic = "an earlier FH3 catch with unmodeled matching semantics prevents handler selection";
+                return plan;
+            }
+            plan.dispatch = PeFh3DispatchDisposition::handler_candidate;
+            plan.selected_try_index = candidate.try_index;
+            plan.selected_handler_index = candidate.handler_index;
+            plan.dispatch_source = candidate.source;
+            plan.dispatch_diagnostic = "first provable matching FH3 handler candidate in metadata order";
+            return plan;
+        }
+    }
+    if (uncertain_match) {
+        plan.dispatch = PeFh3DispatchDisposition::ambiguous;
+        plan.dispatch_source = fh3.source;
+        plan.dispatch_diagnostic = "FH3 catch matching requires a decorated exception type and supported handler adjectives";
+    } else {
+        plan.dispatch = PeFh3DispatchDisposition::continue_search;
+        plan.dispatch_source = fh3.source;
+        plan.dispatch_diagnostic = "no provable active FH3 handler; continue searching outer frames";
+    }
+    return plan;
+}
+
 Result<PeFh4ExceptionPlan> plan_pe_fh4_exception(const PeMetadata &metadata, std::uint64_t module_base,
         std::uint64_t instruction_pointer, std::uint64_t establisher_frame,
         std::optional<std::string_view> exception_decorated_type, const PeMemoryReader &memory,
