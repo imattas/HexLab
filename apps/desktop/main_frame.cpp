@@ -680,6 +680,7 @@ struct MainFrame::Impl {
     PseudocodeView *pseudocode = nullptr;
     SourceView *source = nullptr;
     wxNotebook *pages = nullptr;
+    wxNotebook *metadata_pages = nullptr;
     ReferenceView *references;
     TypeSymbolsView *type_symbols = nullptr;
     DebuggerView *debugger = nullptr;
@@ -1845,6 +1846,55 @@ struct MainFrame::Impl {
         } else
             graph->update(nullptr, {}, GraphKind::function_cfg, 1, nullptr, false, {});
     }
+    void show_macho_objc_placeholder() {
+        if (!macho_objc) return;
+        const bool has_document = static_cast<bool>(shown);
+        auto placeholder = std::make_shared<const std::vector<MachOObjCViewRow>>(
+            std::vector<MachOObjCViewRow>{{"Scan", "", "Objective-C runtime metadata",
+                has_document ? "not scanned" : "unavailable", "on page selection",
+                has_document ? "Select this page to scan the displayed immutable Mach-O snapshot."
+                             : "No document is currently displayed.", {}}});
+        macho_objc->populate(placeholder->size(), [placeholder](std::size_t row, int column) {
+            return row < placeholder->size() ? macho_objc_view_cell((*placeholder)[row], column, nullptr) : wxString{};
+        });
+        macho_objc->activate = {};
+    }
+    void display_macho_objc_rows(const std::shared_ptr<const DocumentSnapshot> &doc,
+                                 const std::shared_ptr<const std::vector<MachOObjCViewRow>> &rows) {
+        if (!macho_objc || !doc || !rows) return;
+        macho_objc->populate(rows->size(), [doc, rows](std::size_t row, int column) {
+            if (row >= rows->size()) return wxString{};
+            return macho_objc_view_cell((*rows)[row], column, doc->image.get());
+        });
+        macho_objc->activate = [this, rows](std::size_t row) {
+            if (row < rows->size() && (*rows)[row].address)
+                frame.Navigate(*(*rows)[row].address);
+        };
+    }
+    void populate_macho_objc() {
+        const auto doc = shown;
+        if (!doc) {
+            show_macho_objc_placeholder();
+            return;
+        }
+        if (macho_objc_source != doc.get()) {
+            std::vector<MachOObjCViewRow> rows;
+            if (doc->image && doc->metadata_view().macho) {
+                auto scanned = scan_macho_objc_classes(*doc->image, doc->metadata_view());
+                if (scanned)
+                    rows = macho_objc_view_rows(scanned.value());
+                else
+                    rows.push_back({"Scan", "", "Objective-C runtime metadata", "unavailable",
+                                    "bounded scanner", scanned.error().message, {}});
+            } else {
+                rows.push_back({"Scan", "", "Objective-C runtime metadata", "unavailable",
+                                "image metadata", "No loaded Mach-O image is available.", {}});
+            }
+            macho_objc_rows = std::make_shared<const std::vector<MachOObjCViewRow>>(std::move(rows));
+            macho_objc_source = doc.get();
+        }
+        display_macho_objc_rows(doc, macho_objc_rows);
+    }
     void populate() {
         macho_slice_choice.reset();
         macho_open_slice->Enable(false);
@@ -1862,6 +1912,7 @@ struct MainFrame::Impl {
                 table->populate(0, {});
                 table->activate = {};
             }
+            show_macho_objc_placeholder();
             index_context_tables({});
             if (pe_view) pe_view->set_document({});
             if (minidump_view) minidump_view->set_document({});
@@ -1983,31 +2034,12 @@ struct MainFrame::Impl {
             if (item)
                 frame.Navigate(item->source);
         };
-        if (macho_objc_source != doc.get()) {
-            std::vector<MachOObjCViewRow> objc_rows;
-            if (doc->image && doc->metadata_view().macho) {
-                auto scanned = scan_macho_objc_classes(*doc->image, doc->metadata_view());
-                if (scanned)
-                    objc_rows = macho_objc_view_rows(scanned.value());
-                else
-                    objc_rows.push_back({"Scan", "", "Objective-C runtime metadata", "unavailable",
-                                         "bounded scanner", scanned.error().message, {}});
-            } else {
-                objc_rows.push_back({"Scan", "", "Objective-C runtime metadata", "unavailable",
-                                     "image metadata", "No loaded Mach-O image is available.", {}});
-            }
-            macho_objc_rows = std::make_shared<const std::vector<MachOObjCViewRow>>(std::move(objc_rows));
-            macho_objc_source = doc.get();
-        }
-        const auto objc_snapshot = macho_objc_rows;
-        macho_objc->populate(objc_snapshot->size(), [doc, objc_snapshot](std::size_t row, int column) {
-            if (row >= objc_snapshot->size()) return wxString{};
-            return macho_objc_view_cell((*objc_snapshot)[row], column, doc->image.get());
-        });
-        macho_objc->activate = [this, objc_snapshot](std::size_t row) {
-            if (row < objc_snapshot->size() && (*objc_snapshot)[row].address)
-                frame.Navigate(*(*objc_snapshot)[row].address);
-        };
+        if (metadata_pages && metadata_pages->GetCurrentPage() == macho_objc)
+            populate_macho_objc();
+        else if (macho_objc_source == doc.get() && macho_objc_rows)
+            display_macho_objc_rows(doc, macho_objc_rows);
+        else
+            show_macho_objc_placeholder();
         const auto elf = doc->metadata_view().elf ? &*doc->metadata_view().elf : nullptr;
         elf_tables->populate(elf ? elf->symbol_tables.size() : 0, [doc, elf](std::size_t row, int column) {
             const auto &item = elf->symbol_tables[row];
@@ -2782,6 +2814,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
                                      .BestSize(FromDIP(wxSize(260, 200)))
                                      .MinSize(FromDIP(wxSize(160, 100))));
     auto *metadata = new wxNotebook(this, wxID_ANY);
+    ui.metadata_pages = metadata;
     metadata->SetName("Binary metadata pane");
     ui.pe_view = new PeView(metadata);
     ui.minidump_view = new MinidumpView(metadata);
@@ -3173,6 +3206,11 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     };
     ui.plugins->set_active_project_breakpoint_services(std::move(active_breakpoint_services));
     metadata->AddPage(ui.plugins, "Plugins");
+    metadata->Bind(wxEVT_NOTEBOOK_PAGE_CHANGED, [this, metadata](wxBookCtrlEvent &event) {
+        if (event.GetSelection() == metadata->FindPage(impl_->macho_objc))
+            impl_->populate_macho_objc();
+        event.Skip();
+    });
     ui.listing->decorate_instruction = [plugins = ui.plugins](Instruction &instruction) {
         (void)plugins->apply_display_extension(instruction);
     };
