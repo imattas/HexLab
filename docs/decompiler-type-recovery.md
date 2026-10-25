@@ -320,6 +320,17 @@ differs from the convention inferred from the image format. Other explicit
 conventions retain the image-format default until a matching recovery map is
 implemented.
 
+System V AMD64 prototype recovery consumes the shared ABI classifier's
+aggregate placements. Register-passed structures up to two eightbytes map each
+INTEGER/SSE piece to its classified GPR/XMM location, retaining the original
+parameter index for every piece. INTEGER pieces use a width-matched unsigned
+integer view only when source fields cover the complete piece; an SSE piece keeps
+its exact floating member type or a vector view only when contiguous equal-width
+floating members fill the piece. Padding-only, ambiguous union, and unsupported
+member views stay untyped. Stack-passed aggregate
+bytes remain visible in the prototype placement, but the current call argument
+snapshot cannot reconstruct arbitrary memory copies of aggregate values.
+
 AArch64 AAPCS64 prototypes map scalar floating-point arguments to v0-v7
 independently from x0-x7. Scalar floating results use v0. Explicit prototypes
 also classify homogeneous floating-point aggregates (HFAs) with one to four
@@ -364,7 +375,7 @@ outputs, while existing call optimization barriers remain in effect.
 Native CLI and desktop paths prepare call effects before SSA, as does each
 interprocedural type-recovery iteration. Unknown targets still have the ABI's
 volatile outputs when the caller ABI is known. Unknown conventions, x87 state,
-AVX-512 registers, aggregate/multiple-register returns, and general alias
+AVX-512 registers, multiple-register aggregate returns, and general alias
 semantics for ordinary assignments are not added by this pass.
 
 
@@ -401,21 +412,12 @@ stores stop that proof. Aggregate returns without a modeled result register rema
 untyped. Targets in a different register file and unsupported slot classes are
 left unresolved.
 
-Explicit prototypes can also model a bounded single-register aggregate return
-for x86-64 Windows, System V AMD64, and AArch64. The result must fit in one
-integer result register and have a complete structure/array layout containing
-only non-overlapping integer, boolean, enum, and pointer fields. Bitfields,
-unions, virtual bases, floating/vector members, unresolved members, and larger
-aggregates remain unresolved because they require ABI-specific register
-classification or hidden-result-pointer handling. A one-member AAPCS64 HFA is
-associated with v0; larger HFAs still require multiple result-register support.
-This path is prototype-driven and does not guess aggregate returns from
-observed register widths.
-
-For System V AMD64, the same call-result path also handles the exact SSE
-one-eightbyte aggregate case: a complete structure containing one `float` or
-`double` at byte offset zero and having the same 4- or 8-byte extent is
-associated with the floating return register (XMM0). Mixed-class layouts,
-multiple SSE eightbytes, arrays, bitfields, and padded or unresolved members
-remain unsupported because they need the complete SysV eightbyte classifier
-and, for some cases, more than one call-result register.
+Explicit prototypes can model aggregate return registers only when the
+decompiler call IR represents the complete result in one register. System V
+AMD64 delegates this decision to the shared eightbyte classifier, so supported
+single-location INTEGER and SSE results use RAX or XMM0, including mixed
+aggregate shapes classified into one register. Returns split across multiple
+GPR/XMM registers and hidden-result-pointer aggregates remain unresolved in call
+SSA. Windows x64 and AAPCS64 retain their bounded single-register cases; AAPCS64
+models a one-member HFA in v0. This path is prototype-driven and never guesses
+aggregate returns from observed register widths.
