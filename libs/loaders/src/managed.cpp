@@ -90,6 +90,16 @@ Result<bool> resolve_type_signature(ManagedTypeSignature& signature,const Manage
   for(auto& child:signature.children){auto resolved=resolve_type_signature(child,catalog,active_specs,depth+1,budget);if(!resolved)return resolved.error();}
   return true;
 }
+const ManagedTypeSignature* resolved_type_spec_root(const ManagedTypeSignature& signature,
+                                                     unsigned depth=0){
+  if(depth>16)return nullptr;
+  if(!signature.type_spec_signature)return &signature;
+  return resolved_type_spec_root(*signature.type_spec_signature,depth+1);
+}
+const ManagedTypeSignature* generic_instance_root(const ManagedTypeSignature& signature){
+  const auto* root=resolved_type_spec_root(signature);
+  return root&&root->element_type==0x15?root:nullptr;
+}
 }
 
 namespace {
@@ -170,12 +180,17 @@ Result<std::map<std::uint32_t,ManagedMethodSignature>> parse_managed_call_signat
   const auto type_name=[&](std::uint32_t token)->std::string{
     if(const auto found=definitions.find(token);found!=definitions.end())return found->second->full_name;
     if(const auto found=references.find(token);found!=references.end())return found->second->full_name;
-    if(const auto found=specifications.find(token);found!=specifications.end())return found->second->signature.metadata_type_name;
+    if(const auto found=specifications.find(token);found!=specifications.end()){
+      const auto* resolved=resolved_type_spec_root(found->second->signature);
+      return resolved?resolved->metadata_type_name:std::string{};
+    }
     return {};
   };
   const auto type_is_value=[&](std::uint32_t token)->std::optional<bool>{
     if(const auto found=specifications.find(token);found!=specifications.end()){
-      const auto& signature=found->second->signature;
+      const auto* resolved=resolved_type_spec_root(found->second->signature);
+      if(!resolved)return {};
+      const auto& signature=*resolved;
       if(signature.element_type==0x15)return signature.generic_instance_is_value_type;
       if(signature.element_type==0x11)return true;
       if(signature.element_type==0x12)return false;
@@ -200,11 +215,12 @@ Result<std::map<std::uint32_t,ManagedMethodSignature>> parse_managed_call_signat
     signature.declaring_type_token=token;
     signature.declaring_type_name=type_name(token);
     signature.declaring_type_is_value_type=type_is_value(token);
-    if(const auto found=specifications.find(token);found!=specifications.end()&&
-       found->second->signature.element_type==0x15) {
-      signature.declaring_type_arguments=found->second->signature.children;
-      signature.declaring_type_generic_arguments_valid=
-          found->second->signature.generic_instance_arity_valid;
+    if(const auto found=specifications.find(token);found!=specifications.end()) {
+      if(const auto* instance=generic_instance_root(found->second->signature)) {
+        signature.declaring_type_arguments=instance->children;
+        signature.declaring_type_generic_arguments_valid=
+            instance->generic_instance_arity_valid;
+      }
     }
   };
   for(auto& [token,signature]:result){
@@ -754,7 +770,7 @@ Result<std::vector<ManagedField>> parse_managed_field_references(std::span<const
     if(tag==0||tag==1){const auto owner=names.find(parent_token);if(owner==names.end())return malformed("CLR MemberRef owner type is unresolved");field.declaring_type=owner->second;}
     else if(tag==2)field.declaring_type="<module-ref:"+std::to_string(parent_rid)+">";
     else if(tag==3){const auto owner=method_owners.find(parent_token);if(owner==method_owners.end())return malformed("CLR MemberRef method owner is unresolved");field.declaring_type=owner->second;}
-    else {const auto owner=specs.find(parent_token);if(owner==specs.end())return malformed("CLR MemberRef TypeSpec owner is unresolved");field.declaring_type=owner->second->signature.metadata_type_name;if(owner->second->signature.element_type==0x15)field.declaring_type_arguments=owner->second->signature.children;}
+    else {const auto owner=specs.find(parent_token);if(owner==specs.end())return malformed("CLR MemberRef TypeSpec owner is unresolved");const auto* spec_root=resolved_type_spec_root(owner->second->signature);if(!spec_root)return Error{ErrorCode::resource_limit,"MemberRef TypeSpec nesting exceeds limit"};field.declaring_type=spec_root->metadata_type_name;if(const auto* instance=generic_instance_root(owner->second->signature)){field.declaring_type_arguments=instance->children;field.declaring_type_generic_arguments_valid=instance->generic_instance_arity_valid;}}
     auto signature=decode_managed_field_signature(bytes);
     if(!signature){if(signature.error().code!=ErrorCode::unsupported)return signature.error();field.signature_diagnostic=signature.error().message;}
     else {auto resolved=std::move(signature.value());auto status=resolve_type_signature(resolved,catalog.value(),active_specs,0,budget);if(!status)return status.error();field.type_signature=std::move(resolved);}
