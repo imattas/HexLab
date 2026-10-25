@@ -33,8 +33,15 @@ the optional `?` negative marker (for example, `?$Buffer@$03@@` presents as
 `Buffer<4>`). Common overloaded
 operators are rendered from their Microsoft operator codes, including arithmetic,
 comparisons, shifts, logical/bitwise operators, indexing, calls, comma,
-compound assignments, allocation, and deallocation. Unknown special names remain
-unsupported. It renders recognized calling-convention markers. The raw spelling
+compound assignments, allocation, and deallocation. The bounded MSVC special-name
+subset also renders vftables (`??_7`), vbtables (`??_8`), RTTI type descriptors
+(`??_R0`), RTTI base-class arrays (`??_R2`), RTTI class-hierarchy descriptors
+(`??_R3`), and RTTI complete-object locators (`??_R4`) when their complete
+terminators and name/type encodings are valid. RTTI base-class descriptors
+(`??_R1`), vcall and adjustment thunks, local tables, and other special names
+remain unsupported because their payloads require additional integer/backreference
+grammar or target-specific adjustment interpretation. It renders recognized
+calling-convention markers. The raw spelling
 remains available in CLI output next to the rendered form.
 
 The bounded special-member subset also recognizes ordinary MSVC constructor
