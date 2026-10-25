@@ -2,19 +2,31 @@
 
 The bounded header importer can instantiate C++ type aliases with integral
 non-type parameters. The parameter type must be an integer type no wider than
-64 bits. Arguments and defaults are non-negative integer literals; the value is
-checked against the declared parameter width. Literal suffixes and decimal,
-octal, and hexadecimal spellings use the same parser as other integer constants.
+64 bits. Arguments and defaults use a bounded integer constant-expression
+subset, then are checked against the declared parameter width. It supports
+integer literals, earlier bound parameters, parentheses, unary `+`, `-`, `~`,
+arithmetic `+`, `-`, `*`, `/`, `%`, and bitwise `&`, `^`, `|`.
 
 ```cpp
 template <typename T, size_t N>
 using FixedArray = T[N];
 
-using Header = FixedArray<uint32_t, 4>;
+using Header = FixedArray<uint32_t, 2 + 2>;
 ```
 
 `Header` is imported as a four-element array of 32-bit unsigned integers.
-Nested alias instantiations may forward an in-scope integral parameter:
+Array extents can also use the bound values and the same expression subset:
+
+```cpp
+template <size_t N, size_t Count = N + 1>
+using DoubledBytes = unsigned char[N * 2 + 1];
+
+using SevenBytes = DoubledBytes<3>;
+```
+
+`SevenBytes` has seven elements, and the default `Count` is evaluated using
+the earlier `N` binding. Nested alias instantiations may forward an in-scope
+integral parameter:
 
 ```cpp
 template <size_t N>
@@ -36,9 +48,12 @@ types; integer range checks apply there too. `<>` can use an alias's defaults
 or bind an empty pack. See [C++ template declarations](cpp-template-import.md)
 for forwarding examples and the strict template-template matching rules.
 
-The importer deliberately rejects negative values, arithmetic expressions,
-enumerator expressions, pointer/reference/member-pointer non-type parameters,
-and compound pack expansion patterns such as `Values + 1...`. Integral
+The importer deliberately rejects negative final values, enumerator names,
+pointer/reference/member-pointer non-type parameters, shift/comparison/logical
+operators, and compound pack expansion patterns such as `Values + 1...`.
+Expressions are capped at 4096 tokens/operations and the configured parser
+nesting limit; overflow, division by zero and unbound names fail explicitly.
+Integral
 non-type parameters are also supported on class/struct/union templates; their
 specialization subset is documented in
 [integral non-type class-template specializations](header-non-type-specializations.md).
