@@ -6,6 +6,7 @@
 #include "breakpoint_step_state.hpp"
 #include "hardware_breakpoint_state.hpp"
 #include "thread_suspend_state.hpp"
+#include "x86_fp_registers.hpp"
 
 #include <algorithm>
 #include <array>
@@ -58,15 +59,24 @@ std::wstring quote(const std::string& argument) {
 template<class T> void append_register(std::vector<RegisterValue>& out, const char* name, T value) {
     RegisterValue reg; reg.name = name; reg.byte_order = ByteOrder::little; reg.bytes.resize(sizeof(value)); std::memcpy(reg.bytes.data(), &value, sizeof(value)); out.push_back(std::move(reg));
 }
-void append_xmm_register(std::vector<RegisterValue>& out, std::uint32_t index, const M128A& value) {
-    RegisterValue reg;
-    reg.name = "xmm" + std::to_string(index);
-    reg.group = "vector";
-    reg.number = index;
-    reg.byte_order = ByteOrder::little;
-    reg.bytes.resize(sizeof(value));
-    std::memcpy(reg.bytes.data(), &value, sizeof(value));
-    out.push_back(std::move(reg));
+Status append_x86_fp_registers(std::vector<RegisterValue>& out, std::span<const std::byte> image,
+                              bool i386) {
+    auto decoded = i386 ? detail::x86_i386_fxsave_register_values(image)
+                        : detail::x86_fxsave_register_values(image);
+    if (!decoded) return decoded.error();
+    for (auto& reg : decoded.value()) {
+        reg.group = reg.name.starts_with("xmm") ? "vector" : "floating-point";
+        reg.byte_order = ByteOrder::little;
+        if (reg.name.starts_with("xmm")) {
+            std::uint32_t index = 0;
+            const auto parsed = std::from_chars(reg.name.data() + 3,
+                reg.name.data() + reg.name.size(), index);
+            if (parsed.ec == std::errc{} && parsed.ptr == reg.name.data() + reg.name.size())
+                reg.number = index;
+        }
+        out.push_back(std::move(reg));
+    }
+    return std::monostate{};
 }
 template<class T> bool assign_register(const RegisterValue& reg, const char* name, T& value) {
     if (reg.name != name) return false;
@@ -1088,12 +1098,17 @@ public:
         std::vector<RegisterValue> out;
 #if defined(_WIN64)
         if (target_architecture() == Architecture::x86) {
-            WOW64_CONTEXT c{}; c.ContextFlags = WOW64_CONTEXT_FULL;
+            WOW64_CONTEXT c{};
+            c.ContextFlags = WOW64_CONTEXT_FULL | WOW64_CONTEXT_FLOATING_POINT | WOW64_CONTEXT_EXTENDED_REGISTERS;
             const bool ok = Wow64GetThreadContext(thread, &c) != FALSE; CloseHandle(thread);
             if (!ok) return win_error("Wow64GetThreadContext");
             append_register(out,"eax",c.Eax); append_register(out,"ebx",c.Ebx); append_register(out,"ecx",c.Ecx); append_register(out,"edx",c.Edx);
             append_register(out,"esi",c.Esi); append_register(out,"edi",c.Edi); append_register(out,"ebp",c.Ebp); append_register(out,"esp",c.Esp);
             append_register(out,"eip",c.Eip); append_register(out,"eflags",c.EFlags);
+            const auto fp_image = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(c.ExtendedRegisters), sizeof(c.ExtendedRegisters));
+            auto fp = append_x86_fp_registers(out, fp_image, true);
+            if (!fp) return fp.error();
         } else
 #endif
         {
@@ -1114,7 +1129,11 @@ public:
             const bool ok = avx.has_value() || GetThreadContext(thread, &c) != FALSE;
 #else
             CONTEXT& c = legacy;
+#if defined(_M_IX86)
+            c.ContextFlags = CONTEXT_FULL | CONTEXT_FLOATING_POINT | CONTEXT_EXTENDED_REGISTERS;
+#else
             c.ContextFlags = CONTEXT_FULL;
+#endif
             const bool ok = GetThreadContext(thread, &c) != FALSE;
 #endif
             const auto error = ok ? Error{} : win_error("GetThreadContext");
@@ -1126,13 +1145,22 @@ public:
             append_register(out,"rip",c.Rip); append_register(out,"r8",c.R8); append_register(out,"r9",c.R9); append_register(out,"r10",c.R10);
             append_register(out,"r11",c.R11); append_register(out,"r12",c.R12); append_register(out,"r13",c.R13); append_register(out,"r14",c.R14);
             append_register(out,"r15",c.R15); append_register(out,"eflags",c.EFlags);
-            for (std::uint32_t i = 0; i < 16; ++i) append_xmm_register(out, i, c.FltSave.XmmRegisters[i]);
+            static_assert(sizeof(c.FltSave) >= detail::x86_fxsave_size);
+            const auto fp_image = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(&c.FltSave), sizeof(c.FltSave));
+            auto fp = append_x86_fp_registers(out, fp_image, false);
+            if (!fp) return fp.error();
             if (avx)
                 for (std::uint32_t i = 0; i < 16; ++i) append_ymm_register(out, i, *avx);
 #elif defined(_M_IX86)
             append_register(out,"eax",c.Eax); append_register(out,"ebx",c.Ebx); append_register(out,"ecx",c.Ecx); append_register(out,"edx",c.Edx);
             append_register(out,"esi",c.Esi); append_register(out,"edi",c.Edi); append_register(out,"ebp",c.Ebp); append_register(out,"esp",c.Esp);
             append_register(out,"eip",c.Eip); append_register(out,"eflags",c.EFlags);
+            static_assert(sizeof(c.ExtendedRegisters) >= detail::x86_fxsave_size);
+            const auto fp_image = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(c.ExtendedRegisters), sizeof(c.ExtendedRegisters));
+            auto fp = append_x86_fp_registers(out, fp_image, true);
+            if (!fp) return fp.error();
 #else
             return Error{ErrorCode::unsupported, "this Windows build cannot read the requested target context"};
 #endif
@@ -1143,13 +1171,23 @@ public:
         if (registers.empty()) return std::monostate{};
         const bool wants_ymm = std::any_of(registers.begin(), registers.end(),
             [](const RegisterValue& reg) { return reg.name.starts_with("ymm"); });
+        const bool wants_native_x64_vector = target_architecture() == Architecture::x86_64 &&
+            std::any_of(registers.begin(), registers.end(), [](const RegisterValue& reg) {
+                return reg.name.starts_with("xmm") || reg.name.starts_with("ymm");
+            });
+        if (wants_native_x64_vector) {
+#if defined(_M_X64)
+            auto validated = validate_x64_vector_aliases(registers);
+            if (!validated) return validated.error();
+#else
+            return Error{ErrorCode::unsupported, "native x64 vector edits require an x64 debugger build"};
+#endif
+        }
         if (wants_ymm) {
 #if defined(_M_X64)
             if (target_architecture() != Architecture::x86_64)
                 return Error{ErrorCode::unsupported, "YMM editing requires a native x64 target"};
             if (!pending_) return Error{ErrorCode::busy, "YMM registers are writable only while a debug event has stopped the target"};
-            auto validated = validate_x64_vector_aliases(registers);
-            if (!validated) return validated.error();
 #else
             return Error{ErrorCode::unsupported, "Windows YMM editing requires an x64 debugger build"};
 #endif
@@ -1232,9 +1270,20 @@ public:
         if (!thread) return win_error("OpenThread");
 #if defined(_WIN64)
         if (target_architecture() == Architecture::x86) {
-            WOW64_CONTEXT c{}; c.ContextFlags = WOW64_CONTEXT_FULL;
+            WOW64_CONTEXT c{};
+            c.ContextFlags = WOW64_CONTEXT_FULL | WOW64_CONTEXT_FLOATING_POINT | WOW64_CONTEXT_EXTENDED_REGISTERS;
             if (!Wow64GetThreadContext(thread, &c)) { CloseHandle(thread); return win_error("Wow64GetThreadContext"); }
+            std::vector<RegisterValue> fp_writes;
+            for (const auto& reg : registers)
+                if (detail::x86_i386_fxsave_field(reg.name)) fp_writes.push_back(reg);
+            if (!fp_writes.empty()) {
+                auto image = std::span<std::byte>(reinterpret_cast<std::byte*>(c.ExtendedRegisters),
+                                                  sizeof(c.ExtendedRegisters));
+                auto written = detail::write_x86_i386_fxsave_registers(image, fp_writes);
+                if (!written) { CloseHandle(thread); return written; }
+            }
             for (const auto& r : registers) {
+                if (detail::x86_i386_fxsave_field(r.name)) continue;
                 if (assign_register(r,"eax",c.Eax)||assign_register(r,"ebx",c.Ebx)||assign_register(r,"ecx",c.Ecx)||assign_register(r,"edx",c.Edx)||
                     assign_register(r,"esi",c.Esi)||assign_register(r,"edi",c.Edi)||assign_register(r,"ebp",c.Ebp)||assign_register(r,"esp",c.Esp)||
                     assign_register(r,"eip",c.Eip)||assign_register(r,"eflags",c.EFlags)) continue;
@@ -1270,6 +1319,33 @@ public:
             CloseHandle(thread);
             return error;
         }
+#if defined(_M_X64)
+        std::vector<RegisterValue> fp_writes;
+        for (const auto& reg : registers)
+            if (detail::x86_fxsave_field(reg.name) && !reg.name.starts_with("xmm"))
+                fp_writes.push_back(reg);
+        if (!fp_writes.empty()) {
+            static_assert(sizeof(c.FltSave) >= detail::x86_fxsave_size);
+            std::array<std::byte, detail::x86_fxsave_size> image{};
+            std::memcpy(image.data(), &c.FltSave, image.size());
+            auto written = detail::write_x86_fxsave_registers(image, fp_writes);
+            if (!written) { CloseHandle(thread); return written; }
+            std::memcpy(&c.FltSave, image.data(), image.size());
+            edited_flags |= CONTEXT_FLOATING_POINT;
+        }
+#elif defined(_M_IX86)
+        std::vector<RegisterValue> fp_writes;
+        for (const auto& reg : registers)
+            if (detail::x86_i386_fxsave_field(reg.name)) fp_writes.push_back(reg);
+        if (!fp_writes.empty()) {
+            static_assert(sizeof(c.ExtendedRegisters) >= detail::x86_fxsave_size);
+            auto image = std::span<std::byte>(reinterpret_cast<std::byte*>(c.ExtendedRegisters),
+                                              sizeof(c.ExtendedRegisters));
+            auto written = detail::write_x86_i386_fxsave_registers(image, fp_writes);
+            if (!written) { CloseHandle(thread); return written; }
+            c.ContextFlags |= CONTEXT_FLOATING_POINT | CONTEXT_EXTENDED_REGISTERS;
+        }
+#endif
         for (const auto& r : registers) {
 #if defined(_M_X64)
             bool vector_matched = false;
@@ -1289,6 +1365,7 @@ public:
                 }
             }
             if (vector_matched) continue;
+            if (detail::x86_fxsave_field(r.name) && !r.name.starts_with("xmm")) continue;
             if (assign_register(r,"rax",c.Rax)||assign_register(r,"rbx",c.Rbx)||assign_register(r,"rcx",c.Rcx)||assign_register(r,"rdx",c.Rdx)||
                 assign_register(r,"rsi",c.Rsi)||assign_register(r,"rdi",c.Rdi)||assign_register(r,"rbp",c.Rbp)||assign_register(r,"rsp",c.Rsp)||
                 assign_register(r,"rip",c.Rip)||assign_register(r,"r8",c.R8)||assign_register(r,"r9",c.R9)||assign_register(r,"r10",c.R10)||
@@ -1298,6 +1375,7 @@ public:
                 continue;
             }
 #elif defined(_M_IX86)
+            if (detail::x86_i386_fxsave_field(r.name)) continue;
             if (assign_register(r,"eax",c.Eax)||assign_register(r,"ebx",c.Ebx)||assign_register(r,"ecx",c.Ecx)||assign_register(r,"edx",c.Edx)||
                 assign_register(r,"esi",c.Esi)||assign_register(r,"edi",c.Edi)||assign_register(r,"ebp",c.Ebp)||assign_register(r,"esp",c.Esp)||
                 assign_register(r,"eip",c.Eip)||assign_register(r,"eflags",c.EFlags)) continue;
