@@ -10,9 +10,22 @@ register arithmetic (add, subtract, multiply, bitwise operations, and shifts),
 wide register moves (`move-wide` forms), signed `const-wide` encodings
 (`/16`, `/32`, `/64`, and `/high16`), 64-bit add/subtract/multiply/bitwise
 operations and shifts, and `return-wide`, plus `return-void`, `return`,
-`goto` forms, and the six
-two-register and six zero-comparison conditional branches. It also lifts
-`iget`/`iput`, `sget`/`sput`, array loads/stores and `array-length`, the five
+`goto` forms, and the six two-register and six zero-comparison conditional
+branches. `const/high16` retains its exact 32-bit immediate bit pattern.
+Single- and double-precision add/subtract/multiply/divide/remainder lift in
+both three-register and `/2addr` encodings; double operands use the checked
+`vN`/`vN+1` pair model shared by wide DEX values. `cmpl-float`, `cmpg-float`,
+`cmpl-double`, `cmpg-double`, and `cmp-long` preserve typed inputs and write
+their int32 compare results through named intrinsics; `cmpl`/`cmpg` retain the
+NaN bias in the operation name. Integer
+`lit16` and `lit8` add, reverse subtract, multiply, bitwise, and shift forms
+lift with signed immediate handling; shift counts are masked to five bits.
+The compare-result intrinsic can feed the existing conditional branches.
+
+The lifter still rejects integer divide/remainder opcodes because their
+divide-by-zero exception edges are not modeled. Floating constants are kept
+as exact bit patterns until a typed use provides floating context. It also
+lifts `iget`/`iput`, `sget`/`sput`, array loads/stores and `array-length`, the five
 invoke kinds and their `/range` forms, `move-result` variants, `new-instance`,
 and `new-array` as conservative memory-effect intrinsics. Object moves/returns,
 string/class constants, casts, instance tests, monitor operations, throws, and

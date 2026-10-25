@@ -66,9 +66,12 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
     } else if (op == 0x12) {
         const auto value = static_cast<std::int8_t>(hi);
         text = "const/4 " + vr(hi & 15) + ", " + std::to_string(value >> 4);
-    } else if (op == 0x13 || op == 0x16 || op == 0x19) {
+    } else if (op == 0x13 || op == 0x15 || op == 0x16 || op == 0x19) {
         words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX 21s constant");
-        text = std::string(op == 0x13 ? "const/16 " : op == 0x16 ? "const-wide/16 " : "const-wide/high16 ") + vr(hi) + ", " + std::to_string(static_cast<std::int16_t>(word(1)));
+        const auto value = op == 0x15
+            ? std::bit_cast<std::int32_t>(std::uint32_t(word(1)) << 16)
+            : static_cast<std::int32_t>(std::bit_cast<std::int16_t>(word(1)));
+        text = std::string(op == 0x13 ? "const/16 " : op == 0x15 ? "const/high16 " : op == 0x16 ? "const-wide/16 " : "const-wide/high16 ") + vr(hi) + ", " + std::to_string(value);
     } else if (op == 0x14 || op == 0x17) {
         words = 3; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX 31i constant");
         text = std::string(op == 0x14 ? "const " : "const-wide/32 ") + vr(hi) + ", " + std::to_string(static_cast<std::int32_t>(le32(word(1), word(2))));
@@ -144,12 +147,38 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         text = std::string(op == 0x2b ? "packed-switch " : "sparse-switch ") + vr(hi) + ", payload " +
                std::to_string(payload_offset);
         flow = FlowKind::switch_dispatch;
+    } else if (op >= 0x2d && op <= 0x31) {
+        words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX compare");
+        static constexpr std::array<std::string_view, 5> names{
+            "cmpl-float", "cmpg-float", "cmpl-double", "cmpg-double", "cmp-long"};
+        const auto operands = word(1);
+        text = std::string(names[op - 0x2d]) + " " + vr(hi) + ", " +
+               vr(operands & 255) + ", " + vr(operands >> 8);
     } else if (op >= 0x28 && op <= 0x2a) {
         std::int64_t offset = 0;
         if (op == 0x28) { text = "goto"; offset = static_cast<std::int8_t>(hi); }
         else if (op == 0x29) { words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX goto/16"); text = "goto/16"; offset = static_cast<std::int16_t>(word(1)); }
         else { words = 3; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX goto/32"); text = "goto/32"; offset = static_cast<std::int32_t>(le32(word(1), word(2))); }
         branch(offset, FlowKind::jump); if (target) text += " " + std::to_string(target->offset);
+    } else if (op >= 0xd0 && op <= 0xe2) {
+        words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX literal arithmetic");
+        if (op <= 0xd7) {
+            static constexpr std::array<std::string_view, 8> names{
+                "add-int/lit16", "rsub-int", "mul-int/lit16", "div-int/lit16",
+                "rem-int/lit16", "and-int/lit16", "or-int/lit16", "xor-int/lit16"};
+            const auto literal = std::bit_cast<std::int16_t>(word(1));
+            text = std::string(names[op - 0xd0]) + " " + vr(hi & 15) + ", " +
+                   vr(hi >> 4) + ", " + std::to_string(literal);
+        } else {
+            static constexpr std::array<std::string_view, 11> names{
+                "add-int/lit8", "rsub-int/lit8", "mul-int/lit8", "div-int/lit8",
+                "rem-int/lit8", "and-int/lit8", "or-int/lit8", "xor-int/lit8",
+                "shl-int/lit8", "shr-int/lit8", "ushr-int/lit8"};
+            const auto operands = word(1);
+            const auto literal = std::bit_cast<std::int8_t>(static_cast<std::uint8_t>(operands >> 8));
+            text = std::string(names[op - 0xd8]) + " " + vr(hi) + ", " +
+                   vr(operands & 255) + ", " + std::to_string(literal);
+        }
     } else if ((op >= 0x32 && op <= 0x37) || (op >= 0x38 && op <= 0x3d)) {
         words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX conditional branch");
         const auto offset = static_cast<std::int16_t>(word(1));
