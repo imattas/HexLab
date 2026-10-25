@@ -5290,6 +5290,134 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         out << "}\n";
         return StructuredPseudocode{out.str(), false, {}};
     };
+    // A complete switch may intentionally flow from one case target into the
+    // next. The ordinary arm recognizer treats each destination as a separate
+    // region, so it cannot represent that shared chain without duplicating
+    // blocks. This narrower form emits a case label at every target in a
+    // disjoint target chain, preserving C switch fallthrough directly.
+    auto try_entry_switch_fallthrough = [&]() -> std::optional<StructuredPseudocode> {
+        if (switch_entry != entry || !switch_prefix.empty() || switch_guard ||
+            !switch_entry || function.blocks.size() < 3 || function.blocks.size() > 1024)
+            return {};
+        const auto &dispatch = *switch_entry->switch_dispatch;
+        if (!dispatch.complete || !dispatch.selector || dispatch.cases.empty() || !dispatch.default_target ||
+            !switch_entry->phis.empty() || switch_entry->memory_phi)
+            return {};
+
+        using TargetKey = std::pair<std::uint32_t, std::uint64_t>;
+        std::map<TargetKey, std::vector<std::uint64_t>> labels_by_target;
+        std::set<std::uint64_t> values;
+        for (const auto &item : dispatch.cases) {
+            if (!values.insert(item.value).second) return {};
+            labels_by_target[{item.target.space.value, item.target.offset}].push_back(item.value);
+        }
+        const TargetKey default_key{dispatch.default_target->space.value, dispatch.default_target->offset};
+        labels_by_target.try_emplace(default_key);
+
+        std::map<TargetKey, const LiftedBlock *> targets;
+        for (const auto &[key, _] : labels_by_target) {
+            const auto *target = find_block(Address{{key.first}, key.second});
+            if (!target || target == switch_entry || !target->phis.empty() || target->memory_phi ||
+                target->switch_dispatch || contains_return(*target))
+                return {};
+            targets.emplace(key, target);
+        }
+
+        std::map<std::uint64_t, std::set<std::uint64_t>> predecessors;
+        for (const auto &block : function.blocks) {
+            for (const auto &edge : block.successors) {
+                if (!edge.target || (edge.kind != BlockEdgeKind::jump && edge.kind != BlockEdgeKind::fallthrough))
+                    return {};
+                const auto *target = find_block(*edge.target);
+                if (!target || (edge.block && edge.block != target->id)) return {};
+                predecessors[target->id.value].insert(block.id.value);
+            }
+        }
+
+        std::map<TargetKey, TargetKey> next_target;
+        std::map<TargetKey, std::size_t> target_predecessor_count;
+        std::set<std::uint64_t> join_predecessors;
+        const LiftedBlock *join = nullptr;
+        for (const auto &[key, block] : targets) {
+            if (block->successors.size() != 1) return {};
+            const auto &edge = block->successors.front();
+            const auto *successor = edge.target ? find_block(*edge.target) : nullptr;
+            if (!successor || (edge.block && edge.block != successor->id)) return {};
+            const auto branch_count = std::count_if(block->instructions.begin(), block->instructions.end(),
+                [](const auto &instruction) { return std::holds_alternative<Branch>(instruction.statement); });
+            if (branch_count > 1 || (branch_count == 1 &&
+                (!std::holds_alternative<Branch>(block->instructions.back().statement) ||
+                 std::get<Branch>(block->instructions.back().statement).condition != "true" ||
+                 !std::get<Branch>(block->instructions.back().statement).true_target ||
+                 std::get<Branch>(block->instructions.back().statement).false_target ||
+                 *std::get<Branch>(block->instructions.back().statement).true_target != *edge.target)))
+                return {};
+
+            const TargetKey successor_key{successor->begin.space.value, successor->begin.offset};
+            if (targets.contains(successor_key)) {
+                next_target.emplace(key, successor_key);
+                if (++target_predecessor_count[successor_key] > 1) return {};
+            } else {
+                if (!has_only_terminal_return(*successor) || !successor->phis.empty() || successor->memory_phi)
+                    return {};
+                if (join && join != successor) return {};
+                join = successor;
+                join_predecessors.insert(block->id.value);
+            }
+        }
+        if (!join || function.blocks.size() != targets.size() + 2 ||
+            predecessors[switch_entry->id.value].size() != 0 ||
+            predecessors[join->id.value] != join_predecessors)
+            return {};
+
+        for (const auto &[key, block] : targets) {
+            std::set<std::uint64_t> expected{switch_entry->id.value};
+            for (const auto &[prior, next] : next_target)
+                if (next == key) expected.insert(targets.at(prior)->id.value);
+            if (predecessors[block->id.value] != expected) return {};
+        }
+
+        std::vector<TargetKey> roots;
+        for (const auto &[key, _] : targets)
+            if (!target_predecessor_count.contains(key)) roots.push_back(key);
+        std::set<TargetKey> visited;
+        std::vector<std::vector<TargetKey>> chains;
+        for (const auto root : roots) {
+            std::vector<TargetKey> chain;
+            auto current = root;
+            while (visited.insert(current).second) {
+                chain.push_back(current);
+                const auto next = next_target.find(current);
+                if (next == next_target.end()) break;
+                current = next->second;
+            }
+            if (chain.empty() || next_target.contains(chain.back()) ||
+                !std::any_of(targets.at(chain.back())->successors.begin(), targets.at(chain.back())->successors.end(),
+                    [&](const auto &edge) { return edge_targets(edge, join->begin); }))
+                return {};
+            chains.push_back(std::move(chain));
+        }
+        if (visited.size() != targets.size()) return {}; // cycles have no root and remain on the state-machine path
+
+        out << "function " << address_label(function.entry) << "() {\n";
+        emit_block(*switch_entry, 4, true);
+        out << "    switch (" << expression_text(*dispatch.selector) << ") {\n";
+        for (const auto &chain : chains) {
+            for (const auto key : chain) {
+                for (const auto value : labels_by_target[key])
+                    out << "        case 0x" << std::hex << value << std::dec << ":\n";
+                if (key == default_key) out << "        default:\n";
+                const auto *block = targets.at(key);
+                emit_block(*block, 12, true);
+                if (!next_target.contains(key)) out << "            break;\n";
+            }
+        }
+        out << "    }\n";
+        emit_block(*join, 4);
+        out << "}\n";
+        return StructuredPseudocode{out.str(), false, {}};
+    };
+    if (auto structured = try_entry_switch_fallthrough()) return *structured;
     if (auto structured = try_entry_switch()) return *structured;
 
     // Recognize bounded natural-loop regions before the acyclic structurer.

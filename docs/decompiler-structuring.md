@@ -200,6 +200,14 @@ switch only on the non-returning path. Prefix blocks must have no phis and one
 unambiguous successor each. Distinct case/default arms must each follow a
 disjoint straight-line path to a return, or converge on one terminal return
 join.
+An entry switch also accepts phi-free case-target chains where a case falls
+through directly into another case target and every chain ends at the same
+terminal return. Each target's labels are emitted immediately before that
+target's statements, so both direct dispatch and sequential fallthrough enter
+the correct block. The recognizer requires disjoint linear chains, exact
+predecessors, and no extra blocks; cycles, multiple fallthrough predecessors,
+phis, guarded/setup dispatches, and non-return continuations use the existing
+region or state-machine formatter.
 Shared-join arms receive edge-specific SSA phi assignments and explicit
 `break` statements. Conditional or nested arms proceed to the general region
 or state-machine formatter. Incomplete tables and dispatches without an
