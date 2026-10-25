@@ -19,6 +19,7 @@
 #include "open_dialogs.hpp"
 #include "elf_view.hpp"
 #include "macho_view.hpp"
+#include "macho_objc_view.hpp"
 #include "pe_view.hpp"
 #include "minidump_view.hpp"
 #include "compare_view.hpp"
@@ -702,6 +703,9 @@ struct MainFrame::Impl {
     wxButton *bookmark_rename = nullptr, *bookmark_remove = nullptr;
     VirtualTable *elf_programs, *elf_sections, *elf_dynamic, *elf_tables;
     VirtualTable *macho_metadata;
+    VirtualTable *macho_objc = nullptr;
+    std::shared_ptr<const std::vector<MachOObjCViewRow>> macho_objc_rows;
+    const DocumentSnapshot *macho_objc_source = nullptr;
     PeView *pe_view = nullptr;
     MinidumpView *minidump_view = nullptr;
     wxButton *macho_open_slice;
@@ -1848,11 +1852,13 @@ struct MainFrame::Impl {
         if (bookmark_rename) bookmark_rename->Enable(false);
         if (bookmark_remove) bookmark_remove->Enable(false);
         if (!shown) {
+            macho_objc_rows.reset();
+            macho_objc_source = nullptr;
             candidate_items.clear();
             visible_candidate_items.clear();
             strings->set_document({});
             for (auto *table : {candidates, symbols, segments, imports, exports, annotations, bookmarks,
-                                elf_programs, elf_sections, elf_dynamic, elf_tables, macho_metadata}) {
+                                elf_programs, elf_sections, elf_dynamic, elf_tables, macho_metadata, macho_objc}) {
                 table->populate(0, {});
                 table->activate = {};
             }
@@ -1976,6 +1982,31 @@ struct MainFrame::Impl {
                     macho_metadata_cell(*doc, *item, 2) + "\n" + macho_metadata_cell(*doc, *item, 3));
             if (item)
                 frame.Navigate(item->source);
+        };
+        if (macho_objc_source != doc.get()) {
+            std::vector<MachOObjCViewRow> objc_rows;
+            if (doc->image && doc->metadata_view().macho) {
+                auto scanned = scan_macho_objc_classes(*doc->image, doc->metadata_view());
+                if (scanned)
+                    objc_rows = macho_objc_view_rows(scanned.value());
+                else
+                    objc_rows.push_back({"Scan", "", "Objective-C runtime metadata", "unavailable",
+                                         "bounded scanner", scanned.error().message, {}});
+            } else {
+                objc_rows.push_back({"Scan", "", "Objective-C runtime metadata", "unavailable",
+                                     "image metadata", "No loaded Mach-O image is available.", {}});
+            }
+            macho_objc_rows = std::make_shared<const std::vector<MachOObjCViewRow>>(std::move(objc_rows));
+            macho_objc_source = doc.get();
+        }
+        const auto objc_snapshot = macho_objc_rows;
+        macho_objc->populate(objc_snapshot->size(), [doc, objc_snapshot](std::size_t row, int column) {
+            if (row >= objc_snapshot->size()) return wxString{};
+            return macho_objc_view_cell((*objc_snapshot)[row], column, doc->image.get());
+        });
+        macho_objc->activate = [this, objc_snapshot](std::size_t row) {
+            if (row < objc_snapshot->size() && (*objc_snapshot)[row].address)
+                frame.Navigate(*(*objc_snapshot)[row].address);
         };
         const auto elf = doc->metadata_view().elf ? &*doc->metadata_view().elf : nullptr;
         elf_tables->populate(elf ? elf->symbol_tables.size() : 0, [doc, elf](std::size_t row, int column) {
@@ -2803,6 +2834,9 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     macho_box->Add(ui.macho_details, 0, wxEXPAND | wxTOP, FromDIP(4));
     macho_box->Add(ui.macho_open_slice, 0, wxALL, FromDIP(4));
     macho_panel->SetSizer(macho_box);
+    ui.macho_objc = new VirtualTable(metadata, "macho-objc",
+                                     {"Kind", "Owner", "Name", "Address", "Status", "Provenance", "Details"});
+    ui.macho_objc->SetToolTip("Objective-C runtime records from the bounded scan of the displayed Mach-O snapshot. Activate an addressable row to navigate.");
     ui.annotations = new VirtualTable(metadata, "annotations", {"Address / offset", "Name", "Comment", "State"});
     auto *bookmark_panel = new wxPanel(metadata);
     auto *bookmark_layout = new wxBoxSizer(wxVERTICAL);
@@ -2838,6 +2872,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     metadata->AddPage(ui.elf_dynamic, "ELF dynamic");
     metadata->AddPage(ui.elf_tables, "ELF tables");
     metadata->AddPage(macho_panel, "Mach-O");
+    metadata->AddPage(ui.macho_objc, "Objective-C");
     metadata->AddPage(ui.annotations, "Annotations");
     metadata->AddPage(bookmark_panel, "Bookmarks");
     ui.references = new ReferenceView(metadata);

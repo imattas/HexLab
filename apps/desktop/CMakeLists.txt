@@ -2,7 +2,7 @@
 target_include_directories(hexlab_desktop_components PRIVATE "${PROJECT_SOURCE_DIR}/libs/workspace/src")
 target_sources(hexlab_desktop_components PRIVATE string_view.cpp analysis_issues_view.cpp)
 target_sources(hexlab_desktop_components PRIVATE minidump_view.cpp)
-target_sources(hexlab_desktop_components PRIVATE macho_view.cpp pseudocode_view.cpp source_view.cpp pe_view.cpp compare_view.cpp compare_adapter.cpp archive_view.cpp history_view.cpp)
+target_sources(hexlab_desktop_components PRIVATE macho_view.cpp macho_objc_view.cpp pseudocode_view.cpp source_view.cpp pe_view.cpp compare_view.cpp compare_adapter.cpp archive_view.cpp history_view.cpp)
 if(BUILD_TESTING)
   target_compile_definitions(hexlab_desktop_components PRIVATE HEXLAB_WORKSPACE_TESTING)
 endif()
