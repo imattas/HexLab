@@ -78,6 +78,7 @@ struct DwarfPackage {
 struct DwarfPackageResolvers {
     symbols::DwarfSupplementaryTypeResolver supplementary;
     symbols::DwarfTypeSignatureResolver type_signature;
+    std::shared_ptr<const DwarfPackage> type_package;
 };
 
 // Charge the decoded tables before the parser allocates them. The public
@@ -119,6 +120,46 @@ struct DwarfEmbeddedPackageResolvers {
     symbols::DwarfTypeSignatureResolver type_signature;
     std::shared_ptr<const DwarfPackage> package;
 };
+
+symbols::DwarfTypeSignatureResolver make_cross_package_type_signature_resolver(
+    const std::vector<std::pair<std::string, std::shared_ptr<const DwarfPackage>>> &sources,
+    Budget &budget, std::stop_token stop) {
+    std::vector<symbols::DwarfTypeUnitPackage> catalog;
+    std::unordered_set<std::uint64_t> signatures;
+    std::vector<std::shared_ptr<const DwarfPackage>> owners;
+    for (const auto &[source_id, package] : sources) {
+        if (!package) continue;
+        const auto index = package->type_index ? package->type_index : package->index;
+        if (!index || index->kind != symbols::DwarfPackageIndexKind::type_units) continue;
+        // A duplicate signature across independently selected packages is
+        // ambiguous here. Keep the loader's established selected/embedded/
+        // supplementary precedence resolver for that case instead of
+        // weakening the catalog's exact-identity rule.
+        for (const auto &row : index->rows) {
+            canceled(stop);
+            if (!signatures.insert(row.signature).second) return {};
+        }
+        budget.include(index->rows.size() * 64u + package->sections.size() * sizeof(symbols::DwarfPackageSectionData));
+        symbols::DwarfTypeUnitPackage item;
+        item.source_id = source_id;
+        item.index = index;
+        item.strings = package->strings;
+        item.line_strings = package->line_strings;
+        item.identity_verified = true; // Explicitly selected or embedded in the input ELF.
+        item.sections.reserve(package->sections.size());
+        for (const auto &[id, bytes] : package->sections) item.sections.push_back({id, bytes});
+        catalog.push_back(std::move(item));
+        owners.push_back(package);
+    }
+    if (catalog.size() < 2) return {};
+    auto resolver = symbols::make_dwarf_package_catalog_type_signature_resolver(
+        std::move(catalog), stop, {budget.limit - budget.used, 4096});
+    return [resolver = std::move(resolver), owners = std::move(owners)](std::uint64_t signature) {
+        // The spans in catalog entries borrow package section storage.
+        (void)owners;
+        return resolver(signature);
+    };
+}
 
 DwarfEmbeddedPackageResolvers read_dwp_resolvers(const ByteStorage &storage, const ElfMetadata &metadata,
                                                  Budget &budget, std::stop_token stop,
@@ -276,6 +317,7 @@ DwarfPackageResolvers read_dwp_supplementary_resolver(
         {budget.used < max_bytes ? max_bytes - budget.used : 0,
          std::min<std::uint32_t>(max_requests, 4096)});
     auto retained_package = package;
+    auto catalog_package = package;
     symbols::DwarfTypeSignatureResolver retained_type_signature =
         [type_signature = std::move(type_signature), retained_package = std::move(retained_package)](std::uint64_t signature) {
             return type_signature(signature);
@@ -352,7 +394,7 @@ DwarfPackageResolvers read_dwp_supplementary_resolver(
         return result;
         } catch (const Failure &failure) { return failure.error; }
     };
-    return {std::move(supplementary), std::move(retained_type_signature)};
+    return {std::move(supplementary), std::move(retained_type_signature), std::move(catalog_package)};
 }
 } // namespace
 
@@ -439,6 +481,7 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
                 "Explicit supplementary DWP was supplied but the ELF has no .debug_sup descriptor",
                 ErrorCode::unsupported);
         auto selected_supplementary_resolver = supplementary_resolver;
+        std::shared_ptr<const DwarfPackage> supplementary_type_package;
         if (supplementary_package && dwarf_sections.supplementary_identity.present) {
             auto package_resolvers = read_dwp_supplementary_resolver(
                 std::move(supplementary_package), dwarf_sections.supplementary_identity,
@@ -446,13 +489,14 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
                 supplementary_max_requests, stop);
             if (!selected_supplementary_resolver)
                 selected_supplementary_resolver = std::move(package_resolvers.supplementary);
+            supplementary_type_package = std::move(package_resolvers.type_package);
             if (dwarf_sections.type_signature_resolver && package_resolvers.type_signature) {
                 // Dispatch by exact package-index membership, rather than
                 // retrying an error: malformed/cyclic local types fail closed.
                 dwarf_sections.type_signature_resolver =
-                    [selected_package = std::move(selected_package.package),
+                    [selected_package = selected_package.package,
                      selected = std::move(selected_package.type_signature),
-                     embedded_package = std::move(embedded_package.package),
+                     embedded_package = embedded_package.package,
                      embedded = std::move(embedded_package.type_signature),
                      supplementary = std::move(package_resolvers.type_signature), stop](std::uint64_t signature)
                     -> Result<types::TypePtr> {
@@ -472,6 +516,12 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
             }
         }
         dwarf_sections.supplementary_type_resolver = std::move(selected_supplementary_resolver);
+        auto cross_package_types = make_cross_package_type_signature_resolver(
+            {{"ELF selected DWP type index", selected_package.package},
+             {"ELF embedded DWP type index", embedded_package.package},
+             {"ELF supplementary DWP type index", supplementary_type_package}},
+            budget, stop);
+        if (cross_package_types) dwarf_sections.type_signature_resolver = std::move(cross_package_types);
         auto imported = symbols::import_dwarf(dwarf_sections);
         if (!imported) return imported.error();
         std::uint64_t result_bytes = 0;
