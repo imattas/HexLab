@@ -480,6 +480,7 @@ class Msvc {
     Msvc(std::string_view input, const DemangleLimits& limits) : s_(input), limits_(limits) {}
     std::string parse() {
         if (s_.size() < 5 || s_[0] != '?') throw Failure{DemangleStatus::unsupported};
+        if (s_.substr(0, 3) == "??_") return special_name();
         at_ = 1;
         const bool templated_function = s_.substr(at_, 2) == "?$";
         auto function = name_component(0);
@@ -547,6 +548,62 @@ class Msvc {
         return out;
     }
   private:
+    std::string special_name() {
+        // Compiler generated data names have their own grammar. Keep this
+        // deliberately separate from function parsing so an incomplete
+        // intrinsic can never be mistaken for a callable symbol.
+        at_ = 3;
+        const char code = s_[at_++];
+        std::string out;
+        auto checked = [&](std::string value) {
+            if (value.size() > limits_.max_output_bytes) throw Failure{DemangleStatus::resource_limit};
+            return value;
+        };
+        auto scoped = [&]() {
+            auto value = qualified_type_name(1);
+            if (value.size() > limits_.max_output_bytes) throw Failure{DemangleStatus::resource_limit};
+            return value;
+        };
+        if (code == '7' || code == '8' || code == 'R') {
+            if (code == 'R') {
+                if (at_ >= s_.size()) throw Failure{DemangleStatus::malformed};
+                const char rtti = s_[at_++];
+                if (rtti == '0') {
+                    const auto type_name = rtti_type(1);
+                    if (!take('@') || !take('8') || at_ != s_.size()) throw Failure{DemangleStatus::malformed};
+                    return checked(type_name + " `RTTI Type Descriptor'");
+                }
+                if (rtti == '1') throw Failure{DemangleStatus::unsupported}; // base descriptor has four signed/unsigned fields
+                const char *label = rtti == '2' ? "`RTTI Base Class Array'" :
+                                    rtti == '3' ? "`RTTI Class Hierarchy Descriptor'" : nullptr;
+                if (rtti == '4') label = "`RTTI Complete Object Locator'";
+                if (!label) throw Failure{DemangleStatus::unsupported};
+                const auto name = scoped();
+                if (rtti == '4') {
+                    if (!take('6') || !take('B') || !take('@') || at_ != s_.size()) throw Failure{DemangleStatus::malformed};
+                    return checked(name + "::" + label);
+                }
+                if (!take('8') || at_ != s_.size()) throw Failure{DemangleStatus::malformed};
+                return checked(name + "::" + label);
+            }
+            const auto name = scoped();
+            if (!take('6') || !take('B') || !take('@') || at_ != s_.size()) throw Failure{DemangleStatus::malformed};
+            return checked(name + (code == '7' ? "::`vftable'" : "::`vbtable'"));
+        }
+        throw Failure{DemangleStatus::unsupported};
+    }
+    std::string rtti_type(std::size_t d) {
+        depth(d);
+        // RTTI type descriptors commonly encode a qualified class as ?AV,
+        // ?AU, ?AT, or ?AW followed by the ordinary scoped-name spelling.
+        if (peek() != '?') return type(d + 1);
+        if (!take('?') || !take('A') || at_ >= s_.size()) throw Failure{DemangleStatus::unsupported};
+        const char tag = s_[at_++];
+        const char *prefix = tag == 'V' ? "class " : tag == 'U' ? "struct " :
+                             tag == 'T' ? "union " : tag == 'W' ? "enum " : nullptr;
+        if (!prefix) throw Failure{DemangleStatus::unsupported};
+        return std::string(prefix) + qualified_type_name(d + 1);
+    }
     struct FunctionClass { bool valid=false, member=false, is_static=false, is_virtual=false; const char* access=""; };
     FunctionClass function_class(char c) {
         switch (c) {
