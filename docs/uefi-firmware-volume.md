@@ -1,0 +1,17 @@
+# UEFI PI firmware-volume inventory
+
+## Design note
+
+HexLab already parses Intel HEX and Motorola S-record text as sparse addressable records. UEFI firmware images instead contain binary firmware volumes with flat FFS file records, so the inventory stays a metadata parser over the original byte span. It recognizes PI revision-2 firmware volumes embedded at arbitrary offsets, validates bounded headers and FFS2/FFS3 block maps, then walks aligned FFS headers and reports file GUIDs, kinds, sizes, states, and payload offsets. It does not copy or map file payloads into synthetic segments. This makes the inventory useful for inspecting firmware blobs while avoiding unsupported assumptions about CPU mapping, capsule layout, or section semantics.
+
+The parser caps source bytes, number of volumes, total number of files, total number of sections, and nested section depth, and accepts a stop token. The CLI renders at most 4,096 file entries and 16,384 section entries while retaining full inventory counts. It parses standard and extended PI section headers, records offsets and parent/depth provenance, and inventories nested sections inside `EFI_SECTION_COMPRESSION` when the type is `EFI_NOT_COMPRESSED` or standard EFI compression type `1` decodes successfully. Decoded children use decoded-stream-relative offsets; they are never presented as original file offsets. Invalid, truncated, unsupported, or over-limit compressed streams remain opaque with declared size and algorithm recorded. See [bounded UEFI standard compression](uefi-standard-compression.md) for the decoder and exact limits. GUID-defined sections retain their GUID, data offset, attributes, and opaque payload range; processing-required sections are called out explicitly. `EFI_SECTION_DISPOSABLE` payloads are parsed as nested sections when structurally valid, but preserved as opaque metadata if their implementation-specific contents do not form a valid stream. No payload is executed or mapped, and malformed section streams are reported on their containing FFS file without hiding the file or volume. Authenticated capsule headers, nested-volume extraction, and file-data checksums remain outside this slice.
+
+The volume, file, section, compression, and GUID-defined section layouts follow the [UEFI Platform Initialization Specification 1.9, Firmware Storage Formats](https://uefi.org/sites/default/files/resources/UEFI_PI_Spec_Final_Draft_1.9.pdf) and the [TianoCore EDK II PI volume definitions](https://github.com/tianocore/edk2/blob/master/MdePkg/Include/Pi/PiFirmwareVolume.h). Section offsets point into the original input file; a section's payload range excludes its common header and, for compression or GUID-defined sections, the corresponding section-specific header.
+
+## CLI
+
+```text
+hexlab_cli firmware inspect image.fd --format uefi
+```
+
+The command scans for valid PI firmware volumes, prints each volume's file offset, length, file-system GUID, revision, and verified header checksum, then lists each FFS file and its section tree. Section rows include type, offset space, total and payload sizes, depth, parent index, and applicable compression or GUID-defined metadata. File-space offsets are relative to the input file; decoded-space offsets are relative to the decompressed stream. Unsupported file-system GUIDs or invalid volume candidates are skipped during scanning; malformed section streams are shown as per-file diagnostics. The command reports an error if no valid FFS2/FFS3 volume is found.

@@ -1,0 +1,3 @@
+#pragma once
+inline constexpr const char hexlab_python_facade[] =
+@HEXLAB_PYTHON_FACADE_LITERALS@;

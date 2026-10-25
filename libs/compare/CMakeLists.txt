@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.24)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  set(HEXLAB_COMPARE_STANDALONE ON)
+  project(HexLabCompare VERSION 0.1.0 LANGUAGES CXX)
+  include(CTest)
+  include(GNUInstallDirs)
+  include(GenerateExportHeader)
+  add_library(hexlab_options INTERFACE)
+  target_compile_features(hexlab_options INTERFACE cxx_std_20)
+  target_compile_options(hexlab_options INTERFACE
+    $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/W4;/permissive-;/utf-8>
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/HexLabLibrary.cmake")
+endif()
+hexlab_add_library(compare SOURCES src/compare.cpp src/instruction_diff.cpp src/block_correspondence.cpp src/session.cpp)
+if(BUILD_TESTING AND HEXLAB_COMPARE_STANDALONE)
+  add_executable(hexlab_compare_tests ../../tests/compare_tests.cpp)
+  target_link_libraries(hexlab_compare_tests PRIVATE hexlab::compare)
+  add_test(NAME binary_compare COMMAND hexlab_compare_tests)
+endif()
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/binary-comparison.md"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")

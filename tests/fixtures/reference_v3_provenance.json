@@ -1,0 +1,55 @@
+{
+    "reference_id":  "824defe0d5a68707",
+    "input_hex":  "e801000000c3c3",
+    "artifacts":  [
+                      {
+                          "path":  "out/ordinary-reference-identity/ordinary-v3.hxrc",
+                          "sha256":  "7904c4517c648d670da47d2447e45bc99ad7d0bcd3949d0ac08390d3a4b1a4cb",
+                          "bytes":  101
+                      },
+                      {
+                          "path":  "out/ordinary-reference-identity/check.cpp",
+                          "sha256":  "79239cab845b75a16d688106ce4c24c8af10b4659a2c0527b96fa6d9450b9c21",
+                          "bytes":  1882
+                      },
+                      {
+                          "path":  "out/ordinary-reference-identity/build/Release/probe.exe",
+                          "sha256":  "c475d32919597355820d9d7d4d6fcd4318c4f15abe34bfde961aa5a8480e9bf8",
+                          "bytes":  47616
+                      },
+                      {
+                          "path":  "out/build/windows-headless/bin/Release/hexlab_analysis.dll",
+                          "sha256":  "5cdcc22d5c8501dc6687d6c0bc86535e45cfa12a356a1930fba41a8182963d07",
+                          "bytes":  671744
+                      },
+                      {
+                          "path":  "out/build/windows-headless/bin/Release/hexlab_processors.dll",
+                          "sha256":  "d15a3495f375bfc412a7ef58ceed921dbf45cdf92a67979126557c1914ab6dba",
+                          "bytes":  63488
+                      }
+                  ],
+    "origin":  "Genuine prior Release payload3 producer, matching Release CRT, opaque ReferenceIndex API; compared with current Debug payload4",
+    "base":  "0x1000",
+    "preserved_runtime":  [
+                              {
+                                  "sha256":  "c475d32919597355820d9d7d4d6fcd4318c4f15abe34bfde961aa5a8480e9bf8",
+                                  "path":  "out\\ordinary-reference-identity\\producer-runtime\\probe.exe"
+                              },
+                              {
+                                  "sha256":  "3e24bf5808d1cc7f912db027b6af7eb21111f973af6bcd51ebeb30139578068b",
+                                  "path":  "out\\ordinary-reference-identity\\producer-runtime\\hexlab_core.dll"
+                              },
+                              {
+                                  "sha256":  "3b79d00290108bad4ce5a03276d2890188e03e2888d3694f28e1f80692ac944f",
+                                  "path":  "out\\ordinary-reference-identity\\producer-runtime\\hexlab_image.dll"
+                              },
+                              {
+                                  "sha256":  "d15a3495f375bfc412a7ef58ceed921dbf45cdf92a67979126557c1914ab6dba",
+                                  "path":  "out\\ordinary-reference-identity\\producer-runtime\\hexlab_processors.dll"
+                              },
+                              {
+                                  "sha256":  "5cdcc22d5c8501dc6687d6c0bc86535e45cfa12a356a1930fba41a8182963d07",
+                                  "path":  "out\\ordinary-reference-identity\\producer-runtime\\hexlab_analysis.dll"
+                              }
+                          ]
+}

@@ -1,0 +1,8 @@
+add_executable(hexlab_cli main.cpp argument_text.cpp commands.cpp compare_command.cpp firmware_uefi.cpp project_commands.cpp project_arguments.cpp project_output.cpp project_exchange_cli.cpp)
+target_link_libraries(hexlab_cli PRIVATE hexlab::workspace hexlab::plugins hexlab::decompiler hexlab::compare hexlab::analysis hexlab::firmware)
+if(APPLE)
+  set_target_properties(hexlab_cli PROPERTIES INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
+elseif(UNIX)
+  set_target_properties(hexlab_cli PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+endif()
+install(TARGETS hexlab_cli RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")

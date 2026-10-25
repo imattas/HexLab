@@ -1,0 +1,11 @@
+# Capstone fallback facts
+
+The Capstone fallback preserves Capstone's mnemonic and operand text and the original instruction bytes. Its opcode remains `Opcode::opaque`; no fallback instruction is treated as liftable merely because Capstone decoded it.
+
+When Capstone detail is available, control groups are mapped for enabled fallback modes: calls, returns/interrupt returns, traps, and jumps. Conditionality is only classified for x86 conditional-jump mnemonics. The fallback does not synthesize a target for architectures whose operand convention has not been handled.
+
+For x86 16-, 32-, and 64-bit modes, the fallback converts register, immediate, and memory operands. Register operands are mapped for the general purpose register bank, IP, flags, segments, XMM, and YMM when the Capstone name maps unambiguously. Memory read/write flags follow Capstone operand access bits; operands with no access bits are omitted. Address base/index reads come from the decoded address expression. A direct target is retained for an immediate operand of a call or branch.
+
+A64 and A32/Thumb use Capstone's per-operand access bits for register, immediate, and memory operands; immediate targets are used when the instruction is in a call/jump group. RISC-V converts register/immediate operands when register access can be established and represents memory operands as address-only, because Capstone does not state whether a particular memory form reads or writes. MIPS and PowerPC convert register/immediate operands when generic register access establishes their roles, and likewise retain memory forms as address-only. Register read/write sets use `cs_regs_access` only when every register maps to a known project bank; one unmappable implicit register suppresses both sets rather than emitting partial data.
+
+MOS6502 remains display-only beyond the generic control groups. Capstone detail may omit access information in diet builds; access-dependent operands are omitted in that case. Unsupported register names and operand types are omitted. Memory access flags remain unset for address-only operands. No opcode semantics, stack effects, delay slots, condition codes, or architecture-specific state transitions are inferred here.

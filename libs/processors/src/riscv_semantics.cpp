@@ -1,0 +1,575 @@
+#include "hexlab/processors/riscv_semantics.hpp"
+#include <algorithm>
+#include <bit>
+
+namespace hexlab {
+namespace {
+std::uint64_t width_mask(unsigned bits) noexcept {
+    return bits == 64 ? UINT64_MAX : (UINT64_C(1) << bits) - 1;
+}
+
+std::uint64_t multiply_high_unsigned(std::uint64_t a, std::uint64_t b) noexcept {
+    const auto a0 = static_cast<std::uint32_t>(a), a1 = static_cast<std::uint32_t>(a >> 32);
+    const auto b0 = static_cast<std::uint32_t>(b), b1 = static_cast<std::uint32_t>(b >> 32);
+    const std::uint64_t p00 = std::uint64_t{a0} * b0;
+    const std::uint64_t p01 = std::uint64_t{a0} * b1;
+    const std::uint64_t p10 = std::uint64_t{a1} * b0;
+    const std::uint64_t middle = (p00 >> 32) + static_cast<std::uint32_t>(p01) + static_cast<std::uint32_t>(p10);
+    return std::uint64_t{a1} * b1 + (p01 >> 32) + (p10 >> 32) + (middle >> 32);
+}
+
+bool negative(std::uint64_t value, unsigned bits) noexcept {
+    return (value & (UINT64_C(1) << (bits - 1))) != 0;
+}
+
+std::uint64_t magnitude(std::uint64_t value, unsigned bits) noexcept {
+    const auto mask = width_mask(bits);
+    value &= mask;
+    return negative(value, bits) ? (UINT64_C(0) - value) & mask : value;
+}
+
+std::uint64_t signed_divide(std::uint64_t a, std::uint64_t b, unsigned bits, bool remainder) noexcept {
+    const auto mask = width_mask(bits);
+    a &= mask;
+    b &= mask;
+    if (b == 0)
+        return remainder ? a : mask;
+    const bool a_negative = negative(a, bits), b_negative = negative(b, bits);
+    const auto a_magnitude = magnitude(a, bits), b_magnitude = magnitude(b, bits);
+    const auto quotient = a_magnitude / b_magnitude;
+    const auto rem = a_magnitude % b_magnitude;
+    if (remainder)
+        return a_negative ? (UINT64_C(0) - rem) & mask : rem;
+    const bool result_negative = a_negative != b_negative;
+    return result_negative ? (UINT64_C(0) - quotient) & mask : quotient;
+}
+
+std::uint64_t unsigned_divide(std::uint64_t a, std::uint64_t b, unsigned bits, bool remainder) noexcept {
+    const auto mask = width_mask(bits);
+    a &= mask;
+    b &= mask;
+    if (b == 0)
+        return remainder ? a : mask;
+    return remainder ? a % b : a / b;
+}
+
+std::uint64_t sign_extend_32(std::uint32_t value) noexcept {
+    return static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(value)));
+}
+
+std::uint64_t multiply_high(std::uint64_t a, std::uint64_t b, unsigned bits, bool signed_a,
+                            bool signed_b) noexcept {
+    const auto mask = width_mask(bits);
+    a &= mask;
+    b &= mask;
+    std::uint64_t high = 0;
+    if (bits <= 32) {
+        const auto product = a * b;
+        high = product >> bits;
+    } else {
+        high = multiply_high_unsigned(a, b);
+    }
+    if (signed_a && negative(a, bits))
+        high = (high - b) & mask;
+    if (signed_b && negative(b, bits))
+        high = (high - a) & mask;
+    return high;
+}
+} // namespace
+
+std::optional<std::uint64_t> evaluate_riscv_m_operation(RiscvOpcode opcode, unsigned xlen, std::uint64_t lhs,
+                                                        std::uint64_t rhs) noexcept {
+    if (xlen != 32 && xlen != 64)
+        return {};
+    const auto mask = width_mask(xlen);
+    lhs &= mask;
+    rhs &= mask;
+    switch (opcode) {
+    case RiscvOpcode::mul: return (lhs * rhs) & mask;
+    case RiscvOpcode::mulh:
+        return multiply_high(lhs, rhs, xlen, true, true);
+    case RiscvOpcode::mulhsu:
+        return multiply_high(lhs, rhs, xlen, true, false);
+    case RiscvOpcode::mulhu:
+        return multiply_high(lhs, rhs, xlen, false, false);
+    case RiscvOpcode::div: return signed_divide(lhs, rhs, xlen, false);
+    case RiscvOpcode::divu: return unsigned_divide(lhs, rhs, xlen, false);
+    case RiscvOpcode::rem: return signed_divide(lhs, rhs, xlen, true);
+    case RiscvOpcode::remu: return unsigned_divide(lhs, rhs, xlen, true);
+    case RiscvOpcode::mulw:
+        if (xlen != 64) return {};
+        return sign_extend_32(static_cast<std::uint32_t>(lhs) * static_cast<std::uint32_t>(rhs));
+    case RiscvOpcode::divw:
+        if (xlen != 64) return {};
+        return sign_extend_32(static_cast<std::uint32_t>(signed_divide(lhs, rhs, 32, false)));
+    case RiscvOpcode::divuw:
+        if (xlen != 64) return {};
+        return sign_extend_32(static_cast<std::uint32_t>(unsigned_divide(lhs, rhs, 32, false)));
+    case RiscvOpcode::remw:
+        if (xlen != 64) return {};
+        return sign_extend_32(static_cast<std::uint32_t>(signed_divide(lhs, rhs, 32, true)));
+    case RiscvOpcode::remuw:
+        if (xlen != 64) return {};
+        return sign_extend_32(static_cast<std::uint32_t>(unsigned_divide(lhs, rhs, 32, true)));
+    default: return {};
+    }
+}
+
+std::optional<std::uint64_t> evaluate_riscv_zbb_count_operation(RiscvOpcode opcode, unsigned xlen,
+                                                                std::uint64_t value) noexcept {
+    if (xlen != 32 && xlen != 64)
+        return {};
+    const bool word = opcode == RiscvOpcode::clzw || opcode == RiscvOpcode::ctzw ||
+                      opcode == RiscvOpcode::cpopw;
+    if (word && xlen != 64)
+        return {};
+    const unsigned width = word ? 32 : xlen;
+    value &= width_mask(width);
+    switch (opcode) {
+    case RiscvOpcode::clz: case RiscvOpcode::clzw:
+        return value ? static_cast<std::uint64_t>(std::countl_zero(value) - (64u - width)) : width;
+    case RiscvOpcode::ctz: case RiscvOpcode::ctzw:
+        return value ? static_cast<std::uint64_t>(std::countr_zero(value)) : width;
+    case RiscvOpcode::cpop: case RiscvOpcode::cpopw:
+        return static_cast<std::uint64_t>(std::popcount(value));
+    default:
+        return {};
+    }
+}
+
+std::optional<RiscvVectorIntegerConfig>
+make_riscv_vector_integer_config(std::uint16_t vlen_bits, std::uint8_t xlen_bits,
+                                 std::uint64_t vl, std::uint64_t vstart,
+                                 std::uint64_t encoded_vtype, bool masked) {
+    if ((xlen_bits != 32 && xlen_bits != 64) || (xlen_bits == 32 && encoded_vtype > UINT32_MAX) ||
+        vlen_bits < 64 || vlen_bits > 65528 || vlen_bits % 8 != 0)
+        return {};
+    const auto xmask = width_mask(xlen_bits);
+    encoded_vtype &= xmask;
+    if ((encoded_vtype & (UINT64_C(1) << (xlen_bits - 1))) != 0 || (encoded_vtype & ~UINT64_C(0xff)) != 0)
+        return {}; // vill or reserved high encoding bits
+    const unsigned vsew = static_cast<unsigned>((encoded_vtype >> 3) & 7);
+    const unsigned vlmul = static_cast<unsigned>(encoded_vtype & 7);
+    if (vsew > 3 || vlmul == 4) return {};
+    RiscvVectorIntegerConfig config;
+    config.vlen_bits = vlen_bits;
+    config.sew_bits = static_cast<std::uint8_t>(8u << vsew);
+    config.lmul_log2 = static_cast<std::int8_t>(vlmul <= 3 ? static_cast<int>(vlmul) : static_cast<int>(vlmul) - 8);
+    config.xlen_bits = xlen_bits;
+    config.vl = vl;
+    config.vstart = vstart;
+    config.masked = masked;
+    // Validate VLMAX and the active length through the same common path.
+    const auto lanes = static_cast<std::uint64_t>(vlen_bits / config.sew_bits);
+    const auto divisor = config.lmul_log2 < 0 ? (UINT64_C(1) << -config.lmul_log2) : 1;
+    const auto vlmax = config.lmul_log2 >= 0 ? lanes << config.lmul_log2 : lanes / divisor;
+    if ((config.lmul_log2 < 0 && lanes % divisor != 0) || vlmax == 0 || vlmax > 65536 ||
+        vl > vlmax || vstart > vl) return {};
+    return config;
+}
+
+std::optional<RiscvVectorConfigurationState>
+evaluate_riscv_vector_configuration(const RiscvInstruction &instruction,
+                                   std::uint8_t xlen_bits, std::uint16_t vlen_bits,
+                                   std::uint64_t rs1_value, std::uint64_t rs2_value,
+                                   std::uint64_t current_vl) {
+    if ((xlen_bits != 32 && xlen_bits != 64) || vlen_bits < 64 || vlen_bits > 65528 || vlen_bits % 8)
+        return {};
+    if (instruction.opcode != RiscvOpcode::vsetvli && instruction.opcode != RiscvOpcode::vsetivli &&
+        instruction.opcode != RiscvOpcode::vsetvl)
+        return {};
+    if (instruction.operands.size() != 3) return {};
+    const auto *rd = std::get_if<RiscvRegister>(&instruction.operands[0]);
+    if (!rd || rd->floating_point || rd->vector || rd->vector_configuration || rd->index >= 32) return {};
+
+    std::uint64_t avl = 0, encoded_vtype = 0;
+    bool rs1_zero = false;
+    if (instruction.opcode == RiscvOpcode::vsetivli) {
+        const auto *avl_immediate = std::get_if<RiscvImmediate>(&instruction.operands[1]);
+        const auto *vtype_immediate = std::get_if<RiscvImmediate>(&instruction.operands[2]);
+        if (!avl_immediate || avl_immediate->is_signed || avl_immediate->encoded_width != 5 ||
+            avl_immediate->value < 0 || avl_immediate->value > 31 || !vtype_immediate ||
+            vtype_immediate->is_signed || vtype_immediate->encoded_width != 10 || vtype_immediate->value < 0)
+            return {};
+        avl = static_cast<std::uint64_t>(avl_immediate->value);
+        encoded_vtype = static_cast<std::uint64_t>(vtype_immediate->value);
+    } else {
+        const auto *rs1 = std::get_if<RiscvRegister>(&instruction.operands[1]);
+        if (!rs1 || rs1->floating_point || rs1->vector || rs1->vector_configuration || rs1->index >= 32)
+            return {};
+        rs1_zero = rs1->index == 0;
+        if (instruction.opcode == RiscvOpcode::vsetvli) {
+            const auto *vtype_immediate = std::get_if<RiscvImmediate>(&instruction.operands[2]);
+            if (!vtype_immediate || vtype_immediate->is_signed || vtype_immediate->encoded_width != 11 ||
+                vtype_immediate->value < 0)
+                return {};
+            encoded_vtype = static_cast<std::uint64_t>(vtype_immediate->value);
+        } else {
+            const auto *rs2 = std::get_if<RiscvRegister>(&instruction.operands[2]);
+            if (!rs2 || rs2->floating_point || rs2->vector || rs2->vector_configuration || rs2->index >= 32)
+                return {};
+            encoded_vtype = rs2->index == 0 ? 0 : rs2_value;
+        }
+    }
+
+    const auto xmask = width_mask(xlen_bits);
+    encoded_vtype &= xmask;
+    RiscvVectorConfigurationState result;
+    result.vstart = 0;
+    const auto valid = make_riscv_vector_integer_config(vlen_bits, xlen_bits, 0, 0, encoded_vtype, false);
+    if (!valid) {
+        result.vill = true;
+        result.vtype = UINT64_C(1) << (xlen_bits - 1);
+        return result;
+    }
+    result.vtype = encoded_vtype;
+    result.sew_bits = valid->sew_bits;
+    result.lmul_log2 = valid->lmul_log2;
+    result.tail_agnostic = (encoded_vtype & (UINT64_C(1) << 6)) != 0;
+    result.mask_agnostic = (encoded_vtype & (UINT64_C(1) << 7)) != 0;
+
+    if (instruction.opcode != RiscvOpcode::vsetivli) {
+        if (rs1_zero)
+            avl = rd->index == 0 ? current_vl & xmask : UINT64_MAX;
+        else
+            avl = rs1_value & xmask;
+    }
+    const auto base_lanes = static_cast<std::uint64_t>(vlen_bits / valid->sew_bits);
+    const auto vlmax = valid->lmul_log2 >= 0
+        ? base_lanes << static_cast<unsigned>(valid->lmul_log2)
+        : base_lanes / (UINT64_C(1) << static_cast<unsigned>(-valid->lmul_log2));
+    result.vl = std::min(avl, vlmax);
+    return result;
+}
+
+std::optional<RiscvVectorIntegerResult>
+evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
+                                       const RiscvVectorIntegerOperands &operands) {
+    const unsigned sew = config.sew_bits, xlen = config.xlen_bits;
+    if ((sew != 8 && sew != 16 && sew != 32 && sew != 64) || (xlen != 32 && xlen != 64) ||
+        config.vlen_bits < 64 || config.vlen_bits > 65528 || config.vlen_bits % 8 != 0 ||
+        config.lmul_log2 < -3 || config.lmul_log2 > 3)
+        return {};
+    const std::uint64_t base_lanes = config.vlen_bits / sew;
+    std::uint64_t vlmax = base_lanes;
+    if (config.lmul_log2 >= 0) {
+        vlmax <<= static_cast<unsigned>(config.lmul_log2);
+    } else {
+        const auto divisor = UINT64_C(1) << static_cast<unsigned>(-config.lmul_log2);
+        if (base_lanes % divisor != 0) return {};
+        vlmax = base_lanes / divisor;
+    }
+    if (vlmax == 0 || vlmax > 65536 || config.vl > vlmax || config.vstart > config.vl ||
+        operands.vs2.size() != vlmax ||
+        operands.old_destination.size() != vlmax || (config.masked && operands.predicate_mask.size() != vlmax))
+        return {};
+
+    const bool gather_vv = opcode == RiscvOpcode::vrgather_vv;
+    const bool gather_vx = opcode == RiscvOpcode::vrgather_vx;
+    const bool gather_vi = opcode == RiscvOpcode::vrgather_vi;
+    const bool slide_up_vx = opcode == RiscvOpcode::vslideup_vx;
+    const bool slide_up_vi = opcode == RiscvOpcode::vslideup_vi;
+    const bool slide_down_vx = opcode == RiscvOpcode::vslidedown_vx;
+    const bool slide_down_vi = opcode == RiscvOpcode::vslidedown_vi;
+    if (gather_vv || gather_vx || gather_vi || slide_up_vx || slide_up_vi ||
+        slide_down_vx || slide_down_vi) {
+        if (gather_vv && operands.vs1.size() != vlmax) return {};
+        if ((gather_vi || slide_up_vi || slide_down_vi) &&
+            (operands.immediate < 0 || operands.immediate > 31))
+            return {};
+        const auto xlen_mask = width_mask(xlen);
+        const std::uint64_t encoded_index = gather_vx || slide_up_vx || slide_down_vx
+            ? operands.scalar & xlen_mask
+            : static_cast<std::uint64_t>(operands.immediate);
+        const auto element_mask = width_mask(sew);
+        RiscvVectorIntegerResult result;
+        result.vlmax = vlmax;
+        result.lanes.assign(operands.old_destination.begin(), operands.old_destination.end());
+        for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
+            if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0)
+                continue;
+            std::uint64_t value = 0;
+            if (gather_vv || gather_vx || gather_vi) {
+                const auto index = gather_vv
+                    ? operands.vs1[static_cast<std::size_t>(lane)] & element_mask
+                    : encoded_index;
+                if (index < vlmax)
+                    value = operands.vs2[static_cast<std::size_t>(index)] & element_mask;
+            } else if (slide_up_vx || slide_up_vi) {
+                if (lane < encoded_index) continue; // Slide-up preserves the low destination elements.
+                const auto source_lane = lane - encoded_index;
+                if (source_lane < vlmax)
+                    value = operands.vs2[static_cast<std::size_t>(source_lane)] & element_mask;
+            } else {
+                // An out-of-range slide-down source element is architecturally zero.
+                if (encoded_index < vlmax - lane)
+                    value = operands.vs2[static_cast<std::size_t>(lane + encoded_index)] & element_mask;
+            }
+            result.lanes[static_cast<std::size_t>(lane)] = value;
+        }
+        return result;
+    }
+
+    enum class Operation { add, sub, rsub, bit_and, bit_or, bit_xor, shl, shr, sar,
+                           minu, min, maxu, max, mul, mulh, mulhu, mulhsu,
+                           divu, div, remu, rem, eq, ne, ltu, lt, leu, le, gtu, gt };
+    Operation operation;
+    bool vector_rhs = false, scalar_rhs = false, immediate_rhs = false, mask_result = false;
+    switch (opcode) {
+#define RV_VECTOR_PAIR(vv, vx, name) case RiscvOpcode::vv: operation = Operation::name; vector_rhs = true; break; case RiscvOpcode::vx: operation = Operation::name; scalar_rhs = true; break
+#define RV_VECTOR_TRIPLE(vv, vx, vi, name) RV_VECTOR_PAIR(vv, vx, name); case RiscvOpcode::vi: operation = Operation::name; immediate_rhs = true; break
+    RV_VECTOR_TRIPLE(vadd_vv, vadd_vx, vadd_vi, add);
+    RV_VECTOR_PAIR(vsub_vv, vsub_vx, sub);
+    case RiscvOpcode::vrsub_vx: operation = Operation::rsub; scalar_rhs = true; break;
+    case RiscvOpcode::vrsub_vi: operation = Operation::rsub; immediate_rhs = true; break;
+    RV_VECTOR_TRIPLE(vand_vv, vand_vx, vand_vi, bit_and);
+    RV_VECTOR_TRIPLE(vor_vv, vor_vx, vor_vi, bit_or);
+    RV_VECTOR_TRIPLE(vxor_vv, vxor_vx, vxor_vi, bit_xor);
+    RV_VECTOR_TRIPLE(vsll_vv, vsll_vx, vsll_vi, shl);
+    RV_VECTOR_TRIPLE(vsrl_vv, vsrl_vx, vsrl_vi, shr);
+    RV_VECTOR_TRIPLE(vsra_vv, vsra_vx, vsra_vi, sar);
+    RV_VECTOR_PAIR(vminu_vv, vminu_vx, minu);
+    RV_VECTOR_PAIR(vmin_vv, vmin_vx, min);
+    RV_VECTOR_PAIR(vmaxu_vv, vmaxu_vx, maxu);
+    RV_VECTOR_PAIR(vmax_vv, vmax_vx, max);
+    RV_VECTOR_PAIR(vmul_vv, vmul_vx, mul);
+    RV_VECTOR_PAIR(vmulh_vv, vmulh_vx, mulh);
+    RV_VECTOR_PAIR(vmulhu_vv, vmulhu_vx, mulhu);
+    RV_VECTOR_PAIR(vmulhsu_vv, vmulhsu_vx, mulhsu);
+    RV_VECTOR_PAIR(vdivu_vv, vdivu_vx, divu);
+    RV_VECTOR_PAIR(vdiv_vv, vdiv_vx, div);
+    RV_VECTOR_PAIR(vremu_vv, vremu_vx, remu);
+    RV_VECTOR_PAIR(vrem_vv, vrem_vx, rem);
+    case RiscvOpcode::vmseq_vv: operation = Operation::eq; vector_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmseq_vx: operation = Operation::eq; scalar_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmseq_vi: operation = Operation::eq; immediate_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsne_vv: operation = Operation::ne; vector_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsne_vx: operation = Operation::ne; scalar_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsne_vi: operation = Operation::ne; immediate_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsltu_vv: operation = Operation::ltu; vector_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsltu_vx: operation = Operation::ltu; scalar_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmslt_vv: operation = Operation::lt; vector_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmslt_vx: operation = Operation::lt; scalar_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsleu_vv: operation = Operation::leu; vector_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsleu_vx: operation = Operation::leu; scalar_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsleu_vi: operation = Operation::leu; immediate_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsle_vv: operation = Operation::le; vector_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsle_vx: operation = Operation::le; scalar_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsle_vi: operation = Operation::le; immediate_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsgtu_vx: operation = Operation::gtu; scalar_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsgtu_vi: operation = Operation::gtu; immediate_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsgt_vx: operation = Operation::gt; scalar_rhs = true; mask_result = true; break;
+    case RiscvOpcode::vmsgt_vi: operation = Operation::gt; immediate_rhs = true; mask_result = true; break;
+#undef RV_VECTOR_TRIPLE
+#undef RV_VECTOR_PAIR
+    default: return {};
+    }
+    if ((vector_rhs && operands.vs1.size() != vlmax) ||
+        (!vector_rhs && !scalar_rhs && !immediate_rhs) || (vector_rhs && scalar_rhs) ||
+        (scalar_rhs && immediate_rhs)) return {};
+
+    const auto mask = width_mask(sew);
+    std::uint64_t scalar = operands.scalar & width_mask(xlen);
+    if (scalar_rhs && sew > xlen && (scalar & (UINT64_C(1) << (xlen - 1))))
+        scalar |= ~width_mask(xlen);
+    scalar &= mask;
+    const std::uint64_t imm = static_cast<std::uint64_t>(operands.immediate) & mask;
+    const auto signed_less = [sew](std::uint64_t lhs, std::uint64_t rhs) {
+        const bool ln = negative(lhs, sew), rn = negative(rhs, sew);
+        return ln != rn ? ln : lhs < rhs;
+    };
+    RiscvVectorIntegerResult result;
+    result.vlmax = vlmax;
+    result.mask_result = mask_result;
+    result.lanes.assign(operands.old_destination.begin(), operands.old_destination.end());
+    for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
+        if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0) continue;
+        const std::uint64_t lhs = operands.vs2.size() == vlmax ? operands.vs2[static_cast<std::size_t>(lane)] & mask : 0;
+        if (operands.vs2.size() != vlmax) return {};
+        const std::uint64_t rhs = vector_rhs ? operands.vs1[static_cast<std::size_t>(lane)] & mask : scalar_rhs ? scalar : imm;
+        std::uint64_t value = 0;
+        switch (operation) {
+        case Operation::add: value = (lhs + rhs) & mask; break;
+        case Operation::sub: value = (lhs - rhs) & mask; break;
+        case Operation::rsub: value = (rhs - lhs) & mask; break;
+        case Operation::bit_and: value = lhs & rhs; break;
+        case Operation::bit_or: value = lhs | rhs; break;
+        case Operation::bit_xor: value = lhs ^ rhs; break;
+        case Operation::shl: value = (lhs << (rhs & (sew - 1))) & mask; break;
+        case Operation::shr: value = lhs >> (rhs & (sew - 1)); break;
+        case Operation::sar: {
+            const unsigned shift = static_cast<unsigned>(rhs & (sew - 1));
+            value = shift == 0 ? lhs : (lhs >> shift) | (negative(lhs, sew) ? (mask ^ (mask >> shift)) : 0);
+            break;
+        }
+        case Operation::minu: value = lhs < rhs ? lhs : rhs; break;
+        case Operation::min: value = signed_less(lhs, rhs) ? lhs : rhs; break;
+        case Operation::maxu: value = lhs > rhs ? lhs : rhs; break;
+        case Operation::max: value = signed_less(lhs, rhs) ? rhs : lhs; break;
+        case Operation::mul: value = (lhs * rhs) & mask; break;
+        case Operation::mulh: value = multiply_high(lhs, rhs, sew, true, true); break;
+        case Operation::mulhu: value = multiply_high(lhs, rhs, sew, false, false); break;
+        case Operation::mulhsu: value = multiply_high(lhs, rhs, sew, true, false); break;
+        case Operation::divu: value = unsigned_divide(lhs, rhs, sew, false); break;
+        case Operation::div: value = signed_divide(lhs, rhs, sew, false); break;
+        case Operation::remu: value = unsigned_divide(lhs, rhs, sew, true); break;
+        case Operation::rem: value = signed_divide(lhs, rhs, sew, true); break;
+        case Operation::eq: value = lhs == rhs; break;
+        case Operation::ne: value = lhs != rhs; break;
+        case Operation::ltu: value = lhs < rhs; break;
+        case Operation::lt: value = signed_less(lhs, rhs); break;
+        case Operation::leu: value = lhs <= rhs; break;
+        case Operation::le: value = !signed_less(rhs, lhs); break;
+        case Operation::gtu: value = lhs > rhs; break;
+        case Operation::gt: value = signed_less(rhs, lhs); break;
+        }
+        result.lanes[static_cast<std::size_t>(lane)] = mask_result ? value : value & mask;
+    }
+    return result;
+}
+
+std::optional<RiscvVectorMemoryAccessPlan>
+plan_riscv_vector_memory_accesses(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
+                                  std::uint64_t base, std::uint64_t stride_bits,
+                                  std::uint8_t element_bits,
+                                  std::span<const std::uint8_t> predicate_mask) {
+    const bool load = opcode == RiscvOpcode::vle || opcode == RiscvOpcode::vlse;
+    const bool unit_stride = opcode == RiscvOpcode::vle || opcode == RiscvOpcode::vse;
+    const bool strided = opcode == RiscvOpcode::vlse || opcode == RiscvOpcode::vsse;
+    if ((!unit_stride && !strided) || (element_bits != 8 && element_bits != 16 &&
+        element_bits != 32 && element_bits != 64) ||
+        (config.xlen_bits != 32 && config.xlen_bits != 64) ||
+        (config.sew_bits != 8 && config.sew_bits != 16 &&
+         config.sew_bits != 32 && config.sew_bits != 64) ||
+        config.vlen_bits < 64 || config.vlen_bits > 65528 || config.vlen_bits % 8 != 0 ||
+        config.vlen_bits % config.sew_bits != 0 ||
+        config.lmul_log2 < -3 || config.lmul_log2 > 3)
+        return {};
+
+    const int sew_log2 = config.sew_bits == 8 ? 3 : config.sew_bits == 16 ? 4 :
+                         config.sew_bits == 32 ? 5 : 6;
+    const int eew_log2 = element_bits == 8 ? 3 : element_bits == 16 ? 4 :
+                         element_bits == 32 ? 5 : 6;
+    const int emul_log2 = static_cast<int>(config.lmul_log2) + eew_log2 - sew_log2;
+    if (emul_log2 < -3 || emul_log2 > 3)
+        return {}; // EMUL outside mf8..m8 is reserved.
+
+    const std::uint64_t base_lanes = config.vlen_bits / config.sew_bits;
+    std::uint64_t vlmax = base_lanes;
+    if (config.lmul_log2 >= 0)
+        vlmax <<= static_cast<unsigned>(config.lmul_log2);
+    else {
+        const auto divisor = UINT64_C(1) << static_cast<unsigned>(-config.lmul_log2);
+        if (base_lanes % divisor != 0) return {};
+        vlmax = base_lanes / divisor;
+    }
+    if (vlmax == 0 || vlmax > 65536 || config.vl > vlmax || config.vstart > config.vl ||
+        (config.masked && predicate_mask.size() != vlmax))
+        return {};
+
+    const auto xlen_mask = width_mask(config.xlen_bits);
+    if (base > xlen_mask || (strided && config.xlen_bits == 32 && stride_bits > UINT32_MAX))
+        return {};
+    std::int64_t signed_stride = 0;
+    if (strided) {
+        stride_bits &= xlen_mask;
+        if (config.xlen_bits == 32) {
+            const auto raw = static_cast<std::uint32_t>(stride_bits);
+            signed_stride = raw & UINT32_C(0x80000000)
+                ? static_cast<std::int64_t>(raw) - (INT64_C(1) << 32)
+                : static_cast<std::int64_t>(raw);
+        } else {
+            signed_stride = std::bit_cast<std::int64_t>(stride_bits);
+        }
+    }
+
+    RiscvVectorMemoryAccessPlan plan;
+    plan.vlmax = vlmax;
+    plan.element_bits = element_bits;
+    plan.load = load;
+    plan.active_elements.reserve(static_cast<std::size_t>(config.vl - config.vstart));
+    const std::uint64_t element_bytes = element_bits / 8;
+    for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
+        if (config.masked && predicate_mask[static_cast<std::size_t>(lane)] == 0)
+            continue;
+
+        const bool negative_stride = strided && signed_stride < 0;
+        const std::uint64_t magnitude = !strided ? element_bytes : negative_stride
+            ? static_cast<std::uint64_t>(-(signed_stride + 1)) + 1
+            : static_cast<std::uint64_t>(signed_stride);
+        if (lane != 0 && magnitude > UINT64_MAX / lane)
+            return {}; // lane * stride would overflow.
+        const auto displacement = lane * magnitude;
+        std::uint64_t address = base;
+        if (negative_stride) {
+            if (displacement > base) return {};
+            address -= displacement;
+        } else {
+            if (displacement > xlen_mask - base) return {};
+            address += displacement;
+        }
+        plan.active_elements.push_back({lane, address});
+    }
+    return plan;
+}
+
+std::optional<RiscvVectorMemoryAccessPlan>
+plan_riscv_vector_indexed_memory_accesses(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
+                                          std::uint64_t base, std::uint8_t index_element_bits,
+                                          std::span<const std::uint64_t> index_offsets,
+                                          std::span<const std::uint8_t> predicate_mask) {
+    const bool load = opcode == RiscvOpcode::vluxei || opcode == RiscvOpcode::vloxei;
+    const bool unordered = opcode == RiscvOpcode::vluxei || opcode == RiscvOpcode::vsuxei;
+    const bool store = opcode == RiscvOpcode::vsuxei || opcode == RiscvOpcode::vsoxei;
+    const auto valid_width = [](unsigned bits) { return bits == 8 || bits == 16 || bits == 32 || bits == 64; };
+    if ((!load && !store) || !valid_width(index_element_bits) || !valid_width(config.sew_bits) ||
+        (config.xlen_bits != 32 && config.xlen_bits != 64) ||
+        config.vlen_bits < 64 || config.vlen_bits > 65528 || config.vlen_bits % 8 != 0 ||
+        config.vlen_bits % config.sew_bits != 0 || config.lmul_log2 < -3 || config.lmul_log2 > 3)
+        return {};
+
+    const auto log2_width = [](unsigned bits) -> int {
+        return bits == 8 ? 3 : bits == 16 ? 4 : bits == 32 ? 5 : 6;
+    };
+    const int index_emul_log2 = static_cast<int>(config.lmul_log2) +
+                                log2_width(index_element_bits) - log2_width(config.sew_bits);
+    if (index_emul_log2 < -3 || index_emul_log2 > 3)
+        return {}; // Index EEW derives an unrepresentable EMUL.
+
+    const std::uint64_t base_lanes = config.vlen_bits / config.sew_bits;
+    std::uint64_t vlmax = base_lanes;
+    if (config.lmul_log2 >= 0)
+        vlmax <<= static_cast<unsigned>(config.lmul_log2);
+    else {
+        const auto divisor = UINT64_C(1) << static_cast<unsigned>(-config.lmul_log2);
+        if (base_lanes % divisor != 0) return {};
+        vlmax = base_lanes / divisor;
+    }
+    if (!vlmax || vlmax > 65536 || config.vl > vlmax || config.vstart > config.vl ||
+        index_offsets.size() != vlmax || (config.masked && predicate_mask.size() != vlmax))
+        return {};
+
+    const auto xlen_mask = width_mask(config.xlen_bits);
+    const auto index_mask = width_mask(index_element_bits);
+    if (base > xlen_mask) return {};
+    RiscvVectorMemoryAccessPlan plan;
+    plan.vlmax = vlmax;
+    plan.element_bits = config.sew_bits;
+    plan.index_element_bits = index_element_bits;
+    plan.load = load;
+    plan.ordered = !unordered;
+    plan.active_elements.reserve(static_cast<std::size_t>(config.vl - config.vstart));
+    for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
+        if (config.masked && predicate_mask[static_cast<std::size_t>(lane)] == 0)
+            continue;
+        const auto raw_offset = index_offsets[static_cast<std::size_t>(lane)];
+        if (raw_offset > index_mask)
+            return {}; // Caller supplied bits outside the encoded index EEW.
+        const auto offset = raw_offset & xlen_mask; // Wider indices use their low XLEN bits.
+        if (offset > xlen_mask - base)
+            return {}; // Reject address wrap rather than silently wrapping.
+        plan.active_elements.push_back({lane, base + offset});
+    }
+    return plan;
+}
+} // namespace hexlab

@@ -1,0 +1,19 @@
+/out/
+/.superpowers/
+/.worktrees/
+CMakeUserPresets.json
+*.user
+
+# Isolated agent build trees and their root-level logs are local artifacts.
+/.agent-*
+/.codex-*
+/agent-*
+/*-build/
+/*.log
+
+# Stray export-header filenames from earlier configure runs are not sources.
+/#pragma once*
+
+# Local generated CMake/build trees outside out/
+/build/
+/src/

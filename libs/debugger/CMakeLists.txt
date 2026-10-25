@@ -1,0 +1,23 @@
+if(WIN32)
+  set(HEXLAB_DEBUGGER_NATIVE src/native_backend_win.cpp)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set(HEXLAB_DEBUGGER_NATIVE src/native_backend_macos.cpp)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" HEXLAB_DEBUGGER_PROCESSOR)
+  if(HEXLAB_DEBUGGER_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(HEXLAB_DEBUGGER_NATIVE src/native_backend_linux_aarch64.cpp)
+  elseif(HEXLAB_DEBUGGER_PROCESSOR MATCHES "^(x86_64|amd64|x64)$")
+    set(HEXLAB_DEBUGGER_NATIVE src/native_backend_linux.cpp)
+  else()
+    # Unsupported Linux architectures still build the portable debugger and
+    # RSP client; make_native_backend() reports native support as unavailable.
+    set(HEXLAB_DEBUGGER_NATIVE src/native_backend_stub.cpp)
+  endif()
+else()
+  set(HEXLAB_DEBUGGER_NATIVE src/native_backend_stub.cpp)
+endif()
+hexlab_add_library(debugger SOURCES src/debugger.cpp src/memory_search.cpp src/rsp.cpp src/rsp_tcp.cpp src/rsp_backend.cpp ${HEXLAB_DEBUGGER_NATIVE}
+  DEPENDS hexlab::core)
+if(WIN32)
+  target_link_libraries(hexlab_debugger PRIVATE kernel32 psapi ws2_32)
+endif()

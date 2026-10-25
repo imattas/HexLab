@@ -1,0 +1,71 @@
+{
+    "origin":  "Unmodified current HexLab v3 producer API; live encode/decode roundtrip; authored ELF provider compiled and linked without execution",
+    "wire_version":  3,
+    "header_hex":  "485844430003",
+    "engine":  "hexlab-functions-v7/x86-scalar-context-v4/elf-symbol-roots-v1",
+    "recipe_hex":  "010004",
+    "symbol_seed_kind":  5,
+    "functions":  1,
+    "artifacts":  [
+                      {
+                          "path":  "out/elf-cache-v3-capture/derived_v3.hxdc",
+                          "bytes":  4337,
+                          "sha256":  "bef86a0f2c897c96bd0ed01cb4e2be0c7a21e8cd9fb14a24ad2c51231062a977"
+                      },
+                      {
+                          "path":  "out/elf-cache-v3-capture/provider.so",
+                          "bytes":  1944,
+                          "sha256":  "679b30fbdecfe6d1e6ab439b9a9ef953733ee7d8f0c4185e89c6762cce1463e3"
+                      },
+                      {
+                          "path":  "out/elf-cache-v3-capture/capture.cpp",
+                          "bytes":  2145,
+                          "sha256":  "a287d47d5f906bb10943dec68c8ac60a931a98205158a099a428571fe3cfd8b2"
+                      },
+                      {
+                          "path":  "out/elf-dynamic-tool-probe/provider.c",
+                          "bytes":  52,
+                          "sha256":  "d3c1cb2f4c51d5f03d1dbcb5a01eb3d0042f00d11da683734d29a868c2a874fa"
+                      },
+                      {
+                          "path":  "libs/analysis/src/derived_cache.cpp",
+                          "bytes":  27073,
+                          "sha256":  "a8d0f9b734462631a6c062ecf40ce44f8af30c0fb69d24b00f7656ca726edcd2"
+                      },
+                      {
+                          "path":  "libs/analysis/src/derived_cache_instruction.cpp",
+                          "bytes":  5513,
+                          "sha256":  "4fe91245d044884813a532280dae100fd5ac5a144958ac96b6ca58f51d2ef367"
+                      },
+                      {
+                          "path":  "libs/analysis/src/functions.cpp",
+                          "bytes":  23872,
+                          "sha256":  "fd6018a4b42811d0472a8c20a4393b5e0fd52de9f2d7619a221373104e036c99"
+                      },
+                      {
+                          "path":  "out/build/windows-headless/bin/Debug/hexlab_core.dll",
+                          "bytes":  157696,
+                          "sha256":  "696e2ef4c4cbe7303923c9cf85dba54e329ee57aedbb2a8826a8d7fd0b060b1c"
+                      },
+                      {
+                          "path":  "out/build/windows-headless/bin/Debug/hexlab_image.dll",
+                          "bytes":  1131008,
+                          "sha256":  "faaf0994e10308b7456258c79e05a4eda666bd7444d4c2392d9b0947ad9f4d70"
+                      },
+                      {
+                          "path":  "out/build/windows-headless/bin/Debug/hexlab_loaders.dll",
+                          "bytes":  1441280,
+                          "sha256":  "012ebeae193eabf6f0aa8a428203ede75c3953833551cc8fba808623f2e580a0"
+                      },
+                      {
+                          "path":  "out/build/windows-headless/bin/Debug/hexlab_processors.dll",
+                          "bytes":  236032,
+                          "sha256":  "d840f363dc476300e8cb190b4a02bb9f0558b1c14aed8ef647327ad8f5a590e8"
+                      },
+                      {
+                          "path":  "out/build/windows-headless/bin/Debug/hexlab_analysis.dll",
+                          "bytes":  3056640,
+                          "sha256":  "7261947242a6f063b5b911b247a3edc20138b697d97471fcd46be39a368ae5c9"
+                      }
+                  ]
+}

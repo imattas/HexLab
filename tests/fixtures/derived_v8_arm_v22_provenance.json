@@ -1,0 +1,3367 @@
+﻿{
+    "claim":  "Genuine engine22 A64 ELF object/schema8/refpayload7 emitted once by actual ProjectSession/Store before A32/T32 metadata changes. Matching freshly installed SDK/runtime/source; 2 functions/7 instructions/6 owned relocations, packed14/19/26 fields, register bank5, annotation and source-bound Follow. No rewriting or input execution.",
+    "engine_sha256":  "5330b1ba4b202ee4975fa23fed9e7d39e3ec8c154e47eb63d399e73dc3e24845",
+    "derived_cache_version":  8,
+    "reference_payload_version":  7,
+    "inputs_executed":  false,
+    "owner":  [
+                  2,
+                  0
+              ],
+    "callee":  [
+                   4,
+                   0
+               ],
+    "files":  [
+                  {
+                      "path":  "bin/hexlab_analysis.dll",
+                      "bytes":  4138496,
+                      "sha256":  "c1333924a51ff7384b7618f9c45278b23c198da106fc06f9f66530d9ee0bf9b5"
+                  },
+                  {
+                      "path":  "bin/hexlab_cli.exe",
+                      "bytes":  1283584,
+                      "sha256":  "6022e502dc7718b5c1d6445ad13ec9defedb3e9e4d5c81c8948223316e8dba90"
+                  },
+                  {
+                      "path":  "bin/hexlab_core.dll",
+                      "bytes":  157696,
+                      "sha256":  "696e2ef4c4cbe7303923c9cf85dba54e329ee57aedbb2a8826a8d7fd0b060b1c"
+                  },
+                  {
+                      "path":  "bin/hexlab_database.dll",
+                      "bytes":  1904640,
+                      "sha256":  "a403ef5263d96dd86148d618d4f3b491a55db6a428803ef0e6068ec56fa2c137"
+                  },
+                  {
+                      "path":  "bin/hexlab_image.dll",
+                      "bytes":  1173504,
+                      "sha256":  "1b0de6aedf465f84d7a7e501377e98a59b32b180b1ac45b31bd2a680df2bf19b"
+                  },
+                  {
+                      "path":  "bin/hexlab_loaders.dll",
+                      "bytes":  2252800,
+                      "sha256":  "652b9ba3397499695d6ac45d148fc2c5ab8ef3fdb81a0d2c10af3766a246ee4b"
+                  },
+                  {
+                      "path":  "bin/hexlab_processors.dll",
+                      "bytes":  264192,
+                      "sha256":  "33dda52d8094b5e48cffb8a928d7d42878eef7c053bdb40ccc839b138f83cb91"
+                  },
+                  {
+                      "path":  "bin/hexlab_sqlite3.dll",
+                      "bytes":  1765888,
+                      "sha256":  "c38f9ca7812cd8eee08d394a2f08e8de9247db99d45583752b4d4dd8dd5d2f44"
+                  },
+                  {
+                      "path":  "bin/hexlab_workspace.dll",
+                      "bytes":  3001344,
+                      "sha256":  "a3ec1e87a7ed249114ec8e6ec9ce78891f403af32d4d2b295017188c199f0053"
+                  },
+                  {
+                      "path":  "CMakeLists.txt",
+                      "bytes":  622,
+                      "sha256":  "12a08dfcfec7baa35ee0f4fe567b8acd7c8ebfe27dbefa4f7387e7d3a133f81d"
+                  },
+                  {
+                      "path":  "derived_v8_arm_v22.hxdc",
+                      "bytes":  5452,
+                      "sha256":  "5be683c0607c240f4dd3797bcd1789fa9011a37146e0a6ea550bf57f8de5177b"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/analysis.hpp",
+                      "bytes":  1174,
+                      "sha256":  "9a2cd460196035fa82785a2be05918d7086cd1adaf3d2a9771516a0558265a5f"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/analysis_export.hpp",
+                      "bytes":  1255,
+                      "sha256":  "2948edb55e61efc180e4e750dcec55ed52cc876fe9e2bfe553edba3a569db430"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/decisions.hpp",
+                      "bytes":  968,
+                      "sha256":  "1d516f841252f22b2c168bf95a237f2f5724d16f73ddc72d3116dbd44e398423"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/dependencies.hpp",
+                      "bytes":  1301,
+                      "sha256":  "37a5938b41406c48b38260bfa1ae6ce1f159f6fe7ee239cf98e0f2737e2273fa"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/derived_cache.hpp",
+                      "bytes":  1189,
+                      "sha256":  "ea557639108fa8be37ea7b6b4801f3647bc5e676b58c49876b28830111e8adf8"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/elf_relocations.hpp",
+                      "bytes":  2616,
+                      "sha256":  "3860239e4d4e50ffccf148bff816502111461dc22f32405c88c45425b4e1f3c3"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/functions.hpp",
+                      "bytes":  3591,
+                      "sha256":  "06e3d9be23db61e03d2769f316f2df3a7f11cb714eb379d6f941a397e32c1bf9"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/graph.hpp",
+                      "bytes":  3309,
+                      "sha256":  "cefa289b9a1f1c61545e90fc35d136d33d0afb6608fdd1db850aa3adce9fbfba"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/incremental.hpp",
+                      "bytes":  2479,
+                      "sha256":  "c23785344682720433fa51d73d6cc559fae60a0d92c9aafe6775f4ae4b73227f"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/macho_dyld.hpp",
+                      "bytes":  3191,
+                      "sha256":  "4ce5cbb76dbc1fbaecc7d6037ec06765a695f3ed3d3ceb51b4f3c815acc38741"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/macho_relocations.hpp",
+                      "bytes":  2239,
+                      "sha256":  "398bfd76b1e7ba0ae39857bb879cb60b0b38f34577c99c20d5f0929cd1c24f83"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/references.hpp",
+                      "bytes":  7954,
+                      "sha256":  "13281baaedc96507cf37510320299d20c0de2fca320abaaf52767f6455f60a64"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/relocations.hpp",
+                      "bytes":  2785,
+                      "sha256":  "72055b4b97e8beb99a8cd0af1a416e0159a8ba417f56b98455f1df510346e662"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/search.hpp",
+                      "bytes":  2537,
+                      "sha256":  "e496720454ebb0fdfe96a3576f4a05f4943aa7f34002d2ebd0372ec0b57353ff"
+                  },
+                  {
+                      "path":  "include/hexlab/analysis/strings.hpp",
+                      "bytes":  868,
+                      "sha256":  "c3b94ac85e8c43743acd814981dd9e83b221ddc3d4aaa1a78bfa47275f6d593c"
+                  },
+                  {
+                      "path":  "include/hexlab/core/address.hpp",
+                      "bytes":  1306,
+                      "sha256":  "fc15aeadaadc54f891f0d5cf1ce53fcfa8f01c657e1aefb33aea4fd6ec2109d4"
+                  },
+                  {
+                      "path":  "include/hexlab/core/architecture.hpp",
+                      "bytes":  915,
+                      "sha256":  "9ea97b570a00583eeae528527924e27dc6e26d8cadb4ddf3d91bd76e21cbfa0e"
+                  },
+                  {
+                      "path":  "include/hexlab/core/byte_reader.hpp",
+                      "bytes":  1164,
+                      "sha256":  "9d45ffdafa1ffe4ad9b014cc70ed1ed6fc8943a0c70283757a16ea95985282cb"
+                  },
+                  {
+                      "path":  "include/hexlab/core/core_export.hpp",
+                      "bytes":  1159,
+                      "sha256":  "4a9a9c04a50301f505da8607c87e67ff666eee3a9b0ae3a746cda7a6c1f857ac"
+                  },
+                  {
+                      "path":  "include/hexlab/core/encoding.hpp",
+                      "bytes":  338,
+                      "sha256":  "9d2492cc136b650575747ffb2858cf47ba03d9980d21f41faf924e7b6394b63a"
+                  },
+                  {
+                      "path":  "include/hexlab/core/location.hpp",
+                      "bytes":  137,
+                      "sha256":  "0edf5477be310d4984deaaf24c010a825172fa36c2d0d0a0f51fd0680b0524b9"
+                  },
+                  {
+                      "path":  "include/hexlab/core/paging.hpp",
+                      "bytes":  140,
+                      "sha256":  "dd6ec92b7e0a9dff95c0d59bb7cd4f3f14a8ceb2060b9dbc19d063371df082aa"
+                  },
+                  {
+                      "path":  "include/hexlab/core/result.hpp",
+                      "bytes":  1108,
+                      "sha256":  "5927c9e0027741d258d1e41b4143dc4f82d0b3123943cb0e7e4d9f8e55e3fafe"
+                  },
+                  {
+                      "path":  "include/hexlab/core/sha256.hpp",
+                      "bytes":  788,
+                      "sha256":  "38177d324bfef1daf6336700c56656b7e0c2de55c889843a20a418428e6f1949"
+                  },
+                  {
+                      "path":  "include/hexlab/core/version.hpp",
+                      "bytes":  218,
+                      "sha256":  "59858596d46c91afe89ac19d4e491d7c87ab99a4a7ad3b8ded7f22d90e04793d"
+                  },
+                  {
+                      "path":  "include/hexlab/core/x86_segments.hpp",
+                      "bytes":  3263,
+                      "sha256":  "732672000cc182cfdf1301688c960d67f9297c01f5e7e120ae6b737682cfd358"
+                  },
+                  {
+                      "path":  "include/hexlab/database/backup.hpp",
+                      "bytes":  58,
+                      "sha256":  "acf3de858c02dd3fe5e1cbc6f25e76604692d332b93593b1c0cf91c6ece6da73"
+                  },
+                  {
+                      "path":  "include/hexlab/database/cache.hpp",
+                      "bytes":  145,
+                      "sha256":  "05804e618778ae888dda136d70627a8212d6435b332ca5fbf3e1dea77b6d9dd4"
+                  },
+                  {
+                      "path":  "include/hexlab/database/codec.hpp",
+                      "bytes":  632,
+                      "sha256":  "cc3ada8f5a69a5bc5db9386a9163f7524e932ec62286cda3b0a97c7f6d5f6a1e"
+                  },
+                  {
+                      "path":  "include/hexlab/database/connection.hpp",
+                      "bytes":  2938,
+                      "sha256":  "6cafaba84185bf2914f257069c97f5c464b60cdafcae912550654eacea1bf14b"
+                  },
+                  {
+                      "path":  "include/hexlab/database/database_export.hpp",
+                      "bytes":  1255,
+                      "sha256":  "77c6037bee85081e1b7d1e3c9231c65cf9574a9f4a4e35d5668185836b86abbd"
+                  },
+                  {
+                      "path":  "include/hexlab/database/input.hpp",
+                      "bytes":  58,
+                      "sha256":  "acf3de858c02dd3fe5e1cbc6f25e76604692d332b93593b1c0cf91c6ece6da73"
+                  },
+                  {
+                      "path":  "include/hexlab/database/lease.hpp",
+                      "bytes":  463,
+                      "sha256":  "bdadd0e11bb8b26eef51daaaea25773300d587fab1a77a5470efbb6c651989ba"
+                  },
+                  {
+                      "path":  "include/hexlab/database/project_state.hpp",
+                      "bytes":  5018,
+                      "sha256":  "37710a79bf3734be0be56358bc9ddf13996355dac92d1d0a4db0e968150b58e8"
+                  },
+                  {
+                      "path":  "include/hexlab/database/transaction.hpp",
+                      "bytes":  715,
+                      "sha256":  "363d934cc6981928e7a4c37078d446f7bcf3fd36f8f509a54a3412891800b65b"
+                  },
+                  {
+                      "path":  "include/hexlab/image/byte_storage.hpp",
+                      "bytes":  666,
+                      "sha256":  "ecb70915e12803b6d5965a70243c7c620189b9c038f11687ccb42cacb4bc4633"
+                  },
+                  {
+                      "path":  "include/hexlab/image/elf_metadata.hpp",
+                      "bytes":  5035,
+                      "sha256":  "5b6c311627428be72179b6c586a5b8d3e7ac18ed610d50931daef8c5f59eb8e5"
+                  },
+                  {
+                      "path":  "include/hexlab/image/file_publication.hpp",
+                      "bytes":  865,
+                      "sha256":  "3aa60597cb9a2eca94e85668946cace96490469fd5c7fa6cd315a77615babc20"
+                  },
+                  {
+                      "path":  "include/hexlab/image/file_storage.hpp",
+                      "bytes":  1130,
+                      "sha256":  "a9877d477662685a267022b01f3d1948233efb1c91f01dbdecf6969ea0f7fb04"
+                  },
+                  {
+                      "path":  "include/hexlab/image/image.hpp",
+                      "bytes":  4427,
+                      "sha256":  "f2cd7a82e693d55f030f76a03f420d379778d22fe3cfaa2c33ae3c960b646202"
+                  },
+                  {
+                      "path":  "include/hexlab/image/image_export.hpp",
+                      "bytes":  1183,
+                      "sha256":  "8534d7cf4e5cff299949a49b595e10e1b5e8ebc758c878209312c1e1985752b9"
+                  },
+                  {
+                      "path":  "include/hexlab/image/macho_mapping.hpp",
+                      "bytes":  1431,
+                      "sha256":  "6a4d219be527ab7e5cdb66d479bb8ee762bdc904e1301dc64463d069995b5612"
+                  },
+                  {
+                      "path":  "include/hexlab/image/macho_metadata.hpp",
+                      "bytes":  12791,
+                      "sha256":  "330906130345ea47b2fa32b25033b92e90a218f972a62473330e2ef67ba8d9ef"
+                  },
+                  {
+                      "path":  "include/hexlab/image/metadata.hpp",
+                      "bytes":  1910,
+                      "sha256":  "b15673044a1ed723b137f5b28a13f03a30a4b15808890bf5272e51e17f9e2081"
+                  },
+                  {
+                      "path":  "include/hexlab/image/patches.hpp",
+                      "bytes":  709,
+                      "sha256":  "31fb496b118397b3a48c884ff4e9fb364e0d5ef703b84d38a5ea484c5f055e7b"
+                  },
+                  {
+                      "path":  "include/hexlab/image/read_set.hpp",
+                      "bytes":  1081,
+                      "sha256":  "0fcbe8ba33ffb54027cc5b59148111739bcd364d6749ea49d4c120c145e28586"
+                  },
+                  {
+                      "path":  "include/hexlab/loaders/elf.hpp",
+                      "bytes":  554,
+                      "sha256":  "352013039b3dbbca197a8116e21cfb5f2de14a0feb3349650076810d21ba0d3d"
+                  },
+                  {
+                      "path":  "include/hexlab/loaders/loaded_image.hpp",
+                      "bytes":  362,
+                      "sha256":  "a271ec1d7897ebd5dfca3ea4b810a0d62708a009188d81634adb4bed5160d6b7"
+                  },
+                  {
+                      "path":  "include/hexlab/loaders/loader.hpp",
+                      "bytes":  360,
+                      "sha256":  "b15307ac0336253764ca2b1d236235517bca46335f01480d773f1b4d0b06ad3e"
+                  },
+                  {
+                      "path":  "include/hexlab/loaders/loaders_export.hpp",
+                      "bytes":  1231,
+                      "sha256":  "c80b8ed433b14b9497b40762dc7327d86d377b13fb6fc47a055ed1e69768f48c"
+                  },
+                  {
+                      "path":  "include/hexlab/loaders/macho.hpp",
+                      "bytes":  818,
+                      "sha256":  "7750a265ae9667fd46bba9436443edc2ef6e07d006d62364810d9bad18740241"
+                  },
+                  {
+                      "path":  "include/hexlab/loaders/pe.hpp",
+                      "bytes":  203,
+                      "sha256":  "32032a3dc7ebc491d705c5fe93d4ffc15419779c9a621c53fceeafdbdce04b83"
+                  },
+                  {
+                      "path":  "include/hexlab/loaders/raw.hpp",
+                      "bytes":  941,
+                      "sha256":  "240de9d9f83d2d0fdb3da2c0fc1b4489b7b0461eebbdfd812e0766f81826eba2"
+                  },
+                  {
+                      "path":  "include/hexlab/loaders/recipe.hpp",
+                      "bytes":  1188,
+                      "sha256":  "883f4ea5cab2dc2af66906216678aeb16438527593549104b4652924a2c73f06"
+                  },
+                  {
+                      "path":  "include/hexlab/loaders/x86_raw_profile.hpp",
+                      "bytes":  1460,
+                      "sha256":  "172affdceb9adbc7e0045b9578e524af16c514e397a8e7a2ccd2f0c6417eec8a"
+                  },
+                  {
+                      "path":  "include/hexlab/processors/decoder.hpp",
+                      "bytes":  1244,
+                      "sha256":  "8eb5627c5d8878509e39aeb327553c25a17959c1c80599057f4ff33b0afcd8f7"
+                  },
+                  {
+                      "path":  "include/hexlab/processors/format.hpp",
+                      "bytes":  366,
+                      "sha256":  "3d8995d7ce15e365fadb2c0b25d5d23c49d72c699a504f584978a43da67751a1"
+                  },
+                  {
+                      "path":  "include/hexlab/processors/instruction.hpp",
+                      "bytes":  3738,
+                      "sha256":  "dc6ba6a79896fb784ebfe34ceb82abc139305df13e4734ec6a47d8065a8766b8"
+                  },
+                  {
+                      "path":  "include/hexlab/processors/processors_export.hpp",
+                      "bytes":  1303,
+                      "sha256":  "66db6211715ad5a1cb50fd4ee5a5c1122e3909869535102f30f974e5aae61008"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/analysis_pool.hpp",
+                      "bytes":  2337,
+                      "sha256":  "de3556da76c3ceccd4c68b9e7f492454b97c57fd5b9e4809890447f8bc9bd40a"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/commands.hpp",
+                      "bytes":  1644,
+                      "sha256":  "441925999b26d393407f8097e5faebf19f737d0eb642af02b869f1f629385383"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/document.hpp",
+                      "bytes":  1573,
+                      "sha256":  "fd1c2f88da7015d7600229d3e491676946125c0501d467655f152ca8c11f0895"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/document_manager.hpp",
+                      "bytes":  2221,
+                      "sha256":  "b0bd859899df49d4ba06fae8dbf32dc6a09b487be72f0ea5bf626b63ec49efc2"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/export.hpp",
+                      "bytes":  328,
+                      "sha256":  "71bb368bf739cc4c1afb3344ae7e5a4b7f78c616b08230d5a1ac44d2dcfe2ae9"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/jobs.hpp",
+                      "bytes":  855,
+                      "sha256":  "fa3fc57ab8b3ce8c0a062d61e36746549e3a1f26b2fcc68011f0726c8fdf4f9e"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/listing.hpp",
+                      "bytes":  1251,
+                      "sha256":  "36142f5b8b08a4ac04b2b2c004c58146bc1b55ba3b817bf171334fe130ef7a9d"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/macho_presentation.hpp",
+                      "bytes":  1460,
+                      "sha256":  "0f6d29a03d56e435501e25c24003e442afaa00135960b10cb1bbdc2095cda310"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/navigation.hpp",
+                      "bytes":  781,
+                      "sha256":  "c6b7145ccfd6b52fb3da01b603a3dd2a9a9bb79b54415e7fbf8ce32594753e67"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/open_recipe.hpp",
+                      "bytes":  397,
+                      "sha256":  "825b49af34f1fb84c33bcad8bc58633b932205f04e48ca1c37096ed66554d35b"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/project.hpp",
+                      "bytes":  4716,
+                      "sha256":  "a8da16f8d8312435fe5996ca1b11410f80b4f7e420ceb18b4a4a5f610b95f518"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/project_actor.hpp",
+                      "bytes":  2639,
+                      "sha256":  "ae4ef4b054f214122ca510add98ffbe788c3aa3fec33d72fbafb9e5bd8040d2a"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/project_analysis.hpp",
+                      "bytes":  862,
+                      "sha256":  "7abe2a44a5cd67f33e7e73fe67bd8d30ea6cf3629bea68ea94f1ab7fcaa1eb4c"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/project_graph.hpp",
+                      "bytes":  596,
+                      "sha256":  "14e8fd2d8d11044c2f0ad11c416bd79ad0b2317f3fbd95b02bed6e527557ebbd"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/search.hpp",
+                      "bytes":  1507,
+                      "sha256":  "d54f5402de5ee042744f85629fb20310c405ee8e4183519980d287b9b2f4d2a5"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/workspace.hpp",
+                      "bytes":  1480,
+                      "sha256":  "c2a20eca197fcc986d2455900f94a9d49e4b3b4ff98b50233e8cf340720a081e"
+                  },
+                  {
+                      "path":  "include/hexlab/workspace/workspace_export.hpp",
+                      "bytes":  1279,
+                      "sha256":  "0f4daf54447e4057cdb9a34ccd22f6cc3a49bfb42a57aea2a4355797b14ca542"
+                  },
+                  {
+                      "path":  "input.o",
+                      "bytes":  984,
+                      "sha256":  "9d454fd08d2d9ec500e01fb7a5ded4bb07d27021e7a5fff94220912b6ead1cd1"
+                  },
+                  {
+                      "path":  "lib/hexlab_analysis.lib",
+                      "bytes":  56072,
+                      "sha256":  "778d10a424f17ac5f4ef4b9257ee7658699bd7363fb1a6f712ce65b8d91cabf6"
+                  },
+                  {
+                      "path":  "lib/hexlab_core.lib",
+                      "bytes":  14174,
+                      "sha256":  "681487f89a5604b4ffc30ab8c55daaf1bec2d64cfd1f346645224945d11d02e1"
+                  },
+                  {
+                      "path":  "lib/hexlab_database.lib",
+                      "bytes":  37768,
+                      "sha256":  "4e373f2551750969736420edd6694bfb41ee9e55fd2cc2b45b4bd2e7c6d1315a"
+                  },
+                  {
+                      "path":  "lib/hexlab_image.lib",
+                      "bytes":  22140,
+                      "sha256":  "5fea913cdcebe036d51519ae4cbcce2ad63fa10dacd15727ab416448cd20b1af"
+                  },
+                  {
+                      "path":  "lib/hexlab_loaders.lib",
+                      "bytes":  14122,
+                      "sha256":  "baedd645b3c724e97ca3638aa92743d34d0903c628307176206ed67396240a0a"
+                  },
+                  {
+                      "path":  "lib/hexlab_processors.lib",
+                      "bytes":  7724,
+                      "sha256":  "288ea6c34946821c37ae6f6568a6b0baffa886d80c0db29e38b6b51e359f0dc9"
+                  },
+                  {
+                      "path":  "lib/hexlab_sqlite3.lib",
+                      "bytes":  68564,
+                      "sha256":  "899269e61a896820fb538c152d992ab70080a1ce25e642c518a38a10270167e0"
+                  },
+                  {
+                      "path":  "lib/hexlab_workspace.lib",
+                      "bytes":  74026,
+                      "sha256":  "566e48726fd91df72346c64a32615effcc398e11956bf0f6ecb4720e2cf7e531"
+                  },
+                  {
+                      "path":  "macho_capture.exe",
+                      "bytes":  271872,
+                      "sha256":  "f5701b55e791d5229b7a5a1f967b9589c3ac0b41c7218c4565d1a4f5a3c7b92f"
+                  },
+                  {
+                      "path":  "producer.cpp",
+                      "bytes":  4289,
+                      "sha256":  "82d6dd0964848d749dbff42d77f8fe50f2d0febeba02f9dbce308435bc39d069"
+                  },
+                  {
+                      "path":  "producer.hxproj",
+                      "bytes":  131072,
+                      "sha256":  "327553888084e8b2f046530a19fab1f4e77d86a632dc4c77d4dd0f595aeec102"
+                  },
+                  {
+                      "path":  "producer-run.log",
+                      "bytes":  688,
+                      "sha256":  "ed08fd6eecdcb81c091e96f9b9669f3d9553953e6fb62673a447d35af1ccb0cc"
+                  },
+                  {
+                      "path":  "producer-source/.gitignore",
+                      "bytes":  63,
+                      "sha256":  "bc9dab71a499e326072c895ab60c6dabe8fa1dee6ce15d43ca5490d7474ed63e"
+                  },
+                  {
+                      "path":  "producer-source/apps/cli/CMakeLists.txt",
+                      "bytes":  341,
+                      "sha256":  "296b53ac67ae373cfa58ac4f6bd578b284be6a320c57cc1c0298785d62abd19d"
+                  },
+                  {
+                      "path":  "producer-source/apps/cli/commands.cpp",
+                      "bytes":  14648,
+                      "sha256":  "142be51d067574f9007a88c8543677813c6ddf13ffd8741bc1505a640d0189d8"
+                  },
+                  {
+                      "path":  "producer-source/apps/cli/commands.hpp",
+                      "bytes":  262,
+                      "sha256":  "a8b6a49b13b31100b026f516fff6dde1fa180043297ceafc1a680b628e8c1aa0"
+                  },
+                  {
+                      "path":  "producer-source/apps/cli/elf_output.hpp",
+                      "bytes":  5507,
+                      "sha256":  "2545d57b22ceac2dc26549068f814b6bb9cfcc1872dd315d24952035dd5f09cf"
+                  },
+                  {
+                      "path":  "producer-source/apps/cli/macho_output.hpp",
+                      "bytes":  18356,
+                      "sha256":  "2a8d5f3307fad8a55ebb8c21fde11341c2627583ee0171f1facdc08824707b94"
+                  },
+                  {
+                      "path":  "producer-source/apps/cli/main.cpp",
+                      "bytes":  388,
+                      "sha256":  "be6d237974422e54d743e2a3190931975929118986cc77e305c80971e4fd92ad"
+                  },
+                  {
+                      "path":  "producer-source/apps/cli/profile_output.hpp",
+                      "bytes":  2132,
+                      "sha256":  "5f8f47379cfa04db448db622d0b91f8d9cb0313bcf5dde847f918c1f7f645e32"
+                  },
+                  {
+                      "path":  "producer-source/apps/cli/project_arguments.cpp",
+                      "bytes":  20573,
+                      "sha256":  "60d5c086ef7ab6cae0e684a75b79871ea901ab57dc1f0173adafcf41becc62b4"
+                  },
+                  {
+                      "path":  "producer-source/apps/cli/project_arguments.hpp",
+                      "bytes":  1853,
+                      "sha256":  "40f8f88bbe3b095198cda0d3f0a3b70db1da50d80a7cdd7c98f6e178b76221a4"
+                  },
+                  {
+                      "path":  "producer-source/apps/cli/project_commands.cpp",
+                      "bytes":  7458,
+                      "sha256":  "00d884b3738286e1180a0121d57c938a01e0e92649f4029ef3495514805521a9"
+                  },
+                  {
+                      "path":  "producer-source/apps/cli/project_commands.hpp",
+                      "bytes":  216,
+                      "sha256":  "9599a2198824835081c852dce32602ac76bb2e634b5ce5d2cf219ffdc0bd2742"
+                  },
+                  {
+                      "path":  "producer-source/apps/cli/project_output.cpp",
+                      "bytes":  11947,
+                      "sha256":  "b9b9f6358d7c3c9456023247b72d40ad3934541d307042f9a3334edbe8fabe44"
+                  },
+                  {
+                      "path":  "producer-source/apps/CMakeLists.txt",
+                      "bytes":  83,
+                      "sha256":  "f46c6863f66c856942600844a1ac9ac65239bdba0a1ed9ef7235ff8b1377a37c"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/app.cpp",
+                      "bytes":  3805,
+                      "sha256":  "873acaf1504a45e153dec881f16462408205fb1cc09095b08aa9e84536177360"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/close_coordinator.cpp",
+                      "bytes":  5809,
+                      "sha256":  "8e584fc1d0f314c0175a458e8cbbe99b3ced50be664fc69e89bba2e5bc116442"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/close_coordinator.hpp",
+                      "bytes":  894,
+                      "sha256":  "27c428572d5fa9eb2b8a35faf1eb2d72fa6af5156da3c13d3e4341b3382e3008"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/CMakeLists.txt",
+                      "bytes":  1362,
+                      "sha256":  "2e287bb919ad20e92b1b7b20d71e79b77a275b0fe0d964985f9bc29410cdbe70"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/data_views.cpp",
+                      "bytes":  9366,
+                      "sha256":  "bf0b82414916ea95ddb8d55b620132dac3b975c5883cb1a90ae13c86c6577f5c"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/data_views.hpp",
+                      "bytes":  1933,
+                      "sha256":  "935a692cb8f658f0f12c15d9df7ff819816bab6a8518332bdd2b0b068ed32236"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/document_controller.cpp",
+                      "bytes":  997,
+                      "sha256":  "068bb9c95ee7122127870f4c0c09ef12b01f99cc80df8c83868a8e0caa8ed9fb"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/document_controller.hpp",
+                      "bytes":  560,
+                      "sha256":  "c2041f97cb637e7f5c9f9f46d81bf1373eac6890b376fc665d05612843c9af6f"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/document_tabs.cpp",
+                      "bytes":  1562,
+                      "sha256":  "b98a0eb220e884de6fd6a157a6bc913c36f60ce78a2e403dfac01d09bbe87f36"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/document_tabs.hpp",
+                      "bytes":  362,
+                      "sha256":  "59de60d775c562403076e5379ef0d190eafce06f209a26472ce481825d1ff8f7"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/edit_dialogs.cpp",
+                      "bytes":  4044,
+                      "sha256":  "ddf915731be835b0ca36e0e3835c40f1315f3a2f1e8c8fc47388eecaa7137c5e"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/edit_dialogs.hpp",
+                      "bytes":  592,
+                      "sha256":  "f46a32b8c4b662cd9c35dc6213421faf36d1f260edb0e076225bc4f6cb8da1ec"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/elf_view.hpp",
+                      "bytes":  1651,
+                      "sha256":  "f905195a450fcbb42bface857c935ccd0a9a17bd1abed2957a2e5f0dabdb8db9"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/graph_canvas.cpp",
+                      "bytes":  10891,
+                      "sha256":  "eaa2d33af30c7adcdd7c4b30cf61c03fc2e91665f86923d8c8f3edab77d47be2"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/graph_canvas.hpp",
+                      "bytes":  1244,
+                      "sha256":  "868fb81b6a4c36f045012491def423673b39edc3aaebb6b6f8fcf64e243cd809"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/graph_view.cpp",
+                      "bytes":  2772,
+                      "sha256":  "d2bf122699e212283bb238549ff5e003e70938b61ff69a9c5edf807aff8dc89e"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/graph_view.hpp",
+                      "bytes":  527,
+                      "sha256":  "c7136640dae661e010b1c0499f027203ab3295d580da298a5425961bacf18067"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/macho_view.cpp",
+                      "bytes":  12637,
+                      "sha256":  "a8df4194007b2cff50715bfd62933d2e8c0fe13d9283a6f4e28ceb27b60663c4"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/macho_view.hpp",
+                      "bytes":  292,
+                      "sha256":  "fb38a915928eeb50e25e8eded9476ae615fb45eb453d8ead113c335f7cd594a5"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/main_frame.cpp",
+                      "bytes":  57962,
+                      "sha256":  "289be58c4bbd59729e43ce7e1f8822039418b2c05bb86b047385df9039dfcf57"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/main_frame.hpp",
+                      "bytes":  1452,
+                      "sha256":  "1036e7506bc54a687b9792610a2bd080b3864a030c30821c29242cac795cbaa6"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/open_dialogs.cpp",
+                      "bytes":  5254,
+                      "sha256":  "515fd66e21705943f7987bb52adec163d42bcb9f90232a333aab14e7a92d2c4f"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/open_dialogs.hpp",
+                      "bytes":  159,
+                      "sha256":  "29c7440142a0ee51e52953ce3e2274fa7c9f208bf17ac5eb4ffc4164bcd07d5e"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/project_actions.cpp",
+                      "bytes":  13408,
+                      "sha256":  "256169c2bb301bbaf43e1cc25364caa99f5f4a9ae24693a196aeea2ac5c304e1"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/project_actions.hpp",
+                      "bytes":  946,
+                      "sha256":  "b9ec4e55340e86ec30518c2076da7abf81ecf05139173eda27472255b4366e66"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/project_view.cpp",
+                      "bytes":  3694,
+                      "sha256":  "d779d68fadde7a5f4085e5a269458b8beddea229c89b7ad14cc027f509b7738d"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/project_view.hpp",
+                      "bytes":  455,
+                      "sha256":  "adf287f69552a308b683f4a472c4df0a3fb48d7d19eac985bc3f926469be24bb"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/reference_dialog.cpp",
+                      "bytes":  4187,
+                      "sha256":  "216b51e8d3784eaf0b62fc4f86cdac3a19571100acc8c2e403d5ce19f6808444"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/reference_dialog.hpp",
+                      "bytes":  312,
+                      "sha256":  "9a469e6d0c1e8ecef57db42a622218d400053b22ddd37e179d8bdc4a40071389"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/reference_view.cpp",
+                      "bytes":  9253,
+                      "sha256":  "ec3f530b53d1e2db9c0e6fed0ee70ec95a9a1ec24a4aa3fe2cce1a5aaa833ced"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/reference_view.hpp",
+                      "bytes":  1028,
+                      "sha256":  "2f233570094fb4a463b4556f45533af220bfb94b76a4c3787dac6b473bac53e6"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/search_view.cpp",
+                      "bytes":  8664,
+                      "sha256":  "196f49113d01dad1449537f2645591abdafd1d93b7eb6235472399840ab7e0cf"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/search_view.hpp",
+                      "bytes":  907,
+                      "sha256":  "1e240f01ebb6156051d3d2dd29a996f0ed3812049ffd377531fffec31aec4f47"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/session_controller.cpp",
+                      "bytes":  7866,
+                      "sha256":  "c962d55604bcbf102a6ddc95d163811109e87cc583185ef7a8662e1bc512b674"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/session_controller.hpp",
+                      "bytes":  3830,
+                      "sha256":  "19687d42f613425bff62f89a083746b39acd7f7cd56886ad7c1af0dcaabea216"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/session_graph.cpp",
+                      "bytes":  7870,
+                      "sha256":  "f995ba3fc3d388a7763aadb9993a1f0f7a228c4006e6f29d0cb3909961085b49"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/session_listing.cpp",
+                      "bytes":  5604,
+                      "sha256":  "f1d9d2078a125ad2e8fa991011ee78323ec602d6bc7cee5d353f7dc1e1b961d3"
+                  },
+                  {
+                      "path":  "producer-source/apps/desktop/session_search.cpp",
+                      "bytes":  8535,
+                      "sha256":  "f9eb0af620e6c7cadbbdfefe4497870d07fe9f0468be2af3dd1d1393b62484b7"
+                  },
+                  {
+                      "path":  "producer-source/cmake/HexLabLibrary.cmake",
+                      "bytes":  1199,
+                      "sha256":  "568ff6f431bbda157a629f6bf2bc0cdec62de553c7a5bab4ab847089cf6280ab"
+                  },
+                  {
+                      "path":  "producer-source/cmake/SQLite.cmake",
+                      "bytes":  814,
+                      "sha256":  "b466593bb0f8287c362ecadb0408d0c69d526cc2afd3a003e568ca4f4ecea4bc"
+                  },
+                  {
+                      "path":  "producer-source/cmake/WxWidgets.cmake",
+                      "bytes":  1858,
+                      "sha256":  "443f4f44821bdbf4b70ed119fc20620327616d919ba9f08ced65ea12ae2a3252"
+                  },
+                  {
+                      "path":  "producer-source/CMakeLists.txt",
+                      "bytes":  1655,
+                      "sha256":  "17c778d141299ab6ca14e337cf5655f7a6552a0acea277ab470654db7df89758"
+                  },
+                  {
+                      "path":  "producer-source/CMakePresets.json",
+                      "bytes":  1398,
+                      "sha256":  "8225dfac0e3da57986bb4d15adb5bb59bca5d4f6895fd3656337dcc54f3ac173"
+                  },
+                  {
+                      "path":  "producer-source/docs/arm-validation.md",
+                      "bytes":  11316,
+                      "sha256":  "30e0da06274556add4ac4cff6433d1a3523fc56b436c55ab9a06e6876b051572"
+                  },
+                  {
+                      "path":  "producer-source/docs/binary-analysis-validation.md",
+                      "bytes":  8466,
+                      "sha256":  "1e474e6eb243c143ba422aa5a818399b675f5dad78dadddce89ed44c9679b3c6"
+                  },
+                  {
+                      "path":  "producer-source/docs/building.md",
+                      "bytes":  14835,
+                      "sha256":  "24eced10d6b40cddef3e5027146bd77695cb8449deb6d5ebab3a26e6178c831b"
+                  },
+                  {
+                      "path":  "producer-source/docs/capabilities.csv",
+                      "bytes":  11363,
+                      "sha256":  "8df562f9881e41fb9d95c7ac39baa182d8420b6564e67a0ab5fd3ae07f899f74"
+                  },
+                  {
+                      "path":  "producer-source/docs/elf-analysis-validation.md",
+                      "bytes":  6459,
+                      "sha256":  "5b61256ec1d9e35b54088cceea79e5ae680edb2fe926128980805cbfb7465b7f"
+                  },
+                  {
+                      "path":  "producer-source/docs/foundation-validation.md",
+                      "bytes":  3059,
+                      "sha256":  "da65f96e14b1957cd0453442806a9b9080ad96bc31eb7779dcbe5d453a8ae6f3"
+                  },
+                  {
+                      "path":  "producer-source/docs/macho-analysis-validation.md",
+                      "bytes":  54231,
+                      "sha256":  "bc69fccb333da0eb9471c34db3d40dd27f27eaf682cbb3b93eb4d357717afdce"
+                  },
+                  {
+                      "path":  "producer-source/docs/project-analysis-validation.md",
+                      "bytes":  9287,
+                      "sha256":  "44d3eb84de7d5b049b5baac098f6b212fac4a5cc410c16cf56df3d74b26e8949"
+                  },
+                  {
+                      "path":  "producer-source/docs/project-cli.md",
+                      "bytes":  5368,
+                      "sha256":  "68ffdcd0f2bcb1addd8e32c37ee80592d1c3665808072d5e6aaec132d00f988d"
+                  },
+                  {
+                      "path":  "producer-source/docs/project-format.md",
+                      "bytes":  4437,
+                      "sha256":  "03a27177f849d61bbb27cfe4897bcda2fa557dd266fdb477d21d41afabdf74fe"
+                  },
+                  {
+                      "path":  "producer-source/docs/reference-coverage.md",
+                      "bytes":  7062,
+                      "sha256":  "20218f8177c0a7d22163e77f69a6b41f1245f8db19d8f9479e0a5c9968a2b8af"
+                  },
+                  {
+                      "path":  "producer-source/docs/reference-matrix.csv",
+                      "bytes":  8039,
+                      "sha256":  "2ba4dcde47ac5f9d4e2eb3fddf98464b25d0d8b1f98180e6175477edb222779a"
+                  },
+                  {
+                      "path":  "producer-source/docs/reference-sources.csv",
+                      "bytes":  878,
+                      "sha256":  "2b2fa94f1cc34a5473c21825e642b26c95a16a13eb78016087aff3f5d21b9ac8"
+                  },
+                  {
+                      "path":  "producer-source/docs/segmented-analysis-validation.md",
+                      "bytes":  4320,
+                      "sha256":  "29d85925ce6bcc8905de9d372f4c8d3c14f901879e0554340d32cb9005b9c3ce"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/plans/2026-10-19-binary-analysis.md",
+                      "bytes":  33892,
+                      "sha256":  "fcbab230d05734a082f36d1a4cc72937597d5af4d9b46e19d2afc447046150f4"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/plans/2026-10-19-foundation.md",
+                      "bytes":  18973,
+                      "sha256":  "a6a1d1899e1b9fd7b0c7fdc8e6921945964735a80d4f57ff237210de7ce4cf0a"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/plans/2026-10-19-project-analysis.md",
+                      "bytes":  31548,
+                      "sha256":  "ac34df8d940ec692fa405d72a9a422cb819f2adb07d9ea83d5355864ffa7c67e"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/plans/2026-10-20-elf.md",
+                      "bytes":  8498,
+                      "sha256":  "beb3e08e66a8edcc155da14abd695e94a02732851ad90931f190820bce384b7c"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/plans/2026-10-20-macho.md",
+                      "bytes":  11294,
+                      "sha256":  "365f8722ea4794ef0e70a38667921fc618236372788360fc08931392ddf4edaf"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/plans/2026-10-20-x86-16-segments.md",
+                      "bytes":  10527,
+                      "sha256":  "a87bb29c4bdae19e67df689cb70464fce447c1e439917f35ce31a67fe5981d14"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/plans/2026-10-20-x86-32.md",
+                      "bytes":  12328,
+                      "sha256":  "05651b56cc454f0623cb75a6cb1c56444b8b4fa7b534ba224e389fa54caabd15"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/plans/2026-10-21-arm-processors.md",
+                      "bytes":  11648,
+                      "sha256":  "7e1c3a5d5598dd390c9e8b110f54dc012ba20aa74a1af584c808bda32d6f7aa1"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/specs/2026-10-19-binary-analysis-design.md",
+                      "bytes":  19258,
+                      "sha256":  "a8f0db63b1be13e43ea2dafa689f0282443e0005f8bb2db57eae761f504c9abc"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/specs/2026-10-19-hexlab-design.md",
+                      "bytes":  19455,
+                      "sha256":  "700d78da2dc1d2fc76a88da267acf849e59296ebe8bdc3518af5c4325b069a01"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/specs/2026-10-19-project-analysis-design.md",
+                      "bytes":  30490,
+                      "sha256":  "50bf623d2a5148c3ce6c8869a6c04efcba0c2a9bd4dc59c613211bed532ca566"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/specs/2026-10-20-elf-design.md",
+                      "bytes":  9525,
+                      "sha256":  "282fd8601331120e1880b2dc2c7954344f620f45c8f6f6f622b87c6615f35ce5"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/specs/2026-10-20-macho-design.md",
+                      "bytes":  9448,
+                      "sha256":  "9ea445e5a92636d8fd6552aba4167259e2d36a0df00f13b72d517d69b1609346"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/specs/2026-10-20-x86-16-segments-design.md",
+                      "bytes":  11137,
+                      "sha256":  "a8845ac95b9edab0c61e3c304565a2af434ca8857511929794b5764a8f3913e9"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/specs/2026-10-20-x86-32-design.md",
+                      "bytes":  11228,
+                      "sha256":  "10eefa3458ec8c4a225494c3e9f608788f148b8e9215ff5d342d89d1f60dbe9c"
+                  },
+                  {
+                      "path":  "producer-source/docs/superpowers/specs/2026-10-21-arm-processors-design.md",
+                      "bytes":  8068,
+                      "sha256":  "b4875d50d8e0a6f1cc2d590b03e142b2e4715c8ece96c0fe0201b450abcc973c"
+                  },
+                  {
+                      "path":  "producer-source/docs/third-party.md",
+                      "bytes":  2647,
+                      "sha256":  "d9152d12905fc6db9e735938305c95d8814e46f9df64fbb7ace42c9879d7a5cb"
+                  },
+                  {
+                      "path":  "producer-source/docs/x64-coverage.csv",
+                      "bytes":  1878,
+                      "sha256":  "0b19a24774d79423a0abe95ff971647864f7a9f120359943748790b0a0932eb7"
+                  },
+                  {
+                      "path":  "producer-source/docs/x86-16-coverage.csv",
+                      "bytes":  5554,
+                      "sha256":  "197f45d0694b40ab8dae528ac006a9a0ccdd7f8e872b59f4653b83f540958c82"
+                  },
+                  {
+                      "path":  "producer-source/docs/x86-32-coverage.csv",
+                      "bytes":  5307,
+                      "sha256":  "6bf7fddf006a24567343bef61b6aa03a4f47d48565681097fc0513548cf1f407"
+                  },
+                  {
+                      "path":  "producer-source/docs/x86-32-validation.md",
+                      "bytes":  9153,
+                      "sha256":  "ea2703ef600e836ceccb6f15d97a9b935dac069cc4c49ed9a7ae00a2b6ad80d5"
+                  },
+                  {
+                      "path":  "producer-source/docs/x86-profiles.md",
+                      "bytes":  3054,
+                      "sha256":  "84f95e4b4b7f011af55f6aed08ce492cc445fa602cb7f4c49a0f752b33365d07"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/CMakeLists.txt",
+                      "bytes":  589,
+                      "sha256":  "e34b491f4b4e1979459f43307ab9c52705fc2aca5e2e5db67cb5dacf2da9ee95"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/analysis.hpp",
+                      "bytes":  1174,
+                      "sha256":  "9a2cd460196035fa82785a2be05918d7086cd1adaf3d2a9771516a0558265a5f"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/decisions.hpp",
+                      "bytes":  968,
+                      "sha256":  "1d516f841252f22b2c168bf95a237f2f5724d16f73ddc72d3116dbd44e398423"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/dependencies.hpp",
+                      "bytes":  1301,
+                      "sha256":  "37a5938b41406c48b38260bfa1ae6ce1f159f6fe7ee239cf98e0f2737e2273fa"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/derived_cache.hpp",
+                      "bytes":  1189,
+                      "sha256":  "ea557639108fa8be37ea7b6b4801f3647bc5e676b58c49876b28830111e8adf8"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/elf_relocations.hpp",
+                      "bytes":  2616,
+                      "sha256":  "3860239e4d4e50ffccf148bff816502111461dc22f32405c88c45425b4e1f3c3"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/functions.hpp",
+                      "bytes":  3591,
+                      "sha256":  "06e3d9be23db61e03d2769f316f2df3a7f11cb714eb379d6f941a397e32c1bf9"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/graph.hpp",
+                      "bytes":  3309,
+                      "sha256":  "cefa289b9a1f1c61545e90fc35d136d33d0afb6608fdd1db850aa3adce9fbfba"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/incremental.hpp",
+                      "bytes":  2479,
+                      "sha256":  "c23785344682720433fa51d73d6cc559fae60a0d92c9aafe6775f4ae4b73227f"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/macho_dyld.hpp",
+                      "bytes":  3191,
+                      "sha256":  "4ce5cbb76dbc1fbaecc7d6037ec06765a695f3ed3d3ceb51b4f3c815acc38741"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/macho_relocations.hpp",
+                      "bytes":  2239,
+                      "sha256":  "398bfd76b1e7ba0ae39857bb879cb60b0b38f34577c99c20d5f0929cd1c24f83"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/references.hpp",
+                      "bytes":  7954,
+                      "sha256":  "13281baaedc96507cf37510320299d20c0de2fca320abaaf52767f6455f60a64"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/relocations.hpp",
+                      "bytes":  2785,
+                      "sha256":  "72055b4b97e8beb99a8cd0af1a416e0159a8ba417f56b98455f1df510346e662"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/search.hpp",
+                      "bytes":  2537,
+                      "sha256":  "e496720454ebb0fdfe96a3576f4a05f4943aa7f34002d2ebd0372ec0b57353ff"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/include/hexlab/analysis/strings.hpp",
+                      "bytes":  868,
+                      "sha256":  "c3b94ac85e8c43743acd814981dd9e83b221ddc3d4aaa1a78bfa47275f6d593c"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/a64_fields.hpp",
+                      "bytes":  1431,
+                      "sha256":  "016915b5264c99bc855d1f67de4fbf55c2fc8f78a7d0bbcd3d3675d43e839d19"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/blocks.cpp",
+                      "bytes":  8043,
+                      "sha256":  "46798bbb752d33f596d56e2437ae77de8d4d9fc122b639d946d114d4f5163ff7"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/control_target.hpp",
+                      "bytes":  2145,
+                      "sha256":  "ba887e7a874dd7d72ba9218db7023f5e227f14ec87ab6d038d60d2d8cb7ad8b3"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/dependencies.cpp",
+                      "bytes":  3149,
+                      "sha256":  "f5aab058b82e64a221c01338a0df6367bb2151feef3cd6d845004f88bde842b6"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/derived_cache.cpp",
+                      "bytes":  27471,
+                      "sha256":  "259fb15e0f8301a0f558346d8ec912c5d408d5dfe458fd39d52e1ab9637cf757"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/derived_cache_instruction.cpp",
+                      "bytes":  6256,
+                      "sha256":  "b0319af2706ba756977acc81ee485d887e0e3a0b2c1cf0aa85f9f6377cdcd806"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/derived_cache_internal.hpp",
+                      "bytes":  8974,
+                      "sha256":  "0c58b92b6a810e5a54cbfccf10afa12df947c71ed2fb4e65d0749514cfba237e"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/elf_reference_codec.cpp",
+                      "bytes":  13631,
+                      "sha256":  "75dc4cfcf652326de07687b81f203f237da1cd9775a5b57a755ffbc201aa9a4e"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/elf_relocations.cpp",
+                      "bytes":  22474,
+                      "sha256":  "f797544c1441faf1a2dd3a580f5fe5a1f0b0d81d03a0f0f1ea8f640698be24e4"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/functions.cpp",
+                      "bytes":  33201,
+                      "sha256":  "3205537eac76669b3c0d242db412982943692b52426ebd6997e21e397032ebfa"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/functions_internal.hpp",
+                      "bytes":  3810,
+                      "sha256":  "59649118831e2c43ccc1ea8b1bd93bbef70121a6936e6ff25aa237168d922cb7"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/graph.cpp",
+                      "bytes":  17487,
+                      "sha256":  "26ae1994af6648563b51c80b4a978031a16d5fcf29bbd007867fc667748f74e2"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/graph_export.cpp",
+                      "bytes":  6523,
+                      "sha256":  "93892b7725a0f6784334213c298b3f2737dbd65e98ed03cbef6cbf83f2f2755a"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/graph_internal.hpp",
+                      "bytes":  2200,
+                      "sha256":  "09a78b78c4d35d6f85f324d0a5864bab994467716bca024e34337247f5a54edc"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/graph_layout.cpp",
+                      "bytes":  6023,
+                      "sha256":  "d1bd3d260d482964219fa660487482aad62d22f0e47105eb99df251f8bd67429"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/incremental.cpp",
+                      "bytes":  13053,
+                      "sha256":  "63a86390e04ffd0eabdc6a786f7ff733fcf727e737dce7b60ca13a7da69aab95"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/instruction_flow.hpp",
+                      "bytes":  1575,
+                      "sha256":  "01cdaa7aaa58f1dd9a383eabef60db973f79aaac01bce769c6e124c022b49fa2"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/macho_dyld.cpp",
+                      "bytes":  16847,
+                      "sha256":  "3814a8161538066e2c668c027e258b5f966d55b8ef5c4b06d6b3e4b6b86746b5"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/macho_dyld_reference_codec.cpp",
+                      "bytes":  29204,
+                      "sha256":  "fbb9230470e4119d771383dffaa3124ef730e34f85a64524db268fe1d202b4fe"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/macho_reference_codec.cpp",
+                      "bytes":  15954,
+                      "sha256":  "a751a752a4e74a8d8e43a68a330de22b52f744855abab1346c60b6d76faee5ce"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/macho_relocations.cpp",
+                      "bytes":  27314,
+                      "sha256":  "70c2cb510c301930e8b8c09c3830b7c2ede3b7648a6aeebd04aab0c40a5f088a"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/reachable.cpp",
+                      "bytes":  15204,
+                      "sha256":  "d57974b52e1178dbc3a2765f3ddcaf4bae90a414682d6cc9c3c11299ee524fb3"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/references.cpp",
+                      "bytes":  37142,
+                      "sha256":  "140e92737098185e8a833310e4970ae48056467b8c7751f2b1048f53d13720a3"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/references_codec.cpp",
+                      "bytes":  43014,
+                      "sha256":  "90a1c76fdd31d59939a829c9d26c3c47a6c23e0f146405041a4e182bcc40cf53"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/references_internal.hpp",
+                      "bytes":  2301,
+                      "sha256":  "f91e44317147dea6c42257c38be002eced6adfc01b062da97d22e4823681393e"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/relocations.cpp",
+                      "bytes":  15686,
+                      "sha256":  "90f15582f76211a47929df2336707c22979590f7daaa8d62235a8a2fe86bc121"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/search.cpp",
+                      "bytes":  8341,
+                      "sha256":  "654cc01a1ba3d1d2364ca7456d298d25c9b2a0907d5dc6e710d758d617587442"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/search_internal.hpp",
+                      "bytes":  1008,
+                      "sha256":  "8e1560318d94260f7362fb6914bccd56988372353d3a823c34507d9d89179779"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/search_query.cpp",
+                      "bytes":  5500,
+                      "sha256":  "4f0297ada1b061b5a217001219be0a180b793af7b07ffa1c5780ff2553b2b841"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/source_context.cpp",
+                      "bytes":  4348,
+                      "sha256":  "43e06edb02553318e404a43c2e5cf7734ef929ed31075ef2793549019d22bb88"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/source_context_internal.hpp",
+                      "bytes":  899,
+                      "sha256":  "a7c090cd4aa8428c8492366ce49b551ea4d010273a6da7a5fc1ea41e27c4c4d2"
+                  },
+                  {
+                      "path":  "producer-source/libs/analysis/src/strings.cpp",
+                      "bytes":  6692,
+                      "sha256":  "a7068225ab7a3f6c4851289e40264002392b505e4008fce22ee4d7a56eeb12cd"
+                  },
+                  {
+                      "path":  "producer-source/libs/CMakeLists.txt",
+                      "bytes":  184,
+                      "sha256":  "90abc1a195da423efd0b27377bcdcecdb634bbd7353d0b1c242a88d757c66119"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/CMakeLists.txt",
+                      "bytes":  1242,
+                      "sha256":  "a0e9553dc46b3c99f3bf00c2f644ba603265a4957a4eef5bd1a1f0dba894423c"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/include/hexlab/core/address.hpp",
+                      "bytes":  1306,
+                      "sha256":  "fc15aeadaadc54f891f0d5cf1ce53fcfa8f01c657e1aefb33aea4fd6ec2109d4"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/include/hexlab/core/architecture.hpp",
+                      "bytes":  915,
+                      "sha256":  "9ea97b570a00583eeae528527924e27dc6e26d8cadb4ddf3d91bd76e21cbfa0e"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/include/hexlab/core/byte_reader.hpp",
+                      "bytes":  1164,
+                      "sha256":  "9d45ffdafa1ffe4ad9b014cc70ed1ed6fc8943a0c70283757a16ea95985282cb"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/include/hexlab/core/encoding.hpp",
+                      "bytes":  338,
+                      "sha256":  "9d2492cc136b650575747ffb2858cf47ba03d9980d21f41faf924e7b6394b63a"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/include/hexlab/core/location.hpp",
+                      "bytes":  137,
+                      "sha256":  "0edf5477be310d4984deaaf24c010a825172fa36c2d0d0a0f51fd0680b0524b9"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/include/hexlab/core/paging.hpp",
+                      "bytes":  140,
+                      "sha256":  "dd6ec92b7e0a9dff95c0d59bb7cd4f3f14a8ceb2060b9dbc19d063371df082aa"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/include/hexlab/core/result.hpp",
+                      "bytes":  1108,
+                      "sha256":  "5927c9e0027741d258d1e41b4143dc4f82d0b3123943cb0e7e4d9f8e55e3fafe"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/include/hexlab/core/sha256.hpp",
+                      "bytes":  788,
+                      "sha256":  "38177d324bfef1daf6336700c56656b7e0c2de55c889843a20a418428e6f1949"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/include/hexlab/core/version.hpp.in",
+                      "bytes":  223,
+                      "sha256":  "fd6d3821f64b849b883d6f07cdfd53b3a8cd3f4a1f30a1c06137cc248f07e75b"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/include/hexlab/core/x86_segments.hpp",
+                      "bytes":  3263,
+                      "sha256":  "732672000cc182cfdf1301688c960d67f9297c01f5e7e120ae6b737682cfd358"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/src/address.cpp",
+                      "bytes":  1154,
+                      "sha256":  "8e2be95d01941c90d46ba8eec8991ec33fe4ff0604609a8924f599d5a9ca0316"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/src/byte_reader.cpp",
+                      "bytes":  1437,
+                      "sha256":  "9fae7a7b1d9fe70ba7f4655da3e0290b54e4cd27642d053e9fc09a354cdc952c"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/src/encoding.cpp",
+                      "bytes":  580,
+                      "sha256":  "fb010d66dfedf0b95e7fcc34baa26b2dd13b158b1d99d2f934be4f5adbb07dc6"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/src/sha256.cpp",
+                      "bytes":  3946,
+                      "sha256":  "8d0fa73486a04c5b0a50b8a04daf4304b967f7a20e3b0ee3379b5e38bd23011d"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/src/version.cpp",
+                      "bytes":  118,
+                      "sha256":  "4e73468097745a75bcc947a1beaff978b876c7e76272d8a95a343f2c685e6853"
+                  },
+                  {
+                      "path":  "producer-source/libs/core/src/x86_segments.cpp",
+                      "bytes":  5065,
+                      "sha256":  "c8c13885a398bac944be4467d42860d67cb0a6d66bfe4eadfafd692f9411d415"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/CMakeLists.txt",
+                      "bytes":  629,
+                      "sha256":  "c7beef7de13ecc685271cdc60fff3020fb0a52eee8a82dbb564158217423e401"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/include/hexlab/database/backup.hpp",
+                      "bytes":  58,
+                      "sha256":  "acf3de858c02dd3fe5e1cbc6f25e76604692d332b93593b1c0cf91c6ece6da73"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/include/hexlab/database/cache.hpp",
+                      "bytes":  145,
+                      "sha256":  "05804e618778ae888dda136d70627a8212d6435b332ca5fbf3e1dea77b6d9dd4"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/include/hexlab/database/codec.hpp",
+                      "bytes":  632,
+                      "sha256":  "cc3ada8f5a69a5bc5db9386a9163f7524e932ec62286cda3b0a97c7f6d5f6a1e"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/include/hexlab/database/connection.hpp",
+                      "bytes":  2938,
+                      "sha256":  "6cafaba84185bf2914f257069c97f5c464b60cdafcae912550654eacea1bf14b"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/include/hexlab/database/input.hpp",
+                      "bytes":  58,
+                      "sha256":  "acf3de858c02dd3fe5e1cbc6f25e76604692d332b93593b1c0cf91c6ece6da73"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/include/hexlab/database/lease.hpp",
+                      "bytes":  463,
+                      "sha256":  "bdadd0e11bb8b26eef51daaaea25773300d587fab1a77a5470efbb6c651989ba"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/include/hexlab/database/project_state.hpp",
+                      "bytes":  5018,
+                      "sha256":  "37710a79bf3734be0be56358bc9ddf13996355dac92d1d0a4db0e968150b58e8"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/include/hexlab/database/transaction.hpp",
+                      "bytes":  715,
+                      "sha256":  "363d934cc6981928e7a4c37078d446f7bcf3fd36f8f509a54a3412891800b65b"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/backup.cpp",
+                      "bytes":  4742,
+                      "sha256":  "4a476a812b5f8e185cf0624d4413d31fdea56a617067bd8cf8e05d17d17d678a"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/cache.cpp",
+                      "bytes":  5193,
+                      "sha256":  "30e7b7f8ed40b16471362c0739512e9a3eaa8afa8739be75853c1696f1a781ce"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/codec.cpp",
+                      "bytes":  12321,
+                      "sha256":  "ee81d244fca65ed2a3740b3412a4a5c381c69ab29594228771363973803cc4fb"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/connection.cpp",
+                      "bytes":  13178,
+                      "sha256":  "f7970453d2648718bb63ae3bf7bad890eb4f2066e9a8933d0eb3a08f7aa0c5d3"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/derived_cache.cpp",
+                      "bytes":  5868,
+                      "sha256":  "aa34a02ffac0f3e6559243fe4bec246695adf154e4746b26284b092667debe92"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/history.cpp",
+                      "bytes":  7748,
+                      "sha256":  "f177bb381eb96661adf9591c5d364128a09c543efb8d82a63c1a85f37a70afca"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/history_internal.hpp",
+                      "bytes":  501,
+                      "sha256":  "cb4886c873d8c43f83513229529e19e40a945a69c4c50a0232567c4d7cbdb504"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/input.cpp",
+                      "bytes":  9840,
+                      "sha256":  "4a8a96d821af43f5b8bd30adb0fa1e3a151131471196f17e29642668c56d7d9c"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/lease_win.cpp",
+                      "bytes":  1050,
+                      "sha256":  "502233120f13e92fe623ce2b196333a04fe79f28161e816e8f2ff5a1fd76d6ff"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/native_files.hpp",
+                      "bytes":  1132,
+                      "sha256":  "935bcefef1709aa02d3b7300a240ef5278cbc7e887dd6dbc4aa34de07287f0d2"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/native_files_win.cpp",
+                      "bytes":  8942,
+                      "sha256":  "4213c8fd71a485404452dd924abe1d03fa81522023b55877ddf5241ac9478617"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/project_internal.hpp",
+                      "bytes":  2151,
+                      "sha256":  "13bec1b7981c5597f7ab4dcb8fbfbc0714b52696672ef03b0ebd0b02ab3cbe2a"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/project_state.cpp",
+                      "bytes":  13574,
+                      "sha256":  "9d220f6ff04ec3ecca85d8ccb7b79f5be5d0e656d85c0dd9fd2fea398f800484"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/schema.cpp",
+                      "bytes":  8307,
+                      "sha256":  "558e56c2d74b710fb80d4a0f72ed97bc00110ab5fa04a6a0f0b8188a5f49d2d7"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/testing.cpp",
+                      "bytes":  1861,
+                      "sha256":  "beef6ea4a5bc785ab038c3ead82946edd7cff77581680e64c214eb3e5feed110"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/testing.hpp",
+                      "bytes":  1290,
+                      "sha256":  "dce94a29ef776466a3a74480d2a85e0f56fe2e8fb8d6f48542aac6b78e4ef63d"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/transaction.cpp",
+                      "bytes":  9079,
+                      "sha256":  "1de8d96a7ea6dacf1ed4e6c00a01b8d21acf714f7a876477f802c16c9686d6fd"
+                  },
+                  {
+                      "path":  "producer-source/libs/database/src/user_rows.cpp",
+                      "bytes":  3960,
+                      "sha256":  "0882d88aee06bffa28a2ee0da78edd46a7ca7b935e87f17cff8f50e86ef06872"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/CMakeLists.txt",
+                      "bytes":  548,
+                      "sha256":  "6b977c1bafaab13f45ca66da0d90a958ddf54db47b89da79ea00d1f1bd2f6706"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/include/hexlab/image/byte_storage.hpp",
+                      "bytes":  666,
+                      "sha256":  "ecb70915e12803b6d5965a70243c7c620189b9c038f11687ccb42cacb4bc4633"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/include/hexlab/image/elf_metadata.hpp",
+                      "bytes":  5035,
+                      "sha256":  "5b6c311627428be72179b6c586a5b8d3e7ac18ed610d50931daef8c5f59eb8e5"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/include/hexlab/image/file_publication.hpp",
+                      "bytes":  865,
+                      "sha256":  "3aa60597cb9a2eca94e85668946cace96490469fd5c7fa6cd315a77615babc20"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/include/hexlab/image/file_storage.hpp",
+                      "bytes":  1130,
+                      "sha256":  "a9877d477662685a267022b01f3d1948233efb1c91f01dbdecf6969ea0f7fb04"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/include/hexlab/image/image.hpp",
+                      "bytes":  4427,
+                      "sha256":  "f2cd7a82e693d55f030f76a03f420d379778d22fe3cfaa2c33ae3c960b646202"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/include/hexlab/image/macho_mapping.hpp",
+                      "bytes":  1431,
+                      "sha256":  "6a4d219be527ab7e5cdb66d479bb8ee762bdc904e1301dc64463d069995b5612"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/include/hexlab/image/macho_metadata.hpp",
+                      "bytes":  12791,
+                      "sha256":  "330906130345ea47b2fa32b25033b92e90a218f972a62473330e2ef67ba8d9ef"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/include/hexlab/image/metadata.hpp",
+                      "bytes":  1910,
+                      "sha256":  "b15673044a1ed723b137f5b28a13f03a30a4b15808890bf5272e51e17f9e2081"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/include/hexlab/image/patches.hpp",
+                      "bytes":  709,
+                      "sha256":  "31fb496b118397b3a48c884ff4e9fb364e0d5ef703b84d38a5ea484c5f055e7b"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/include/hexlab/image/read_set.hpp",
+                      "bytes":  1081,
+                      "sha256":  "0fcbe8ba33ffb54027cc5b59148111739bcd364d6749ea49d4c120c145e28586"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/src/byte_storage.cpp",
+                      "bytes":  997,
+                      "sha256":  "7863e66c010baea99ef2fc50bc1d4fa5c9fd2c77067aaf33f0cd784e633a8d8c"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/src/file_publication_win.cpp",
+                      "bytes":  10992,
+                      "sha256":  "bfe88a8cf02f194c41721c78901137df1f145926bf2cbe68f80923ac9e132dc4"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/src/file_storage_win.cpp",
+                      "bytes":  3261,
+                      "sha256":  "6ac003459bb31afbfd9d3d1c9f49e768307f50a4c672593d28ec68b67be21676"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/src/image.cpp",
+                      "bytes":  12438,
+                      "sha256":  "ea77a5881477c1c96586cb2fa30232c3f5daafdc4589dcd0eabf643165381523"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/src/image_segments.cpp",
+                      "bytes":  10710,
+                      "sha256":  "ed66d595cc44c54cd14eb217df04ae9d57fa6a69e36ec10c8a847ec275dbf36b"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/src/image_testing.cpp",
+                      "bytes":  432,
+                      "sha256":  "818361b380faf56467681f04766ca3461ba7b7f26544800219ddcae04ca9817c"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/src/image_testing.hpp",
+                      "bytes":  278,
+                      "sha256":  "df70c327c50d488f180716ab3ce3711ddbe746dc8aceeb0a3316b4021a4d406f"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/src/mapping_identity.cpp",
+                      "bytes":  4743,
+                      "sha256":  "5d345148ed5f2c3b3380e6cd7cd1aa087dfea4c3c3070de49286c2b309119dfd"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/src/patches.cpp",
+                      "bytes":  6624,
+                      "sha256":  "cc70e3eb56adf00f3cef1988302639d56421501457cdebfe4ac89bf94d703681"
+                  },
+                  {
+                      "path":  "producer-source/libs/image/src/read_set.cpp",
+                      "bytes":  3015,
+                      "sha256":  "c5d6d56114fd5eb509c2210b27210daa1416f118f5795c4dfc614613ea09dc89"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/CMakeLists.txt",
+                      "bytes":  688,
+                      "sha256":  "efe107524c7592236ea89d3e0d62ad8eab620f2c5f1514771d6b2c820821b543"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/include/hexlab/loaders/elf.hpp",
+                      "bytes":  554,
+                      "sha256":  "352013039b3dbbca197a8116e21cfb5f2de14a0feb3349650076810d21ba0d3d"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/include/hexlab/loaders/loaded_image.hpp",
+                      "bytes":  362,
+                      "sha256":  "a271ec1d7897ebd5dfca3ea4b810a0d62708a009188d81634adb4bed5160d6b7"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/include/hexlab/loaders/loader.hpp",
+                      "bytes":  360,
+                      "sha256":  "b15307ac0336253764ca2b1d236235517bca46335f01480d773f1b4d0b06ad3e"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/include/hexlab/loaders/macho.hpp",
+                      "bytes":  818,
+                      "sha256":  "7750a265ae9667fd46bba9436443edc2ef6e07d006d62364810d9bad18740241"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/include/hexlab/loaders/pe.hpp",
+                      "bytes":  203,
+                      "sha256":  "32032a3dc7ebc491d705c5fe93d4ffc15419779c9a621c53fceeafdbdce04b83"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/include/hexlab/loaders/raw.hpp",
+                      "bytes":  941,
+                      "sha256":  "240de9d9f83d2d0fdb3da2c0fc1b4489b7b0461eebbdfd812e0766f81826eba2"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/include/hexlab/loaders/recipe.hpp",
+                      "bytes":  1188,
+                      "sha256":  "883f4ea5cab2dc2af66906216678aeb16438527593549104b4652924a2c73f06"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/include/hexlab/loaders/x86_raw_profile.hpp",
+                      "bytes":  1460,
+                      "sha256":  "172affdceb9adbc7e0045b9578e524af16c514e397a8e7a2ccd2f0c6417eec8a"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/detect.cpp",
+                      "bytes":  1264,
+                      "sha256":  "774918ede0bde71f8517e8e57b3ca595c311b322247f352513542c335b7f1e09"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/elf_dynamic.cpp",
+                      "bytes":  8402,
+                      "sha256":  "9dc7232f44d5e4c0fddb57914de2bd50bd10b5cdc7a1c2452553c0defd73efbb"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/elf_dynamic_relocations.cpp",
+                      "bytes":  3485,
+                      "sha256":  "8a2be083445d60373d2616939a7296bbd96daf94814978b27bfa37ca3ff90f47"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/elf_dynamic_symbols.cpp",
+                      "bytes":  11636,
+                      "sha256":  "45b124a01690fd84c1245456445812f384783d1cc7442b367c26216a8a724c39"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/elf_headers.cpp",
+                      "bytes":  6811,
+                      "sha256":  "a8c9cae7cd69384e8f78faf1bb28c28b401a400f78f59e05f8503c7ce8827021"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/elf_image.cpp",
+                      "bytes":  9340,
+                      "sha256":  "ef3bffca436f2c760ab6277388fa5ce35b1d00c9cb33b670ac03685676a08fb8"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/elf_internal.hpp",
+                      "bytes":  5159,
+                      "sha256":  "a310d4ee78419593789268ff2cf42829f5f66abe6b12ee0cd8042cf02edb5eb5"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/elf_relocations.cpp",
+                      "bytes":  17304,
+                      "sha256":  "9811d8907b17caa035e9c6bd822b9827d75a8d053fd311a77833cf59730a903c"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/elf_sections.cpp",
+                      "bytes":  5015,
+                      "sha256":  "6c4df89ba8616510d8892d8e3a0bd3b869c3dba8219a766f241a89cf6951d74d"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/elf_symbols.cpp",
+                      "bytes":  9737,
+                      "sha256":  "6452747113cced0d60d4ea97b53870145ca94f7347f57e588fa12dbd08545aa5"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/elf_virtual.cpp",
+                      "bytes":  4158,
+                      "sha256":  "6d3a99b21c8335ec0ce35563241a03d8007b94854bf406f3d64fdedf1c660222"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/macho_chained.cpp",
+                      "bytes":  18495,
+                      "sha256":  "2bfe4558ada1239bfc0c2099f4ad819a3d3199c0a3857cb5474c2fd843545ebb"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/macho_commands.cpp",
+                      "bytes":  13712,
+                      "sha256":  "7094f4893b549943551348e41bc46fc66dca89e29c7a5524e540736f7244c805"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/macho_dyld.cpp",
+                      "bytes":  14983,
+                      "sha256":  "fb0f3836f9bb5c5191046af523236801d4bb8987b7a89c95550df718fcb44def"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/macho_dyld_internal.hpp",
+                      "bytes":  2459,
+                      "sha256":  "2bd71196810c828f2c0067dd389272713314b91aa4bc53b4babc7293b7960db1"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/macho_exports.cpp",
+                      "bytes":  5337,
+                      "sha256":  "24dd3f5b8e382a4edfd5504fb33da62bda79e4931cdaa715a028f6497b437d8e"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/macho_headers.cpp",
+                      "bytes":  9128,
+                      "sha256":  "4088e576e912827b7a6eec46a7cd309120a055dcb0b17139537eef6fdd4207a4"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/macho_image.cpp",
+                      "bytes":  9976,
+                      "sha256":  "80ccdf4ec4ff26797a8feec05f3c5a4e63aefb122d6abe151ca795e3ecb6c3a4"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/macho_internal.hpp",
+                      "bytes":  3305,
+                      "sha256":  "ca9683c7a95ee6b25ca9383c1b4ec20eb9e685a5fa9d5b6ed136f0cdbf571694"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/macho_protections.cpp",
+                      "bytes":  6563,
+                      "sha256":  "d8aa02ad7766a56324b487cadd1c2e29c087a64ae30558bda816c2658f79fe4c"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/macho_relocations.cpp",
+                      "bytes":  13987,
+                      "sha256":  "d7a1bbe524c7544fd84587ee8f171e0b141852165f97f33fcdc855ac7d97bbe6"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/macho_segments.cpp",
+                      "bytes":  10705,
+                      "sha256":  "311ac7cbfe4768b62ba1324d6d92aabd7b7d36b1ed27eb505a9c74636f03c393"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/macho_symbols.cpp",
+                      "bytes":  6757,
+                      "sha256":  "9de5d9792de13b539b741456c9f357aa2f47578b8ff9dd22073344323d89e2a5"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/pe_exports.cpp",
+                      "bytes":  2958,
+                      "sha256":  "533b28b2be58ad1939f7b1dca15df1e16b7e93342aab0820fd8134677378b21c"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/pe_headers.cpp",
+                      "bytes":  8687,
+                      "sha256":  "7a28a4b09bfa1ab2adbcef3b2d81953d37a47f9a9eeb379e474ca2e3249237a3"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/pe_imports.cpp",
+                      "bytes":  3275,
+                      "sha256":  "83099b64023375ccae7e39e39020ec8e27ce7d260169309f2fc1a5ea504ac832"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/pe_internal.hpp",
+                      "bytes":  5095,
+                      "sha256":  "141268c9d83b235b70317f52a22319e1434273d1743e0c466ffdb816595eb6e0"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/pe_relocations.cpp",
+                      "bytes":  1945,
+                      "sha256":  "d85a8c098a76aad5b8fde86bfca23aed71678b57cb0ad0f21b886f77b3fa676b"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/raw.cpp",
+                      "bytes":  2957,
+                      "sha256":  "1f857c46e5cc9a54461aa9498a63d9e61c29c5abc9ff7ae8fd512618ccc5cd8b"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/recipe.cpp",
+                      "bytes":  9884,
+                      "sha256":  "750336d377dde9a92b852d9a65ef44d4961a107fbb82afde726658cf9cb7906b"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/segmented_raw.cpp",
+                      "bytes":  4251,
+                      "sha256":  "8a4070295480cafe35e8e5b2fa4c53a63a0ee3793421b95ca4641dc4eca8c2b0"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/x86_profile_codec.cpp",
+                      "bytes":  10779,
+                      "sha256":  "935bdea067b9c9ef01cde27f8a66d5ae73896c9217161d340fa60033afa6f3b2"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/x86_profile_internal.hpp",
+                      "bytes":  3381,
+                      "sha256":  "87d43f3dfa01442c3daa77eff6cd2f4bc694394bc4ee5a7b1262af5aa876e2e3"
+                  },
+                  {
+                      "path":  "producer-source/libs/loaders/src/x86_raw_profile.cpp",
+                      "bytes":  6124,
+                      "sha256":  "d5dc5905a87c60051a50a91fd7bdf5f98cb725689f0998102a947921a50eb4d8"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/CMakeLists.txt",
+                      "bytes":  269,
+                      "sha256":  "a71c327124e29d2ed7cba86662c10fc2c093afac7e7ec4d6fe5e9ab02a54b309"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/include/hexlab/processors/decoder.hpp",
+                      "bytes":  1244,
+                      "sha256":  "8eb5627c5d8878509e39aeb327553c25a17959c1c80599057f4ff33b0afcd8f7"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/include/hexlab/processors/format.hpp",
+                      "bytes":  366,
+                      "sha256":  "3d8995d7ce15e365fadb2c0b25d5d23c49d72c699a504f584978a43da67751a1"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/include/hexlab/processors/instruction.hpp",
+                      "bytes":  3738,
+                      "sha256":  "dc6ba6a79896fb784ebfe34ceb82abc139305df13e4734ec6a47d8065a8766b8"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/a64_data.cpp",
+                      "bytes":  3201,
+                      "sha256":  "38cee6ef8b650319f7591656fec4834be45f3f9ae977e9ca5321b8bca2e45149"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/a64_decode.cpp",
+                      "bytes":  929,
+                      "sha256":  "ffe8b78d2c5ae57f55d95738a958288cd4628b48da1dab50e6b49d4c848d85d9"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/a64_flow.cpp",
+                      "bytes":  2811,
+                      "sha256":  "f3ae85d77e43292b98dd79a885fe38b5a7bf6b3c45a618c2eaa751cf1bef8216"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/a64_format.cpp",
+                      "bytes":  3283,
+                      "sha256":  "aa7e54fac91e54961af1cfb72803bc21fe9acd7d23b30ff2f5972d5ab49b28fa"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/a64_internal.hpp",
+                      "bytes":  2226,
+                      "sha256":  "5f35f30355d876fd37dd606f60f8e822d0b2e3b32bcbdf985a3c7f2d0299431d"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/dispatch.cpp",
+                      "bytes":  2616,
+                      "sha256":  "e7367a1a43fb2501baceef8a4ccae18abd090dc578d020d262bc82eceffe2a01"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/format.cpp",
+                      "bytes":  6835,
+                      "sha256":  "1c32e829fa1aa911f48a82b04e0547d6da90239c8471c846d108dd86797cc15d"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/x64_arithmetic.cpp",
+                      "bytes":  5374,
+                      "sha256":  "1ee09b3e13cf17aadb0c79a940a4fa22771ec9fff3fd5a496e7e83ec57af6ac8"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/x64_decode.cpp",
+                      "bytes":  5684,
+                      "sha256":  "21bd656fc2cb9e1970a89cc9a07e05e7b50e7eb23eba11c636877f8849c9cc4a"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/x64_flow.cpp",
+                      "bytes":  8351,
+                      "sha256":  "18da235ff84ba3ad110af3a0f618d37fa3c32b515b80eb23f8f6fedba7495b0c"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/x64_internal.hpp",
+                      "bytes":  4567,
+                      "sha256":  "ff690f3d6b9909d0fd6cb00497b83418d28cca341c4f928e9888d007e7db0969"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/x64_operands.cpp",
+                      "bytes":  8115,
+                      "sha256":  "bada0a983a04a003c6bdae2240e8b11938fc18ef66646c9526a0ade45e7a28b2"
+                  },
+                  {
+                      "path":  "producer-source/libs/processors/src/x64_prefixes.cpp",
+                      "bytes":  3324,
+                      "sha256":  "7fc776f30c2fbd477ad79675fb76732c75567ac565a30d6aa6d385c33b394fd4"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/CMakeLists.txt",
+                      "bytes":  686,
+                      "sha256":  "fe2cd407a90a00fa82872fadfe8493fcaf3c5e1da9201b87ee68c6c1c452a517"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/analysis_pool.hpp",
+                      "bytes":  2337,
+                      "sha256":  "de3556da76c3ceccd4c68b9e7f492454b97c57fd5b9e4809890447f8bc9bd40a"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/commands.hpp",
+                      "bytes":  1644,
+                      "sha256":  "441925999b26d393407f8097e5faebf19f737d0eb642af02b869f1f629385383"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/document.hpp",
+                      "bytes":  1573,
+                      "sha256":  "fd1c2f88da7015d7600229d3e491676946125c0501d467655f152ca8c11f0895"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/document_manager.hpp",
+                      "bytes":  2221,
+                      "sha256":  "b0bd859899df49d4ba06fae8dbf32dc6a09b487be72f0ea5bf626b63ec49efc2"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/export.hpp",
+                      "bytes":  328,
+                      "sha256":  "71bb368bf739cc4c1afb3344ae7e5a4b7f78c616b08230d5a1ac44d2dcfe2ae9"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/jobs.hpp",
+                      "bytes":  855,
+                      "sha256":  "fa3fc57ab8b3ce8c0a062d61e36746549e3a1f26b2fcc68011f0726c8fdf4f9e"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/listing.hpp",
+                      "bytes":  1251,
+                      "sha256":  "36142f5b8b08a4ac04b2b2c004c58146bc1b55ba3b817bf171334fe130ef7a9d"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/macho_presentation.hpp",
+                      "bytes":  1460,
+                      "sha256":  "0f6d29a03d56e435501e25c24003e442afaa00135960b10cb1bbdc2095cda310"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/navigation.hpp",
+                      "bytes":  781,
+                      "sha256":  "c6b7145ccfd6b52fb3da01b603a3dd2a9a9bb79b54415e7fbf8ce32594753e67"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/open_recipe.hpp",
+                      "bytes":  397,
+                      "sha256":  "825b49af34f1fb84c33bcad8bc58633b932205f04e48ca1c37096ed66554d35b"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/project.hpp",
+                      "bytes":  4716,
+                      "sha256":  "a8da16f8d8312435fe5996ca1b11410f80b4f7e420ceb18b4a4a5f610b95f518"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/project_actor.hpp",
+                      "bytes":  2639,
+                      "sha256":  "ae4ef4b054f214122ca510add98ffbe788c3aa3fec33d72fbafb9e5bd8040d2a"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/project_analysis.hpp",
+                      "bytes":  862,
+                      "sha256":  "7abe2a44a5cd67f33e7e73fe67bd8d30ea6cf3629bea68ea94f1ab7fcaa1eb4c"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/project_graph.hpp",
+                      "bytes":  596,
+                      "sha256":  "14e8fd2d8d11044c2f0ad11c416bd79ad0b2317f3fbd95b02bed6e527557ebbd"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/search.hpp",
+                      "bytes":  1507,
+                      "sha256":  "d54f5402de5ee042744f85629fb20310c405ee8e4183519980d287b9b2f4d2a5"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/include/hexlab/workspace/workspace.hpp",
+                      "bytes":  1480,
+                      "sha256":  "c2a20eca197fcc986d2455900f94a9d49e4b3b4ff98b50233e8cf340720a081e"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/action_availability.cpp",
+                      "bytes":  5347,
+                      "sha256":  "e4e989d931344b56e82902000f5d2c4059c4cf241aab311d11efc6d991fcfdff"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/analysis_pool.cpp",
+                      "bytes":  15405,
+                      "sha256":  "5b2c5e9873034cfc968bb40198eaf7df75ea0f9225b1d315e9e922cb2c990be5"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/command_validation.cpp",
+                      "bytes":  3236,
+                      "sha256":  "cabaf53a9a3e9a75e4667930a74d7ec9a8b161baf1d14d660ee4beb7aaca541d"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/commands.cpp",
+                      "bytes":  13663,
+                      "sha256":  "fd602384868814f845581a98db87d0cab02d74cd47c1dc3aa3534b26b44476e7"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/document.cpp",
+                      "bytes":  2717,
+                      "sha256":  "60291bed49e6e90904e986f596cbd1702e4d6c5503934613717ede4932c4f2cd"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/document_manager.cpp",
+                      "bytes":  18558,
+                      "sha256":  "e91bf9362feb954fa2daed4554df607be9b45412bc202347cc6f1ae4d2710ba5"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/export.cpp",
+                      "bytes":  2208,
+                      "sha256":  "2282eca5c5a7186dadf9a4647f2a806f6074d885bd21528ea51df238eb5216b0"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/jobs.cpp",
+                      "bytes":  2891,
+                      "sha256":  "bd0ef4a1dcb504a26a14ddc0651e5054d71b78bf79b9aa4861d730e6941357a6"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/listing.cpp",
+                      "bytes":  13384,
+                      "sha256":  "487cf23c946bf7cca5a16b4950c0cfd71d1837902d00953c47154256db00a0be"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/navigation.cpp",
+                      "bytes":  7491,
+                      "sha256":  "4733beb8a4bd6e6ae253d03a6bac4eeb1f42ad774d9c8405837bfd2b8998f9c6"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/open_recipe.cpp",
+                      "bytes":  2247,
+                      "sha256":  "2318b5c77d4d0bd5347b57f5d49ff1dbe0436b04ba4591b6479833f57de4f40b"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/presentation.cpp",
+                      "bytes":  24135,
+                      "sha256":  "d3ae6746029c2173a5dc1bb6f1a827b7d197c17b9ab8b861fdf44eed5a52d84c"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/project.cpp",
+                      "bytes":  13855,
+                      "sha256":  "cd32aab13bd9c208a913c62e9de8f5f7d773d1ebec79754d5bdfdda11d1c39ff"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/project_actor.cpp",
+                      "bytes":  24269,
+                      "sha256":  "de6ab39148a245fb1b990e136bacb0b51d9ddd749627fa9aee9c71451d79dec0"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/project_analysis.cpp",
+                      "bytes":  8332,
+                      "sha256":  "c69c3553f269569196a1afe9931ff3a4bdc5ee219f831985898f69fbcdf74930"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/project_graph.cpp",
+                      "bytes":  4559,
+                      "sha256":  "3fb6798614254ab6830e4bbac9279ad273c47cc53feab26798f45c1ee6649f73"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/project_internal.hpp",
+                      "bytes":  1940,
+                      "sha256":  "a27d88134003b3b39048096eb5aa44cf1baa848b1be8f29e405581e173b99839"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/project_testing.cpp",
+                      "bytes":  952,
+                      "sha256":  "28ab528737bb2cd956fc4d9b31233541415e4bed5ec0caf5598a6b68f6ffe35e"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/project_testing.hpp",
+                      "bytes":  887,
+                      "sha256":  "54cb35f4c8bc73ec518d64f8920bacea5961156e28cedbe9a641e608a01af951"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/search.cpp",
+                      "bytes":  3308,
+                      "sha256":  "837eae9f4a7a761049b4cbf02a0a8cddc4e77ed81d1e37efb14ae956b8946318"
+                  },
+                  {
+                      "path":  "producer-source/libs/workspace/src/workspace.cpp",
+                      "bytes":  2700,
+                      "sha256":  "2dc909fe1526b631265e65aa5e52dbf0d74dcd70f6489e790f19422ab0baaa66"
+                  },
+                  {
+                      "path":  "producer-source/README.md",
+                      "bytes":  3172,
+                      "sha256":  "f20ee36a8a4ee022ab9cdee7b996eb5263ddf72c9dde2d4e711f016c39130702"
+                  },
+                  {
+                      "path":  "producer-source/tests/a64_cli_tests.cmake",
+                      "bytes":  1524,
+                      "sha256":  "c6aee41f6e7c64273960462bdeb3f8e765a995a3fe96ebe2e0aee9fdb1983d89"
+                  },
+                  {
+                      "path":  "producer-source/tests/a64_decode_probe.cpp",
+                      "bytes":  828,
+                      "sha256":  "56f5ce8b53d8e3277bf41bd3a3d24f8d4e94e50c35c3d4913956b5a58cbbb7e9"
+                  },
+                  {
+                      "path":  "producer-source/tests/a64_decoder_tests.cpp",
+                      "bytes":  11293,
+                      "sha256":  "3562e0452b61865fe302c6107e1e2373136aa5c1eb5e05a6f678a5e10832ff3b"
+                  },
+                  {
+                      "path":  "producer-source/tests/a64_fixture_generator.cpp",
+                      "bytes":  528,
+                      "sha256":  "3e97f015390fd5d363758df1cf22d7fa29705f09b50c7e13784f565ecd77c481"
+                  },
+                  {
+                      "path":  "producer-source/tests/a64_image_tests.cpp",
+                      "bytes":  9333,
+                      "sha256":  "8d3ff1901e3058b7b8c5dec71d37f576daf25ea48203d3cd019e3646a9fb3f24"
+                  },
+                  {
+                      "path":  "producer-source/tests/a64_project_tests.cpp",
+                      "bytes":  8955,
+                      "sha256":  "db3118891b6e5fea616e36f4ed9d49540aca189867776f35d4ea32252a4c0e09"
+                  },
+                  {
+                      "path":  "producer-source/tests/a64_relocation_tests.cpp",
+                      "bytes":  6727,
+                      "sha256":  "6fb936ad784b60b58f584bf9680fabbdf91a6f12c105423e1ef5693c46651d6d"
+                  },
+                  {
+                      "path":  "producer-source/tests/a64_scalar_oracle.py",
+                      "bytes":  4282,
+                      "sha256":  "ab1a71e32650eae61d1367005cb36e215ad496b8e2e857ac1b07e252e7918eda"
+                  },
+                  {
+                      "path":  "producer-source/tests/analysis_pool_tests.cpp",
+                      "bytes":  10342,
+                      "sha256":  "e10f658891983bcd7fbda078ae76c0232a1953958a2541240c1ae772d38d933d"
+                  },
+                  {
+                      "path":  "producer-source/tests/analysis_tests.cpp",
+                      "bytes":  8331,
+                      "sha256":  "d8df8651a786e39bb54c95b1bfd1143c930cd41dee994d6c042aeb8dde6b9e0f"
+                  },
+                  {
+                      "path":  "producer-source/tests/cli_binary_tests.cmake",
+                      "bytes":  3944,
+                      "sha256":  "58cacdeca9312a29fd76189ed47f6930ddc1af22cad545c54c19ea0bb14b1677"
+                  },
+                  {
+                      "path":  "producer-source/tests/cli_tests.cmake",
+                      "bytes":  951,
+                      "sha256":  "51630a8f9b1ae0d700beb2a83be6145604f4c73fc7ab316803a4bc1e7fb943dd"
+                  },
+                  {
+                      "path":  "producer-source/tests/CMakeLists.txt",
+                      "bytes":  41303,
+                      "sha256":  "3ec8338bc7580247e6769c7aa8c9699e389a3c2bc95a35aa8ef46da0c6e830e4"
+                  },
+                  {
+                      "path":  "producer-source/tests/core_tests.cpp",
+                      "bytes":  4514,
+                      "sha256":  "e1cc5603ee9bfa878de2322f74f58dd8a758ab01635ec7321d3cb87b30b2f216"
+                  },
+                  {
+                      "path":  "producer-source/tests/derived_cache_tests.cpp",
+                      "bytes":  17603,
+                      "sha256":  "3a357c4fd6a14b7589c6129f39599df5f1e27c78ea013872cee3d50941172b84"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_binary_tests.cpp",
+                      "bytes":  13090,
+                      "sha256":  "e01a2a1b920e3085c78c285803fb8b9f62f4ddc5497af7453287020f5d74839e"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_close_tests.cpp",
+                      "bytes":  6485,
+                      "sha256":  "00dceee936a96dec928d641448d2f7338515a4099053c382cca7e6bc04e3b620"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_edit_tests.cpp",
+                      "bytes":  17318,
+                      "sha256":  "46be144becffae5551eb1129d1fbe8cd53068f41ad388b2c84d2c10b68714687"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_elf_tests.cpp",
+                      "bytes":  21580,
+                      "sha256":  "3f4884569d4838bad479f1d5010bd43f4b64e004fa43a491a3e44f5d6419e4f1"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_graph_tests.cpp",
+                      "bytes":  19538,
+                      "sha256":  "e09cf04ce5730d601f813826e8736cce97b9f61a2d8eed5fce36b92295055aff"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_macho_tests.cpp",
+                      "bytes":  24155,
+                      "sha256":  "b9316e6b7d51caae47d56986aa7673004365605f5114cbed6550fb360a095317"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_mode_tests.cpp",
+                      "bytes":  20243,
+                      "sha256":  "73cd48a467a52221ed043e64dd1a26441c4b01aed1f0e2c75d179a9def082e36"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_orphan_tests.cpp",
+                      "bytes":  4745,
+                      "sha256":  "30eacfa9e250a36ada5f27848efbaba8e3fb891697a1d9233b9c98c2149e2f05"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_project_tests.cpp",
+                      "bytes":  6545,
+                      "sha256":  "1637b965a5814a2cbf0a503847ca17e25e07cff3c3e4688184c20d3b4414f9f6"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_reference_tests.cpp",
+                      "bytes":  9861,
+                      "sha256":  "b8e69d4890f71b651bb221bf45f85c68ccd66733902c341149a2be6de02b9609"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_search_tests.cpp",
+                      "bytes":  13269,
+                      "sha256":  "c2083ed934cf99e032b1c51e784413b61e892c9da7e6c7b7f917cd5a4e6f3308"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_segment_tests.cpp",
+                      "bytes":  41180,
+                      "sha256":  "93be39a642930243d8ffd231f7ff0bfdf3f4cd6979cbb14be914d8fccae70ec7"
+                  },
+                  {
+                      "path":  "producer-source/tests/desktop_smoke.cmake",
+                      "bytes":  396,
+                      "sha256":  "86f03f369463e9806bb5707c25af26bcddee220092da9b9447d9078cd28f568c"
+                  },
+                  {
+                      "path":  "producer-source/tests/document_manager_tests.cpp",
+                      "bytes":  10084,
+                      "sha256":  "754586a5081f4247605316ad7f0ae6da1a304c4ea6456f76d98d134d074f2eab"
+                  },
+                  {
+                      "path":  "producer-source/tests/effective_input_tests.cpp",
+                      "bytes":  4096,
+                      "sha256":  "439f2e24512d5d61a6880be42b1504cba7fa570660120a18c7ee5ba6c1f55785"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_cli_tests.cmake",
+                      "bytes":  3743,
+                      "sha256":  "ef302df20560c274d5c72ae5571429473865b230e5f010dcaf9ba8f8683f1794"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_dynamic_relocation_tests.cpp",
+                      "bytes":  10906,
+                      "sha256":  "b66d979b38407257fd10c7d20e7e697f6d9832a88b1f58ecb0c109fc4cd3a0b6"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_dynamic_symbol_tests.cpp",
+                      "bytes":  14705,
+                      "sha256":  "f2df4f558618cde5d7890fc5c191593019974f879fa45df2d25c6a7d335decd9"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_dynamic_tests.cpp",
+                      "bytes":  10039,
+                      "sha256":  "3f2d7f6fd873835a7848a5e7f60d500dec3e5a4d619db75efc8719fd6faaec4b"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_flow_tests.cpp",
+                      "bytes":  21394,
+                      "sha256":  "fd5b1d81d839ddede70efb2d140994b3d9e4dd36cb6c1ec1189eb35937da2207"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_header_tests.cpp",
+                      "bytes":  10987,
+                      "sha256":  "33c671bb9edaeffedc34fdf93b7d560ae8af187e7f91a68c70b15e07869f8d91"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_image_tests.cpp",
+                      "bytes":  14210,
+                      "sha256":  "259bc4e417f126170731b1f096857f72995d06a97d844d31d3eb0376be51c2eb"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_install_tests.cmake",
+                      "bytes":  2576,
+                      "sha256":  "5d3899ed734ced1be219e7ddc5646e2f6ddf6f234fe70f6be31b9dd3075bb4b8"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_oracle.py",
+                      "bytes":  22419,
+                      "sha256":  "d10b60d243637153a849abff0eb61736173c5276469c8af86f49fc7970d58eb1"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_oracle_probe.cpp",
+                      "bytes":  8650,
+                      "sha256":  "07c94dd6ca436bbf641346df0bbf8fd6d4efa6cd9be819535d5f7c32a73332e3"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_project_tests.cpp",
+                      "bytes":  23779,
+                      "sha256":  "77e7746547c181ea8ecd8486dc65080b93521bfa6cb0dd75f5f478d38a1bfa8b"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_reference_cli_tests.cmake",
+                      "bytes":  1333,
+                      "sha256":  "680c253ea69fd236e1ff158a84989710fd7d53d2800b585c280e419646e8c389"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_reference_provenance_tests.cpp",
+                      "bytes":  21145,
+                      "sha256":  "f3307fec493442c8fa4bc1edc57c5d93962cdd4962664f3b5a3ea984ccb4fd12"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_relocation_tests.cpp",
+                      "bytes":  11175,
+                      "sha256":  "f4b9a1d9bd3c9038bcc954ac180f1a4d6413fe58bdff7ed95e3e26cac6fe53f7"
+                  },
+                  {
+                      "path":  "producer-source/tests/elf_symbol_tests.cpp",
+                      "bytes":  24910,
+                      "sha256":  "bc48fc7af25adbe02f081ccb3d47d2ffab2c4b16a69ed68919ed85891ab46692"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixture_generator.cpp",
+                      "bytes":  2314,
+                      "sha256":  "a054a384622a5bf4bca1471bbd441b1c1c3cbcdb477ff5129bc7346f82397a84"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/a64_relocations_elf.s",
+                      "bytes":  282,
+                      "sha256":  "5089f3525ebcaf81443dc4bf74311882feb5d00fcc58fca464273cf27e6a4e18"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/a64_relocations_macho.s",
+                      "bytes":  233,
+                      "sha256":  "9dc2fc897e860916db5191af8a1e98d50e9c01689cce3d808519ef2dfd4aa645"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/a64_scalar.s",
+                      "bytes":  526,
+                      "sha256":  "c5ce00db8c60184e5c5ea29ecf2ad4bfbb13a9ea6bbba6eef8d6daa5407ed99d"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v1.hxdc",
+                      "bytes":  991,
+                      "sha256":  "2718f208c3d0a1d57fcac7511ede5609b43948d177604605eccc3d09eb97de44"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v1.json",
+                      "bytes":  388,
+                      "sha256":  "a2f48dea8804c9ca9b8d819020bf29d3e0b680da6bcc27a54052ac93688a027b"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v2.hxdc",
+                      "bytes":  1893,
+                      "sha256":  "f24811a72ab59984b8d005d4f0130fb339fbdbde34278e58759d0243188a0248"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v2.json",
+                      "bytes":  1222,
+                      "sha256":  "62c83b7093fa7ba54349ffc2f1db94c21d79535b7a27d4c8ccd7c1ada735c5ce"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v3.hxdc",
+                      "bytes":  4337,
+                      "sha256":  "bef86a0f2c897c96bd0ed01cb4e2be0c7a21e8cd9fb14a24ad2c51231062a977"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v3_producer.cpp",
+                      "bytes":  2145,
+                      "sha256":  "a287d47d5f906bb10943dec68c8ac60a931a98205158a099a428571fe3cfd8b2"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v3_provenance.json",
+                      "bytes":  3839,
+                      "sha256":  "76f9b819506983807fdc7ec9635adc31f670dffb487e6d9f5e4db5051a81fa2d"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v3_provider.c",
+                      "bytes":  52,
+                      "sha256":  "d3c1cb2f4c51d5f03d1dbcb5a01eb3d0042f00d11da683734d29a868c2a874fa"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v3_provider.so",
+                      "bytes":  1944,
+                      "sha256":  "679b30fbdecfe6d1e6ab439b9a9ef953733ee7d8f0c4185e89c6762cce1463e3"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v4.hxdc",
+                      "bytes":  4352,
+                      "sha256":  "49333b76ac0b7e343cc67c2659f9d68bfcb58454eab77d3bbfe8a796ad15f6c0"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v4_producer.cpp",
+                      "bytes":  2147,
+                      "sha256":  "585ddf39f587a47d3d7506f5e2c581698b84639f71c33e330f7024b78e562594"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v4_provenance.json",
+                      "bytes":  2907,
+                      "sha256":  "c6ca30a167fac7afbfa1d55ea2be6152345fc7466baa758569b98ee1f6c70414"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v5.hxdc",
+                      "bytes":  4898,
+                      "sha256":  "29b38f8e1f9702e5c114af4b0e3211b128bea819a1b9f2fc851e14e0fe13bbc4"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v5_input.o",
+                      "bytes":  1224,
+                      "sha256":  "702c191fbeab72770b4c56f3e9b14810eaaa8cec48469d8d050373722d1f99bd"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v5_macho_v13.hxdc",
+                      "bytes":  3011,
+                      "sha256":  "8f68d4f08d2596a9d77aa268a1451de9991ab8a8a0e4ccc326e52c54882b288a"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v5_macho_v13_input.o",
+                      "bytes":  4096,
+                      "sha256":  "7f3ff3e4b323b90f40f2c6a2068fa9979aeff3df0bd9aa64d9e0d34e6290073b"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v5_macho_v13_producer.cpp",
+                      "bytes":  1971,
+                      "sha256":  "21aa9426bbea20e32d55addb3f8495be143ead08a0a96488666a31407d144b43"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v5_macho_v13_provenance.json",
+                      "bytes":  68613,
+                      "sha256":  "703580e4c8410947341147794718ad1be00f42be5f643584b88e889c5b416fbe"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v5_producer.cpp",
+                      "bytes":  2352,
+                      "sha256":  "58025cf0e1931cec71a080d203bfdbf2d5f4f381692cf8f0ded4e9b871b0880a"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v5_provenance.json",
+                      "bytes":  1985,
+                      "sha256":  "14e090aeb2db19ca6efe82a3380a88fa96e68a0cbabbf4f8b4908f24d7cff4d8"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v6_macho_v15.hxdc",
+                      "bytes":  3215,
+                      "sha256":  "5289ffa0d3448156f52e12059040ef82f3c97c311d4374582e14e86a7e9c1727"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v6_macho_v15_input.o",
+                      "bytes":  4096,
+                      "sha256":  "1a1caa0faa21743ad4e34741c2424b0ce69a647c83affdec098e8ca9a7e8a1bc"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v6_macho_v15_producer.cpp",
+                      "bytes":  3155,
+                      "sha256":  "0f7fbfd75b78673a4c8c9b8486d2896f04d4faa5e3bf389f51e541cdfa47d5f6"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v6_macho_v15_provenance.json",
+                      "bytes":  88633,
+                      "sha256":  "f2902f17785c83c09591f79a2590f6422364795a0ce9b7dc4bf6eca7b5de291f"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v7_macho_v16.hxdc",
+                      "bytes":  100131,
+                      "sha256":  "976f33b520adc9f2c1b7dbd442c1ea09ac7c6883a2fe4c2d67887bc174129ede"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v7_macho_v16_input.macho",
+                      "bytes":  4096,
+                      "sha256":  "c521e2bcbc613ee5670134f2fc67361aa004c724ff2bffa5134edaaf9c1d4261"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v7_macho_v16_producer.cpp",
+                      "bytes":  4450,
+                      "sha256":  "5697439c978a41c4773ca77cb6282ee9015001de1396325f70dff853ce3a1e4a"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v7_macho_v16_provenance.json",
+                      "bytes":  151661,
+                      "sha256":  "eb96bc92c1436d2ba0f0711ebdacb4b6bd444a7f7369bf6e13a2f232d3b88acd"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_arm_v20.hxdc",
+                      "bytes":  6175,
+                      "sha256":  "c504408a2e8ec553774644e15644031332b5a821a9d8a8ab72046f3232ab6c04"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_arm_v20_input.macho",
+                      "bytes":  4096,
+                      "sha256":  "563f4e55990c5e96acf01b2aef41c81db185548c5077fa8d3355a47b3fd7e85a"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_arm_v20_producer.cpp",
+                      "bytes":  6321,
+                      "sha256":  "ff0fbe7e3ca30a03244decd764d9bb755aaa0f7f9b7a4d37cc79ed8b5d25d3e4"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_arm_v20_provenance.json",
+                      "bytes":  167344,
+                      "sha256":  "f8767be60c8e05e7f82de8d2e726c2db5978d993d34011d951b6d94e2a4e361c"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_arm_v21.hxdc",
+                      "bytes":  6175,
+                      "sha256":  "08e0d6f61b8fcfcc7f29d8e3257112472f28e870f20c0dca6a83367e55dfa007"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_arm_v21_input.macho",
+                      "bytes":  4096,
+                      "sha256":  "563f4e55990c5e96acf01b2aef41c81db185548c5077fa8d3355a47b3fd7e85a"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_arm_v21_producer.cpp",
+                      "bytes":  6321,
+                      "sha256":  "a4a6f5a2b459baee67ecb403f72d0e78fc92dd748a03b0275556e741427958f7"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_arm_v21_provenance.json",
+                      "bytes":  175267,
+                      "sha256":  "b9648b36fae831c6246c453183c10f2f8c893d780271d42a1bfba7a18acfe628"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_macho_v17.hxdc",
+                      "bytes":  6019,
+                      "sha256":  "aa60c2d083e79069bc5b382b55bb5d2514050be7b1c8a3258693249899b4ea33"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_macho_v17_input.macho",
+                      "bytes":  4096,
+                      "sha256":  "c04a2f5e0fc4a1f99702176b8c05acc235ec35c608cce6e44f9084311db9f254"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_macho_v17_producer.cpp",
+                      "bytes":  5841,
+                      "sha256":  "82fc973dbebb3b299e6a5de40b94a61e7595f6bd396485857629aeeb9090228d"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_macho_v17_provenance.json",
+                      "bytes":  153431,
+                      "sha256":  "221658775d588f6052104b9eb1820ff7014eb5201fd10a7d2a1893d730c6a151"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_macho_v18.hxdc",
+                      "bytes":  6175,
+                      "sha256":  "6e3ee89d40e58dc289074b176737d8770540d49e6e3892980962cf0d353bea4d"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_macho_v18_input.macho",
+                      "bytes":  4096,
+                      "sha256":  "563f4e55990c5e96acf01b2aef41c81db185548c5077fa8d3355a47b3fd7e85a"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_macho_v18_producer.cpp",
+                      "bytes":  6325,
+                      "sha256":  "90a6b3e12751680c820cda4f334a2e39192bdb71a87fb0a2467ba852f42670dd"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_macho_v18_provenance.json",
+                      "bytes":  155278,
+                      "sha256":  "1f2b618a0b87ce8f891a975a3d2faa3f72f3e2c89e280dc6b3da6de728393e14"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_macho_v19.hxdc",
+                      "bytes":  6175,
+                      "sha256":  "789d2fd9e94dfe4fd9a3aab0be310083d742f4e41ca35c5b0567bd47536c1d8b"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_macho_v19_input.macho",
+                      "bytes":  4096,
+                      "sha256":  "563f4e55990c5e96acf01b2aef41c81db185548c5077fa8d3355a47b3fd7e85a"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_macho_v19_producer.cpp",
+                      "bytes":  6325,
+                      "sha256":  "f6f2a0f751f55e2ea4599fb42fd7a37f549e6f9cffa0c4a5f418dc01b18fe300"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/derived_v8_macho_v19_provenance.json",
+                      "bytes":  165081,
+                      "sha256":  "385c6d7bcffdad1038d6a0993be3bd66608a09ce3c05f0e0b8251de0fd009f59"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/elf_oracle/consumer.c",
+                      "bytes":  159,
+                      "sha256":  "d1a032ab0e9db3ade2c34750616247b13a407cebcf6d7936ed21de9588536106"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/elf_oracle/provider.c",
+                      "bytes":  51,
+                      "sha256":  "6ec7cad437ab6e37ab5d4b52a1d993325cb3e38534f80d12d1c17a6d7719fedc"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/elf_oracle/README.md",
+                      "bytes":  2849,
+                      "sha256":  "adb18397d84f61dc324ce35f997e6c2bd0a071a40f4916f7172224acd1fa31a5"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/elf_oracle/retained.c",
+                      "bytes":  95,
+                      "sha256":  "14dd92b835bfd60c72f6fa06b954853fd72dcdb7172d83310a09edf8d6d739bd"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/elf_oracle/tools.json",
+                      "bytes":  802,
+                      "sha256":  "625d74dd4858c5d733cc238f047ad8138dc69dc44408e745a6dd39c37f72066a"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/macho_guard_x64.o",
+                      "bytes":  400,
+                      "sha256":  "d2e82a2bd995313d1eaf25da0e1c6a9f7972f584e007c77d0196cf15a386f1ff"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/macho_guard_x64.s",
+                      "bytes":  119,
+                      "sha256":  "ed8f26446bda8688dc4bf65f9442ff5eb33fe0459446d6d1a9c2b30e997264f6"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/macho_guard_x64_llvm.txt",
+                      "bytes":  1558,
+                      "sha256":  "8fc6d35543d58c79bc065f3b549d590934d637b8cd044f0b6b515a4fc61423f4"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/macho_guard_x64_provenance.json",
+                      "bytes":  1968,
+                      "sha256":  "e1a02bd654e3f23747ddd1f012b2b8e5b7ad6f0bc3611f389278e69499197683"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/macho_oracle/consumer.c",
+                      "bytes":  370,
+                      "sha256":  "0fc78acbf5ee521e3e1eb76a291cc2e98db3ca90758242729776ab9ae910d7df"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/macho_oracle/provider.c",
+                      "bytes":  93,
+                      "sha256":  "c77f3e2c2fcec64c9c17adaa5678023c041fcaadd28346ac3bfea5afb03add34"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/macho_oracle/README.md",
+                      "bytes":  2571,
+                      "sha256":  "4dcb6ac93563a34b6201689a8b7faf583dfb0a0f76b84806202240024173ad4a"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/macho_oracle/relocations32.s",
+                      "bytes":  208,
+                      "sha256":  "f31d48ee03ac11b2dba7b7198e37c4188fcddb999538d6eaf87313c55e1c15d3"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/macho_oracle/relocations64.s",
+                      "bytes":  268,
+                      "sha256":  "711f3dcda7e8957b956ee269bfe2be3f60f2f4b7059e28884d78ca54e5b78571"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/macho_oracle/tools.json",
+                      "bytes":  566,
+                      "sha256":  "5c7f0d9cf78af1bac9314f74997103f8f61bb40bf8ae505934ab42f232a013aa"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/reference_v3_ordinary.hxrc",
+                      "bytes":  101,
+                      "sha256":  "7904c4517c648d670da47d2447e45bc99ad7d0bcd3949d0ac08390d3a4b1a4cb"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/reference_v3_provenance.json",
+                      "bytes":  3294,
+                      "sha256":  "56c88bd2d0d3f1c92191aa9d90b892553d3cd851abbf81ac3bdfd1e86fca3e0a"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/references_v6_macho_v16.hxrf",
+                      "bytes":  29262,
+                      "sha256":  "b39a67a192bce7fd5670ad8b94a2c35eaa05a8f7a22c91f41a97e9b36610a067"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/references_v7_arm_v20.hxrf",
+                      "bytes":  2593,
+                      "sha256":  "83bd05662fcab1ffe8e8c495585bd07c38550e64ebda27060267a23fefad901d"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/references_v7_arm_v21.hxrf",
+                      "bytes":  2593,
+                      "sha256":  "ab07b7a3b972bd4c9d6094df32ced2acd6f25d16657758b5eb8132808555bea1"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/references_v7_macho_v17.hxrf",
+                      "bytes":  2593,
+                      "sha256":  "5c93e8a9aca9507def513cb4541419dcc1873dff0e4627857d3bc406e7f153fc"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/references_v7_macho_v18.hxrf",
+                      "bytes":  2593,
+                      "sha256":  "c99abb79f64665ba3748ebc1fbe8b44ff1260bbcf8d83ed40171b212141ad2fd"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/references_v7_macho_v19.hxrf",
+                      "bytes":  2593,
+                      "sha256":  "d7ed06bc907ddb10cf146d4083babaca3e59c265ba88428e0802b8ff35cc9579"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/x64_lea_segments.asm",
+                      "bytes":  290,
+                      "sha256":  "fb8e0b319c6411914abe10c46cc94aedbbf72900654e39591fb4660cab411815"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/x64_scalar.asm",
+                      "bytes":  341,
+                      "sha256":  "d34841339489b78142c3e57647c8f790913151a2ed5e9c055eb0adc74de4a99e"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/x86_16_oracle/boot.asm",
+                      "bytes":  8089,
+                      "sha256":  "66c73f0ad583c35f2e6fee2dfae07374072869c348deace06b0b0e6412b7fb19"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/x86_16_oracle/README.md",
+                      "bytes":  3729,
+                      "sha256":  "847aebbb17a7ea334a50d9980f2fdfe6257a2cba8a31c7e69b59b13afa6ebbf0"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/x86_16_oracle/tools.json",
+                      "bytes":  2462,
+                      "sha256":  "1caf37bdf25299b42aa6ded76f5ecae26677300b91032c65bd73013a01c9261c"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/x86_32_oracle/CMakeLists.txt",
+                      "bytes":  525,
+                      "sha256":  "eb0920a03e0393d4307813a93134845ffa2625a165b132346d33ade5a16567c1"
+                  },
+                  {
+                      "path":  "producer-source/tests/fixtures/x86_32_oracle/oracle.cpp",
+                      "bytes":  2901,
+                      "sha256":  "a28e884980c063b8bf19117d57946771542a45b96b227f7c861c90a51bc250dc"
+                  },
+                  {
+                      "path":  "producer-source/tests/function_tests.cpp",
+                      "bytes":  13593,
+                      "sha256":  "f36e26bc314e892c86477f143d846cc952ab6baad4c993156cac79d6e11e1b21"
+                  },
+                  {
+                      "path":  "producer-source/tests/graph_oracle.cmake",
+                      "bytes":  341,
+                      "sha256":  "20025725d8e57d572ac871190b0398ff58ae39c0252275107612cc217e4a64b8"
+                  },
+                  {
+                      "path":  "producer-source/tests/graph_oracle.ps1",
+                      "bytes":  2341,
+                      "sha256":  "a6cf076fc6d6548618bf996990d2cf42cbf21e286eaedfdc5ca7504bdd1cfc00"
+                  },
+                  {
+                      "path":  "producer-source/tests/graph_tests.cpp",
+                      "bytes":  9082,
+                      "sha256":  "21e6e2309d98022bde3e46ea7437840b4776ccc2c18f657286302cd35c13609a"
+                  },
+                  {
+                      "path":  "producer-source/tests/identity_oracle.cmake",
+                      "bytes":  680,
+                      "sha256":  "669aa56624715a0dccc13aa9c2fa89a72b152744cee4e3b44479585d7b6828e3"
+                  },
+                  {
+                      "path":  "producer-source/tests/identity_oracle.ps1",
+                      "bytes":  155,
+                      "sha256":  "abadb94cf05b28e548ae8183ba7e71557f3b383272870905cbd4843da662b451"
+                  },
+                  {
+                      "path":  "producer-source/tests/identity_tests.cpp",
+                      "bytes":  4298,
+                      "sha256":  "6e64bcc5e914b4e8be6631dd8c760305928e2fe9bcc59cf58e49c2f176fae88f"
+                  },
+                  {
+                      "path":  "producer-source/tests/image_domains_tests.cpp",
+                      "bytes":  11406,
+                      "sha256":  "505f974720afc69ee60e42d4c8debb7d04fa42b3c492867cb03650222a703377"
+                  },
+                  {
+                      "path":  "producer-source/tests/image_tests.cpp",
+                      "bytes":  4351,
+                      "sha256":  "1fb8b3244310840d4d2c54cb9d4b5695fe9fc090f516f603711629f292df2941"
+                  },
+                  {
+                      "path":  "producer-source/tests/incremental_tests.cpp",
+                      "bytes":  11134,
+                      "sha256":  "764b04d3884843c36733d532479559d7960807b41e80f30693334c1b43ac46a5"
+                  },
+                  {
+                      "path":  "producer-source/tests/install_tests.cmake",
+                      "bytes":  3079,
+                      "sha256":  "daadcaa77555f7b95a03fba686183a6c6f1a26d2294897490b56638d378553d0"
+                  },
+                  {
+                      "path":  "producer-source/tests/installed_runtime.ps1",
+                      "bytes":  12698,
+                      "sha256":  "19690a32006ad57fbaf9cdad359407919d5360d7fa7e0b3f5511200cc3784290"
+                  },
+                  {
+                      "path":  "producer-source/tests/loader_tests.cpp",
+                      "bytes":  9164,
+                      "sha256":  "8bc604bcd04970106deaad0181afa456bdda6e24c8a321e6891849bf0832ed2b"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_cache_tests.cpp",
+                      "bytes":  8886,
+                      "sha256":  "f29112eb1f4530cd478065fea6762f58c23374736bc9ed1d9e4ce504eb5f5324"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_chained_tests.cpp",
+                      "bytes":  13803,
+                      "sha256":  "f7f41c6a25edb36d16ba3d5b07e70f41ba19231307beafe079ac35260a0e5f27"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_cli_tests.cmake",
+                      "bytes":  6914,
+                      "sha256":  "a19d4c1305bd08d64c0afccd9a75caa0390fa7e8b7c60a568adbe66fd790ef3c"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_command_tests.cpp",
+                      "bytes":  15052,
+                      "sha256":  "59618da2d0cc8085b8e97f0f500ebceb43a220fbd85625047df760b1cae3d5d4"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_dyld_flow_tests.cpp",
+                      "bytes":  14017,
+                      "sha256":  "66fb61e3b231fd9003be1a40f52fda6c0b1dae7a4e729b7136c89fc80075efe5"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_dyld_reference_tests.cpp",
+                      "bytes":  14645,
+                      "sha256":  "3635a7a6f74b7221ebc9a4524ca5cca263b32c27a4660059af71e75dbfb806d5"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_dyld_resolution_tests.cpp",
+                      "bytes":  16294,
+                      "sha256":  "674dc01401c284df84a29d6be5ff28c00a4738c82dffcdc8bc9b7b189c01629a"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_dyld_tests.cpp",
+                      "bytes":  15066,
+                      "sha256":  "a0cdb2b068ee97724ec0ded4b4329452de43d0bba4d7c4012980ccb4ca628800"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_export_flow_tests.cpp",
+                      "bytes":  7361,
+                      "sha256":  "35540086d5679ac6600f67d1fa233552e597df4111c591a821013e173778c17f"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_fixture_generator.cpp",
+                      "bytes":  3851,
+                      "sha256":  "1c407b13caa5f3c08a8d61402af8d4b42582d4d95bb7c3edd09be149109df823"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_flow_tests.cpp",
+                      "bytes":  9216,
+                      "sha256":  "66f184e07bf6ecddbbf27248cc9968f27a2c588ac6ca62304211cdce6af85f32"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_guard_tests.cpp",
+                      "bytes":  22817,
+                      "sha256":  "14038ab1b43423467ebca256c28614f30cc1e77979d0a4c3df36738ace0f2953"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_header_tests.cpp",
+                      "bytes":  9138,
+                      "sha256":  "c44f978ed7dcebf7c80a643866dab19943734cb43143084ffb8d1194e63b9339"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_image_tests.cpp",
+                      "bytes":  8582,
+                      "sha256":  "acc8353f80354fd8db256d8794a181e77ece764cfecc7acbc2251106cd8d1538"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_install_tests.cmake",
+                      "bytes":  5331,
+                      "sha256":  "bf734fe46def90ae9a8fcd72630c1ca04df519449341cc1d46d2906c90a37c79"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_oracle.py",
+                      "bytes":  33263,
+                      "sha256":  "efdc619841aa93f0be265998b5f678144d50cef8a313cafd83dc053d9e29001e"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_oracle_probe.cpp",
+                      "bytes":  10086,
+                      "sha256":  "2716ea1fd6cd395490c287fee0c2ed01c8c956e9e3a652a8c73664edd68d15ab"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_project_symbol_tests.cpp",
+                      "bytes":  4285,
+                      "sha256":  "e2d925903bd8a72c75bcf3dac6c0c1bf65ae93784a4843d204f440aad211f9f4"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_project_tests.cpp",
+                      "bytes":  16575,
+                      "sha256":  "6ca2e4320ddbe9f8d25f0e290e8382bf41a7e399cf6be05e42cb1df353467ba9"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_recipe_tests.cpp",
+                      "bytes":  1484,
+                      "sha256":  "faf824b7741d62042ae1e16fcae13b11c4fb32ac0281b71e917d7f46c063f774"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_reference_tests.cpp",
+                      "bytes":  11879,
+                      "sha256":  "b7b7e42dd1348577136861fd7124b76fe1eb3b400cc2fc0f3c21911995d9baa8"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_relocation_tests.cpp",
+                      "bytes":  11349,
+                      "sha256":  "6b9f8883475d9fb73a5673c80b2b348430826d5872b464589f224d5739bce018"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_resolution_tests.cpp",
+                      "bytes":  10836,
+                      "sha256":  "ba3978030bd565b3a1ffcc012c964d5bbc542fd5cb87775ddc43dc878e8babf2"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_symbol_tests.cpp",
+                      "bytes":  8071,
+                      "sha256":  "6f0243ad8a1eddd58568d000b906238c6327dce6e9d6f7a9bd53e2cfe022d83e"
+                  },
+                  {
+                      "path":  "producer-source/tests/macho_worker_tests.cpp",
+                      "bytes":  6326,
+                      "sha256":  "003cd8594693552773d818bbc9b42764f9ac78d43939107b115b62e467de2cf2"
+                  },
+                  {
+                      "path":  "producer-source/tests/mode_project_tests.cpp",
+                      "bytes":  21940,
+                      "sha256":  "a7df5fd6c17f33fba876488aa2f691a78ed82d89086be14934016d253ae56bda"
+                  },
+                  {
+                      "path":  "producer-source/tests/open_profile_tests.cpp",
+                      "bytes":  8890,
+                      "sha256":  "b2583e8393bbdba1f11aec570407bef4c9b62bdc9d44aa901fbefe117e55b25d"
+                  },
+                  {
+                      "path":  "producer-source/tests/operand_encoding_tests.cpp",
+                      "bytes":  4953,
+                      "sha256":  "417e37f88feaf1bd742741d0fb52e1546d5ae6d2a7fa83abc759f925c53515be"
+                  },
+                  {
+                      "path":  "producer-source/tests/overlay_tests.cpp",
+                      "bytes":  7277,
+                      "sha256":  "fd4ccdf371ee2e18c0b163908e5733d8b03203a16609ca00dcfbbcad378fd7d1"
+                  },
+                  {
+                      "path":  "producer-source/tests/patch_export_oracle.cmake",
+                      "bytes":  366,
+                      "sha256":  "0d94189a2e833e3e8c5b36dbed469c887a9598ed3af98a19dc3469dad2182c85"
+                  },
+                  {
+                      "path":  "producer-source/tests/patch_export_oracle.ps1",
+                      "bytes":  381,
+                      "sha256":  "d636d9b86b09efeeaacb6a9cbb7dd5eee498ffdb603c8124e90ce7ed04b48dad"
+                  },
+                  {
+                      "path":  "producer-source/tests/patch_export_tests.cpp",
+                      "bytes":  13912,
+                      "sha256":  "cd4675461824ebd4fca2d482d2b6764612fceb112b52dbfa8d50d737e0ca3caa"
+                  },
+                  {
+                      "path":  "producer-source/tests/processor_lea_cpu_tests.cpp",
+                      "bytes":  1177,
+                      "sha256":  "ba85172d19b2a1064d9bb9e23e03de030a3153bbe087d126eaf40710194a345d"
+                  },
+                  {
+                      "path":  "producer-source/tests/processor_modes_tests.cpp",
+                      "bytes":  10752,
+                      "sha256":  "e2a426434a215eafc48b32cdc8837ccf5271809040e9af3dab25b594df026e06"
+                  },
+                  {
+                      "path":  "producer-source/tests/processor_tests.cpp",
+                      "bytes":  11768,
+                      "sha256":  "bb5dc8ddeb74928b5d311663711e7c9462733edb4d69e9eeb546f43646aa01e9"
+                  },
+                  {
+                      "path":  "producer-source/tests/processor_x86_cpu_tests.cpp",
+                      "bytes":  5101,
+                      "sha256":  "e56f132b041774d3d37a8d40ee755a7d755bf58e0ba8e8d1714c9fc19427ec23"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_analysis_tests.cpp",
+                      "bytes":  8600,
+                      "sha256":  "435ce03d44b8b6e3be5ad93d12b489a43aae235367f5b09b559e070b897e1ff2"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_cli_oracle.cpp",
+                      "bytes":  3071,
+                      "sha256":  "a88ccf6fe98b04b63b1f66da3050fde40f1e4ee0a3099ba698c04a9f2613064b"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_cli_tests.cmake",
+                      "bytes":  11172,
+                      "sha256":  "04f31c804cedf665fc6e270e102cb2217724fb7ec4ad88e8f27f56a5eb274669"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_command_tests.cpp",
+                      "bytes":  24140,
+                      "sha256":  "1213d6c02c08c72a862343f6ea6470404dda8872aac1012a7b1153ccd65611df"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_crash_helper.cpp",
+                      "bytes":  2167,
+                      "sha256":  "441005e9cbf3c2db9f497a99bd655258942f4bd3cd71c70310300ba68efe821c"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_crash_tests.cmake",
+                      "bytes":  370,
+                      "sha256":  "5c73737efe6d1a5f985c18fcef74d3d39cf6a1322ddf0de08f6ebab28777dbf4"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_crash_tests.ps1",
+                      "bytes":  1739,
+                      "sha256":  "69432c2e089158016493ae16f1a235edf17941144f143401e592c9ba98eec15b"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_derived_cache_tests.cpp",
+                      "bytes":  19465,
+                      "sha256":  "5512d113a92a30eebf5fad4b289228e595fe2a59edf8d121dfd1022889b0cd66"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_graph_tests.cpp",
+                      "bytes":  4833,
+                      "sha256":  "d085acf2036d494660d43344f51b0f6cc36ebc09bdbd63faedc10056765d48a8"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_history_tests.cpp",
+                      "bytes":  9728,
+                      "sha256":  "f0af09686a42a9c302cc3c2820b660045b9c8cc3ba5ffbcd7498b8694e7104d6"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_input_tests.cpp",
+                      "bytes":  12953,
+                      "sha256":  "8dca2774db7f996a78b7fa8a75faf952f8156d1cd2999e89e062de4a1033392e"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_install_tests.cmake",
+                      "bytes":  3295,
+                      "sha256":  "df79dd44aabf547a196af2bb970f51adbd373ba850f5269021c909c48e043529"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_jobs_tests.cpp",
+                      "bytes":  15852,
+                      "sha256":  "ca1861d4e6185ecdd24d8fd608b90201ff207412246cdc438f3410a25d8aa570"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_listing_tests.cpp",
+                      "bytes":  7525,
+                      "sha256":  "ac91b69a473c84a08aaf2b42773cf509d3f4846f6596c479b418a5facd37af7e"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_save_crash_helper.cpp",
+                      "bytes":  2514,
+                      "sha256":  "58eacdd0ef33e65296e4c963aaa5e3419609113d3940fcf4897856074e42d96b"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_save_crash_tests.cmake",
+                      "bytes":  388,
+                      "sha256":  "f0a74632ca92bb51b48542c00d3003cddc48066960d9e8da1f59d64c3c5507df"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_save_crash_tests.ps1",
+                      "bytes":  2946,
+                      "sha256":  "c6a750149d840a4eb6625d0f53e8bd54b7adcdc6ed841078d29032b6e3dd0880"
+                  },
+                  {
+                      "path":  "producer-source/tests/project_schema_tests.cpp",
+                      "bytes":  10510,
+                      "sha256":  "b3cdc667937935aff4ab6a283d91c7b6a02e28308597e06b8d28968d77344824"
+                  },
+                  {
+                      "path":  "producer-source/tests/provision_x86_16_tools.ps1",
+                      "bytes":  3478,
+                      "sha256":  "ac19f929ce479ce7316182c855e009cbfa29144e6fa155b534a5eba03985e358"
+                  },
+                  {
+                      "path":  "producer-source/tests/raw_modes_tests.cpp",
+                      "bytes":  9587,
+                      "sha256":  "915d4f5e19b55db73f1190cf2c1c527c8eb4e31f187c4997801664dcd18d70e5"
+                  },
+                  {
+                      "path":  "producer-source/tests/raw_profiles_tests.cpp",
+                      "bytes":  11528,
+                      "sha256":  "834a8d067d30276dd00443fc40a3331902ddcae2d3775f66774b53adae4da8ad"
+                  },
+                  {
+                      "path":  "producer-source/tests/reference_cache_tests.cpp",
+                      "bytes":  5192,
+                      "sha256":  "98c607dad82b4649efe32810c7bac57df3e16c8e94b20c335945527f4c9c369d"
+                  },
+                  {
+                      "path":  "producer-source/tests/reference_tests.cpp",
+                      "bytes":  17760,
+                      "sha256":  "e306bef3c3a1646945e54c1c064420754e1bb08d5906d290a25ece2a488c58f4"
+                  },
+                  {
+                      "path":  "producer-source/tests/run_x86_bochs.ps1",
+                      "bytes":  2452,
+                      "sha256":  "016038c8727f150369288a63bdd4498d133e29a5749e05e55de0219657a4c1dc"
+                  },
+                  {
+                      "path":  "producer-source/tests/runtime_boundaries.ps1",
+                      "bytes":  4063,
+                      "sha256":  "e03091c6f026eb3eac88d21f0016eb82d4bc9ce820ced90445fb1e92b588a8a1"
+                  },
+                  {
+                      "path":  "producer-source/tests/sdk/elf/CMakeLists.txt",
+                      "bytes":  674,
+                      "sha256":  "917c5c5bd8c1726828c4fd83dbe8ec317b0674a99ad7349a8f0bf7f3760c5fe3"
+                  },
+                  {
+                      "path":  "producer-source/tests/sdk/elf/main.cpp",
+                      "bytes":  8133,
+                      "sha256":  "586ec16ca6170a4b543f1884f1a8e273996430ca771c37e1f9e5467278733f0e"
+                  },
+                  {
+                      "path":  "producer-source/tests/sdk/macho/CMakeLists.txt",
+                      "bytes":  684,
+                      "sha256":  "0ec4312b81f2a4e880c4423876b7da7713d7de5b759f1cd975c8a80da33d6f1d"
+                  },
+                  {
+                      "path":  "producer-source/tests/sdk/macho/main.cpp",
+                      "bytes":  15741,
+                      "sha256":  "b279fc5b603b146545c24baa27eeb0a00193d3a4c47ff5c7a43b3f9fa2ab5037"
+                  },
+                  {
+                      "path":  "producer-source/tests/sdk/segmented/CMakeLists.txt",
+                      "bytes":  708,
+                      "sha256":  "0ab57f1b0813658738289c5a0e1a6d118483824eee6e819dfa6b5b3342919016"
+                  },
+                  {
+                      "path":  "producer-source/tests/sdk/segmented/main.cpp",
+                      "bytes":  3601,
+                      "sha256":  "5b3ea332821c403b949a597fe2b3adc977724c7461086581c27507afa006a46a"
+                  },
+                  {
+                      "path":  "producer-source/tests/search_tests.cpp",
+                      "bytes":  12879,
+                      "sha256":  "7a0880cb4a47901dc8fd4b0c3733dc31ff7bb03dbb764fcbc9587a2372a1db99"
+                  },
+                  {
+                      "path":  "producer-source/tests/segmented_cli_tests.cmake",
+                      "bytes":  7748,
+                      "sha256":  "5b87844324cf80df09f07ac7cc0b8e8bcf5a24b5b0795d4ac12c8cddf7bef1e7"
+                  },
+                  {
+                      "path":  "producer-source/tests/segmented_install_tests.cmake",
+                      "bytes":  2966,
+                      "sha256":  "1235100bf9b01701b9cd212e8ebd1da3c6621f95cd688fb7862d8882504b9826"
+                  },
+                  {
+                      "path":  "producer-source/tests/segmented_navigation_tests.cpp",
+                      "bytes":  5367,
+                      "sha256":  "dab0ccd1c6cc12cc544f72974e529806f53d1653e5272ae0f11d7272077d45b4"
+                  },
+                  {
+                      "path":  "producer-source/tests/segmented_project_tests.cpp",
+                      "bytes":  10314,
+                      "sha256":  "f2c1cfb360a671a5a3d7bb3a175b2ee09bf6408a504cba2b40631f99598d8574"
+                  },
+                  {
+                      "path":  "producer-source/tests/segmented_recovery_tests.cpp",
+                      "bytes":  21613,
+                      "sha256":  "847c723132fcb895aec0a480d22aa0eda50131a19d55e748b71bcb4b6b2fd5ed"
+                  },
+                  {
+                      "path":  "producer-source/tests/segmented_search_tests.cpp",
+                      "bytes":  4601,
+                      "sha256":  "14758099941516434311863066c7951fdc9e51c4ade79a27e751093d37d257a5"
+                  },
+                  {
+                      "path":  "producer-source/tests/sqlite_tests.cpp",
+                      "bytes":  4701,
+                      "sha256":  "38c08a0535b750694c881ba6e320c95cc560c8eae0ee8abcde5038cf790b78a5"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/a64_image_fixture.hpp",
+                      "bytes":  1776,
+                      "sha256":  "0e55755ed86d2e0d3d9055db931d9c3301ca48a8934b97fde012efcbcfb8bbba"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/analysis_fixture.hpp",
+                      "bytes":  1254,
+                      "sha256":  "9b85dd75c41482869b5855ebb0529b1aba7b0c84067cc2845c23d0c2c7e2d6b4"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/checks.hpp",
+                      "bytes":  1222,
+                      "sha256":  "7e8ae2e09f821205f741277a9a3cc4066e7c4b13a938508bb34fe96dce14afee"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/elf_dynamic_symbol_fixture.hpp",
+                      "bytes":  4097,
+                      "sha256":  "15823f08937774f282d5778fbb3bf9afaa73d83c298b544b03bdcd44d175a46c"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/elf_fixture.hpp",
+                      "bytes":  4554,
+                      "sha256":  "3fd00f47755aea4ca6748fd18e05654129a1c0becec06b4fb06546a0510f0d40"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/elf_metadata_fixture.hpp",
+                      "bytes":  3669,
+                      "sha256":  "c91b206934aa23731a9ea7ae3752b1e047d0300f836d5eb13736e5562b68bc0a"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/elf_retained_fixture.hpp",
+                      "bytes":  1689,
+                      "sha256":  "dc753f7cc9ac82348cae928b9fb5c127daea21323f504a5a87c14c521044d0f0"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/elf_ui_fixture.hpp",
+                      "bytes":  1731,
+                      "sha256":  "ef1395390bfc383348d76e690a05735b3568f641e5813a00bcae981d5c49922f"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/fixture_files.hpp",
+                      "bytes":  1463,
+                      "sha256":  "c85a38f4d1bfb5a807b58bfd3185bcbfa8b1dc56744dc18d5fb5feba80adc2bf"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/macho_chained_fixture.hpp",
+                      "bytes":  2321,
+                      "sha256":  "35ac89fe7bb2d1c3ab3d69904598c953df5ff57768c2ec5c485013d263bcfd5f"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/macho_dyld_fixture.hpp",
+                      "bytes":  1695,
+                      "sha256":  "d9343daa557822e90046a2e8d1e953ec14f19f11232cf0e901dfa3de4b61527c"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/macho_fixture.hpp",
+                      "bytes":  5280,
+                      "sha256":  "1c09ff42ef7352da270df92372d0602e9dcedffc3b171ad283f9157d199058ef"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/macho_relocation_fixture.hpp",
+                      "bytes":  1624,
+                      "sha256":  "6a39b0d220cece4e981f22a06dddeb0c775fb3f0b3454b233d4e75d98d783445"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/macho_symbol_fixture.hpp",
+                      "bytes":  2369,
+                      "sha256":  "6e344958e4ee28309b26f538cc987ff62bd6568126ddf8ad91694f77128c876c"
+                  },
+                  {
+                      "path":  "producer-source/tests/support/pe_fixture.hpp",
+                      "bytes":  3182,
+                      "sha256":  "54e99c616d233ac4f1cd44d9f8974151d807f3e9f354ecf363171978d0e73f82"
+                  },
+                  {
+                      "path":  "producer-source/tests/view_model_tests.cpp",
+                      "bytes":  4762,
+                      "sha256":  "665fa0885ba66b40be22d528648b8242ef293e38071721f598563c27722d180e"
+                  },
+                  {
+                      "path":  "producer-source/tests/workspace_tests.cpp",
+                      "bytes":  5338,
+                      "sha256":  "c6c7981a610a670502d2c7a06f254438825f0bd25f643013dc873bcb0f2aedde"
+                  },
+                  {
+                      "path":  "producer-source/tests/x86_16_cpu_tests.cpp",
+                      "bytes":  8809,
+                      "sha256":  "12efb8ce1388e6013c611984b229de466ebb71a38053ce008111f46c594c99d3"
+                  },
+                  {
+                      "path":  "producer-source/tests/x86_16_decoder_tests.cpp",
+                      "bytes":  22525,
+                      "sha256":  "9afd912e8e37f38232550cedcbe8e680980262b6c8aa41161b013625559813f7"
+                  },
+                  {
+                      "path":  "producer-source/tests/x86_32_decoder_tests.cpp",
+                      "bytes":  21818,
+                      "sha256":  "fadc66e7d018bd759cfef922b3a74dd161431cdb8f929b66ea337935e148137b"
+                  },
+                  {
+                      "path":  "producer-source/tests/x86_cpu_oracle.cmake",
+                      "bytes":  914,
+                      "sha256":  "3339e235e26c7de1d4af20367adf636910aa625558ea14def1079529a6bedc98"
+                  },
+                  {
+                      "path":  "producer-source/tests/x86_segment_cpu_tests.cpp",
+                      "bytes":  4570,
+                      "sha256":  "1424a94c84045061d83a8db22fb55d5d735cd54bd2204d6cefb88bbb8a479413"
+                  },
+                  {
+                      "path":  "producer-source/tests/x86_segment_oracle.cmake",
+                      "bytes":  5376,
+                      "sha256":  "52a1fa6f53cc4136a918423f8cf8e8b28fc59f1a9466a1321a68d9c04047f64b"
+                  },
+                  {
+                      "path":  "producer-source/tests/x86_segment_oracle_negative.cmake",
+                      "bytes":  2672,
+                      "sha256":  "f6c89991d3e41f4dd6e975dc2d58845226712c30638d66d0bfc8ab5245c378cc"
+                  },
+                  {
+                      "path":  "producer-source/tests/x86_segments_tests.cpp",
+                      "bytes":  8906,
+                      "sha256":  "456f9d1fee529898c5c4286ffda1dd0df2e22765d1becb1887f517f4a103b00a"
+                  },
+                  {
+                      "path":  "producer-source/third_party/sqlite/NOTICE",
+                      "bytes":  382,
+                      "sha256":  "df2d0ace21e2d84399c022bf062ed09e15ddf9d2a61765afb30472e71985dda4"
+                  },
+                  {
+                      "path":  "producer-source/third_party/sqlite/provenance.json",
+                      "bytes":  386,
+                      "sha256":  "9eb8dafaa39f392af523abfb75fc60a22eb8aa92e084225c362056315aad2d7e"
+                  },
+                  {
+                      "path":  "producer-source/third_party/sqlite/sqlite3.c",
+                      "bytes":  9582521,
+                      "sha256":  "0c657666d819f261cc4007526ad57e1669de9949df7a8ea847aa284a2bf0ee52"
+                  },
+                  {
+                      "path":  "producer-source/third_party/sqlite/sqlite3.h",
+                      "bytes":  695729,
+                      "sha256":  "d6c84557261893439b341d2e6c35187ae3ea24fbfd843ad94616f72d89242b8c"
+                  },
+                  {
+                      "path":  "producer-source/third_party/sqlite/sqlite3ext.h",
+                      "bytes":  39547,
+                      "sha256":  "48963abfefb41ac329ef9d706acb5eadba952a99a748285c9ded6b5e0942721b"
+                  },
+                  {
+                      "path":  "references_v7_arm_v22.hxrf",
+                      "bytes":  1669,
+                      "sha256":  "4bf751058b9ee6b409638424804194942edd7fd8ffc5e396e0ed56e02a36d640"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/binary-analysis-validation.md",
+                      "bytes":  8466,
+                      "sha256":  "1e474e6eb243c143ba422aa5a818399b675f5dad78dadddce89ed44c9679b3c6"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/building.md",
+                      "bytes":  14835,
+                      "sha256":  "24eced10d6b40cddef3e5027146bd77695cb8449deb6d5ebab3a26e6178c831b"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/capabilities.csv",
+                      "bytes":  11363,
+                      "sha256":  "8df562f9881e41fb9d95c7ac39baa182d8420b6564e67a0ab5fd3ae07f899f74"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/elf-analysis-validation.md",
+                      "bytes":  6459,
+                      "sha256":  "5b61256ec1d9e35b54088cceea79e5ae680edb2fe926128980805cbfb7465b7f"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/foundation-validation.md",
+                      "bytes":  3059,
+                      "sha256":  "da65f96e14b1957cd0453442806a9b9080ad96bc31eb7779dcbe5d453a8ae6f3"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/macho-analysis-validation.md",
+                      "bytes":  54231,
+                      "sha256":  "bc69fccb333da0eb9471c34db3d40dd27f27eaf682cbb3b93eb4d357717afdce"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/project-analysis-validation.md",
+                      "bytes":  9287,
+                      "sha256":  "44d3eb84de7d5b049b5baac098f6b212fac4a5cc410c16cf56df3d74b26e8949"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/project-cli.md",
+                      "bytes":  5368,
+                      "sha256":  "68ffdcd0f2bcb1addd8e32c37ee80592d1c3665808072d5e6aaec132d00f988d"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/project-format.md",
+                      "bytes":  4437,
+                      "sha256":  "03a27177f849d61bbb27cfe4897bcda2fa557dd266fdb477d21d41afabdf74fe"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/README.md",
+                      "bytes":  3172,
+                      "sha256":  "f20ee36a8a4ee022ab9cdee7b996eb5263ddf72c9dde2d4e711f016c39130702"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/segmented-analysis-validation.md",
+                      "bytes":  4320,
+                      "sha256":  "29d85925ce6bcc8905de9d372f4c8d3c14f901879e0554340d32cb9005b9c3ce"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/third-party.md",
+                      "bytes":  2647,
+                      "sha256":  "d9152d12905fc6db9e735938305c95d8814e46f9df64fbb7ace42c9879d7a5cb"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/x64-coverage.csv",
+                      "bytes":  1878,
+                      "sha256":  "0b19a24774d79423a0abe95ff971647864f7a9f120359943748790b0a0932eb7"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/x86-16-coverage.csv",
+                      "bytes":  5554,
+                      "sha256":  "197f45d0694b40ab8dae528ac006a9a0ccdd7f8e872b59f4653b83f540958c82"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/x86-32-coverage.csv",
+                      "bytes":  5307,
+                      "sha256":  "6bf7fddf006a24567343bef61b6aa03a4f47d48565681097fc0513548cf1f407"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/x86-32-validation.md",
+                      "bytes":  9153,
+                      "sha256":  "ea2703ef600e836ceccb6f15d97a9b935dac069cc4c49ed9a7ae00a2b6ad80d5"
+                  },
+                  {
+                      "path":  "share/hexlab/docs/x86-profiles.md",
+                      "bytes":  3054,
+                      "sha256":  "84f95e4b4b7f011af55f6aed08ce492cc445fa602cb7f4c49a0f752b33365d07"
+                  },
+                  {
+                      "path":  "share/hexlab/licenses/sqlite/NOTICE",
+                      "bytes":  382,
+                      "sha256":  "df2d0ace21e2d84399c022bf062ed09e15ddf9d2a61765afb30472e71985dda4"
+                  },
+                  {
+                      "path":  "share/hexlab/licenses/sqlite/provenance.json",
+                      "bytes":  386,
+                      "sha256":  "9eb8dafaa39f392af523abfb75fc60a22eb8aa92e084225c362056315aad2d7e"
+                  }
+              ]
+}

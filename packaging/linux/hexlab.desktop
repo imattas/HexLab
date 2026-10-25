@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=HexLab
+Comment=Inspect and analyze executable files
+Exec=hexlab
+TryExec=hexlab
+Icon=hexlab
+Terminal=false
+Categories=Development;Debugger;IDE;
+StartupNotify=true

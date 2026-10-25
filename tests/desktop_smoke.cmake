@@ -1,0 +1,11 @@
+if(NOT EXISTS "${APP}")
+  message(FATAL_ERROR "Desktop executable does not exist: ${APP}")
+endif()
+if(NOT DEFINED MODE)
+  set(MODE --smoke-test)
+endif()
+execute_process(COMMAND "${APP}" "${MODE}" RESULT_VARIABLE status
+  OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 25)
+if(NOT "${status}" STREQUAL "0")
+  message(FATAL_ERROR "Desktop smoke failed: ${status}; ${output}; ${error}")
+endif()

@@ -1,0 +1,14 @@
+# Portable type libraries
+
+The CLI exchanges editable project types, their DWARF declaration origins, and compatible type assignments without project IDs:
+
+```text
+hexlab_cli project types export sample.hxproj --output sample.hxtl
+hexlab_cli project types import other.hxproj --input sample.hxtl
+```
+
+The binary `HXTL` format is versioned, little-endian, and length-prefixed. Version 2 is written by export; version 1 files remain readable. A bundle contains up to 4096 unique named definitions, canonical type records, declaration kind, and optional DWARF origin offsets. Version 2 also records the input size and SHA-256 plus a SHA-256 of the encoded load recipe. Type assignments refer to definitions by name and can be imported only when both source identity hashes match the destination project. Address locations are supported. Conflicting assignments fail by default; pass `--replace-assignments` to replace them. If only the definitions are wanted from a bundle with assignments whose source identity differs, pass `--skip-assignments-on-mismatch`.
+
+The complete file is limited to 16 MiB, names to 512 bytes, definitions to 4096, and assignments to 262144. Every record is decoded and validated before the workspace import command runs. Imports are one atomic, undoable project command. Matching names update in place; new names receive destination-local IDs. References remain symbolic by name, so nested types and forward references work when their targets are included in the bundle or already exist in the destination. Unknown references are rejected before workspace commit. Version 1 bundles contain definitions only.
+
+This workflow handles the project type model, including aggregate layout, function types, enum values, qualifiers, methods and static data attached to declarations. It is not a compiler header/library importer and does not transfer project-local IDs or debug-variable records. Use native PDB/DWARF import for debug variables.

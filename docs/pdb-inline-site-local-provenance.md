@@ -1,0 +1,13 @@
+﻿# PDB inline-site local provenance
+
+PDB local-symbol imports retain which `S_INLINESITE` or `S_INLINESITE2` scope owns a local. Each nested local carries the inlinee IPI index and the module-local record offset of its inline-site symbol. The outer procedure identity and the local's existing type/location metadata remain available alongside those fields.
+
+The association is exact to the parsed module stream. Consumers can join the inlinee index to the PDB's IPI records without guessing from a displayed procedure or local name. Inline-site scopes are tracked in nesting order, and malformed or unmatched inline-site endings fail the local import rather than leaking a nested local into the outer procedure.
+
+The local parser also retains inline-site scopes independently of locals, with parent site record offsets, nesting depth, outer procedure identity, and bounded binary annotations. This slice decodes compressed code offsets, signed line deltas, file changes, and explicit lengths (`ChangeCodeLength` and `ChangeCodeLengthAndCodeOffset`). Only an explicit length emits a half-open code range; an offset change alone never extends a previous source mapping. End-line, column, and statement/expression operands are consumed but do not contribute to the reported start line.
+
+C13 `InlineeLines` signatures 0 and 1 supply definition start lines and checksum-table file identities; extended extra-file lists are validated. The join uses the exact module ordinal and inlinee IPI index, then the exact module and checksum-record offset. Duplicate inlinee or file identities fail rather than selecting by display name. Unknown signatures remain explicit module/signature records. Unknown annotation opcodes and `ChangeCodeOffsetBase` (separated code chunks) retain the opcode and byte offset and suppress all ranges for that site. Truncated operands, invalid compression, and ranges outside the outer procedure fail the local parse.
+
+The parser limits inline nesting to 256, sites to 250,000, ranges to 1,000,000, and inline output to 64 MiB; source-file and inlinee records share the C13 parser's 256 MiB output budget. PE attachment additionally caps inline output at 128 MiB. Cancellation is checked during decoding. Locals without an inline parent retain empty provenance fields.
+
+This is start-line attribution inside the inlinee definition, not reconstruction of the caller's source call expression. Implicit range lengths, separated code chunks, column/end-line attribution, IPI display-name resolution, and a complete source-level inline call tree remain unsupported. Encoding follows Microsoft's [CodeView declarations](https://github.com/microsoft/microsoft-pdb/blob/master/include/cvinfo.h).

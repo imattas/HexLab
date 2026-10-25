@@ -1,0 +1,38 @@
+{
+    "wire_version":  5,
+    "engine":  "hexlab-functions-v10/.../elf-reference-provenance-v1",
+    "artifacts":  [
+                      {
+                          "path":  "out/elf-cache-v5-capture/derived_v5.hxdc",
+                          "sha256":  "29b38f8e1f9702e5c114af4b0e3211b128bea819a1b9f2fc851e14e0fe13bbc4",
+                          "bytes":  4898
+                      },
+                      {
+                          "path":  "out/elf-cache-v5-capture/input.o",
+                          "sha256":  "702c191fbeab72770b4c56f3e9b14810eaaa8cec48469d8d050373722d1f99bd",
+                          "bytes":  1224
+                      },
+                      {
+                          "path":  "out/elf-cache-v5-capture/capture.cpp",
+                          "sha256":  "58025cf0e1931cec71a080d203bfdbf2d5f4f381692cf8f0ded4e9b871b0880a",
+                          "bytes":  2352
+                      },
+                      {
+                          "path":  "libs/analysis/src/elf_relocations.cpp",
+                          "sha256":  "f4e355de60e7bafabe9fda4035eef153c4cf1673eb5aa47c842ab07a331132c7",
+                          "bytes":  19347
+                      },
+                      {
+                          "path":  "libs/analysis/src/elf_reference_codec.cpp",
+                          "sha256":  "75dc4cfcf652326de07687b81f203f237da1cd9775a5b57a755ffbc201aa9a4e",
+                          "bytes":  13631
+                      },
+                      {
+                          "path":  "out/build/windows-headless/bin/Debug/hexlab_analysis.dll",
+                          "sha256":  "0d818988b4e0b4c2b13a72a78ada539a50542dd68d129b016b224a827212e9bd",
+                          "bytes":  3350016
+                      }
+                  ],
+    "origin":  "Live v5 provenance encoder/decoder API with actual authored compiler ELF object; unmodified payload bytes",
+    "provenance_required":  true
+}

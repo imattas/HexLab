@@ -1,0 +1,9 @@
+id,publisher,title,url,retrieved,scope
+P01,Hex-Rays,Processor families,https://docs.hex-rays.com/core/disassembler/specification/supported-processors.md,2026-10-19,family baseline; nested chip and extension audit remains open
+R01,RISC-V International,Unprivileged ISA Manual 20240411,https://docs.riscv.org/reference/isa/v20240411/unpriv/unpriv-index.html,2026-10-21,Ratified RV64I 2.1 and M 2.0 encoding reference; this source does not cover privileged ISA or later extensions
+F01,Hex-Rays,File format families,https://docs.hex-rays.com/core/disassembler/specification/supported-file-formats.md,2026-10-19,explicitly nonexhaustive public list
+D01,Hex-Rays,Decompiler product families,https://hex-rays.com/decompiler,2026-10-19,local decompiler choices listed under IDA Pro; not the disassembler list
+B01,Hex-Rays,Debugger backend identifiers,https://python.docs.hex-rays.com/ida_idd/index.html,2026-10-19,documented interface identifiers; not a guarantee of current packaged backend availability
+W01,Hex-Rays,Product workflows,https://hex-rays.com/ida-pro,2026-10-19,high-level workflow baseline; product and add-on distinctions
+R02,RISC-V International,Ratified ISA specifications library,https://docs.riscv.org/reference/isa/,2026-10-24,Official specification index for named unprivileged and privileged ISA extensions; exact revision and profile combinations must be pinned when implementing each row
+P02,OpenPOWER Foundation,Power ISA Version 3.1C,https://openpower.foundation/specifications/isa/,2026-10-24,Primary encoding and semantic reference for the PowerPC/POWER decoder subset; this does not imply support for all ISA facilities

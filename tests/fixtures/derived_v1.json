@@ -1,0 +1,8 @@
+{
+  "origin": "HexLab stage-3 installed CLI; authored raw NOP RET HELLO fixture; ready before explicit function command",
+  "cache_kind": 2,
+  "engine_version": 1,
+  "bytes": 991,
+  "sha256": "2718f208c3d0a1d57fcac7511ede5609b43948d177604605eccc3d09eb97de44",
+  "purpose": "Genuine pre-context HXDC v1 incompatibility regression; generated from original HexLab implementation."
+}

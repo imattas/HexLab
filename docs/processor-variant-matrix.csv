@@ -1,0 +1,87 @@
+﻿family_id,family,variant_axis,variant,reference_scope,hexlab_status,evidence,source_id
+processor.arm,ARM,architecture_profile,ARMv3-v8,"32-bit architectural generations",not_assessed,,P01
+processor.arm,ARM,execution_state,ARM state,"32-bit ARM instruction state",not_assessed,,P01
+processor.arm,ARM,execution_state,Thumb,"16-bit Thumb state",not_assessed,,P01
+processor.arm,ARM,execution_state,Thumb-2,"mixed-width Thumb state",not_assessed,,P01
+processor.arm,ARM,profile,ARMv4 and ARMv4T,"ARM7 and ARM9 examples",not_assessed,,P01
+processor.arm,ARM,profile,ARMv5 / ARMv5TE / ARMv5TEJ,"ARM9 and ARM10 examples",not_assessed,,P01
+processor.arm,ARM,profile,ARMv6 / ARMv6T2 / ARMv6Z / ARMv6K,"ARM11 examples",not_assessed,,P01
+processor.arm,ARM,profile,ARMv6-M,"Cortex-M0/M0+/M1 profile",not_assessed,,P01
+processor.arm,ARM,profile,ARMv7-M,"Cortex-M3 profile",not_assessed,,P01
+processor.arm,ARM,profile,ARMv7E-M,"Cortex-M4 profile",not_assessed,,P01
+processor.arm,ARM,profile,ARMv7-R,"Cortex-R profile",not_assessed,,P01
+processor.arm,ARM,profile,ARMv7-A,"Cortex-A profile",not_assessed,,P01
+processor.arm,ARM,extension,DSP,"ARM DSP instructions",not_assessed,,P01
+processor.arm,ARM,extension,NEON Advanced SIMD,"ARM 32-bit SIMD",not_assessed,,P01
+processor.aarch64,AArch64,profile,ARMv8-A,"Cortex-A50 family examples",not_assessed,,P01
+processor.aarch64,AArch64,profile,ARMv8 custom,"Apple A7/A8 examples",not_assessed,,P01
+processor.aarch64,AArch64,extension,SVE2,"Scalable Vector Extension 2",not_assessed,,P01
+processor.aarch64,AArch64,extension,SME,"Scalable Matrix Extension",not_assessed,,P01
+processor.x86,x86,execution_mode,16-bit,"8086/8088 through 80286 mode behavior",not_assessed,,P01
+processor.x86,x86,execution_mode,32-bit,"80386 and later legacy mode behavior",not_assessed,,P01
+processor.x86,x86,processor_generation,8086/8088,,not_assessed,,P01
+processor.x86,x86,processor_generation,80186,,not_assessed,,P01
+processor.x86,x86,processor_generation,80286,,not_assessed,,P01
+processor.x86,x86,processor_generation,80386,,not_assessed,,P01
+processor.x86,x86,processor_generation,80486,,not_assessed,,P01
+processor.x86,x86,processor_generation,Pentium/Celeron/Xeon,"modern family baseline",not_assessed,,P01
+processor.x87,x87,extension,8087/287/387 and later x87,"floating-point instruction family",not_assessed,,P01
+processor.x86_simd,x86 SIMD,extension,SSE,,not_assessed,,P01
+processor.x86_simd,x86 SIMD,extension,SSE2,,not_assessed,,P01
+processor.x86_simd,x86 SIMD,extension,SSE3,,not_assessed,,P01
+processor.x86_simd,x86 SIMD,extension,SSE4,,not_assessed,,P01
+processor.x86_simd,x86 SIMD,extension,AVX,,not_assessed,,P01
+processor.x86_simd,x86 SIMD,extension,AVX2,,not_assessed,,P01
+processor.x86_simd,x86 SIMD,extension,AVX-512,"feature-subset matrix still required",not_assessed,,P01
+processor.x86_simd,x86 SIMD,extension,other published extensions,"must be enumerated against primary ISA manuals",not_assessed,,P01
+processor.x64,x64,execution_mode,64-bit long mode,"x86-64/AMD64/Intel 64 naming variants",not_assessed,,P01
+processor.x64,x64,extension,legacy x86 instructions,,not_assessed,,P01
+processor.x64,x64,extension,SSE through AVX-512,"split into concrete subsets before acceptance",not_assessed,,P01
+processor.mips,MIPS,architecture_revision,Mark I / R2000,,not_assessed,,P01
+processor.mips,MIPS,architecture_revision,Mark II / R3000,,not_assessed,,P01
+processor.mips,MIPS,architecture_revision,Mark III / R4000 family,,not_assessed,,P01
+processor.mips,MIPS,architecture_revision,Mark IV / R8000 R10000 R5900,,not_assessed,,P01
+processor.mips,MIPS,architecture_revision,MIPS32 / MIPS32r2 / MIPS32r3,,not_assessed,,P01
+processor.mips64,MIPS64,architecture_revision,MIPS64 / MIPS64r2 / MIPS64r3,,not_assessed,,P01
+processor.mips,MIPS,execution_mode,MIPS16 / MIPS16e / MIPS16e2,,not_assessed,,P01
+processor.mips,MIPS,execution_mode,microMIPS,,not_assessed,,P01
+processor.mips,MIPS,extension,MIPS-MT,,not_assessed,,P01
+processor.mips,MIPS,extension,MIPS-3D,,not_assessed,,P01
+processor.mips,MIPS,extension,smartMIPS,,not_assessed,,P01
+processor.mips,MIPS,extension,Allegrex VFPU,"PSP-specific extension",not_assessed,,P01
+processor.mips,MIPS,extension,Cavium Octeon / Octeon2,,not_assessed,,P01
+processor.mips,MIPS,extension,Toshiba TX19/TX19A MIPS16e+,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,extension,Book E,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,extension,Freescale isel,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,extension,SPE,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,extension,AltiVec / VMX,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,extension,Hypervisor and virtualization,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,extension,Power ISA 2.06 vector / DFP / MAC / VSX,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,extension,Cell BE,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,execution_mode,VLE,"variable-length encoding",not_assessed,,P01
+processor.powerpc,PowerPC/POWER,extension,Xenon VMX128,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,extension,Paired Single,"Gekko/Broadway/Espresso examples",not_assessed,,P01
+processor.powerpc,PowerPC/POWER,core_family,MPC5xx,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,core_family,MPC8xx / PowerQUICC,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,core_family,MPC8xxx / PowerQUICC II/III,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,core_family,MPC5xxx / Qorivva,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,core_family,4xx / 6xx / 74xx,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,core_family,e200 / e500 / e600 / e700,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,core_family,e5500 / e6500,,not_assessed,,P01
+processor.powerpc,PowerPC/POWER,core_family,QorIQ P1-P5 / T1/T2/T4,,not_assessed,,P01
+processor.hexagon,Hexagon,scalar_generation,V4-V79,"generation-by-generation decode and semantic differences",not_assessed,,P01
+processor.hexagon,Hexagon,extension,HVX,"vector extension on V60 and later per reference",not_assessed,,P01
+processor.hexagon,Hexagon,extension,HMX,"matrix extension",not_assessed,,P01
+processor.riscv,RISC-V,base_isa,RV32I / RV32E,"integer register width and reduced-register base",not_assessed,,P01
+processor.riscv,RISC-V,base_isa,RV64I / RV64E,"integer register width and reduced-register base",not_assessed,,P01
+processor.riscv,RISC-V,standard_extension,M,,not_assessed,,R02
+processor.riscv,RISC-V,standard_extension,A,,not_assessed,,R02
+processor.riscv,RISC-V,standard_extension,F / D / Q,,not_assessed,,R02
+processor.riscv,RISC-V,standard_extension,C,,not_assessed,,R02
+processor.riscv,RISC-V,standard_extension,B and Zba/Zbb/Zbs,,not_assessed,,R02
+processor.riscv,RISC-V,standard_extension,V,,not_assessed,,R02
+processor.riscv,RISC-V,standard_extension,H,,not_assessed,,R02
+processor.riscv,RISC-V,standard_extension,Zc* code-size extensions,,not_assessed,,R02
+processor.riscv,RISC-V,privileged_isa,machine / supervisor / hypervisor levels,"separate privileged architecture coverage",not_assessed,,R02
+processor.riscv,RISC-V,standard_extension,Zicsr / Zifencei,,not_assessed,,R02
+

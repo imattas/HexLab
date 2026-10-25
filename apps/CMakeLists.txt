@@ -1,0 +1,5 @@
+add_subdirectory(cli)
+add_subdirectory(debug-server)
+if(HEXLAB_BUILD_DESKTOP)
+  add_subdirectory(desktop)
+endif()

@@ -1,0 +1,161 @@
+name: C++ portability
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portability-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  headless:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            preset: linux-headless
+            toolchain: Clang Debug
+          - os: ubuntu-24.04
+            preset: linux-gcc-headless-release
+            toolchain: GCC Release
+          - os: macos-14
+            preset: macos-headless
+            toolchain: Apple Clang Debug
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ninja-build clang g++ python3
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Report toolchain
+        run: |
+          cmake --version
+          ninja --version
+          python3 --version
+          if [ "${{ matrix.preset }}" = "linux-gcc-headless-release" ]; then g++ --version; else c++ --version; fi
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build headless CLI and complete test suite
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Run CTest suite
+        run: ctest --preset ${{ matrix.preset }}
+
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            preset: linux-desktop
+          - os: macos-14
+            preset: macos-desktop
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Linux wxWidgets build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ninja-build clang dpkg-dev libgtk-3-dev libsm-dev libxtst-dev libnotify-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxcomposite-dev libxdamage-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev libglu1-mesa-dev
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Configure desktop and shared wxWidgets
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build complete desktop distribution
+        run: cmake --build --preset ${{ matrix.preset }} --target package
+      - name: Verify archive contains wxWidgets runtime libraries
+        run: |
+          archive="$(find out/build/${{ matrix.preset }}/packages -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$archive"
+          ls -lh "$archive"
+          tar -tvzf "$archive" | grep -E '^-[rwxstST-]{9} .*libwx.*\.(so|dylib)'
+      - name: Extract package and smoke-test relocated CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(find out/build/${{ matrix.preset }}/packages -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$archive"
+          extract_root="$RUNNER_TEMP/hexlab-relocated"
+          mkdir -p "$extract_root"
+          tar -xzf "$archive" -C "$extract_root"
+          cli="$(find "$extract_root" -type f -name hexlab_cli -print -quit)"
+          desktop="$(find "$extract_root" -type f -name hexlab -print -quit)"
+          test -x "$cli"
+          test -x "$desktop"
+          cd "$RUNNER_TEMP"
+          env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH "$cli" --version
+      - name: Create relocatable Finder app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="out/build/${{ matrix.preset }}/packages"
+          archive="$(find "$package_dir" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$archive"
+          python3 packaging/macos/create_app_bundle.py \
+            --archive "$archive" \
+            --output "$package_dir/HexLab.app.zip"
+      - name: Verify Debian package contents
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          package="$(find out/build/${{ matrix.preset }}/packages -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          test -n "$package"
+          dpkg-deb --info "$package"
+          dpkg-deb --contents "$package" | grep -E '/usr/bin/hexlab$'
+          dpkg-deb --contents "$package" | grep -E '/usr/share/applications/hexlab.desktop$'
+      - name: Write SHA-256 checksum
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          package_dir = Path("out/build/${{ matrix.preset }}/packages")
+          packages = (
+              list(package_dir.glob("*.tar.gz"))
+              + list(package_dir.glob("*.deb"))
+              + list(package_dir.glob("*.app.zip"))
+          )
+          if not packages:
+              raise SystemExit("No platform package artifacts found")
+          for package in packages:
+              hasher = hashlib.sha256()
+              with package.open("rb") as archive:
+                  for block in iter(lambda: archive.read(1024 * 1024), b""):
+                      hasher.update(block)
+              digest = hasher.hexdigest()
+              package.with_name(package.name + ".sha256").write_text(
+                  f"{digest} *{package.name}\n", encoding="ascii"
+              )
+          PY
+      - name: Upload platform distribution artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: HexLab-${{ matrix.os }}-Release-${{ github.sha }}
+          path: |
+            out/build/${{ matrix.preset }}/packages/*.tar.gz
+            out/build/${{ matrix.preset }}/packages/*.tar.gz.sha256
+            out/build/${{ matrix.preset }}/packages/*.deb
+            out/build/${{ matrix.preset }}/packages/*.deb.sha256
+            out/build/${{ matrix.preset }}/packages/*.app.zip
+            out/build/${{ matrix.preset }}/packages/*.app.zip.sha256
+          if-no-files-found: error
+          retention-days: 14

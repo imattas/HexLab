@@ -1,0 +1,31 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {"major": 3, "minor": 24, "patch": 0},
+  "configurePresets": [
+    {"name": "windows-headless", "generator": "Visual Studio 17 2022", "architecture": "x64", "binaryDir": "${sourceDir}/out/build/windows-headless", "cacheVariables": {"HEXLAB_BUILD_DESKTOP": "OFF", "BUILD_TESTING": "ON"}},
+    {"name": "windows-desktop", "inherits": "windows-headless", "binaryDir": "${sourceDir}/out/build/windows-desktop", "cacheVariables": {"HEXLAB_BUILD_DESKTOP": "ON"}},
+    {"name": "linux-headless", "generator": "Ninja", "binaryDir": "${sourceDir}/out/build/linux-headless", "cacheVariables": {"CMAKE_C_COMPILER": "clang", "CMAKE_CXX_COMPILER": "clang++", "CMAKE_BUILD_TYPE": "Debug", "HEXLAB_BUILD_DESKTOP": "OFF", "BUILD_TESTING": "ON", "HEXLAB_ENABLE_PINNED_LLVM_ORACLES": "OFF"}},
+    {"name": "linux-gcc-headless-release", "generator": "Ninja", "binaryDir": "${sourceDir}/out/build/linux-gcc-headless-release", "cacheVariables": {"CMAKE_C_COMPILER": "gcc", "CMAKE_CXX_COMPILER": "g++", "CMAKE_BUILD_TYPE": "Release", "HEXLAB_BUILD_DESKTOP": "OFF", "BUILD_TESTING": "ON", "HEXLAB_ENABLE_PINNED_LLVM_ORACLES": "OFF"}},
+    {"name": "macos-headless", "generator": "Ninja", "binaryDir": "${sourceDir}/out/build/macos-headless", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug", "HEXLAB_BUILD_DESKTOP": "OFF", "BUILD_TESTING": "ON", "HEXLAB_ENABLE_PINNED_LLVM_ORACLES": "OFF"}},
+    {"name": "linux-desktop", "generator": "Ninja", "binaryDir": "${sourceDir}/out/build/linux-desktop", "cacheVariables": {"CMAKE_C_COMPILER": "clang", "CMAKE_CXX_COMPILER": "clang++", "CMAKE_BUILD_TYPE": "Release", "HEXLAB_BUILD_DESKTOP": "ON", "BUILD_TESTING": "OFF", "HEXLAB_ENABLE_PINNED_LLVM_ORACLES": "OFF"}},
+    {"name": "macos-desktop", "generator": "Ninja", "binaryDir": "${sourceDir}/out/build/macos-desktop", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "HEXLAB_BUILD_DESKTOP": "ON", "BUILD_TESTING": "OFF", "HEXLAB_ENABLE_PINNED_LLVM_ORACLES": "OFF"}}
+  ],
+  "buildPresets": [
+    {"name": "windows-headless", "configurePreset": "windows-headless", "configuration": "Debug"},
+    {"name": "windows-headless-release", "configurePreset": "windows-headless", "configuration": "Release"},
+    {"name": "windows-desktop", "configurePreset": "windows-desktop", "configuration": "Debug"},
+    {"name": "linux-headless", "configurePreset": "linux-headless", "jobs": 4},
+    {"name": "linux-gcc-headless-release", "configurePreset": "linux-gcc-headless-release", "jobs": 4},
+    {"name": "macos-headless", "configurePreset": "macos-headless", "jobs": 4},
+    {"name": "linux-desktop", "configurePreset": "linux-desktop", "jobs": 4},
+    {"name": "macos-desktop", "configurePreset": "macos-desktop", "jobs": 4}
+  ],
+  "testPresets": [
+    {"name": "windows-headless", "configurePreset": "windows-headless", "configuration": "Debug", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "windows-headless-release", "configurePreset": "windows-headless", "configuration": "Release", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "windows-desktop", "configurePreset": "windows-desktop", "configuration": "Debug", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "linux-headless", "configurePreset": "linux-headless", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "linux-gcc-headless-release", "configurePreset": "linux-gcc-headless-release", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}},
+    {"name": "macos-headless", "configurePreset": "macos-headless", "output": {"outputOnFailure": true}, "execution": {"noTestsAction": "error"}}
+  ]
+}

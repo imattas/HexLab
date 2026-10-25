@@ -1,0 +1,7 @@
+# ARM register-derived control-flow references
+
+The reference index can now resolve selected AArch64 `BR`/`BLR` and ARM A32/Thumb `BX`/`BLX` targets when function-level register propagation proves the target. The target must map to an executable image segment. ARM interworking bit 0 is used to select the physical target address; A32 targets are aligned to four bytes and Thumb targets to two.
+
+AArch64 values can come from the existing `MOVZ`/`MOVN`/known-input `MOVK`, `ADR`/`ADRP` plus immediate `ADD`/`SUB`, an unshifted `ORR` register-copy alias, or a validated full-width static pointer load. A32/Thumb values can come from `ADR`, PC-relative or tracked-base `ADD`/`SUB`, register/immediate `MOV`, and a validated full-width static pointer load. Calls invalidate the corresponding propagated register state.
+
+Propagation follows only resolved function CFG edges and uses the shared 100,000-block and 1,000,000-edge bounds. At joins, a register fact survives only when all incoming paths agree. Incomplete ownership, unresolved edges, unsupported instruction effects, relocation-covered pointer slots, or a target outside executable mapped bytes leave the indirect reference unresolved. A resolved reference retains the source branch instruction identity and is marked with dataflow provenance; this ARM/AArch64 path does not yet publish a full producer instruction chain.
