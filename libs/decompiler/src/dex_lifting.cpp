@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -65,13 +66,18 @@ Result<Statement> lift_one(const Instruction &instruction) {
     const auto hi = static_cast<std::uint8_t>(first >> 8);
     const auto expected_length = [&]() -> unsigned {
         if (op == 0x01 || op == 0x04 || op == 0x07) return 2;
-        if (op == 0x02 || op == 0x05 || op == 0x08 || op == 0x16 || op == 0x19) return 4;
-        if (op == 0x03 || op == 0x06 || op == 0x09 || op == 0x17) return 6;
+        if (op == 0x02 || op == 0x05 || op == 0x08 || op == 0x13 || op == 0x15 ||
+            op == 0x16 || op == 0x19) return 4;
+        if (op == 0x03 || op == 0x06 || op == 0x09 || op == 0x14 || op == 0x17) return 6;
         if (op == 0x18) return 10;
         if (op == 0x1a || op == 0x1c || op == 0x1f || op == 0x20) return 4;
         if (op == 0x1b) return 6;
         if (op == 0x1d || op == 0x1e || op == 0x27) return 2;
         if (op == 0x2b || op == 0x2c) return 6;
+        if (op >= 0x2d && op <= 0x31) return 4;
+        if (op >= 0xa6 && op <= 0xaf) return 4;
+        if (op >= 0xc6 && op <= 0xcf) return 2;
+        if (op >= 0xd0 && op <= 0xe2) return 4;
         if (op >= 0x7b && op <= 0x8f) return 2;
         if ((op >= 0x44 && op <= 0x6d) || op == 0x23 || (op >= 0x6e && op <= 0x78))
             return op >= 0x6e && op <= 0x78 ? 6 : 4;
@@ -251,12 +257,14 @@ Result<Statement> lift_one(const Instruction &instruction) {
         const char *name = op == 0x1d ? "dex_monitor_enter" : op == 0x1e ? "dex_monitor_exit" : "dex_throw";
         return Statement{Intrinsic{name, {typed_reg(object.value(), pointer32())}, IntrinsicMemoryEffect::unknown}};
     }
-    if (op == 0x13 || op == 0x14) {
+    if (op == 0x13 || op == 0x14 || op == 0x15) {
         const auto value = op == 0x13
-            ? static_cast<std::int32_t>(static_cast<std::int16_t>(unit(instruction, 1)))
-            : static_cast<std::int32_t>(std::uint32_t(unit(instruction, 1)) |
-                                        (std::uint32_t(unit(instruction, 2)) << 16));
-        return assign(hi, constant(static_cast<std::uint32_t>(value)));
+            ? static_cast<std::uint32_t>(static_cast<std::int32_t>(std::bit_cast<std::int16_t>(unit(instruction, 1))))
+            : op == 0x15
+                ? std::uint32_t(unit(instruction, 1)) << 16
+                : std::uint32_t(unit(instruction, 1)) |
+                    (std::uint32_t(unit(instruction, 2)) << 16);
+        return assign(hi, constant(value));
     }
     if (op >= 0x16 && op <= 0x19) {
         std::uint64_t value = 0;
@@ -292,12 +300,64 @@ Result<Statement> lift_one(const Instruction &instruction) {
             right_value = binary("and", std::move(right_value), constant(31));
         return assign(dst, binary(operations[slot], reg(lhs_reg.value()), std::move(right_value)));
     }
+    if (op >= 0xd0 && op <= 0xe2) {
+        static constexpr std::array<const char *, 8> literal16_operations{
+            "add", "sub", "mul", "sdiv", "srem", "and", "or", "xor"};
+        static constexpr std::array<const char *, 11> literal8_operations{
+            "add", "sub", "mul", "sdiv", "srem", "and", "or", "xor", "shl", "sar", "shr"};
+        const bool literal16 = op <= 0xd7;
+        const auto slot = static_cast<unsigned>(literal16 ? op - 0xd0 : op - 0xd8);
+        const auto packed = literal16 ? static_cast<std::uint16_t>(hi) : unit(instruction, 1);
+        const auto destination_index = static_cast<std::uint16_t>(literal16 ? packed & 15 : hi);
+        const auto source_index = static_cast<std::uint16_t>(literal16 ? packed >> 4 : packed & 0xff);
+        const auto immediate = literal16
+            ? static_cast<std::int32_t>(std::bit_cast<std::int16_t>(unit(instruction, 1)))
+            : static_cast<std::int32_t>(std::bit_cast<std::int8_t>(static_cast<std::uint8_t>(packed >> 8)));
+        if (slot == 3 || slot == 4)
+            return Error{ErrorCode::unsupported, "DEX literal division/remainder exception behavior is not modeled"};
+        auto source = require_reg(source_index);
+        if (!source) return source.error();
+        ExpressionPtr literal = constant(static_cast<std::uint32_t>(immediate));
+        ExpressionPtr left = reg(source.value());
+        ExpressionPtr right = std::move(literal);
+        const auto operation = literal16 ? literal16_operations[slot] : literal8_operations[slot];
+        if (slot == 1) {
+            std::swap(left, right); // rsub computes literal - vB
+        } else if (!literal16 && slot >= 8) {
+            right = binary("and", std::move(right), constant(31));
+        }
+        return assign(destination_index, binary(operation, std::move(left), std::move(right)));
+    }
     if (op == 0x0e) return Statement{Return{}};
     if (op == 0x2b || op == 0x2c) {
         if (!instruction.dex_switch || !instruction.dex_switch->validated ||
             instruction.flow != FlowKind::switch_dispatch)
             return Error{ErrorCode::unsupported, "DEX switch payload is unavailable or unvalidated"};
         return Statement{Intrinsic{"dex_switch_dispatch", {reg(vreg(hi))}, IntrinsicMemoryEffect::none}};
+    }
+    if (op >= 0x2d && op <= 0x31) {
+        static constexpr std::array<const char *, 5> names{
+            "dex_cmpl_float", "dex_cmpg_float", "dex_cmpl_double", "dex_cmpg_double", "dex_cmp_long"};
+        const auto destination_index = static_cast<std::uint16_t>(hi);
+        const auto packed = unit(instruction, 1);
+        const auto left_index = static_cast<std::uint16_t>(packed & 0xff);
+        const auto right_index = static_cast<std::uint16_t>(packed >> 8);
+        const bool is_wide = op >= 0x2f;
+        const auto input_type = op <= 0x2e ? f32() : op <= 0x30 ? f64() : i64();
+        auto left_operand = is_wide ? require_wide(left_index) : require_reg(left_index);
+        auto right_operand = is_wide ? require_wide(right_index) : require_reg(right_index);
+        auto destination = require_reg(destination_index);
+        if (!left_operand) return left_operand.error();
+        if (!right_operand) return right_operand.error();
+        if (!destination) return destination.error();
+        Intrinsic compare;
+        compare.name = names[op - 0x2d];
+        compare.operands = {typed_reg(left_operand.value(), input_type),
+                            typed_reg(right_operand.value(), input_type)};
+        compare.memory_effect = IntrinsicMemoryEffect::none;
+        compare.register_writes.push_back(destination.value());
+        compare.result_type = i32();
+        return Statement{std::move(compare)};
     }
     if (op == 0x0f || op == 0x11) {
         auto source = require_reg(hi);
@@ -308,6 +368,35 @@ Result<Statement> lift_one(const Instruction &instruction) {
         auto source = require_wide(hi);
         if (!source) return source.error();
         return Statement{Return{wide_reg(source.value())}};
+    }
+    if ((op >= 0xa6 && op <= 0xaf) || (op >= 0xc6 && op <= 0xcf)) {
+        static constexpr std::array<const char *, 5> operations{
+            "+", "-", "*", "/", "frem"};
+        const bool two_address = op >= 0xc6;
+        const auto normalized = static_cast<unsigned>(two_address ? op - 0xc6 : op - 0xa6);
+        const bool is_double = normalized >= 5;
+        const auto operation_index = normalized % 5;
+        const auto destination_index = static_cast<std::uint16_t>(
+            two_address ? hi & 15 : hi);
+        const auto left_index = static_cast<std::uint16_t>(
+            two_address ? destination_index : unit(instruction, 1) & 0xff);
+        const auto right_index = static_cast<std::uint16_t>(
+            two_address ? hi >> 4 : unit(instruction, 1) >> 8);
+        const auto type = is_double ? f64() : f32();
+        const auto make_register = [&](std::uint16_t index) -> Result<ExpressionPtr> {
+            auto operand = is_double ? require_wide(index) : require_reg(index);
+            if (!operand) return operand.error();
+            return typed_reg(operand.value(), type);
+        };
+        auto destination = is_double ? require_wide(destination_index) : require_reg(destination_index);
+        if (!destination) return destination.error();
+        auto left = make_register(left_index);
+        auto right = make_register(right_index);
+        if (!left) return left.error();
+        if (!right) return right.error();
+        auto value = std::make_shared<Expression>(Expression{type, BinaryValue{
+            operations[operation_index], std::move(left.value()), std::move(right.value())}});
+        return Statement{Assign{destination.value(), std::move(value)}};
     }
     if ((op >= 0x9b && op <= 0xa5) || (op >= 0xbb && op <= 0xc5)) {
         static constexpr std::array<const char *, 11> operations{
