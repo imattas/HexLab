@@ -121,7 +121,7 @@ struct TemplateParameter {
     bool template_parameter = false;
     bool pack = false;
     TypePtr value_type;
-    std::optional<std::uint64_t> default_value;
+    std::vector<Token> default_value_expression;
     std::string default_template;
     std::vector<TemplateParameter> nested_parameters;
 };
@@ -143,6 +143,168 @@ struct AggregateTemplate {
     std::vector<TemplateParameter> parameters;
     std::vector<Token> definition;
     std::vector<AggregateSpecialization> specializations;
+};
+
+std::uint64_t integer_token_magnitude(std::string text, std::uint64_t limit) {
+    while (!text.empty() && (text.back() == 'u' || text.back() == 'U' ||
+                             text.back() == 'l' || text.back() == 'L'))
+        text.pop_back();
+    if (text.empty()) fail(ErrorCode::malformed, "invalid integer constant expression literal");
+    int base = 10;
+    std::string_view digits = text;
+    if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+        base = 16;
+        digits.remove_prefix(2);
+    } else if (digits.size() > 1 && digits[0] == '0') {
+        base = 8;
+        digits.remove_prefix(1);
+    }
+    std::uint64_t value = 0;
+    const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), value, base);
+    if (error != std::errc{} || end != digits.data() + digits.size() || value > limit)
+        fail(ErrorCode::overflow, "integer constant expression literal is outside the supported range");
+    return value;
+}
+
+class IntegerExpressionParser {
+public:
+    IntegerExpressionParser(const std::vector<Token> &tokens,
+                            const std::map<std::string, std::uint64_t, std::less<>> &bindings,
+                            std::uint16_t max_nesting)
+        : tokens_(tokens), bindings_(bindings), max_nesting_(max_nesting) {}
+
+    std::int64_t parse() {
+        if (tokens_.empty()) fail(ErrorCode::malformed, "empty integer constant expression");
+        if (tokens_.size() > max_tokens)
+            fail(ErrorCode::resource_limit, "integer constant expression exceeds its token limit");
+        const auto value = parse_binary(1, 0);
+        if (position_ != tokens_.size())
+            fail(ErrorCode::unsupported, "unsupported token in integer constant expression");
+        return value;
+    }
+
+private:
+    static constexpr std::size_t max_tokens = 4096;
+    static constexpr std::size_t max_operations = 4096;
+
+    static int precedence(std::string_view op) {
+        if (op == "|") return 1;
+        if (op == "^") return 2;
+        if (op == "&") return 3;
+        if (op == "+" || op == "-") return 4;
+        if (op == "*" || op == "/" || op == "%") return 5;
+        return 0;
+    }
+
+    bool done() const { return position_ >= tokens_.size(); }
+    std::string_view peek() const { return done() ? std::string_view{} : tokens_[position_].text; }
+    bool take(std::string_view value) {
+        if (peek() != value) return false;
+        ++position_;
+        return true;
+    }
+
+    std::int64_t parse_binary(int minimum, unsigned depth) {
+        enter(depth);
+        auto left = parse_unary(depth + 1);
+        for (;;) {
+            const auto op = peek();
+            const auto op_precedence = precedence(op);
+            if (op_precedence < minimum) break;
+            if (++operations_ > max_operations)
+                fail(ErrorCode::resource_limit, "integer constant expression exceeds its operation limit");
+            ++position_;
+            const auto right = parse_binary(op_precedence + 1, depth + 1);
+            left = apply(op, left, right);
+        }
+        return left;
+    }
+
+    std::int64_t parse_unary(unsigned depth) {
+        enter(depth);
+        if (take("+")) return parse_unary(depth + 1);
+        if (take("-")) {
+            const auto value = parse_unary(depth + 1);
+            if (value == INT64_MIN) fail(ErrorCode::overflow, "integer constant expression negation overflows");
+            return -value;
+        }
+        if (take("~")) return ~parse_unary(depth + 1);
+        return parse_primary(depth + 1);
+    }
+
+    std::int64_t parse_primary(unsigned depth) {
+        enter(depth);
+        if (take("(")) {
+            const auto value = parse_binary(1, depth + 1);
+            if (!take(")")) fail(ErrorCode::malformed, "unclosed parenthesis in integer constant expression");
+            return value;
+        }
+        if (done()) fail(ErrorCode::malformed, "missing operand in integer constant expression");
+        const auto token = tokens_[position_++].text;
+        if (token == "true") return 1;
+        if (token == "false") return 0;
+        if (!token.empty() && ident_start(token.front()) &&
+            std::all_of(token.begin(), token.end(), ident_continue)) {
+            const auto binding = bindings_.find(token);
+            if (binding == bindings_.end())
+                fail(ErrorCode::unsupported, "unbound name in integer constant expression: '" + token + "'");
+            if (binding->second > static_cast<std::uint64_t>(INT64_MAX))
+                fail(ErrorCode::overflow, "bound integer exceeds the signed expression range");
+            return static_cast<std::int64_t>(binding->second);
+        }
+        return static_cast<std::int64_t>(integer_token_magnitude(token, static_cast<std::uint64_t>(INT64_MAX)));
+    }
+
+    std::int64_t apply(std::string_view op, std::int64_t left, std::int64_t right) {
+        constexpr auto minimum = std::numeric_limits<std::int64_t>::min();
+        constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
+        if (op == "+") {
+            if ((right > 0 && left > maximum - right) || (right < 0 && left < minimum - right))
+                fail(ErrorCode::overflow, "integer constant expression addition overflows");
+            return left + right;
+        }
+        if (op == "-") {
+            if ((right < 0 && left > maximum + right) || (right > 0 && left < minimum + right))
+                fail(ErrorCode::overflow, "integer constant expression subtraction overflows");
+            return left - right;
+        }
+        if (op == "*") {
+            if (left == 0 || right == 0) return 0;
+            const bool negative = (left < 0) != (right < 0);
+            const auto magnitude = [](std::int64_t value) {
+                return value < 0 ? static_cast<std::uint64_t>(-(value + 1)) + 1
+                                 : static_cast<std::uint64_t>(value);
+            };
+            const auto lhs = magnitude(left), rhs = magnitude(right);
+            const auto limit = negative ? (std::uint64_t{1} << 63) : static_cast<std::uint64_t>(maximum);
+            if (rhs > limit / lhs) fail(ErrorCode::overflow, "integer constant expression multiplication overflows");
+            const auto product = lhs * rhs;
+            if (!negative) return static_cast<std::int64_t>(product);
+            if (product == (std::uint64_t{1} << 63)) return minimum;
+            return -static_cast<std::int64_t>(product);
+        }
+        if (op == "/" || op == "%") {
+            if (!right) fail(ErrorCode::malformed, "division by zero in integer constant expression");
+            if (left == minimum && right == -1)
+                fail(ErrorCode::overflow, "integer constant expression division overflows");
+            return op == "/" ? left / right : left % right;
+        }
+        if (op == "&") return left & right;
+        if (op == "^") return left ^ right;
+        if (op == "|") return left | right;
+        fail(ErrorCode::unsupported, "unsupported operator in integer constant expression");
+    }
+
+    void enter(unsigned depth) const {
+        if (depth > max_nesting_)
+            fail(ErrorCode::resource_limit, "integer constant expression exceeds the nesting limit");
+    }
+
+    const std::vector<Token> &tokens_;
+    const std::map<std::string, std::uint64_t, std::less<>> &bindings_;
+    std::uint16_t max_nesting_;
+    std::size_t position_ = 0;
+    std::size_t operations_ = 0;
 };
 
 const Type *unqualified(const Type *type) {
@@ -217,7 +379,17 @@ private:
                                                  : HeaderTemplateParameterKind::type;
         result.pack = parameter.pack;
         result.value_type = parameter.value_type;
-        if (parameter.default_value) result.default_argument = std::to_string(*parameter.default_value);
+        if (!parameter.default_value_expression.empty()) {
+            for (const auto &token : parameter.default_value_expression) {
+                if (!result.default_argument.empty() && identifier(token.text)) {
+                    const auto previous = static_cast<unsigned char>(result.default_argument.back());
+                    if ((previous >= 'a' && previous <= 'z') || (previous >= 'A' && previous <= 'Z') ||
+                        (previous >= '0' && previous <= '9') || previous == '_')
+                        result.default_argument += ' ';
+                }
+                result.default_argument += token.text;
+            }
+        }
         else if (!parameter.default_template.empty()) result.default_argument = parameter.default_template;
         else for (const auto &token : parameter.default_type) {
             if (!result.default_argument.empty() && identifier(token.text)) {
@@ -605,16 +777,11 @@ private:
                 if (template_name.empty()) fail(ErrorCode::unsupported, "template argument does not name a supported class or alias template");
                 append({{}, {}, std::move(template_name)});
             } else if (parameter->value_parameter) {
-                std::optional<std::uint64_t> value;
-                if (auto binding = template_value_bindings_.find(peek().text); binding != template_value_bindings_.end()) {
-                    value = binding->second;
-                    ++pos_;
-                } else if (!peek().text.empty() && peek().text.front() >= '0' && peek().text.front() <= '9') {
-                    value = integer_magnitude(next().text, static_cast<std::uint64_t>(INT64_MAX));
-                } else {
-                    fail(ErrorCode::unsupported, "non-type template arguments must be integer literals or bound values");
-                }
-                append({{}, value, {}});
+                const auto expression = take_integer_expression_until_template_delimiter();
+                const auto evaluated = evaluate_integer_expression(expression, template_value_bindings_);
+                if (evaluated < 0)
+                    fail(ErrorCode::unsupported, "negative non-type template arguments are unsupported");
+                append({{}, static_cast<std::uint64_t>(evaluated), {}});
             } else {
                 auto base = parse_base();
                 if (base.is_typedef || base.is_static) syntax("storage specifiers are invalid in template arguments");
@@ -675,7 +842,13 @@ private:
             const bool has_argument = argument_index < arguments.size();
             const TemplateArgument *argument = has_argument ? &arguments[argument_index++] : nullptr;
             if (parameter.value_parameter) {
-                auto value = argument ? argument->value : parameter.default_value;
+                std::optional<std::uint64_t> value = argument ? argument->value : std::nullopt;
+                if (!argument && !parameter.default_value_expression.empty()) {
+                    const auto evaluated = evaluate_integer_expression(parameter.default_value_expression, bindings.values);
+                    if (evaluated < 0)
+                        fail(ErrorCode::unsupported, "negative non-type template defaults are unsupported");
+                    value = static_cast<std::uint64_t>(evaluated);
+                }
                 if (!value) fail(ErrorCode::malformed, "template requires an integer argument for '" + parameter.name + "'");
                 if (argument && (argument->type || !argument->template_name.empty()))
                     fail(ErrorCode::malformed, "template argument '" + parameter.name + "' must be an integer");
@@ -799,9 +972,7 @@ private:
                 if (parameter.pack) fail(ErrorCode::malformed, "a template parameter pack cannot have a default");
                 saw_default = true;
                 if (parameter.value_parameter) {
-                    if (peek().text.empty() || peek().text.front() < '0' || peek().text.front() > '9')
-                        fail(ErrorCode::unsupported, "non-type template defaults must be integer literals");
-                    parameter.default_value = integer_magnitude(next().text, static_cast<std::uint64_t>(INT64_MAX));
+                    parameter.default_value_expression = take_integer_expression_until_template_delimiter();
                 } else {
                 std::size_t angle = 0, paren = 0, bracket = 0;
                 while (!at("<eof>")) {
@@ -1122,7 +1293,7 @@ private:
             return;
         }
         if (std::any_of(parameters.begin(), parameters.end(), [](const auto &parameter) {
-                return parameter.template_parameter || parameter.pack || parameter.default_value.has_value() ||
+                return parameter.template_parameter || parameter.pack || !parameter.default_value_expression.empty() ||
                        !parameter.default_type.empty() || !parameter.default_template.empty();
             }))
             fail(ErrorCode::unsupported,
@@ -1788,6 +1959,35 @@ private:
         if(!static_members.empty()){auto with_static=Type::with_static_data_members(completed,std::move(static_members));if(!with_static)fail(with_static.error().code,with_static.error().message);completed=with_static.value();}
         register_tag_type(is_union?"union":"struct",tag,completed,cpp_declarations);return completed;
     }
+    std::vector<Token> take_integer_expression_until(std::string_view delimiter, bool template_delimiters) {
+        std::vector<Token> expression;
+        std::size_t parentheses = 0;
+        while (!at("<eof>")) {
+            const bool terminal = at(delimiter) || (template_delimiters && (at(",") || at(">")));
+            if (!parentheses && terminal) break;
+            if (at(")") && !parentheses)
+                fail(ErrorCode::malformed, "unmatched closing parenthesis in integer constant expression");
+            if (at("(")) ++parentheses;
+            else if (at(")")) --parentheses;
+            expression.push_back(next());
+            if (expression.size() > 4096)
+                fail(ErrorCode::resource_limit, "integer constant expression exceeds its token limit");
+        }
+        if (parentheses) fail(ErrorCode::malformed, "unclosed parenthesis in integer constant expression");
+        if (expression.empty()) fail(ErrorCode::malformed, "empty integer constant expression");
+        return expression;
+    }
+    std::vector<Token> take_integer_expression_until_template_delimiter() {
+        return take_integer_expression_until(">", true);
+    }
+    std::vector<Token> take_integer_expression_until_array_delimiter() {
+        return take_integer_expression_until("]", false);
+    }
+    std::int64_t evaluate_integer_expression(
+        const std::vector<Token> &expression,
+        const std::map<std::string, std::uint64_t, std::less<>> &bindings) const {
+        return IntegerExpressionParser(expression, bindings, o_.max_nesting).parse();
+    }
     std::uint64_t integer_magnitude(std::string s,std::uint64_t limit){
         while(!s.empty()&&(s.back()=='u'||s.back()=='U'||s.back()=='l'||s.back()=='L'))s.pop_back();if(s.empty())syntax("invalid enum integer");
         int base=10;std::string_view v=s;if(v.size()>2&&v[0]=='0'&&(v[1]=='x'||v[1]=='X')){base=16;v.remove_prefix(2);}else if(v.size()>1&&v[0]=='0'){base=8;v.remove_prefix(1);}std::uint64_t val=0;auto [end,ec]=std::from_chars(v.data(),v.data()+v.size(),val,base);if(ec!=std::errc{}||end!=v.data()+v.size()||val>limit)syntax("integer is outside the supported range");return val;
@@ -1857,7 +2057,7 @@ private:
         } else if(identifier(peek().text)) name=next().text;
         else if(!allow_abstract)syntax("declarator requires an identifier");
         for(;;){
-            if(take("[")){std::uint64_t count=0;if(!take("]")){const auto extent_token=next().text;auto binding=template_value_bindings_.find(extent_token);if(binding!=template_value_bindings_.end())count=binding->second;else {auto extent=integer_literal(extent_token);if(extent>0)count=static_cast<std::uint64_t>(extent);}if(!count||count>o_.max_array_elements)fail(ErrorCode::resource_limit,"array extent is invalid or exceeds configured limit");need("]");}derived.push_back({Derived::Kind::array,count,{},false});continue;}
+            if(take("[")){std::uint64_t count=0;if(!take("]")){const auto expression=take_integer_expression_until_array_delimiter();const auto extent=evaluate_integer_expression(expression,template_value_bindings_);if(extent<0)fail(ErrorCode::unsupported,"negative array extents are unsupported");count=static_cast<std::uint64_t>(extent);if(!count||count>o_.max_array_elements)fail(ErrorCode::resource_limit,"array extent is invalid or exceeds configured limit");need("]");}derived.push_back({Derived::Kind::array,count,{},false});continue;}
             if(!take("("))break;
             enter();std::vector<Parameter> params;bool variadic=false;
             if(!take(")")){

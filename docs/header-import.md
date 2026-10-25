@@ -39,6 +39,17 @@ and fails instead of choosing one. An inline namespace cannot alias a namespace
 that was previously declared without `inline`; it can be reopened normally.
 Anonymous namespaces and namespace members other than types remain unsupported.
 
+An integer constant-expression evaluator supports decimal, octal, and
+hexadecimal literals; previously bound integral template parameters;
+`true`/`false`; parentheses; unary `+`, `-`, `~`; arithmetic `+`, `-`, `*`,
+`/`, `%`; and bitwise `&`, `^`, `|`. It is used for non-type template
+arguments, non-type defaults (which may refer to earlier parameters), and
+fixed array extents in instantiated templates. Final non-type values and array
+extents must be non-negative; negative results, division by zero, overflow,
+unknown names, and unsupported operators fail explicitly. Each expression is
+limited to 4096 tokens and operations and the configured parser nesting limit.
+No compiler is invoked.
+
 Alias and `class`/`struct`/`union` templates support type parameters,
 integral non-type parameters, template-template parameters, and a trailing
 parameter pack. Type parameters may have type defaults. Alias
@@ -70,7 +81,7 @@ retained in the shared type model, but does not affect imported offsets or size.
 
 Template-template parameters and parameter packs cannot be used in class-template
 specializations; compound pack patterns, member/parameter pack expansions,
-arithmetic/non-literal non-type expressions, function-template
+arithmetic non-type specialization patterns, function-template
 specializations, explicit alias-template specializations, forward-declared
 templates, and nested class-template definitions are unsupported. Type
 specialization patterns outside `T`, `T*`, `const T*`, and fixed types are also
