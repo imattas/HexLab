@@ -34,6 +34,47 @@ HEXLAB_IMAGE_EXPORT Result<PeRegisterContext> unwind_pe_frame(const PeMetadata &
                                                               const PeRegisterContext &,
                                                               const PeMemoryReader &);
 
+enum class PeFh3CatchDisposition : std::uint8_t {
+    catch_all, exact_type, different_type, type_unknown, unsupported_adjectives
+};
+enum class PeFh3DispatchDisposition : std::uint8_t {
+    unresolved, handler_candidate, continue_search, ambiguous
+};
+struct PeFh3CleanupAction {
+    std::int32_t state = -1;
+    std::uint64_t action_address = 0;
+    PeRecordSource source;
+};
+struct PeFh3CatchCandidate {
+    std::uint32_t try_index = 0, handler_index = 0;
+    PeFh3CatchDisposition disposition = PeFh3CatchDisposition::type_unknown;
+    std::optional<std::string> decorated_type_name;
+    std::uint64_t handler_address = 0;
+    std::optional<std::uint64_t> catch_object_address;
+    PeRecordSource source;
+    std::optional<PeRecordSource> type_descriptor_source;
+};
+struct PeFh3ExceptionPlan {
+    std::uint32_t function_begin_rva = 0;
+    std::int32_t state = -1;
+    std::uint64_t establisher_frame = 0;
+    PeFh3DispatchDisposition dispatch = PeFh3DispatchDisposition::unresolved;
+    std::optional<std::uint32_t> selected_try_index, selected_handler_index;
+    std::optional<PeRecordSource> dispatch_source;
+    std::string dispatch_diagnostic;
+    std::vector<PeFh3CleanupAction> cleanup_actions;
+    std::vector<PeFh3CatchCandidate> handlers;
+};
+
+// Build a bounded FH3 exception-state plan using source-tracked FuncInfo data.
+// This reports cleanup and catch candidates only; it never invokes target code.
+// Typed catches match only exact decorated-name identity, so conversions and
+// rethrow/foreign-exception semantics remain explicitly ambiguous.
+HEXLAB_IMAGE_EXPORT Result<PeFh3ExceptionPlan>
+plan_pe_fh3_exception(const PeMetadata &, std::uint64_t module_base,
+                      std::uint64_t instruction_pointer, std::uint64_t establisher_frame,
+                      std::optional<std::string_view> exception_decorated_type = {});
+
 enum class PeFh4CatchDisposition : std::uint8_t {
     catch_all, exact_type, different_type, type_unknown, unsupported_adjectives
 };
