@@ -13,10 +13,17 @@ thread-qualified continue and single-step resume only the event thread. A
 thread-resume schedule can continue several selected stopped threads while
 leaving other owned threads stopped. If a ptrace continue fails partway through
 such a schedule, the backend interrupts and re-stops the threads it already
-resumed before returning the original error; if rollback is incomplete, the
-returned error includes that failure. Multi-thread schedules currently accept
+resumed before returning the original error. If rollback is incomplete, the
+session blocks further resume operations until it has retried stopping those
+peers; signal, clone, exit, and other racing statuses are retained as deferred
+events and are not attributed to the schedule's pending event. A schedule must
+include the exact pending event owner, and every listed thread must be uniquely
+owned and stopped by this session. The schedule API has no signal-delivery
+field, so schedules fail closed when the pending event is a real signal stop;
+use the signal-aware continue operation instead. Multi-thread schedules accept
 continue actions only and cannot step over a pending software or hardware
 breakpoint; single-step schedules remain limited to one runnable thread.
+These ptrace operations use stop-and-rollback and are not atomic.
 Memory reads and writes, breakpoint changes, detach, and register writes
 require the entire process thread group to be owned and stopped. If the task
 list and ptrace ownership do not match, these operations fail closed.
