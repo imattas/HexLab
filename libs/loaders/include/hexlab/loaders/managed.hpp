@@ -65,6 +65,7 @@ struct ManagedField {
   // Closed generic owner arguments for MemberRef field references. Definition
   // fields have no substitution context and keep this empty.
   std::vector<ManagedTypeSignature> declaring_type_arguments;
+  bool declaring_type_generic_arguments_valid=true;
 };
 struct ManagedTypeDefinition {
   std::uint32_t token=0, flags=0;

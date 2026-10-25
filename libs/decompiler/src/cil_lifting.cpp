@@ -71,6 +71,7 @@ ValueType managed_signature_type(const ManagedTypeSignature &signature,
                                  const ManagedMethodSignature &context,
                                  unsigned depth = 0) {
     if (depth > 16) return {};
+    if (!context.declaring_type_generic_arguments_valid) return {};
     if (signature.element_type == 0x15 && !signature.generic_instance_arity_valid) return {};
     if (signature.type_spec_signature)
         return managed_signature_type(*signature.type_spec_signature, context, depth + 1);
@@ -1334,6 +1335,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                 if (op.starts_with("ld")) {
                 ManagedMethodSignature field_context;
                 field_context.declaring_type_arguments=field->second.declaring_type_arguments;
+                field_context.declaring_type_generic_arguments_valid=field->second.declaring_type_generic_arguments_valid;
                 const auto type = field->second.type_signature
                     ? managed_signature_type(*field->second.type_signature, field_context) : ValueType{};
                     if (!shape_push(type)) return failure(ErrorCode::malformed, "CIL max_stack exceeded");
@@ -1736,6 +1738,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                     return failure(ErrorCode::malformed, "CIL field access underflows evaluation stack");
                 ManagedMethodSignature empty_context;
                 empty_context.declaring_type_arguments=field->second.declaring_type_arguments;
+                empty_context.declaring_type_generic_arguments_valid=field->second.declaring_type_generic_arguments_valid;
                 const auto type = field->second.type_signature
                     ? managed_signature_type(*field->second.type_signature, empty_context) : ValueType{};
                 const auto field_name = field->second.declaring_type + "::" + field->second.name;

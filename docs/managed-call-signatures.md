@@ -41,9 +41,13 @@ and trailing bytes are rejected. The parser does not guess stack effects for
 unresolved tokens; decompilation reports those calls unsupported.
 
 The implementation applies limits of 4,096 parameters and 16 nested pointer or
-byref element wrappers. Generic arity is bounded at 1,024. These limits keep
-metadata parsing bounded; they do not imply type resolution or generic
-substitution.
+byref element wrappers. Generic arity is bounded at 1,024. TypeSpec owner
+instantiations are followed through resolved TypeSpec-to-TypeSpec constructor
+chains under the same 16-level nesting bound, so closed `VAR` substitutions
+reach CIL call typing even when the owning TypeSpec is indirect. Open generic
+variables with no supplied owner or MethodSpec argument remain unknown. Cycles,
+invalid local generic arities, and missing or ambiguous metadata identities do
+not produce guessed substitutions.
 
 Field signatures use the same bounded type-node decoder through
 `decode_managed_field_signature`, which requires the `FIELD` calling-convention
