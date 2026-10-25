@@ -20,7 +20,7 @@ Continue building HexLab toward an IDA-class reverse-engineering workbench by ad
 
 - Let desktop users inspect validated Objective-C runtime records and navigate to their source addresses.
 - Render additional well-understood Microsoft ABI special names while preserving raw names for unsupported or malformed inputs.
-- Permit safe multi-thread Linux AArch64 resume schedules with event ownership and stop-and-rollback behavior equivalent to the established Linux x86 contract.
+- Permit safe multi-thread Linux AArch64 resume schedules with event ownership and stop-and-rollback behavior informed by, but implemented separately from, the established Linux x86 contract.
 
 ## Constraints and non-goals
 
@@ -34,4 +34,4 @@ Continue building HexLab toward an IDA-class reverse-engineering workbench by ad
 
 - The Objective-C page belongs in the existing Binary Metadata notebook, uses the already produced scan snapshot, and exposes explicit navigation callbacks.
 - MSVC support is additive to the current bounded parser; use the Microsoft decorated-name ABI grammar as the authority and keep unsupported cases conservative.
-- AArch64 scheduling follows the backend's existing stop-and-rollback model. The implementation must preserve pending event ownership and defer racing stops rather than attributing them to the wrong thread.
+- CMake selects `native_backend_linux_aarch64.cpp` on AArch64; `native_backend_linux.cpp` is x86-64-only. AArch64 scheduling is implemented in its selected backend, informed by the x86 stop-and-rollback model. Preserve pending signal/event ownership and defer racing stops rather than attributing them to the wrong thread.
