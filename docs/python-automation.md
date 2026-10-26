@@ -1,4 +1,4 @@
-# Python automation v1
+﻿# Python automation v1
 
 `hexlab_python script.py [arguments...]` executes trusted Python against the same
 project store, command validation, analysis engine and persistent history as the
@@ -368,7 +368,7 @@ register/segment state is fabricated. Reference kind and execution mode values
 are native enum ordinals and are not string guesses.
 
 `incoming_references(target)` exposes the reverse-reference index directly, so
-scripts can answer “what calls or accesses this location?” without scanning each
+scripts can answer â€œwhat calls or accesses this location?â€ without scanning each
 instruction and querying its outgoing edges. It returns a `ReferencePage` with
 `references`, total matching row count, and `next`; continue with
 `incoming_references(target, start=page.next)` until `next is None`. Results
