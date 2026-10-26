@@ -525,6 +525,26 @@ Result<CfiExpressionValue> evaluate_cfi_expression(std::span<const std::byte> ex
         }
         case 0x27: // DW_OP_xor
             { auto result = binary([](auto a, auto b) { return a ^ b; }); if (!result) return result.error(); break; }
+        case 0x28: // DW_OP_bra
+        case 0x2f: { // DW_OP_skip
+            if (expression.size() - cursor < 2)
+                return failure(ErrorCode::malformed, "Truncated Mach-O DW_OP branch displacement");
+            const auto low = std::to_integer<unsigned>(expression[cursor++]);
+            const auto high = std::to_integer<unsigned>(expression[cursor++]);
+            const auto displacement = std::bit_cast<std::int16_t>(static_cast<std::uint16_t>(low | (high << 8)));
+            bool take = true;
+            if (op == 0x28) {
+                auto condition = pop(); if (!condition) return condition.error();
+                take = condition.value() != 0;
+            }
+            if (take) {
+                const auto target = static_cast<std::int64_t>(cursor) + displacement;
+                if (target < 0 || static_cast<std::uint64_t>(target) > expression.size())
+                    return failure(ErrorCode::out_of_bounds, "Mach-O DW_OP branch target is outside its expression");
+                cursor = static_cast<std::size_t>(target);
+            }
+            break;
+        }
         case 0x29: case 0x2a: case 0x2b: case 0x2c: case 0x2d: case 0x2e: { // comparisons
             auto rhs = pop(); if (!rhs) return rhs.error(); auto lhs = pop(); if (!lhs) return lhs.error();
             const auto signed_lhs = std::bit_cast<std::int64_t>(lhs.value());

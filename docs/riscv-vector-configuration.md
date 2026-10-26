@@ -153,6 +153,13 @@ therefore remains symbolic only. The lane API does not receive physical vector
 register group identities, so it cannot validate group alignment or overlap.
 The seven encodings and operand signedness follow the official RVV 1.0
 [widening multiply-add specification](https://docs.riscv.org/reference/isa/unpriv/v-st-ext).
+Non-accumulating widening multiply is also decoded and lifted for
+`vwmulu.vv/vx`, `vwmulsu.vv/vx`, and `vwmul.vv/vx`. The lane evaluator returns
+the full 2*SEW product for SEW 8/16/32 and effective destination LMUL at most
+8, preserving masked, prestart, and tail lanes; 128-bit SEW=64 results remain
+symbolic. `vwmulsu` treats `vs2` as signed and `vs1`/`x[rs1]` as unsigned.
+The encoding and signedness follow the official RVV 1.0
+[widening integer multiply specification](https://docs.riscv.org/reference/isa/unpriv/v-st-ext).
 The decoder and decompiler also recognize widening add/subtract `vwadd`,
 `vwaddu`, `vwsub`, and `vwsubu` in `.vv`, `.vx`, `.wv`, and `.wx` forms.
 Narrow-source forms sign- or zero-extend both narrow operands to 2*SEW;

@@ -272,6 +272,29 @@ bool decode_vector_multiply_add(std::uint32_t w, RiscvInstruction &i) {
     return true;
 }
 
+bool decode_vector_widening_multiply(std::uint32_t w, RiscvInstruction &i) {
+    const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
+    const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
+    const unsigned funct3 = (w >> 12) & 7, vd = (w >> 7) & 31;
+    if ((funct6 < 0x38 || funct6 > 0x3b) || (funct3 != 2 && funct3 != 6))
+        return false;
+    const bool scalar = funct3 == 6;
+    static constexpr RiscvOpcode vv_ops[]{RiscvOpcode::vwmulu_vv, RiscvOpcode::vwmulsu_vv,
+                                          RiscvOpcode::vwmul_vv, RiscvOpcode::vwmul_vv};
+    static constexpr RiscvOpcode vx_ops[]{RiscvOpcode::vwmulu_vx, RiscvOpcode::vwmulsu_vx,
+                                          RiscvOpcode::vwmul_vx, RiscvOpcode::vwmul_vx};
+    i.opcode = scalar ? vx_ops[funct6 - 0x38] : vv_ops[funct6 - 0x38];
+    // The final funct6 value is vwmul (0x3b); 0x39 is reserved.
+    if (funct6 == 0x39) return false;
+    operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
+    read_vector_destination(i, vd);
+    operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
+    operand(i, RiscvRegister{static_cast<std::uint8_t>(vs1), false, !scalar}, RiscvOperandAccess::read);
+    if (!vm) i.register_reads.push_back(RiscvRegister{0, false, true});
+    i.vector_masked = !vm;
+    return true;
+}
+
 bool decode_vector_widening_add_sub(std::uint32_t w, RiscvInstruction &i) {
     const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
     const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
@@ -893,7 +916,7 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
             unsupported = "reserved or unimplemented vector-configuration encoding";
             return false;
         }
-        if (decode_vector_integer(w, i) || decode_vector_compare(w, i) || decode_vector_widening_add_sub(w, i) || decode_vector_multiply_add(w, i) ||
+        if (decode_vector_integer(w, i) || decode_vector_compare(w, i) || decode_vector_widening_add_sub(w, i) || decode_vector_widening_multiply(w, i) || decode_vector_multiply_add(w, i) ||
             decode_vector_shift_minmax(w, i) ||
             decode_vector_multiply(w, i) || decode_vector_divide(w, i) || decode_vector_permutation(w, i)) {
             read_vector_configuration(i);
