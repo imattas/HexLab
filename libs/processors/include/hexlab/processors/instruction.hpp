@@ -414,7 +414,13 @@ enum class Opcode {
     // RVV non-accumulating widening integer multiply; appended for ID stability.
     rv_vwmulu_vv, rv_vwmulu_vx, rv_vwmulsu_vv, rv_vwmulsu_vx, rv_vwmul_vv, rv_vwmul_vx,
     // EVEX variable packed shifts; append to preserve persisted opcode IDs.
-    vpsllvw, vpsllvd, vpsllvq, vpsrlvw, vpsrlvd, vpsrlvq, vpsravw, vpsravd, vpsravq
+    vpsllvw, vpsllvd, vpsllvq, vpsrlvw, vpsrlvd, vpsrlvq, vpsravw, vpsravd, vpsravq,
+    // RVV floating arithmetic, sign, min/max and compare forms; appended for cache stability.
+    rv_vfadd_vv, rv_vfadd_vf, rv_vfsub_vv, rv_vfsub_vf, rv_vfmul_vv, rv_vfmul_vf,
+    rv_vfdiv_vv, rv_vfdiv_vf, rv_vfsgnj_vv, rv_vfsgnj_vf, rv_vfsgnjn_vv, rv_vfsgnjn_vf,
+    rv_vfsgnjx_vv, rv_vfsgnjx_vf, rv_vfmin_vv, rv_vfmin_vf, rv_vfmax_vv, rv_vfmax_vf,
+    rv_vmfeq_vv, rv_vmfeq_vf, rv_vmfne_vv, rv_vmfne_vf, rv_vmflt_vv, rv_vmflt_vf,
+    rv_vmfle_vv, rv_vmfle_vf, rv_vmfgt_vf, rv_vmfge_vf
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
@@ -607,6 +613,10 @@ struct Instruction {
     // Some bytecode formats have variable-width instructions larger than the
     // native instruction-byte buffer. Retain the full encoding only then.
     std::vector<std::byte> extended_bytes;
+    // RVV floating arithmetic reads the dynamic RISC-V frm control field.
+    bool reads_frm = false;
+    // Accrued exception flags are sticky, so vector FP operations read old fflags.
+    bool reads_fflags = false;
     std::size_t byte_length() const noexcept { return length; }
     std::span<const std::byte> encoded_bytes() const noexcept {
         if (!extended_bytes.empty()) return extended_bytes;

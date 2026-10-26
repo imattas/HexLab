@@ -1,5 +1,6 @@
 #include "references_internal.hpp"
 #include "control_target.hpp"
+#include "mips64_reference_helpers.hpp"
 #include "hexlab/analysis/relocations.hpp"
 #include <algorithm>
 #include <array>
@@ -2480,6 +2481,18 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                     if (reg.bank == RegisterBank::mips_gpr && reg.index != 0)
                         registers.erase(reg.index);
             };
+            // MIPS HI16/LO16 and other instruction relocations are not
+            // currently solved as semantic pairs. Never treat their encoded
+            // immediate bits as a complete address; unsupported, incomplete,
+            // or ambiguous relocation records remain opaque.
+            if (mips64 && relocations.overlaps(instruction.address, instruction.length)) {
+                erase_written();
+                if (instruction.flow == FlowKind::call) registers.clear();
+                if (mips64)
+                    if (const auto link = reference_detail::mips64_link_value(*image, instruction))
+                        registers[link->first] = link->second;
+                continue;
+            }
             std::optional<Address> indirect_target;
             if (instruction.opcode == Opcode::mips_jr || instruction.opcode == Opcode::mips_jalr) {
                 const auto *target_register = architecture_register(instruction, 0, RegisterBank::mips_gpr, width);
@@ -2663,6 +2676,9 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
             }
             if (indirect_target) result.immediate_targets[{fact->id, 0}] = *indirect_target;
             if (instruction.flow == FlowKind::call) registers.clear();
+            if (mips64)
+                if (const auto link = reference_detail::mips64_link_value(*image, instruction))
+                    registers[link->first] = link->second;
         }
         return registers;
     };

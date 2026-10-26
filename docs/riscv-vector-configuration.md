@@ -122,10 +122,11 @@ runtime VLEN/LMUL group boundaries, so it cannot fold them during decompilation
 or prove the architecturally required group non-overlap. The standalone lane
 evaluator accepts caller-supplied VLEN/vtype and preserves masked, prestart,
 and tail lanes from the supplied destination. Slide1, segmented loads/stores,
-fault-only-first, floating-point, and other vector memory forms remain unsupported.
+fault-only-first, floating-point vector memory, and other vector memory forms
+remain unsupported.
 
-Segmented, whole-register, fault-only-first, floating-point, and other vector
-memory forms remain unsupported. The decoder preserves encoded EEW and
+Segmented, whole-register, fault-only-first, and other vector memory forms
+remain unsupported. The decoder preserves encoded EEW and
 vtype dependencies without knowing implementation VLEN. The execution helper
 validates a caller-supplied configuration; implementation-specific ELEN and
 actual memory accesses remain outside this bounded static model.
@@ -133,6 +134,39 @@ actual memory accesses remain outside this bounded static model.
 The decoder supports the encoded RVV 1.0 forms listed here without claiming a
 complete RVV implementation; implementation-specific VLEN/ELEN and execution
 semantics remain outside this bounded static representation.
+
+## Base vector floating-point elementwise slice
+
+The RVV decoder recognizes base `vfadd`, `vfsub`, `vfmul`, and `vfdiv` in
+`.vv`/`.vf`; `vfsgnj`, `vfsgnjn`, `vfsgnjx`, `vfmin`, and `vfmax` in those same
+forms; and mask-producing `vmfeq`, `vmfne`, `vmflt`, and `vmfle` in `.vv`/`.vf`
+plus `vmfgt.vf` and `vmfge.vf`. These encodings use the OPFVV/OPFVF operand
+classes and retain vector versus scalar FPR sources. SEW is runtime state, so
+the decoder does not claim a specific lane width. The base floating-point
+operations require an implementation setting with SEW 32 or 64; SEW 16 and
+other unsupported settings remain runtime constraints rather than being
+evaluated by this stateless decoder.
+
+The decompiler keeps the operations as named floating-vector or boolean-mask
+intrinsics. Every operation retains implicit `vl`, `vtype`, and `vstart` reads,
+the normal-completion `vstart` write, masked `v0`, and the old destination
+input needed for prestart, masked-off, and undisturbed tail lanes. Rounded
+add/subtract/multiply/divide additionally read `frm`; they and the comparison
+and min/max families read the old sticky `fflags` value and write its updated
+value. Sign-injection operations do not read `frm` or `fflags` and do not write
+`fflags`. An invalid `frm` value makes execution reserved even for operations
+that do not consult rounding state; this static decoder does not inspect the
+runtime CSR value. Equality and inequality comparisons may set NV for
+signaling NaNs, while ordered comparisons may set NV for quiet or signaling
+NaNs. Min/max may set NV for signaling NaNs. The intrinsic preserves the
+family and these state dependencies without calculating IEEE-754 results or
+per-lane exception values. A reserved `frm` remains outside this static check.
+
+Fused multiply-add, reductions, conversions, classification, reciprocal and
+square-root operations, widening floating-point arithmetic, half-precision
+vector operations, and all other vector floating-point encodings remain
+unsupported. A recognized FP funct6 with a reserved operand class is invalid;
+FP funct6 values outside this slice remain unsupported.
 
 The decoder and lane evaluator also support the non-widening integer
 multiply-accumulate/subtract forms `vmacc.vv/vx`, `vnmsac.vv/vx`,

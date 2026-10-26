@@ -76,7 +76,13 @@ enum class RiscvOpcode {
     // Zba address-generation operations; appended for stable decoded IDs.
     sh1add, sh2add, sh3add, add_uw, sh1add_uw, sh2add_uw, sh3add_uw, slli_uw,
     // RVV non-accumulating widening integer multiply; appended for ID stability.
-    vwmulu_vv, vwmulu_vx, vwmulsu_vv, vwmulsu_vx, vwmul_vv, vwmul_vx
+    vwmulu_vv, vwmulu_vx, vwmulsu_vv, vwmulsu_vx, vwmul_vv, vwmul_vx,
+    // RVV base floating-point VV/VF arithmetic, sign, min/max, and compare forms.
+    vfadd_vv, vfadd_vf, vfsub_vv, vfsub_vf, vfmul_vv, vfmul_vf, vfdiv_vv, vfdiv_vf,
+    vfsgnj_vv, vfsgnj_vf, vfsgnjn_vv, vfsgnjn_vf, vfsgnjx_vv, vfsgnjx_vf,
+    vfmin_vv, vfmin_vf, vfmax_vv, vfmax_vf,
+    vmfeq_vv, vmfeq_vf, vmfne_vv, vmfne_vf, vmflt_vv, vmflt_vf, vmfle_vv, vmfle_vf,
+    vmfgt_vf, vmfge_vf
 };
 
 struct RiscvRegister {
@@ -129,6 +135,8 @@ struct RiscvInstruction {
     std::optional<std::uint8_t> rounding_mode;
     bool writes_fflags = false;
     bool vector_masked = false;
+    bool reads_frm = false;
+    bool reads_fflags = false;
 };
 
 struct RiscvDecodeResult {

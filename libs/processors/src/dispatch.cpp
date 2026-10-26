@@ -125,6 +125,14 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
     else if (opcode_index >= 287 && opcode_index <= 292)
         opcode = std::array{Opcode::rv_vwmulu_vv, Opcode::rv_vwmulu_vx, Opcode::rv_vwmulsu_vv,
             Opcode::rv_vwmulsu_vx, Opcode::rv_vwmul_vv, Opcode::rv_vwmul_vx}[opcode_index - 287];
+    else if (opcode_index >= 293 && opcode_index <= 320)
+        opcode = std::array{Opcode::rv_vfadd_vv, Opcode::rv_vfadd_vf, Opcode::rv_vfsub_vv, Opcode::rv_vfsub_vf,
+            Opcode::rv_vfmul_vv, Opcode::rv_vfmul_vf, Opcode::rv_vfdiv_vv, Opcode::rv_vfdiv_vf,
+            Opcode::rv_vfsgnj_vv, Opcode::rv_vfsgnj_vf, Opcode::rv_vfsgnjn_vv, Opcode::rv_vfsgnjn_vf,
+            Opcode::rv_vfsgnjx_vv, Opcode::rv_vfsgnjx_vf, Opcode::rv_vfmin_vv, Opcode::rv_vfmin_vf,
+            Opcode::rv_vfmax_vv, Opcode::rv_vfmax_vf, Opcode::rv_vmfeq_vv, Opcode::rv_vmfeq_vf,
+            Opcode::rv_vmfne_vv, Opcode::rv_vmfne_vf, Opcode::rv_vmflt_vv, Opcode::rv_vmflt_vf,
+            Opcode::rv_vmfle_vv, Opcode::rv_vmfle_vf, Opcode::rv_vmfgt_vf, Opcode::rv_vmfge_vf}[opcode_index - 293];
     else
         return {DecodeStatus::invalid, {}, "RV64 opcode has no generic representation"};
 
@@ -146,6 +154,8 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
     instruction.rounding_mode = source.rounding_mode;
     instruction.writes_fflags = source.writes_fflags;
     instruction.riscv_vector_masked = source.vector_masked;
+    instruction.reads_frm = source.reads_frm;
+    instruction.reads_fflags = source.reads_fflags;
     for (const auto &operand : source.operands) {
         instruction.operands.push_back(std::visit([register_width](const auto &part) -> Operand {
             using T = std::decay_t<decltype(part)>;
@@ -165,6 +175,12 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
         instruction.access.push_back(static_cast<OperandAccess>(access));
     for (auto reg : source.register_reads)
         instruction.register_reads.push_back({reg.vector_configuration ? RegisterBank::riscv_vcsr : reg.vector ? RegisterBank::riscv_vpr : reg.floating_point ? RegisterBank::riscv_fpr : RegisterBank::riscv_gpr, reg.index, static_cast<std::uint8_t>(reg.vector ? 0 : reg.floating_point ? 64 : register_width), false});
+    // riscv_fstatus index 1 is the three-bit frm alias in architectural FCSR;
+    // index 0 remains the five-bit fflags field written by FP operations.
+    if (source.reads_frm)
+        instruction.register_reads.push_back({RegisterBank::riscv_fstatus, 1, 3, false});
+    if (source.reads_fflags)
+        instruction.register_reads.push_back({RegisterBank::riscv_fstatus, 0, 5, false});
     for (auto reg : source.register_writes)
         instruction.register_writes.push_back({reg.vector_configuration ? RegisterBank::riscv_vcsr : reg.vector ? RegisterBank::riscv_vpr : reg.floating_point ? RegisterBank::riscv_fpr : RegisterBank::riscv_gpr, reg.index, static_cast<std::uint8_t>(reg.vector ? 0 : reg.floating_point ? 64 : register_width), false});
     if (source.writes_fflags)

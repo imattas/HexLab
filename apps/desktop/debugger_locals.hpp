@@ -70,6 +70,9 @@ std::vector<DebuggerStackFrame> debugger_stack_frames_at(
 // Projects contain link-time addresses while the debugger reports runtime
 // addresses. `module_base` is the runtime base of the module represented by
 // `image`; registers and memory are the selected stopped frame's live state.
+// Bound PDB lexical blocks additionally restrict visibility to their half-open
+// code extents. Unresolved block bindings retain an unresolved row without
+// evaluating registers or memory for that local.
 std::vector<DebuggerLocalRow> debugger_locals_at(
     const ProjectSnapshot &, const Image &, std::uint64_t runtime_pc,
     std::uint64_t module_base, Architecture,

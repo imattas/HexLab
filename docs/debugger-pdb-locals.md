@@ -1,10 +1,26 @@
 # Live PDB locals in the debugger
 
 For a PE image with a uniquely matched PDB, the debugger can display CodeView
-locals and parameters from the bound PDB metadata. A row is shown only when a
-CodeView defrange covers the selected frame's current PC and the PC is outside
-that range's gap list. The table reads the selected frame's live registers and
-uses the debugger memory reader for memory-backed locations.
+locals and parameters from the bound PDB metadata. A value is evaluated only
+when a CodeView defrange covers the selected frame's current PC and the PC is
+outside that range's gap list. Locals nested in `S_BLOCK32` additionally require
+the PC to lie in the nearest enclosing lexical block's half-open code range:
+the start is included and the end is excluded. A full-procedure defrange does
+not widen a nested local's lexical scope. Procedure-scope locals have no block
+restriction and retain their existing defrange visibility throughout the
+procedure. The table reads the selected frame's live registers and uses the
+debugger memory reader for memory-backed locations.
+
+Block extents bind through the identity-matched PDB's section ordinal and the
+loaded PE section declarations. The complete range must fit the section, image,
+address-space width, and one executable image segment, agree with the bound
+procedure, and lie entirely inside that procedure. Overlapping section or
+segment mappings, zero or invalid extents, and arithmetic overflow leave the
+scope unresolved. Within a known containing procedure, such a local retains a
+row with Location `unresolved`, its raw section/offset/size in Scope / origin,
+and no evaluated value. A valid block outside the selected PC is omitted before
+any register or memory evaluation. This filtering applies to the debugger locals
+table; function-wide pseudocode local-name and type inference remains separate.
 
 Currently evaluated locations are AMD64 and x86 register values,
 frame-pointer-relative memory (RBP/EBP), and register-relative memory using
@@ -29,8 +45,9 @@ as if it were a member.
 Register or memory values remain unavailable when their required register or
 type size is unknown, the register is absent, the type exceeds the 256-byte
 preview bound, an address calculation overflows, or memory cannot be read in
-full. PE section coordinates are validated against the image section extent
-before they are translated. Rows without a live range are omitted;
+full. Complete PE live-range extents are validated with the same section/image
+mapping checks before they are translated. Rows without a live range are
+omitted unless their lexical scope is unresolved;
 unsupported CodeView register identifiers are not guessed. PDB rows duplicate
 a DWARF row only when no same-name, same-kind DWARF row is already available.
 

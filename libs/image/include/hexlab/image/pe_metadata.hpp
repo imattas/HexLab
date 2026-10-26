@@ -609,6 +609,11 @@ struct PePdbLocal {
     std::string name, procedure_name, module_name, object_name;
     std::uint32_t type_index = 0;
     bool parameter = false;
+    // Nearest enclosing CodeView S_BLOCK32. These offsets are section-relative
+    // and remain unresolved until the section is bound to the loaded image.
+    bool has_lexical_scope = false;
+    std::uint16_t lexical_scope_section = 0;
+    std::uint32_t lexical_scope_offset = 0, lexical_scope_size = 0;
     // When set, this local belongs to a CodeView inlinee nested in the
     // enclosing procedure. The ID is an IPI index; the offset is module-local.
     std::optional<std::uint32_t> inlinee_id;

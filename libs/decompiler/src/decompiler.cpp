@@ -148,8 +148,8 @@ std::string riscv_fp_name(Opcode op) {
     return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_flw)];
 }
 
-struct RiscvVectorEffect { const char* name; bool mask_result; };
-std::optional<RiscvVectorEffect> riscv_integer_vector_effect(Opcode opcode) {
+struct RiscvVectorEffect { const char* name; bool mask_result; bool floating = false; };
+std::optional<RiscvVectorEffect> riscv_vector_effect(Opcode opcode) {
     // Explicit opcode cases keep routing independent of serialized enum ranges.
     switch (opcode) {
 #define RVV_PAIR(name, mask) \
@@ -216,6 +216,34 @@ std::optional<RiscvVectorEffect> riscv_integer_vector_effect(Opcode opcode) {
     RVV_TRIPLE(vmsle, true);
     RVV_SCALAR(vmsgtu, true);
     RVV_SCALAR(vmsgt, true);
+    case Opcode::rv_vfadd_vv: return RiscvVectorEffect{"vfadd.vv", false, true};
+    case Opcode::rv_vfadd_vf: return RiscvVectorEffect{"vfadd.vf", false, true};
+    case Opcode::rv_vfsub_vv: return RiscvVectorEffect{"vfsub.vv", false, true};
+    case Opcode::rv_vfsub_vf: return RiscvVectorEffect{"vfsub.vf", false, true};
+    case Opcode::rv_vfmul_vv: return RiscvVectorEffect{"vfmul.vv", false, true};
+    case Opcode::rv_vfmul_vf: return RiscvVectorEffect{"vfmul.vf", false, true};
+    case Opcode::rv_vfdiv_vv: return RiscvVectorEffect{"vfdiv.vv", false, true};
+    case Opcode::rv_vfdiv_vf: return RiscvVectorEffect{"vfdiv.vf", false, true};
+    case Opcode::rv_vfsgnj_vv: return RiscvVectorEffect{"vfsgnj.vv", false, true};
+    case Opcode::rv_vfsgnj_vf: return RiscvVectorEffect{"vfsgnj.vf", false, true};
+    case Opcode::rv_vfsgnjn_vv: return RiscvVectorEffect{"vfsgnjn.vv", false, true};
+    case Opcode::rv_vfsgnjn_vf: return RiscvVectorEffect{"vfsgnjn.vf", false, true};
+    case Opcode::rv_vfsgnjx_vv: return RiscvVectorEffect{"vfsgnjx.vv", false, true};
+    case Opcode::rv_vfsgnjx_vf: return RiscvVectorEffect{"vfsgnjx.vf", false, true};
+    case Opcode::rv_vfmin_vv: return RiscvVectorEffect{"vfmin.vv", false, true};
+    case Opcode::rv_vfmin_vf: return RiscvVectorEffect{"vfmin.vf", false, true};
+    case Opcode::rv_vfmax_vv: return RiscvVectorEffect{"vfmax.vv", false, true};
+    case Opcode::rv_vfmax_vf: return RiscvVectorEffect{"vfmax.vf", false, true};
+    case Opcode::rv_vmfeq_vv: return RiscvVectorEffect{"vmfeq.vv", true, true};
+    case Opcode::rv_vmfeq_vf: return RiscvVectorEffect{"vmfeq.vf", true, true};
+    case Opcode::rv_vmfne_vv: return RiscvVectorEffect{"vmfne.vv", true, true};
+    case Opcode::rv_vmfne_vf: return RiscvVectorEffect{"vmfne.vf", true, true};
+    case Opcode::rv_vmflt_vv: return RiscvVectorEffect{"vmflt.vv", true, true};
+    case Opcode::rv_vmflt_vf: return RiscvVectorEffect{"vmflt.vf", true, true};
+    case Opcode::rv_vmfle_vv: return RiscvVectorEffect{"vmfle.vv", true, true};
+    case Opcode::rv_vmfle_vf: return RiscvVectorEffect{"vmfle.vf", true, true};
+    case Opcode::rv_vmfgt_vf: return RiscvVectorEffect{"vmfgt.vf", true, true};
+    case Opcode::rv_vmfge_vf: return RiscvVectorEffect{"vmfge.vf", true, true};
 #undef RVV_SCALAR
 #undef RVV_TRIPLE
 #undef RVV_PAIR
@@ -371,7 +399,7 @@ std::string register_name(RegisterOperand reg) {
     if (reg.bank == RegisterBank::mips_fcsr)
         return "fcsr";
     if (reg.bank == RegisterBank::riscv_fstatus)
-        return "fflags";
+        return reg.index == 1 ? "frm" : "fflags";
     if (reg.bank == RegisterBank::mips_hilo)
         return reg.index == 0 ? "HI" : reg.index == 1 ? "LO" : "HILO" + std::to_string(reg.index);
     if (reg.bank == RegisterBank::segment)
@@ -2377,8 +2405,8 @@ a64_unhandled:
             effect.register_writes = instruction.register_writes;
             return effect;
         }
-        if (const auto operation = riscv_integer_vector_effect(op)) {
-            const auto vector_result = vector_type(0);
+        if (const auto operation = riscv_vector_effect(op)) {
+            const auto vector_result = vector_type(0, operation->floating ? TypeKind::floating : TypeKind::unknown);
             const auto mask_result = vector_type(0, TypeKind::boolean, 1);
             std::vector<ExpressionPtr> inputs;
             for (std::size_t n = 1; n < operands.size(); ++n) inputs.push_back(operands[n]);
@@ -2391,7 +2419,7 @@ a64_unhandled:
             }
             std::vector<RegisterOperand> configurations;
             for (const auto& reg : instruction.register_reads) {
-                if (reg.bank != RegisterBank::riscv_vcsr ||
+                if ((reg.bank != RegisterBank::riscv_vcsr && reg.bank != RegisterBank::riscv_fstatus) ||
                     std::find(configurations.begin(), configurations.end(), reg) != configurations.end()) continue;
                 configurations.push_back(reg);
                 inputs.push_back(reg_expr(reg));

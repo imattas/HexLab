@@ -90,6 +90,10 @@ Result<std::size_t> attach_pdb_locals(LoadedImage &image, const types::PdbDataba
         row.name = local.name; row.procedure_name = local.procedure_name;
         row.module_name = local.module_name; row.object_name = local.object_name;
         row.type_index = local.type_index; row.parameter = local.parameter;
+        row.has_lexical_scope = local.has_lexical_scope;
+        row.lexical_scope_section = local.lexical_scope_section;
+        row.lexical_scope_offset = local.lexical_scope_offset;
+        row.lexical_scope_size = local.lexical_scope_size;
         row.inlinee_id = local.inlinee_id;
         row.inline_site_record_offset = local.inline_site_record_offset;
         row.location_kind = static_cast<PePdbLocalLocationKind>(local.location_kind);

@@ -207,6 +207,45 @@ bool decode_vector_shift_minmax(std::uint32_t w, RiscvInstruction &i) {
     return true;
 }
 
+bool decode_vector_floating(std::uint32_t w, RiscvInstruction &i) {
+    const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
+    const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
+    const unsigned funct3 = (w >> 12) & 7, vd = (w >> 7) & 31;
+    if (funct3 != 1 && funct3 != 5) return false; // OPFVV and OPFVF only.
+    const bool scalar = funct3 == 5;
+    RiscvOpcode op;
+    bool uses_rounding = false, flags = false;
+    switch (funct6) {
+    case 0x00: op = scalar ? RiscvOpcode::vfadd_vf : RiscvOpcode::vfadd_vv; uses_rounding = flags = true; break;
+    case 0x02: op = scalar ? RiscvOpcode::vfsub_vf : RiscvOpcode::vfsub_vv; uses_rounding = flags = true; break;
+    case 0x20: op = scalar ? RiscvOpcode::vfdiv_vf : RiscvOpcode::vfdiv_vv; uses_rounding = flags = true; break;
+    case 0x24: op = scalar ? RiscvOpcode::vfmul_vf : RiscvOpcode::vfmul_vv; uses_rounding = flags = true; break;
+    case 0x08: op = scalar ? RiscvOpcode::vfsgnj_vf : RiscvOpcode::vfsgnj_vv; break;
+    case 0x09: op = scalar ? RiscvOpcode::vfsgnjn_vf : RiscvOpcode::vfsgnjn_vv; break;
+    case 0x0a: op = scalar ? RiscvOpcode::vfsgnjx_vf : RiscvOpcode::vfsgnjx_vv; break;
+    case 0x04: op = scalar ? RiscvOpcode::vfmin_vf : RiscvOpcode::vfmin_vv; flags = true; break;
+    case 0x06: op = scalar ? RiscvOpcode::vfmax_vf : RiscvOpcode::vfmax_vv; flags = true; break;
+    case 0x18: op = scalar ? RiscvOpcode::vmfeq_vf : RiscvOpcode::vmfeq_vv; flags = true; break;
+    case 0x1c: op = scalar ? RiscvOpcode::vmfne_vf : RiscvOpcode::vmfne_vv; flags = true; break;
+    case 0x1b: op = scalar ? RiscvOpcode::vmflt_vf : RiscvOpcode::vmflt_vv; flags = true; break;
+    case 0x19: op = scalar ? RiscvOpcode::vmfle_vf : RiscvOpcode::vmfle_vv; flags = true; break;
+    case 0x1d: if (!scalar) return false; op = RiscvOpcode::vmfgt_vf; flags = true; break;
+    case 0x1f: if (!scalar) return false; op = RiscvOpcode::vmfge_vf; flags = true; break;
+    default: return false;
+    }
+    i.opcode = op;
+    i.writes_fflags = flags;
+    i.reads_frm = uses_rounding;
+    i.reads_fflags = flags;
+    operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
+    read_vector_destination(i, vd);
+    operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
+    operand(i, RiscvRegister{static_cast<std::uint8_t>(vs1), scalar, !scalar}, RiscvOperandAccess::read);
+    if (!vm) i.register_reads.push_back(RiscvRegister{0, false, true});
+    i.vector_masked = !vm;
+    return true;
+}
+
 bool decode_vector_multiply(std::uint32_t w, RiscvInstruction &i) {
     const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
     const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
@@ -916,7 +955,7 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
             unsupported = "reserved or unimplemented vector-configuration encoding";
             return false;
         }
-        if (decode_vector_integer(w, i) || decode_vector_compare(w, i) || decode_vector_widening_add_sub(w, i) || decode_vector_widening_multiply(w, i) || decode_vector_multiply_add(w, i) ||
+        if (decode_vector_integer(w, i) || decode_vector_compare(w, i) || decode_vector_floating(w, i) || decode_vector_widening_add_sub(w, i) || decode_vector_widening_multiply(w, i) || decode_vector_multiply_add(w, i) ||
             decode_vector_shift_minmax(w, i) ||
             decode_vector_multiply(w, i) || decode_vector_divide(w, i) || decode_vector_permutation(w, i)) {
             read_vector_configuration(i);
@@ -931,9 +970,13 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
                                      (funct6 >= 0x3c && funct6 <= 0x3f) ||
                                      funct6 == 0x0c || funct6 == 0x0e || funct6 == 0x0f ||
                                      (funct6 >= 0x18 && funct6 <= 0x1f) || (funct6 >= 0x20 && funct6 <= 0x23);
-            if (implemented && (funct3 == 0 || funct3 == 3 || funct3 == 4))
-                return false; // A reserved form of an explicitly implemented integer operation.
-            unsupported = "RVV operand class or operation is outside the enabled integer subset";
+            const bool floating_implemented = funct6 == 0 || funct6 == 2 || funct6 == 4 || funct6 == 6 ||
+                funct6 == 8 || funct6 == 9 || funct6 == 10 || funct6 == 0x18 || funct6 == 0x19 ||
+                funct6 == 0x1b || funct6 == 0x1c || funct6 == 0x1d || funct6 == 0x1f ||
+                funct6 == 0x20 || funct6 == 0x24;
+            if ((implemented && (funct3 == 0 || funct3 == 3 || funct3 == 4)) || floating_implemented)
+                return false; // Reserved operand class of an explicitly implemented integer/FP operation.
+            unsupported = "RVV operand class or operation is outside the enabled vector subset";
             return false;
         }
     case 0x0b: case 0x2b: case 0x5b: case 0x7b:
