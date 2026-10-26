@@ -85,7 +85,8 @@ struct Definition {
 std::size_t aarch64_width(std::uint32_t type) {
     if (type == 0) return 0;
     if (type == 257 || type == 260) return 8;
-    require(type == 258 || type == 261 || type == 275 || type == 277 || type == 282 || type == 283 || type == 286,
+    require(type == 258 || type == 261 || type == 275 || type == 277 || type == 279 || type == 280 ||
+                type == 282 || type == 283 || type == 286,
             "Unsupported AArch64 ELF relocation type " + std::to_string(type), ErrorCode::unsupported);
     return 4;
 }
@@ -115,6 +116,28 @@ std::uint64_t aarch64_relocation(std::uint32_t type, std::uint64_t target, std::
         require(value >= -(INT64_C(1) << 27) && value < (INT64_C(1) << 27),
                 "AArch64 branch relocation overflows (veneers are unsupported)", ErrorCode::unsupported);
         return (instruction & 0xfc000000U) | ((static_cast<std::uint64_t>(value) >> 2) & 0x03ffffffU);
+    }
+    if (type == 279 || type == 280) {
+        const auto value = pc_value(target, addend, place);
+        require((value & 3) == 0, "AArch64 conditional branch target is not instruction aligned", ErrorCode::unsupported);
+        if (type == 279) {
+            require((instruction & 0x7e000000U) == 0x36000000U,
+                    "AArch64 TSTBR14 relocation requires TBZ/TBNZ instruction", ErrorCode::malformed);
+            require(value >= -(INT64_C(1) << 15) && value < (INT64_C(1) << 15),
+                    "AArch64 TSTBR14 relocation overflows", ErrorCode::unsupported);
+            const auto immediate = static_cast<std::uint64_t>(value) >> 2;
+            return (instruction & ~UINT32_C(0x0007ffe0)) |
+                   (static_cast<std::uint32_t>(immediate & 0x3fffU) << 5);
+        }
+        const bool is_bcond = (instruction & 0xff000010U) == 0x54000000U;
+        const bool is_cbz = (instruction & 0x7e000000U) == 0x34000000U;
+        require(is_bcond || is_cbz,
+                "AArch64 CONDBR19 relocation requires B.cond, CBZ, or CBNZ instruction", ErrorCode::malformed);
+        require(value >= -(INT64_C(1) << 20) && value < (INT64_C(1) << 20),
+                "AArch64 CONDBR19 relocation overflows", ErrorCode::unsupported);
+        const auto immediate = static_cast<std::uint64_t>(value) >> 2;
+        return (instruction & ~UINT32_C(0x00ffffe0)) |
+               (static_cast<std::uint32_t>(immediate & 0x7ffffU) << 5);
     }
     if (type == 275) {
         require((instruction & 0x9f000000U) == 0x90000000U,

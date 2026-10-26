@@ -21,6 +21,8 @@ struct PointerOrigin { PointerRoot root; std::int64_t offset = 0; bool operator=
 using PointerValueKey = std::pair<Key, std::uint32_t>;
 using PointerOrigins = std::map<PointerValueKey, PointerOrigin>;
 using IntegerConstants = std::map<PointerValueKey, std::uint64_t>;
+using FlatAddressRootKey = std::pair<unsigned, unsigned>;
+using FlatAddressRoots = std::map<FlatAddressRootKey, PointerRoot>;
 using DynamicMemoryRange = std::tuple<PointerRoot, std::int64_t, std::int64_t>;
 using DynamicMemoryPartitions = std::map<DynamicMemoryRange, std::string>;
 
@@ -103,6 +105,25 @@ std::optional<std::uint64_t> integer_constant(const ExpressionPtr &expression,
         return *left * *right;
     };
     return evaluate(evaluate, expression, 0);
+}
+
+std::optional<std::int64_t> flat_address_constant(PointerValueKey value,
+                                                  const IntegerConstants &constants) {
+    const auto bank = std::get<0>(value.first);
+    const auto width = std::get<2>(value.first);
+    // These register banks have flat, unsegmented address calculations in the
+    // supported profiles. The generic x86 GPR bank is intentionally excluded:
+    // a segment override can make equal offsets refer to different addresses.
+    if (bank != static_cast<unsigned>(RegisterBank::arm32_gpr) &&
+        bank != static_cast<unsigned>(RegisterBank::arm64_gpr) &&
+        bank != static_cast<unsigned>(RegisterBank::riscv_gpr) &&
+        bank != static_cast<unsigned>(RegisterBank::mips_gpr) &&
+        bank != static_cast<unsigned>(RegisterBank::ppc_gpr)) return {};
+    if (width != 32 && width != 64) return {};
+    const auto found = constants.find(value);
+    if (found == constants.end() || found->second > static_cast<std::uint64_t>(
+            std::numeric_limits<std::int64_t>::max())) return {};
+    return static_cast<std::int64_t>(found->second);
 }
 
 std::optional<DynamicMemoryRange> dynamic_memory_range(const MemoryValue &memory, const PointerOrigins &origins,
@@ -990,19 +1011,37 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
         }
 
         // Track pointer identity through SSA copies, constant add/sub (including
-        // offsets in constant-proven SSA registers), and unanimous phis. Every
-        // other value gets an opaque root; distinct roots remain may-alias, so
-        // this never licenses cross-root disjointness.
+        // offsets in constant-proven SSA registers), and unanimous phis. Flat
+        // architecture registers with proven numeric addresses share one root
+        // per bank and width. Every other value gets an opaque root; distinct
+        // roots remain may-alias, so this never licenses cross-root disjointness.
         PointerOrigins pointer_origins;
+        FlatAddressRoots flat_address_roots;
+        for (const auto &[value, constant] : integer_constants) {
+            (void)constant;
+            if (!flat_address_constant(value, integer_constants)) continue;
+            flat_address_roots.try_emplace(
+                FlatAddressRootKey{std::get<0>(value.first), std::get<2>(value.first)},
+                PointerRoot{value.first, value.second});
+        }
+        const auto initial_pointer_origin = [&](PointerValueKey value) {
+            const auto constant = flat_address_constant(value, integer_constants);
+            if (constant) {
+                const auto root = flat_address_roots.find(
+                    FlatAddressRootKey{std::get<0>(value.first), std::get<2>(value.first)});
+                if (root != flat_address_roots.end()) return PointerOrigin{root->second, *constant};
+            }
+            return PointerOrigin{PointerRoot{value.first, value.second}, 0};
+        };
         for (const auto &variable : variables)
-            pointer_origins.emplace(PointerValueKey{variable, 0}, PointerOrigin{{variable, 0}, 0});
+            pointer_origins.emplace(PointerValueKey{variable, 0}, initial_pointer_origin({variable, 0}));
         for (auto block_index : reachable) for (const auto &phi : partitioned.blocks[block_index].phis)
             pointer_origins.emplace(PointerValueKey{key(phi.destination), phi.version},
-                                    PointerOrigin{{key(phi.destination), phi.version}, 0});
+                                    initial_pointer_origin({key(phi.destination), phi.version}));
         for (auto block_index : reachable) for (const auto &instruction : partitioned.blocks[block_index].instructions)
             if (const auto *assign = std::get_if<Assign>(&instruction.statement); assign && assign->destination_version)
                 pointer_origins.emplace(PointerValueKey{key(assign->destination), *assign->destination_version},
-                                        PointerOrigin{{key(assign->destination), *assign->destination_version}, 0});
+                    initial_pointer_origin({key(assign->destination), *assign->destination_version}));
         // Call results and ABI-clobbered registers have opaque values, but they
         // are still stable roots when copied or adjusted later. Giving each
         // definition its own root enables bounded accesses through that value;
@@ -1012,13 +1051,13 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
             if (const auto *call = std::get_if<Call>(&instruction.statement)) {
                 if (call->return_register && call->return_version)
                     pointer_origins.emplace(PointerValueKey{key(*call->return_register), *call->return_version},
-                        PointerOrigin{{key(*call->return_register), *call->return_version}, 0});
+                        initial_pointer_origin({key(*call->return_register), *call->return_version}));
                 const auto count = std::min(call->register_writes.size(), call->register_output_versions.size());
                 for (std::size_t i = 0; i < count; ++i) {
                     const auto reg = call->register_writes[i];
                     const auto version = call->register_output_versions[i];
                     pointer_origins.emplace(PointerValueKey{key(reg), version},
-                        PointerOrigin{{key(reg), version}, 0});
+                        initial_pointer_origin({key(reg), version}));
                 }
             }
         bool provenance_changed = true;
@@ -1121,6 +1160,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
         }
 
         AbsoluteMemoryPartitions absolute_partitions;
+        std::map<std::string, AbsoluteMemoryRange> absolute_partition_ranges;
         if (!absolute_range_overflow && !absolute_ranges.empty()) {
             auto range = absolute_ranges.begin();
             while (range != absolute_ranges.end()) {
@@ -1136,6 +1176,8 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                 const auto partition = std::string("\x1fglobal:") + std::to_string(space) + ":" +
                                        std::to_string(component_begin) + ":" + std::to_string(component_end);
                 partitions.insert(partition);
+                absolute_partition_ranges.emplace(
+                    partition, AbsoluteMemoryRange{space, component_begin, component_end});
                 for (auto member = range; member != next; ++member)
                     absolute_partitions.emplace(*member, partition);
                 range = next;
@@ -1288,6 +1330,26 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                             effects.push_back({partition, input_version, partition_stacks[partition].back()});
                         }
                     };
+                    const auto invalidate_for_absolute_store = [&](const AbsoluteMemoryRange &written,
+                                                                     std::vector<MemoryPartitionEffect> &effects) {
+                        effects.clear();
+                        const auto written_space = std::get<0>(written);
+                        const auto written_begin = std::get<1>(written);
+                        const auto written_end = std::get<2>(written);
+                        for (const auto &partition : partitions) {
+                            bool proven_disjoint = false;
+                            if (const auto known = absolute_partition_ranges.find(partition);
+                                known != absolute_partition_ranges.end()) {
+                                const auto &range = known->second;
+                                proven_disjoint = std::get<0>(range) != written_space ||
+                                    std::get<2>(range) <= written_begin || written_end <= std::get<1>(range);
+                            }
+                            if (proven_disjoint) continue;
+                            const auto input_version = partition_stacks[partition].back();
+                            if (!advance(partition)) continue;
+                            effects.push_back({partition, input_version, partition_stacks[partition].back()});
+                        }
+                    };
                     for (auto &phi : block.memory_partition_phis) {
                         if (!advance(phi.partition)) return;
                         phi.version = partition_stacks[phi.partition].back();
@@ -1314,6 +1376,11 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                                     const auto dynamic_target = dynamic_store_ranges.find({block_index, instruction_index});
                                     if (dynamic_target != dynamic_store_ranges.end())
                                         invalidate_for_dynamic_store(dynamic_target->second, statement.memory_partition_effects);
+                                    else if (const auto absolute_target = global_store_ranges.find(
+                                                 {block_index, instruction_index});
+                                             absolute_target != global_store_ranges.end())
+                                        invalidate_for_absolute_store(absolute_target->second,
+                                                                      statement.memory_partition_effects);
                                     else {
                                         statement.memory_partition_effects.clear();
                                         const auto input_version = partition_stacks[target->second].back();

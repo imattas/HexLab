@@ -30,7 +30,6 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
     FlowKind flow = FlowKind::fallthrough;
     std::optional<Address> target;
     std::optional<DexSwitchTable> dex_switch;
-    std::vector<unsigned> dex_register_reads;
     std::optional<std::uint16_t> dex_type_index;
     const auto ensure = [&](unsigned count) {
         std::uint16_t ignored = 0;
@@ -72,9 +71,10 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         text = "const/4 " + vr(hi & 15) + ", " + std::to_string(value >> 4);
     } else if (op == 0x13 || op == 0x15 || op == 0x16 || op == 0x19) {
         words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX 21s constant");
-        const auto value = op == 0x15
+        const std::int64_t value = op == 0x15
             ? std::bit_cast<std::int32_t>(std::uint32_t(word(1)) << 16)
-            : static_cast<std::int32_t>(std::bit_cast<std::int16_t>(word(1)));
+            : op == 0x19 ? std::bit_cast<std::int64_t>(std::uint64_t(word(1)) << 48)
+            : static_cast<std::int64_t>(std::bit_cast<std::int16_t>(word(1)));
         text = std::string(op == 0x13 ? "const/16 " : op == 0x15 ? "const/high16 " : op == 0x16 ? "const-wide/16 " : "const-wide/high16 ") + vr(hi) + ", " + std::to_string(value);
     } else if (op == 0x14 || op == 0x17) {
         words = 3; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX 31i constant");
@@ -108,7 +108,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
             if (instance)
                 text = std::string(names[op - 0x52]) + " " + vr(reg_a) + ", " + vr(reg_b) + ", field@" + std::to_string(word(1));
             else
-                text = std::string(names[op - 0x60]) + " " + vr(hi) + ", field@" + std::to_string(word(1));
+                text = std::string(names[op - 0x52]) + " " + vr(hi) + ", field@" + std::to_string(word(1));
         }
     } else if (op == 0x21) {
         text = "array-length " + vr(hi & 15) + ", " + vr(hi >> 4);
@@ -128,7 +128,6 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         for (unsigned i = 0; i < count; ++i) {
             if (i) text += ", ";
             text += vr(regs[i]);
-            dex_register_reads.push_back(regs[i]);
         }
         dex_type_index = word(1);
         text += "}, type@" + std::to_string(*dex_type_index);
@@ -145,7 +144,6 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         if (count) text += vr(start) + " .. " + vr(start + count - 1);
         dex_type_index = word(1);
         text += "}, type@" + std::to_string(*dex_type_index);
-        for (unsigned i = 0; i < count; ++i) dex_register_reads.push_back(start + i);
     } else if (op >= 0x44 && op <= 0x51) {
         words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX array access");
         static constexpr std::array<std::string_view, 14> names{
@@ -281,22 +279,132 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         instruction.memory_read = instruction.memory_write = true;
     instruction.mnemonic_override = std::move(text); instruction.flow = flow; instruction.direct_target = target;
     instruction.dex_switch = std::move(dex_switch);
+    // Keep operand order identical to the Dalvik syntax. Wide operands are
+    // 64-bit values, but effects name both constituent 32-bit slots so accesses
+    // through the high half alias ordinary single-slot operations.
+    bool unrepresentable_register = false;
+    const auto reg = [&](unsigned index, OperandAccess access, unsigned width = 32) {
+        if (index > UINT8_MAX || (width == 64 && index == UINT8_MAX)) {
+            unrepresentable_register = true;
+            return;
+        }
+        instruction.operands.emplace_back(RegisterOperand{RegisterBank::dex_vreg,
+            static_cast<std::uint8_t>(index), static_cast<std::uint16_t>(width), false});
+        instruction.access.push_back(access);
+        for (unsigned slot = 0; slot < width / 32; ++slot) {
+            const RegisterOperand effect{RegisterBank::dex_vreg,
+                static_cast<std::uint8_t>(index + slot), 32, false};
+            const auto add = [&](auto &effects) {
+                if (std::find(effects.begin(), effects.end(), effect) == effects.end()) effects.push_back(effect);
+            };
+            if (access == OperandAccess::read || access == OperandAccess::read_write) add(instruction.register_reads);
+            if (access == OperandAccess::write || access == OperandAccess::read_write) add(instruction.register_writes);
+        }
+    };
+    const auto imm = [&](std::uint64_t value, unsigned encoded, unsigned effective, bool sign = false) {
+        instruction.operands.emplace_back(ImmediateOperand{value, static_cast<std::uint16_t>(encoded),
+            static_cast<std::uint16_t>(effective), sign, {}});
+        instruction.access.push_back(OperandAccess::read);
+    };
+    constexpr auto read = OperandAccess::read, write = OperandAccess::write, rw = OperandAccess::read_write;
+    const unsigned a = hi & 15, b = hi >> 4;
+    if (op >= 0x01 && op <= 0x09) {
+        const unsigned form = (op - 1) % 3, width = op >= 0x04 && op <= 0x06 ? 64 : 32;
+        reg(form == 0 ? a : form == 1 ? hi : word(1), write, width);
+        reg(form == 0 ? b : form == 1 ? word(1) : word(2), read, width);
+    } else if (op >= 0x0a && op <= 0x0d) reg(hi, write, op == 0x0b ? 64 : 32);
+    else if (op >= 0x0f && op <= 0x11) reg(hi, read, op == 0x10 ? 64 : 32);
+    else if (op >= 0x12 && op <= 0x19) {
+        const unsigned width = op >= 0x16 ? 64 : 32;
+        reg(op == 0x12 ? a : hi, write, width);
+        if (op == 0x12) imm(static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int8_t>(hi) >> 4)), 4, 32, true);
+        else if (op == 0x15) imm(std::uint32_t(word(1)) << 16, 16, 32);
+        else if (op == 0x19) imm(std::uint64_t(word(1)) << 48, 16, 64);
+        else if (op == 0x13 || op == 0x16)
+            imm(static_cast<std::uint64_t>(static_cast<std::int64_t>(std::bit_cast<std::int16_t>(word(1)))), 16, width, true);
+        else if (op == 0x14) imm(le32(word(1), word(2)), 32, 32);
+        else if (op == 0x17)
+            imm(static_cast<std::uint64_t>(static_cast<std::int64_t>(std::bit_cast<std::int32_t>(le32(word(1), word(2))))), 32, width, true);
+        else imm(std::uint64_t(word(1)) | (std::uint64_t(word(2)) << 16) |
+                 (std::uint64_t(word(3)) << 32) | (std::uint64_t(word(4)) << 48), 64, 64);
+    } else if (op == 0x1a || op == 0x1b || op == 0x1c || op == 0x1f || op == 0x22) {
+        // check-cast refines a reference's verifier type without defining a vreg.
+        reg(hi, op == 0x1f ? read : write);
+        imm(op == 0x1b ? le32(word(1), word(2)) : word(1), op == 0x1b ? 32 : 16, op == 0x1b ? 32 : 16);
+    } else if (op == 0x1d || op == 0x1e || op == 0x27 || op == 0x2b || op == 0x2c) reg(hi, read);
+    else if (op == 0x20 || op == 0x21 || op == 0x23) {
+        reg(a, write); reg(b, read);
+        if (op != 0x21) imm(word(1), 16, 16);
+    } else if (op == 0x24 || op == 0x25 || (op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78)) {
+        const bool range = op == 0x25 || op >= 0x74;
+        const unsigned count = range ? hi : b;
+        if (count > 15)
+            return fail(DecodeStatus::unsupported, "DEX register list exceeds the typed instruction operand budget");
+        if (range) {
+            const unsigned start = word(2);
+            if (count && start > UINT16_MAX - (count - 1))
+                return fail(DecodeStatus::invalid, "DEX register range overflows 16-bit register indexes");
+            for (unsigned i = 0; i < count; ++i) reg(start + i, read);
+        } else {
+            const auto list = word(2);
+            const std::array<unsigned, 5> regs{unsigned(list & 15), unsigned((list >> 4) & 15),
+                unsigned((list >> 8) & 15), unsigned((list >> 12) & 15), a};
+            for (unsigned i = 0; i < count; ++i) reg(regs[i], read);
+        }
+        // Invoke lists encode argument words, including both words of wide
+        // arguments. Prototype/type resolution belongs to method analysis.
+        imm(word(1), 16, 16);
+    } else if (op >= 0x2d && op <= 0x31) {
+        reg(hi, write);
+        reg(word(1) & 255, read, op >= 0x2f ? 64 : 32);
+        reg(word(1) >> 8, read, op >= 0x2f ? 64 : 32);
+    } else if (op >= 0x32 && op <= 0x37) { reg(a, read); reg(b, read); }
+    else if (op >= 0x38 && op <= 0x3d) reg(hi, read);
+    else if (op >= 0x44 && op <= 0x51) {
+        reg(hi, op <= 0x4a ? write : read, op == 0x45 || op == 0x4c ? 64 : 32);
+        reg(word(1) & 255, read); reg(word(1) >> 8, read);
+    } else if (op >= 0x52 && op <= 0x6d) {
+        const bool instance = op < 0x60;
+        const bool get = op <= 0x58 || (op >= 0x60 && op <= 0x66);
+        const bool wide = op == 0x53 || op == 0x5a || op == 0x61 || op == 0x68;
+        reg(instance ? a : hi, get ? write : read, wide ? 64 : 32);
+        if (instance) reg(b, read);
+        imm(word(1), 16, 16);
+    } else if (op >= 0x7b && op <= 0x8f) {
+        const bool wide_dest = op == 0x7d || op == 0x7e || op == 0x80 || op == 0x81 ||
+            op == 0x83 || op == 0x86 || op == 0x88 || op == 0x89 || op == 0x8b;
+        const bool wide_source = op == 0x7d || op == 0x7e || op == 0x80 ||
+            (op >= 0x84 && op <= 0x86) || (op >= 0x8a && op <= 0x8c);
+        reg(a, write, wide_dest ? 64 : 32); reg(b, read, wide_source ? 64 : 32);
+    } else if (op >= 0x90 && op <= 0xcf) {
+        const bool two_address = op >= 0xb0;
+        const unsigned operation = two_address ? op - 0x20 : op;
+        const bool wide = (operation >= 0x9b && operation <= 0xa5) || operation >= 0xab;
+        const bool shift = operation >= 0xa3 && operation <= 0xa5;
+        reg(two_address ? a : hi, two_address ? rw : write, wide ? 64 : 32);
+        if (!two_address) reg(word(1) & 255, read, wide ? 64 : 32);
+        reg(two_address ? b : word(1) >> 8, read, wide && !shift ? 64 : 32);
+    } else if (op >= 0xd0 && op <= 0xe2) {
+        reg(op <= 0xd7 ? a : hi, write); reg(op <= 0xd7 ? b : word(1) & 255, read);
+        const std::int64_t value = op <= 0xd7 ? std::bit_cast<std::int16_t>(word(1)) :
+            std::bit_cast<std::int8_t>(static_cast<std::uint8_t>(word(1) >> 8));
+        imm(static_cast<std::uint64_t>(value), op <= 0xd7 ? 16 : 8, 32, true);
+    }
+    if (unrepresentable_register)
+        return fail(DecodeStatus::unsupported, "DEX register indexes above 255 exceed the typed operand model (including wide pairs)");
     if (instruction.dex_switch) {
-        instruction.operands.emplace_back(RegisterOperand{RegisterBank::dex_vreg, hi, 32, false});
-        instruction.access.push_back(OperandAccess::read);
-        instruction.register_reads.push_back({RegisterBank::dex_vreg, hi, 32, false});
-    }
-    for (const auto index : dex_register_reads) {
-        const RegisterOperand reg{RegisterBank::dex_vreg, static_cast<std::uint8_t>(index), 32, false};
-        instruction.operands.emplace_back(reg);
-        instruction.access.push_back(OperandAccess::read);
-        instruction.register_reads.push_back(reg);
-    }
-    if (dex_type_index) {
-        instruction.operands.emplace_back(ImmediateOperand{*dex_type_index, 16, 16, false, {}});
+        instruction.operands.emplace_back(RelativeOperand{static_cast<std::int64_t>(instruction.dex_switch->payload.offset) -
+            static_cast<std::int64_t>(at.offset), 32, 32, {}});
         instruction.access.push_back(OperandAccess::read);
     }
-    if (target) instruction.operands.emplace_back(RelativeOperand{static_cast<std::int64_t>(target->offset) - static_cast<std::int64_t>(at.offset),16,32,{}});
+    if ((op >= 0x28 && op <= 0x2a) || (op >= 0x32 && op <= 0x3d)) {
+        const std::int64_t units = op == 0x28 ? std::bit_cast<std::int8_t>(hi) :
+            op == 0x2a ? std::bit_cast<std::int32_t>(le32(word(1), word(2))) :
+            std::bit_cast<std::int16_t>(word(1));
+        instruction.operands.emplace_back(RelativeOperand{units * 2,
+            static_cast<std::uint16_t>(op == 0x28 ? 8 : op == 0x2a ? 32 : 16), 32, {}});
+        instruction.access.push_back(OperandAccess::read);
+    }
     return {DecodeStatus::decoded, std::move(instruction), {}};
 }
 } // namespace hexlab

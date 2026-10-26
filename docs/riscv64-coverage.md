@@ -63,8 +63,14 @@ square root, sign injection, min/max, the four fused multiply-add forms,
 FEQ/FLT/FLE/FCLASS, integer and S/D conversions, and raw integer/FP moves.
 It validates static rounding modes and retains the selected mode, including
 dynamic `dyn`. FPR operands use a distinct physical 64-bit bank; S operations
-carry 32-bit values. `fflags` writes are represented as a separate five-bit
-status register effect. RV64F NaN-boxing is not modeled. The decoder does not
+carry 32-bit values. Rounding-sensitive dynamic conversions read the three-bit
+`frm` alias; exact FCVT.D.W/WU and non-rounding FCVT.D.S do not. Possible
+`fflags` writes read the accrued prior flags and remain a separate five-bit
+status register effect. FCVT.D.W/WU are exact and leave flags untouched.
+FCVT and FCLASS lifting preserves integer signedness, low-word truncation,
+RV64 W/WU result sign extension, rounding inputs only where the ISA uses them, and separate
+conservative exception formulas; see `riscv-decompiler.md` for encodings.
+RV64F NaN-boxing is not modeled. The decoder does not
 evaluate IEEE-754 results, select runtime `frm`, or compute precise exception
 flags. Q-format operations, compressed floating forms, and RV32-only absent
 forms remain unsupported or invalid according to their encoding.

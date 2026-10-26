@@ -1,2 +1,2 @@
-hexlab_add_library(decompiler SOURCES src/decompiler.cpp src/dex_lifting.cpp src/wasm_lifting.cpp src/jvm_lifting.cpp src/mips64_lifting.cpp src/ppc_lifting.cpp src/cil_lifting.cpp src/ssa.cpp src/call_effects.cpp src/optimizer.cpp src/identity_simplifier.cpp src/dead_code.cpp src/type_recovery.cpp src/virtual_calls.cpp
+hexlab_add_library(decompiler SOURCES src/decompiler.cpp src/dex_lifting.cpp src/wasm_lifting.cpp src/jvm_lifting.cpp src/mips64_lifting.cpp src/ppc_lifting.cpp src/riscv_fp_lifting.cpp src/cil_lifting.cpp src/ssa.cpp src/call_effects.cpp src/optimizer.cpp src/identity_simplifier.cpp src/dead_code.cpp src/type_recovery.cpp src/virtual_calls.cpp
   DEPENDS hexlab::analysis hexlab::processors hexlab::core hexlab::types hexlab::loaders)

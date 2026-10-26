@@ -215,6 +215,7 @@ struct RegisterReferenceFacts {
 };
 struct RelocationCoverage;
 std::optional<Address> static_m6502_indirect_target(const Image &, const RelocationCoverage &, Address);
+std::optional<Address> dex_invoke_code_target(const Instruction &, const Image &, const ImageMetadata &);
 RegisterReferenceFacts m6502_reference_facts(const Image *image, const RelocationCoverage &relocations,
                                               const FunctionSnapshot &functions, std::stop_token stop) {
     RegisterReferenceFacts result;
@@ -421,6 +422,29 @@ std::optional<Address> static_m6502_indirect_target(const Image &image, const Re
     if (!segment || !segment->executable || target.offset < segment->begin.offset ||
         target.offset - segment->begin.offset >= segment->size)
         return {};
+    return target;
+}
+std::optional<Address> dex_invoke_code_target(const Instruction &instruction, const Image &image,
+                                              const ImageMetadata &metadata) {
+    if (instruction.context.architecture != Architecture::dex || instruction.flow != FlowKind::call ||
+        !metadata.dex) return {};
+    const auto bytes = instruction.encoded_bytes();
+    if (bytes.size() < 4) return {};
+    const auto opcode = std::to_integer<std::uint8_t>(bytes[0]);
+    // The referenced method ID is an exact callee only for direct/static
+    // invokes. Virtual/interface/super invokes require dispatch evidence.
+    if (opcode != 0x70 && opcode != 0x71 && opcode != 0x76 && opcode != 0x77) return {};
+    const auto method_index = static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(bytes[2])) |
+                              (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(bytes[3])) << 8);
+    const auto &code = metadata.dex->code;
+    const auto method = std::lower_bound(code.begin(), code.end(), method_index,
+        [](const DexMethodCode &candidate, std::uint32_t index) { return candidate.method_index < index; });
+    if (method == code.end() || method->method_index != method_index || method_index == UINT32_MAX) return {};
+    const Address target{AddressSpaceId{method_index + 1}, 0};
+    const auto *segment = image.segment_at(target);
+    const auto context = image.context_at(target);
+    if (!segment || !segment->executable || !context || context.value().architecture != Architecture::dex ||
+        context.value().mode != ExecutionMode::dex) return {};
     return target;
 }
 bool mapped_data_range(const Image &image, Address target, OperandAccess access, std::uint64_t size) {
@@ -3921,9 +3945,30 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
             const auto kind = instruction.flow == FlowKind::call   ? ReferenceKind::call
                               : instruction.flow == FlowKind::jump ? ReferenceKind::jump
                                                                    : ReferenceKind::conditional_jump;
-            const auto control_index = instruction.opcode == Opcode::rv_jalr && instruction.operands.size() > 1
-                                           ? 1u
-                                           : analysis_detail::control_operand_index(instruction);
+            auto control_index = instruction.opcode == Opcode::rv_jalr && instruction.operands.size() > 1
+                                     ? 1u
+                                     : analysis_detail::control_operand_index(instruction);
+            if (instruction.context.architecture == Architecture::dex) {
+                if (instruction.flow == FlowKind::call) {
+                    for (std::size_t i = 0; i < instruction.operands.size(); ++i)
+                        if (const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[i]);
+                            immediate && immediate->encoded_width == 16 && immediate->effective_width == 16 &&
+                            !immediate->is_signed)
+                            control_index = static_cast<std::uint32_t>(i);
+                } else {
+                    const auto relative = std::find_if(instruction.operands.begin(), instruction.operands.end(),
+                        [](const auto &operand) { return std::holds_alternative<RelativeOperand>(operand); });
+                    if (relative == instruction.operands.end()) {
+                        // Incomplete/unsupported branch facts must not turn a
+                        // source vreg into an indirect control expression.
+                        append({{0}, instruction.address, {},
+                                UnresolvedTarget{UnresolvedReason::missing_operand, std::monostate{}},
+                                kind, OperandAccess::address, decoded, {}});
+                        continue;
+                    }
+                    control_index = static_cast<std::uint32_t>(relative - instruction.operands.begin());
+                }
+            }
             Reference reference{{0},  instruction.address,    {},      Location{Address{{0}, 0}},
                                 kind, OperandAccess::address, decoded, {}};
             if (!instruction.operands.empty())
@@ -3945,6 +3990,9 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                            ? resolution.address
                            : std::nullopt)
                     : instruction.direct_target;
+            if (!target && image && instruction.context.architecture == Architecture::dex &&
+                instruction.flow == FlowKind::call)
+                target = dex_invoke_code_target(instruction, *image, metadata);
             if (!target && !resolution.constant && !resolution.relocated()) {
                 bool dataflow_target = false;
                 const auto computed = x86_facts.immediate_targets.find(

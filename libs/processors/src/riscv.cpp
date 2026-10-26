@@ -709,9 +709,15 @@ bool decode_fp_op(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
     if (fmt == 2) return false; // Q is recognized but outside this F/D slice.
     if (fmt == 3) return false;
     const bool d = fmt == 1;
-    auto set = [&](RiscvOpcode op, bool flags, bool rm) {
-        i.opcode = op; i.writes_fflags = flags;
-        if (rm) { if (f3 == 5 || f3 == 6) return false; i.rounding_mode = static_cast<std::uint8_t>(f3); }
+    auto set = [&](RiscvOpcode op, bool flags, bool rm, bool uses_rounding = true) {
+        if (rm && (f3 == 5 || f3 == 6)) return false;
+        i.opcode = op;
+        i.writes_fflags = flags;
+        // Exception flags accrue by OR into FCSR, rather than replacing the
+        // previous flags. Only dynamic rounding observes the frm field.
+        i.reads_fflags = flags;
+        i.reads_frm = rm && uses_rounding && f3 == 7;
+        if (rm) i.rounding_mode = static_cast<std::uint8_t>(f3);
         return true;
     };
     auto fp_rd = [&] { operand(i, RiscvRegister{static_cast<std::uint8_t>(rd), true}, RiscvOperandAccess::write); };
@@ -743,9 +749,15 @@ bool decode_fp_op(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
     else if ((operation==0x60 || operation==0x68) && rs2<=3 && (rs2<2 || xlen==64)) {
         const bool to_int=operation==0x60; static constexpr RiscvOpcode tos[2][4]{{RiscvOpcode::fcvt_w_s,RiscvOpcode::fcvt_wu_s,RiscvOpcode::fcvt_l_s,RiscvOpcode::fcvt_lu_s},{RiscvOpcode::fcvt_w_d,RiscvOpcode::fcvt_wu_d,RiscvOpcode::fcvt_l_d,RiscvOpcode::fcvt_lu_d}};
         static constexpr RiscvOpcode froms[2][4]{{RiscvOpcode::fcvt_s_w,RiscvOpcode::fcvt_s_wu,RiscvOpcode::fcvt_s_l,RiscvOpcode::fcvt_s_lu},{RiscvOpcode::fcvt_d_w,RiscvOpcode::fcvt_d_wu,RiscvOpcode::fcvt_d_l,RiscvOpcode::fcvt_d_lu}};
-        ok=set(to_int?tos[d][rs2]:froms[d][rs2],true,true); dst_fp=!to_int; src1_fp=to_int; unary=true;
+        // Every 32-bit integer is represented exactly by binary64. These two
+        // forms cannot raise exceptions, although rm is decoded as usual.
+        const bool exact = !to_int && d && rs2 < 2;
+        ok=set(to_int?tos[d][rs2]:froms[d][rs2],!exact,true,!exact); dst_fp=!to_int; src1_fp=to_int; unary=true;
     }
-    else if (operation==0x20 && rs2==((f7 & 1) ? 0u : 1u)) { ok=set((f7 & 1) ? RiscvOpcode::fcvt_d_s : RiscvOpcode::fcvt_s_d,true,true); }
+    else if (operation==0x20 && rs2==((f7 & 1) ? 0u : 1u)) {
+        const bool to_double = (f7 & 1) != 0;
+        ok=set(to_double ? RiscvOpcode::fcvt_d_s : RiscvOpcode::fcvt_s_d, true, true, !to_double);
+    }
     if (!ok) return false;
     if (dst_fp) fp_rd(); else gpr_rd();
     if (src1_fp) fp_rs1(); else gpr_rs1();
