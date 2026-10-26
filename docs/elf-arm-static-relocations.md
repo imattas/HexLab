@@ -12,6 +12,9 @@ is locally resolvable.
 | `R_ARM_REL32` | 3 | 4 bytes | `((S + A) | T) - P` | Existing support. |
 | `R_ARM_ABS16` | 5 | 2 bytes | `S + A` | Overflow range permits signed or unsigned values. |
 | `R_ARM_ABS8` | 8 | 1 byte | `S + A` | Overflow range permits signed or unsigned values. |
+| `R_ARM_PREL31` | 42 | low 31 bits of a 4-byte word | `((S + A) | T) - P` | REL addend is sign-extended from bits 30:0; bit 31 is preserved by runtime application; the result must fit signed 31 bits. |
+| `R_ARM_ABS32_NOI` | 55 | 4 bytes | `S + A` | Does not apply the Thumb function-state bit. |
+| `R_ARM_REL32_NOI` | 56 | 4 bytes | `S + A - P` | Does not apply the Thumb function-state bit. |
 
 The type numbers, expressions, field widths, and overflow ranges follow
 [AAELF32, relocation codes and static data
@@ -22,7 +25,9 @@ not denote a representable address. In that case the resolver reports
 `overflow` instead of inventing a pointer.
 
 Instruction-field relocations, grouped MOVW/MOVT or Thumb pairs, branch
-relocations, `PREL31`, and platform-specific `TARGET1`/`TARGET2` are not part
-of this subset. Their field extraction, place bias, state bit handling, or
+relocations, and platform-specific `TARGET1`/`TARGET2` are not part of this
+subset. Their field extraction, place bias, state bit handling, or
 instruction-pair semantics require additional shape checks; they remain
-unsupported and preserved as raw relocation records.
+unsupported and preserved as raw relocation records. `PREL31` is a data-field
+relocation: its top bit is unrelated metadata and is not part of its signed
+relocation expression.

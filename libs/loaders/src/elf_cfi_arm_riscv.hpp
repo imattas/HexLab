@@ -1,6 +1,7 @@
 #pragma once
 
 #include <bit>
+#include <memory>
 #include <new>
 #include <span>
 #include <vector>
@@ -53,15 +54,29 @@ struct ElfCfiCursor {
         }
         throw ElfCfiFailure{{ErrorCode::malformed, "ELF CFI SLEB exceeds ten bytes"}};
     }
+    std::shared_ptr<const std::vector<std::byte>> block() {
+        const auto length = uleb();
+        elf_cfi_require(length <= 64 * 1024, ErrorCode::resource_limit,
+                        "ELF CFI expression exceeds 64 KiB");
+        elf_cfi_require(length <= bytes.size() - at, ErrorCode::malformed,
+                        "Truncated ELF CFI expression block");
+        auto result = std::make_shared<std::vector<std::byte>>(
+            bytes.begin() + static_cast<std::ptrdiff_t>(at),
+            bytes.begin() + static_cast<std::ptrdiff_t>(at + static_cast<std::size_t>(length)));
+        at += static_cast<std::size_t>(length);
+        return result;
+    }
 };
 struct ElfCfiRule {
-    enum class Kind { offset, value_offset, same, undefined, reg } kind = Kind::same;
+    enum class Kind { offset, value_offset, same, undefined, reg, expression, value_expression } kind = Kind::same;
     std::int64_t offset = 0;
     std::uint64_t source = 0;
+    std::shared_ptr<const std::vector<std::byte>> expression;
 };
 struct ElfCfiState {
     std::optional<std::uint64_t> cfa_register;
     std::int64_t cfa_offset = 0;
+    std::shared_ptr<const std::vector<std::byte>> cfa_expression;
     std::map<std::uint64_t, ElfCfiRule> rules;
 };
 
@@ -82,6 +97,174 @@ std::uint64_t elf_cfi_add(std::uint64_t base, std::int64_t delta, std::uint64_t 
     const auto magnitude = std::uint64_t(-(delta + 1)) + 1;
     elf_cfi_require(magnitude <= base, ErrorCode::overflow, "ELF CFI address underflows");
     return base - magnitude;
+}
+
+std::uint64_t evaluate_elf_cfi_expression(std::span<const std::byte> expression, ByteOrder order,
+    std::uint8_t width, std::uint64_t limit, const ElfUnwindContext &registers,
+    const ElfUnwindMemoryReader &read, std::optional<std::uint64_t> cfa,
+    bool seed_cfa, bool riscv, std::size_t &operations) {
+    elf_cfi_require(!expression.empty(), ErrorCode::malformed, "ELF CFI expression is empty");
+    elf_cfi_require(width == 4 || width == 8, ErrorCode::unsupported,
+                    "ELF CFI expression address width is unsupported");
+    ElfCfiCursor cursor{expression, order};
+    std::vector<std::uint64_t> stack;
+    stack.reserve(16);
+    if (seed_cfa) {
+        elf_cfi_require(cfa.has_value(), ErrorCode::unsupported,
+                        "ELF CFI register expression requires a computed CFA");
+        stack.push_back(*cfa);
+    }
+    const auto push = [&](std::uint64_t value) {
+        elf_cfi_require(stack.size() < 64, ErrorCode::resource_limit,
+                        "ELF CFI expression stack exceeds 64 entries");
+        elf_cfi_require(value <= limit, ErrorCode::overflow,
+                        "ELF CFI expression value exceeds target width");
+        stack.push_back(value);
+    };
+    const auto push_signed = [&](std::int64_t value) {
+        if (width == 4)
+            elf_cfi_require(value >= INT32_MIN && value <= INT32_MAX, ErrorCode::overflow,
+                            "ELF CFI signed expression constant exceeds target width");
+        push(static_cast<std::uint64_t>(value) & limit);
+    };
+    const auto pop = [&]() {
+        elf_cfi_require(!stack.empty(), ErrorCode::malformed,
+                        "ELF CFI expression stack underflows");
+        const auto value = stack.back();
+        stack.pop_back();
+        return value;
+    };
+    const auto register_value = [&](std::uint64_t number) {
+        elf_cfi_require(number <= (riscv ? 31u : 15u), ErrorCode::unsupported,
+                        "ELF CFI expression register is outside the integer context");
+        if (riscv && number == 0) {
+            const auto found = registers.find(0);
+            elf_cfi_require(found == registers.end() || found->second == 0, ErrorCode::malformed,
+                            "ELF CFI expression context has nonzero RISC-V x0");
+            return std::uint64_t{0};
+        }
+        const auto found = registers.find(number);
+        elf_cfi_require(found != registers.end(), ErrorCode::out_of_bounds,
+                        "ELF CFI expression references an unavailable register");
+        elf_cfi_require(found->second <= limit, ErrorCode::overflow,
+                        "ELF CFI expression register exceeds target width");
+        return found->second;
+    };
+    while (cursor.at < expression.size()) {
+        elf_cfi_require(++operations <= 65536, ErrorCode::resource_limit,
+                        "ELF CFI exceeds the 65536 operation limit");
+        const auto op = static_cast<unsigned>(cursor.fixed(1));
+        if (op >= 0x30 && op <= 0x4f) {
+            push(op - 0x30);
+            continue;
+        }
+        if (op >= 0x70 && op <= 0x8f) { // DW_OP_breg0..31
+            const auto base = register_value(op - 0x70);
+            push((base + static_cast<std::uint64_t>(cursor.sleb())) & limit);
+            continue;
+        }
+        switch (op) {
+        case 0x03: // DW_OP_addr
+            push(cursor.fixed(width));
+            break;
+        case 0x06: { // DW_OP_deref
+            const auto address = pop();
+            elf_cfi_require(width - 1u <= limit - address, ErrorCode::overflow,
+                            "ELF CFI expression dereference crosses target width");
+            elf_cfi_require(static_cast<bool>(read), ErrorCode::invalid_argument,
+                            "ELF CFI expression requires a memory reader");
+            const auto value = read(address, width);
+            elf_cfi_require(value.has_value(), ErrorCode::out_of_bounds,
+                            "ELF CFI expression dereference is unavailable");
+            elf_cfi_require(*value <= limit, ErrorCode::overflow,
+                            "ELF CFI expression dereference exceeds target width");
+            push(*value);
+            break;
+        }
+        case 0x08: push(cursor.fixed(1)); break; // DW_OP_const1u
+        case 0x09: push_signed(std::bit_cast<std::int8_t>(
+                            static_cast<std::uint8_t>(cursor.fixed(1)))); break; // DW_OP_const1s
+        case 0x0a: push(cursor.fixed(2)); break; // DW_OP_const2u
+        case 0x0b: push_signed(std::bit_cast<std::int16_t>(
+                            static_cast<std::uint16_t>(cursor.fixed(2)))); break; // DW_OP_const2s
+        case 0x0c: push(cursor.fixed(4)); break; // DW_OP_const4u
+        case 0x0d: push_signed(std::bit_cast<std::int32_t>(
+                            static_cast<std::uint32_t>(cursor.fixed(4)))); break; // DW_OP_const4s
+        case 0x0e: push(cursor.fixed(8)); break; // DW_OP_const8u
+        case 0x0f: push_signed(std::bit_cast<std::int64_t>(cursor.fixed(8))); break; // DW_OP_const8s
+        case 0x10: push(cursor.uleb()); break; // DW_OP_constu
+        case 0x11: push_signed(cursor.sleb()); break; // DW_OP_consts
+        case 0x12: // DW_OP_dup
+            elf_cfi_require(!stack.empty(), ErrorCode::malformed, "DW_OP_dup requires one stack item");
+            push(stack.back());
+            break;
+        case 0x13: (void)pop(); break; // DW_OP_drop
+        case 0x14: // DW_OP_over
+            elf_cfi_require(stack.size() >= 2, ErrorCode::malformed, "DW_OP_over requires two stack items");
+            push(stack[stack.size() - 2]);
+            break;
+        case 0x15: { // DW_OP_pick
+            const auto depth = cursor.fixed(1);
+            elf_cfi_require(depth < stack.size(), ErrorCode::malformed,
+                            "DW_OP_pick index is outside the expression stack");
+            push(stack[stack.size() - 1 - static_cast<std::size_t>(depth)]);
+            break;
+        }
+        case 0x16: // DW_OP_swap
+            elf_cfi_require(stack.size() >= 2, ErrorCode::malformed, "DW_OP_swap requires two stack items");
+            std::swap(stack[stack.size() - 1], stack[stack.size() - 2]);
+            break;
+        case 0x17: { // DW_OP_rot
+            elf_cfi_require(stack.size() >= 3, ErrorCode::malformed, "DW_OP_rot requires three stack items");
+            const auto first = stack[stack.size() - 3];
+            stack[stack.size() - 3] = stack[stack.size() - 2];
+            stack[stack.size() - 2] = stack.back();
+            stack.back() = first;
+            break;
+        }
+        case 0x1c: { // DW_OP_minus
+            const auto right = pop(), left = pop();
+            push((left - right) & limit);
+            break;
+        }
+        case 0x1f: push((std::uint64_t{0} - pop()) & limit); break; // DW_OP_neg
+        case 0x20: push(~pop() & limit); break; // DW_OP_not
+        case 0x22: { // DW_OP_plus
+            const auto right = pop(), left = pop();
+            push((left + right) & limit);
+            break;
+        }
+        case 0x23: { // DW_OP_plus_uconst
+            const auto addend = cursor.uleb(), value = pop();
+            elf_cfi_require(addend <= limit, ErrorCode::overflow,
+                            "DW_OP_plus_uconst constant exceeds target width");
+            push((value + addend) & limit);
+            break;
+        }
+        case 0x90: { // DW_OP_regx is a register location; do not guess a value
+            elf_cfi_require(false, ErrorCode::unsupported,
+                            "ELF CFI expression register-location operators are unsupported");
+            break;
+        }
+        case 0x92: { // DW_OP_bregx
+            const auto number = cursor.uleb();
+            const auto base = register_value(number);
+            push((base + static_cast<std::uint64_t>(cursor.sleb())) & limit);
+            break;
+        }
+        case 0x96: break; // DW_OP_nop
+        case 0x9c: // DW_OP_call_frame_cfa is excluded by the CFI-expression subset.
+            elf_cfi_require(false, ErrorCode::unsupported,
+                            "DW_OP_call_frame_cfa is unsupported in ELF CFI expressions");
+            break;
+        default:
+            throw ElfCfiFailure{{ErrorCode::unsupported,
+                "ELF CFI expression opcode is outside the bounded integer subset"}};
+        }
+    }
+    elf_cfi_require(!stack.empty(), ErrorCode::malformed,
+                    "ELF CFI expression produces no result");
+    return stack.back();
 }
 
 void run_elf_integer_cfi(std::span<const std::byte> program, ByteOrder order, bool arm,
@@ -150,6 +333,12 @@ void run_elf_integer_cfi(std::span<const std::byte> program, ByteOrder order, bo
         case 12: case 18:
             state.cfa_register = register_number();
             state.cfa_offset = op == 12 ? unsigned_factor() : elf_cfi_scale(cursor.sleb(), data_alignment);
+            state.cfa_expression.reset();
+            break;
+        case 15: // DW_CFA_def_cfa_expression
+            state.cfa_register.reset();
+            state.cfa_offset = 0;
+            state.cfa_expression = cursor.block();
             break;
         case 13:
             elf_cfi_require(state.cfa_register.has_value(), ErrorCode::malformed, "ELF CFI def_cfa_register has no CFA rule");
@@ -164,6 +353,13 @@ void run_elf_integer_cfi(std::span<const std::byte> program, ByteOrder order, bo
             const auto factor = op == 20 ? unsigned_factor() : cursor.sleb();
             state.rules[number] = {op == 17 ? ElfCfiRule::Kind::offset : ElfCfiRule::Kind::value_offset,
                 elf_cfi_scale(factor, data_alignment), 0};
+            break;
+        }
+        case 16: case 22: { // DW_CFA_expression / DW_CFA_val_expression
+            const auto number = register_number();
+            auto expression = cursor.block();
+            state.rules[number] = {op == 16 ? ElfCfiRule::Kind::expression : ElfCfiRule::Kind::value_expression,
+                0, 0, std::move(expression)};
             break;
         }
         default:
@@ -204,11 +400,18 @@ Result<ElfUnwindResult> evaluate_elf_integer_unwind(const ElfMetadata &metadata,
         initial = state;
         run_elf_integer_cfi(fde.instructions, metadata.header.order, arm, fde.code_alignment,
             fde.data_alignment, pc.offset - fde.begin.offset, limit, state, initial, operations);
-        elf_cfi_require(state.cfa_register.has_value(), ErrorCode::unsupported, "ELF CFI does not define an integer CFA rule");
-        const auto base = live(*state.cfa_register);
-        elf_cfi_require(base.has_value(), ErrorCode::out_of_bounds, "ELF CFI CFA register is unavailable");
         ElfUnwindResult result;
-        result.cfa = elf_cfi_add(*base, state.cfa_offset, limit);
+        if (state.cfa_expression) {
+            result.cfa = evaluate_elf_cfi_expression(*state.cfa_expression, metadata.header.order, width,
+                limit, context, read, {}, false, !arm, operations);
+        } else {
+            elf_cfi_require(state.cfa_register.has_value(), ErrorCode::unsupported,
+                            "ELF CFI does not define an integer CFA rule");
+            const auto base = live(*state.cfa_register);
+            elf_cfi_require(base.has_value(), ErrorCode::out_of_bounds,
+                            "ELF CFI CFA register is unavailable");
+            result.cfa = elf_cfi_add(*base, state.cfa_offset, limit);
+        }
         result.function = fde.begin;
         result.record_file_offset = fde.file_offset;
         result.source_kind = fde.source_kind;
@@ -230,6 +433,28 @@ Result<ElfUnwindResult> evaluate_elf_integer_unwind(const ElfMetadata &metadata,
                 const auto value = live(rule.kind == ElfCfiRule::Kind::same ? number : rule.source);
                 elf_cfi_require(value.has_value(), ErrorCode::out_of_bounds, "ELF CFI register rule source is unavailable");
                 result.caller[number] = *value;
+                continue;
+            }
+            if (rule.kind == ElfCfiRule::Kind::expression ||
+                rule.kind == ElfCfiRule::Kind::value_expression) {
+                elf_cfi_require(rule.expression != nullptr, ErrorCode::malformed,
+                                "ELF CFI expression rule has no expression block");
+                const auto value = evaluate_elf_cfi_expression(*rule.expression, metadata.header.order, width,
+                    limit, context, read, result.cfa, true, !arm, operations);
+                if (rule.kind == ElfCfiRule::Kind::value_expression) {
+                    result.caller[number] = value;
+                } else {
+                    elf_cfi_require(width - 1u <= limit - value, ErrorCode::overflow,
+                                    "ELF CFI expression saved-register read exceeds target width");
+                    elf_cfi_require(static_cast<bool>(read), ErrorCode::invalid_argument,
+                                    "ELF CFI memory reader is empty");
+                    const auto saved = read(value, width);
+                    elf_cfi_require(saved.has_value(), ErrorCode::out_of_bounds,
+                                    "ELF CFI expression saved-register word is unavailable");
+                    elf_cfi_require(*saved <= limit, ErrorCode::overflow,
+                                    "ELF CFI expression saved register exceeds target width");
+                    result.caller[number] = *saved;
+                }
                 continue;
             }
             const auto value = elf_cfi_add(result.cfa, rule.offset, limit);

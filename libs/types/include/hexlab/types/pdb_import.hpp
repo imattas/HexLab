@@ -98,6 +98,10 @@ struct PdbImportedFunctionId {
     std::uint32_t parent_scope = 0;
     std::uint32_t class_type = 0;
     std::uint32_t function_type = 0;
+    std::uint32_t parent_string_id = 0, related_type = 0, source_file_id = 0;
+    std::uint32_t line_number = 0;
+    std::uint16_t module_index = 0;
+    std::vector<std::uint32_t> references;
     std::string name;
     std::uint32_t record_offset = 0, record_size = 0;
     TypePtr signature;
@@ -117,8 +121,8 @@ struct PdbFunctionIdImportResult {
 // skipped, including references into an unavailable external TPI namespace;
 // malformed or unresolved references within the source TPI fail the import.
 HEXLAB_TYPES_EXPORT Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph);
-// Joins IPI function IDs to exact TPI function records and signatures. Missing
-// or mismatched references are retained as unresolved records with diagnostics.
+// Imports recognized IPI string/build/source records and joins function IDs to
+// exact TPI function records. Missing or mismatched references remain visible.
 HEXLAB_TYPES_EXPORT Result<PdbFunctionIdImportResult> import_pdb_function_ids(
     const PdbIdStream &ids, const PdbTypeStream &types, const PdbTypeImportResult &imported);
 // Imports root and exact-identity type-server IPI streams. Type references use

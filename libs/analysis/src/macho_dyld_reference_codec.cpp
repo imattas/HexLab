@@ -298,8 +298,9 @@ void validate_pointer_bits(const MachODyldChainedOrigin &v) {
             require(p.high8 == ((raw >> 34) & 0xff) && !p.diversity && !p.address_diversity && !p.key,
                     "Owned unauthenticated shared-cache pointer differs from original word");
     } else {
-        require(format == 1 || format == 9 || format == 12, "Unknown owned chained pointer layout");
-        require(p.field_size == 8 && p.stride == 8 && p.bind == bool((raw >> 62) & 1) &&
+        require(format == 1 || format == 7 || format == 9 || format == 12,
+                "Unknown owned chained pointer layout");
+        require(p.field_size == 8 && p.stride == (format == 7 ? 4 : 8) && p.bind == bool((raw >> 62) & 1) &&
                     p.authenticated == bool(raw >> 63) && p.next == ((raw >> 51) & 0x7ff),
                 "Owned ARM64e flags differ from original word");
         if (p.authenticated)

@@ -85,6 +85,7 @@ std::pair<std::uint8_t, std::uint8_t> layout(std::uint16_t format) {
     case 3:
         return {std::uint8_t{4}, std::uint8_t{4}};
     case 1:
+    case 7: // DYLD_CHAINED_PTR_ARM64E_KERNEL: 8-byte word, 4-byte chain stride
     case 9:
     case 12:
     case 13: // DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE

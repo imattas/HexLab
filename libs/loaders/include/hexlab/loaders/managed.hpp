@@ -11,6 +11,7 @@
 #include <vector>
 namespace hexlab {
 struct LoadedImage;
+struct ManagedTypeSignature;
 struct ManagedStream { std::uint32_t offset=0, size=0; };
 struct ManagedTables { std::uint8_t major=0, minor=0, heap_sizes=0; std::uint64_t valid=0, sorted=0; std::size_t data_offset=0; std::map<std::uint8_t,std::uint32_t> row_counts; std::map<std::uint8_t,std::uint32_t> row_sizes; };
 struct ManagedMetadataRoot { std::string version; std::map<std::string,ManagedStream,std::less<>> streams; ManagedTables tables; };
@@ -21,6 +22,15 @@ struct ManagedGenericParameter {
   std::string name;
   // TypeDef, TypeRef, or TypeSpec metadata tokens from GenericParamConstraint.
   std::vector<std::uint32_t> constraint_tokens;
+  // Resolved identities in catalog contexts. The token list above remains the
+  // authoritative metadata provenance; unresolved external scopes stay marked.
+  struct ConstraintIdentity {
+    std::uint32_t token=0;
+    std::string name, scope;
+    bool external_unresolved=false;
+    std::shared_ptr<ManagedTypeSignature> signature;
+  };
+  std::vector<ConstraintIdentity> resolved_constraints;
 };
 // Lossless, bounded subset of the CLR signature type grammar. `element_type`
 // retains the raw ELEMENT_TYPE byte; VAR/MVAR use `generic_index`, token types
@@ -119,6 +129,9 @@ struct ManagedTypeCatalog {
   std::vector<ManagedTypeReference> references;
   std::vector<ManagedExportedType> exported_types;
   std::vector<ManagedTypeSpecification> specifications;
+  // MethodDef-owned generic parameters are retained here so their constraint
+  // identities can be refreshed when TypeRefs bind across catalogs.
+  std::vector<ManagedGenericParameter> method_generic_parameters;
 };
 // Returns true only when `candidate` is proven assignable to `target` through
 // the bounded in-module TypeDef base/interface graph. Unknown/external edges

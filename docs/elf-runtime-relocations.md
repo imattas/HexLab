@@ -20,6 +20,9 @@ ELF64 x86-64, AArch64, PPC64, and RISC-V `ET_DYN` records, with these types:
 | i386 | `R_386_JMP_SLOT` | 7 | `S` |
 | ARM | `R_ARM_ABS32` | 2 | `(S + A) | T` (low 32 bits) |
 | ARM | `R_ARM_REL32` | 3 | `((S + A) | T) - P` (low 32 bits) |
+| ARM | `R_ARM_PREL31` | 42 | `((S + A) | T) - P` (signed 31-bit result; preserve place bit 31) |
+| ARM | `R_ARM_ABS32_NOI` | 55 | `S + A` (low 32 bits, no Thumb bit) |
+| ARM | `R_ARM_REL32_NOI` | 56 | `S + A - P` (low 32 bits, no Thumb bit) |
 | ARM | `R_ARM_GLOB_DAT` | 21 | `(S + A) | T` (low 32 bits) |
 | ARM | `R_ARM_JUMP_SLOT` | 22 | `S` for REL; `S + A` for RELA |
 | ARM | `R_ARM_RELATIVE` | 23 | `B + A` |
@@ -63,11 +66,14 @@ addends are read as unsigned 32-bit pointer words; RELA records use their
 signed explicit addend before the 32-bit result check.
 
 The ARM profile is little-endian ELF32 `ET_DYN` and supports dynamic REL and
-RELA records for `R_ARM_ABS32`, `R_ARM_REL32`, `R_ARM_GLOB_DAT`,
-`R_ARM_JUMP_SLOT`, and `R_ARM_RELATIVE`. REL addends are sampled from the
-original four-byte target, except REL `JUMP_SLOT`, whose ABI addend is zero.
-For symbol relocations, `T` is the Thumb bit from the resolved symbol address;
-it is preserved after `S + A`. REL32 uses runtime place `P`. All ARM targets
+RELA records for `R_ARM_ABS32`, `R_ARM_REL32`, `R_ARM_PREL31`,
+`R_ARM_ABS32_NOI`, `R_ARM_REL32_NOI`, `R_ARM_GLOB_DAT`, `R_ARM_JUMP_SLOT`,
+and `R_ARM_RELATIVE`. REL addends are sampled from the original four-byte
+target, except REL `JUMP_SLOT`, whose ABI addend is zero. For ordinary ARM
+symbol relocations, `T` is the Thumb bit from the resolved symbol address;
+the NOI forms omit it. `REL32` and `PREL31` use runtime place `P`. PREL31
+sign-extends the implicit addend from bits 30:0, checks the final signed
+31-bit range, and preserves bit 31 in the destination word. All ARM targets
 must be complete four-byte fields in writable initialized load memory and
 four-byte aligned. ELF32 addresses and rebased extents must fit in 32 bits.
 Big-endian ARM, TLS, IFUNC, COPY, instruction relocations, and other ARM types

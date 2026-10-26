@@ -1,6 +1,7 @@
 #include "elf_internal.hpp"
 #include "hexlab/image/patches.hpp"
 #include <algorithm>
+#include <bit>
 #include <map>
 #include <set>
 #include <string_view>
@@ -475,6 +476,12 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                                         relocation.kind == ElfRelocationKind::absolute;
             const bool arm32_pc_relative = arm32 && relocation.type == 3 &&
                                            relocation.kind == ElfRelocationKind::pc_relative;
+            const bool arm32_prel31 = arm32 && relocation.type == 42 &&
+                                      relocation.kind == ElfRelocationKind::pc_relative;
+            const bool arm32_abs32_noi = arm32 && relocation.type == 55 &&
+                                         relocation.kind == ElfRelocationKind::absolute;
+            const bool arm32_rel32_noi = arm32 && relocation.type == 56 &&
+                                         relocation.kind == ElfRelocationKind::pc_relative;
             const bool arm32_glob_dat = arm32 && relocation.type == 21 &&
                                         relocation.kind == ElfRelocationKind::global_data;
             const bool arm32_jump_slot = arm32 && relocation.type == 22 &&
@@ -484,7 +491,8 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             const bool x64_32 = x64 && relocation.type == 10 && relocation.kind == ElfRelocationKind::absolute;
             const bool x64_32s = x64 && relocation.type == 11 && relocation.kind == ElfRelocationKind::absolute;
             if (!relative && !symbol_slot && !symbol_with_addend && !i386_absolute && !i386_pc_relative &&
-                !arm32_absolute && !arm32_pc_relative && !arm32_glob_dat && !arm32_jump_slot &&
+                !arm32_absolute && !arm32_pc_relative && !arm32_prel31 && !arm32_abs32_noi &&
+                !arm32_rel32_noi && !arm32_glob_dat && !arm32_jump_slot &&
                 !x64_64 && !x64_pc32 && !x64_32 && !x64_32s &&
                 !aarch64_abs64 && !aarch64_abs32 && !aarch64_abs16 &&
                 !aarch64_prel64 && !aarch64_prel32 && !aarch64_prel16 &&
@@ -492,7 +500,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 skip(index, i386
                     ? "Supported dynamic types are R_386_32, R_386_PC32, R_386_RELATIVE, R_386_GLOB_DAT, and R_386_JMP_SLOT"
                     : arm32
-                    ? "Supported dynamic types are R_ARM_ABS32, REL32, RELATIVE, GLOB_DAT, and JUMP_SLOT"
+                    ? "Supported dynamic types are R_ARM_ABS32/REL32/PREL31/ABS32_NOI/REL32_NOI, RELATIVE, GLOB_DAT, and JUMP_SLOT"
                     : riscv
                     ? (riscv64 ? "Supported dynamic types are R_RISCV_RELATIVE, R_RISCV_64, and R_RISCV_JUMP_SLOT"
                                : "Supported dynamic types are R_RISCV_RELATIVE, R_RISCV_32, and R_RISCV_JUMP_SLOT")
@@ -620,7 +628,8 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     // the specified low 32 bits, including negative addends.
                     value = static_cast<std::uint32_t>(
                         static_cast<std::uint32_t>(value) + addend - static_cast<std::uint32_t>(place));
-                } else if (arm32_absolute || arm32_pc_relative || arm32_glob_dat || arm32_jump_slot) {
+                } else if (arm32_absolute || arm32_pc_relative || arm32_prel31 || arm32_abs32_noi ||
+                           arm32_rel32_noi || arm32_glob_dat || arm32_jump_slot) {
                     // ARM ELF32 dynamic relocations write a 32-bit word. Preserve
                     // the Thumb function bit from S after arithmetic on S + A.
                     std::uint32_t addend = 0;
@@ -633,9 +642,10 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                         }
                         addend = static_cast<std::uint32_t>(*relocation.addend);
                     }
-                    const auto tagged_symbol = static_cast<std::uint32_t>(value) + addend |
-                                               static_cast<std::uint32_t>(arm_thumb_symbol);
-                    if (arm32_pc_relative) {
+                    const bool preserve_thumb = !arm32_abs32_noi && !arm32_rel32_noi;
+                    const auto tagged_symbol = (static_cast<std::uint32_t>(value) + addend) |
+                        static_cast<std::uint32_t>(preserve_thumb && arm_thumb_symbol);
+                    if (arm32_pc_relative || arm32_rel32_noi || arm32_prel31) {
                         if (!relocation.place) {
                             skip(index, "R_ARM_REL32 relocation place is unavailable");
                             continue;
@@ -647,10 +657,22 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                             continue;
                         }
                         if (place > UINT32_MAX) {
-                            skip(index, "R_ARM_REL32 runtime place exceeds the 32-bit address space");
+                            skip(index, "ARM PC-relative runtime place exceeds the 32-bit address space");
                             continue;
                         }
-                        value = static_cast<std::uint32_t>(tagged_symbol - static_cast<std::uint32_t>(place));
+                        const auto difference = static_cast<std::uint32_t>(
+                            tagged_symbol - static_cast<std::uint32_t>(place));
+                        if (arm32_prel31) {
+                            const auto signed_difference = std::bit_cast<std::int32_t>(difference);
+                            if (signed_difference < -(INT32_C(1) << 30) ||
+                                signed_difference > (INT32_C(1) << 30) - 1) {
+                                skip(index, "R_ARM_PREL31 result does not fit signed 31 bits");
+                                continue;
+                            }
+                            value = difference & UINT32_C(0x7fffffff);
+                        } else {
+                            value = difference;
+                        }
                     } else {
                         value = tagged_symbol;
                     }
@@ -795,6 +817,14 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 continue;
             }
             std::vector<std::byte> replacement(static_cast<std::size_t>(expected_width));
+            if (arm32_prel31) {
+                std::uint32_t old_word = 0;
+                for (std::size_t byte = 0; byte < 4; ++byte) {
+                    const auto shift = 8 * (metadata.header.order == ByteOrder::little ? byte : 3 - byte);
+                    old_word |= std::to_integer<std::uint32_t>(original.value().bytes[byte]) << shift;
+                }
+                value |= old_word & UINT32_C(0x80000000);
+            }
             for (std::size_t byte = 0; byte < replacement.size(); ++byte) {
                 const auto shift = 8 * (metadata.header.order == ByteOrder::little
                     ? byte : replacement.size() - byte - 1);

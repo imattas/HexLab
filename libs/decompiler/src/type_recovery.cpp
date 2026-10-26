@@ -344,9 +344,15 @@ struct PointerAlias {
     // address(destination) = address(source) + displacement
     std::int64_t displacement = 0;
 };
+struct PointerMemoryObservation {
+    Key base;
+    std::int64_t displacement = 0;
+    std::uint16_t bits = 0;
+};
 std::optional<std::pair<Key, std::int64_t>> canonical_stack_address(
     const Key &start, const std::vector<PointerAlias> &aliases);
 bool checked_add(std::int64_t left, std::int64_t right, std::int64_t &result);
+bool checked_subtract(std::int64_t left, std::int64_t right, std::int64_t &result);
 
 std::optional<std::int64_t> integer_constant(const ExpressionPtr &expression) {
     if (!expression) return {};
@@ -1384,6 +1390,7 @@ static Result<TypeRecoveryResult> recover_types_impl(
     std::set<Key> parameter_evidence;
     for (const auto &input : known_call_inputs) parameter_evidence.insert(key(input.reg, input.version));
     std::vector<PointerAlias> pointer_aliases;
+    std::vector<PointerMemoryObservation> pointer_memory_observations;
     auto ensure=[&](RegisterOperand r,std::optional<std::uint32_t> v={}) -> Fact& {
         Fact initial;
         initial.reg = r;
@@ -1441,10 +1448,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
                             base.indexed_element_ambiguous = true;
                         } else if (!base.indexed_element_ambiguous) base.indexed_element_bits = x.type.bits;
                     }
-                    if (!x.index && !x.absolute && x.displacement >= 0 && x.type.bits && x.type.bits % 8 == 0) {
-                        auto &field_bits = base.object_fields[static_cast<std::uint64_t>(x.displacement)];
-                        if (field_bits && field_bits != x.type.bits) base.object_layout_ambiguous = true;
-                        else field_bits = x.type.bits;
+                    if (!x.index && !x.absolute && x.type.bits && x.type.bits % 8 == 0) {
+                        pointer_memory_observations.push_back({key(*x.base, x.base_version), x.displacement, x.type.bits});
                     }
                 }
                 if(x.index) { parameter_evidence.insert(key(*x.index, x.index_version)); ensure(*x.index,x.index_version); }
@@ -1950,6 +1955,109 @@ static Result<TypeRecoveryResult> recover_types_impl(
             fact->second.sign_ambiguous = true;
         } else if (evidence == 1) {
             fact->second.sign = true;
+        }
+    }
+
+    // Normalize constant memory observations across the proven copy/constant
+    // offset graph. This recovers accesses such as `p = q + 8; load [p - 8]`
+    // on both pointer views, while rejecting inconsistent alias cycles and
+    // paths that would place a field outside the bounded object model.
+    struct PointerAddressEdge { Key target; std::int64_t displacement; bool subtract; };
+    std::map<Key, std::vector<PointerAddressEdge>> pointer_address_graph;
+    std::map<Key, std::map<std::uint64_t, std::uint16_t>> normalized_fields;
+    std::set<Key> normalized_ambiguous;
+    const auto stage_observation = [&](const Key &view, std::uint64_t offset, std::uint16_t bits) {
+        auto &width = normalized_fields[view][offset];
+        if (width && width != bits) normalized_ambiguous.insert(view);
+        else width = bits;
+    };
+    std::size_t pointer_observation_work = 0;
+    bool pointer_observation_work_exceeded = false;
+    for (const auto &alias : pointer_aliases) {
+        if (pointer_observation_work > aggregate_layout_work_limit - 2) {
+            pointer_observation_work_exceeded = true;
+            break;
+        }
+        pointer_observation_work += 2;
+        pointer_address_graph[alias.destination].push_back({alias.source, alias.displacement, false});
+        pointer_address_graph[alias.source].push_back({alias.destination, alias.displacement, true});
+    }
+    for (const auto &observation : pointer_memory_observations) {
+        if (pointer_observation_work_exceeded) break;
+        if (pointer_observation_work >= aggregate_layout_work_limit) {
+            pointer_observation_work_exceeded = true;
+            break;
+        }
+        ++pointer_observation_work;
+        if (observation.displacement >= 0 && observation.displacement <= (1 << 20) &&
+            facts.contains(observation.base) && facts.at(observation.base).pointer)
+            stage_observation(observation.base, static_cast<std::uint64_t>(observation.displacement), observation.bits);
+        struct AddressNode { Key value; std::int64_t displacement; };
+        std::vector<AddressNode> pending{{observation.base, 0}};
+        std::map<Key, std::int64_t> visited;
+        bool ambiguous_path = false;
+        for (std::size_t cursor = 0; cursor < pending.size() && !ambiguous_path; ++cursor) {
+            if (pointer_observation_work >= aggregate_layout_work_limit) {
+                pointer_observation_work_exceeded = true;
+                break;
+            }
+            ++pointer_observation_work;
+            const auto node = pending[cursor];
+            if (const auto prior = visited.find(node.value); prior != visited.end()) {
+                if (prior->second != node.displacement) ambiguous_path = true;
+                continue;
+            }
+            visited.emplace(node.value, node.displacement);
+            const auto adjacent = pointer_address_graph.find(node.value);
+            if (adjacent == pointer_address_graph.end()) continue;
+            for (const auto &edge : adjacent->second) {
+                if (pointer_observation_work >= aggregate_layout_work_limit) {
+                    pointer_observation_work_exceeded = true;
+                    break;
+                }
+                ++pointer_observation_work;
+                std::int64_t translated = 0;
+                const bool valid = edge.subtract
+                    ? checked_subtract(node.displacement, edge.displacement, translated)
+                    : checked_add(node.displacement, edge.displacement, translated);
+                if (!valid) { ambiguous_path = true; break; }
+                pending.push_back({edge.target, translated});
+            }
+            if (pointer_observation_work_exceeded) break;
+        }
+        if (pointer_observation_work_exceeded) break;
+        if (ambiguous_path) {
+            // Keep the exact local memory evidence, but taint that view so the
+            // ordinary alias fixed point cannot export it through a graph
+            // whose accumulated offsets disagree.
+            if (observation.displacement >= 0 && observation.displacement <= (1 << 20))
+                normalized_ambiguous.insert(observation.base);
+            continue;
+        }
+        for (const auto &[view, relative] : visited) {
+            std::int64_t field_offset = 0;
+            if (!checked_add(observation.displacement, relative, field_offset) || field_offset < 0 ||
+                field_offset > (1 << 20)) continue;
+            const auto fact = facts.find(view);
+            if (fact == facts.end() || !fact->second.pointer) continue;
+            stage_observation(view, static_cast<std::uint64_t>(field_offset), observation.bits);
+        }
+    }
+    if (!pointer_observation_work_exceeded) {
+        for (const auto &[view, fields] : normalized_fields) {
+            auto fact = facts.find(view);
+            if (fact == facts.end()) continue;
+            auto &destination = fact->second;
+            if (normalized_ambiguous.contains(view)) destination.object_layout_ambiguous = true;
+            if (destination.object_layout_ambiguous) continue;
+            for (const auto &[offset, bits] : fields) {
+                auto &width = destination.object_fields[offset];
+                if (width && width != bits) {
+                    destination.object_layout_ambiguous = true;
+                    break;
+                }
+                width = bits;
+            }
         }
     }
 
