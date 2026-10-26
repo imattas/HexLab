@@ -1983,6 +1983,63 @@ a64_unhandled:
                 const auto source = as_register(instruction.operands[0]);
                 return Store{fp_memory(operands[1], source ? source->width : 32), operands[0]};
             }
+            if ((op == Opcode::mips_mfc1 || op == Opcode::mips_cfc1 ||
+                 op == Opcode::mips_mtc1 || op == Opcode::mips_ctc1) && operands.size() == 2) {
+                const auto general = as_register(instruction.operands[0]);
+                const auto cop = as_register(instruction.operands[1]);
+                if (!general || !cop || general->width != 32 || cop->width != 32) return {};
+                const bool from_cop = op == Opcode::mips_mfc1 || op == Opcode::mips_cfc1;
+                const bool control = op == Opcode::mips_cfc1 || op == Opcode::mips_ctc1;
+                if (!control && cop->bank != RegisterBank::mips_fpr) return {};
+                if (control && cop->bank != RegisterBank::mips_fcsr) return {};
+                if (op == Opcode::mips_mfc1) {
+                    if (general->index == 0) return Intrinsic{"nop", {}, IntrinsicMemoryEffect::none};
+                    auto value = std::make_shared<Expression>(Expression{
+                        integer_type(32), UnaryValue{"bitcast_i32", operands[1]}});
+                    return Assign{*general, std::move(value)};
+                }
+                if (op == Opcode::mips_mtc1) {
+                    auto value = std::make_shared<Expression>(Expression{
+                        floating_type(32), UnaryValue{"bitcast_f32", operands[0]}});
+                    return Assign{*cop, std::move(value)};
+                }
+                if (op == Opcode::mips_cfc1 && cop->index == 0) {
+                    if (general->index == 0) return Intrinsic{"nop", {}, IntrinsicMemoryEffect::none};
+                    return Assign{*general, retag_expr(operands[1], integer_type(32))};
+                }
+                if (op == Opcode::mips_ctc1 && cop->index == 0) {
+                    auto source = retag_expr(operands[0], integer_type(32));
+                    Intrinsic effect{"mips.ctc1.fcsr31", {source}, IntrinsicMemoryEffect::none};
+                    effect.register_writes = instruction.register_writes;
+                    for (const auto written : effect.register_writes) {
+                        if (written == *cop) {
+                            effect.register_output_values.push_back(source);
+                        } else if (written.bank == RegisterBank::mips_fcsr &&
+                                   written.index >= 1 && written.index <= 8) {
+                            const unsigned condition_code = written.index - 1;
+                            const unsigned bit_position = condition_code == 0 ? 23 : 24 + condition_code;
+                            auto bit = boolean_binary("bit_extract", source,
+                                constant_expr(bit_position, 32));
+                            effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                                integer_type(32), UnaryValue{"zext", std::move(bit)}}));
+                        } else {
+                            return Intrinsic{"mips.ctc1.fcsr31.unmodeled_alias", {source},
+                                IntrinsicMemoryEffect::unknown};
+                        }
+                    }
+                    return effect;
+                }
+
+                // FCCR/FEXR/FENR overlap pieces of FCSR. Preserve these
+                // architecturally named effects without inventing bit-level
+                // aliases until the FCSR partition is modeled precisely.
+                std::vector<ExpressionPtr> control_operands{from_cop ? operands[1] : operands[0]};
+                control_operands.push_back(reg_expr({RegisterBank::mips_fcsr, 0, 32, false}));
+                Intrinsic effect{from_cop ? "mips.cfc1.control" : "mips.ctc1.control",
+                    std::move(control_operands), IntrinsicMemoryEffect::none};
+                effect.register_writes = instruction.register_writes;
+                return effect;
+            }
             std::string intrinsic_name;
             if (op >= Opcode::mips_add_s && op <= Opcode::mips_c_le_s) {
                 static constexpr const char *names[]{"mips.add.s", "mips.sub.s", "mips.mul.s", "mips.div.s",

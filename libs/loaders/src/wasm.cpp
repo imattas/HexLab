@@ -15,6 +15,7 @@ constexpr std::uint64_t max_input_bytes = 256u * 1024u * 1024u;
 constexpr std::uint32_t max_vector_items = 1'000'000;
 constexpr std::size_t max_wasm_control_depth = 100'000;
 constexpr std::size_t max_wasm_operand_stack = 1'000'000;
+constexpr std::uint32_t max_wasm_multi_values = 128;
 constexpr std::uint32_t max_name_bytes = 1024u * 1024u;
 constexpr std::uint64_t max_total_name_bytes = 16u * 1024u * 1024u;
 constexpr std::uint64_t wasm_page_bytes = 65536;
@@ -82,6 +83,36 @@ struct Reader {
         if (decoded) *decoded = type;
         return true;
     }
+    bool sleb(unsigned bits, std::int64_t &value) {
+        const unsigned limit = (bits + 6) / 7;
+        std::uint64_t raw = 0;
+        unsigned shift = 0;
+        std::uint8_t b = 0;
+        for (unsigned i = 0; i < limit; ++i) {
+            if (!byte(b)) return false;
+            const auto payload = static_cast<std::uint64_t>(b & 0x7f);
+            const auto remaining = bits - i * 7;
+            if (remaining < 7) {
+                const bool negative = (payload & (std::uint64_t{1} << (remaining - 1))) != 0;
+                const auto unused = payload >> remaining;
+                const auto expected = negative ? ((std::uint64_t{1} << (7 - remaining)) - 1) : 0;
+                if (unused != expected) return false;
+            }
+            if (shift < 64) raw |= payload << shift;
+            shift += 7;
+            if (!(b & 0x80)) {
+                if (shift < 64 && (b & 0x40)) raw |= (~std::uint64_t{0}) << shift;
+                if (bits < 64) {
+                    const auto mask = (std::uint64_t{1} << bits) - 1;
+                    raw &= mask;
+                    if (raw & (std::uint64_t{1} << (bits - 1))) raw |= ~mask;
+                }
+                value = static_cast<std::int64_t>(raw);
+                return true;
+            }
+        }
+        return false;
+    }
     bool limits(bool memory, WasmLimits &result) {
         std::uint32_t flags = 0, minimum = 0, maximum = 0;
         if (!uleb(flags) || (flags & ~(memory ? std::uint32_t{0x3} : std::uint32_t{0x1})) || !uleb(minimum)) return false;
@@ -137,7 +168,8 @@ const char *unparsed_section_name(std::uint8_t id) {
     default: return "unknown";
     }
 }
-bool parse_types(Reader &r, std::uint32_t &type_count, WasmMetadata &metadata) {
+bool parse_types(Reader &r, std::uint32_t &type_count, WasmMetadata &metadata,
+                 std::string &reason, bool &unsupported) {
     if (!r.uleb(type_count) || type_count > max_vector_items) return false;
     metadata.function_types.reserve(type_count);
     for (std::uint32_t i = 0; i < type_count; ++i) {
@@ -152,7 +184,12 @@ bool parse_types(Reader &r, std::uint32_t &type_count, WasmMetadata &metadata) {
             if (!r.value_type(&type)) return false;
             parameter_types.push_back(type);
         }
-        if (!r.uleb(count) || count > 1) return false; // WebAssembly 1.0 function results
+        if (!r.uleb(count)) return false;
+        if (count > max_wasm_multi_values) {
+            unsupported = true;
+            reason = "function result vector exceeds the 128-value multi-value limit";
+            return false;
+        }
         std::vector<std::uint8_t> result_types;
         result_types.reserve(count);
         for (std::uint32_t p = 0; p < count; ++p) {
@@ -849,11 +886,12 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
     Reader code{module.subspan(static_cast<std::size_t>(body.code_offset),
                                static_cast<std::size_t>(body.code_size))};
     struct Frame {
-        std::uint8_t kind, result;
+        std::uint8_t kind;
+        std::vector<std::uint8_t> parameters, results;
         std::size_t height;
         bool unreachable = false, has_else = false;
     };
-    std::vector<Frame> controls{{0xff, signature.result_count ? signature.result_types[0] : std::uint8_t{0}, 0}};
+    std::vector<Frame> controls{{0xff, {}, signature.result_types, 0}};
     std::vector<std::uint8_t> stack;
     const auto fail = [&](const char *message) { reason = "function[" + std::to_string(body.index) +
         "] at operator byte " + std::to_string(code.position ? code.position - 1 : 0) + ": " + message; return false; };
@@ -878,9 +916,14 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
         stack.resize(controls.back().height);
         controls.back().unreachable = true;
     };
-    const auto label = [&](std::uint32_t depth) -> std::uint8_t {
+    const auto label = [&](std::uint32_t depth) -> const std::vector<std::uint8_t> & {
         const auto &target = controls[controls.size() - 1 - depth];
-        return target.kind == 0x03 ? 0 : target.result;
+        return target.kind == 0x03 ? target.parameters : target.results;
+    };
+    const auto pop_types = [&](const std::vector<std::uint8_t> &types) {
+        for (auto it = types.rbegin(); it != types.rend(); ++it)
+            if (!pop(*it)) return false;
+        return true;
     };
     const auto local_type = [&](std::uint32_t index) -> std::uint8_t {
         if (index < signature.parameter_types.size()) return signature.parameter_types[index];
@@ -903,56 +946,73 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
         std::uint32_t index = 0;
         if (op == 0x00 || op == 0x0c || op == 0x0f) {
             if (op == 0x0c && (!code.uleb(index) || index >= controls.size())) return fail("invalid branch depth");
-            if (op == 0x0f && controls.front().result && !pop(controls.front().result))
-                return fail("return type mismatch");
-            if (op == 0x0c && label(index) && !pop(label(index))) return fail("branch type mismatch");
+            if (op == 0x0f && !pop_types(controls.front().results)) return fail("return type mismatch");
+            if (op == 0x0c && !pop_types(label(index))) return fail("branch type mismatch");
             dead();
         } else if (op == 0x01) {
         } else if (op >= 0x02 && op <= 0x04) {
-            std::uint8_t result = 0;
-            if (!code.byte(result)) return fail("truncated block type");
-            if (result != 0x40 && result != 0x7f && result != 0x7e && result != 0x7d && result != 0x7c) {
-                unsupported = true; return fail("indexed or non-MVP block type");
+            std::int64_t block_type = 0;
+            if (!code.sleb(33, block_type)) return fail("invalid or truncated block type");
+            std::vector<std::uint8_t> parameters, results;
+            if (block_type == -1) results.push_back(0x7f);
+            else if (block_type == -2) results.push_back(0x7e);
+            else if (block_type == -3) results.push_back(0x7d);
+            else if (block_type == -4) results.push_back(0x7c);
+            else if (block_type != -64) {
+                if (block_type < 0 || static_cast<std::uint64_t>(block_type) >= metadata.function_types.size())
+                    return fail("block type index is out of range");
+                const auto &block_signature = metadata.function_types[static_cast<std::size_t>(block_type)];
+                if (!block_signature.parameter_types.empty()) {
+                    unsupported = true;
+                    return fail("block type parameters are outside the bounded multi-value subset");
+                }
+                results = block_signature.result_types;
+            }
+            if (results.size() > max_wasm_multi_values) {
+                unsupported = true;
+                return fail("block result vector exceeds the 128-value multi-value limit");
             }
             if (op == 0x04 && !pop(0x7f)) return fail("if condition must be i32");
             if (controls.size() >= max_wasm_control_depth) {
                 limited = true;
                 return fail("control nesting limit exceeded");
             }
-            controls.push_back({op, result == 0x40 ? std::uint8_t{0} : result, stack.size(),
+            controls.push_back({op, std::move(parameters), std::move(results), stack.size(),
                                 controls.back().unreachable});
         } else if (op == 0x05 || op == 0x0b) {
             if (controls.empty()) return fail("unmatched else or end");
             auto &frame = controls.back();
             if (op == 0x05 && (frame.kind != 0x04 || frame.has_else)) return fail("else without matching if");
-            if (frame.result && !pop(frame.result)) return fail("block result type mismatch");
+            if (!pop_types(frame.results)) return fail("block result type mismatch");
             if (stack.size() != frame.height) return fail("block stack height mismatch");
             if (op == 0x05) {
                 frame.has_else = true;
                 frame.unreachable = controls.size() > 1 && controls[controls.size() - 2].unreachable;
+                for (auto type : frame.parameters) if (!push(type)) return fail("operand stack limit exceeded");
             } else {
-                if (frame.kind == 0x04 && frame.result && !frame.has_else)
-                    return fail("result-typed if requires else");
-                const auto result = frame.result;
+                if (frame.kind == 0x04 && !frame.has_else && frame.parameters != frame.results)
+                    return fail("if without else requires identical parameter and result types");
+                const auto results = frame.results;
                 controls.pop_back();
                 if (controls.empty()) return code.position == code.bytes.size() || fail("bytes after function end");
-                if (result && !push(result)) return fail("operand stack limit exceeded");
+                for (auto type : results) if (!push(type)) return fail("operand stack limit exceeded");
             }
         } else if (op == 0x0d) {
             if (!code.uleb(index) || index >= controls.size()) return fail("invalid branch depth");
-            if (!pop(0x7f) || (label(index) && !pop(label(index))))
+            if (!pop(0x7f) || !pop_types(label(index)))
                 return fail("conditional branch type mismatch");
-            if (label(index) && !push(label(index))) return fail("operand stack limit exceeded");
+            for (auto type : label(index)) if (!push(type)) return fail("operand stack limit exceeded");
         } else if (op == 0x0e) {
-            std::uint32_t count = 0, first = 0;
+            std::uint32_t count = 0;
+            std::vector<std::uint8_t> first;
             if (!code.uleb(count) || count > 8) { unsupported = true; return fail("branch table exceeds decoder limit"); }
             for (std::uint32_t n = 0; n <= count; ++n) {
                 if (!code.uleb(index) || index >= controls.size()) return fail("invalid branch table depth");
-                const auto type = label(index);
-                if (n == 0) first = type;
-                else if (first != type) return fail("branch table target types differ");
+                const auto &types = label(index);
+                if (n == 0) first = types;
+                else if (first != types) return fail("branch table target types differ");
             }
-            if (!pop(0x7f) || (first && !pop(static_cast<std::uint8_t>(first))))
+            if (!pop(0x7f) || !pop_types(first))
                 return fail("branch table type mismatch");
             dead();
         } else if (op == 0x10 || op == 0x11) {
@@ -1102,7 +1162,7 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
             previous_order = order;
         }
         bool valid = true;
-        if (id == 1) valid = parse_types(section, type_count, wasm);
+        if (id == 1) valid = parse_types(section, type_count, wasm, parse_reason, unsupported_payload);
         else if (id == 2) {
             valid = parse_imports(section, type_count, wasm, section_begin, name_bytes,
                                   parse_reason, unsupported_payload);

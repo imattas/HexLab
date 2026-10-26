@@ -220,6 +220,37 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
                     add_target(i, signed16(w), order);
                     return {DecodeStatus::decoded, std::move(i), {}};
                 }
+                if (rs == 0 || rs == 2 || rs == 4 || rs == 6) { // MFC1/CFC1/MTC1/CTC1.
+                    if ((w & 0x7ffu) != 0) return invalid("Reserved MIPS32 COP1 transfer encoding");
+                    const bool from_cop = rs == 0 || rs == 2;
+                    const bool control = rs == 2 || rs == 6;
+                    if (control && rd != 25 && rd != 26 && rd != 28 && rd != 31)
+                        return {DecodeStatus::unsupported, {}, "MIPS32 COP1 control transfers support FCCR25, FEXR26, FENR28, and FCSR31"};
+                    const auto general = reg(rt);
+                    const auto cop = control ? R{RegisterBank::mips_fcsr,
+                        static_cast<std::uint8_t>(rd == 31 ? 0 : rd), 32, false} : fpr(rd);
+                    i.opcode = rs == 0 ? Opcode::mips_mfc1 : rs == 2 ? Opcode::mips_cfc1 :
+                               rs == 4 ? Opcode::mips_mtc1 : Opcode::mips_ctc1;
+                    i.operands = {general, cop};
+                    i.access = from_cop ? std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read}
+                                        : std::vector<OperandAccess>{OperandAccess::read, OperandAccess::write};
+                    if (from_cop) {
+                        i.register_reads = {cop};
+                        if (control && rd != 31) i.register_reads.push_back(fcsr());
+                        if (rt) i.register_writes = {general};
+                    } else {
+                        if (rt) i.register_reads = {general};
+                        i.register_writes = {cop};
+                        if (control && rd != 31) {
+                            i.register_reads.push_back(fcsr());
+                            i.register_writes.push_back(fcsr());
+                        }
+                        if (control && (rd == 25 || rd == 31))
+                            for (unsigned condition_code = 0; condition_code < 8; ++condition_code)
+                                i.register_writes.push_back(fcc(condition_code));
+                    }
+                    return {DecodeStatus::decoded, std::move(i), {}};
+                }
                 if (rs != 16 && rs != 17 && rs != 20)
                     return {DecodeStatus::unsupported, {}, "MIPS32 COP1 format is outside the implemented S/D/W subset"};
                 const unsigned ft = rt, fs = rd, fd = shamt;
