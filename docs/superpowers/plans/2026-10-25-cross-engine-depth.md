@@ -32,31 +32,31 @@
 
 **Files:** `libs/decompiler/src/decompiler.cpp` and `docs/decompiler-structuring.md`.
 
-- [ ] Inspect the post-tested-loop recognizer and its current diamond validation.
-- [ ] Add a bounded nested conditional diamond with validated disjoint arms and exact register-phi predecessor coverage at consumed joins.
-- [ ] Emit parallel phi copies on the exact predecessor edges; keep side exits, memory-phi ambiguity, overlaps, and deeper nesting on the existing fallback.
-- [ ] Document limits and compile `hexlab_decompiler` Debug.
+- [x] Inspect the post-tested-loop recognizer and its current diamond validation.
+- [x] Add a bounded nested conditional diamond with validated disjoint arms and exact register-phi predecessor coverage at consumed joins.
+- [x] Emit parallel phi copies on the exact predecessor edges; keep side exits, memory-phi ambiguity, overlaps, and deeper nesting on the existing fallback.
+- [x] Document limits; changed decompiler object and integrated `hexlab_cli` Debug build passed. Isolated full `hexlab_decompiler` link was blocked by the unchanged `ByteStorage` vtable issue in the agent GCC configuration.
 
 ### Task 2: RISC-V reference producer graphs
 
-**Files:** `libs/analysis/src/references.cpp` and `docs/reference-producer-provenance.md` or a focused RISC-V xref page.
+**Files:** `libs/analysis/src/references.cpp`, `libs/analysis/src/functions.cpp`, and `docs/reference-producer-provenance.md` or a focused RISC-V xref page.
 
-- [ ] Inspect the existing producer graph storage and RISC-V register-value propagation.
-- [ ] Carry bounded producer sets/dependency edges through RISC-V address construction, pointer loads, and CFG joins for references the pass already resolves.
-- [ ] Preserve exact value agreement, relocation rejection, address-space checks, and call clobbers; do not invent facts at conflicting joins.
-- [ ] Compile `hexlab_analysis` and `hexlab_cli` Debug.
+- [x] Inspect the existing producer graph storage and RISC-V register-value propagation.
+- [x] Carry bounded producer sets/dependency edges through RISC-V address construction, pointer loads, and CFG joins for references the pass already resolves.
+- [x] Preserve exact value agreement, relocation rejection, address-space checks, and call clobbers; do not invent facts at conflicting joins.
+- [x] Compile `hexlab_analysis` and `hexlab_cli` Debug; integrated CLI build passed.
 
 ### Task 3: Managed ExportedType forwarding
 
 **Files:** `libs/loaders/include/hexlab/loaders/managed.hpp`, `libs/loaders/src/managed.cpp`, and managed metadata documentation.
 
-- [ ] Inspect the current TypeRef binding and metadata-table index helpers.
-- [ ] Parse and retain bounded ExportedType identity and implementation records.
-- [ ] Resolve assembly-scoped forwarders through exact supplied-catalog AssemblyRef identities, including nested ExportedType chains; retain unsupported File/Module cases as unresolved.
-- [ ] Reject duplicate or cyclic forwarding paths and preserve deterministic unresolved diagnostics; compile `hexlab_loaders` and dependent `hexlab_cli` Debug.
+- [x] Inspect the current TypeRef binding and metadata-table index helpers.
+- [x] Parse and retain bounded ExportedType identity and implementation records.
+- [x] Resolve assembly-scoped forwarders through exact supplied-catalog AssemblyRef identities, including nested ExportedType chains; retain unsupported File/Module cases as unresolved.
+- [x] Reject duplicate or cyclic forwarding paths and preserve deterministic unresolved diagnostics; isolated loaders+CLI Debug and integrated CLI Debug builds passed.
 
 ### Integration
 
-- [ ] Review workstream diffs for bounds, edge correctness, provenance, and exact identity.
-- [ ] Compile integrated Debug targets serially; do not run tests or launch the desktop.
-- [ ] Update the capability ledger from source/build evidence, commit the integration record, and push `feat/foundation`.
+- [x] Review workstream diffs for bounds, edge correctness, provenance, and exact identity.
+- [x] Compile integrated Windows Debug `hexlab_cli` serially; no tests or GUI were run. Desktop configure could not fetch wxWidgets in the clean tree.
+- [x] Update the capability ledger from source/build evidence, commit the integration record, and push `feat/foundation`.
