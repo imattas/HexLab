@@ -40,8 +40,12 @@ const char *kind_text(ReferenceKind kind) {
 }
 wxString target_text(const Reference &reference, const Image *image) {
     const auto &target = reference.target;
-    if (auto location = std::get_if<Location>(&target))
-        return location_text(*location, image);
+    if (auto location = std::get_if<Location>(&target)) {
+        auto text = location_text(*location, image);
+        if (reference.provenance.target_mode)
+            text += *reference.provenance.target_mode == ExecutionMode::thumb ? " [Thumb]" : " [A32]";
+        return text;
+    }
     if (auto external = std::get_if<ExternalIdentity>(&target))
         return preview_text(external->library, 160) + "!" +
                (external->name ? preview_text(*external->name, 160)

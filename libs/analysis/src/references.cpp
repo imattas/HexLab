@@ -207,6 +207,7 @@ namespace {
 using ReferenceOperandKey = std::pair<std::uint64_t, std::uint32_t>;
 struct RegisterReferenceFacts {
     std::map<ReferenceOperandKey, Address> immediate_targets;
+    std::map<ReferenceOperandKey, ExecutionMode> target_modes;
     std::map<ReferenceOperandKey, Address> memory_targets;
     std::set<ReferenceOperandKey> relocation_pair_targets;
     std::set<std::uint64_t> address_definitions;
@@ -1576,6 +1577,7 @@ void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_
         constexpr std::size_t max_transfers = 1000000;
         std::size_t transfers = 0;
         const auto base_immediate = result.immediate_targets;
+        const auto base_target_modes = result.target_modes;
         const auto base_memory = result.memory_targets;
         const auto base_producers = result.producer_instruction_ids;
         const auto base_graphs = result.producer_graphs;
@@ -1610,6 +1612,7 @@ void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_
             if (!safe) break;
             reference_detail::canceled(stop);
             result.immediate_targets = base_immediate;
+            result.target_modes = base_target_modes;
             result.memory_targets = base_memory;
             result.producer_instruction_ids = base_producers;
             result.producer_graphs = base_graphs;
@@ -1650,6 +1653,7 @@ void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_
         if (converged) outputs.insert(states.begin(), states.end());
         else {
             result.immediate_targets = base_immediate;
+            result.target_modes = base_target_modes;
             result.memory_targets = base_memory;
             result.producer_instruction_ids = base_producers;
             result.producer_graphs = base_graphs;
@@ -2984,7 +2988,7 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
         return outcome;
     };
     const auto arm_pc_target = [&](const Instruction &instruction, std::uint32_t raw_value)
-        -> std::optional<Address> {
+        -> std::optional<std::pair<Address, ExecutionMode>> {
         if (!instruction.arm) return {};
         auto target_mode = instruction.arm->target_mode.value_or(instruction.context.mode);
         switch (instruction.arm->exchange) {
@@ -3008,7 +3012,7 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
             return {};
         const auto context = image->context_at(target);
         if (!context || context.value().mode != target_mode) return {};
-        return target;
+        return std::pair{target, target_mode};
     };
     const auto process_block = [&](const BasicBlock &block, RegisterState registers) {
         for (const auto &fact : block.instructions) {
@@ -3065,8 +3069,11 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     const auto found = registers.find({mode, target_register->index});
                     if (found != registers.end() && found->second.space == instruction.address.space) {
                         if (const auto target = arm_pc_target(instruction,
-                                static_cast<std::uint32_t>(found->second.offset)))
-                            result.immediate_targets[{fact->id, control}] = *target;
+                                static_cast<std::uint32_t>(found->second.offset))) {
+                            const ReferenceOperandKey key{fact->id, control};
+                            result.immediate_targets[key] = target->first;
+                            result.target_modes[key] = target->second;
+                        }
                     }
                 }
             }
@@ -3151,9 +3158,12 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                 if (arm_instruction_unconditional && destination) {
                     if (const auto operand2 = arm_operand2_value(instruction.operands[1])) {
                         if (destination->index == 15 && instruction.arm->writes_pc) {
-                            if (const auto target = arm_pc_target(instruction, *operand2))
-                                result.immediate_targets[{fact->id,
-                                    analysis_detail::control_operand_index(instruction)}] = *target;
+                            if (const auto target = arm_pc_target(instruction, *operand2)) {
+                                const ReferenceOperandKey key{fact->id,
+                                    analysis_detail::control_operand_index(instruction)};
+                                result.immediate_targets[key] = target->first;
+                                result.target_modes[key] = target->second;
+                            }
                         } else if (destination->index != 15) {
                             definition = {{destination->index, Address{instruction.address.space, *operand2}}};
                             const Address target{instruction.address.space, *operand2};
@@ -3169,9 +3179,12 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     if (const auto operand2 = arm_operand2_value(instruction.operands[1])) {
                         const auto value = static_cast<std::uint32_t>(~*operand2);
                         if (destination->index == 15 && instruction.arm->writes_pc) {
-                            if (const auto target = arm_pc_target(instruction, value))
-                                result.immediate_targets[{fact->id,
-                                    analysis_detail::control_operand_index(instruction)}] = *target;
+                            if (const auto target = arm_pc_target(instruction, value)) {
+                                const ReferenceOperandKey key{fact->id,
+                                    analysis_detail::control_operand_index(instruction)};
+                                result.immediate_targets[key] = target->first;
+                                result.target_modes[key] = target->second;
+                            }
                         } else if (destination->index != 15) {
                             definition = {{destination->index, Address{instruction.address.space, value}}};
                             const Address target{instruction.address.space, value};
@@ -3241,9 +3254,12 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     }
                     if (target && destination->index == 15 && instruction.arm->writes_pc) {
                         if (const auto resolved = arm_pc_target(instruction,
-                                static_cast<std::uint32_t>(target->offset)))
-                            result.immediate_targets[{fact->id,
-                                analysis_detail::control_operand_index(instruction)}] = *resolved;
+                                static_cast<std::uint32_t>(target->offset))) {
+                            const ReferenceOperandKey key{fact->id,
+                                analysis_detail::control_operand_index(instruction)};
+                            result.immediate_targets[key] = resolved->first;
+                            result.target_modes[key] = resolved->second;
+                        }
                     } else if (target && destination->index != 15 &&
                                riscv_target_segment(*image, *target, OperandAccess::address)) {
                         definition = {{destination->index, *target}};
@@ -3450,8 +3466,11 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
             if (loaded_pointer) {
                 if (loaded_pointer->first == 15 && instruction.arm->writes_pc) {
                     if (const auto target = arm_pc_target(instruction,
-                            static_cast<std::uint32_t>(loaded_pointer->second.offset)))
-                        result.immediate_targets[{fact->id, 1}] = *target;
+                            static_cast<std::uint32_t>(loaded_pointer->second.offset))) {
+                        const ReferenceOperandKey key{fact->id, 1};
+                        result.immediate_targets[key] = target->first;
+                        result.target_modes[key] = target->second;
+                    }
                 } else {
                     registers[{mode, loaded_pointer->first}] = loaded_pointer->second;
                 }
@@ -4039,6 +4058,16 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                 if (dataflow_target)
                     reference.provenance.producer_graph =
                         producer_graph_for({fact->id, static_cast<std::uint32_t>(control_index)});
+            }
+            if (target && instruction.context.architecture == Architecture::arm && instruction.arm &&
+                (instruction.context.mode == ExecutionMode::a32 ||
+                 instruction.context.mode == ExecutionMode::thumb)) {
+                const ReferenceOperandKey key{fact->id, control_index};
+                if (const auto proven = arm_facts.target_modes.find(key);
+                    proven != arm_facts.target_modes.end())
+                    reference.provenance.target_mode = proven->second;
+                else
+                    reference.provenance.target_mode = instruction.arm->target_mode.value_or(instruction.context.mode);
             }
             if (target)
                 reference.target = Location{*target};

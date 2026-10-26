@@ -266,6 +266,13 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata) {
         pointer("Guard XFG table dispatch", config.guard_xfg_table_dispatch_rva);
         pointer("CastGuard failure mode", config.cast_guard_failure_mode_rva);
         pointer("Guard memcpy", config.guard_memcpy_rva);
+        pointer("Guard RF failure routine", config.guard_rf_failure_routine_rva);
+        pointer("Guard RF failure routine function pointer", config.guard_rf_failure_routine_pointer_rva);
+        pointer("Guard RF verify stack function pointer", config.guard_rf_verify_stack_pointer_rva);
+        pointer("Enclave configuration", config.enclave_configuration_rva);
+        pointer("Volatile metadata", config.volatile_metadata_rva);
+        if (config.hot_patch_table_offset)
+            out << "  Hot-patch table offset=0x" << std::hex << *config.hot_patch_table_offset << std::dec << '\n';
         auto table = [&](const char *name, const auto &targets) {
             if (targets.empty()) return;
             out << "  " << name << ": " << targets.size() << " entries\n";

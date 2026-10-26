@@ -154,6 +154,9 @@ struct Writer {
         number(value.provenance.instruction_id, 8);
         number(value.provenance.user_id, 8);
         optional_location(value.association);
+        number(value.provenance.target_mode ? 1 : 0, 1);
+        if (value.provenance.target_mode)
+            number(*value.provenance.target_mode == ExecutionMode::a32 ? 1 : 2, 1);
         require(value.provenance.producer_instruction_ids.size() <= 32,
                 "Reference producer chain exceeds 32 instruction IDs");
         number(value.provenance.producer_instruction_ids.size(), 1);
@@ -371,6 +374,15 @@ struct Reader {
         value.provenance.instruction_id = number(8);
         value.provenance.user_id = number(8);
         value.association = optional_location();
+        if (payload_version >= 16) {
+            const auto has_target_mode = number(1);
+            require(has_target_mode <= 1, "Invalid reference target-mode flag");
+            if (has_target_mode) {
+                const auto target_mode = number(1);
+                require(target_mode == 1 || target_mode == 2, "Invalid ARM reference target mode");
+                value.provenance.target_mode = target_mode == 1 ? ExecutionMode::a32 : ExecutionMode::thumb;
+            }
+        }
         if (payload_version >= 12) {
             const auto producer_count = number(1);
             require(producer_count <= 32, "Reference producer chain exceeds bound");
@@ -684,6 +696,15 @@ void validate_reference(const Reference &value) {
                 static_cast<unsigned>(value.provenance.kind) <=
                     static_cast<unsigned>(ReferenceProvenanceKind::elf_vtable_slot),
             "Unknown reference kind/access/provenance");
+    if (value.provenance.target_mode) {
+        const auto *target = std::get_if<Location>(&value.target);
+        require((*value.provenance.target_mode == ExecutionMode::a32 ||
+                 *value.provenance.target_mode == ExecutionMode::thumb) && target &&
+                    std::holds_alternative<Address>(*target) &&
+                    (value.kind == ReferenceKind::call || value.kind == ReferenceKind::jump ||
+                     value.kind == ReferenceKind::conditional_jump),
+                "ARM target mode requires a resolved control-flow address");
+    }
     require(value.provenance.producer_instruction_ids.size() <= 32,
             "Reference producer chain exceeds bound");
     if (!value.provenance.producer_instruction_ids.empty()) {
@@ -993,7 +1014,7 @@ Result<std::vector<std::byte>> encode_reference_index(const ReferenceIndex &inde
         using namespace reference_detail;
         canceled(stop);
         Writer out;
-        out.number(15, 1);
+        out.number(16, 1);
         out.number(0, 1);
         out.number(index.key() ? 1 : 0, 1);
         if (index.key())
@@ -1024,7 +1045,8 @@ Result<std::shared_ptr<const ReferenceIndex>> decode_reference_index(std::span<c
         in.payload_version = static_cast<unsigned>(in.number(1));
         require((in.payload_version == 7 || in.payload_version == 8 || in.payload_version == 9 ||
                  in.payload_version == 10 || in.payload_version == 11 || in.payload_version == 12 ||
-                 in.payload_version == 13 || in.payload_version == 14 || in.payload_version == 15) && in.number(1) == 0,
+                 in.payload_version == 13 || in.payload_version == 14 || in.payload_version == 15 ||
+                 in.payload_version == 16) && in.number(1) == 0,
                 "Unknown reference payload version");
         std::optional<AnalysisKey> key;
         if (in.flag())
@@ -1040,10 +1062,10 @@ Result<std::shared_ptr<const ReferenceIndex>> decode_reference_index(std::span<c
             const auto id = in.number(8);
             require(id != 0, "Zero cached reference identity");
             auto reference = in.record();
-            // Older record versions have no producer-chain field. Their IDs
-            // were hashed from the older canonical record shape, so migrate
-            // the identity from decoded content while upgrading in memory.
-            reference.id = in.payload_version >= 12 ? ReferenceId{id} : ReferenceId{};
+            // Older payloads predate target-mode provenance, which changes
+            // the canonical record bytes. Recompute their identities in
+            // memory while upgrading so v16 references use the new key shape.
+            reference.id = in.payload_version >= 16 ? ReferenceId{id} : ReferenceId{};
             references.push_back(std::move(reference));
         }
         require(in.cursor == payload.size(), "Trailing reference payload bytes");

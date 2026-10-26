@@ -142,6 +142,12 @@ Result<std::size_t> read_load_configuration(const Image& image, const Directory&
         // offset 192; CHPEMetadataPointer follows it at offset 200. The PE32
         // fields are 32-bit and remain at offsets 120 and 124 respectively.
         const std::size_t dynamic_reloc_table_at = pe64 ? 192 : 120;
+        const std::size_t guard_rf_failure_at = pe64 ? 208 : 128;
+        const std::size_t guard_rf_failure_pointer_at = pe64 ? 216 : 132;
+        const std::size_t guard_rf_verify_stack_at = pe64 ? 232 : 144;
+        const std::size_t hot_patch_table_offset_at = pe64 ? 240 : 148;
+        const std::size_t enclave_configuration_at = pe64 ? 248 : 156;
+        const std::size_t volatile_metadata_at = pe64 ? 256 : 160;
         const std::size_t eh_continuation_table_at = pe64 ? 264 : 164;
         const std::size_t eh_continuation_count_at = pe64 ? 272 : 168;
         const std::size_t xfg_check_at = pe64 ? 280 : 172;
@@ -315,6 +321,30 @@ Result<std::size_t> read_load_configuration(const Image& image, const Directory&
         result.cast_guard_failure_mode_rva = read_optional_pointer(
             cast_guard_failure_mode_at, "CastGuard failure-mode pointer");
         result.guard_memcpy_rva = read_optional_pointer(guard_memcpy_at, "Guard memcpy pointer");
+        const auto read_optional_pointer_with_source = [&](std::size_t at, const char *field,
+                                                            std::optional<PeRecordSource> &source)
+            -> std::optional<std::uint64_t> {
+            const auto rva = read_optional_pointer(at, field);
+            if (rva) source = PeRecordSource{0, reader.sources(directory.location + at, width)};
+            return rva;
+        };
+        result.guard_rf_failure_routine_rva = read_optional_pointer_with_source(
+            guard_rf_failure_at, "Guard RF failure routine", result.guard_rf_failure_routine_source);
+        result.guard_rf_failure_routine_pointer_rva = read_optional_pointer_with_source(
+            guard_rf_failure_pointer_at, "Guard RF failure routine function pointer",
+            result.guard_rf_failure_routine_pointer_source);
+        result.guard_rf_verify_stack_pointer_rva = read_optional_pointer_with_source(
+            guard_rf_verify_stack_at, "Guard RF verify stack pointer function pointer",
+            result.guard_rf_verify_stack_pointer_source);
+        if (declared >= hot_patch_table_offset_at + 4) {
+            result.hot_patch_table_offset = u32(hot_patch_table_offset_at);
+            result.hot_patch_table_offset_source = PeRecordSource{
+                0, reader.sources(directory.location + hot_patch_table_offset_at, 4)};
+        }
+        result.enclave_configuration_rva = read_optional_pointer_with_source(
+            enclave_configuration_at, "enclave configuration", result.enclave_configuration_source);
+        result.volatile_metadata_rva = read_optional_pointer_with_source(
+            volatile_metadata_at, "volatile metadata", result.volatile_metadata_source);
         if (declared >= dynamic_reloc_table_at + width) {
             const auto table_va = pointer(dynamic_reloc_table_at);
             if (table_va) {
