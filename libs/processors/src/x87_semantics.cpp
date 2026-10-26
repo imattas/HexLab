@@ -1,6 +1,7 @@
 #include "hexlab/processors/x87_semantics.hpp"
 
 #include <bit>
+#include <algorithm>
 
 namespace hexlab {
 namespace {
@@ -98,6 +99,86 @@ std::uint32_t with_eflags(std::uint32_t flags, X87Relation relation) noexcept {
     return flags;
 }
 } // namespace
+
+X87StackState join_x87_stack_states(const X87StackState &left, const X87StackState &right) noexcept {
+    X87StackState result;
+    if (left.top == right.top) result.top = left.top;
+    for (std::size_t i = 0; i < result.tags.size(); ++i)
+        if (left.tags[i] == right.tags[i]) result.tags[i] = left.tags[i];
+    return result;
+}
+
+X87StackState transfer_x87_stack_state(const X87StackState &input, const Instruction &instruction) noexcept {
+    auto result = input;
+    if (instruction.flow == FlowKind::call) return {};
+    if (instruction.opcode == Opcode::opaque || instruction.opcode == Opcode::x86_opaque) return {};
+    if (instruction.opcode != Opcode::x87) return result;
+    const auto &name = instruction.mnemonic_override;
+    if (name == "fldenv" || name == "frstor") {
+        result = {};
+        return result;
+    }
+    if (name == "fninit" || name == "finit" || name == "fnsave") {
+        result.top = std::uint8_t{0};
+        result.tags.fill(X87Tag::empty);
+        return result;
+    }
+    if (name == "fincstp" || name == "fdecstp") {
+        if (result.top) {
+            const auto delta = name == "fincstp" ? 1 : 7;
+            result.top = static_cast<std::uint8_t>((*result.top + delta) & 7);
+        }
+        return result;
+    }
+    const bool writes_tag = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::x87_tag; });
+    if (writes_tag && !instruction.x87_stack_delta) result.tags.fill(std::nullopt);
+    // Explicit ST destinations can change a value's tag class. Invalidate
+    // those physical tags before applying any implicit push/pop transition.
+    if (result.top) {
+        const auto count = std::min(instruction.operands.size(), instruction.access.size());
+        for (std::size_t i = 0; i < count; ++i) {
+            if (instruction.access[i] == OperandAccess::read) continue;
+            const auto *reg = std::get_if<RegisterOperand>(&instruction.operands[i]);
+            if (!reg || reg->bank != RegisterBank::x87 || reg->index >= 8) continue;
+            result.tags[(*result.top + reg->index) & 7].reset();
+        }
+    }
+    if (instruction.x87_stack_delta > 0) {
+        for (int i = 0; result.top && i < instruction.x87_stack_delta; ++i) {
+            result.top = static_cast<std::uint8_t>((*result.top + 7) & 7);
+            std::optional<X87Tag> pushed_tag;
+            const bool destination_empty = result.tags[*result.top] == X87Tag::empty;
+            if (destination_empty) {
+                if (name == "fldz") pushed_tag = X87Tag::zero;
+                else if (name == "fld1" || name == "fldpi" || name == "fldl2e" || name == "fldln2" ||
+                         name == "fldlg2" || name == "fldl2t") pushed_tag = X87Tag::valid;
+                else if (name == "fld" && input.top && !instruction.operands.empty()) {
+                    const auto *source = std::get_if<RegisterOperand>(&instruction.operands.front());
+                    if (source && source->bank == RegisterBank::x87 && source->index < 8)
+                        if (const auto source_tag = input.tags[(*input.top + source->index) & 7];
+                            source_tag && *source_tag != X87Tag::empty)
+                            pushed_tag = source_tag;
+                }
+            }
+            // Unknown payloads stay unknown; a masked overflow can also
+            // complete with a special indefinite value.
+            result.tags[*result.top] = pushed_tag;
+        }
+    } else if (instruction.x87_stack_delta < 0) {
+        for (int i = 0; result.top && i < -instruction.x87_stack_delta; ++i) {
+            result.tags[*result.top] = X87Tag::empty;
+            result.top = static_cast<std::uint8_t>((*result.top + 1) & 7);
+        }
+    }
+    return result;
+}
+
+std::optional<std::uint8_t> x87_physical_register(const X87StackState &state,
+                                                   std::uint8_t logical_st) noexcept {
+    if (!state.top || logical_st >= 8) return {};
+    return static_cast<std::uint8_t>((*state.top + logical_st) & 7);
+}
 
 std::optional<X87Relation> compare_x87_binary80(X87Binary80 left, X87Binary80 right) noexcept {
     const auto a = decode(left), b = decode(right);
