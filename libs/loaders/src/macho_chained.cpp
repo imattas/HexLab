@@ -138,11 +138,11 @@ void pointer_bits(MachOChainedPointer &row, const MachOChainedStarts &starts) {
         row.target_is_offset = true;
         row.complete = false;
     } else if (format == 5) {
-        // Firmware targets need firmware image context; retain their encoded
-        // 26-bit target and 6-bit next field without inventing a base.
+        // Unlike the cache-relative format 4, format 5 stores a VM address.
+        // Retain it as a direct target; the chain is fully decoded even when
+        // a later resolver cannot map that target in this image.
         row.next = static_cast<std::uint16_t>((raw >> 26) & 0x3f);
         row.target = raw & UINT64_C(0x03ffffff);
-        row.complete = false;
     } else if (format == 14) {
         // Preserve the packed 4-bit segment index and 28-bit segment offset
         // as an unassembled target payload. Resolution needs the segmented
