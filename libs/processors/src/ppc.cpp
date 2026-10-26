@@ -14,6 +14,7 @@ R ctr(unsigned width) { return {RegisterBank::ppc_ctr, 0, static_cast<std::uint1
 R xer() { return {RegisterBank::ppc_xer, 0, 32, false}; }
 R fpr(unsigned index, unsigned bits) { return {RegisterBank::ppc_fpr, static_cast<std::uint8_t>(index), static_cast<std::uint16_t>(bits), false}; }
 R fpscr() { return {RegisterBank::ppc_fpscr, 0, 32, false}; }
+R cr1() { return {RegisterBank::ppc_cr, 1, 4, false}; }
 R vr(unsigned index) { return {RegisterBank::ppc_vr, static_cast<std::uint8_t>(index), 128, false}; }
 DecodeResult fail(DecodeStatus status, const char *why) { return {status, {}, why}; }
 std::uint32_t word(std::span<const std::byte> bytes, ByteOrder order) {
@@ -600,8 +601,6 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
     } else if (op == 63 && (((w >> 1) & 0x3ff) == 12 || ((w >> 1) & 0x3ff) == 40 ||
                             ((w >> 1) & 0x3ff) == 72 || ((w >> 1) & 0x3ff) == 264)) {
         const auto xo10 = (w >> 1) & 0x3ff;
-        if (rc)
-            return fail(DecodeStatus::unsupported, "PowerPC floating Rc forms require modeled FPSCR-to-CR1 effects");
         if (ra != 0)
             return fail(DecodeStatus::invalid, "PowerPC unary floating instruction has nonzero reserved fields");
         const auto opcode = xo10 == 12 ? Opcode::ppc_frsp : xo10 == 40 ? Opcode::ppc_fneg :
@@ -617,6 +616,11 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             i.register_reads.push_back(fpscr());
             i.register_writes.push_back(fpscr());
         }
+        if (rc) {
+            if (std::find(i.register_reads.begin(), i.register_reads.end(), fpscr()) == i.register_reads.end())
+                i.register_reads.push_back(fpscr());
+            i.register_writes.push_back(cr1());
+        }
     } else if (op == 59 || op == 63) {
         const unsigned xo = (w >> 1) & 31;
         const bool single = op == 59;
@@ -630,8 +634,6 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         else if (xo == 25) opcode = single ? Opcode::ppc_fmuls : Opcode::ppc_fmul;
         else return fail(DecodeStatus::unsupported, unsupported);
         const bool multiply = xo == 25;
-        if (rc)
-            return fail(DecodeStatus::unsupported, "PowerPC floating record forms require modeled FPSCR effects");
         if ((multiply && rb != 0) || (!multiply && frc != 0))
             return fail(DecodeStatus::invalid, "PowerPC floating arithmetic has a nonzero reserved operand field");
         const auto destination = fpr(rt, bits);
@@ -642,6 +644,10 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
         i.register_writes.push_back(destination);
         i.register_reads = {left, right};
+        i.register_reads.push_back(fpscr());
+        i.register_writes.push_back(fpscr());
+        if (rc)
+            i.register_writes.push_back(cr1());
     } else if (op == 4) {
         // VMX VX form: six-bit primary opcode, three five-bit vector registers,
         // and an exact eleven-bit extended opcode. None of the selected forms

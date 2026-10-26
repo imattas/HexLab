@@ -47,6 +47,8 @@ std::string pdb_declaration_kind(types::PdbAggregateDeclarationKind kind) {
     case types::PdbAggregateDeclarationKind::nested_type: return "nested type";
     case types::PdbAggregateDeclarationKind::method: return "method";
     case types::PdbAggregateDeclarationKind::vftable_pointer: return "virtual table pointer type";
+    case types::PdbAggregateDeclarationKind::friend_class: return "friend class";
+    case types::PdbAggregateDeclarationKind::friend_function: return "friend function";
     }
     return "unknown";
 }

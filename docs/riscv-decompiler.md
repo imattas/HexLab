@@ -67,6 +67,8 @@ append IDs without changing project serialization formats.
 
 This is effect-preserving lifting rather than an IEEE-754 evaluator: it does not calculate floating results, choose dynamic `frm`, or derive precise exception flags. The physical FPR bank is 64 bits wide, with S values typed at 32 bits; RV64F NaN-boxing is not modeled. Atomic and privileged instruction decompilation remain outside this slice. Compressed integer instructions use the same lifter only when the decoder normalizes them to one of the listed scalar opcodes.
 
+The processor semantics API separately evaluates the bit-exact vector floating sign-injection, min/max, and comparison families for SEW 32/64. It accepts already-unboxed scalar FPR element bits, applies active-lane and old-destination rules, and reports the accrued NV bit for NaN cases. The generic lifter remains an opaque effect record because dynamic SEW, VLEN, and mask/tail policies are not carried into typed lane expressions; rounded floating arithmetic remains unevaluated.
+
 The RVV gather/slide subset (`vrgather.vv/vx/vi`, `vslideup.vx/vi`, and
 `vslidedown.vx/vi`) is represented as named intrinsics with explicit source
 operands, destination writes, masked `v0` reads, and implicit vector

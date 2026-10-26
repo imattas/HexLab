@@ -162,6 +162,19 @@ NaNs. Min/max may set NV for signaling NaNs. The intrinsic preserves the
 family and these state dependencies without calculating IEEE-754 results or
 per-lane exception values. A reserved `frm` remains outside this static check.
 
+The standalone `evaluate_riscv_vector_floating_operation` helper now evaluates
+the bit-exact `vfsgnj`, `vfsgnjn`, and `vfsgnjx` sign-injection families,
+`vfmin`/`vfmax`, and all decoded vector floating comparisons for SEW 32 or 64.
+It accepts raw IEEE element bit patterns, caller-unboxed scalar FPR bits,
+`vstart`, `vl`, masked predicate lanes, and the old destination. It preserves
+inactive and tail lanes, handles signed zero, propagates a numeric operand for
+single-NaN min/max, returns the canonical NaN for two NaN inputs, and reports
+the union of per-active-lane NV exceptions in `fflags_set`. FEQ/FNE raise NV
+only for signaling NaNs; ordered comparisons raise NV for any NaN. Sign
+injection is bitwise and does not raise flags. Floating arithmetic, dynamic
+rounding, inexact/underflow/overflow/divide-by-zero flags, and wider or
+half-precision lanes remain outside the evaluator.
+
 Fused multiply-add, reductions, conversions, classification, reciprocal and
 square-root operations, widening floating-point arithmetic, half-precision
 vector operations, and all other vector floating-point encodings remain

@@ -64,6 +64,25 @@ struct RiscvVectorIntegerResult {
     std::uint8_t element_bits = 0; // 1 for masks, SEW for ordinary results, 2*SEW for widening.
 };
 
+// Floating vector operands are raw IEEE-754 element bit patterns. For `.vf`,
+// scalar is the low SEW bits of the source F register after any XLEN-specific
+// NaN unboxing performed by the caller.
+struct RiscvVectorFloatingOperands {
+    std::span<const std::uint64_t> vs2;
+    std::span<const std::uint64_t> vs1;
+    std::uint64_t scalar = 0;
+    std::span<const std::uint8_t> predicate_mask;
+    std::span<const std::uint64_t> old_destination;
+};
+
+struct RiscvVectorFloatingResult {
+    std::vector<std::uint64_t> lanes; // compare results are 0/1 mask bits
+    std::uint64_t vlmax = 0;
+    bool mask_result = false;
+    std::uint8_t element_bits = 0; // 1 for masks, SEW for vector values.
+    std::uint8_t fflags_set = 0; // accrued IEEE exception bits: NX=1, UF=2, OF=4, DZ=8, NV=16.
+};
+
 struct RiscvVectorMemoryElementAccess {
     std::uint64_t lane = 0;
     std::uint64_t address = 0;
@@ -103,6 +122,14 @@ evaluate_riscv_vector_configuration(const RiscvInstruction &instruction,
 HEXLAB_PROCESSORS_EXPORT std::optional<RiscvVectorIntegerResult>
 evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
                                        const RiscvVectorIntegerOperands &operands);
+
+// Evaluates bit-exact RVV floating sign injection, min/max, and compare
+// families for SEW=32 or 64. Arithmetic rounding is intentionally not handled
+// here. fflags_set contains exception bits raised by active lanes only; callers
+// merge these into the architectural sticky fflags register.
+HEXLAB_PROCESSORS_EXPORT std::optional<RiscvVectorFloatingResult>
+evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
+                                         const RiscvVectorFloatingOperands &operands);
 
 // Plans active unit-stride or strided integer vector memory elements. The
 // caller supplies the XLEN-width base/stride bit patterns and v0 predicate

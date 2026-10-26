@@ -98,6 +98,12 @@ ExpressionPtr ppc_compare_fp_field(ExpressionPtr left, ExpressionPtr right) {
     auto un = predicate("ppc_fcmp_unordered", std::move(left), std::move(right));
     return pack_ppc_cr_field(std::move(lt), std::move(gt), std::move(eq), std::move(un));
 }
+ExpressionPtr ppc_fpscr_record_cr1(ExpressionPtr fpscr) {
+    // Rc copies FPSCR's summary nibble into CR1 after the floating operation.
+    // Keep the dependency explicit even when the operation's exception state
+    // is not statically known.
+    return unary("ppc_fpscr_cr1", std::move(fpscr), 4);
+}
 ExpressionPtr ppc_record_cr0(ExpressionPtr result, std::uint16_t bits) {
     const auto zero = constant(0, bits);
     auto lt = predicate("slt", result, zero);
@@ -306,6 +312,23 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         const auto *source = std::get_if<R>(&ops[1]);
         if (!source || source->bank != RegisterBank::ppc_fpr || source->width != 64 || dst->width != 64)
             return effect(i, "ppc_malformed_fp_unary");
+        const R status{RegisterBank::ppc_fpscr, 0, 32, false};
+        const R record{RegisterBank::ppc_cr, 1, 4, false};
+        const bool single_round = i.opcode == Opcode::ppc_frsp;
+        const bool writes_record = std::find(i.register_writes.begin(), i.register_writes.end(), record) !=
+                                   i.register_writes.end();
+        std::vector<R> expected_reads{*source};
+        std::vector<R> expected_writes{*dst};
+        if (single_round) {
+            expected_reads.push_back(status);
+            expected_writes.push_back(status);
+        }
+        if (writes_record) {
+            if (!single_round) expected_reads.push_back(status);
+            expected_writes.push_back(record);
+        }
+        if (i.register_reads != expected_reads || i.register_writes != expected_writes)
+            return effect(i, "ppc_malformed_fp_unary_effects");
         auto input = reg(*source);
         ExpressionPtr result;
         if (i.opcode == Opcode::ppc_fmr) result = std::move(input);
@@ -315,9 +338,18 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
             result = std::make_shared<Expression>(Expression{floating(64), UnaryValue{"fabs", std::move(input)}});
         else
             result = std::make_shared<Expression>(Expression{floating(64), UnaryValue{"ppc_frsp_to_f64", std::move(input)}});
-        if (i.opcode != Opcode::ppc_frsp) return Assign{*dst, std::move(result)};
-        auto fpscr = std::make_shared<Expression>(Expression{integer(32), UnknownValue{"ppc_fpscr_after_frsp"}});
-        return effect_with_outputs(i, "ppc_frsp", {std::move(result), std::move(fpscr)});
+        if (!single_round && !writes_record) return Assign{*dst, std::move(result)};
+        ExpressionPtr next_status = single_round
+            ? std::make_shared<Expression>(Expression{integer(32), UnknownValue{"ppc_fpscr_after_frsp"}})
+            : reg(status);
+        std::vector<ExpressionPtr> outputs{std::move(result)};
+        if (single_round) outputs.push_back(next_status);
+        if (writes_record) outputs.push_back(ppc_fpscr_record_cr1(next_status));
+        auto statement = effect_with_outputs(i, single_round ? "ppc_frsp" : "ppc_fp_record_move",
+                                             std::move(outputs));
+        auto *intrinsic = statement ? std::get_if<Intrinsic>(&*statement) : nullptr;
+        if (intrinsic && (single_round || writes_record)) intrinsic->operands.push_back(reg(status));
+        return statement;
     }
     if (ops.size() == 3 && dst && dst->bank == RegisterBank::ppc_fpr &&
         (i.opcode == Opcode::ppc_fadds || i.opcode == Opcode::ppc_fsubs ||
@@ -327,10 +359,32 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         const char *operation = i.opcode == Opcode::ppc_fadds || i.opcode == Opcode::ppc_fadd ? "fadd" :
             i.opcode == Opcode::ppc_fsubs || i.opcode == Opcode::ppc_fsub ? "fsub" :
             i.opcode == Opcode::ppc_fmuls || i.opcode == Opcode::ppc_fmul ? "fmul" : "fdiv";
+        const R status{RegisterBank::ppc_fpscr, 0, 32, false};
+        const R record{RegisterBank::ppc_cr, 1, 4, false};
+        const auto *left = ops.size() > 1 ? std::get_if<R>(&ops[1]) : nullptr;
+        const auto *right = ops.size() > 2 ? std::get_if<R>(&ops[2]) : nullptr;
+        if (!left || !right || left->bank != RegisterBank::ppc_fpr || right->bank != RegisterBank::ppc_fpr ||
+            left->width != dst->width || right->width != dst->width ||
+            (dst->width != 32 && dst->width != 64))
+            return effect(i, "ppc_malformed_fp_arithmetic_operands");
+        const bool writes_record = std::find(i.register_writes.begin(), i.register_writes.end(), record) !=
+                                   i.register_writes.end();
+        std::vector<R> expected_reads{*left, *right, status};
+        std::vector<R> expected_writes{*dst, status};
+        if (writes_record) expected_writes.push_back(record);
+        if (i.register_reads != expected_reads || i.register_writes != expected_writes)
+            return effect(i, "ppc_malformed_fp_arithmetic_effects");
         const auto type = floating(dst->width);
         auto value = std::make_shared<Expression>(Expression{type,
             BinaryValue{operation, operand(ops[1]), operand(ops[2])}});
-        return Assign{*dst, std::move(value)};
+        auto next_status = std::make_shared<Expression>(Expression{integer(32),
+            UnknownValue{std::string("ppc_fpscr_after_") + operation}});
+        std::vector<ExpressionPtr> outputs{std::move(value), next_status};
+        if (writes_record) outputs.push_back(ppc_fpscr_record_cr1(next_status));
+        auto statement = effect_with_outputs(i, "ppc_fp_arithmetic", std::move(outputs));
+        auto *intrinsic = statement ? std::get_if<Intrinsic>(&*statement) : nullptr;
+        if (intrinsic) intrinsic->operands.push_back(reg(status));
+        return statement;
     }
     if (i.opcode == Opcode::ppc_nop) return Intrinsic{"nop", {}, IntrinsicMemoryEffect::none};
     if ((i.opcode == Opcode::ppc_addi || i.opcode == Opcode::ppc_addis) && ops.size() == 3) {

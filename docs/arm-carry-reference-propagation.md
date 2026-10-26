@@ -1,16 +1,22 @@
-# ARM32 carry-aware reference propagation
+# ARM32 carry and predicate-aware reference propagation
 
-The A32/Thumb reference pass may carry a proven CPSR C bit alongside unanimous
-GPR address values while propagating through an owned CFG. It derives C from
-decoded instructions whose modeled flag write proves the result; when incoming
-C is unknown, it keeps the result only if evaluating both possible inputs
-produces the same C value. Calls discard register and carry facts.
+The A32/Thumb reference pass carries proven NZCV bits alongside unanimous GPR
+address values through an owned CFG. A flag-setting instruction updates each
+written bit only when the shared decoded-instruction evaluator proves that bit
+for every combination of unknown incoming flags consistent with known facts.
+Calls discard register facts; unknown or unsupported flag effects discard the
+affected flag facts.
 
-A proven C value feeds immediate RRX operand2 and memory offsets, plus ADC,
-SBC, and RSC address calculations. It also resolves A32/Thumb CS (C set) and
-CC (C clear) predicates: a proven false condition preserves the incoming state,
-while a proven true condition allows ordinary transfer and flag effects. Other
-unknown predicates conservatively invalidate written facts. Arithmetic remains
-32-bit wrapping. A resulting address is published only when the target is
-mapped. PC writes, interworking, unresolved registers, relocation ambiguity,
-and unsupported operand forms remain conservative.
+The complete fourteen ARM condition codes are evaluated from proven NZCV. A
+known-false predicated instruction preserves its incoming register and flag
+state, while a known-true instruction permits ordinary dataflow and flag
+transfer. An unknown predicate keeps the existing conservative behavior and
+invalidates written register/flag facts. This applies to CS/CC, Z/N, V, unsigned
+HI/LS, and signed GE/LT/GT/LE conditions, including Thumb IT predicates only
+when the decoder identifies an exact condition.
+
+Proven C feeds immediate RRX operand2 and memory offsets, plus ADC, SBC, and
+RSC address calculations. Arithmetic remains 32-bit wrapping. A resulting
+address is published only when the target is mapped. CFG edge facts are not
+refined by branch outcomes; PC writes/interworking, unresolved registers,
+relocation ambiguity, and unsupported operand forms remain conservative.

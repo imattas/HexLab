@@ -121,3 +121,20 @@ flat-pointer flag is preserved and accepted. Const, volatile, and restrict
 flags become explicit pointer qualifiers. Synthetic
 records cover attribute extraction and import behavior; the generated MSVC PDB
 regression verifies real ordinary pointer attributes in the decoded TPI graph.
+
+## Modern nested and friend declarations
+
+The TPI field-list reader decodes `LF_NESTTYPEEX`, `LF_FRIENDCLS`, and
+`LF_FRIENDFCN` in addition to the existing `LF_NESTTYPE` form. Nested-type
+access attributes are retained on the imported declaration. Friend class and
+friend function records retain their referenced TPI type and declaration name;
+friend class rows use the target type's display name when CodeView omits a name.
+All three forms create explicit graph references and remain separate from object
+layout. The parser requires zero reserved padding on friend records and bounds
+type indices, names, and record reads to the containing length-delimited field
+list. Missing or unsupported friend targets remain skipped declaration rows
+rather than becoming guessed members. Other unknown field-list leaves stay
+explicitly unsupported.
+
+Format evidence: Microsoft's [`cvinfo.h`](https://github.com/microsoft/microsoft-pdb/blob/master/include/cvinfo.h)
+defines the `LF_NESTTYPEEX`, `LF_FRIENDCLS`, and `LF_FRIENDFCN` payloads.

@@ -2885,6 +2885,12 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
     using RegisterKey = std::pair<ExecutionMode, std::uint32_t>;
     using RegisterState = std::map<RegisterKey, Address>;
     constexpr std::uint32_t carry_fact_register = 16;
+    constexpr std::uint32_t negative_fact_register = 17;
+    constexpr std::uint32_t zero_fact_register = 18;
+    constexpr std::uint32_t overflow_fact_register = 19;
+    constexpr std::array<std::pair<std::uint8_t, std::uint32_t>, 4> arm_flag_facts{{
+        {std::uint8_t{8}, negative_fact_register}, {std::uint8_t{4}, zero_fact_register},
+        {std::uint8_t{2}, carry_fact_register}, {std::uint8_t{1}, overflow_fact_register}}};
     const auto process_block = [&](const BasicBlock &block, RegisterState registers) {
         for (const auto &fact : block.instructions) {
             reference_detail::canceled(stop);
@@ -2913,14 +2919,40 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     return {};
                 return found->second.offset != 0;
             };
+            const auto current_flag = [&](std::uint8_t mask) -> std::optional<bool> {
+                const auto fact_key = std::find_if(arm_flag_facts.begin(), arm_flag_facts.end(),
+                    [&](const auto &entry) { return entry.first == mask; });
+                if (fact_key == arm_flag_facts.end()) return {};
+                const auto found = registers.find({mode, fact_key->second});
+                if (found == registers.end() || found->second.space != instruction.address.space ||
+                    found->second.offset > 1)
+                    return {};
+                return found->second.offset != 0;
+            };
             std::optional<bool> predicate_executes;
             if (instruction.arm) {
                 if (instruction.arm->predicate == ArmPredicate::always) {
                     predicate_executes = true;
-                } else if (instruction.arm->predicate == ArmPredicate::condition &&
-                           (instruction.condition == 2 || instruction.condition == 3)) {
-                    if (const auto carry = current_carry())
-                        predicate_executes = instruction.condition == 2 ? *carry : !*carry;
+                } else if (instruction.arm->predicate == ArmPredicate::condition) {
+                    const auto n = current_flag(8), z = current_flag(4);
+                    const auto c = current_flag(2), v = current_flag(1);
+                    switch (instruction.condition) {
+                    case 0: if (z) predicate_executes = *z; break;       // EQ
+                    case 1: if (z) predicate_executes = !*z; break;      // NE
+                    case 2: if (c) predicate_executes = *c; break;       // CS/HS
+                    case 3: if (c) predicate_executes = !*c; break;      // CC/LO
+                    case 4: if (n) predicate_executes = *n; break;       // MI
+                    case 5: if (n) predicate_executes = !*n; break;      // PL
+                    case 6: if (v) predicate_executes = *v; break;       // VS
+                    case 7: if (v) predicate_executes = !*v; break;      // VC
+                    case 8: if (c && z) predicate_executes = *c && !*z; break; // HI
+                    case 9: if (c && z) predicate_executes = !*c || *z; break; // LS
+                    case 10: if (n && v) predicate_executes = *n == *v; break; // GE
+                    case 11: if (n && v) predicate_executes = *n != *v; break; // LT
+                    case 12: if (n && z && v) predicate_executes = !*z && *n == *v; break; // GT
+                    case 13: if (n && z && v) predicate_executes = *z || *n != *v; break; // LE
+                    default: break;
+                    }
                 }
             }
             // A known-false predicated instruction has no architectural effects.
@@ -3213,37 +3245,69 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     writeback_definition = {{memory->base.index,
                                              Address{base->second.space, effective}}};
             }
-            const bool carry_may_change = instruction.flow != FlowKind::call && instruction.arm &&
-                (!instruction.arm->flags_known || (instruction.arm->flags_written & 2));
-            std::optional<bool> updated_carry;
-            if (carry_may_change && instruction.arm->flags_known &&
-                (instruction.arm->flags_written & 2) &&
+            std::array<std::optional<bool>, 4> updated_flags{};
+            const bool flags_may_change = instruction.flow != FlowKind::call && instruction.arm &&
+                (!instruction.arm->flags_known || instruction.arm->flags_written != 0);
+            if (flags_may_change && instruction.arm->flags_known && instruction.arm->flags_written &&
                 arm_instruction_unconditional && !instruction.arm->writes_pc) {
                 const auto read_register = [&](const RegisterOperand &reg) { return arm_register_value(reg); };
-                const auto known_carry = current_carry();
-                const std::array<bool, 2> candidates{known_carry.value_or(false), known_carry.value_or(true)};
-                const auto candidate_count = known_carry ? std::size_t{1} : std::size_t{2};
-                std::optional<bool> common;
-                bool valid = true;
-                for (std::size_t candidate = 0; candidate < candidate_count; ++candidate) {
-                    Arm32Nzcv incoming{};
-                    incoming.c = candidates[candidate];
+                const std::array<std::optional<bool>, 4> known_flags{
+                    current_flag(8), current_flag(4), current_flag(2), current_flag(1)};
+                std::array<bool, 4> first_values{};
+                std::array<bool, 4> have_values{};
+                std::array<bool, 4> invariant{true, true, true, true};
+                bool evaluated_any = false;
+                for (unsigned candidate = 0; candidate < 16; ++candidate) {
+                    const Arm32Nzcv incoming{
+                        (candidate & 8) != 0, (candidate & 4) != 0,
+                        (candidate & 2) != 0, (candidate & 1) != 0};
+                    const std::array<bool, 4> candidate_flags{
+                        incoming.n, incoming.z, incoming.c, incoming.v};
+                    bool compatible = true;
+                    for (std::size_t bit = 0; bit < known_flags.size(); ++bit)
+                        if (known_flags[bit] && *known_flags[bit] != candidate_flags[bit]) {
+                            compatible = false;
+                            break;
+                        }
+                    if (!compatible) continue;
                     const auto evaluated = evaluate_arm32_nzcv_instruction(instruction, incoming, read_register);
-                    if (!evaluated || !(evaluated->flags_written & 2)) { valid = false; break; }
-                    if (!common) common = evaluated->flags.c;
-                    else if (*common != evaluated->flags.c) { valid = false; break; }
+                    evaluated_any = true;
+                    const std::array<bool, 4> output_flags{
+                        evaluated && evaluated->flags.n, evaluated && evaluated->flags.z,
+                        evaluated && evaluated->flags.c, evaluated && evaluated->flags.v};
+                    for (std::size_t bit = 0; bit < arm_flag_facts.size(); ++bit) {
+                        if (!(instruction.arm->flags_written & arm_flag_facts[bit].first) ||
+                            !evaluated || !(evaluated->flags_written & arm_flag_facts[bit].first)) {
+                            invariant[bit] = false;
+                            continue;
+                        }
+                        if (!have_values[bit]) {
+                            first_values[bit] = output_flags[bit];
+                            have_values[bit] = true;
+                        } else if (first_values[bit] != output_flags[bit]) {
+                            invariant[bit] = false;
+                        }
+                    }
                 }
-                if (valid) updated_carry = common;
+                if (evaluated_any)
+                    for (std::size_t bit = 0; bit < arm_flag_facts.size(); ++bit)
+                        if (invariant[bit] && have_values[bit]) updated_flags[bit] = first_values[bit];
             }
             for (const auto &written : instruction.register_writes)
                 if (written.bank == RegisterBank::arm32_gpr && written.index != 15)
                     registers.erase({mode, written.index});
             if (instruction.flow == FlowKind::call)
                 registers.clear();
-            if (carry_may_change) {
-                registers.erase(carry_key);
-                if (updated_carry)
-                    registers[carry_key] = Address{instruction.address.space, *updated_carry ? 1u : 0u};
+            if (flags_may_change) {
+                for (std::size_t bit = 0; bit < arm_flag_facts.size(); ++bit) {
+                    const auto [mask, index] = arm_flag_facts[bit];
+                    if (!instruction.arm->flags_known || (instruction.arm->flags_written & mask)) {
+                        const RegisterKey key{mode, index};
+                        registers.erase(key);
+                        if (updated_flags[bit])
+                            registers[key] = Address{instruction.address.space, *updated_flags[bit] ? 1u : 0u};
+                    }
+                }
             }
             if (definition) {
                 registers[{mode, definition->first}] = definition->second;

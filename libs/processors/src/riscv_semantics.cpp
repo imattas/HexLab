@@ -615,6 +615,153 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
     return result;
 }
 
+std::optional<RiscvVectorFloatingResult>
+evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
+                                         const RiscvVectorFloatingOperands &operands) {
+    const unsigned sew = config.sew_bits;
+    if ((sew != 32 && sew != 64) || (config.xlen_bits != 32 && config.xlen_bits != 64) ||
+        config.vlen_bits < 64 || config.vlen_bits > 65528 || config.vlen_bits % 8 != 0 ||
+        config.lmul_log2 < -3 || config.lmul_log2 > 3)
+        return {};
+    const std::uint64_t base_lanes = config.vlen_bits / sew;
+    std::uint64_t vlmax = base_lanes;
+    if (config.lmul_log2 >= 0)
+        vlmax <<= static_cast<unsigned>(config.lmul_log2);
+    else {
+        const auto divisor = UINT64_C(1) << static_cast<unsigned>(-config.lmul_log2);
+        if (base_lanes % divisor != 0) return {};
+        vlmax = base_lanes / divisor;
+    }
+    if (!vlmax || vlmax > 65536 || config.vl > vlmax || config.vstart > config.vl ||
+        operands.vs2.size() != vlmax || operands.old_destination.size() != vlmax ||
+        (config.masked && operands.predicate_mask.size() != vlmax))
+        return {};
+
+    enum class Operation { sign_copy, sign_invert, sign_xor, min, max, equal, not_equal,
+                           less, less_equal, greater, greater_equal };
+    Operation operation;
+    bool vector_rhs = false, mask_result = false;
+    switch (opcode) {
+#define RV_FLOAT_PAIR(vv, vf, name) \
+    case RiscvOpcode::vv: operation = Operation::name; vector_rhs = true; break; \
+    case RiscvOpcode::vf: operation = Operation::name; break
+    RV_FLOAT_PAIR(vfsgnj_vv, vfsgnj_vf, sign_copy);
+    RV_FLOAT_PAIR(vfsgnjn_vv, vfsgnjn_vf, sign_invert);
+    RV_FLOAT_PAIR(vfsgnjx_vv, vfsgnjx_vf, sign_xor);
+    RV_FLOAT_PAIR(vfmin_vv, vfmin_vf, min);
+    RV_FLOAT_PAIR(vfmax_vv, vfmax_vf, max);
+    RV_FLOAT_PAIR(vmfeq_vv, vmfeq_vf, equal);
+    RV_FLOAT_PAIR(vmfne_vv, vmfne_vf, not_equal);
+    RV_FLOAT_PAIR(vmflt_vv, vmflt_vf, less);
+    RV_FLOAT_PAIR(vmfle_vv, vmfle_vf, less_equal);
+#undef RV_FLOAT_PAIR
+    case RiscvOpcode::vmfgt_vf: operation = Operation::greater; break;
+    case RiscvOpcode::vmfge_vf: operation = Operation::greater_equal; break;
+    default: return {};
+    }
+    if (vector_rhs && operands.vs1.size() != vlmax) return {};
+    mask_result = operation == Operation::equal || operation == Operation::not_equal ||
+                  operation == Operation::less || operation == Operation::less_equal ||
+                  operation == Operation::greater || operation == Operation::greater_equal;
+
+    const auto element_mask = width_mask(sew);
+    const auto sign_mask = UINT64_C(1) << (sew - 1);
+    const auto exponent_mask = sew == 32 ? UINT64_C(0x7f800000) : UINT64_C(0x7ff0000000000000);
+    const auto fraction_mask = sew == 32 ? UINT64_C(0x007fffff) : UINT64_C(0x000fffffffffffff);
+    const auto quiet_mask = sew == 32 ? UINT64_C(0x00400000) : UINT64_C(0x0008000000000000);
+    const auto canonical_nan = sew == 32 ? UINT64_C(0x7fc00000) : UINT64_C(0x7ff8000000000000);
+    const auto is_nan = [&](std::uint64_t value) {
+        value &= element_mask;
+        return (value & exponent_mask) == exponent_mask && (value & fraction_mask) != 0;
+    };
+    const auto is_signaling_nan = [&](std::uint64_t value) {
+        return is_nan(value) && (value & quiet_mask) == 0;
+    };
+    const auto is_zero = [&](std::uint64_t value) { return (value & ~sign_mask & element_mask) == 0; };
+    const auto ordered_less = [&](std::uint64_t lhs, std::uint64_t rhs) {
+        lhs &= element_mask;
+        rhs &= element_mask;
+        if (is_zero(lhs) && is_zero(rhs)) return false;
+        const auto order_key = [&](std::uint64_t value) {
+            return (value & sign_mask) ? (~value & element_mask) : (value ^ sign_mask);
+        };
+        return order_key(lhs) < order_key(rhs);
+    };
+
+    RiscvVectorFloatingResult result;
+    result.vlmax = vlmax;
+    result.mask_result = mask_result;
+    result.element_bits = mask_result ? 1 : static_cast<std::uint8_t>(sew);
+    result.lanes.assign(operands.old_destination.begin(), operands.old_destination.end());
+    for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
+        if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0) continue;
+        const auto lhs = operands.vs2[static_cast<std::size_t>(lane)] & element_mask;
+        const auto rhs = vector_rhs ? operands.vs1[static_cast<std::size_t>(lane)] & element_mask
+                                    : operands.scalar & element_mask;
+        const bool lhs_nan = is_nan(lhs), rhs_nan = is_nan(rhs);
+        const bool any_signaling_nan = is_signaling_nan(lhs) || is_signaling_nan(rhs);
+        std::uint64_t value = 0;
+        switch (operation) {
+        case Operation::sign_copy:
+            value = (lhs & ~sign_mask) | (rhs & sign_mask);
+            break;
+        case Operation::sign_invert:
+            value = (lhs & ~sign_mask) | ((~rhs) & sign_mask);
+            break;
+        case Operation::sign_xor:
+            value = (lhs & ~sign_mask) | ((lhs ^ rhs) & sign_mask);
+            break;
+        case Operation::min:
+        case Operation::max:
+            if (lhs_nan || rhs_nan) {
+                if (any_signaling_nan) result.fflags_set |= 0x10;
+                value = lhs_nan && rhs_nan ? canonical_nan : lhs_nan ? rhs : lhs;
+            } else if (is_zero(lhs) && is_zero(rhs)) {
+                // minimumNumber(-0,+0) is -0; maximumNumber(-0,+0) is +0.
+                const auto signs = (lhs | rhs) & sign_mask;
+                value = operation == Operation::min ? signs : signs ?
+                    ((lhs & rhs) & sign_mask) : 0;
+            } else {
+                const bool take_lhs = ordered_less(lhs, rhs);
+                value = operation == Operation::min ? (take_lhs ? lhs : rhs)
+                                                    : (take_lhs ? rhs : lhs);
+            }
+            break;
+        case Operation::equal:
+        case Operation::not_equal:
+        case Operation::less:
+        case Operation::less_equal:
+        case Operation::greater:
+        case Operation::greater_equal: {
+            const bool ordered_compare = operation == Operation::less || operation == Operation::less_equal ||
+                                        operation == Operation::greater || operation == Operation::greater_equal;
+            if (any_signaling_nan || (ordered_compare && (lhs_nan || rhs_nan)))
+                result.fflags_set |= 0x10;
+            bool predicate = false;
+            if (operation == Operation::not_equal && (lhs_nan || rhs_nan)) {
+                predicate = true;
+            } else if (!lhs_nan && !rhs_nan) {
+                const bool less = ordered_less(lhs, rhs);
+                const bool equal = lhs == rhs || (is_zero(lhs) && is_zero(rhs));
+                switch (operation) {
+                case Operation::equal: predicate = equal; break;
+                case Operation::not_equal: predicate = !equal; break;
+                case Operation::less: predicate = less; break;
+                case Operation::less_equal: predicate = less || equal; break;
+                case Operation::greater: predicate = !less && !equal; break;
+                case Operation::greater_equal: predicate = !less || equal; break;
+                default: break;
+                }
+            }
+            value = predicate ? 1u : 0u;
+            break;
+        }
+        }
+        result.lanes[static_cast<std::size_t>(lane)] = mask_result ? value : value & element_mask;
+    }
+    return result;
+}
+
 std::optional<RiscvVectorMemoryAccessPlan>
 plan_riscv_vector_memory_accesses(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
                                   std::uint64_t base, std::uint64_t stride_bits,
