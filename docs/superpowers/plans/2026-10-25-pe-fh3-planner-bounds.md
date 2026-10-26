@@ -26,12 +26,14 @@
 
 **Files:** `libs/image/src/pe_unwind.cpp`, `docs/pe-exception-directory.md`.
 
-- [ ] Inspect the FH3 planner's assumptions against parser guarantees and public metadata structs.
-- [ ] Add documented count caps and validate ordered, function-owned IP rows and all state/handler references before planning.
-- [ ] Preserve ambiguous/candidate dispositions when serialized ordering cannot prove runtime selection.
-- [ ] Compile affected Debug image and CLI targets; do not run tests.
+- [x] Inspect the FH3 planner's assumptions against parser guarantees and public metadata structs.
+- [x] Add documented count caps and validate ordered, function-owned IP rows and all state/handler references before planning.
+- [x] Preserve ambiguous/candidate dispositions when serialized ordering cannot prove runtime selection.
+- [x] Compile the affected Debug image target; do not run tests. The broader CLI dependency build was stopped after the image target completed.
 
 ## Integration
 
-- [ ] Review parser-produced and caller-constructed metadata flows.
-- [ ] Root updates `docs/capabilities.csv` with exact implementation and build evidence.
+- [x] Review parser-produced and caller-constructed metadata flows.
+- [x] Root updates `docs/capabilities.csv` with exact implementation and build evidence.
+
+**Integration evidence:** `hexlab_image` Debug build passed after the final planner changes. No tests were added or run; `out/` was untouched.

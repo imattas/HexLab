@@ -26,12 +26,14 @@
 
 **Files:** `libs/analysis/src/functions.cpp`, `libs/decompiler/src/jvm_lifting.cpp`, `docs/jvm-analysis.md`.
 
-- [ ] Inspect the current throwing-opcode predicates and exception scan cap.
-- [ ] Synchronize classification for `ldc`, `ldc_w`, and `ldc2_w`, preserving conservative handling for unknown constants.
-- [ ] Ensure incomplete/capped exception-edge coverage is surfaced to the lifter as an explicit failure or incomplete result.
-- [ ] Compile affected Debug targets; do not run tests.
+- [x] Inspect the current throwing-opcode predicates and exception scan cap.
+- [x] Synchronize classification for `ldc`, `ldc_w`, and `ldc2_w`, preserving conservative handling for unknown constants.
+- [x] Ensure incomplete/capped exception-edge coverage is surfaced to the lifter as an explicit failure or incomplete result, including ambiguous ownership paths.
+- [x] Compile `hexlab_analysis` Debug and decompiler Debug `ClCompile`; do not run tests.
 
 ## Integration
 
-- [ ] Review the complete flow from class-file exception rows through CFG construction and lifting.
-- [ ] Root updates `docs/capabilities.csv` with the exact implementation and build evidence.
+- [x] Review the complete flow from class-file exception rows through CFG construction and lifting.
+- [x] Root updates `docs/capabilities.csv` with the exact implementation and build evidence.
+
+**Integration evidence:** `hexlab_analysis` Debug build completed successfully, including the modified function-recovery source. Serial MSBuild `ClCompile` of `hexlab_decompiler` completed successfully, including the JVM lifter. Existing MSVC warnings remain. No tests were added or run; `out/` was untouched.
