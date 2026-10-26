@@ -108,6 +108,8 @@ std::string register_name(const RegisterOperand &r) {
         return r.index < 32 && (r.width == 32 || r.width == 64) ? "r" + std::to_string(r.index) : "?ppc-register";
     if (r.bank == RegisterBank::ppc_fpr)
         return r.index < 32 && (r.width == 32 || r.width == 64) ? "f" + std::to_string(r.index) : "?ppc-fpr";
+    if (r.bank == RegisterBank::ppc_vr)
+        return r.index < 32 && r.width == 128 ? "v" + std::to_string(r.index) : "?ppc-vr";
     if (r.bank == RegisterBank::ppc_cr)
         return r.width == 32 && r.index == 0 ? "cr" : r.index < 8 && r.width == 4 ? "cr" + std::to_string(r.index) : "?ppc-cr";
     if (r.bank == RegisterBank::ppc_lr)
@@ -348,6 +350,17 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::ppc_fneg: return "fneg";
     case Opcode::ppc_fabs: return "fabs";
     case Opcode::ppc_frsp: return "frsp";
+    case Opcode::ppc_vaddubm: return "vaddubm";
+    case Opcode::ppc_vadduhm: return "vadduhm";
+    case Opcode::ppc_vadduwm: return "vadduwm";
+    case Opcode::ppc_vsububm: return "vsububm";
+    case Opcode::ppc_vsubuhm: return "vsubuhm";
+    case Opcode::ppc_vsubuwm: return "vsubuwm";
+    case Opcode::ppc_vand: return "vand";
+    case Opcode::ppc_vandc: return "vandc";
+    case Opcode::ppc_vor: return "vor";
+    case Opcode::ppc_vxor: return "vxor";
+    case Opcode::ppc_vnor: return "vnor";
     case Opcode::vpaddb: return "vpaddb";
     case Opcode::vpaddw: return "vpaddw";
     case Opcode::vpaddsb: return "vpaddsb";

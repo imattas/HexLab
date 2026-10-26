@@ -314,6 +314,8 @@ std::string register_name(RegisterOperand reg) {
         return "f" + std::to_string(reg.index);
     if (reg.bank == RegisterBank::ppc_fpr)
         return "f" + std::to_string(reg.index);
+    if (reg.bank == RegisterBank::ppc_vr)
+        return "v" + std::to_string(reg.index);
     if (reg.bank == RegisterBank::ppc_fpscr)
         return "fpscr";
     if (reg.bank == RegisterBank::mips_fcsr)

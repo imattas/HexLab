@@ -14,6 +14,7 @@ R ctr(unsigned width) { return {RegisterBank::ppc_ctr, 0, static_cast<std::uint1
 R xer() { return {RegisterBank::ppc_xer, 0, 32, false}; }
 R fpr(unsigned index, unsigned bits) { return {RegisterBank::ppc_fpr, static_cast<std::uint8_t>(index), static_cast<std::uint16_t>(bits), false}; }
 R fpscr() { return {RegisterBank::ppc_fpscr, 0, 32, false}; }
+R vr(unsigned index) { return {RegisterBank::ppc_vr, static_cast<std::uint8_t>(index), 128, false}; }
 DecodeResult fail(DecodeStatus status, const char *why) { return {status, {}, why}; }
 std::uint32_t word(std::span<const std::byte> bytes, ByteOrder order) {
     std::uint32_t result = 0;
@@ -642,7 +643,32 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         i.register_writes.push_back(destination);
         i.register_reads = {left, right};
     } else if (op == 4) {
-        return fail(DecodeStatus::unsupported, "PowerPC vector instructions are outside the enabled scalar subset");
+        // VMX VX form: six-bit primary opcode, three five-bit vector registers,
+        // and an exact eleven-bit extended opcode. None of the selected forms
+        // uses a record bit or an additional modifier field.
+        const unsigned vx_xo = w & 0x7ff;
+        unsigned element_bits = 0;
+        switch (vx_xo) {
+        case 0:    i.opcode = Opcode::ppc_vaddubm; element_bits = 8; break;
+        case 64:   i.opcode = Opcode::ppc_vadduhm; element_bits = 16; break;
+        case 128:  i.opcode = Opcode::ppc_vadduwm; element_bits = 32; break;
+        case 1024: i.opcode = Opcode::ppc_vsububm; element_bits = 8; break;
+        case 1088: i.opcode = Opcode::ppc_vsubuhm; element_bits = 16; break;
+        case 1152: i.opcode = Opcode::ppc_vsubuwm; element_bits = 32; break;
+        case 1028: i.opcode = Opcode::ppc_vand; break;
+        case 1092: i.opcode = Opcode::ppc_vandc; break;
+        case 1156: i.opcode = Opcode::ppc_vor; break;
+        case 1220: i.opcode = Opcode::ppc_vxor; break;
+        case 1284: i.opcode = Opcode::ppc_vnor; break;
+        default: return fail(DecodeStatus::unsupported, "PowerPC opcode-4 form is outside the enabled VMX integer subset");
+        }
+        const auto destination = vr(rt), left = vr(ra), right = vr(rb);
+        i.operands = {destination, left, right};
+        i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
+        i.register_reads = {left, right};
+        i.register_writes = {destination};
+        i.vector_bits = 128;
+        i.vector_element_bits = static_cast<std::uint16_t>(element_bits);
     } else {
         return fail(DecodeStatus::invalid, "Reserved or unsupported PowerPC primary opcode");
     }

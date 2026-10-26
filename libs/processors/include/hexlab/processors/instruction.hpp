@@ -12,7 +12,7 @@
 namespace hexlab {
 enum class DecodeStatus { decoded, unsupported, invalid, truncated };
 enum class FlowKind { fallthrough, call, conditional_branch, jump, ret, trap, switch_dispatch };
-enum class RegisterBank { gpr, ip, flags, segment, arm32_gpr, arm64_gpr, arm64_sp, arm64_zero, arm_flags, riscv_gpr, mips_gpr, mos6502, mips_hilo, mips_cp0, x87, ppc_gpr, ppc_cr, ppc_lr, ppc_ctr, xmm, riscv_fpr, riscv_fstatus, mips_fpr, mips_fcsr, cil_stack, ymm, riscv_vpr, riscv_vcsr, cil_continuation, ppc_xer, x87_status, x87_control, x87_tag, arm64_simd, dex_vreg, jvm_local, wasm_stack, mxcsr, zmm, opmask, ppc_fpr, jvm_stack, ppc_fpscr };
+enum class RegisterBank { gpr, ip, flags, segment, arm32_gpr, arm64_gpr, arm64_sp, arm64_zero, arm_flags, riscv_gpr, mips_gpr, mos6502, mips_hilo, mips_cp0, x87, ppc_gpr, ppc_cr, ppc_lr, ppc_ctr, xmm, riscv_fpr, riscv_fstatus, mips_fpr, mips_fcsr, cil_stack, ymm, riscv_vpr, riscv_vcsr, cil_continuation, ppc_xer, x87_status, x87_control, x87_tag, arm64_simd, dex_vreg, jvm_local, wasm_stack, mxcsr, zmm, opmask, ppc_fpr, jvm_stack, ppc_fpscr, ppc_vr };
 enum class Opcode {
     mov,
     movzx,
@@ -376,7 +376,11 @@ enum class Opcode {
     // Appended scalar PowerPC floating-point compare and unary operations.
     ppc_fcmpu, ppc_fcmpo, ppc_fmr, ppc_fneg, ppc_fabs, ppc_frsp,
     // EVEX dword/qword bitwise forms; append to preserve persisted opcode IDs.
-    vpandd, vpandq, vpord, vporq, vpxord, vpxorq
+    vpandd, vpandq, vpord, vporq, vpxord, vpxorq,
+    // VMX VX-form integer operations; append to preserve persisted opcode IDs.
+    ppc_vaddubm, ppc_vadduhm, ppc_vadduwm,
+    ppc_vsububm, ppc_vsubuhm, ppc_vsubuwm,
+    ppc_vand, ppc_vandc, ppc_vor, ppc_vxor, ppc_vnor
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
@@ -558,8 +562,8 @@ struct Instruction {
     std::optional<std::uint8_t> rounding_mode;
     bool writes_fflags = false;
     bool riscv_vector_masked = false;
-    // AdvSIMD operation shape. vector_bits is the encoded D/Q arrangement
-    // width; vector_element_bits is zero for byte-oriented logical operations.
+    // Vector operation shape. vector_bits is the architectural register width;
+    // vector_element_bits is zero when the operation has no lane interpretation.
     std::uint16_t vector_bits = 0, vector_element_bits = 0;
     // Some bytecode formats have variable-width instructions larger than the
     // native instruction-byte buffer. Retain the full encoding only then.
