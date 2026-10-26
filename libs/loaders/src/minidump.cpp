@@ -8,7 +8,8 @@ namespace hexlab {
 namespace {
 constexpr std::uint32_t stream_thread_list = 3, stream_module_list = 4,
     stream_memory_list = 5, stream_exception = 6, stream_system_info = 7,
-    stream_memory64_list = 9, stream_memory_info = 16, stream_thread_names = 24;
+    stream_memory64_list = 9, stream_unloaded_module_list = 14,
+    stream_memory_info = 16, stream_thread_names = 24;
 constexpr std::uint64_t max_streams = 4096, max_memory_regions = 131072,
     max_modules = 65536, max_threads = 65536, max_metadata_bytes = 64u * 1024u * 1024u;
 constexpr std::uint64_t max_decoded_contexts = 4096;
@@ -117,7 +118,8 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
             if (std::find_if(streams.begin(), streams.end(), [&](const auto &existing) {
                     return existing.type == row.type && (row.type == stream_thread_list || row.type == stream_module_list ||
                         row.type == stream_memory_list || row.type == stream_exception || row.type == stream_system_info ||
-                        row.type == stream_memory64_list || row.type == stream_memory_info || row.type == stream_thread_names);
+                        row.type == stream_memory64_list || row.type == stream_unloaded_module_list ||
+                        row.type == stream_memory_info || row.type == stream_thread_names);
                 }) != streams.end())
                 return Error{ErrorCode::malformed, "Minidump contains duplicate standard streams"};
             streams.push_back(row);
@@ -291,6 +293,46 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                 metadata.modules.push_back(std::move(module));
             }
             budget += count * sizeof(MinidumpModule);
+        }
+
+        if (auto list = stream(stream_unloaded_module_list)) {
+            if (list->size < 12)
+                return Error{ErrorCode::malformed, "Minidump UnloadedModuleList stream header is truncated"};
+            auto header = read(*storage, list->rva, 12);
+            if (!header) return header.error();
+            const auto header_size = u(header.value().bytes, 0, 4);
+            const auto entry_size = u(header.value().bytes, 4, 4);
+            const auto count = u(header.value().bytes, 8, 4);
+            if (header_size < 12 || header_size > 4096 || entry_size < 24 || entry_size > 4096 ||
+                header_size > list->size || count > max_modules ||
+                count > (list->size - header_size) / entry_size)
+                return Error{ErrorCode::malformed, "Minidump UnloadedModuleList header or entries are invalid"};
+            const auto table_size = header_size + count * entry_size;
+            if (table_size > max_metadata_bytes || budget > max_metadata_bytes ||
+                count > (max_metadata_bytes - budget) / sizeof(MinidumpUnloadedModule))
+                return Error{ErrorCode::resource_limit, "Minidump unloaded-module metadata exceeds its byte budget"};
+            auto bytes = read(*storage, list->rva, static_cast<std::size_t>(table_size));
+            if (!bytes) return bytes.error();
+            metadata.unloaded_modules.reserve(static_cast<std::size_t>(count));
+            for (std::uint64_t i = 0; i < count; ++i) {
+                if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump unloaded-module parsing canceled"};
+                const auto at = static_cast<std::size_t>(header_size + i * entry_size);
+                MinidumpUnloadedModule module;
+                module.record_file_offset = {std::uint64_t{list->rva} + at};
+                module.image_base = u(bytes.value().bytes, at, 8);
+                module.image_size = static_cast<std::uint32_t>(u(bytes.value().bytes, at + 8, 4));
+                module.checksum = static_cast<std::uint32_t>(u(bytes.value().bytes, at + 12, 4));
+                module.timestamp = static_cast<std::uint32_t>(u(bytes.value().bytes, at + 16, 4));
+                const auto name_rva = static_cast<std::uint32_t>(u(bytes.value().bytes, at + 20, 4));
+                if (!name_rva || (module.image_size && module.image_base > UINT64_MAX - module.image_size))
+                    return Error{ErrorCode::malformed, "Minidump unloaded-module record has an invalid name or image range"};
+                auto name = utf8(name_rva, *storage, budget);
+                if (!name) return name.error();
+                module.name_file_offset = {name_rva};
+                module.name = std::move(name.value());
+                metadata.unloaded_modules.push_back(std::move(module));
+            }
+            budget += count * sizeof(MinidumpUnloadedModule);
         }
 
         if (auto list = stream(stream_thread_list)) {

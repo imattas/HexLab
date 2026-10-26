@@ -7,8 +7,12 @@ inspect memory captured by the dump.
 
 The loader reads the bounded stream directory and supports standard
 `SystemInfo`, `MemoryList`, `Memory64List`, `MemoryInfoList`, `ModuleList`,
-`ThreadList`, `ThreadNames`, and `Exception` streams. Module and thread names
-are decoded from bounded UTF-16 strings. Thread-name rows retain their source
+`ThreadList`, `ThreadNames`, `UnloadedModuleList`, and `Exception` streams.
+Module and thread names are decoded from bounded UTF-16 strings. Unloaded module
+records retain image base, size, checksum, timestamp, name, and source file
+offset; they describe modules that were unloaded before capture and are not
+mapped into the captured image. Their header and extensible entry size are
+validated and bounded. Thread-name rows retain their source
 record and string offsets and are matched by thread ID. Thread IDs must be
 nonzero and unique within `ThreadList`; thread-name IDs must also be nonzero
 and unique within `ThreadNames`. Name rows without a matching thread context

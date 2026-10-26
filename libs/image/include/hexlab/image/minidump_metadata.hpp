@@ -26,6 +26,14 @@ struct MinidumpModule {
     std::uint32_t cv_record_size = 0, cv_record_rva = 0;
     bool operator==(const MinidumpModule &) const = default;
 };
+struct MinidumpUnloadedModule {
+    std::uint64_t image_base = 0;
+    std::uint32_t image_size = 0, checksum = 0, timestamp = 0;
+    std::string name;
+    // File offsets of the descriptor and its MINIDUMP_STRING.
+    FileOffset record_file_offset{}, name_file_offset{};
+    bool operator==(const MinidumpUnloadedModule &) const = default;
+};
 struct MinidumpThreadName {
     std::uint32_t thread_id = 0;
     std::string name;
@@ -89,6 +97,7 @@ struct MinidumpMetadata {
     std::vector<MinidumpStream> streams;
     std::vector<MinidumpMemoryRegion> memory;
     std::vector<MinidumpModule> modules;
+    std::vector<MinidumpUnloadedModule> unloaded_modules;
     std::vector<MinidumpThread> threads;
     std::vector<MinidumpThreadName> thread_names;
     std::optional<MinidumpException> exception;
