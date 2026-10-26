@@ -21,6 +21,13 @@ inline void jvm_description(std::ostream &out, const ImageMetadata &metadata) {
     }
     for (const auto &method : j.methods) {
         out << "  " << method.name << method.descriptor << " access=" << method.access_flags;
+        if (method.declared_exceptions) {
+            out << " throws=";
+            for (std::size_t i = 0; i < method.declared_exceptions->size(); ++i) {
+                if (i) out << ',';
+                out << (*method.declared_exceptions)[i];
+            }
+        }
         if (method.code) out << " code=" << method.code->code_size << " max_stack=" << method.code->max_stack
                              << " max_locals=" << method.code->max_locals
                              << " exceptions=" << method.code->exception_table.size();

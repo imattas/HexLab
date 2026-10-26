@@ -85,6 +85,15 @@ can still leave an unconstrained variable unknown. This currently covers typed
 IR comparison operators, not architecture flag predicates or register values
 nested inside other arithmetic expressions.
 
+Signedness-aware integer division and remainder operators (`sdiv`, `srem`,
+`udiv`, `urem`, and the AArch64 `a64_sdiv`/`a64_udiv` forms) now provide the
+same evidence for direct register operands. Evidence follows proven
+same-width, zero-displacement register copies. If signed and unsigned
+operations use the same value, the scalar type is left unknown; explicit
+prototype constraints still take precedence. This does not infer signedness
+for operands nested inside an expression or infer signedness from machine
+condition flags.
+
 Vector lane metadata (`element_kind`, `element_bits`, and `lanes`) now produces
 an immutable homogeneous vector type when its total width matches the IR value.
 Typed vector ABI slots and vector return registers carry that recovered type

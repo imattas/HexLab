@@ -16,10 +16,12 @@ and skips the architecturally skipped SP cell. This recovers memory footprint
 and access sites, not saved register values. On AArch64 it tracks
 `ADD/SUB SP, SP, #imm`, constant `ADD/SUB`
 relations between SP and x29 (including restoring SP from x29), and direct typed
-memory operands based on SP or x29. Scalar and pair load/store writeback through
-SP updates the entry-relative depth, covering common `STP`/`LDP` prologue and
-epilogue forms. Post-indexed accesses use the pre-writeback address; pre-indexed
-accesses use the adjusted address. On A32 and Thumb it tracks immediate SP adjustments,
+memory operands based on SP or x29. `LDP`/`STP` pair operands based on a tracked
+SP or x29 produce two adjacent typed slots, each with the instruction's read or
+write provenance. Scalar and pair load/store writeback through SP updates the
+entry-relative depth, covering common `STP`/`LDP` prologue and epilogue forms.
+Post-indexed accesses use the pre-writeback address; pre-indexed accesses use
+the adjusted address. On A32 and Thumb it tracks immediate SP adjustments,
 `MOV r7/r11,sp`, and constant `ADD`/`SUB` relations that establish r7/r11
 from SP or adjust an already tracked frame register. SP restoration from those
 frame registers, immediate SP-based load/store operands, and writeback address

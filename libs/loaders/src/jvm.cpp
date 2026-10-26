@@ -271,6 +271,19 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 const auto code_bytes=bytes.subspan(static_cast<std::size_t>(code_owner->file_begin.value),code_owner->code_size);
                 auto table=read_stack_map_table(r,md,*member,*code_owner,code_bytes,stop,expanded_verification_entries,stack_map_frames);
                 if(!table)return table.error();code_owner->stack_map_table=std::move(table.value());
+            }else if(method&&member&&an.value()=="Exceptions"){
+                if(member->declared_exceptions)return malformed("duplicate Exceptions attribute");
+                std::uint16_t exception_count=0;
+                if(len<2||!r.u2(exception_count)||std::uint64_t(exception_count)*2+2!=len)
+                    return malformed("Exceptions attribute length does not match its class indexes");
+                member->declared_exceptions.emplace();member->declared_exceptions->reserve(exception_count);
+                for(unsigned i=0;i<exception_count;++i){
+                    std::uint16_t ix=0;if(!r.u2(ix))return malformed("truncated Exceptions class index");
+                    auto name=class_name(ix);if(!name)return name.error();
+                    member->declared_exceptions->push_back(std::move(name.value()));
+                }
+            }else if(an.value()=="Exceptions"){
+                return malformed("Exceptions attribute appears outside a method attribute list");
             }else if(method&&member&&an.value()=="Code"){
                 if(member->code)return malformed("duplicate Code attribute");
                 std::uint16_t ms=0,ml=0,ec=0;std::uint32_t cl=0;
