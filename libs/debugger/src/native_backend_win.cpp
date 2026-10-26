@@ -270,6 +270,42 @@ struct Arm64DebugConfiguration {
     std::size_t breakpoint_count = 0, watch_count = 0;
 };
 
+struct Arm32DebugConfiguration {
+    std::array<DWORD, 8> breakpoint_control{};
+    std::array<DWORD, 8> breakpoint_value{};
+    std::size_t breakpoint_count = 0;
+};
+
+std::optional<Arm32DebugConfiguration> encode_arm32_debug_configuration(
+    const std::vector<detail::HardwareRequest>& requests) {
+    // ARMv7 DBGBCR: enable, EL0-only PMC, and BAS for the selected instruction bytes.
+    constexpr DWORD enable = 1u;
+    constexpr DWORD user_mode = 2u << 1;
+    Arm32DebugConfiguration config;
+    for (const auto& request : requests) {
+        if (request.kind != BreakpointKind::execute || request.size != 1 ||
+            config.breakpoint_count == config.breakpoint_control.size() || request.address > UINT32_MAX)
+            return {};
+        const bool thumb = (request.address & 1u) != 0;
+        const auto address = static_cast<DWORD>(request.address & ~std::uint64_t{1});
+        DWORD bas = 0xfu;
+        DWORD value = address;
+        if (thumb) {
+            if ((address & 1u) != 0) return {};
+            // Thumb hardware breakpoints select a halfword within the aligned word.
+            const auto lane = (address & 2u) ? 2u : 0u;
+            bas = 0x3u << lane;
+            value = address & ~DWORD{3};
+        } else if ((address & 3u) != 0) {
+            return {};
+        }
+        const auto slot = config.breakpoint_count++;
+        config.breakpoint_control[slot] = enable | user_mode | (bas << 5);
+        config.breakpoint_value[slot] = value;
+    }
+    return config;
+}
+
 struct Arm64HardwareStepState {
     DWORD thread = 0;
     std::array<bool, 2> owned{};
@@ -659,6 +695,18 @@ public:
         }
         arm32_completed_step_pending_ = completed_arm32_step;
         if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
+            event.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP &&
+            target_architecture() == Architecture::arm && !hardware_breakpoints_.empty()) {
+            for (const auto& breakpoint : hardware_breakpoints_) {
+                if (breakpoint.enabled && breakpoint.kind == BreakpointKind::execute &&
+                    (breakpoint.address & ~std::uint64_t{1}) == result.address)
+                    result.breakpoint_ids.push_back(breakpoint.id);
+            }
+            if (!result.breakpoint_ids.empty()) {
+                result.kind = EventKind::breakpoint;
+                result.message = "ARM32 hardware execution breakpoint hit";
+            }
+        } else if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
             event.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP &&
             target_architecture() == Architecture::arm64 && !hardware_breakpoints_.empty()) {
             const auto address = result.address;
@@ -1705,6 +1753,22 @@ public:
             return Breakpoint{id, address, kind, true, size};
 #endif
         }
+        if (architecture == Architecture::arm) {
+#if !defined(_M_ARM)
+            return Error{ErrorCode::unsupported, "this debugger build cannot access Windows ARM32 debug registers; rebuild for ARM32"};
+#else
+            if (!pending_) return Error{ErrorCode::busy, "hardware breakpoints can only be changed while a debug event has stopped the target"};
+            auto requests = hardware_requests();
+            requests.push_back({address, kind, size});
+            if (!encode_arm32_debug_configuration(requests))
+                return Error{ErrorCode::invalid_argument, "ARM32 execute breakpoints require aligned ARM/Thumb addresses and one of eight slots"};
+            auto applied = update_hardware_registers(requests, hardware_requests());
+            if (!applied) return applied.error();
+            const auto id = ++breakpoint_id_;
+            hardware_breakpoints_.push_back({id, address, kind, size});
+            return Breakpoint{id, address, kind, true, size};
+#endif
+        }
         if (kind == BreakpointKind::read)
             return Error{ErrorCode::unsupported, "x86/x64 debug registers cannot distinguish read-only watchpoints; choose access (read/write) or write"};
         if (!pending_) return Error{ErrorCode::busy, "hardware breakpoints can only be changed while a debug event has stopped the target"};
@@ -2358,6 +2422,34 @@ private:
     Status write_debug_registers(HANDLE thread, const std::vector<detail::HardwareRequest>& requests,
                                  const std::vector<detail::HardwareRequest>& expected_current,
                                  bool newly_created_thread = false) {
+        if (target_architecture() == Architecture::arm) {
+#if !defined(_M_ARM)
+            return Error{ErrorCode::unsupported, "Windows ARM32 debug-register access requires an ARM32 debugger build"};
+#else
+            const auto desired = encode_arm32_debug_configuration(requests);
+            const auto expected = encode_arm32_debug_configuration(expected_current);
+            if (!desired || !expected)
+                return Error{ErrorCode::invalid_argument, "invalid ARM32 hardware breakpoint configuration"};
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (!GetThreadContext(thread, &context)) return win_error("GetThreadContext for ARM32 hardware breakpoint");
+            for (std::size_t i = 0; i < std::max(desired->breakpoint_count, expected->breakpoint_count); ++i) {
+                const bool was_owned = i < expected->breakpoint_count;
+                const bool will_be_owned = i < desired->breakpoint_count;
+                if (was_owned) {
+                    if (context.Bcr[i] != expected->breakpoint_control[i] ||
+                        context.Bvr[i] != expected->breakpoint_value[i])
+                        return Error{ErrorCode::conflict, "ARM32 thread breakpoint register changed outside this debugger"};
+                } else if (will_be_owned && (context.Bcr[i] != 0 || context.Bvr[i] != 0)) {
+                    return Error{ErrorCode::conflict, "ARM32 thread already uses a requested hardware breakpoint slot"};
+                }
+                context.Bcr[i] = will_be_owned ? desired->breakpoint_control[i] : 0;
+                context.Bvr[i] = will_be_owned ? desired->breakpoint_value[i] : 0;
+            }
+            if (!SetThreadContext(thread, &context)) return win_error("SetThreadContext for ARM32 hardware breakpoint");
+            return std::monostate{};
+#endif
+        }
         if (target_architecture() == Architecture::arm64) {
 #if !defined(_M_ARM64)
             return Error{ErrorCode::unsupported, "Windows ARM64 debug-register access requires an ARM64 debugger build"};

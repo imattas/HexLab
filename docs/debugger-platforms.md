@@ -8,7 +8,7 @@ can still be debugged through a compatible remote server.
 
 | Host platform and architecture | Native backend selection | Scope |
 | --- | --- | --- |
-| Windows | Win32 backend | x86/x64 process control and four-slot execution/data hardware breakpoints; native ARM32 builds expose stopped-thread GPR/NEON context edits, ARM/Thumb software breakpoints and bounded sequential-instruction steps; native ARM64 builds support stopped-thread GPR/FPSIMD context access and safe edits, software BRK breakpoints with PSTATE single-step, and up to two execution plus two data hardware breakpoints |
+| Windows | Win32 backend | x86/x64 process control and four-slot execution/data hardware breakpoints; native ARM32 builds expose stopped-thread GPR/NEON context edits, ARM/Thumb software breakpoints, bounded sequential-instruction steps and up to eight hardware execute breakpoints; native ARM64 builds support stopped-thread GPR/FPSIMD context access and safe edits, software BRK breakpoints with PSTATE single-step, and up to two execution plus two data hardware breakpoints |
 | Linux x86-64 | x86-64 ptrace backend | x86-64 and compat i386 targets, including register, memory, event, and breakpoint operations described in [Linux ptrace debugging](linux-ptrace-debugging.md) |
 | Linux AArch64 | AArch64 ptrace backend | AArch64 GPR/FPSIMD, process lifecycle, memory, software breakpoints, hardware execute/watchpoints, and per-thread run-state; scalable SVE state is conditional on kernel regset availability |
 | macOS x86-64 / Apple Silicon | Darwin Mach/ptrace backend | Bounded thread enumeration, task-suspended per-thread register inspection/editing, memory and module/region inspection; single-thread process execution, stepping, and software breakpoints; multi-thread stop attribution/stepping and hardware watchpoints are unsupported |
@@ -55,9 +55,17 @@ continues the event owner. At the next stop it rewinds a post-trap PC, restores
 the successor bytes, and rearms the owned breakpoint. Restoration failure
 keeps the event stopped and is retried before continuation; the temporary
 breakpoint exception must be continued as handled. Windows ARM32
-hardware breakpoint APIs expose BVR/BCR and WVR/WCR registers, but this
-backend has no transactional per-thread ownership and hit attribution for
-them, so hardware breakpoints and watchpoints remain explicitly unsupported.
+hardware breakpoints use the eight BVR/BCR execute comparators ([Armv7-A/R Architecture Reference Manual](https://developer.arm.com/documentation/ddi0406/b/Application-Level-Architecture/Introduction-to-the-ARM-Architecture/Debug)). Only execute
+breakpoints are supported; data watchpoints remain unsupported. ARM addresses
+must be four-byte aligned. Thumb addresses use the low address bit as a Thumb
+tag, which selects the indicated halfword in the aligned word; the current API
+therefore supports tagged 16-bit Thumb instruction breakpoints. Updates require
+a pending debug event and are transactional across the current target threads.
+New threads receive the active configuration at their creation event. The
+backend preserves unowned comparators, rejects occupied slots and external edits
+to owned slots, and matches execution stops to the configured instruction
+addresses. Removing breakpoints and detaching clear the owned comparators.
+Runtime behavior still requires validation on native ARM32 Windows.
 
 Windows x86 and x64 hardware breakpoints use DR0-DR3/DR7. Execution
 breakpoints and write/access watchpoints share the four available slots. Data
