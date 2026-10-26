@@ -37,18 +37,22 @@ the verified prefix and mark it partial. This recognizer consumes addresses
 already resolved by instruction decoding; unresolved ADRP/ADD pairs are only
 accepted through the exact ELF relocatable-object pair described below.
 
-AArch64 signed-offset tables are also recognized for the exact contiguous
+AArch64 signed-offset tables are recognized for either exact contiguous
 `ADRP Xbase` / `ADD Xbase, Xbase, #low` / `LDR Woff, [Xbase, Wselector,
 UXTW #2]` / `SBFM Xoff, Xoff, #0, #31` / `ADD Xoff, Xbase, Xoff` / `BR Xoff`
-form. The `SBFM` encoding must be the exact sign-extension operation (the
-`SXTW` alias), so each 32-bit table displacement is signed and is added to the
-resolved table base. This path uses only instruction facts already decoded by
-the processor; it does not infer a signed load from an unsupported opcode.
-The five setup instructions must be adjacent in the same recovered block, use
-one A64 context, preserve the stated register relationships, and address
-four-byte entries. The table must be readable and file-backed, and each
-table-relative target must decode in executable AArch64 bytes. Invalid entries
-preserve the verified prefix and mark it partial. For ELF relocatable objects,
+form, or `ADRP Xbase` / `ADD Xbase, Xbase, #low` / `LDRSW Xoff, [Xbase,
+Wselector, UXTW #2]` / `ADD Xtarget, Xbase, Xoff` / `BR Xtarget`. The explicit
+`SBFM` encoding must be the exact sign-extension operation (the `SXTW` alias);
+the `LDRSW` form uses the native signed-word load and directly writes the
+64-bit offset register. In both forms each 32-bit table displacement is
+signed and is added to the resolved table base. The `LDRSW` recognizer requires
+the indexed memory operand to have a 64-bit base, 32-bit UXTW selector shifted
+by two, zero displacement, and a 32-bit signed load. Both five/six-instruction
+sequences must be adjacent in the same recovered block, use one A64 context,
+preserve the stated register relationships, and address four-byte entries.
+The table must be readable and file-backed, and each table-relative target
+must decode in executable AArch64 bytes. Invalid entries preserve the verified
+prefix and mark it partial. For ELF relocatable objects,
 the form can recover an otherwise unresolved table base from an exact
 `R_AARCH64_ADR_PREL_PG_HI21` / `R_AARCH64_ADD_ABS_LO12_NC` pair. Both
 explicit-addend records must refer to the same validated symbol-table namespace,
@@ -170,9 +174,10 @@ fixture coverage for AArch64 remains focused on absolute-pointer tables,
 bounded invalid-entry prefixes, and rejection of unsupported entry scaling;
 the explicit signed-offset sequence described above has not yet received a
 literal fixture. Other register-based relative-table forms, provenance
-persistence, and broader 16/32-bit fixtures remain follow-up work. Direct
-`LDRSW` recognition remains unavailable until the processor decoder exposes
-that instruction with typed semantics.
+persistence, and broader 16/32-bit fixtures remain follow-up work. The signed
+offset recovery path recognizes the directly decoded register-offset `LDRSW`
+form as well as the explicit `LDR`/`SBFM` sequence; other signed-load
+addressing modes remain outside this decoder subset.
 
 MIPS64 N64 switch recovery recognizes a same-basic-block register sequence
 that constructs an absolute table base with `LUI`/`ORI` (or bounded

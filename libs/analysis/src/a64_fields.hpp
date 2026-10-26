@@ -23,6 +23,7 @@ inline bool a64_packed_operand(const Instruction &i, std::uint32_t index) {
     case Opcode::a64_movz:
     case Opcode::a64_movk:
     case Opcode::a64_ldr:
+    case Opcode::a64_ldrsw:
     case Opcode::a64_str:
     case Opcode::a64_ldrb:
     case Opcode::a64_strb:

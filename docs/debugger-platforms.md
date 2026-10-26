@@ -6,6 +6,12 @@ time. The portable GDB Remote Serial Protocol backend remains available on
 every host with the platform's TCP transport, so an unsupported native target
 can still be debugged through a compatible remote server.
 
+The desktop refreshes the thread list and per-thread run states on its inspection
+worker, so a slow native or remote backend does not block the UI. Results are
+discarded when the debug session, stop event, or selected thread changes while
+the query is in flight; the view then requests a fresh list for the current
+selection.
+
 | Host platform and architecture | Native backend selection | Scope |
 | --- | --- | --- |
 | Windows | Win32 backend | x86/x64 process control and four-slot execution/data hardware breakpoints; native ARM32 builds expose stopped-thread GPR/NEON context edits, ARM/Thumb software breakpoints, bounded sequential-instruction steps and up to eight hardware execute breakpoints; native ARM64 builds support stopped-thread GPR/FPSIMD context access and safe edits, software BRK breakpoints with PSTATE single-step, and up to two execution plus two data hardware breakpoints |

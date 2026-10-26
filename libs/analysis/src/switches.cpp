@@ -1297,22 +1297,27 @@ std::optional<SwitchSite> a64_signed_offset_switch(
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
     std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
     const ImageMetadata *metadata, std::stop_token stop) {
-    // Recognize the fully explicit sequence:
+    // Recognize either exact signed-offset sequence:
     //   ADRP Xbase; ADD Xbase, Xbase, #lo12; LDR Woff, [Xbase, Wsel, UXTW #2];
     //   SXTW Xoff, Woff (encoded as SBFM Xoff, Xoff, #0, #31);
     //   ADD Xoff, Xbase, Xoff; BR Xoff.
-    // The processor currently exposes these forms as typed instructions, so
-    // the analysis does not infer signedness from an unsupported load opcode.
-    if (dispatch_index < 5 || stop.stop_requested())
+    //   ADRP Xbase; ADD Xbase, Xbase, #lo12; LDRSW Xoff, [Xbase, Wsel, UXTW #2];
+    //   ADD Xtarget, Xbase, Xoff; BR Xtarget.
+    // Signedness comes only from the explicit SBFM alias or native LDRSW opcode.
+    const bool native_signed_load = dispatch_index >= 2 && facts[dispatch_index - 2] &&
+        facts[dispatch_index - 2]->instruction.opcode == Opcode::a64_ldrsw;
+    const std::size_t setup_size = native_signed_load ? 4 : 5;
+    if (dispatch_index < setup_size || stop.stop_requested())
         return {};
-    for (std::size_t i = dispatch_index - 5; i <= dispatch_index; ++i)
+    const auto first = dispatch_index - setup_size;
+    for (std::size_t i = first; i <= dispatch_index; ++i)
         if (!facts[i])
             return {};
 
-    const auto &page = facts[dispatch_index - 5]->instruction;
-    const auto &base_add = facts[dispatch_index - 4]->instruction;
-    const auto &load = facts[dispatch_index - 3]->instruction;
-    const auto &sign_extend = facts[dispatch_index - 2]->instruction;
+    const auto &page = facts[first]->instruction;
+    const auto &base_add = facts[first + 1]->instruction;
+    const auto &load = facts[first + 2]->instruction;
+    const auto &sign_extend = facts[first + 3]->instruction;
     const auto &target_add = facts[dispatch_index - 1]->instruction;
     const auto &dispatch = facts[dispatch_index]->instruction;
     if (dispatch.context.architecture != Architecture::arm64 || dispatch.context.mode != ExecutionMode::a64 ||
@@ -1321,8 +1326,9 @@ std::optional<SwitchSite> a64_signed_offset_switch(
         sign_extend.context != dispatch.context || target_add.context != dispatch.context ||
         page.opcode != Opcode::a64_adrp || page.flow != FlowKind::fallthrough ||
         base_add.opcode != Opcode::a64_add || base_add.flow != FlowKind::fallthrough ||
-        load.opcode != Opcode::a64_ldr || load.flow != FlowKind::fallthrough ||
-        sign_extend.opcode != Opcode::a64_sbfm || sign_extend.flow != FlowKind::fallthrough ||
+        load.opcode != (native_signed_load ? Opcode::a64_ldrsw : Opcode::a64_ldr) ||
+        load.flow != FlowKind::fallthrough ||
+        (!native_signed_load && (sign_extend.opcode != Opcode::a64_sbfm || sign_extend.flow != FlowKind::fallthrough)) ||
         target_add.opcode != Opcode::a64_add || target_add.flow != FlowKind::fallthrough)
         return {};
     const auto page_end = analysis_detail::continuation_address(page);
@@ -1331,10 +1337,13 @@ std::optional<SwitchSite> a64_signed_offset_switch(
     const auto sign_extend_end = analysis_detail::continuation_address(sign_extend);
     const auto target_add_end = analysis_detail::continuation_address(target_add);
     if (!page_end || page_end.value() != base_add.address || !base_add_end || base_add_end.value() != load.address ||
-        !load_end || load_end.value() != sign_extend.address || !sign_extend_end ||
-        sign_extend_end.value() != target_add.address || !target_add_end || target_add_end.value() != dispatch.address ||
+        !load_end || load_end.value() != sign_extend.address ||
+        (!native_signed_load && (!sign_extend_end || sign_extend_end.value() != target_add.address)) ||
+        (native_signed_load && sign_extend.address != target_add.address) ||
+        !target_add_end || target_add_end.value() != dispatch.address ||
         page.operands.size() != 2 || base_add.operands.size() != 3 || load.operands.size() != 2 ||
-        sign_extend.operands.size() != 4 || target_add.operands.size() != 3 || dispatch.operands.size() != 1)
+        (!native_signed_load && sign_extend.operands.size() != 4) ||
+        (native_signed_load && sign_extend.operands.size() != 3) || target_add.operands.size() != 3 || dispatch.operands.size() != 1)
         return {};
 
     const auto *page_reg = register_operand(page, 0);
@@ -1342,17 +1351,16 @@ std::optional<SwitchSite> a64_signed_offset_switch(
     const auto relocated_pair = a64_adrp_add_relocated_address(image, metadata, relocations, page, base_add, stop);
     if (relocated_pair.relocation_present && !relocated_pair.address)
         return {};
-    if (relocated_pair.address) {
-        if (base_add.bytes.size() < 4)
-            return {};
-        const auto word = std::to_integer<std::uint32_t>(base_add.bytes[0]) |
+    if (base_add.bytes.size() < 4)
+        return {};
+    const auto add_word = std::to_integer<std::uint32_t>(base_add.bytes[0]) |
                           (std::to_integer<std::uint32_t>(base_add.bytes[1]) << 8) |
                           (std::to_integer<std::uint32_t>(base_add.bytes[2]) << 16) |
                           (std::to_integer<std::uint32_t>(base_add.bytes[3]) << 24);
-        // ADD_ABS_LO12_NC patches the unshifted imm12 field.
-        if (word & (1u << 22))
-            return {};
-    }
+    // The switch idiom forms a low-12-bit table address; shifted ADD forms are
+    // a different address construction even when they happen to resolve.
+    if (add_word & (1u << 22))
+        return {};
     const auto decoded_page = page_address
                                   ? relocated_operand_address(page, 1, page_address->resolved_address,
                                                               relocations, stop)
@@ -1366,10 +1374,10 @@ std::optional<SwitchSite> a64_signed_offset_switch(
     const auto *low = std::get_if<ImmediateOperand>(&base_add.operands[2]);
     const auto *loaded_reg = register_operand(load, 0);
     const auto *entries = std::get_if<MemoryOperand>(&load.operands[1]);
-    const auto *extended_dest = register_operand(sign_extend, 0);
-    const auto *extended_source = register_operand(sign_extend, 1);
-    const auto *immr = std::get_if<ImmediateOperand>(&sign_extend.operands[2]);
-    const auto *imms = std::get_if<ImmediateOperand>(&sign_extend.operands[3]);
+    const auto *extended_dest = native_signed_load ? loaded_reg : register_operand(sign_extend, 0);
+    const auto *extended_source = native_signed_load ? loaded_reg : register_operand(sign_extend, 1);
+    const auto *immr = native_signed_load ? nullptr : std::get_if<ImmediateOperand>(&sign_extend.operands[2]);
+    const auto *imms = native_signed_load ? nullptr : std::get_if<ImmediateOperand>(&sign_extend.operands[3]);
     const auto *target_dest = register_operand(target_add, 0);
     const auto *target_left = register_operand(target_add, 1);
     const auto *target_right = register_operand(target_add, 2);
@@ -1381,7 +1389,8 @@ std::optional<SwitchSite> a64_signed_offset_switch(
         !same_register(page_reg, base_source) || !low || low->encoded_width != 12 ||
         low->effective_width != 64 || low->is_signed ||
         !loaded_reg ||
-        loaded_reg->bank != RegisterBank::arm64_gpr || loaded_reg->width != 32 || !entries ||
+        loaded_reg->bank != RegisterBank::arm64_gpr ||
+        loaded_reg->width != (native_signed_load ? 64 : 32) || !entries ||
         !same_register(entries->base ? &*entries->base : nullptr, page_reg) || !entries->base ||
         entries->base->width != 64 || !entries->index ||
         entries->index->bank != RegisterBank::arm64_gpr || entries->index->width != 32 ||
@@ -1390,11 +1399,13 @@ std::optional<SwitchSite> a64_signed_offset_switch(
         same_register(page_reg, &*entries->index) || same_register(page_reg, loaded_reg) ||
         !extended_dest || extended_dest->bank != RegisterBank::arm64_gpr || extended_dest->width != 64 ||
         !same_register(extended_dest, loaded_reg) || !extended_source || extended_source->width != 64 ||
-        !same_register(extended_source, loaded_reg) || !immr || immr->encoded_width != 6 ||
-        immr->effective_width != 64 || immr->is_signed || immr->value != 0 || !imms ||
-        imms->encoded_width != 6 || imms->effective_width != 64 || imms->is_signed || imms->value != 31 ||
+        !same_register(extended_source, loaded_reg) ||
+        (!native_signed_load && (!immr || immr->encoded_width != 6 || immr->effective_width != 64 ||
+         immr->is_signed || immr->value != 0 || !imms || imms->encoded_width != 6 ||
+         imms->effective_width != 64 || imms->is_signed || imms->value != 31)) ||
         !target_dest || target_dest->bank != RegisterBank::arm64_gpr || target_dest->width != 64 ||
-        !same_register(target_dest, branch_reg) || !same_register(target_dest, extended_dest) ||
+        !same_register(target_dest, branch_reg) ||
+        (!native_signed_load && !same_register(target_dest, extended_dest)) ||
         !branch_reg || branch_reg->bank != RegisterBank::arm64_gpr || branch_reg->width != 64 ||
         !target_left || !target_right || target_left->width != 64 || target_right->width != 64 ||
         !((same_register(target_left, page_reg) && same_register(target_right, extended_dest)) ||

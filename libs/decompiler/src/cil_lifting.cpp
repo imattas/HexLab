@@ -666,7 +666,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
     if (!method.body->exception_clauses.empty()) {
         result.complete = false;
         result.lifted.diagnostics.push_back(
-            "CIL exception regions expose ordered catch/filter dispatch and explicit finally/fault continuations; type matching is proven only for direct newobj throws with validated in-module assignability, while other runtime exception types, filter throwability, and full unwind semantics remain incomplete");
+            "CIL exception regions expose ordered catch/filter dispatch, filter failures as false results, and explicit finally/fault continuations; type matching is proven only for direct newobj throws with validated in-module assignability, while other runtime exception types, exact throwability, and full unwind semantics remain incomplete");
     }
     result.lifted.id = {method.method.token};
     result.lifted.entry = il_address(starts.front());
