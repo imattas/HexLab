@@ -1403,12 +1403,12 @@ void Recovery::assign_owners() {
             }
             owners[at].push_back(function->id);
             function_nodes[function->id].insert(at);
+            if (current.stop)
+                record(*current.stop);
             if (ambiguous.contains(at)) {
                 record({at, FunctionStopReason::overlap, "Conflicting instruction streams stop trusted ownership"});
                 continue;
             }
-            if (current.stop)
-                record(*current.stop);
             if (current.call_issue)
                 record(*current.call_issue);
             if (current.call) {
