@@ -161,6 +161,63 @@ std::uint16_t signal_exception(std::uint16_t status, std::uint16_t exception) no
     return static_cast<std::uint16_t>(status | exception | fsw_error_summary | fsw_busy);
 }
 
+X87Binary80 x87_indefinite() noexcept {
+    return {integer_bit | quiet_bit, static_cast<std::uint16_t>(exponent_mask | sign_mask)};
+}
+
+X87Binary80 quiet_nan(X87Binary80 value) noexcept {
+    value.significand |= quiet_bit;
+    return value;
+}
+
+X87ArithmeticResult invalid_arithmetic(std::uint16_t status, std::uint16_t control,
+                                       X87Binary80 masked_value) noexcept {
+    X87ArithmeticResult result;
+    result.invalid_operation = true;
+    result.status_word = static_cast<std::uint16_t>(status & ~fsw_c1);
+    if (control & fcw_invalid_mask) {
+        result.status_word |= fsw_invalid;
+        result.value = masked_value;
+    } else {
+        result.status_word = signal_exception(result.status_word, fsw_invalid);
+        result.completed = false;
+    }
+    return result;
+}
+
+// x87 NaN source selection differs from the usual SIMD first-source rule:
+// two same-kind NaNs select the one with the larger significand, while a
+// quiet NaN wins over a signaling NaN. Signaling NaNs still raise IE.
+bool handle_special_operands(X87Binary80 left, X87Binary80 right,
+                             const Decoded &a, const Decoded &b,
+                             std::uint16_t control, std::uint16_t status,
+                             X87ArithmeticResult &result) noexcept {
+    if (a.kind == Class::unsupported || b.kind == Class::unsupported) {
+        result = invalid_arithmetic(status, control, x87_indefinite());
+        return true;
+    }
+    const bool a_nan = is_nan(a.kind), b_nan = is_nan(b.kind);
+    if (!a_nan && !b_nan) return false;
+    const bool signaling = a.kind == Class::signaling_nan || b.kind == Class::signaling_nan;
+    X87Binary80 selected = a_nan ? left : right;
+    if (a_nan && b_nan) {
+        if (a.kind == Class::quiet_nan && b.kind == Class::signaling_nan)
+            selected = left;
+        else if (b.kind == Class::quiet_nan && a.kind == Class::signaling_nan)
+            selected = right;
+        else if (right.significand > left.significand)
+            selected = right;
+    }
+    selected = quiet_nan(selected);
+    if (signaling)
+        result = invalid_arithmetic(status, control, selected);
+    else {
+        result.status_word = static_cast<std::uint16_t>(status & ~fsw_c1);
+        result.value = selected;
+    }
+    return true;
+}
+
 struct Product128 { std::uint64_t hi, lo; };
 Product128 shift_right_jam(Product128 value, unsigned amount) noexcept {
     if (!amount) return value;
@@ -537,13 +594,38 @@ evaluate_x87_round_to_integral(const X87RoundToIntegralRequest &request) noexcep
 std::optional<X87ArithmeticResult> evaluate_x87_multiply(const X87MultiplyRequest &request) noexcept {
     if (((request.control_word >> 8) & 3) == 1) return {};
     const auto a = decode(request.left), b = decode(request.right);
-    const bool a_numeric = a.kind == Class::finite || a.kind == Class::zero;
-    const bool b_numeric = b.kind == Class::finite || b.kind == Class::zero;
-    if (!a_numeric || !b_numeric) return {};
+    X87ArithmeticResult special;
+    if (handle_special_operands(request.left, request.right, a, b,
+                                request.control_word, request.status_word, special))
+        return special;
     const bool negative = a.negative != b.negative;
+    const auto is_denormal = [](const Decoded &value) noexcept {
+        return value.kind == Class::finite && value.exponent == 0 &&
+               (value.significand & integer_bit) == 0;
+    };
+    const bool denormal = is_denormal(a) || is_denormal(b);
+    if (denormal && (request.control_word & fcw_denormal_mask) == 0) {
+        X87ArithmeticResult result;
+        result.status_word = signal_exception(
+            static_cast<std::uint16_t>(request.status_word & ~fsw_c1), fsw_denormal);
+        result.completed = false;
+        return result;
+    }
+    const auto arithmetic_status = static_cast<std::uint16_t>(request.status_word |
+        (denormal ? fsw_denormal : 0));
+    if (a.kind == Class::infinity || b.kind == Class::infinity) {
+        const auto &other = a.kind == Class::infinity ? b : a;
+        if (other.kind == Class::zero)
+            return invalid_arithmetic(arithmetic_status, request.control_word, x87_indefinite());
+        X87ArithmeticResult result;
+        result.status_word = static_cast<std::uint16_t>(arithmetic_status & ~fsw_c1);
+        result.value = X87Binary80{integer_bit,
+            static_cast<std::uint16_t>(exponent_mask | (negative ? sign_mask : 0))};
+        return result;
+    }
     if (a.kind == Class::zero || b.kind == Class::zero) {
         X87ArithmeticResult result;
-        result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
+        result.status_word = static_cast<std::uint16_t>(arithmetic_status & ~fsw_c1);
         result.value = X87Binary80{0, static_cast<std::uint16_t>(negative ? sign_mask : 0)};
         return result;
     }
@@ -591,7 +673,7 @@ std::optional<X87ArithmeticResult> evaluate_x87_multiply(const X87MultiplyReques
     significand = retained << discard;
 
     X87ArithmeticResult result;
-    result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
+    result.status_word = static_cast<std::uint16_t>(arithmetic_status & ~fsw_c1);
     if (inexact && increment) result.status_word |= fsw_c1;
     const bool overflow = exponent >= 0x7fff;
     if (overflow) {
@@ -632,10 +714,11 @@ evaluate_x87_add_subtract(const X87AddSubtractRequest &request) noexcept {
          request.operation != X87BinaryArithmetic::subtract))
         return {};
     const auto a = decode(request.left), b = decode(request.right);
-    const bool a_numeric = a.kind == Class::finite || a.kind == Class::zero;
-    const bool b_numeric = b.kind == Class::finite || b.kind == Class::zero;
-    if (!a_numeric || !b_numeric) return {};
-
+    X87ArithmeticResult special;
+    if (handle_special_operands(request.left, request.right, a, b,
+                                request.control_word, request.status_word, special))
+        return special;
+    const bool right_negative = b.negative ^ (request.operation == X87BinaryArithmetic::subtract);
     const auto is_subnormal = [](const Decoded &operand) noexcept {
         return operand.kind == Class::finite && operand.exponent == 0 &&
                (operand.significand & integer_bit) == 0;
@@ -648,12 +731,25 @@ evaluate_x87_add_subtract(const X87AddSubtractRequest &request) noexcept {
         result.completed = false;
         return result;
     }
+    X87AddSubtractRequest effective_request = request;
+    if (denormal) effective_request.status_word |= fsw_denormal;
+    if (a.kind == Class::infinity || b.kind == Class::infinity) {
+        if (a.kind == Class::infinity && b.kind == Class::infinity &&
+            a.negative != right_negative)
+            return invalid_arithmetic(effective_request.status_word, request.control_word, x87_indefinite());
+        const bool negative = a.kind == Class::infinity ? a.negative : right_negative;
+        X87ArithmeticResult result;
+        result.status_word = static_cast<std::uint16_t>(effective_request.status_word & ~fsw_c1);
+        result.value = X87Binary80{integer_bit,
+            static_cast<std::uint16_t>(exponent_mask | (negative ? sign_mask : 0))};
+        return result;
+    }
+
     const auto add_denormal_status = [denormal](X87ArithmeticResult result) noexcept {
         if (denormal) result.status_word |= fsw_denormal;
         return result;
     };
 
-    const bool right_negative = b.negative ^ (request.operation == X87BinaryArithmetic::subtract);
     const auto rc = static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10);
     if (a.kind == Class::zero && b.kind == Class::zero) {
         const bool negative = a.negative == right_negative ? a.negative : rc == 1;
@@ -667,7 +763,7 @@ evaluate_x87_add_subtract(const X87AddSubtractRequest &request) noexcept {
         const bool negative = a.kind == Class::zero ? right_negative : a.negative;
         const auto normalized = normalize_finite(nonzero);
         auto rounded = round_add_sub_result(
-            extended_significand(normalized.significand), normalized.exponent, negative, request);
+            extended_significand(normalized.significand), normalized.exponent, negative, effective_request);
         if (!rounded) return {};
         return add_denormal_status(std::move(*rounded));
     }
@@ -722,7 +818,7 @@ evaluate_x87_add_subtract(const X87AddSubtractRequest &request) noexcept {
             --exponent;
         }
     }
-    auto result = round_add_sub_result(combined, exponent, negative, request);
+    auto result = round_add_sub_result(combined, exponent, negative, effective_request);
     if (!result) return {};
     return add_denormal_status(std::move(*result));
 }

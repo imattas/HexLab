@@ -335,6 +335,16 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             return unsupported("a result-typed if requires an else arm");
 
     if (function_end != code.size()-1) return unsupported("function has no final end operator");
+    std::vector<ValueType> function_label_results;
+    if (function_signature) {
+        for (const auto type : function_signature->result_types) {
+            const auto converted = wasm_value_type(type);
+            if (!converted) return unsupported("function label contains an unsupported result type");
+            function_label_results.push_back(*converted);
+        }
+    }
+    const auto function_label = labels.size();
+    labels.push_back({0xff, 0, function_end, code.size(), {}, function_label_results});
     struct Edge { std::size_t target; BlockEdgeKind kind; std::optional<std::size_t> label; };
     std::set<std::size_t> boundaries{0, code.size()};
     std::vector<std::vector<std::size_t>> active_labels(code.size());
@@ -349,9 +359,12 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         for (std::size_t operand = 0; operand <= *count; ++operand) {
             const auto depth = immediate(instruction, operand + 1);
             if (!depth || *depth >= active_labels[n].size())
-                return unsupported("br_table target depth is unavailable or targets the implicit function label");
+                return unsupported("br_table target depth is unavailable or invalid");
             const auto label = active_labels[n][active_labels[n].size() - 1 - static_cast<std::size_t>(*depth)];
-            const auto target = labels[label].kind == 3 ? labels[label].opener + 1 : labels[label].end + 1;
+            if (label == function_label && !function_signature)
+                return unsupported("br_table to the implicit function label requires its signature");
+            const auto target = label == function_label ? function_end :
+                labels[label].kind == 3 ? labels[label].opener + 1 : labels[label].end + 1;
             if (target >= code.size()) return unsupported("br_table target falls outside the function body");
             targets.push_back({operand < *count ? std::optional<std::uint64_t>{operand} : std::nullopt, label, target});
         }
@@ -361,13 +374,18 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         const auto op=std::to_integer<std::uint8_t>(code[n]->instruction.bytes[0]);
         if (op==2||op==3||op==4||op==5||op==0x0b||op==0x00) { boundaries.insert(n); boundaries.insert(n+1); }
         if (op==0x0c||op==0x0d||op==0x0e) { boundaries.insert(n); boundaries.insert(n+1); }
-        for (std::size_t li=0;li<labels.size();++li) if (labels[li].opener<n&&n<labels[li].end) active_labels[n].push_back(li);
+        for (std::size_t li=0;li<function_label;++li)
+            if (labels[li].opener<n&&n<labels[li].end) active_labels[n].push_back(li);
         std::sort(active_labels[n].begin(),active_labels[n].end(),[&](auto a,auto b){return labels[a].opener<labels[b].opener;});
+        active_labels[n].insert(active_labels[n].begin(), function_label);
         if (op==0x0c||op==0x0d) {
             auto depth=immediate(code[n]->instruction); if(!depth)return unsupported("branch depth unavailable");
-            if(*depth>=active_labels[n].size())return unsupported("branch depth targets the implicit function label or is invalid");
+            if(*depth>=active_labels[n].size())return unsupported("branch depth is invalid");
             const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(*depth)];
-            const auto target=labels[li].kind==3?labels[li].opener+1:labels[li].end+1;
+            if (li == function_label && !function_signature)
+                return unsupported("branch to the implicit function label requires its signature");
+            const auto target=li==function_label?function_end:
+                labels[li].kind==3?labels[li].opener+1:labels[li].end+1;
             if(target>=code.size())return unsupported("branch target falls outside the function body");
             boundaries.insert(target);
         } else if (op == 0x0e) {
@@ -393,7 +411,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         const auto op=std::to_integer<std::uint8_t>(code[n]->instruction.bytes[0]);
         const auto fallthrough=n+1;
         if(op==0x0f||op==0x00||(op==0x0b&&n==function_end))continue;
-        if(op==0x0c||op==0x0d){const auto depth=*immediate(code[n]->instruction);const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(depth)];const auto target=labels[li].kind==3?labels[li].opener+1:labels[li].end+1;if(!add_edge(bi,target,op==0x0c?BlockEdgeKind::jump:BlockEdgeKind::conditional_true,li))return unsupported("branch target is not a block boundary");if(op==0x0d&&fallthrough<code.size()&&!add_edge(bi,fallthrough,BlockEdgeKind::conditional_false))return unsupported("conditional fallthrough is not a block boundary");continue;}
+        if(op==0x0c||op==0x0d){const auto depth=*immediate(code[n]->instruction);const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(depth)];const auto target=li==function_label?function_end:labels[li].kind==3?labels[li].opener+1:labels[li].end+1;if(!add_edge(bi,target,op==0x0c?BlockEdgeKind::jump:BlockEdgeKind::conditional_true,li))return unsupported("branch target is not a block boundary");if(op==0x0d&&fallthrough<code.size()&&!add_edge(bi,fallthrough,BlockEdgeKind::conditional_false))return unsupported("conditional fallthrough is not a block boundary");continue;}
         if (op == 0x0e) { auto targets = table_targets(n); if (!targets) return targets.error(); for (const auto &target : targets.value()) if (!add_edge(bi, target.target, BlockEdgeKind::jump, target.label)) return unsupported("br_table target is not a block boundary"); continue; }
         if(op==4){const auto li=*opener_label[n];const auto false_target=labels[li].else_index<code.size()?labels[li].else_index+1:labels[li].end+1;if(fallthrough>=code.size()||!add_edge(bi,fallthrough,BlockEdgeKind::conditional_true)||false_target>=code.size()||!add_edge(bi,false_target,BlockEdgeKind::conditional_false))return unsupported("if target is outside the function body");continue;}
         if(op==5){const auto li=active_labels[n].back();const auto target=labels[li].end+1;if(target>=code.size()||!add_edge(bi,target,BlockEdgeKind::jump,li))return unsupported("else target is outside the function body");continue;}
@@ -407,6 +425,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     // every typed label produces its result value.
     std::vector<std::optional<Shape>> branch_shapes(labels.size()),end_shapes(labels.size());
     std::vector<std::optional<std::size_t>> label_heights(labels.size());
+    branch_shapes[function_label] = function_label_results;
+    label_heights[function_label] = 0;
     std::vector<std::vector<std::size_t>> predecessors(starts.size());
     // A Wasm branch may discard temporaries while preserving the target
     // label's result operands. Remember which source stack slots feed each
@@ -664,7 +684,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             if(op==5){const auto li=active_labels[n].back();auto values=take_results(labels[li].result_types);if(!values)return values.error();if(!label_heights[li]||stack.size()<*label_heights[li])return unsupported("if then-arm stack height is unavailable");stack.resize(*label_heights[li]);stack.insert(stack.end(),values.value().begin(),values.value().end());const auto target=labels[li].end+1;emit(n,Branch{"true",code[target]->instruction.address,{}});continue;}
             if(op==0x0b){if(end_label[n]){const auto li=*end_label[n];auto values=take_results(labels[li].result_types);if(!values)return values.error();if(!label_heights[li]||stack.size()<*label_heights[li])return unsupported("block stack height is unavailable");stack.resize(*label_heights[li]);stack.insert(stack.end(),values.value().begin(),values.value().end());}else if(n==function_end){auto result=emit_return(n,function_result_types.value());if(!result)return result.error();}continue;}
             if(op==0x0f){auto result=emit_return(n,function_result_types.value());if(!result)return result.error();continue;}
-            if(op==0x0c||op==0x0d){auto depth=immediate(i);if(!depth)return unsupported("branch depth unavailable");const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(*depth)];const auto target=labels[li].kind==3?labels[li].opener+1:labels[li].end+1;if(op==0x0c)emit(n,Branch{"true",code[target]->instruction.address,{}});else{auto cond=pop(integer(32));if(!cond)return cond.error();emit(n,Branch{"br_if",code[target]->instruction.address,n+1<code.size()?std::optional<Address>{code[n+1]->instruction.address}:std::nullopt,cond.value()});}continue;}
+            if(op==0x0c||op==0x0d){auto depth=immediate(i);if(!depth)return unsupported("branch depth unavailable");const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(*depth)];const auto target=li==function_label?function_end:labels[li].kind==3?labels[li].opener+1:labels[li].end+1;if(op==0x0c)emit(n,Branch{"true",code[target]->instruction.address,{}});else{auto cond=pop(integer(32));if(!cond)return cond.error();emit(n,Branch{"br_if",code[target]->instruction.address,n+1<code.size()?std::optional<Address>{code[n+1]->instruction.address}:std::nullopt,cond.value()});}continue;}
             if(op==0x0e){auto selector=pop(integer(32));if(!selector)return selector.error();auto targets=table_targets(n);if(!targets)return targets.error();LiftedBlock::SwitchDispatch dispatch;dispatch.selector=selector.value();for(const auto &target:targets.value()){const auto target_block=block_for(target.target);if(!target_block)return unsupported("br_table target is not a basic block");const auto address=code[starts[*target_block]]->instruction.address;if(target.value)dispatch.cases.push_back({*target.value,address});else dispatch.default_target=address;}lifted.switch_dispatch=std::move(dispatch);continue;}
             if(op==0x1a){auto v=pop({});if(!v)return v.error();continue;}
             if(op==0x1b){auto cond=pop(integer(32));if(!cond)return cond.error();auto when_true=pop({});if(!when_true)return when_true.error();auto when_false=pop(when_true.value()->type);if(!when_false)return when_false.error();auto alternatives=binary("pair",when_true.value(),when_false.value(),when_true.value()->type);stack.push_back(binary("select_if",cond.value(),alternatives,when_true.value()->type));continue;}

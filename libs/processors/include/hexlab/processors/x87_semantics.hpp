@@ -125,10 +125,11 @@ struct X87ArithmeticResult {
     bool completed = true;
     bool overflow = false;
     bool precision = false;
+    bool invalid_operation = false;
     bool operator==(const X87ArithmeticResult &) const = default;
 };
-// Evaluate finite and signed-zero binary80 FMUL operands with x87 precision
-// control and RC. NaN/infinity and unsupported encodings fail closed.
+// Evaluate binary80 FMUL finite, signed-zero, infinity, and NaN operands with
+// x87 precision control and exception masks. Gradual-underflow results fail closed.
 HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
 evaluate_x87_multiply(const X87MultiplyRequest &request) noexcept;
 
@@ -139,8 +140,8 @@ struct X87AddSubtractRequest {
     std::uint16_t control_word = 0x037f;
     std::uint16_t status_word = 0;
 };
-// Evaluate finite and signed-zero binary80 FADD/FSUB operands with x87
-// precision control and RC. NaNs, infinities, reserved PC, and gradual-
+// Evaluate binary80 FADD/FSUB finite, signed-zero, infinity, and NaN operands
+// with x87 precision control and exception masks. Reserved PC and gradual-
 // underflow results fail closed.
 HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
 evaluate_x87_add_subtract(const X87AddSubtractRequest &request) noexcept;

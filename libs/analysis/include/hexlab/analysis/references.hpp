@@ -183,6 +183,10 @@ struct ReferenceProvenance {
     std::optional<ElfVTableReferenceProvenance> elf_vtable;
     std::optional<MachOReferenceProvenance> macho;
     std::shared_ptr<const MachODyldReferenceProvenance> dyld;
+    // Execution mode proven for an interworking ARM code target. The address
+    // remains normalized; this preserves the BX/BLX mode decision for display
+    // and mode-aware navigation.
+    std::optional<ExecutionMode> target_mode;
 };
 struct Reference {
     ReferenceId id;

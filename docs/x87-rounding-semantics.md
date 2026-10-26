@@ -22,32 +22,43 @@ model stack underflow, memory access, pending-exception delivery, or decompiler
 SSA integration. The behavior follows Intel's [FRNDINT instruction
 reference](https://cdrdv2-public.intel.com/812383/253666-sdm-vol-2a.pdf).
 
-The caller-driven API evaluates `FMUL` for zero and finite operands, including
-normalization of subnormal and pseudo-denormal inputs when the result is
-normal. Zero products preserve the XORed sign and clear C1 while preserving
-other status bits. Finite products form the significand product with integer
-limbs and apply FCW precision-control and rounding-control fields.
+The caller-driven API evaluates `FMUL` for zero, finite, infinity, and NaN
+operands, including normalization of subnormal and pseudo-denormal inputs when
+the result is normal. Zero products preserve the XORed sign; infinity products
+preserve the sign XOR; and finite products form the significand product with
+integer limbs and apply FCW precision-control and rounding-control fields.
+Denormal inputs set DE when masked, and stop before arithmetic when DM is
+clear.
 
-The caller-driven `FADD`/`FSUB` API handles finite binary80 operands and signed
-zeros. It aligns significands with an integer shift-right-jam path, normalizes
-cancellation results, rounds to the selected PC/RC, and reports DE, PE, OE,
-C1, and exception-delivery state. Opposite-sign exact cancellation produces
-negative zero only under round-toward-negative-infinity; same-sign zero inputs
-retain their sign. True subnormal inputs set DE and stop before arithmetic when
-DM is clear. Gradual-underflow result rounding remains unsupported.
+The caller-driven `FADD`/`FSUB` API handles finite, zero, infinity, and NaN
+binary80 operands. It aligns finite significands with an integer
+shift-right-jam path, normalizes cancellation results, rounds to the selected
+PC/RC, and reports DE, PE, OE, C1, and exception-delivery state. Opposite-sign
+exact cancellation produces negative zero only under round-toward-negative-
+infinity; same-sign zero inputs retain their sign. Masked denormal operands
+set DE and continue; an unmasked DE stops before arithmetic.
+
+QNaNs propagate without IE. Masked SNaNs are quieted and raise IE; x87 NaN
+source selection uses the SDM's QNaN preference and larger-significand rule.
+Masked unsupported encodings and invalid arithmetic combinations return the
+x87 floating-point indefinite QNaN. The modeled invalid arithmetic cases are
+opposite-signed infinities for addition, like-signed infinities for
+subtraction, and zero multiplied by infinity. Unmasked IE sets IE/ES/B and
+returns no destination value. Ordinary infinities and finite-plus-infinity
+results retain their architectural signs.
+
+Gradual-underflow result rounding remains unsupported.
 
 For x87 register arithmetic, an unmasked PE still commits the rounded value
 while marking exception delivery incomplete. Unmasked overflow remains
 fail-closed because the biased x87 register result is not modeled. Masked
 overflow returns the RC-selected infinity or largest finite value. These
-operations do not use host floating point. NaN/infinity operands, reserved
-precision-control encoding 01, and unsupported encodings fail closed. The
-operation and exception rules follow Intel's [x87 floating-point operation
-and exception definitions](https://cdrdv2-public.intel.com/835781/325462-sdm-vol-1-2abcd-3abcd-4.pdf).
-Ghidra's SLEIGH language documents floating-point operations as explicit
-p-code operators, a reference for symbolic arithmetic coverage rather than
-x87 exception behavior ([SLEIGH reference](https://ghidra.re/ghidra_docs/languages/html/sleigh)).
-Its native decompiler `FloatFormat::roundToNearestEven` uses a halfway bit,
-lower sticky bits, and the retained low bit for ties; this evaluator uses the
-same general guard/sticky decision shape over integer limbs while honoring x87
-RC/PC state ([Ghidra native float.cc](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/float.cc)).
+operations do not use host floating point. Reserved precision-control encoding
+01 and unsupported gradual-underflow results fail closed. The operation and
+exception behavior follows Intel's [x87 floating-point operation and exception
+definitions](https://cdrdv2-public.intel.com/874240/325462-090-sdm-vol-1-2abcd-3abcd-4.pdf).
+Intel specifies x87 NaN source priority. Ghidra's native decompiler
+`FloatFormat::roundToNearestEven` uses halfway, lower sticky, and retained-low
+bits for ties; this evaluator applies the same general guard/sticky decision
+shape over integer limbs while honoring x87 RC/PC state
+([Ghidra native float.cc](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/float.cc)).

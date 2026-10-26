@@ -18,10 +18,20 @@ initialized image bytes; long-jump and EH-continuation targets must map to
 initialized executable bytes. All tables are bounded by the image extent and
 the one-million-record loader budget. Malformed table content produces a
 warning and marks PE metadata incomplete.
+The versioned Guard RF helper fields (`GuardRFFailureRoutine`, its function
+pointer, and `GuardRFVerifyStackPointerFunctionPointer`) are retained as
+normalized RVAs when their complete pointer fields are present and nonzero.
+`EnclaveConfigurationPointer` and `VolatileMetadataPointer` are retained the
+same way. These values must resolve to initialized image bytes. The
+`HotPatchTableOffset` scalar is retained with its source span when present;
+HexLab does not interpret it as a file or RVA offset, nor decode the enclave,
+volatile-metadata, or Guard RF structures it points to.
 The CLI `inspect` metadata report prints normalized RVAs for the supported
-cookie, Guard CF, XFG, CastGuard, and Guard memcpy pointers, along with Guard CF,
-address-taken IAT, long-jump, and EH-continuation rows. Table rows include file
-provenance where available and each table has a 4096-row display cap.
+cookie, Guard CF, XFG, CastGuard, Guard memcpy, Guard RF, enclave, and
+volatile-metadata pointers, and prints the hot-patch table offset. It also
+prints Guard CF, address-taken IAT, long-jump, and EH-continuation rows. Table
+rows include file provenance where available and each table has a 4096-row
+display cap.
 
 Versioned fields are read only when their complete fixed-width fields lie
 within the structure's declared size. The parser materializes at most the

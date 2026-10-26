@@ -186,6 +186,19 @@ struct PeLoadConfiguration {
     std::optional<std::uint64_t> guard_xfg_table_dispatch_rva;
     std::optional<std::uint64_t> cast_guard_failure_mode_rva;
     std::optional<std::uint64_t> guard_memcpy_rva;
+    // Guard RF helper and metadata VAs are retained as normalized RVAs.
+    std::optional<std::uint64_t> guard_rf_failure_routine_rva;
+    std::optional<std::uint64_t> guard_rf_failure_routine_pointer_rva;
+    std::optional<std::uint64_t> guard_rf_verify_stack_pointer_rva;
+    std::optional<std::uint32_t> hot_patch_table_offset;
+    std::optional<std::uint64_t> enclave_configuration_rva;
+    std::optional<std::uint64_t> volatile_metadata_rva;
+    std::optional<PeRecordSource> guard_rf_failure_routine_source;
+    std::optional<PeRecordSource> guard_rf_failure_routine_pointer_source;
+    std::optional<PeRecordSource> guard_rf_verify_stack_pointer_source;
+    std::optional<PeRecordSource> hot_patch_table_offset_source;
+    std::optional<PeRecordSource> enclave_configuration_source;
+    std::optional<PeRecordSource> volatile_metadata_source;
     bool operator==(const PeLoadConfiguration &) const = default;
 };
 enum class PeUnwindOperationKind : std::uint8_t {
