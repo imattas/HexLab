@@ -1,0 +1,9 @@
+# Desktop symbol navigation
+
+The **Jump to location** command accepts exact symbol names in virtual-address mode and offers bounded substring suggestions when an exact name is not found. Candidates include PE imports and exports, defined ELF and Mach-O symbols, Mach-O dyld exports, PDB symbols, analyzed function names, project annotations, bookmarks, and loaded segment names. Duplicate names at different destinations open a chooser that shows the symbol name and formatted address. Address values keep their `AddressSpaceId`; numeric qualified virtual addresses use `va:<space>:<offset>`.
+
+Choosing a candidate navigates the active workspace to its typed `Location` and selects Disassembly for virtual addresses or Bytes for file offsets. The existing Pseudocode page follows the same workspace selection, so callers can inspect the destination's containing function there. File offsets remain file offsets and are not silently converted into virtual addresses.
+
+Metadata rows for imports, exports, PE symbols, ELF symbols, Mach-O symbols, runtime Objective-C records, PDB data symbols, and type assignments use the same document-bound navigation path. Reference endpoint actions also retain their source project snapshot. Before navigation, HexLab verifies that the same document is active, remains open at the same document revision, still publishes the same project snapshot, and is not closing. A tab switch, close, or analysis/project refresh while a chooser or metadata page is open cancels navigation instead of applying a destination from stale context.
+
+Import table rows navigate to their IAT slots, and export/symbol metadata rows navigate to their recorded addresses. Reference rows use the selected endpoint and preserve its location kind. These actions select the shared Disassembly or Bytes page, and Pseudocode follows virtual-address selections.

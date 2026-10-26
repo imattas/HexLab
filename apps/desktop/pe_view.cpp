@@ -163,12 +163,12 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         const auto &entry = metadata->directories[row];
         if (entry.file_offset) {
             if (entry.location <= document_->image->storage()->size() && navigate)
-                navigate(FileOffset{entry.location});
+                navigate(document_, FileOffset{entry.location});
             return;
         }
         const auto base = metadata->preferred_base;
         if (entry.location <= UINT64_MAX - base)
-            if (navigate) navigate(Address{{0}, base + entry.location});
+            if (navigate) navigate(document_, Address{{0}, base + entry.location});
     };
 
     constexpr std::size_t resource_display_limit = 4096;
@@ -226,7 +226,7 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         if (row >= resource_rows.size() || !resource_rows[row].resource || !navigate) return;
         const auto &item = *resource_rows[row].resource;
         if (item.size != 0 && !item.payload.empty())
-            navigate(Location{item.payload.front().offset});
+            navigate(document_, Location{item.payload.front().offset});
     };
 
     std::vector<BoundRow> rows;
@@ -252,7 +252,7 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
     });
     bound_imports_->activate = [this, rows](std::size_t row) {
         if (row < rows.size() && rows[row].source && navigate)
-            navigate(*rows[row].source);
+            navigate(document_, *rows[row].source);
     };
     const auto &certificate_table = metadata->pe->certificate_table;
     if (!certificate_table) {
@@ -285,8 +285,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         certificates_->activate = [this, records, shown](std::size_t row) {
             if (row >= shown || !navigate) return;
             const auto &record = records[row];
-            if (!record.payload.empty()) navigate(record.payload.front().offset);
-            else if (!record.source.spans.empty()) navigate(record.source.spans.front().offset);
+            if (!record.payload.empty()) navigate(document_, record.payload.front().offset);
+            else if (!record.source.spans.empty()) navigate(document_, record.source.spans.front().offset);
         };
     }
     const auto &load_config = metadata->pe->load_configuration;
@@ -336,7 +336,7 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
             if (row >= handlers.size() || !navigate) return;
             const auto base = metadata->preferred_base;
             if (handlers[row].rva <= UINT64_MAX - base)
-                navigate(Address{{0}, base + handlers[row].rva});
+                navigate(document_, Address{{0}, base + handlers[row].rva});
         };
     }
     std::vector<ExceptionRow> exception_rows;
@@ -419,9 +419,9 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
     });
     exceptions_->activate = [this, exception_rows](std::size_t row) {
         if (row < exception_rows.size() && exception_rows[row].source && navigate)
-            navigate(*exception_rows[row].source);
+            navigate(document_, *exception_rows[row].source);
         else if (row < exception_rows.size() && exception_rows[row].address && navigate)
-            navigate(*exception_rows[row].address);
+            navigate(document_, *exception_rows[row].address);
     };
     const auto &pdb = *metadata->pe;
     const auto *pdb_ptr = &pdb;
@@ -446,7 +446,7 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         }
     });
     pdb_symbols_->activate = [this, pdb_ptr](std::size_t row) {
-        if (row < pdb_ptr->pdb_symbols.size() && pdb_ptr->pdb_symbols[row].address && navigate) navigate(*pdb_ptr->pdb_symbols[row].address);
+        if (row < pdb_ptr->pdb_symbols.size() && pdb_ptr->pdb_symbols[row].address && navigate) navigate(document_, *pdb_ptr->pdb_symbols[row].address);
     };
     pdb_types_->populate(std::min<std::size_t>(4096, pdb.pdb_types.size()), [pdb_ptr](std::size_t row, int column) {
         const auto &item = pdb_ptr->pdb_types[row];
@@ -467,7 +467,7 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         }
     });
     pdb_lines_->activate = [this, pdb_ptr](std::size_t row) {
-        if (row < pdb_ptr->source_lines.size() && pdb_ptr->source_lines[row].address && navigate) navigate(*pdb_ptr->source_lines[row].address);
+        if (row < pdb_ptr->source_lines.size() && pdb_ptr->source_lines[row].address && navigate) navigate(document_, *pdb_ptr->source_lines[row].address);
     };
     std::vector<std::pair<std::size_t, std::optional<std::size_t>>> inline_rows;
     for (std::size_t i = 0; i < pdb.pdb_inline_sites.size() && inline_rows.size() < 4096; ++i) {
@@ -496,7 +496,7 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         if (row >= inline_rows.size()) return;
         const auto &[site, range] = inline_rows[row];
         if (range && pdb_ptr->pdb_inline_sites[site].ranges[*range].address && navigate)
-            navigate(*pdb_ptr->pdb_inline_sites[site].ranges[*range].address);
+            navigate(document_, *pdb_ptr->pdb_inline_sites[site].ranges[*range].address);
     };
     pdb_inline_->fit_columns({0, 1, 2, 3, 4, 5});
     directories_->fit_columns({0, 1, 2, 3});

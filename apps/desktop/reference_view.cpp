@@ -286,7 +286,7 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
         auto target = std::get_if<Location>(&ref.target);
         auto location = incoming || !target ? ref.source : *target;
         if (navigate)
-            navigate(id, location);
+            navigate(id, project_, location);
     };
     pin_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
         if (!document_) return;
@@ -301,7 +301,7 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
         if (document_ && location_ && navigate) {
             const auto id = *document_;
             const auto location = *location_;
-            navigate(id, location);
+            navigate(id, project_, location);
         }
     });
     table_->SetToolTip("References for the selected location. Use Up/Down to select an item; Enter or double-click follows its current endpoint.");
@@ -328,7 +328,7 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
         }
         if (event.ControlDown() && event.GetKeyCode() == WXK_HOME) {
             if (document_ && location_ && navigate)
-                navigate(*document_, *location_);
+            navigate(*document_, project_, *location_);
             return;
         }
         event.Skip();
@@ -460,10 +460,10 @@ void ReferenceView::follow_selected(bool target) {
         const auto *destination = std::get_if<Location>(&reference->target);
         if (!destination) return;
         const auto location = *destination;
-        navigate(id, location);
+        navigate(id, project_, location);
     } else {
         const auto location = reference->source;
-        navigate(id, location);
+        navigate(id, project_, location);
     }
 }
 void ReferenceView::retain_documents(std::span<const DocumentInfo> docs) {
