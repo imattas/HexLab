@@ -64,7 +64,7 @@ a pending debug event and are transactional across the current target threads.
 New threads receive the active configuration at their creation event. The
 backend preserves unowned comparators, rejects occupied slots and external edits
 to owned slots, and matches execution stops to the configured instruction
-addresses after clearing the low Thumb tag from both the configured and reported`r`naddresses. Removing breakpoints and detaching clear the owned comparators.
+addresses after clearing the low Thumb tag from both the configured and reported addresses. Removing breakpoints and detaching clear the owned comparators.
 Runtime behavior still requires validation on native ARM32 Windows.
 
 Windows x86 and x64 hardware breakpoints use DR0-DR3/DR7. Execution
