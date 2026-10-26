@@ -410,7 +410,9 @@ enum class Opcode {
     rv_vwsub_vv, rv_vwsub_vx, rv_vwsub_wv, rv_vwsub_wx,
     rv_vwsubu_vv, rv_vwsubu_vx, rv_vwsubu_wv, rv_vwsubu_wx,
     // Appended RISC-V Zba scalar address-generation forms.
-    rv_sh1add, rv_sh2add, rv_sh3add, rv_add_uw, rv_sh1add_uw, rv_sh2add_uw, rv_sh3add_uw, rv_slli_uw
+    rv_sh1add, rv_sh2add, rv_sh3add, rv_add_uw, rv_sh1add_uw, rv_sh2add_uw, rv_sh3add_uw, rv_slli_uw,
+    // RVV non-accumulating widening integer multiply; appended for ID stability.
+    rv_vwmulu_vv, rv_vwmulu_vx, rv_vwmulsu_vv, rv_vwmulsu_vx, rv_vwmul_vv, rv_vwmul_vx
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

@@ -11,7 +11,7 @@ F/D scalar instructions enter the shared pipeline with a distinct floating value
 Floating-result intrinsics carry an explicit 32- or 64-bit result type into type recovery. Only FPR destinations receive that floating fact; integer results and `fflags` remain separate effects.
 
 The decoded RVV integer elementwise families share one explicit opcode-to-effect
-route covering 84 forms:
+route covering 90 forms:
 
 | Family | Retained forms |
 | --- | --- |
@@ -22,6 +22,7 @@ route covering 84 forms:
 | Multiply | `vmul`, `vmulh`, `vmulhu`, `vmulhsu` in `.vv/.vx` |
 | Multiply-accumulate | `vmacc`, `vnmsac`, `vmadd`, `vnmsub` in `.vv/.vx` |
 | Widening multiply-accumulate | `vwmaccu`, `vwmacc`, `vwmaccsu` in `.vv/.vx`; `vwmaccus.vx` |
+| Widening multiply | `vwmulu`, `vwmulsu`, `vwmul` in `.vv/.vx` |
 | Divide/remainder | `vdivu`, `vdiv`, `vremu`, `vrem` in `.vv/.vx` |
 | Comparisons | `vmseq/vmsne` in `.vv/.vx/.vi`; `vmsltu/vmslt` in `.vv/.vx`; `vmsleu/vmsle` in `.vv/.vx/.vi`; `vmsgtu/vmsgt` in `.vx/.vi` |
 
@@ -48,6 +49,9 @@ The widening multiply-accumulate forms retain the same dependency and carry
 distinct opcode names. Their result remains an opaque vector here: the generic
 instruction does not carry the active SEW or LMUL needed to prove a concrete
 2*SEW lane shape or a legal destination register group.
+The non-accumulating widening multiply forms keep their signedness in distinct
+intrinsics and do not read the old destination as a multiply input. Destination
+preservation is still represented for masked or undisturbed lanes.
 The names distinguish accumulation into the old destination (`vmacc`,
 `vnmsac`) from multiplication using the old destination (`vmadd`, `vnmsub`).
 The lifter preserves their architectural input dependencies without lowering

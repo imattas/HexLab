@@ -74,7 +74,9 @@ enum class RiscvOpcode {
     vwsub_vv, vwsub_vx, vwsub_wv, vwsub_wx,
     vwsubu_vv, vwsubu_vx, vwsubu_wv, vwsubu_wx,
     // Zba address-generation operations; appended for stable decoded IDs.
-    sh1add, sh2add, sh3add, add_uw, sh1add_uw, sh2add_uw, sh3add_uw, slli_uw
+    sh1add, sh2add, sh3add, add_uw, sh1add_uw, sh2add_uw, sh3add_uw, slli_uw,
+    // RVV non-accumulating widening integer multiply; appended for ID stability.
+    vwmulu_vv, vwmulu_vx, vwmulsu_vv, vwmulsu_vx, vwmul_vv, vwmul_vx
 };
 
 struct RiscvRegister {

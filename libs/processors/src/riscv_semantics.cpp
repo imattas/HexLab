@@ -399,6 +399,47 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
         return result;
     }
 
+    bool widening_multiply = false, widening_vector_multiplier = false;
+    bool widening_first_signed = false, widening_second_signed = false;
+    switch (opcode) {
+    case RiscvOpcode::vwmulu_vv: widening_multiply = true; widening_vector_multiplier = true; break;
+    case RiscvOpcode::vwmulu_vx: widening_multiply = true; break;
+    case RiscvOpcode::vwmulsu_vv: widening_multiply = true; widening_vector_multiplier = true; widening_first_signed = true; break;
+    case RiscvOpcode::vwmulsu_vx: widening_multiply = true; widening_first_signed = true; break;
+    case RiscvOpcode::vwmul_vv: widening_multiply = true; widening_vector_multiplier = true; widening_first_signed = widening_second_signed = true; break;
+    case RiscvOpcode::vwmul_vx: widening_multiply = true; widening_first_signed = widening_second_signed = true; break;
+    default: break;
+    }
+    if (widening_multiply) {
+        if (sew > 32 || config.lmul_log2 > 2 ||
+            (widening_vector_multiplier && operands.vs1.size() != vlmax))
+            return {};
+        const auto source_mask = width_mask(sew);
+        const auto destination_mask = width_mask(2 * sew);
+        const auto extend = [source_mask, sew](std::uint64_t value, bool is_signed) {
+            value &= source_mask;
+            if (is_signed && negative(value, sew)) value |= ~source_mask;
+            return value;
+        };
+        std::uint64_t scalar = operands.scalar & width_mask(xlen);
+        if (sew > xlen && (scalar & (UINT64_C(1) << (xlen - 1))))
+            scalar |= ~width_mask(xlen);
+        RiscvVectorIntegerResult result;
+        result.vlmax = vlmax;
+        result.element_bits = static_cast<std::uint8_t>(2 * sew);
+        result.lanes.assign(operands.old_destination.begin(), operands.old_destination.end());
+        for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
+            if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0)
+                continue;
+            const auto second_raw = widening_vector_multiplier
+                ? operands.vs1[static_cast<std::size_t>(lane)] : scalar;
+            const auto first_raw = operands.vs2[static_cast<std::size_t>(lane)];
+            result.lanes[static_cast<std::size_t>(lane)] =
+                (extend(first_raw, widening_first_signed) * extend(second_raw, widening_second_signed)) & destination_mask;
+        }
+        return result;
+    }
+
     // Widening MAC destinations have EMUL = 2*LMUL and 2*SEW-bit elements.
     // The public lane representation is uint64_t, so SEW=64 (a 128-bit
     // destination) is deliberately left to symbolic lifting.

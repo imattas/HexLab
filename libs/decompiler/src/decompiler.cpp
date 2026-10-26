@@ -173,6 +173,9 @@ std::optional<RiscvVectorEffect> riscv_integer_vector_effect(Opcode opcode) {
     RVV_PAIR(vwmacc, false);
     RVV_PAIR(vwmaccsu, false);
     case Opcode::rv_vwmaccus_vx: return RiscvVectorEffect{"vwmaccus.vx", false};
+    RVV_PAIR(vwmulu, false);
+    RVV_PAIR(vwmulsu, false);
+    RVV_PAIR(vwmul, false);
     case Opcode::rv_vwadd_vv: return RiscvVectorEffect{"vwadd.vv", false};
     case Opcode::rv_vwadd_vx: return RiscvVectorEffect{"vwadd.vx", false};
     case Opcode::rv_vwadd_wv: return RiscvVectorEffect{"vwadd.wv", false};
