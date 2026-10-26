@@ -1078,8 +1078,12 @@ private:
                                           const std::vector<TemplateParameter> &parameters,
                                           std::map<std::string, std::uint64_t, std::less<>> &bindings,
                                           std::uint64_t argument, unsigned &strength) {
-        if (pattern.size() != 1)
-            fail(ErrorCode::unsupported, "non-type specialization patterns must be one integer literal or parameter name");
+        if (pattern.size() != 1) {
+            const auto value = evaluate_integer_expression(pattern, {});
+            if (value < 0) fail(ErrorCode::unsupported, "negative non-type specialization patterns are unsupported");
+            strength = 8;
+            return static_cast<std::uint64_t>(value) == argument;
+        }
         const auto &token = pattern.front().text;
         const auto parameter = std::find_if(parameters.begin(), parameters.end(), [&](const auto &item) {
             return item.name == token;
@@ -1101,6 +1105,23 @@ private:
         const auto value = integer_magnitude(token, std::numeric_limits<std::uint64_t>::max());
         strength = 8;
         return value == argument;
+    }
+    bool is_dependent_value_expression_pattern(
+        const std::vector<Token> &pattern,
+        const std::vector<TemplateParameter> &parameters) const {
+        if (pattern.size() <= 1) return false;
+        bool dependent = false;
+        for (const auto &token : pattern) {
+            if (!identifier(token.text) || token.text == "true" || token.text == "false") continue;
+            const auto parameter = std::find_if(parameters.begin(), parameters.end(), [&](const auto &item) {
+                return item.name == token.text;
+            });
+            if (parameter == parameters.end()) continue;
+            if (!parameter->value_parameter || parameter->template_parameter || parameter->pack)
+                fail(ErrorCode::unsupported, "non-type specialization expressions can reference only integral parameters");
+            dependent = true;
+        }
+        return dependent;
     }
     bool template_template_parameter_pattern(const std::vector<Token> &pattern,
                                             const std::vector<TemplateParameter> &parameters,
@@ -1192,6 +1213,7 @@ private:
             if (specialization.patterns.size() != complete_arguments.size()) continue;
             TemplateBindings candidate_bindings;
             std::vector<unsigned> strengths(complete_arguments.size(), specialization.parameters.empty() ? 10000u : 0u);
+            std::vector<std::size_t> dependent_value_expressions;
             bool matches = true;
             for (std::size_t i = 0; i < complete_arguments.size(); ++i) {
                 const auto &primary_parameter = definition->second.parameters[i];
@@ -1199,9 +1221,19 @@ private:
                 unsigned pattern_strength = 0;
                 bool matched = false;
                 if (primary_parameter.value_parameter && complete_arguments[i].value) {
-                    matched = template_value_parameter_pattern(pattern, specialization.parameters,
-                                                               candidate_bindings.values,
-                                                               *complete_arguments[i].value, pattern_strength);
+                    if (is_dependent_value_expression_pattern(pattern, specialization.parameters)) {
+                        dependent_value_expressions.push_back(i);
+                        matched = true;
+                        // Dependent expressions are checked for equality, but
+                        // do not claim a specificity advantage over a direct
+                        // parameter pattern. This keeps overlapping or
+                        // equivalent arithmetic patterns ambiguous.
+                        pattern_strength = 0;
+                    } else {
+                        matched = template_value_parameter_pattern(pattern, specialization.parameters,
+                                                                   candidate_bindings.values,
+                                                                   *complete_arguments[i].value, pattern_strength);
+                    }
                 } else if (!primary_parameter.value_parameter && !primary_parameter.template_parameter &&
                            complete_arguments[i].type) {
                     matched = template_parameter_pattern(pattern, specialization.parameters,
@@ -1229,6 +1261,17 @@ private:
                      !candidate_bindings.types.contains(parameter.name)))
                     fail(ErrorCode::unsupported,
                          "partial specialization contains a parameter that cannot be deduced");
+            for (const auto index : dependent_value_expressions) {
+                const auto evaluated = evaluate_integer_expression(specialization.patterns[index],
+                                                                   candidate_bindings.values);
+                if (evaluated < 0)
+                    fail(ErrorCode::unsupported, "negative non-type specialization patterns are unsupported");
+                if (static_cast<std::uint64_t>(evaluated) != *complete_arguments[index].value) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (!matches) continue;
             matches_found.push_back({&specialization, std::move(candidate_bindings), std::move(strengths)});
         }
 
