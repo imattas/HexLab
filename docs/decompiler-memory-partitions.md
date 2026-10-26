@@ -14,7 +14,11 @@ The partitioner recognizes three bounded forms:
   the same address space. A load or store uses the resulting connected-range
   partition only when its exact byte range was observed and mapped.
 - **Pointer-relative ranges:** a base register must have a proven SSA pointer
-  origin through supported copies, constant offsets, and unanimous phi inputs.
+  origin through supported copies, constant offsets, constant-proven SSA
+  register offsets, and unanimous phi inputs. Integer offsets are propagated
+  from literals, same-width copies, and unanimous phis before pointer origins
+  are solved, so an address expression such as `base + offset_register` can
+  produce an exact range when that register has one proven value.
   The memory access may have no index register, or use a same-width index whose
   exact nonnegative integer constant is proven through a literal, same-width
   copy, or unanimous phi. Indexed scale/shift and displacement arithmetic must
@@ -46,6 +50,8 @@ the function keeps only whole-memory SSA.
 
 This does not partition heap or global accesses whose address cannot be proven,
 aliases reached through unrelated roots, variable or signed-negative indices,
-index extensions other than the proven same-width form, or arbitrary pointer
-arithmetic. The IR keeps these partitions supplementary: passes that ignore
-`memory_partition` continue to use the coarser `memory_version` chain.
+index extensions other than the proven same-width form, or pointer arithmetic
+whose offset is not a proven nonnegative constant (or direct subtraction of
+one) in a same-width integer expression. The IR keeps these partitions
+supplementary: passes that ignore `memory_partition` continue to use the coarser
+`memory_version` chain.

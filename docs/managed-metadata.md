@@ -95,11 +95,25 @@ unresolved with a reason in `unresolved_scope`. Binding is bounded by the
 TypeRef scopes remain unresolved. Public-key-to-token conversion and missing
 assembly identities are not inferred.
 
+When catalog binding succeeds, a TypeRef node inside a retained TypeSpec also
+records the exact destination catalog index and TypeDef token, in addition to
+its original source TypeRef token and display scope. This lets callers
+distinguish identical names from different loaded assemblies without replacing
+the original metadata identity. Binding revisits TypeSpec trees and validates
+each `GENERICINST` arity against the uniquely resolved destination TypeDef;
+known mismatches remain visible in metadata and are marked invalid, so a
+consumer passing the signature to the CIL lifter keeps the resulting value
+type unknown. An unresolved or ambiguous TypeRef does not
+gain a guessed destination or arity proof. `VAR` and `MVAR` remain separate
+ordinal spaces; substitution still requires an explicit declaring-type or
+method argument context and leaves unbound variables open.
+
 `managed_type_is_assignable_across_catalogs` follows local TypeDef base and
 interface edges plus uniquely bound external TypeRefs. It returns false when a
 chain contains an unresolved reference or the bounded traversal cannot prove
-the relation. Generic TypeSpec substitution and strong-name public-key-to-token
-conversion are not inferred by this resolver.
+the relation. It still does not substitute constructed generic base/interface
+edges or compare closed generic assignability. Strong-name public-key-to-token
+conversion is not inferred by this resolver.
 
 Method-shaped `MemberRef` signatures now carry recursively substituted
 `ManagedTypeSignature` trees when their TypeSpec owner resolves to an

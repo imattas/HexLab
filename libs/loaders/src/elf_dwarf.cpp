@@ -55,7 +55,8 @@ const ElfSection *debug_section(const ElfMetadata &metadata, std::string_view na
 // sections contain data fields; instruction relocations are deliberately not
 // decoded or rewritten here. ET_REL symbol values are section-relative.
 void relocate_dwarf_data(const ElfMetadata &metadata,
-                         const std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> &buffers) {
+                         const std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> &buffers,
+                         std::stop_token stop) {
     const auto bytes_for = [&](std::uint32_t section) -> std::vector<std::uint8_t> * {
         for (const auto &[index, bytes] : buffers) if (index == section) return bytes;
         return nullptr;
@@ -67,9 +68,15 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
         for (std::uint8_t i = 0; i < width; ++i)
             bytes[static_cast<std::size_t>(offset) + i] = static_cast<std::uint8_t>(value >> (8 * i));
     };
+    std::size_t relocation_index = 0;
     for (const auto &rel : metadata.relocations) {
+        if ((relocation_index++ & 0x3ffu) == 0) canceled(stop);
         if (!rel.target_section || !bytes_for(*rel.target_section)) continue;
         require(metadata.header.object_type == 1, "DWARF section relocations are supported only for ET_REL objects", ErrorCode::unsupported);
+        require(*rel.target_section < metadata.sections.size(), "DWARF relocation target section is unavailable");
+        const auto &target_section = metadata.sections[*rel.target_section];
+        require((target_section.flags & 0x800u) == 0 && !target_section.name.starts_with(".zdebug_"),
+                "Relocations into compressed DWARF sections are unsupported", ErrorCode::unsupported);
         const bool x64 = metadata.header.machine == 62;
         const bool a64 = metadata.header.machine == 183;
         std::uint8_t width = 0;
@@ -92,7 +99,7 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
             }
         }
         require(symbol_matches == 1 && symbol && symbol->state == ElfSymbolState::defined && symbol->section_index < metadata.sections.size(),
-                "DWARF relocation symbol is not a uniquely defined section symbol", ErrorCode::unsupported);
+                "DWARF relocation symbol is not a uniquely defined symbol in a valid section", ErrorCode::unsupported);
         auto &target = *bytes_for(*rel.target_section);
         require(rel.offset <= target.size() && width <= target.size() - rel.offset, "DWARF relocation field exceeds target section");
         const auto max_value = width == 8 ? UINT64_MAX : std::uint64_t(UINT32_MAX);
@@ -520,7 +527,7 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
         add_reloc_buffer(addresses, address_bytes); add_reloc_buffer(line_strings, line_string_bytes);
         add_reloc_buffer(location_lists, location_list_bytes); add_reloc_buffer(locations, location_bytes);
         add_reloc_buffer(range_lists, range_list_bytes); add_reloc_buffer(ranges, range_bytes);
-        relocate_dwarf_data(metadata, relocation_buffers);
+        relocate_dwarf_data(metadata, relocation_buffers, stop);
         canceled(stop);
         symbols::DwarfSections dwarf_sections;
         dwarf_sections.source_id = "ELF .debug_info";
@@ -712,6 +719,15 @@ Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
         auto abbrev_bytes = read_debug_bytes(storage, metadata, *abbrev, budget, stop);
         std::vector<std::uint8_t> strings, string_offsets, addresses, line_strings,
             location_lists, range_lists, ranges, line_bytes;
+        std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> relocation_buffers;
+        const auto add_reloc_buffer = [&](const ElfSection *section, std::vector<std::uint8_t> &bytes) {
+            if (section && !bytes.empty()) {
+                const auto index = static_cast<std::uint32_t>(section - metadata.sections.data());
+                relocation_buffers.emplace_back(index, &bytes);
+            }
+        };
+        add_reloc_buffer(info, info_bytes);
+        add_reloc_buffer(abbrev, abbrev_bytes);
         dwarf.info = info_bytes;
         dwarf.abbrev = abbrev_bytes;
         dwarf.stop = stop;
@@ -719,8 +735,10 @@ Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
         if (request.address_size) dwarf.expected_split_address_size = request.address_size;
         dwarf.type_signature_resolver = std::move(type_signature_resolver);
         const auto copy_optional = [&](std::string_view name, std::vector<std::uint8_t> &target) {
-            if (const auto *section = debug_section(metadata, name); section && section->size)
+            if (const auto *section = debug_section(metadata, name); section && section->size) {
                 target = read_debug_bytes(storage, metadata, *section, budget, stop);
+                add_reloc_buffer(section, target);
+            }
         };
         copy_optional(".debug_str.dwo", strings);
         copy_optional(".debug_str_offsets.dwo", string_offsets);
@@ -730,6 +748,9 @@ Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
         copy_optional(".debug_rnglists.dwo", range_lists);
         copy_optional(".debug_ranges.dwo", ranges);
         copy_optional(".debug_line.dwo", line_bytes);
+        relocate_dwarf_data(metadata, relocation_buffers, stop);
+        dwarf.info = info_bytes;
+        dwarf.abbrev = abbrev_bytes;
         dwarf.strings = strings;
         dwarf.string_offsets = string_offsets;
         dwarf.addresses = addresses;

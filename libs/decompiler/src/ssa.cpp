@@ -29,7 +29,11 @@ std::optional<std::int64_t> add_signed(std::int64_t left, std::int64_t right) {
     return left + right;
 }
 
-std::optional<PointerOrigin> pointer_origin(const ExpressionPtr &expression, const PointerOrigins &origins) {
+std::optional<std::uint64_t> integer_constant(const ExpressionPtr &expression,
+                                              const IntegerConstants &constants);
+
+std::optional<PointerOrigin> pointer_origin(const ExpressionPtr &expression, const PointerOrigins &origins,
+                                            const IntegerConstants &constants) {
     if (!expression) return {};
     if (const auto *reg = std::get_if<RegisterValue>(&expression->value)) {
         if (!reg->version || !expression->type.bits || expression->type.bits != reg->reg.width) return {};
@@ -41,15 +45,15 @@ std::optional<PointerOrigin> pointer_origin(const ExpressionPtr &expression, con
     if (!expression->type.bits || !binary->left || !binary->right ||
         binary->left->type.bits != expression->type.bits || binary->right->type.bits != expression->type.bits)
         return {};
-    auto left = pointer_origin(binary->left, origins);
-    auto *constant = binary->right ? std::get_if<ConstantValue>(&binary->right->value) : nullptr;
+    auto left = pointer_origin(binary->left, origins, constants);
+    auto offset_constant = integer_constant(binary->right, constants);
     if (!left && binary->operation == "add") {
-        left = pointer_origin(binary->right, origins);
-        constant = binary->left ? std::get_if<ConstantValue>(&binary->left->value) : nullptr;
+        left = pointer_origin(binary->right, origins, constants);
+        offset_constant = integer_constant(binary->left, constants);
     }
-    if (!left || !constant || std::get<2>(left->root.first) != expression->type.bits ||
-        constant->value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return {};
-    auto delta = static_cast<std::int64_t>(constant->value);
+    if (!left || !offset_constant || std::get<2>(left->root.first) != expression->type.bits ||
+        *offset_constant > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return {};
+    auto delta = static_cast<std::int64_t>(*offset_constant);
     if (binary->operation == "sub") delta = -delta;
     const auto offset = add_signed(left->offset, delta);
     if (!offset) return {};
@@ -893,9 +897,55 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
     if (exception_memory_edges.empty()) recovered_slots.emplace(recover_stack_variables(result));
     if (recovered_slots && *recovered_slots) {
         auto partitioned = std::move(recovered_slots->value());
-        // Track pointer identity only through SSA copies, constant add/sub, and
-        // unanimous phis. Every other value gets an opaque root; distinct roots
-        // remain may-alias, so this never licenses cross-root disjointness.
+        // Exact integer constants are needed only for finite indexed accesses.
+        // Propagate literals and same-width SSA copies, plus unanimous phis.
+        // These exact facts also permit pointer arithmetic by a proven constant
+        // register offset; arithmetic and unresolved loop-carried values remain unknown.
+        IntegerConstants integer_constants;
+        std::set<PointerValueKey> nonconstant_values;
+        bool constants_changed = true;
+        for (std::size_t iteration = 0; constants_changed && iteration < 64; ++iteration) {
+            constants_changed = false;
+            const auto propagate_constant = [&](PointerValueKey value, std::uint64_t constant) {
+                if (nonconstant_values.contains(value)) return;
+                auto [found, inserted] = integer_constants.emplace(value, constant);
+                if (inserted) constants_changed = true;
+                else if (found->second != constant) {
+                    integer_constants.erase(found);
+                    nonconstant_values.insert(value);
+                }
+            };
+            for (auto block_index : reachable) {
+                for (const auto &phi : partitioned.blocks[block_index].phis) {
+                    if (phi.inputs.empty()) continue;
+                    std::optional<std::uint64_t> unanimous;
+                    bool complete = true;
+                    for (const auto &input : phi.inputs) {
+                        const auto found = integer_constants.find({key(phi.destination), input.version});
+                        if (found == integer_constants.end()) { complete = false; break; }
+                        if (!unanimous) unanimous = found->second;
+                        else if (*unanimous != found->second) { complete = false; break; }
+                    }
+                    if (complete && unanimous) {
+                        propagate_constant(PointerValueKey{key(phi.destination), phi.version}, *unanimous);
+                    }
+                }
+                for (const auto &instruction : partitioned.blocks[block_index].instructions)
+                    if (const auto *assign = std::get_if<Assign>(&instruction.statement);
+                        assign && assign->destination_version) {
+                        if (!assign->value || assign->destination.width != assign->value->type.bits) continue;
+                        const auto candidate = integer_constant(assign->value, integer_constants);
+                        if (!candidate) continue;
+                        propagate_constant(PointerValueKey{key(assign->destination), *assign->destination_version},
+                                           *candidate);
+                    }
+            }
+        }
+
+        // Track pointer identity through SSA copies, constant add/sub (including
+        // offsets in constant-proven SSA registers), and unanimous phis. Every
+        // other value gets an opaque root; distinct roots remain may-alias, so
+        // this never licenses cross-root disjointness.
         PointerOrigins pointer_origins;
         for (const auto &variable : variables)
             pointer_origins.emplace(PointerValueKey{variable, 0}, PointerOrigin{{variable, 0}, 0});
@@ -946,53 +996,10 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                 for (const auto &instruction : partitioned.blocks[block_index].instructions)
                     if (const auto *assign = std::get_if<Assign>(&instruction.statement); assign && assign->destination_version) {
                         if (!assign->value || assign->destination.width != assign->value->type.bits) continue;
-                        const auto candidate = pointer_origin(assign->value, pointer_origins);
+                        const auto candidate = pointer_origin(assign->value, pointer_origins, integer_constants);
                         if (!candidate) continue;
                         auto &origin = pointer_origins[{key(assign->destination), *assign->destination_version}];
                         if (origin != *candidate) { origin = *candidate; provenance_changed = true; }
-                    }
-            }
-        }
-        // Exact integer constants are needed only for finite indexed accesses.
-        // Propagate literals and same-width SSA copies, plus unanimous phis;
-        // arithmetic and unresolved loop-carried values remain unknown.
-        IntegerConstants integer_constants;
-        std::set<PointerValueKey> nonconstant_values;
-        bool constants_changed = true;
-        for (std::size_t iteration = 0; constants_changed && iteration < 64; ++iteration) {
-            constants_changed = false;
-            const auto propagate_constant = [&](PointerValueKey value, std::uint64_t constant) {
-                if (nonconstant_values.contains(value)) return;
-                auto [found, inserted] = integer_constants.emplace(value, constant);
-                if (inserted) constants_changed = true;
-                else if (found->second != constant) {
-                    integer_constants.erase(found);
-                    nonconstant_values.insert(value);
-                }
-            };
-            for (auto block_index : reachable) {
-                for (const auto &phi : partitioned.blocks[block_index].phis) {
-                    if (phi.inputs.empty()) continue;
-                    std::optional<std::uint64_t> unanimous;
-                    bool complete = true;
-                    for (const auto &input : phi.inputs) {
-                        const auto found = integer_constants.find({key(phi.destination), input.version});
-                        if (found == integer_constants.end()) { complete = false; break; }
-                        if (!unanimous) unanimous = found->second;
-                        else if (*unanimous != found->second) { complete = false; break; }
-                    }
-                    if (complete && unanimous) {
-                        propagate_constant(PointerValueKey{key(phi.destination), phi.version}, *unanimous);
-                    }
-                }
-                for (const auto &instruction : partitioned.blocks[block_index].instructions)
-                    if (const auto *assign = std::get_if<Assign>(&instruction.statement);
-                        assign && assign->destination_version) {
-                        if (!assign->value || assign->destination.width != assign->value->type.bits) continue;
-                        const auto candidate = integer_constant(assign->value, integer_constants);
-                        if (!candidate) continue;
-                        propagate_constant(PointerValueKey{key(assign->destination), *assign->destination_version},
-                                           *candidate);
                     }
             }
         }
