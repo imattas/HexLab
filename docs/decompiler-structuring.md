@@ -296,6 +296,19 @@ a one-level conditional diamond and complete switch dispatch inside a
 pre-tested loop, each with one shared continuation. Incomplete switch
 metadata retains the explicit goto fallback.
 
+A pre-tested loop-body diamond may contain one further bounded side exit: the
+final conditional in one outer diamond arm may branch directly to the loop's
+already validated exit block while its other edge follows a straight-line path
+to the outer in-loop join. The exit block must be phi-free (including memory
+phis). The continue path and the outer sibling arm must be disjoint, and the
+join must have exactly their two tail predecessors; register phis at the join
+must cover those exact edges and are copied in parallel on each edge. The exit
+branch itself must have exactly its two resolved conditional edges, and its
+break arm must have no side-path blocks or edge assignments. The formatter emits
+the break under its original predicate and emits the shared in-loop join once.
+Other nested exit targets, side-path assignments, exit phis, extra join
+predecessors, or ambiguous ownership retain the existing fallback.
+
 The dedicated `decompiler_multiexit_structuring` test runs fixtures through SSA,
 constant and identity simplification, dead-code elimination, and formatting.
 An independent interpreter for the emitted fixture subset checks every branch
