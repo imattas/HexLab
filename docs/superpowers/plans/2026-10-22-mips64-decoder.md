@@ -32,3 +32,14 @@
 - [ ] Dispatch MIPS64 mode and add function/reachable-analysis delay-slot regressions on 64-bit addresses.
 - [ ] Add boundary, reserved-field, and unsupported-form cases plus focused documentation.
 - [ ] Run MIPS64, MIPS32, ELF, architecture-dispatch, and integrated analysis tests; update capability evidence and state remaining ABI/extension gaps.
+
+## Follow-up implementation
+
+- MIPS64 COP1 control transfers now lift FCCR25, FEXR26, and FENR28 as exact
+  bitfield views/updates of aggregate FCSR31. CFC1 extracts the aliased bits;
+  CTC1 preserves unrelated FCSR bits while replacing only the selected view.
+  The field equations were checked against MIPS32 Instruction Set Revision
+  5.04 CFC1/CTC1 semantics and Ghidra's MIPS register declarations. The
+  implementation translates behavior into HexLab SSA expressions; it does
+  not copy Ghidra source. `hexlab_decompiler` Debug build passed. Runtime
+  reserved-field validation and CTC1 exception behavior remain unmodeled.
