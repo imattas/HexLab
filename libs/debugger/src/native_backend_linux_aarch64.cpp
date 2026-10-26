@@ -767,43 +767,52 @@ public:
             return Error{ErrorCode::invalid_argument, "resume schedule must continue or step at least one thread"};
 
         if (runnable.size() > 1) {
-            if (std::any_of(runnable.begin(), runnable.end(), [](const auto* action) {
-                    return action->kind != ThreadResumeKind::continue_execution;
-                }))
-                return Error{ErrorCode::unsupported, "Linux AArch64 multi-thread schedules support continue actions only"};
-            if (pending_breakpoint_ || pending_hardware_execute_)
-                return Error{ErrorCode::unsupported, "cannot continue multiple AArch64 threads while stepping over a breakpoint"};
-            if (step_pending_ && std::any_of(runnable.begin(), runnable.end(), [&](const auto* action) {
+            const auto step_count = static_cast<std::size_t>(std::count_if(
+                runnable.begin(), runnable.end(), [](const auto* action) {
+                    return action->kind == ThreadResumeKind::single_step;
+                }));
+            if (step_count > 1)
+                return Error{ErrorCode::unsupported, "Linux AArch64 schedules support at most one single-step action"};
+            if (step_pending_ && (step_count != 0 || std::any_of(runnable.begin(), runnable.end(), [&](const auto* action) {
                     return static_cast<pid_t>(action->thread) == step_thread_;
-                }))
-                return Error{ErrorCode::busy, "cannot continue an AArch64 thread while its single-step result is pending"};
+                })))
+                return Error{ErrorCode::busy, "cannot schedule an AArch64 thread while a single-step result is pending"};
+            if (pending_breakpoint_ || pending_hardware_execute_)
+                return Error{ErrorCode::unsupported, "cannot run a multi-thread AArch64 schedule while stepping over a breakpoint"};
             auto configured = ensure_hardware_breakpoints_configured(); if (!configured) return configured;
 
-            // Resume non-owner threads first and the event owner last. If any
-            // ptrace request fails, stop every thread already resumed before
-            // returning, preserving the pending event for a retry.
+            // Run continuations before issuing the one allowed step. Keep the
+            // event owner last among continuations, then run a non-owner step
+            // last too; a failed request can therefore roll back only threads
+            // that were resumed without starting an untracked outstanding step.
             std::vector<pid_t> order;
             order.reserve(runnable.size());
             for (const auto* action : runnable) {
                 const auto tid = static_cast<pid_t>(action->thread);
-                if (tid != owner) order.push_back(tid);
+                if (tid != owner && action->kind == ThreadResumeKind::continue_execution) order.push_back(tid);
             }
             if (std::any_of(runnable.begin(), runnable.end(), [&](const auto* action) {
-                    return static_cast<pid_t>(action->thread) == owner;
+                    return static_cast<pid_t>(action->thread) == owner &&
+                           action->kind == ThreadResumeKind::continue_execution;
                 }))
                 order.push_back(owner);
+            for (const auto* action : runnable)
+                if (action->kind == ThreadResumeKind::single_step)
+                    order.push_back(static_cast<pid_t>(action->thread));
 
             std::vector<pid_t> resumed;
             resumed.reserve(order.size());
             for (const auto tid : order) {
                 const auto action = std::find_if(runnable.begin(), runnable.end(), [&](const auto* item) {
-                    return static_cast<pid_t>((*item)->thread) == tid;
+                    return static_cast<pid_t>(item->thread) == tid;
                 });
                 const auto* selected_action = *action;
                 const int queued_signal = signal_for(*selected_action);
                 const int delivered = selected_action->signal_disposition == ContinueStatus::handled ? 0 : queued_signal;
-                if (ptrace(PTRACE_CONT, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(delivered))) != 0) {
-                    const auto error = sys_error("PTRACE_CONT scheduled AArch64 thread");
+                const auto request = selected_action->kind == ThreadResumeKind::single_step ? PTRACE_SINGLESTEP : PTRACE_CONT;
+                if (ptrace(request, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(delivered))) != 0) {
+                    const auto error = sys_error(selected_action->kind == ThreadResumeKind::single_step
+                        ? "PTRACE_SINGLESTEP scheduled AArch64 thread" : "PTRACE_CONT scheduled AArch64 thread");
                     rollback_threads_ = resumed;
                     auto rollback = stop_threads_for_rollback(resumed);
                     if (!rollback) {
@@ -815,6 +824,10 @@ public:
                 }
                 stopped_.erase(tid);
                 deferred_signals_.erase(tid);
+                if (selected_action->kind == ThreadResumeKind::single_step) {
+                    step_thread_ = tid;
+                    step_pending_ = true;
+                }
                 resumed.push_back(tid);
             }
             for (const auto& action : actions) {
@@ -833,8 +846,8 @@ public:
         const auto tid = static_cast<pid_t>(selected_action->thread);
         const int queued_signal = signal_for(*selected_action);
         const int delivered = selected_action->signal_disposition == ContinueStatus::handled ? 0 : queued_signal;
-        if (step_pending_ && tid == step_thread_)
-            return Error{ErrorCode::busy, "cannot resume an AArch64 thread while its single-step result is pending"};
+        if (step_pending_ && (tid == step_thread_ || selected_action->kind == ThreadResumeKind::single_step))
+            return Error{ErrorCode::busy, "cannot resume the pending AArch64 step thread or issue another step"};
         if (pending_breakpoint_ && tid != owner)
             return Error{ErrorCode::unsupported, "cannot preserve a pending software-breakpoint event while scheduling another thread"};
         if (pending_hardware_execute_ && tid != owner)
