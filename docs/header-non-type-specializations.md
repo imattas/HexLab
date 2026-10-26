@@ -46,12 +46,17 @@ duplicate declarations. Repeated direct integral parameter names must match
 the same value. A specialization parameter that cannot be deduced from its
 pattern is rejected.
 
+Template-template arguments can also be matched by a direct template-template
+parameter name or by a fixed previously declared class or alias template name.
+The template parameter shapes must match exactly. Compound template argument
+patterns and template-template parameter packs remain unsupported.
+
 The importer does not evaluate arithmetic or symbolic expressions in
 specialization patterns: `N + 1`, enumerators, negative values, and pointer or
 reference non-type arguments remain unsupported. Type patterns are limited to
 the existing direct `T`, `T*`, `const T*`, and fixed-type forms. Template-
 template parameters and parameter packs can appear in primary class templates,
-but specializations of templates that use either are not supported. Scope is
+but parameter packs remain unsupported by specializations. Scope is
 part of template identity, so same-named templates in distinct namespaces
 remain independent. Function
 and alias-template specializations remain unsupported. Ambiguous matches fail
