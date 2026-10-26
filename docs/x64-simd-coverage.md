@@ -222,6 +222,16 @@ multiply-add keeps its defined wrapping exceptional result; mixed byte
 multiply-add saturates to signed words. Shared bounded lane routines serve
 both the existing VEX evaluator and this EVEX evaluator.
 
+The EVEX bitwise subset includes `vpandd/q`, `vpord/q`, and `vpxord/q` for
+VL128, VL256, and VL512. These use map 0F, `pp=66`, and opcode DB, EB, or EF;
+W=0 selects the dword mnemonic and W=1 selects the qword mnemonic. Each form
+uses the same full-width vector register or memory source, result-element
+masking, merge/zero behavior, and upper-ZMM clearing as the other supported
+EVEX integer operations. Their typed intrinsic shapes preserve 32- or 64-bit
+unsigned lanes, and the pure evaluator applies the bitwise operation over the
+active vector bytes. Reserved pp values and unsupported maps remain rejected;
+the existing VEX `vpand`, `vpor`, and `vpxor` opcode identities are unchanged.
+
 The decompiler has a separate EVEX integer route rather than extending VEX
 comparison or shuffle rules to unrelated encodings. Each intrinsic retains the
 two full-width source shapes, the result shape, signedness, optional old
