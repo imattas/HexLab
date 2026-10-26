@@ -49,7 +49,16 @@ Result<std::shared_ptr<ProjectSession>> ProjectSession::attach_impl(std::shared_
     const auto path=std::filesystem::absolute(session->store_->path());blank.protected_paths.push_back(path);for(auto suffix:{L"-wal",L"-shm",L"-journal"}){auto companion=path;companion+=suffix;blank.protected_paths.push_back(std::move(companion));}
     if(auto backing=std::dynamic_pointer_cast<const FileStorage>(blank.original))blank.protected_paths.push_back(std::filesystem::absolute(backing->backing_path()));
     if(state->provenance){const auto& provenance=*state->provenance;if(!provenance.native_path.empty())blank.protected_paths.push_back(std::filesystem::absolute(provenance.native_path));if(!provenance.relative_path.empty()){auto relative=std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(provenance.relative_path.data()),provenance.relative_path.size()));blank.protected_paths.push_back((path.parent_path()/relative).lexically_normal());}}
-    auto prepared=project_bytes(blank,std::move(state),stop);if(!analyze && prepared->loaded){prepared->status=DerivedStatus::pending;prepared->reason="Analysis pending";}session->snapshot_=std::move(prepared);if(analyze)take(session->refresh_analysis(stop));return session;
+    auto prepared=project_bytes(blank,std::move(state),stop);
+    // A successful durable load completes this import's loader pass. Publish
+    // both diagnostic sources in one database transaction so cancellation or
+    // a failed load cannot erase the last completed set.
+    if(prepared->loaded && session->store_->mode()!=database::ProjectMode::read_only){
+        take(session->store_->replace_loader_diagnostics(prepared->loaded->diagnostics,
+            prepared->loaded->runtime_relocation_diagnostics,stop));
+        prepared->state=take(session->store_->snapshot());
+    }
+    if(!analyze && prepared->loaded){prepared->status=DerivedStatus::pending;prepared->reason="Analysis pending";}session->snapshot_=std::move(prepared);if(analyze)take(session->refresh_analysis(stop));return session;
 });}
 std::shared_ptr<const ProjectSnapshot> ProjectSession::snapshot()const{std::lock_guard lock(mutex_);return snapshot_;}
 Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::set_analysis_options(const AnalysisOptions& options){return project_detail::guarded([&]()->Result<std::shared_ptr<const ProjectSnapshot>>{std::lock_guard lock(mutex_);options_=options;auto next=std::make_shared<ProjectSnapshot>(*snapshot_);next->analysis_options=options;snapshot_=std::move(next);return snapshot_;});}

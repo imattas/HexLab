@@ -4,6 +4,7 @@
 #include "hexlab/analysis/dependencies.hpp"
 #include "hexlab/analysis/signatures.hpp"
 #include "hexlab/image/patches.hpp"
+#include "hexlab/image/metadata.hpp"
 #include "hexlab/loaders/recipe.hpp"
 #include "hexlab/types/types.hpp"
 #include <array>
@@ -104,6 +105,9 @@ struct ProjectState {
     ProjectUuid uuid{};LoadRecipe recipe{Format::raw,RawOptions{Architecture::x86_64,ExecutionMode::x86_64,{{0},0},true,false,true,{}}};
     InputIdentity input;ProjectRevisions revisions;std::uint64_t history_cursor=0,next_entity=1,history_count=0;
     std::optional<InputProvenance> provenance;
+    // Loader-origin findings are durable import metadata, independent of the
+    // undoable user state. Runtime relocation findings share the same lifecycle.
+    std::vector<Diagnostic> loader_diagnostics, runtime_relocation_diagnostics;
     std::shared_ptr<const UserState> user=std::make_shared<const UserState>();
 };
 enum class ProjectMode {read_write,read_only,collaborative};
@@ -221,6 +225,7 @@ public:
     // Runtime debugger metadata is committed atomically without changing edit
     // revisions or creating undo history.
     HEXLAB_DATABASE_EXPORT Result<bool> persist_breakpoint_hit_counts(std::span<const BreakpointHitCount>,std::stop_token);
+    HEXLAB_DATABASE_EXPORT Result<bool> replace_loader_diagnostics(std::span<const Diagnostic>,std::span<const Diagnostic>,std::stop_token);
     HEXLAB_DATABASE_EXPORT Result<bool> checkpoint(std::stop_token);
 private:
     struct HistorySaveRequest {std::uint64_t expected_edit,target_step;HistoryPreviewLimits limits;};

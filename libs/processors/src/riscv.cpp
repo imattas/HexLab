@@ -450,6 +450,22 @@ bool decode_op(std::uint32_t w, RiscvInstruction &i, bool word_form, unsigned xl
     const unsigned f7 = w >> 25;
     const bool m_extension = f7 == 1;
     const bool word = word_form;
+    if (!word && f7 == 0x10 && (f3 == 2 || f3 == 4 || f3 == 6)) {
+        const auto op = f3 == 2 ? RiscvOpcode::sh1add : f3 == 4 ? RiscvOpcode::sh2add : RiscvOpcode::sh3add;
+        set_rr(i, op, rd, rs1, rs2);
+        return true;
+    }
+    if (xlen == 64) {
+        if (word && f7 == 0x04 && f3 == 0) {
+            set_rr(i, RiscvOpcode::add_uw, rd, rs1, rs2);
+            return true;
+        }
+        if (word && f7 == 0x10 && (f3 == 2 || f3 == 4 || f3 == 6)) {
+            const auto op = f3 == 2 ? RiscvOpcode::sh1add_uw : f3 == 4 ? RiscvOpcode::sh2add_uw : RiscvOpcode::sh3add_uw;
+            set_rr(i, op, rd, rs1, rs2);
+            return true;
+        }
+    }
     // Zbb count operations use the unary OP encoding with rs2=0. Reject
     // nonzero rs2 here instead of interpreting reserved encodings as aliases.
     if (f7 == 0x30 && rs2 == 0 && f3 >= 1 && f3 <= 3) {
@@ -517,6 +533,11 @@ bool decode_op_imm(std::uint32_t w, RiscvInstruction &i, bool word_form, unsigne
     const auto imm = sign_extend(w >> 20, 12);
     if (word_form && xlen != 64)
         return false;
+    if (word_form && xlen == 64 && f3 == 1 && (w & 0xfc00707fu) == 0x0800101bu) {
+        const unsigned shift = (w >> 20) & 63;
+        set_ri(i, RiscvOpcode::slli_uw, rd, rs1, shift, 6, false);
+        return true;
+    }
     if (word_form) {
         if (f3 == 0) {
             set_ri(i, RiscvOpcode::addiw, rd, rs1, imm, 12);

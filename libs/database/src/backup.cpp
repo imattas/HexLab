@@ -54,7 +54,7 @@ Result<SavedProject> ProjectStore::save_as_impl(const std::filesystem::path& des
                 // Only the unpublished copy is migrated. Read-only legacy sources
                 // remain untouched and the fork opens as a normal editable project.
                 if(history){
-                    if(copied_version<11)detail::migrate_schema(*output);
+                    if(copied_version<12)detail::migrate_schema(*output);
                     auto preview=detail::take(detail::project_history_at(*output,history->expected_edit,history->target_step,history->limits,stop));
                     detail::restore_history_copy(*output,preview);
                 }

@@ -118,6 +118,10 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
             Opcode::rv_vwaddu_vv, Opcode::rv_vwaddu_vx, Opcode::rv_vwaddu_wv, Opcode::rv_vwaddu_wx,
             Opcode::rv_vwsub_vv, Opcode::rv_vwsub_vx, Opcode::rv_vwsub_wv, Opcode::rv_vwsub_wx,
             Opcode::rv_vwsubu_vv, Opcode::rv_vwsubu_vx, Opcode::rv_vwsubu_wv, Opcode::rv_vwsubu_wx}[opcode_index - 263];
+    else if (opcode_index >= 279 && opcode_index <= 286)
+        opcode = std::array{Opcode::rv_sh1add, Opcode::rv_sh2add, Opcode::rv_sh3add, Opcode::rv_add_uw,
+            Opcode::rv_sh1add_uw, Opcode::rv_sh2add_uw, Opcode::rv_sh3add_uw, Opcode::rv_slli_uw}
+            [opcode_index - 279];
     else
         return {DecodeStatus::invalid, {}, "RV64 opcode has no generic representation"};
 

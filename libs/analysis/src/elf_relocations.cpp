@@ -192,6 +192,17 @@ struct ElfRelocationResolver::State {
             if (extended != *result)
                 return unresolved(ElfResolutionReason::overflow);
         }
+        if (metadata->header.machine == 40 && absolute && (row.type == 5 || row.type == 8)) {
+            // AAELF32 permits either signed or unsigned narrow values. In
+            // the ELF32 address domain, negative signed results occupy the
+            // high end of the 32-bit representation.
+            const auto bits = static_cast<unsigned>(*row.field_size * 8);
+            const auto low = *result & UINT32_MAX;
+            const auto signed_min = UINT32_MAX - (UINT32_C(1) << (bits - 1)) + 1;
+            const auto unsigned_max = (UINT32_C(1) << bits) - 1;
+            if (low > unsigned_max && low < signed_min)
+                return unresolved(ElfResolutionReason::overflow);
+        }
         target->offset = *result;
         output.reason = ElfResolutionReason::resolved;
         output.address = target;

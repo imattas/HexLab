@@ -468,20 +468,25 @@ void AnalysisIssuesView::rebuild() {
 
     const auto *snapshot = project_ ? project_->functions.get() : nullptr;
     const auto *loaded = project_ ? project_->loaded.get() : nullptr;
-    // Project loader diagnostics are authoritative for a project. A file-only
-    // document retains its loader result directly in DocumentSnapshot.
+    // The immutable loaded image belongs to this exact project snapshot, so it
+    // takes precedence over durable diagnostics from the preceding revision.
+    // Durable rows provide a fallback when the project has no loaded image.
     const auto *file_diagnostics = !project_ && document_snapshot_ ? &document_snapshot_->diagnostics : nullptr;
-    const auto diagnostic_count = loaded
-        ? std::min(max_loader_rows, loaded->diagnostics.size()) +
-              std::min(max_loader_rows, loaded->runtime_relocation_diagnostics.size())
+    const auto *durable_loader = project_ && project_->state ? &project_->state->loader_diagnostics : nullptr;
+    const auto *durable_runtime = project_ && project_->state ? &project_->state->runtime_relocation_diagnostics : nullptr;
+    const auto *loader_items = loaded ? &loaded->diagnostics : durable_loader;
+    const auto *runtime_items = loaded ? &loaded->runtime_relocation_diagnostics : durable_runtime;
+    const auto diagnostic_count = project_
+        ? std::min(max_loader_rows, loader_items ? loader_items->size() : 0) +
+              std::min(max_loader_rows, runtime_items ? runtime_items->size() : 0)
         : file_diagnostics ? std::min(max_loader_rows, file_diagnostics->size()) : 0;
     const auto active_type = document_ && type_diagnostics_.contains(document_->value) ? &type_diagnostics_.at(document_->value) : nullptr;
     const auto active_decompiler = document_ && decompiler_diagnostics_.contains(document_->value) ? &decompiler_diagnostics_.at(document_->value) : nullptr;
     const auto producer_count = std::min(max_loader_rows, active_type ? active_type->size() : 0) +
                                 std::min(max_loader_rows, active_decompiler ? active_decompiler->size() : 0);
     const auto diagnostic_total = diagnostic_count + producer_count;
-    const bool diagnostic_source_truncated = loaded
-        ? loaded->diagnostics.size() > max_loader_rows || loaded->runtime_relocation_diagnostics.size() > max_loader_rows
+    const bool diagnostic_source_truncated = project_
+        ? (loader_items && loader_items->size() > max_loader_rows) || (runtime_items && runtime_items->size() > max_loader_rows)
         : file_diagnostics && file_diagnostics->size() > max_loader_rows;
     const bool producer_source_truncated = (active_type && active_type->size() > max_loader_rows) ||
                                            (active_decompiler && active_decompiler->size() > max_loader_rows);
@@ -551,9 +556,9 @@ void AnalysisIssuesView::rebuild() {
             ++diagnostic_rows;
         }
     };
-    if (loaded) {
-        add_diagnostics(loaded->diagnostics, "Loader");
-        add_diagnostics(loaded->runtime_relocation_diagnostics, "Runtime relocation");
+    if (project_) {
+        if (loader_items) add_diagnostics(*loader_items, "Loader");
+        if (runtime_items) add_diagnostics(*runtime_items, "Runtime relocation");
     } else if (file_diagnostics) {
         add_diagnostics(*file_diagnostics, "File inspection");
     }

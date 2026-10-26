@@ -431,6 +431,10 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
                 const bool fixed_base = field.leaf == 0x1400 || field.leaf == 0x151a;
                 const bool virtual_base = field.leaf == 0x1401 || field.leaf == 0x1402;
                 if (field.leaf != 0x150d && !fixed_base && !virtual_base) continue;
+                const auto access_bits = field.attributes & 3;
+                const auto access = access_bits == 1 ? MemberAccess::private_ :
+                                    access_bits == 2 ? MemberAccess::protected_ :
+                                    access_bits == 3 ? MemberAccess::public_ : MemberAccess::unknown;
                 if ((fixed_base || virtual_base) && record.kind == CodeViewTypeKind::union_type)
                     return fail(Error{ErrorCode::unsupported, "PDB union contains a base-class subobject"});
                 std::string member_name = field.name;
@@ -481,7 +485,7 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
                     alignment = std::max(alignment, vbptr_base->alignment());
                     Member::VirtualBaseLocation location{vbptr_type.value(), field.offset, field.value,
                                                          field.leaf == 0x1402};
-                    members.push_back({std::move(member_name), member.value(), 0, {}, {}, {}, std::move(location)});
+                    members.push_back({std::move(member_name), member.value(), 0, {}, {}, {}, std::move(location), access});
                     continue;
                 }
                 if (!member.value()->size() || field.offset > record.size || *member.value()->size() > record.size - field.offset)
@@ -494,7 +498,7 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
                     return fail(Error{ErrorCode::unsupported, "PDB aggregate has an unnamed or duplicate data member"});
                 alignment = std::max(alignment, member.value()->alignment());
                 members.push_back({std::move(member_name), member.value(), record.kind == CodeViewTypeKind::union_type ? 0 : field.offset,
-                                   bit_width, bit_offset});
+                                   bit_width, bit_offset, {}, {}, access});
             }
             auto aggregate = record.kind == CodeViewTypeKind::union_type
                 ? Type::union_type(record.name, std::move(members), record.size, alignment)

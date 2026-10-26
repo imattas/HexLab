@@ -15,6 +15,7 @@ enum class Qualifier : std::uint8_t { const_ = 1, volatile_ = 2, restrict_ = 4 }
 enum class FunctionConvention : std::uint8_t { platform_default, c_decl, stdcall, fastcall, thiscall, vectorcall, sysv_abi, ms_abi, aapcs64, aapcs32, mips_n64, mips_n32 };
 using TypePtr = std::shared_ptr<const class Type>;
 class Type;
+enum class MemberAccess : std::uint8_t { unknown, private_, protected_, public_ };
 HEXLAB_TYPES_EXPORT std::string format(const Type &type);
 HEXLAB_TYPES_EXPORT hexlab::Result<std::vector<std::byte>> encode(const Type &type);
 HEXLAB_TYPES_EXPORT hexlab::Result<TypePtr> decode(std::span<const std::byte> bytes);
@@ -43,6 +44,8 @@ struct Member {
     // Present for CodeView virtual bases. `offset` is only a zero placeholder
     // in that case; runtime vbtable lookup determines the base subobject offset.
     std::optional<VirtualBaseLocation> virtual_base;
+    // Source access control is declaration metadata and does not affect layout.
+    MemberAccess access = MemberAccess::unknown;
     bool has_fixed_offset() const noexcept { return !virtual_base.has_value(); }
 };
 struct Parameter {
@@ -61,7 +64,6 @@ struct VTableSlot {
     std::uint32_t source_type_index = 0;
     std::uint32_t source_record_offset = 0; // Byte offset in the source PDB TPI stream.
 };
-enum class MemberAccess : std::uint8_t { unknown, private_, protected_, public_ };
 enum class MemberDispatch : std::uint8_t {
     non_virtual, virtual_method, introducing_virtual, pure_virtual,
     pure_introducing_virtual, unknown

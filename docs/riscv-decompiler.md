@@ -78,4 +78,9 @@ and undisturbed tail lanes remain represented as dependencies. The lifter
 does not statically evaluate vtype, determine implementation VLEN, or model
 the `vta`/`vma` agnostic choice.
 
+The scalar Zba forms `sh1add`, `sh2add`, `sh3add`, `add.uw`, their supported
+`.uw` shift-and-add variants, and `slli.uw` lift to typed shift, zero-extension,
+and addition expressions. The shift amount and 32-bit truncation are explicit;
+the lifter does not treat an unknown register index as a constant address.
+
 Focused validation is provided by `decompiler_riscv_lifting`; it exercises RV64 scalar and M operations, x0 semantics, signed and unsigned byte loads, branch predicates, SSA versions, constant M folding, signed RV64 word results, and typed F/D effects.

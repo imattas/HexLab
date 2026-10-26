@@ -180,6 +180,8 @@ Field field(const ElfHeader &header, std::uint32_t type) {
         switch (type) {
         case 2: return {K::absolute, 4}; // R_ARM_ABS32
         case 3: return {K::pc_relative, 4}; // R_ARM_REL32
+        case 5: return {K::absolute, 2}; // R_ARM_ABS16
+        case 8: return {K::absolute, 1}; // R_ARM_ABS8
         case 20: return {K::copy, {}}; // R_ARM_COPY
         case 21: return {K::global_data, 4}; // R_ARM_GLOB_DAT
         case 22: return {K::jump_slot, 4}; // R_ARM_JUMP_SLOT

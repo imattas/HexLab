@@ -20,6 +20,13 @@ evaluate_riscv_m_operation(RiscvOpcode opcode, unsigned xlen, std::uint64_t lhs,
 HEXLAB_PROCESSORS_EXPORT std::optional<std::uint64_t>
 evaluate_riscv_zbb_count_operation(RiscvOpcode opcode, unsigned xlen, std::uint64_t value) noexcept;
 
+// Evaluate the scalar Zba address-generation instructions. RV32 supports the
+// XLEN-width sh1add/sh2add/sh3add forms; RV64 additionally supports the
+// unsigned-word forms and slli.uw.
+HEXLAB_PROCESSORS_EXPORT std::optional<std::uint64_t>
+evaluate_riscv_zba_operation(RiscvOpcode opcode, unsigned xlen, std::uint64_t lhs,
+                             std::uint64_t rhs) noexcept;
+
 struct RiscvVectorIntegerConfig {
     std::uint16_t vlen_bits = 128;
     std::uint8_t sew_bits = 8;

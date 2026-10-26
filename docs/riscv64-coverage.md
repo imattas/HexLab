@@ -155,6 +155,15 @@ analysis context construction. Other ELF classes and byte orders remain
 inspectable as metadata but do not select this decoder. ABI register aliases
 and the disabled ISA extensions listed above remain outside this integration.
 
+RV32/RV64 decode the XLEN-width `sh1add`, `sh2add`, and `sh3add` Zba address
+generators. RV64 additionally decodes `add.uw`, `sh1add.uw`, `sh2add.uw`,
+`sh3add.uw`, and `slli.uw`. The semantic evaluator performs XLEN-width modular
+arithmetic and zero-extends the low 32-bit source for `.uw` forms. The typed
+lifter keeps shifts and additions explicit, and reference propagation carries
+known mapped addresses through these operations only when all required source
+values are known. This does not infer an unknown runtime index. Encodings and
+operations follow the frozen [Zba extension specification](https://github.com/riscv/riscv-bitmanip/blob/main/bitmanip/zba.adoc).
+
 ## Reference
 
 The opcode and encoding scope follows the versioned [RISC-V Unprivileged ISA

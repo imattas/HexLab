@@ -2024,6 +2024,31 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
                         result.immediate_targets[{fact->id, 2}] = *target;
                 }
                 propagated = true;
+            } else if (instruction.operands.size() == 3 &&
+                       (instruction.opcode == Opcode::rv_sh1add || instruction.opcode == Opcode::rv_sh2add ||
+                        instruction.opcode == Opcode::rv_sh3add || instruction.opcode == Opcode::rv_add_uw ||
+                        instruction.opcode == Opcode::rv_sh1add_uw || instruction.opcode == Opcode::rv_sh2add_uw ||
+                        instruction.opcode == Opcode::rv_sh3add_uw || instruction.opcode == Opcode::rv_slli_uw)) {
+                const auto *dst = riscv_register(instruction, 0);
+                const auto *lhs = riscv_register(instruction, 1);
+                const auto *rhs = instruction.opcode == Opcode::rv_slli_uw ? nullptr : riscv_register(instruction, 2);
+                std::optional<Address> target;
+                std::optional<RiscvAddressValue> definition;
+                // Address facts track mapped pointers, not arbitrary integer
+                // indices. Propagate only the exact zero-index form where the
+                // shifted operand is architectural x0 and rs2 is a known base.
+                if (lhs && !lhs->index && lhs->width == width && rhs && rhs->index && rhs->width == width) {
+                    if (const auto base = registers.find(rhs->index); base != registers.end() &&
+                        base->second.address.space == instruction.address.space &&
+                        riscv_target_segment(*image, base->second.address, OperandAccess::address)) {
+                        target = base->second.address;
+                        definition = riscv_definition(*target, fact->id, &base->second);
+                    }
+                }
+                erase_written();
+                if (dst && dst->index && dst->width == width && target && definition)
+                    registers[dst->index] = std::move(*definition);
+                propagated = true;
             }
 
             // JALR expresses its register-relative destination as a memory-shaped
