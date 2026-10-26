@@ -147,15 +147,21 @@ or explicit label/goto fallback. The recognizer is bounded to 1,024 blocks
 and 4,096 edges.
 
 Post-tested loops with an explicit preheader also accept loop-carried register
-and memory SSA phis in a bounded linear form. A straight-line setup chain
-enters the loop header, a straight-line body ends at one conditional latch,
+and memory SSA phis in a bounded form. A straight-line setup chain
+enters the loop header, a mostly straight-line body ends at one conditional latch,
 and the latch branches back to the header or into a straight-line cleanup
 chain ending in a return. The header and latch may be the same block. Setup,
 body, latch, and cleanup blocks may carry register phis when each phi has
 exactly one input for every actual CFG predecessor; function-entry phis are
 rejected. Header predecessors must be exactly the preheader and latch, and
-each other non-entry block must have exactly its preceding chain block as its
-sole predecessor. Initial copies execute after setup, recurrent copies only
+each other non-entry chain block must have exactly its preceding chain block as its
+sole predecessor. The body may contain one `if`/`else` diamond after the loop
+header: each arm follows at most 64 disjoint straight-line blocks and both
+arms converge at one join, which may be the latch. Arm blocks have exactly
+their preceding edge as predecessor, and the join has exactly the two arm
+tails as predecessors. Register phi copies execute on each actual branch,
+arm, and join edge before the shared join is emitted once. Initial header
+copies execute after setup, recurrent copies only
 on the backedge, and cleanup copies only on the exit edge. Multiple values
 use simultaneous copies, including loop-carried swaps. Whole-memory and
 per-partition memory phis require the same exact predecessor coverage and
@@ -169,7 +175,7 @@ accepts at most 1,024 blocks, 4,096 edges, 4,096 register phis and 4,096 memory
 partition phis per block, 65,536 combined register/memory phi inputs, and 64
 cleanup blocks. It requires unique block IDs and addresses, exact resolved
 edge kinds and target block
-identities, complete function coverage, and a terminal return. Body branches,
+identities, complete function coverage, and a terminal return. Further body branches,
 switches, side entries or exits, multiple latches, extra or duplicated edges,
 and malformed phis proceed to the existing region/state-machine/goto paths.
 

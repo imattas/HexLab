@@ -11,6 +11,11 @@
 #include <wx/sizer.h>
 #include <wx/stattext.h>
 #include <wx/textdlg.h>
+#include <wx/clipbrd.h>
+#include <wx/dataobj.h>
+#include <wx/filedlg.h>
+#include <wx/file.h>
+#include <wx/msgdlg.h>
 #include <algorithm>
 #include <charconv>
 #include <cctype>
@@ -862,10 +867,15 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     previous_use_->SetName("pseudocode-previous-occurrence");
     next_use_ = new wxButton(this, wxID_ANY, "Next occurrence");
     next_use_->SetName("pseudocode-next-occurrence");
+    copy_pseudocode_ = new wxButton(this, wxID_ANY, "Copy pseudocode");
+    copy_pseudocode_->SetName("pseudocode-copy");
+    save_pseudocode_ = new wxButton(this, wxID_ANY, "Save pseudocode...");
+    save_pseudocode_->SetName("pseudocode-save");
     variable_status_ = new wxStaticText(this, wxID_ANY, "Select a variable in source or the table",
                                        wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
     variable_status_->SetName("pseudocode-variable-status");
-    for (auto *button : {definition_, previous_use_, next_use_}) navigation->Add(button, 0, wxRIGHT, FromDIP(4));
+    for (auto *button : {definition_, previous_use_, next_use_, copy_pseudocode_, save_pseudocode_})
+        navigation->Add(button, 0, wxRIGHT, FromDIP(4));
     navigation->Add(variable_status_, 1, wxALIGN_CENTER_VERTICAL);
     layout->Add(navigation, 0, wxEXPAND | wxALL, FromDIP(4));
     auto *stack_panel = new wxBoxSizer(wxVERTICAL);
@@ -946,6 +956,8 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     definition_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { go_to_definition(); });
     previous_use_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_occurrence(false); });
     next_use_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_occurrence(true); });
+    copy_pseudocode_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_pseudocode(); });
+    save_pseudocode_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { save_pseudocode(); });
     const auto deferred_selection = [this] {
         const auto id = document_;
         const auto serial = render_serial_;
@@ -963,6 +975,30 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
         } else event.Skip();
     });
     update_variable_actions();
+}
+
+void PseudocodeView::copy_pseudocode() {
+    if (!model_ready_ || source_->GetValue().empty() || !wxTheClipboard->Open()) return;
+    wxTheClipboard->SetData(new wxTextDataObject(source_->GetValue()));
+    wxTheClipboard->Close();
+}
+
+void PseudocodeView::save_pseudocode() {
+    if (!model_ready_ || source_->GetValue().empty()) return;
+    wxFileDialog dialog(this, "Save pseudocode", {}, {},
+                        "C/C++ source (*.c;*.cpp)|*.c;*.cpp|Text files (*.txt)|*.txt|All files (*.*)|*.*",
+                        wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    if (dialog.ShowModal() != wxID_OK) return;
+    const auto encoded = source_->GetValue().utf8_str();
+    wxFile file;
+    if (!file.Create(dialog.GetPath(), true)) {
+        wxMessageBox("Could not write the pseudocode file.", "Save pseudocode", wxOK | wxICON_ERROR, this);
+        return;
+    }
+    const bool written = file.Write(encoded.data(), encoded.length());
+    const bool closed = file.Close();
+    if (!written || !closed)
+        wxMessageBox("Could not write the pseudocode file.", "Save pseudocode", wxOK | wxICON_ERROR, this);
 }
 
 void PseudocodeView::update_document(std::optional<DocumentId> id, std::shared_ptr<const ProjectSnapshot> project,
@@ -1551,6 +1587,9 @@ const PseudocodeVariableEdit *PseudocodeView::editable_variable() const {
     return editable && *editable < variables_.size() ? &variables_[*editable] : nullptr;
 }
 void PseudocodeView::update_variable_actions() {
+    const bool pseudocode_available = model_ready_ && !source_->GetValue().empty();
+    copy_pseudocode_->Enable(pseudocode_available);
+    save_pseudocode_->Enable(pseudocode_available);
     const auto *link = model_ready_ && selected_variable_ && *selected_variable_ < variable_links_.size()
                            ? &variable_links_[*selected_variable_] : nullptr;
     definition_->Enable(link != nullptr);

@@ -225,15 +225,21 @@ overload snapshots register arguments and each configured stack-base register;
 known scalar, pointer, floating, and typed-vector return values get a new SSA
 definition at the call. Register and stack-passed argument types are propagated
 through a bounded fixed point. Stack arguments require a unique reaching store
-in the same basic block as an exact direct call, matching caller/callee ABI
-slot maps, and a stack address resolved through constant stack-pointer
-adjustments. The scan
+in the same basic block as an exact direct call, a supported callee ABI slot,
+and a stack address resolved through constant stack-pointer adjustments. The
+caller and callee may have different register-file maps for this stack-only
+path when their stack-base register operand and pointer width are identical;
+register arguments still require a shared register file. The scan
 rejects unknown memory clobbers, overlapping stores, and source values without
 a recovered type. All known non-recursive call sites for a parameter must
 agree; an unknown recursive edge waits for a concrete seed from the same call
 component. This avoids inventing a type when independent callers disagree.
-Indirect calls, cross-register-file calls, cross-ABI stack arguments, and
-aggregate return conventions without a modeled scalar return register are not
+Indirect calls and cross-register-file register arguments are not propagated.
+Stack arguments can cross that boundary only when caller and callee use the
+same register operand for the stack base and the same pointer width; the callee
+slot offset and caller's explicit call-stack adjustment must resolve to a
+unique same-block store. Return values remain gated by the register-file map,
+and aggregate return conventions without a modeled result location are not
 propagated. Register arguments from a known callee prototype can now constrain
 the caller's matching SSA value when no conflicting local type evidence exists;
 conflicting formal types for the same call input remain ambiguous and are not
