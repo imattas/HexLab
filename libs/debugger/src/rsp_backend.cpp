@@ -816,6 +816,7 @@ class RemoteBackend final : public Backend {
     };
 public:
     explicit RemoteBackend(std::unique_ptr<rsp::ByteTransport> transport = {}) : transport_(std::move(transport)) {}
+    bool supports_scheduled_signal_disposition() const noexcept override { return true; }
     Result<ProcessInfo> launch(const Target&) override { return unsupported("RSP targets must be connected by host and port"); }
     Result<ProcessInfo> attach(ProcessId) override { return unsupported("RSP attach is performed during host connection"); }
     Result<ProcessInfo> connect_remote(std::string_view host, std::uint16_t port) override {
@@ -823,6 +824,7 @@ public:
         terminated_ = false;
         current_process_detach_rejected_ = false;
         remote_process_id_.reset();
+        pending_event_signal_ = 0;
         if (!transport_) {
             auto transport = rsp::connect_tcp(host, port, 5s);
             if (!transport) return transport.error();
@@ -853,6 +855,8 @@ public:
             }
         }
         supports_vcont_continue_ = false;
+        supports_vcont_continue_signal_ = false;
+        supports_vcont_thread_step_signal_ = false;
         supports_vcont_thread_continue_ = false;
         supports_vcont_thread_step_ = false;
         supports_vcont_thread_stop_ = false;
@@ -868,12 +872,17 @@ public:
                     const auto action = reply.substr(0, end);
                     if (action == "c") { supports_vcont_continue_ = true; supports_vcont_thread_continue_ = true; }
                     else if (action.starts_with("c:") && action.size() > 2) supports_vcont_thread_continue_ = true;
+                    else if (action == "C") supports_vcont_continue_signal_ = true;
+                    else if (action.starts_with("C:") && action.size() > 2) supports_vcont_continue_signal_ = true;
                     // vCont? advertises action kinds (normally just "s"). The
                     // packet grammar allows an action to be qualified with a
                     // thread ID, so an advertised unqualified "s" also permits
                     // the backend to target the stopped thread precisely.
                     else if (action == "s" || (action.starts_with("s:") && action.size() > 2))
                         supports_vcont_thread_step_ = true;
+                    else if (action == "S" || (action.starts_with("S:") && action.size() > 2)) {
+                        supports_vcont_thread_step_signal_ = true;
+                    }
                     else if (action == "t" || (action.starts_with("t:") && action.size() > 2))
                         supports_vcont_thread_stop_ = true;
                     if (end == std::string_view::npos) break;
@@ -986,6 +995,7 @@ public:
         remote_process_id_ = process;
         pending_stop_.reset();
         pending_event_.reset();
+        pending_event_signal_ = 0;
         pending_event_thread_.clear();
         expected_step_threads_.clear();
         legacy_expected_step_ = false;
@@ -1087,7 +1097,7 @@ public:
             if (belongs_to_process(*it)) it = expected_step_threads_.erase(it); else ++it;
         }
         inferiors_.erase(process);
-        pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear();
+        pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
         legacy_expected_step_ = false; remote_process_id_.reset(); breakpoints_.clear();
         return std::monostate{};
     }
@@ -1113,7 +1123,7 @@ public:
                     inferior.thread_states.clear();
                     inferior.known_attached = false;
                 }
-                pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear();
+                pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
                 expected_step_threads_.clear(); legacy_expected_step_ = false;
                 breakpoints_.clear();
                 // vKill;pid affects only that inferior. Keep the negotiated
@@ -1121,7 +1131,7 @@ public:
                 return std::monostate{};
             }
             for (auto& [thread, state] : thread_run_states_) state = ThreadState::exited;
-            client_.reset(); transport_.reset(); pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear();
+            client_.reset(); transport_.reset(); pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
             expected_step_threads_.clear(); legacy_expected_step_ = false; terminated_ = true; remote_process_id_.reset();
             breakpoints_.clear(); target_.reset(); target_xml_advertised_ = false; libraries_advertised_ = false;
             memory_map_advertised_ = false; threads_xml_advertised_ = false; multiprocess_supported_ = false;
@@ -1153,7 +1163,7 @@ public:
                     ? Status{Error{ErrorCode::unsupported, "remote does not support detach"}}
                     : Status{Error{ErrorCode::io, "remote rejected detach: " + result.value()}};
         }
-        client_.reset(); transport_.reset(); pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear();
+        client_.reset(); transport_.reset(); pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
         expected_step_threads_.clear(); legacy_expected_step_ = false;
         remote_thread_tokens_.clear(); thread_token_ids_.clear(); thread_run_states_.clear(); next_thread_token_ = 1;
         inferiors_.clear();
@@ -1184,6 +1194,7 @@ public:
         event.sequence = ++sequence_;
         const auto stopped_thread = stopped.value().fields.find("thread");
         pending_event_thread_ = stopped_thread == stopped.value().fields.end() ? std::string{} : stopped_thread->second;
+        pending_event_signal_ = stopped.value().signal;
         if (!pending_event_thread_.empty() && !valid_thread_wire_id(pending_event_thread_))
             return Error{ErrorCode::malformed, "remote stop does not identify a concrete thread"};
         if (non_stop_mode_ && (stopped.value().kind == 'T' || stopped.value().kind == 'S') &&
@@ -1291,21 +1302,41 @@ public:
         }
         return event;
     }
-    Status continue_event(std::uint64_t sequence, ContinueStatus) override {
+    Status continue_event(std::uint64_t sequence, ContinueStatus disposition) override {
         if (!client_ || !pending_event_ || *pending_event_ != sequence) return Error{ErrorCode::invalid_argument, "remote event sequence is stale"};
-        std::string command = supports_vcont_continue_ ? "vCont;c" : "c";
+        const auto signal_action = pending_event_signal_ != 0 && disposition == ContinueStatus::not_handled;
+        const bool use_vcont_signal = signal_action && supports_vcont_continue_signal_;
+        if (signal_action && (non_stop_mode_ || multiprocess_supported_) && !use_vcont_signal)
+            return unsupported("remote does not advertise a thread-qualified continue-with-signal action");
+        if (signal_action && multiprocess_supported_ && !supports_vcont_continue_)
+            return unsupported("remote cannot target a multiprocess continue-with-signal action");
+        std::string action = signal_action ? "C" + hex_signal(pending_event_signal_) : "c";
+        std::string command = supports_vcont_continue_ && (!signal_action || use_vcont_signal) ? "vCont;" + action :
+            (signal_action ? "C" + hex_signal(pending_event_signal_) : "c");
+        bool qualified_signal_schedule = false;
+        if (signal_action && use_vcont_signal && supports_vcont_continue_ && !non_stop_mode_ &&
+            !pending_event_thread_.empty() && pending_event_thread_ != "0") {
+            command = "vCont;" + action + ":" + pending_event_thread_ + ";c";
+            qualified_signal_schedule = true;
+        }
         if (non_stop_mode_) {
             // A stop event is owned by its stopped thread. Resume only that
             // thread; non-stop peers continue independently and may report
             // their own queued stop notifications later.
-            if (!supports_vcont_thread_continue_ || pending_event_thread_.empty() || pending_event_thread_ == "0")
+            if ((!signal_action && !supports_vcont_thread_continue_) ||
+                (signal_action && !supports_vcont_continue_signal_) || pending_event_thread_.empty() || pending_event_thread_ == "0")
                 return unsupported("non-stop continue requires an exact thread-qualified vCont action");
-            command = "vCont;c:" + pending_event_thread_;
+            command = "vCont;" + action + ":" + pending_event_thread_;
         } else if (multiprocess_supported_) {
-            if (!supports_vcont_continue_ || !remote_process_id_ ||
+            if ((signal_action ? (!use_vcont_signal || !supports_vcont_continue_) : !supports_vcont_continue_) || !remote_process_id_ ||
                 thread_process_id(pending_event_thread_) != remote_process_id_)
                 return unsupported("remote cannot continue the session process without resuming an ambiguous process selection");
-            command += ":p" + hex_thread_token(*remote_process_id_) + ".-1";
+            if (signal_action) {
+                if (!qualified_signal_schedule)
+                    return unsupported("remote cannot target the pending signal to one multiprocess thread");
+                command = "vCont;" + action + ":" + pending_event_thread_ + ";c:p" +
+                    hex_thread_token(*remote_process_id_) + ".-1";
+            } else command += ":p" + hex_thread_token(*remote_process_id_) + ".-1";
         }
         auto result = client_->send_resume(command);
         if (result) {
@@ -1318,18 +1349,21 @@ public:
                 for (auto& [thread, state] : thread_run_states_)
                     if (state != ThreadState::exited) state = ThreadState::running;
             }
-            pending_event_.reset(); pending_event_thread_.clear();
+            pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
         }
         return result;
     }
-    Status continue_thread_event(std::uint64_t sequence, ThreadId thread, ContinueStatus) override {
+    Status continue_thread_event(std::uint64_t sequence, ThreadId thread, ContinueStatus disposition) override {
         if (!client_ || !pending_event_ || *pending_event_ != sequence)
             return Error{ErrorCode::invalid_argument, "remote event sequence is stale"};
-        if (!supports_vcont_thread_continue_)
+        const bool redeliver_signal = pending_event_signal_ != 0 && disposition == ContinueStatus::not_handled;
+        if (!redeliver_signal && !supports_vcont_thread_continue_)
             return unsupported("remote does not advertise thread-qualified continue");
         const auto wire_thread = thread_id(thread);
         if (wire_thread.empty() || !valid_thread_wire_id(wire_thread))
             return Error{ErrorCode::invalid_argument, "thread token is unknown or stale"};
+        if (!pending_event_thread_.empty() && wire_thread != pending_event_thread_)
+            return Error{ErrorCode::invalid_argument, "event continuation must resume the thread that owns the pending stop"};
         if (const auto state = thread_run_states_.find(wire_thread);
             state != thread_run_states_.end() && state->second == ThreadState::exited)
             return Error{ErrorCode::invalid_argument, "cannot resume an exited remote thread"};
@@ -1340,10 +1374,16 @@ public:
         if (multiprocess_supported_ && (!remote_process_id_ || target_process != remote_process_id_ ||
             thread_process_id(pending_event_thread_) != remote_process_id_))
             return unsupported("thread-qualified continue requires exact thread IDs in the session process");
-        const auto command = "c:" + wire_thread;
+        const auto action = redeliver_signal
+            ? "C" + hex_signal(pending_event_signal_) : "c";
+        if (action.front() == 'c' && !supports_vcont_thread_continue_)
+            return unsupported("remote does not advertise thread-qualified continue");
+        if (action.front() == 'C' && !supports_vcont_continue_signal_)
+            return unsupported("remote does not advertise vCont continue-with-signal");
+        const auto command = action + ":" + wire_thread;
         auto result = client_->send_vcont(command);
         if (result) {
-            pending_event_.reset(); pending_event_thread_.clear(); expected_step_threads_.erase(wire_thread); legacy_expected_step_ = false;
+            pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0; expected_step_threads_.erase(wire_thread); legacy_expected_step_ = false;
             thread_run_states_[wire_thread] = ThreadState::running;
         }
         return result;
@@ -1366,14 +1406,29 @@ public:
                 return Error{ErrorCode::invalid_argument, "resume schedule includes an exited thread"};
             if (multiprocess_supported_ && (!remote_process_id_ || thread_process_id(wire) != remote_process_id_))
                 return unsupported("resume schedule requires exact thread IDs in the session process");
+            const bool owns_pending_signal = wire == pending_event_thread_;
+            if (action.signal_disposition && !owns_pending_signal)
+                return Error{ErrorCode::invalid_argument, "signal disposition is valid only for the thread that owns the pending stop"};
+            if (action.kind == ThreadResumeKind::stop && owns_pending_signal && pending_event_signal_ != 0)
+                return unsupported("RSP cannot preserve or disposition a pending signal in a stop action");
             if (action.kind == ThreadResumeKind::continue_execution) {
                 resumes_any_thread = true;
-                if (!supports_vcont_thread_continue_) return unsupported("remote does not advertise thread-qualified continue");
-                wire_actions.push_back("c:" + wire);
+                const bool redeliver = owns_pending_signal && pending_event_signal_ != 0 &&
+                    action.signal_disposition != std::optional<ContinueStatus>(ContinueStatus::handled);
+                if (redeliver && !supports_vcont_continue_signal_)
+                    return unsupported("remote does not advertise vCont continue-with-signal");
+                if (!redeliver && !supports_vcont_thread_continue_)
+                    return unsupported("remote does not advertise thread-qualified continue");
+                wire_actions.push_back((redeliver ? "C" + hex_signal(pending_event_signal_) : "c") + ":" + wire);
             } else if (action.kind == ThreadResumeKind::single_step) {
                 resumes_any_thread = true;
-                if (!supports_vcont_thread_step_) return unsupported("remote does not advertise thread-qualified single-step");
-                wire_actions.push_back("s:" + wire);
+                const bool redeliver = owns_pending_signal && pending_event_signal_ != 0 &&
+                    action.signal_disposition != std::optional<ContinueStatus>(ContinueStatus::handled);
+                if (redeliver && !supports_vcont_thread_step_signal_)
+                    return unsupported("remote does not advertise vCont step-with-signal");
+                if (!redeliver && !supports_vcont_thread_step_)
+                    return unsupported("remote does not advertise thread-qualified single-step");
+                wire_actions.push_back((redeliver ? "S" + hex_signal(pending_event_signal_) : "s") + ":" + wire);
             } else if (action.kind == ThreadResumeKind::stop) {
                 if (!supports_vcont_thread_stop_) return unsupported("remote does not advertise thread-qualified stop");
                 wire_actions.push_back("t:" + wire);
@@ -1397,25 +1452,31 @@ public:
             }
             pending_event_.reset();
             pending_event_thread_.clear();
+            pending_event_signal_ = 0;
             legacy_expected_step_ = false;
         }
         return result;
     }
-    Status single_step_event(std::uint64_t sequence, ContinueStatus) override {
+    Status single_step_event(std::uint64_t sequence, ContinueStatus disposition) override {
         if (!client_ || !pending_event_ || *pending_event_ != sequence) return Error{ErrorCode::invalid_argument, "remote event sequence is stale"};
         if (multiprocess_supported_ && (!remote_process_id_ || thread_process_id(pending_event_thread_) != remote_process_id_))
             return unsupported("remote stop does not identify a thread in the session process");
         const bool has_stopped_thread = !pending_event_thread_.empty() && pending_event_thread_ != "0";
         std::string command;
         if (has_stopped_thread) {
-            if (!supports_vcont_thread_step_)
-                return unsupported("remote does not advertise thread-qualified single-step for the stopped thread");
-            command = "vCont;s:" + pending_event_thread_;
+            const auto action = pending_event_signal_ != 0 && disposition == ContinueStatus::not_handled
+                ? "S" + hex_signal(pending_event_signal_) : "s";
+            if (action.front() == 'S' && !supports_vcont_thread_step_signal_)
+                return unsupported("remote does not advertise vCont step-with-signal");
+            if (action.front() == 's' && !supports_vcont_thread_step_)
+                return unsupported("remote does not advertise thread-qualified single-step");
+            command = "vCont;" + action + ":" + pending_event_thread_;
         } else {
             // An unqualified vCont;s matches all threads. Without an exact
             // stop thread, keep the legacy operation on the stub's current
             // selection instead of introducing an all-thread step.
-            command = "s";
+            command = pending_event_signal_ != 0 && disposition == ContinueStatus::not_handled
+                ? "S" + hex_signal(pending_event_signal_) : "s";
         }
         auto result = client_->send_resume(command);
         if (result) {
@@ -1424,7 +1485,7 @@ public:
             if (has_stopped_thread) thread_run_states_[pending_event_thread_] = ThreadState::running;
             else for (auto& [thread, state] : thread_run_states_)
                 if (state != ThreadState::exited) state = ThreadState::unknown;
-            pending_event_.reset(); pending_event_thread_.clear();
+            pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
         }
         return result;
     }
@@ -1663,6 +1724,10 @@ public:
         return result;
     }
 private:
+    static std::string hex_signal(unsigned signal) {
+        constexpr char digits[] = "0123456789abcdef";
+        return {digits[(signal >> 4) & 0xf], digits[signal & 0xf]};
+    }
     bool thread_belongs_to_session(std::string_view wire_id) const {
         if (!valid_thread_wire_id(wire_id)) return false;
         const auto process = thread_process_id(wire_id);
@@ -1702,6 +1767,7 @@ private:
     std::optional<rsp::StopReply> pending_stop_;
     std::optional<std::uint64_t> pending_event_;
     std::string pending_event_thread_;
+    unsigned pending_event_signal_ = 0;
     std::set<std::string, std::less<>> expected_step_threads_;
     bool legacy_expected_step_ = false;
     std::optional<TargetDescription> target_;
@@ -1724,8 +1790,10 @@ private:
     std::string host_;
     std::uint64_t sequence_ = 0, next_breakpoint_ = 1, next_thread_token_ = 1;
     bool supports_vcont_continue_ = false;
+    bool supports_vcont_continue_signal_ = false;
     bool supports_vcont_thread_continue_ = false;
     bool supports_vcont_thread_step_ = false;
+    bool supports_vcont_thread_step_signal_ = false;
     bool supports_vcont_thread_stop_ = false;
 };
 
