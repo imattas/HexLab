@@ -127,7 +127,9 @@ callers requiring confirmed detach/reap must retry a failed cleanup before
 destroying the backend. No unconditional successful cleanup is claimed after
 a timeout, and attached processes are not killed merely to force detach.
 Fork/vfork inferior tracking, cross-architecture AArch32 tracees, cross-endian
-tracees and general multi-thread single-step schedules remain unsupported.
+tracees and schedules with multiple concurrent single-step actions remain
+unsupported. One single-step may run alongside continue actions while all
+traced threads are stopped.
 
 Thread resume schedules support signal-aware continue and single-step actions.
 An action without a signal disposition preserves/redelivers its queued signal;
