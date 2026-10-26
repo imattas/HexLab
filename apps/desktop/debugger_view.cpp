@@ -232,7 +232,8 @@ DebuggerView::DebuggerView(wxWindow *parent, std::unique_ptr<debugger::Backend> 
     remote_host_ = make_text(this, "debug-remote-host"); remote_host_->SetValue("127.0.0.1");
     remote_port_ = make_text(this, "debug-remote-port"); remote_port_->SetValue("1234");
     remote->Add(remote_host_, 1, wxRIGHT, FromDIP(4)); remote->Add(remote_port_, 0, wxRIGHT, FromDIP(4));
-    remote->Add(make_button(this, "debug-remote-connect", "Connect RSP", remote_connect_id), 0);
+    remote_connect_button_ = make_button(this, "debug-remote-connect", "Connect RSP", remote_connect_id);
+    remote->Add(remote_connect_button_, 0);
     target->Add(remote, 1, wxEXPAND);
     root->Add(target, 0, wxEXPAND | wxALL, FromDIP(6));
 
@@ -835,20 +836,110 @@ void DebuggerView::detach_remote_process() {
 }
 
 void DebuggerView::connect_remote() {
+    if (remote_connecting_) return;
     const auto host = narrow(remote_host_->GetValue());
     std::uint64_t port = 0;
     if (host.empty() || !parse_unsigned(narrow(remote_port_->GetValue()), port) || port == 0 || port > 65535) {
         report("Enter a host and a TCP port from 1 through 65535."); return;
     }
-    auto result = [&] { std::lock_guard lock(inspection_state_->backend_mutex); return session_->connect_remote(host, static_cast<std::uint16_t>(port)); }();
-    if (!result) { report(wxString::FromUTF8(result.error().message)); refresh_state(); return; }
+    remote_connecting_ = true;
+    const auto request = ++remote_connect_request_;
+    Enable(false);
+    remote_connect_button_->SetLabel("Connecting...");
+    report(wxString::Format("Connecting to %s:%llu...", wxString::FromUTF8(host),
+                            static_cast<unsigned long long>(port)));
+    auto state = inspection_state_;
+    auto session = session_;
+    enqueue_inspection(0, [state, session, host, port, request] {
+        std::optional<debugger::ProcessInfo> process;
+        std::vector<debugger::ProcessInfo> processes;
+        std::string connect_error, process_error;
+        {
+            std::lock_guard lock(state->backend_mutex);
+            auto connected = session->connect_remote(host, static_cast<std::uint16_t>(port));
+            if (!connected) connect_error = connected.error().message;
+            else {
+                process = std::move(connected.value());
+                auto listed = session->processes();
+                if (listed) processes = std::move(listed.value());
+                else process_error = listed.error().message;
+            }
+        }
+        if (!wxTheApp) {
+            if (process) {
+                std::lock_guard lock(state->backend_mutex);
+                (void)session->detach();
+            }
+            return;
+        }
+        wxTheApp->CallAfter([state, session, request, process = std::move(process),
+                             processes = std::move(processes), connect_error = std::move(connect_error),
+                             process_error = std::move(process_error)]() mutable {
+            DebuggerView *target = nullptr;
+            {
+                std::lock_guard lock(state->mutex);
+                target = state->target;
+            }
+            if (target) {
+                target->finish_remote_connect(request, std::move(process), std::move(processes),
+                                              std::move(connect_error), std::move(process_error));
+            } else if (process) {
+                std::lock_guard lock(state->backend_mutex);
+                (void)session->detach();
+            }
+        });
+    });
+}
+
+void DebuggerView::finish_remote_connect(std::uint64_t request,
+                                         std::optional<debugger::ProcessInfo> process,
+                                         std::vector<debugger::ProcessInfo> processes,
+                                         std::string connect_error, std::string process_error) {
+    if (request != remote_connect_request_) {
+        if (process) {
+            auto session = session_;
+            auto state = inspection_state_;
+            enqueue_inspection(0, [session, state] {
+                std::lock_guard lock(state->backend_mutex);
+                (void)session->detach();
+            });
+        }
+        return;
+    }
+    remote_connecting_ = false;
+    Enable(true);
+    remote_connect_button_->SetLabel("Connect RSP");
+    if (!process) {
+        report(wxString::FromUTF8(connect_error));
+        refresh_state();
+        return;
+    }
     remote_session_active_ = true;
     pending_event_.reset(); pending_event_thread_.reset(); threads_.clear(); breakpoints_.clear();
     threads_view_->DeleteAllItems(); registers_view_->DeleteAllItems(); breakpoints_view_->DeleteAllItems();
     event_->Clear(); clear_inspection();
-    report(wxString::Format("Connected to remote target %s (thread %llu)", wxString::FromUTF8(result.value().name),
-                            static_cast<unsigned long long>(result.value().id)));
-    refresh_processes();
+    report(wxString::Format("Connected to remote target %s (thread %llu)", wxString::FromUTF8(process->name),
+                            static_cast<unsigned long long>(process->id)));
+    process_id_->SetValue(wxString::Format("%llu", static_cast<unsigned long long>(process->id)));
+    processes_choice_->Clear();
+    processes_ = std::move(processes);
+    for (const auto &listed : processes_)
+        processes_choice_->Append(wxString::Format("%llu  %s", static_cast<unsigned long long>(listed.id),
+                                                   wxString::FromUTF8(listed.name)));
+    if (processes_.empty()) processes_choice_->Append("No processes found");
+    const auto active = std::find_if(processes_.begin(), processes_.end(),
+        [&](const auto &listed) { return listed.id == process->id; });
+    if (active != processes_.end()) {
+        const auto index = static_cast<int>(std::distance(processes_.begin(), active));
+        processes_choice_->SetSelection(index);
+        process_id_->SetValue(wxString::Format("%llu", static_cast<unsigned long long>(active->id)));
+    }
+    if (!process_error.empty()) {
+        processes_choice_->Clear();
+        processes_choice_->Append("Unavailable: " + wxString::FromUTF8(process_error));
+        report("Connected, but process enumeration failed: " + wxString::FromUTF8(process_error));
+    }
+    update_process_actions();
     refresh_state(); poll_timer_.Start(100);
 }
 
