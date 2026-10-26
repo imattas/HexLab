@@ -231,4 +231,12 @@ All work stayed headless and left `out/` untouched.
 - **Native plugin type workflow:** ABI 1.13 adds bounded C-header type import, paged project type queries, and durable address assignments/removal; added C++ SDK wrappers, documentation, and a standalone C provider example. hexlab_plugins and the example Debug targets compiled and linked; no tests run.
 - **Functions browser:** added name/address filtering, sorting by address/name/block count/completeness, and visible-row-aware navigation/context actions. hexlab_desktop_components Debug target compiled and linked after fixing address-space ordering; no GUI or tests run.
 
+## 2026-10-25 continuation
+
+- **MIPS32 COP1 conversions:** corrected FPR destination widths for S/D/W conversions and attached exact scalar result types to lifted conversion intrinsics. Debug processor and decompiler targets passed; IEEE evaluation remains abstract; no tests run.
+- **ELF DWARF relocation:** ordinary little-endian ET_REL DWARF sections now apply bounded explicit-addend absolute relocations for x86-64 and AArch64; unsupported target relocations fail import. Arithmetic and symbol/field bounds are documented; no tests run.
+- **DWARF function ranges:** v4 `.debug_ranges` and v5 `.debug_rnglists` now flow through ordinary ELF import, retaining all bounded function intervals. Symbols/loaders Debug builds passed; v2/v3 DIE streams remain outside the importer; no tests run.
+- **Decompiler joins:** acyclic formatting now validates whole-memory and partition-memory phis against exact CFG predecessor sets, unique partition names, and a 65,536 combined input cap; loop child decision trees accept up to eight nested conditionals. Debug decompiler build passed; no tests run.
+- **WebAssembly MVP validation:** complete scalar function bodies are validated against signatures, locals/globals, calls, branch labels, memory immediates, numeric types, and structured-control results before mapping. Control/operand bounds and periodic cancellation are explicit; Debug loader build passed; the decompiler subset remains narrower; no tests run.
+- **Windows ARM32 debugging:** native stopped-thread GPR/NEON access, guarded edits, ARM/Thumb software breakpoints, and temporary-trap stepping for verified sequential instructions are implemented. Thumb IT blocks are rejected; ARMv7 syntax and Windows x64 debugger builds passed; native ARM32 runtime validation and hardware breakpoints remain open; no tests run.
 All work stayed headless and left out/ untouched.
