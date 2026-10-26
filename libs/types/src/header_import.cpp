@@ -1094,7 +1094,11 @@ private:
         }
         if (token.empty() || token.front() < '0' || token.front() > '9')
             fail(ErrorCode::unsupported, "non-type specialization patterns must use integer literals or direct parameter names");
-        const auto value = integer_magnitude(token, static_cast<std::uint64_t>(INT64_MAX));
+        // Non-type template arguments are stored as uint64_t after the primary
+        // parameter's width check. Keep the same full unsigned range here;
+        // signed-only parsing incorrectly rejected valid high-bit unsigned
+        // specialization arguments before they could be compared.
+        const auto value = integer_magnitude(token, std::numeric_limits<std::uint64_t>::max());
         specificity += 8;
         return value == argument;
     }
@@ -1305,6 +1309,17 @@ private:
             fail(ErrorCode::malformed, "class-template specialization argument count does not match the primary template");
         if (primary->second.is_union != is_union)
             fail(ErrorCode::conflict, "template specialization changes struct/union kind");
+        // Canonicalize integral literals before conflict detection. Equivalent
+        // decimal/octal/hex spellings (and U/ L suffixes) denote the same
+        // specialization and must not defer an ambiguity until instantiation.
+        for (std::size_t index = 0; index < patterns.size(); ++index) {
+            if (!primary->second.parameters[index].value_parameter || patterns[index].size() != 1)
+                continue;
+            const auto &token = patterns[index].front().text;
+            if (token.empty() || token.front() < '0' || token.front() > '9') continue;
+            patterns[index].front().text = std::to_string(
+                integer_magnitude(token, std::numeric_limits<std::uint64_t>::max()));
+        }
         AggregateSpecialization specialization{std::move(parameters), std::move(patterns), std::move(full_definition)};
         if (std::any_of(primary->second.specializations.begin(), primary->second.specializations.end(),
                         [&](const auto &item) { return item.patterns == specialization.patterns; }))
