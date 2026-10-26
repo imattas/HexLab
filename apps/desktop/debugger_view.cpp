@@ -1400,48 +1400,86 @@ void DebuggerView::remove_breakpoint() {
 }
 
 void DebuggerView::refresh_threads(std::optional<debugger::ThreadId> preferred) {
-    auto result = [&] { std::lock_guard lock(inspection_state_->backend_mutex); return session_->threads(); }();
-    auto run_states = [&] { std::lock_guard lock(inspection_state_->backend_mutex); return session_->thread_run_states(); }();
-    thread_run_states_supported_ = static_cast<bool>(run_states);
-    if (result) threads_ = std::move(result.value());
-    else if (!run_states) { report(wxString::FromUTF8(result.error().message)); return; }
-    if (run_states) {
-        for (const auto &snapshot : run_states.value()) {
-            const auto found = std::find_if(threads_.begin(), threads_.end(), [&](const auto &thread) { return thread.id == snapshot.thread; });
-            if (found != threads_.end()) found->state = snapshot.state;
-            else {
-                const auto name = "thread " + std::to_string(snapshot.thread);
-                threads_.push_back({snapshot.thread, name, snapshot.state});
-            }
-        }
-    } else if (run_states.error().code != ErrorCode::unsupported) {
-        report(wxString::FromUTF8(run_states.error().message));
-    }
-    threads_view_->DeleteAllItems(); registers_view_->DeleteAllItems();
-    for (std::size_t i = 0; i < threads_.size(); ++i) {
-        const auto &thread = threads_[i];
-        const auto row = threads_view_->InsertItem(static_cast<long>(i),
-                                                    wxString::Format("%llu", static_cast<unsigned long long>(thread.id)));
-        threads_view_->SetItem(row, 1, wxString::FromUTF8(thread.name));
-        const char *state = thread.state == debugger::ThreadState::running ? "running" :
-                            thread.state == debugger::ThreadState::stopped ? "stopped" :
-                            thread.state == debugger::ThreadState::exited ? "exited" : "unknown";
-        threads_view_->SetItem(row, 2, state);
-    }
     if (!preferred && selected_register_thread_) preferred = selected_register_thread_;
-    auto selected = threads_.end();
-    if (preferred) selected = std::find_if(threads_.begin(), threads_.end(), [&](const auto &thread) { return thread.id == *preferred; });
-    if (selected == threads_.end()) {
-        selected = std::find_if(threads_.begin(), threads_.end(), [](const auto &thread) {
-            return thread.state != debugger::ThreadState::exited;
+    const auto generation = session_generation_;
+    const auto stop_generation = inspection_state_->stop_generation.load(std::memory_order_acquire);
+    const auto selection_generation = thread_selection_generation_;
+    const auto request = ++thread_request_;
+    auto session = session_;
+    auto state = inspection_state_;
+    enqueue_inspection(0, [session, state, generation, stop_generation, selection_generation,
+                           request, preferred] {
+        auto [result, run_states] = [&] {
+            std::lock_guard backend_lock(state->backend_mutex);
+            return std::pair{session->threads(), session->thread_run_states()};
+        }();
+        std::vector<debugger::ThreadInfo> values;
+        std::string error;
+        if (result) values = std::move(result.value());
+        else if (!run_states) error = result.error().message;
+        if (run_states) {
+            for (const auto &snapshot : run_states.value()) {
+                const auto found = std::find_if(values.begin(), values.end(), [&](const auto &thread) {
+                    return thread.id == snapshot.thread;
+                });
+                if (found != values.end()) found->state = snapshot.state;
+                else values.push_back({snapshot.thread, "thread " + std::to_string(snapshot.thread), snapshot.state});
+            }
+        } else if (run_states.error().code != ErrorCode::unsupported && error.empty()) {
+            error = run_states.error().message;
+        }
+        if (auto *app = wxTheApp) app->CallAfter([state, generation, stop_generation, selection_generation,
+                request, preferred, values = std::move(values), thread_query_succeeded = static_cast<bool>(result),
+                run_states_supported = static_cast<bool>(run_states), error = std::move(error)]() mutable {
+            std::unique_lock lock(state->mutex);
+            auto *view = state->target;
+            if (!view || view->session_generation_ != generation || view->thread_request_ != request ||
+                state->stop_generation.load(std::memory_order_acquire) != stop_generation) return;
+            if (view->thread_selection_generation_ != selection_generation) {
+                const auto current_selection = view->selected_register_thread_;
+                lock.unlock();
+                view->refresh_threads(current_selection);
+                return;
+            }
+            if (!thread_query_succeeded && values.empty()) {
+                // An empty or unavailable run-state snapshot cannot prove the
+                // session has no threads. Keep the last usable list intact.
+                if (error.empty()) view->report("Thread enumeration returned no usable thread data.");
+                else view->report(wxString::FromUTF8(error));
+                return;
+            }
+            if (!error.empty()) view->report(wxString::FromUTF8(error));
+            view->thread_run_states_supported_ = run_states_supported;
+            view->threads_ = std::move(values);
+            view->threads_view_->DeleteAllItems();
+            view->registers_view_->DeleteAllItems();
+            for (std::size_t i = 0; i < view->threads_.size(); ++i) {
+                const auto &thread = view->threads_[i];
+                const auto row = view->threads_view_->InsertItem(static_cast<long>(i),
+                    wxString::Format("%llu", static_cast<unsigned long long>(thread.id)));
+                view->threads_view_->SetItem(row, 1, wxString::FromUTF8(thread.name));
+                const char *thread_state = thread.state == debugger::ThreadState::running ? "running" :
+                    thread.state == debugger::ThreadState::stopped ? "stopped" :
+                    thread.state == debugger::ThreadState::exited ? "exited" : "unknown";
+                view->threads_view_->SetItem(row, 2, thread_state);
+            }
+            auto selected = view->threads_.end();
+            if (preferred) selected = std::find_if(view->threads_.begin(), view->threads_.end(),
+                [&](const auto &thread) { return thread.id == *preferred; });
+            if (selected == view->threads_.end()) selected = std::find_if(view->threads_.begin(), view->threads_.end(),
+                [](const auto &thread) { return thread.state != debugger::ThreadState::exited; });
+            const auto row = selected == view->threads_.end() ? std::size_t{0} :
+                static_cast<std::size_t>(selected - view->threads_.begin());
+            if (!view->threads_.empty())
+                view->threads_view_->SetItemState(static_cast<long>(row), wxLIST_STATE_SELECTED, wxLIST_STATE_SELECTED);
+            lock.unlock();
+            view->refresh_registers(row);
         });
-    }
-    const auto row = selected == threads_.end() ? std::size_t{0} : static_cast<std::size_t>(selected - threads_.begin());
-    if (!threads_.empty()) threads_view_->SetItemState(static_cast<long>(row), wxLIST_STATE_SELECTED, wxLIST_STATE_SELECTED);
-    refresh_registers(row);
+    });
 }
 
 void DebuggerView::refresh_registers(std::size_t row) {
+    ++thread_selection_generation_;
     invalidate_frames();
     registers_view_->DeleteAllItems();
     registers_.clear(); selected_register_thread_.reset(); selected_register_index_.reset();

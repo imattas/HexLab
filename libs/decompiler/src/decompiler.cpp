@@ -435,7 +435,7 @@ bool is_memory(const Operand &operand) {
 bool is_load(Opcode opcode) {
     switch (opcode) {
     case Opcode::mov: case Opcode::movzx: case Opcode::movsx: case Opcode::movsxd:
-    case Opcode::a64_ldr: case Opcode::a64_ldrb: case Opcode::a64_ldrh:
+    case Opcode::a64_ldr: case Opcode::a64_ldrb: case Opcode::a64_ldrh: case Opcode::a64_ldrsw:
     case Opcode::a32_ldr: case Opcode::a32_ldrb: case Opcode::a32_ldrh:
     case Opcode::a32_ldrsb: case Opcode::a32_ldrsh:
     case Opcode::mips_lb: case Opcode::mips_lh: case Opcode::mips_lw:
@@ -3602,8 +3602,11 @@ a64_unhandled:
             }
             if (is_load(instruction.opcode) && is_memory(instruction.operands[1])) {
                 auto value = operands[1];
-                if (const auto *memory = std::get_if<ArmMemoryOperand>(&instruction.operands[1]);
-                    memory && memory->data_width < destination.width)
+                if (instruction.opcode == Opcode::a64_ldrsw && destination.width == 64) {
+                    value = std::make_shared<Expression>(Expression{integer_type(64),
+                        UnaryValue{"sext", std::move(value)}});
+                } else if (const auto *memory = std::get_if<ArmMemoryOperand>(&instruction.operands[1]);
+                           memory && memory->data_width < destination.width)
                     value = std::make_shared<Expression>(Expression{integer_type(destination.width),
                         UnaryValue{memory->sign_extend ? "sext" : "zext", value}});
                 if (arm32 && instruction.arm && instruction.arm->predicate == ArmPredicate::condition &&

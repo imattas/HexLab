@@ -401,7 +401,9 @@ enum class Opcode {
     // x86 scalar count/byte-order operations; append to preserve serialized IDs.
     bswap, popcnt,
     // MIPS32 COP1 data/control transfers; appended to preserve serialized IDs.
-    mips_mfc1, mips_cfc1, mips_mtc1, mips_ctc1
+    mips_mfc1, mips_cfc1, mips_mtc1, mips_ctc1,
+    // AArch64 signed word load; append to preserve persisted opcode IDs.
+    a64_ldrsw
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

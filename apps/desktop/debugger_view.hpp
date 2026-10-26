@@ -125,6 +125,8 @@ class DebuggerView final : public wxPanel {
     std::optional<std::uint64_t> pending_event_;
     std::optional<debugger::ThreadId> pending_event_thread_;
     std::uint64_t session_generation_ = 0;
+    std::uint64_t thread_request_ = 0;
+    std::uint64_t thread_selection_generation_ = 0;
     std::uint64_t register_request_ = 0;
     std::uint64_t memory_request_ = 0;
     std::uint64_t module_request_ = 0;

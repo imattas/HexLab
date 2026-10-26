@@ -9,6 +9,7 @@ std::string hex(std::uint64_t value) {
 }
 } // namespace
 std::string mnemonic(Opcode opcode, std::uint8_t condition) {
+    if (opcode == Opcode::a64_ldrsw) return "ldrsw";
     if (opcode == Opcode::a64_madd) return "madd";
     if (opcode == Opcode::a64_msub) return "msub";
     if (opcode == Opcode::a64_csel) return "csel";
