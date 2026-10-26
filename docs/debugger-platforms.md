@@ -8,7 +8,7 @@ can still be debugged through a compatible remote server.
 
 | Host platform and architecture | Native backend selection | Scope |
 | --- | --- | --- |
-| Windows | Win32 backend | x86/x64 process control; native ARM32 builds expose stopped-thread GPR/NEON context edits, ARM/Thumb software breakpoints and bounded sequential-instruction steps; native ARM64 builds support stopped-thread GPR/FPSIMD context access and safe edits, software BRK breakpoints with PSTATE single-step, and up to two execution plus two data hardware breakpoints |
+| Windows | Win32 backend | x86/x64 process control and four-slot execution/data hardware breakpoints; native ARM32 builds expose stopped-thread GPR/NEON context edits, ARM/Thumb software breakpoints and bounded sequential-instruction steps; native ARM64 builds support stopped-thread GPR/FPSIMD context access and safe edits, software BRK breakpoints with PSTATE single-step, and up to two execution plus two data hardware breakpoints |
 | Linux x86-64 | x86-64 ptrace backend | x86-64 and compat i386 targets, including register, memory, event, and breakpoint operations described in [Linux ptrace debugging](linux-ptrace-debugging.md) |
 | Linux AArch64 | AArch64 ptrace backend | AArch64 GPR/FPSIMD, process lifecycle, memory, software breakpoints, hardware execute/watchpoints, and per-thread run-state; scalable SVE state is conditional on kernel regset availability |
 | macOS x86-64 / Apple Silicon | Darwin Mach/ptrace backend | Bounded thread enumeration, task-suspended per-thread register inspection/editing, memory and module/region inspection; single-thread process execution, stepping, and software breakpoints; multi-thread stop attribution/stepping and hardware watchpoints are unsupported |
@@ -58,6 +58,20 @@ breakpoint exception must be continued as handled. Windows ARM32
 hardware breakpoint APIs expose BVR/BCR and WVR/WCR registers, but this
 backend has no transactional per-thread ownership and hit attribution for
 them, so hardware breakpoints and watchpoints remain explicitly unsupported.
+
+Windows x86 and x64 hardware breakpoints use DR0-DR3/DR7. Execution
+breakpoints and write/access watchpoints share the four available slots. Data
+watchpoints accept aligned 1, 2, 4, or 8 byte ranges (8 bytes requires an x64
+target); x86/x64 cannot distinguish read-only accesses, so read-only watchpoints
+return `unsupported`. Changes require a pending debug event. Updates check the
+debugger-owned slot state on every current target thread and apply
+transactionally, rolling back earlier threads if a later thread update fails.
+New threads receive the active configuration before their creation event is
+returned. DR6 identifies hit slots and the backend clears the hit bits before
+the event is continued. Removing breakpoints and detaching clears owned slots;
+process and thread exit discard the corresponding session/thread state. Slots
+already used by another debugger or changed outside HexLab cause a conflict
+rather than being overwritten.
 
 Windows ARM64 context access uses `GetThreadContext`/`SetThreadContext` with
 the ARM64 context flags ([`ARM64_NT_CONTEXT`](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-arm64_nt_context), [`GetThreadContext`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadcontext)) and is restricted to the stop window while a debug event is pending. Register reads expose X0 through X30, SP, PC, CPSR, V0 through V31, FPCR, and FPSR. Writes validate register sizes, keep PC instruction aligned and SP 16-byte aligned, restrict CPSR changes to NZCV flags, and reject X18 writes because Windows reserves it for the thread environment pointer. Vector state is the fixed 128-bit V register bank; scalable SVE/SME state is not exposed.
