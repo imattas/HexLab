@@ -1123,9 +1123,17 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
             for (const auto &variable : recovered_types.value().stack_variables) {
                 const auto sites = access_sites.find(variable.name);
                 if (sites == access_sites.end() || sites->second.empty()) continue;
-                const auto *annotation = project_ ? annotation_at(*project_, sites->second.front()) : nullptr;
+                auto variable_accesses = sites->second;
+                std::sort(variable_accesses.begin(), variable_accesses.end(), [](Address left, Address right) {
+                    return std::pair{left.space.value, left.offset} < std::pair{right.space.value, right.offset};
+                });
+                variable_accesses.erase(std::unique(variable_accesses.begin(), variable_accesses.end()),
+                                        variable_accesses.end());
+                if (variable_accesses.empty()) continue;
+                const auto *annotation = project_ ? annotation_at(*project_, variable_accesses.front()) : nullptr;
                 const auto display = annotation && !annotation->name.empty() ? annotation->name : variable.name;
-                variables_.push_back({variable.name, sites->second.front(), display, true, false, sites->second});
+                variables_.push_back({variable.name, variable_accesses.front(), display, true, false,
+                                      std::move(variable_accesses)});
             }
         }
     }
