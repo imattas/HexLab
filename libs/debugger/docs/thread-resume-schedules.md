@@ -22,10 +22,17 @@ These selector rules follow the [GDB packet specification](https://sourceware.or
 
 | Backend | Supported filtered schedule | Explicit restrictions |
 | --- | --- | --- |
-| Linux x86/x64 | One selected thread continues or steps; multiple selected threads may continue while others stay stopped. The event owner can remain stopped when another thread runs. | Every traced thread must be stopped. Deferred-event owners cannot be rescheduled. A pending software-breakpoint step-over limits runnable selection; multi-thread continue through that breakpoint is rejected. Mixed step/continue and multiple steps remain unsupported. |
+| Linux x86/x64 | One selected thread continues or steps; multiple selected threads may continue while others stay stopped. One schedule may single-step the pending event owner while other selected threads continue. The event owner can remain stopped when another thread runs. | Every traced thread must be stopped. Deferred-event owners cannot be rescheduled. A pending software-breakpoint step-over limits runnable selection; multi-thread schedules through that breakpoint are rejected. Mixed schedules may step only the event owner, with a maximum of one step; multiple steps remain unsupported. |
 | Linux AArch64 | One selected thread continues or steps; a multi-thread schedule may combine one single-step action with any number of continue actions. The event owner can remain stopped when another thread runs. A scheduled action may preserve/redeliver its queued signal by default or suppress it with `signal_disposition = handled`; `not_handled` explicitly requests redelivery. | Every traced thread must be stopped. At most one single-step may be outstanding; a later schedule cannot resume that step thread or issue another step until its event is collected. Pending software/hardware execute-breakpoint step-over still limits the schedule to one runnable thread. |
 | Windows | The event thread steps alone, or a continue-only subset including the event owner runs. Unselected peers retain one debugger-owned suspend count. | Foreign-thread steps, a held event owner with other runnable threads, mixed step/continue, multiple steps and an active displaced software-breakpoint step reject. ARM32 stepping remains unsupported. A Windows ARM64 execute-breakpoint step-over cannot run a multi-thread subset. |
 | Darwin | One exact continue or step action for a target proven to contain one thread. | Process-wide ptrace cannot implement multithread schedules; the existing Mach-thread census and stop-identity restrictions remain conservative. |
+
+The Linux x86-64 mixed schedule issues peer continuations first and the pending
+event owner's single-step last. If a continuation or the final step request
+fails, already continued peers are interrupted and collected before the owned
+event is returned for retry. A failed rollback blocks further resume until
+recovery. The event owner is restricted to the step action so a failed final
+step never has to recreate an event already consumed by continuing its owner.
 
 The Linux resume mechanisms predate this server integration. Explicit stop
 actions now preserve deferred-event owners instead of rejecting an otherwise

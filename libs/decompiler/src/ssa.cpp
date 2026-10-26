@@ -19,6 +19,7 @@ using PointerRoot = std::pair<Key, std::uint32_t>;
 struct PointerOrigin { PointerRoot root; std::int64_t offset = 0; bool operator==(const PointerOrigin &) const = default; };
 using PointerValueKey = std::pair<Key, std::uint32_t>;
 using PointerOrigins = std::map<PointerValueKey, PointerOrigin>;
+using IntegerConstants = std::map<PointerValueKey, std::uint64_t>;
 using DynamicMemoryRange = std::tuple<PointerRoot, std::int64_t, std::int64_t>;
 using DynamicMemoryPartitions = std::map<DynamicMemoryRange, std::string>;
 
@@ -56,13 +57,50 @@ std::optional<PointerOrigin> pointer_origin(const ExpressionPtr &expression, con
     return left;
 }
 
-std::optional<DynamicMemoryRange> dynamic_memory_range(const MemoryValue &memory, const PointerOrigins &origins) {
-    if (!memory.base || memory.index || memory.absolute || !memory.type.bits || memory.type.bits % 8 ||
+std::optional<std::uint64_t> integer_constant(const ExpressionPtr &expression,
+                                              const IntegerConstants &constants) {
+    if (!expression || expression->type.kind != TypeKind::integer || !expression->type.bits ||
+        expression->type.bits > 64) return {};
+    if (const auto *constant = std::get_if<ConstantValue>(&expression->value)) {
+        if (constant->type.kind != TypeKind::integer || constant->type.bits != expression->type.bits) return {};
+        if (expression->type.bits == 64) return constant->value;
+        return constant->value & ((std::uint64_t{1} << expression->type.bits) - 1);
+    }
+    if (const auto *reg = std::get_if<RegisterValue>(&expression->value)) {
+        if (!reg->version || reg->reg.width != expression->type.bits) return {};
+        const auto found = constants.find({key(reg->reg), *reg->version});
+        if (found != constants.end()) return found->second;
+    }
+    return {};
+}
+
+std::optional<DynamicMemoryRange> dynamic_memory_range(const MemoryValue &memory, const PointerOrigins &origins,
+                                                       const IntegerConstants &constants) {
+    if (!memory.base || memory.absolute || !memory.type.bits || memory.type.bits % 8 ||
         !memory.base_version) return {};
     const auto found = origins.find({key(*memory.base), *memory.base_version});
     if (found == origins.end()) return {};
     if (std::get<2>(found->second.root.first) != memory.base->width) return {};
-    const auto begin = add_signed(found->second.offset, memory.displacement);
+    auto displacement = memory.displacement;
+    if (memory.index) {
+        if (!memory.index_version || memory.index->width != memory.base->width ||
+            !memory.index_extend.empty() ||
+            (memory.index_shift != "" && memory.index_shift != "lsl")) return {};
+        const auto index = constants.find({key(*memory.index), *memory.index_version});
+        if (index == constants.end() || index->second > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+            return {};
+        const auto shift = static_cast<unsigned>(memory.index_shift_amount);
+        if (shift >= 63 || memory.scale == 0) return {};
+        const auto raw = index->second;
+        if (raw > (static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) >> shift) /
+                      static_cast<std::uint64_t>(memory.scale)) return {};
+        auto delta = static_cast<std::int64_t>(raw * static_cast<std::uint64_t>(memory.scale) << shift);
+        if (!memory.index_add) delta = -delta;
+        const auto adjusted = add_signed(displacement, delta);
+        if (!adjusted) return {};
+        displacement = *adjusted;
+    }
+    const auto begin = add_signed(found->second.offset, displacement);
     const auto bytes = static_cast<std::int64_t>(memory.type.bits / 8);
     if (!begin || bytes <= 0 || *begin > std::numeric_limits<std::int64_t>::max() - bytes) return {};
     const auto address_width = std::get<2>(found->second.root.first);
@@ -159,7 +197,8 @@ void rename_partition_memory(ExpressionPtr &expression,
                              const std::map<std::string, std::uint32_t> &versions,
                              const AbsoluteMemoryPartitions &absolute_partitions,
                              const DynamicMemoryPartitions &dynamic_partitions,
-                             const PointerOrigins &pointer_origins) {
+                             const PointerOrigins &pointer_origins,
+                             const IntegerConstants &integer_constants) {
     if (!expression) return;
     auto copy = std::make_shared<Expression>(*expression);
     std::visit([&](auto &value) {
@@ -171,7 +210,7 @@ void rename_partition_memory(ExpressionPtr &expression,
             } else if (const auto range = absolute_memory_range(value)) {
                 const auto found = absolute_partitions.find(*range);
                 if (found != absolute_partitions.end()) partition = found->second;
-            } else if (const auto range = dynamic_memory_range(value, pointer_origins)) {
+            } else if (const auto range = dynamic_memory_range(value, pointer_origins, integer_constants)) {
                 const auto found = dynamic_partitions.find(*range);
                 if (found != dynamic_partitions.end()) partition = found->second;
             }
@@ -183,10 +222,13 @@ void rename_partition_memory(ExpressionPtr &expression,
                 }
             }
         } else if constexpr (std::is_same_v<T, UnaryValue>)
-            rename_partition_memory(value.operand, versions, absolute_partitions, dynamic_partitions, pointer_origins);
+            rename_partition_memory(value.operand, versions, absolute_partitions, dynamic_partitions, pointer_origins,
+                                    integer_constants);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
-            rename_partition_memory(value.left, versions, absolute_partitions, dynamic_partitions, pointer_origins);
-            rename_partition_memory(value.right, versions, absolute_partitions, dynamic_partitions, pointer_origins);
+            rename_partition_memory(value.left, versions, absolute_partitions, dynamic_partitions, pointer_origins,
+                                    integer_constants);
+            rename_partition_memory(value.right, versions, absolute_partitions, dynamic_partitions, pointer_origins,
+                                    integer_constants);
         }
     }, copy->value);
     expression = std::move(copy);
@@ -911,6 +953,49 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                     }
             }
         }
+        // Exact integer constants are needed only for finite indexed accesses.
+        // Propagate literals and same-width SSA copies, plus unanimous phis;
+        // arithmetic and unresolved loop-carried values remain unknown.
+        IntegerConstants integer_constants;
+        std::set<PointerValueKey> nonconstant_values;
+        bool constants_changed = true;
+        for (std::size_t iteration = 0; constants_changed && iteration < 64; ++iteration) {
+            constants_changed = false;
+            const auto propagate_constant = [&](PointerValueKey value, std::uint64_t constant) {
+                if (nonconstant_values.contains(value)) return;
+                auto [found, inserted] = integer_constants.emplace(value, constant);
+                if (inserted) constants_changed = true;
+                else if (found->second != constant) {
+                    integer_constants.erase(found);
+                    nonconstant_values.insert(value);
+                }
+            };
+            for (auto block_index : reachable) {
+                for (const auto &phi : partitioned.blocks[block_index].phis) {
+                    if (phi.inputs.empty()) continue;
+                    std::optional<std::uint64_t> unanimous;
+                    bool complete = true;
+                    for (const auto &input : phi.inputs) {
+                        const auto found = integer_constants.find({key(phi.destination), input.version});
+                        if (found == integer_constants.end()) { complete = false; break; }
+                        if (!unanimous) unanimous = found->second;
+                        else if (*unanimous != found->second) { complete = false; break; }
+                    }
+                    if (complete && unanimous) {
+                        propagate_constant(PointerValueKey{key(phi.destination), phi.version}, *unanimous);
+                    }
+                }
+                for (const auto &instruction : partitioned.blocks[block_index].instructions)
+                    if (const auto *assign = std::get_if<Assign>(&instruction.statement);
+                        assign && assign->destination_version) {
+                        if (!assign->value || assign->destination.width != assign->value->type.bits) continue;
+                        const auto candidate = integer_constant(assign->value, integer_constants);
+                        if (!candidate) continue;
+                        propagate_constant(PointerValueKey{key(assign->destination), *assign->destination_version},
+                                           *candidate);
+                    }
+            }
+        }
         std::set<std::string> partitions;
         constexpr std::size_t max_absolute_ranges = 4'096;
         std::set<AbsoluteMemoryRange> absolute_ranges;
@@ -924,7 +1009,8 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                 std::visit([&](const auto &value) {
                     using T = std::decay_t<decltype(value)>;
                     if constexpr (std::is_same_v<T, MemoryValue>) {
-                        if (const auto range = dynamic_memory_range(value, pointer_origins)) dynamic_ranges.insert(*range);
+                        if (const auto range = dynamic_memory_range(value, pointer_origins, integer_constants))
+                            dynamic_ranges.insert(*range);
                     } else if constexpr (std::is_same_v<T, UnaryValue>) collect_dynamic(value.operand);
                     else if constexpr (std::is_same_v<T, BinaryValue>) { collect_dynamic(value.left); collect_dynamic(value.right); }
                 }, node->value);
@@ -956,7 +1042,8 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                             if (const auto range = absolute_memory_range(*address)) {
                                 global_store_ranges.emplace(std::pair{block_index, instruction_index}, *range);
                                 ++local_writes;
-                            } else if (const auto range = dynamic_memory_range(*address, pointer_origins)) {
+                            } else if (const auto range = dynamic_memory_range(*address, pointer_origins,
+                                                                                integer_constants)) {
                                 dynamic_store_ranges.emplace(std::pair{block_index, instruction_index}, *range);
                                 ++local_writes;
                             } else ++global_writes;
@@ -1158,7 +1245,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                             {block.id.value, instruction.origin.instruction_id}, capture_partitions());
                         const auto rename_reads = [&](ExpressionPtr &expression, const PartitionSnapshot &state) {
                             rename_partition_memory(expression, state, absolute_partitions, dynamic_partitions,
-                                                    pointer_origins);
+                                                    pointer_origins, integer_constants);
                         };
                         std::visit([&](auto &statement) {
                             using T = std::decay_t<decltype(statement)>;
@@ -1222,7 +1309,8 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                     block_exit_partition_versions[block.id.value] = capture_partitions();
                     if (block.switch_dispatch)
                         rename_partition_memory(block.switch_dispatch->selector, capture_partitions(),
-                                                absolute_partitions, dynamic_partitions, pointer_origins);
+                                                absolute_partitions, dynamic_partitions, pointer_origins,
+                                                integer_constants);
                     for (auto successor : successors[block_index]) if (reachable.contains(successor)) {
                         auto &target = partitioned.blocks[successor];
                         for (auto &phi : target.memory_partition_phis)

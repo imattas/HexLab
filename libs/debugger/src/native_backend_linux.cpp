@@ -878,29 +878,43 @@ public:
             return Error{ErrorCode::invalid_argument, "resume schedule must continue or step at least one thread"};
 
         if (runnable.size() > 1) {
-            if (std::any_of(runnable.begin(), runnable.end(), [](const auto* action) {
-                    return action->kind != ThreadResumeKind::continue_execution;
-                }))
-                return Error{ErrorCode::unsupported, "Linux ptrace multi-thread schedules support continue actions only"};
+            const auto single_steps = std::count_if(runnable.begin(), runnable.end(), [](const auto *action) {
+                return action->kind == ThreadResumeKind::single_step;
+            });
+            if (single_steps > 1 || (!step_threads_.empty() && single_steps != 0))
+                return Error{ErrorCode::unsupported, "Linux ptrace schedules support at most one outstanding single-step"};
+            const auto step_action = std::find_if(runnable.begin(), runnable.end(), [](const auto *action) {
+                return action->kind == ThreadResumeKind::single_step;
+            });
+            // Keep the pending event owner stopped until every continuation is
+            // accepted, then issue its step last. This lets a failed step roll
+            // back peer continuations without consuming the owned event.
+            if (step_action != runnable.end() &&
+                static_cast<pid_t>((*step_action)->thread) != owner)
+                return Error{ErrorCode::unsupported, "mixed Linux schedules may step only the pending event owner"};
             if (pending_breakpoint_)
-                return Error{ErrorCode::unsupported, "cannot continue multiple threads while stepping over a pending software breakpoint"};
+                return Error{ErrorCode::unsupported, "cannot schedule multiple threads while stepping over a pending software breakpoint"};
 
-            // Release non-owner threads first and the pending-event owner last.
-            // If any request fails, interrupt and collect every thread already
-            // resumed before returning with the pending event available to retry.
+            // Release non-owner continuations first and the pending-event owner
+            // last. When the owner is stepping, its PTRACE_SINGLESTEP is always
+            // the final operation so no rollback has to undo a started step.
             std::vector<pid_t> order;
             order.reserve(runnable.size());
             for (const auto* action : runnable) {
                 const auto tid = static_cast<pid_t>(action->thread);
-                if (tid != owner) order.push_back(tid);
+                if (action->kind == ThreadResumeKind::continue_execution && tid != owner)
+                    order.push_back(tid);
             }
-            if (std::any_of(runnable.begin(), runnable.end(), [&](const auto* action) {
-                    return static_cast<pid_t>(action->thread) == owner;
-                }))
+            const auto owner_continue = std::find_if(runnable.begin(), runnable.end(), [&](const auto *action) {
+                return static_cast<pid_t>(action->thread) == owner &&
+                       action->kind == ThreadResumeKind::continue_execution;
+            });
+            if (owner_continue != runnable.end())
                 order.push_back(owner);
+            if (step_action != runnable.end()) order.push_back(owner);
 
             std::vector<pid_t> resumed;
-            resumed.reserve(order.size());
+            resumed.reserve(order.size() - static_cast<std::size_t>(step_action != runnable.end()));
             for (const auto tid : order) {
                 const auto action = std::find_if(runnable.begin(), runnable.end(), [&](const auto* item) {
                     return static_cast<pid_t>(item->thread) == tid;
@@ -908,6 +922,22 @@ public:
                 const auto* selected_action = *action;
                 const int queued_signal = signal_for(*selected_action);
                 const int delivered = selected_action->signal_disposition == ContinueStatus::handled ? 0 : queued_signal;
+                if (selected_action->kind == ThreadResumeKind::single_step) {
+                    if (ptrace(PTRACE_SINGLESTEP, tid, nullptr,
+                               reinterpret_cast<void*>(static_cast<std::intptr_t>(delivered))) != 0) {
+                        const auto error = sys_error("PTRACE_SINGLESTEP scheduled Linux thread");
+                        auto rollback = stop_threads(resumed, true);
+                        resume_blocked_ = !rollback;
+                        if (!rollback)
+                            return Error{error.code, error.message + "; resume rollback failed: " + rollback.error().message};
+                        return error;
+                    }
+                    stopped_.erase(tid);
+                    step_threads_.insert(tid);
+                    deferred_signals_.erase(tid);
+                    if (tid == owner) pending_signal_ = 0;
+                    continue;
+                }
                 if (ptrace(PTRACE_CONT, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(delivered))) != 0) {
                     const auto error = sys_error("PTRACE_CONT scheduled Linux thread");
                     auto rollback = stop_threads(resumed, true);
