@@ -1022,13 +1022,13 @@ Result<PdbFunctionIdImportResult> import_pdb_function_ids(const PdbIdStream &roo
 
     const auto selector_map = [](const std::vector<std::pair<std::uint8_t, std::uint8_t>> &mapping,
                                  std::uint8_t local) -> std::optional<std::uint8_t> {
-        if (!local) return std::uint8_t{0};
         std::optional<std::uint8_t> value;
         for (const auto &[from, to] : mapping) if (from == local) {
             if (value) return {};
             value = to;
         }
-        return value;
+        if (value) return value;
+        return local == 0 ? std::optional<std::uint8_t>{0} : std::nullopt;
     };
     const auto append = [&](const PdbIdStream &ids, std::uint8_t owner_ns,
                             const std::array<std::byte, 16> &guid, std::uint32_t age,
