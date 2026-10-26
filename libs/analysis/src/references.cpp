@@ -1814,6 +1814,28 @@ RegisterReferenceFacts non_x86_producer_facts(
         return state;
     };
     propagate_cfg_register_values<ProducerRegisterState>(functions, stop, result, transfer);
+    // Preserve the ordered non-x86 producer chain as a compact dependency DAG.
+    // The first dependency is from the referenced instruction to its latest
+    // register producer; subsequent edges follow the bounded causal chain.
+    // Target validation remains owned by each architecture's address analysis.
+    for (const auto &[key, producers] : result.producer_instruction_ids) {
+        reference_detail::canceled(stop);
+        if (producers.empty()) continue;
+        ReferenceProducerGraph graph;
+        const auto add_edge = [&](std::uint64_t consumer, std::uint64_t producer) {
+            if (consumer == producer) return;
+            if (graph.dependencies.size() >= 128) { graph.truncated = true; return; }
+            graph.dependencies.push_back({consumer, producer});
+        };
+        add_edge(key.first, producers.back());
+        for (std::size_t i = producers.size(); i > 1; --i)
+            add_edge(producers[i - 1], producers[i - 2]);
+        // Producer state is capped at 32 IDs during transfer. Reaching the
+        // cap may mean older ancestry was dropped, so surface that uncertainty.
+        if (producers.size() >= 32) graph.truncated = true;
+        if (!graph.dependencies.empty() || graph.truncated)
+            result.producer_graphs.emplace(key, std::move(graph));
+    }
     return result;
 }
 
@@ -2761,6 +2783,8 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                 found != x86_facts.producer_graphs.end()) return found->second;
             if (const auto found = riscv_facts.producer_graphs.find(key);
                 found != riscv_facts.producer_graphs.end()) return found->second;
+            if (const auto found = non_x86_producers.producer_graphs.find(key);
+                found != non_x86_producers.producer_graphs.end()) return found->second;
             return ReferenceProducerGraph{};
         };
         const auto relocation_reason = macho ? UnresolvedReason::macho_relocation : UnresolvedReason::elf_relocation;
