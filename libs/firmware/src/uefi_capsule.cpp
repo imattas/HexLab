@@ -1,6 +1,7 @@
 #include "hexlab/firmware/uefi_capsule.hpp"
 #include <algorithm>
 #include <limits>
+#include <utility>
 
 namespace hexlab::firmware {
 namespace {
@@ -83,6 +84,37 @@ Result<UefiCapsule> parse_uefi_fmp_capsule(std::span<const std::byte> bytes,
             item.vendor_code_offset = item.payload_offset + item.update_image_size;
         }
         result.items.push_back(item);
+    }
+    return result;
+}
+
+Result<UefiCapsuleList> parse_uefi_fmp_capsule_list(
+    std::span<const std::span<const std::byte>> capsules,
+    UefiCapsuleParseOptions options, std::stop_token stop) {
+    if (stop.stop_requested()) return Error{ErrorCode::canceled, "UEFI capsule-list parsing canceled"};
+    if (capsules.empty()) return malformed("FMP capsule list is empty");
+    if (capsules.size() > options.max_capsules)
+        return Error{ErrorCode::resource_limit, "FMP capsule count exceeds limit"};
+
+    UefiCapsuleList result;
+    result.capsules.reserve(capsules.size());
+    for (const auto capsule_bytes : capsules) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "UEFI capsule-list parsing canceled"};
+        if (result.total_input_bytes > options.max_input_bytes ||
+            capsule_bytes.size() > options.max_input_bytes - result.total_input_bytes)
+            return Error{ErrorCode::resource_limit, "FMP capsule list exceeds cumulative input-size limit"};
+        if (result.total_item_count > options.max_items)
+            return Error{ErrorCode::resource_limit, "FMP capsule list exceeds cumulative item limit"};
+
+        auto capsule_options = options;
+        capsule_options.max_input_bytes = options.max_input_bytes - result.total_input_bytes;
+        capsule_options.max_items = options.max_items - result.total_item_count;
+        auto parsed = parse_uefi_fmp_capsule(capsule_bytes, capsule_options, stop);
+        if (!parsed) return parsed.error();
+        if (result.capsules.empty()) result.capsule_guid = parsed.value().capsule_guid;
+        result.total_input_bytes += capsule_bytes.size();
+        result.total_item_count += parsed.value().items.size();
+        result.capsules.push_back(std::move(parsed.value()));
     }
     return result;
 }

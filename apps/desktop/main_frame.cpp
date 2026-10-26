@@ -96,7 +96,9 @@
 namespace hexlab::desktop {
 namespace {
 constexpr int move_pane_id_base = python_console_id + 1;
-constexpr long maximum_restored_documents = 32;
+// Keep persisted restore work bounded while avoiding the old small ceiling
+// that silently dropped most tabs in larger analysis sessions.
+constexpr long maximum_restored_documents = 256;
 constexpr std::size_t maximum_persisted_path_characters = 32768;
 constexpr std::size_t maximum_persisted_recipe_bytes = 65536;
 constexpr char recipe_hex_digits[] = "0123456789abcdef";
