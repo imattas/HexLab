@@ -50,10 +50,10 @@
 
 - [x] Inspected graph callbacks; graph follow previously used the asynchronously rendered listing row instead of the focused graph instruction.
 - [x] Graph follow now carries the exact instruction and graph snapshot and checks active document/image/revision plus reference and endpoint ownership.
-- [x] Documented Enter/double-click behavior; MSVC Debug compiled graph canvas, graph view, and main frame translation units. No GUI launched.
+- [x] Documented Enter/double-click behavior; Enter now follows keyboard-selected graph instructions after arrow-key navigation; integrated Windows Debug desktop component build passed. No GUI/tests run.
 
 ### Integration
 
 - [x] Reviewed all three diffs; independent task reviews approved all three tasks.
-- [ ] Compile integrated Windows Debug CLI and desktop component targets serially where wxWidgets is available; graph translation units were compiled independently because configured wx source resides under prohibited `out/`.
+- [x] Compile integrated Windows Debug `hexlab_cli` and `hexlab_desktop_components` targets; both completed successfully from `switch-desktop-build`, outside `out/`.
 - [x] Update capability evidence, commit the integration record, and push `feat/foundation`.
