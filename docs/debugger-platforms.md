@@ -44,19 +44,26 @@ the recorded instruction width.
 ARM32 has no CPSR single-step bit exposed by this API. The bounded step path
 accepts verified sequential instructions: common 16-bit Thumb scalar and
 load/store forms, 32-bit Thumb MOVW/MOVT, and ARM data-processing immediates
-that do not write PC. It rejects branches, calls, returns, interworking,
-unknown encodings, and a successor overlapping a user breakpoint. Inside a
-Thumb IT block, the path accepts only the final IT instruction and only when
-its encoding is otherwise verified sequential; the successor trap then lies
-outside the IT block whether the final predicate passes or fails. Earlier IT
-slots remain unsupported because their successor trap would still be subject
-to IT predication. For an accepted step, the backend restores an owned
-breakpoint instruction if needed,
-patches a temporary trap at the decoded successor, suspends peer threads, and
-continues the event owner. At the next stop it rewinds a post-trap PC, restores
-the successor bytes, and rearms the owned breakpoint. Restoration failure
-keeps the event stopped and is retried before continuation; the temporary
-breakpoint exception must be continued as handled. Windows ARM32
+that do not write PC. It also follows A32 B/BL (including known NZCV
+conditions), A32 BX/BLX register, Thumb 16-bit B/B<cond>, and Thumb BX/BLX
+register. Branch targets and ARM/Thumb interworking are derived from the
+stopped context; PC-relative register branches, Thumb-2 wide branches, other
+PC-writing instructions, unknown encodings, and a successor overlapping a
+user breakpoint remain unsupported. A Thumb branch in an active IT block is
+accepted only in the final slot, and the IT predicate is applied before
+choosing its destination; conditional branches in IT must match the active IT
+condition. Sequential instructions may be stepped from any IT
+slot: nested IT encodings are rejected, the temporary Thumb BKPT traps
+unconditionally, and the backend restores the exact advanced ITSTATE when it
+rewinds the post-trap PC. For an accepted
+step, the backend restores an owned breakpoint instruction if needed, patches
+a temporary trap at the decoded successor, suspends peer threads, and
+continues the event owner. Only that thread's breakpoint at the tracked
+successor is classified as completion. At the next stop it rewinds PC and
+ITSTATE, restores the successor bytes, and rearms the owned breakpoint.
+Restoration failure keeps the event stopped and is retried before
+continuation; the temporary breakpoint exception must be continued as
+handled. Windows ARM32
 hardware breakpoints use up to eight BVR/BCR execute comparators exposed by the Windows ARM32 context ([Armv7-A/R Architecture Reference Manual](https://developer.arm.com/documentation/ddi0406/b/Application-Level-Architecture/Introduction-to-the-ARM-Architecture/Debug)). Since hardware may implement fewer, each update verifies the programmed context and fails with `unsupported` if the requested comparator count is unavailable. Only execute
 breakpoints are supported; data watchpoints remain unsupported. ARM addresses
 must be four-byte aligned. Thumb addresses use the low address bit as a Thumb

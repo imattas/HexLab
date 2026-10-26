@@ -349,6 +349,21 @@ bool arm32_thumb_wide_prefix(std::uint16_t first) {
     return (first & 0xf800u) == 0xe800u || (first & 0xf000u) == 0xf000u;
 }
 
+std::uint8_t arm32_advance_it_state(std::uint8_t state);
+
+std::optional<std::uint8_t> arm32_thumb_it_instruction_state(std::uint16_t instruction) {
+    if ((instruction & 0xff00u) != 0xbf00u) return {};
+    const auto condition = static_cast<std::uint8_t>((instruction >> 4) & 0xfu);
+    const auto mask = static_cast<std::uint8_t>(instruction & 0xfu);
+    if (!mask || condition >= 14) return {};
+    return static_cast<std::uint8_t>((condition << 4) | mask);
+}
+
+std::uint8_t arm32_thumb_it_state_after(std::uint16_t instruction, std::uint8_t before) {
+    if (before) return arm32_advance_it_state(before);
+    return arm32_thumb_it_instruction_state(instruction).value_or(0);
+}
+
 // A temporary successor trap is a step only when the current instruction is
 // known to fall through without writing PC or changing instruction state.
 std::optional<std::size_t> arm32_linear_instruction_width(std::span<const std::byte> bytes, bool thumb) {
@@ -365,7 +380,9 @@ std::optional<std::size_t> arm32_linear_instruction_width(std::span<const std::b
                     ((second >> 8) & 15u) != 15u)
                 ? std::optional<std::size_t>{4} : std::nullopt;
         }
-        if (halfword == 0xbf00u || halfword < 0x4400u ||
+        if (halfword == 0xbf00u || arm32_thumb_it_instruction_state(halfword) ||
+            ((halfword & 0xff0fu) == 0xbf00u && ((halfword >> 4) & 0xfu) <= 4u) ||
+            halfword < 0x4400u ||
             (halfword >= 0x4800u && halfword < 0xb000u) ||
             (halfword >= 0xc000u && halfword < 0xd000u && (halfword & 0xffu) != 0)) return 2;
         return {};
@@ -378,6 +395,124 @@ std::optional<std::size_t> arm32_linear_instruction_width(std::span<const std::b
     if ((word >> 28) == 15 || (word & 0x0e000000u) != 0x02000000u ||
         ((word >> 12) & 15u) == 15u) return {};
     return 4;
+}
+
+struct Arm32StepDestination {
+    DWORD address = 0;
+    bool thumb = false;
+};
+
+bool arm32_condition_passed(unsigned condition, DWORD cpsr) {
+    const bool n = (cpsr & (1u << 31)) != 0;
+    const bool z = (cpsr & (1u << 30)) != 0;
+    const bool c = (cpsr & (1u << 29)) != 0;
+    const bool v = (cpsr & (1u << 28)) != 0;
+    switch (condition) {
+    case 0: return z;
+    case 1: return !z;
+    case 2: return c;
+    case 3: return !c;
+    case 4: return n;
+    case 5: return !n;
+    case 6: return v;
+    case 7: return !v;
+    case 8: return c && !z;
+    case 9: return !c || z;
+    case 10: return n == v;
+    case 11: return n != v;
+    case 12: return !z && n == v;
+    case 13: return z || n != v;
+    case 14: return true;
+    default: return false;
+    }
+}
+
+std::int64_t arm32_sign_extend(std::uint32_t value, unsigned bits) {
+    const auto sign = std::uint32_t{1} << (bits - 1);
+    return (value & sign) ? static_cast<std::int64_t>(value) - (std::int64_t{1} << bits)
+                          : static_cast<std::int64_t>(value);
+}
+
+std::uint8_t arm32_advance_it_state(std::uint8_t state) {
+    if (!state || (state & 7u) == 0) return 0;
+    return static_cast<std::uint8_t>((state & 0xe0u) | ((state << 1) & 0x1fu));
+}
+
+std::uint8_t arm32_cpsr_it_state(DWORD cpsr) {
+    return static_cast<std::uint8_t>(((cpsr >> 8) & 0xfcu) | ((cpsr >> 25) & 3u));
+}
+
+bool arm32_valid_it_state(std::uint8_t state) {
+    return state == 0 || (((state >> 4) & 0xfu) < 14 && (state & 0xfu) != 0);
+}
+
+DWORD arm32_it_state_cpsr_bits(std::uint8_t state) {
+    return (static_cast<DWORD>(state & 0xfcu) << 8) | (static_cast<DWORD>(state & 3u) << 25);
+}
+
+std::optional<Arm32StepDestination> arm32_branch_destination(
+    std::span<const std::byte> bytes, DWORD pc, bool thumb, DWORD cpsr,
+    const std::array<DWORD, 16> &registers, std::uint8_t it_state) {
+    if (thumb) {
+        if (bytes.size() < 2) return {};
+        const auto half = static_cast<std::uint16_t>(std::to_integer<unsigned>(bytes[0]) |
+            (std::to_integer<unsigned>(bytes[1]) << 8));
+        const DWORD fallthrough = pc + 2;
+        const bool in_it = it_state != 0;
+        if (in_it && (it_state & 7u) != 0) return {}; // PC-changing T32 instructions belong in the final IT slot.
+        const bool it_executes = !in_it || arm32_condition_passed(it_state >> 4, cpsr);
+        const auto destination = [&](std::int64_t displacement) -> std::optional<Arm32StepDestination> {
+            const auto target = static_cast<std::int64_t>(pc) + 4 + displacement;
+            if (target < 0 || target > UINT32_MAX || (target & 1)) return {};
+            return Arm32StepDestination{static_cast<DWORD>(target), true};
+        };
+        if ((half & 0xf000u) == 0xd000u) { // B<cond> T1.
+            const auto condition = static_cast<unsigned>((half >> 8) & 0xfu);
+            if (condition >= 14) return {};
+            if (in_it && condition != static_cast<unsigned>(it_state >> 4)) return {};
+            const bool take = it_executes && arm32_condition_passed(condition, cpsr);
+            return take ? destination(arm32_sign_extend((half & 0xffu) << 1, 9))
+                        : std::optional<Arm32StepDestination>{Arm32StepDestination{fallthrough, true}};
+        }
+        if ((half & 0xf800u) == 0xe000u) { // B T2.
+            return it_executes ? destination(arm32_sign_extend((half & 0x7ffu) << 1, 12))
+                               : std::optional<Arm32StepDestination>{Arm32StepDestination{fallthrough, true}};
+        }
+        if ((half & 0xff07u) == 0x4700u) { // BX/BLX register.
+            const auto reg = static_cast<unsigned>((half >> 3) & 0xfu);
+            if (reg == 15) return {};
+            if (!it_executes) return Arm32StepDestination{fallthrough, true};
+            const auto target = registers[reg];
+            const bool target_thumb = (target & 1u) != 0;
+            return Arm32StepDestination{target & (target_thumb ? ~DWORD{1} : ~DWORD{3}), target_thumb};
+        }
+        return {};
+    }
+
+    if (bytes.size() < 4) return {};
+    const auto word = static_cast<std::uint32_t>(std::to_integer<unsigned>(bytes[0])) |
+        (std::to_integer<std::uint32_t>(bytes[1]) << 8) |
+        (std::to_integer<std::uint32_t>(bytes[2]) << 16) |
+        (std::to_integer<std::uint32_t>(bytes[3]) << 24);
+    const auto condition = static_cast<unsigned>(word >> 28);
+    if (condition == 15) return {};
+    const auto fallthrough = static_cast<DWORD>(pc + 4u);
+    if ((word & 0x0e000000u) == 0x0a000000u) { // B/BL immediate.
+        if (!arm32_condition_passed(condition, cpsr)) return Arm32StepDestination{fallthrough, false};
+        const auto displacement = arm32_sign_extend((word & 0x00ffffffu) << 2, 26);
+        const auto target = static_cast<DWORD>(static_cast<std::int64_t>(pc) + 8 + displacement);
+        return Arm32StepDestination{target, false};
+    }
+    const auto branch_encoding = word & 0x0ffffff0u;
+    if (branch_encoding == 0x012fff10u || branch_encoding == 0x012fff30u) { // BX/BLX register.
+        const auto reg = static_cast<unsigned>(word & 0xfu);
+        if (reg == 15) return {};
+        if (!arm32_condition_passed(condition, cpsr)) return Arm32StepDestination{fallthrough, false};
+        const auto target = registers[reg];
+        const bool target_thumb = (target & 1u) != 0;
+        return Arm32StepDestination{target & (target_thumb ? ~DWORD{1} : ~DWORD{3}), target_thumb};
+    }
+    return {};
 }
 
 class Win32Backend final : public Backend {
@@ -1839,6 +1974,7 @@ private:
         std::vector<std::byte> original, trap;
         std::optional<std::uintptr_t> displaced;
         std::optional<DWORD> restore_pc;
+        std::uint8_t successor_it_state = 0;
         bool thumb = false;
         bool rewind_successor = false;
         bool successor_patched = false;
@@ -1876,8 +2012,18 @@ private:
                 CloseHandle(thread);
                 return Error{ErrorCode::unsupported, "ARM32 step stop PC does not match the temporary breakpoint"};
             }
+            bool context_changed = false;
             if (desired != c.Pc) {
                 c.Pc = desired;
+                context_changed = true;
+            }
+            if (arm32_step_->rewind_successor) {
+                constexpr DWORD it_mask = (3u << 25) | (0x3fu << 10);
+                c.Cpsr = (c.Cpsr & ~it_mask) |
+                    arm32_it_state_cpsr_bits(arm32_step_->successor_it_state);
+                context_changed = true;
+            }
+            if (context_changed) {
                 if (!SetThreadContext(thread, &c)) {
                     const auto error = win_error("SetThreadContext restoring ARM32 step PC");
                     CloseHandle(thread);
@@ -1932,22 +2078,10 @@ private:
         }
         CONTEXT original_context = context;
         const bool thumb = (context.Cpsr & (1u << 5)) != 0;
-        constexpr DWORD it_state = (3u << 25) | (0x3fu << 10);
-        if (thumb && (context.Cpsr & it_state) != 0) {
-            // The successor trap is only unconditional after the last IT
-            // instruction. Earlier instructions may be skipped by their
-            // predicate, and the following instruction would still be inside
-            // ITSTATE, so a software BKPT there is not a safe step boundary.
-            const auto packed_it_state = static_cast<std::uint8_t>(
-                ((context.Cpsr >> 8) & 0xfcu) | ((context.Cpsr >> 25) & 3u));
-            // ITSTATE advances to zero after this instruction only when it is
-            // the final slot; then normal execution reaches the trap outside
-            // the conditional block regardless of whether the predicate passes.
-            if ((packed_it_state & 7u) != 0) {
-                CloseHandle(thread);
-                return Error{ErrorCode::unsupported,
-                    "ARM32 temporary-trap stepping is available only on the final sequential instruction in a Thumb IT block"};
-            }
+        const auto it_state = thumb ? arm32_cpsr_it_state(context.Cpsr) : std::uint8_t{0};
+        if (!arm32_valid_it_state(it_state)) {
+            CloseHandle(thread);
+            return Error{ErrorCode::unsupported, "ARM32 step cannot interpret the stopped thread's Thumb ITSTATE"};
         }
         std::uintptr_t pc = context.Pc;
         if ((pc & (thumb ? 1u : 3u)) != 0) {
@@ -1984,13 +2118,41 @@ private:
             const auto& original = breakpoints_.at(*displaced).original;
             std::copy(original.begin(), original.end(), instruction.begin());
         }
-        const auto width = arm32_linear_instruction_width(instruction, thumb);
+        if (thumb && it_state != 0) {
+            const auto half = static_cast<std::uint16_t>(std::to_integer<unsigned>(instruction[0]) |
+                (std::to_integer<unsigned>(instruction[1]) << 8));
+            if (arm32_thumb_it_instruction_state(half)) {
+                CloseHandle(thread);
+                return Error{ErrorCode::unsupported, "ARM32 step cannot interpret a nested Thumb IT instruction"};
+            }
+        }
+        std::array<DWORD, 16> registers{};
+        registers[0] = context.R0; registers[1] = context.R1;
+        registers[2] = context.R2; registers[3] = context.R3;
+        registers[4] = context.R4; registers[5] = context.R5;
+        registers[6] = context.R6; registers[7] = context.R7;
+        registers[8] = context.R8; registers[9] = context.R9;
+        registers[10] = context.R10; registers[11] = context.R11;
+        registers[12] = context.R12; registers[13] = context.Sp;
+        registers[14] = context.Lr; registers[15] = context.Pc;
+        const auto branch = arm32_branch_destination(instruction, static_cast<DWORD>(pc), thumb,
+            context.Cpsr, registers, it_state);
+        std::optional<std::size_t> width;
+        Arm32StepDestination next{};
+        if (branch) {
+            width = thumb ? 2u : 4u;
+            next = *branch;
+        } else {
+            width = arm32_linear_instruction_width(instruction, thumb);
+            if (width) next = Arm32StepDestination{static_cast<DWORD>(pc + *width), thumb};
+        }
         if (!width) {
             CloseHandle(thread);
-            return Error{ErrorCode::unsupported, "ARM32 step supports only verified sequential ARM/Thumb instructions"};
+            return Error{ErrorCode::unsupported, "ARM32 step supports only verified sequential instructions and known branch forms"};
         }
-        const auto successor = pc + *width;
-        const auto trap = arm32_breakpoint_instruction(thumb);
+        const auto successor = static_cast<std::uintptr_t>(next.address);
+        const auto successor_thumb = next.thumb;
+        const auto trap = arm32_breakpoint_instruction(successor_thumb);
         if (successor > UINT32_MAX - trap.size()) {
             CloseHandle(thread);
             return Error{ErrorCode::invalid_argument, "ARM32 step successor exceeds the address space"};
@@ -2005,7 +2167,12 @@ private:
         state.successor = successor;
         state.trap = trap;
         state.displaced = displaced;
-        state.thumb = thumb;
+        state.thumb = successor_thumb;
+        if (thumb) {
+            const auto half = static_cast<std::uint16_t>(std::to_integer<unsigned>(instruction[0]) |
+                (std::to_integer<unsigned>(instruction[1]) << 8));
+            state.successor_it_state = arm32_thumb_it_state_after(half, it_state);
+        }
         state.original.resize(trap.size());
         if (!ReadProcessMemory(process_, reinterpret_cast<const void*>(successor), state.original.data(),
                                state.original.size(), &read) || read != state.original.size()) {
