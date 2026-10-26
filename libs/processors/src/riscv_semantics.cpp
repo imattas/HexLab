@@ -637,11 +637,12 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         (config.masked && operands.predicate_mask.size() != vlmax))
         return {};
 
-    enum class Operation { sign_copy, sign_invert, sign_xor, min, max, equal, not_equal,
+    enum class Operation { classification, sign_copy, sign_invert, sign_xor, min, max, equal, not_equal,
                            less, less_equal, greater, greater_equal };
     Operation operation;
     bool vector_rhs = false, mask_result = false;
     switch (opcode) {
+    case RiscvOpcode::vfclass_v: operation = Operation::classification; break;
 #define RV_FLOAT_PAIR(vv, vf, name) \
     case RiscvOpcode::vv: operation = Operation::name; vector_rhs = true; break; \
     case RiscvOpcode::vf: operation = Operation::name; break
@@ -702,6 +703,24 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         const bool any_signaling_nan = is_signaling_nan(lhs) || is_signaling_nan(rhs);
         std::uint64_t value = 0;
         switch (operation) {
+        case Operation::classification: {
+            const auto magnitude = lhs & ~sign_mask;
+            const auto exponent = magnitude & exponent_mask;
+            const auto fraction = magnitude & fraction_mask;
+            if (exponent == exponent_mask) {
+                if (fraction == 0) value = UINT64_C(1) << (lhs & sign_mask ? 0 : 7);
+                else {
+                    const bool quiet = (fraction & quiet_mask) != 0;
+                    value = UINT64_C(1) << (quiet ? 9 : 8);
+                }
+            } else if (exponent == 0) {
+                if (fraction == 0) value = UINT64_C(1) << (lhs & sign_mask ? 3 : 4);
+                else value = UINT64_C(1) << (lhs & sign_mask ? 2 : 5);
+            } else {
+                value = UINT64_C(1) << (lhs & sign_mask ? 1 : 6);
+            }
+            break;
+        }
         case Operation::sign_copy:
             value = (lhs & ~sign_mask) | (rhs & sign_mask);
             break;

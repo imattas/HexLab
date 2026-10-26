@@ -126,7 +126,7 @@ DecodeResult decode_wasm(std::span<const std::byte> bytes, Address at) {
         std::uint64_t count = 0;
         auto result = uleb(bytes, position, 32, count);
         if (result != LebResult::ok) return decode_leb_result(result);
-        if (count > 8) return fail(DecodeStatus::unsupported, "br_table operands exceed the fixed decoded instruction capacity");
+        if (count > 12) return fail(DecodeStatus::unsupported, "br_table exceeds the maximum case count that can fit in a 15-byte instruction");
         operands.push_back(ImmediateOperand{count, 32, 32, false, {}});
         for (std::uint64_t n = 0; n <= count; ++n) {
             std::uint64_t label = 0;

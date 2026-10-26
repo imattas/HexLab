@@ -583,8 +583,6 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
         unsupported("EVEX opcode map is outside the enabled AVX-512 subset");
     if (vector_bits != 128 && vector_bits != 256 && vector_bits != 512)
         unsupported("EVEX vector length is outside the modeled 128/256/512-bit forms");
-    if (broadcast)
-        unsupported("EVEX broadcast and embedded-rounding forms are not covered");
     if (zeroing && mask == 0)
         invalid("EVEX zeroing requires a nonzero opmask register");
 
@@ -732,7 +730,18 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
             invalid("EVEX packed floating arithmetic has an unsupported pp/W combination");
     }
 
-    auto decoded = modrm(state, static_cast<std::uint16_t>(vector_bits), static_cast<std::uint16_t>(vector_bits));
+    const bool packed_single = operation == Opcode::vaddps || operation == Opcode::vsubps ||
+        operation == Opcode::vmulps || operation == Opcode::vdivps;
+    const bool packed_double = operation == Opcode::vaddpd || operation == Opcode::vsubpd ||
+        operation == Opcode::vmulpd || operation == Opcode::vdivpd;
+    const auto element_bits = static_cast<std::uint16_t>(packed_single ? 32 : packed_double ? 64 : 0);
+    if (broadcast && (!element_bits || move_load || move_store || integer_operation))
+        unsupported("EVEX.b broadcast is only modeled for packed floating arithmetic");
+
+    auto decoded = modrm(state, static_cast<std::uint16_t>(broadcast ? element_bits : vector_bits),
+                         static_cast<std::uint16_t>(vector_bits));
+    if (broadcast && std::holds_alternative<RegisterOperand>(decoded.rm))
+        unsupported("EVEX embedded rounding is not modeled");
     const auto vector_bank = vector_bits == 128 ? RegisterBank::xmm :
                              vector_bits == 256 ? RegisterBank::ymm : RegisterBank::zmm;
     auto vector_register = [&](RegisterOperand reg) {
@@ -751,15 +760,16 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
         if (rm_high)
             reg->index = static_cast<std::uint8_t>(reg->index + 16);
     } else if (auto *memory = std::get_if<MemoryOperand>(&rm)) {
-        memory->data_width = static_cast<std::uint16_t>(vector_bits);
-        // All currently accepted EVEX forms use a full-width, non-broadcast
-        // tuple; compressed disp8 therefore scales by the vector size.
+        memory->data_width = static_cast<std::uint16_t>(broadcast ? element_bits : vector_bits);
+        // Compressed disp8 scales by the full-vector tuple, or by one lane
+        // for the supported scalar broadcast tuple.
         if (memory->displacement_encoding && memory->displacement_encoding->size == 1)
-            memory->displacement *= static_cast<std::int64_t>(vector_bits / 8);
+            memory->displacement *= static_cast<std::int64_t>((broadcast ? element_bits : vector_bits) / 8);
     }
 
     state.i.opcode = operation;
     state.i.x86_evex = true;
+    state.i.x86_evex_broadcast = broadcast;
     state.i.vector_bits = static_cast<std::uint16_t>(vector_bits);
     auto add_upper_zero_writes = [&](RegisterOperand reg) {
         if (vector_bits == 128)
@@ -799,8 +809,7 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
         return true;
     }
 
-    state.i.vector_element_bits = (operation == Opcode::vaddps || operation == Opcode::vsubps ||
-                                   operation == Opcode::vmulps || operation == Opcode::vdivps) ? 32 : 64;
+    state.i.vector_element_bits = element_bits;
     constexpr RegisterOperand mxcsr{RegisterBank::mxcsr, 0, 32, false};
     state.i.register_reads.push_back(mxcsr);
     state.i.register_writes.push_back(mxcsr);

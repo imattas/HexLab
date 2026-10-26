@@ -352,7 +352,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     const auto table_targets = [&](std::size_t n) -> Result<std::vector<TableTarget>> {
         const auto &instruction = code[n]->instruction;
         const auto count = immediate(instruction, 0);
-        if (!count || *count > 8 || instruction.operands.size() != *count + 2)
+        if (!count || *count > 12 || instruction.operands.size() != *count + 2)
             return unsupported("br_table count or target vector is malformed or exceeds the decoded bound");
         std::vector<TableTarget> targets;
         targets.reserve(static_cast<std::size_t>(*count) + 1);

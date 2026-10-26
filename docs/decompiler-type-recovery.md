@@ -412,8 +412,12 @@ contiguous members of the same supported floating type into consecutive SIMD
 argument registers; caller evidence for each member is propagated to the
 callee's aggregate parameter. When all HFA members do not fit in the remaining
 SIMD argument registers, the allocator exhausts that register bank and assigns
-the complete aggregate to its aligned incoming stack slot. Prototype slots
-that cannot be classified stop at the first unsupported parameter. Aggregates
+the complete aggregate to aligned incoming stack storage. Recovery represents
+that spilled HFA as one stack slot per scalar member, so exact-width member
+loads in the callee and direct register-to-stack member stores at a compatible
+callsite can propagate each member's floating type. It does not reconstruct
+aggregate copies, partial stores, or non-register store sources. Prototype
+slots that cannot be classified stop at the first unsupported parameter. Aggregates
 with padding, unions, mixed member types, or more than four members remain
 unsupported. Multi-register HFA returns and ambiguous mixed-class argument
 evidence without a prototype are left unresolved. Without a prototype,

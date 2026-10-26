@@ -25,6 +25,7 @@
 #include <cstring>
 #include <cstdio>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <condition_variable>
@@ -62,6 +63,16 @@ std::string register_hex(const debugger::RegisterValue &reg) {
         const auto index = big_endian ? i : reg.bytes.size() - 1 - i;
         const auto b = std::to_integer<unsigned>(reg.bytes[index]);
         value.push_back(digits[b >> 4]); value.push_back(digits[b & 15]);
+    }
+    return value;
+}
+std::optional<std::uint64_t> register_u64(const debugger::RegisterValue &reg) {
+    if (reg.bytes.size() != 8) return {};
+    std::uint64_t value = 0;
+    const bool big_endian = reg.byte_order == ByteOrder::big;
+    for (std::size_t i = 0; i < reg.bytes.size(); ++i) {
+        const auto index = big_endian ? i : reg.bytes.size() - 1 - i;
+        value = (value << 8) | std::to_integer<std::uint8_t>(reg.bytes[index]);
     }
     return value;
 }
@@ -1630,6 +1641,21 @@ void DebuggerView::refresh_locals() {
                         const auto &frame = frames[frame_index];
                         rows = debugger_locals_at(*document->project, *loaded.image, frame.runtime_pc,
                             module_base, architecture, frame.registers, read_memory, frame.call_frame_cfa);
+                        if (pe && architecture == Architecture::x86_64) {
+                            const auto rsp = std::find_if(frame.registers.begin(), frame.registers.end(),
+                                [](const auto &reg) { return reg.name == "RSP" || reg.name == "rsp"; });
+                            const auto establisher_frame = rsp == frame.registers.end()
+                                ? std::nullopt : register_u64(*rsp);
+                            if (establisher_frame) {
+                                auto exception_rows = debugger_pe_exception_rows(
+                                    *pe, module_base, frame.runtime_pc, *establisher_frame,
+                                    [&](std::uint64_t address, std::size_t size) {
+                                        return read_memory(address, size);
+                                    });
+                                rows.insert(rows.end(), std::make_move_iterator(exception_rows.begin()),
+                                            std::make_move_iterator(exception_rows.end()));
+                            }
+                        }
                     }
                 } else if (mapping) mapping_reason = "Static mapping unavailable: thread PC is outside mapped executable image coverage.";
             } else mapping_reason = "Static mapping unavailable: " + modules.error().message;

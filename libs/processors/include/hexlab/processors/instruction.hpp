@@ -434,7 +434,11 @@ enum class Opcode {
     // Scalar PowerPC signed FP/integer conversions; preserve persisted IDs.
     ppc_fctiw, ppc_fctiwz, ppc_fctid, ppc_fctidz, ppc_fcfid,
     // AVX packed signed integer absolute value; preserve persisted opcode IDs.
-    vpabsb, vpabsw, vpabsd
+    vpabsb, vpabsw, vpabsd,
+    // MIPS64 conditional trap comparisons; append to preserve persisted IDs.
+    mips64_tge, mips64_tgeu, mips64_tlt, mips64_tltu, mips64_teq, mips64_tne,
+    // RVV unary square-root and IEEE class mask; appended for ID stability.
+    rv_vfsqrt_v, rv_vfclass_v
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
@@ -603,6 +607,9 @@ struct Instruction {
     // empty optional; a present index is 1..7. Zeroing applies only to the
     // destination's inactive vector elements.
     bool x86_evex = false;
+    // EVEX.b memory tuple broadcast for the supported packed FP arithmetic
+    // subset. The memory operand width is one lane, replicated by the op.
+    bool x86_evex_broadcast = false;
     std::optional<std::uint8_t> x86_opmask;
     bool x86_opmask_zeroing = false;
     bool memory_read = false, memory_write = false;

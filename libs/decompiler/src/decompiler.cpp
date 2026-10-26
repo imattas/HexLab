@@ -251,6 +251,8 @@ std::optional<RiscvVectorEffect> riscv_vector_effect(Opcode opcode) {
     case Opcode::rv_vfmsub_vf: return RiscvVectorEffect{"vfmsub.vf", false, true};
     case Opcode::rv_vfnmsub_vv: return RiscvVectorEffect{"vfnmsub.vv", false, true};
     case Opcode::rv_vfnmsub_vf: return RiscvVectorEffect{"vfnmsub.vf", false, true};
+    case Opcode::rv_vfsqrt_v: return RiscvVectorEffect{"vfsqrt.v", false, true};
+    case Opcode::rv_vfclass_v: return RiscvVectorEffect{"vfclass.v", false};
     case Opcode::rv_vmfeq_vv: return RiscvVectorEffect{"vmfeq.vv", true, true};
     case Opcode::rv_vmfeq_vf: return RiscvVectorEffect{"vmfeq.vf", true, true};
     case Opcode::rv_vmfne_vv: return RiscvVectorEffect{"vmfne.vv", true, true};
@@ -3655,7 +3657,9 @@ a64_unhandled:
             if (const auto *reg = std::get_if<RegisterOperand>(&operand))
                 return reg->bank == vector_bank && reg->width == vector_width;
             if (allow_memory)
-                if (const auto *memory = std::get_if<MemoryOperand>(&operand)) return memory->data_width == vector_width;
+                if (const auto *memory = std::get_if<MemoryOperand>(&operand))
+                    return memory->data_width == vector_width ||
+                        (instruction.x86_evex_broadcast && memory->data_width == instruction.vector_element_bits);
             return false;
         };
         if (supported_width && avx_move && instruction.operands.size() == 2) {
@@ -3694,7 +3698,9 @@ a64_unhandled:
                 const auto input_type = vector_type_for(avx_float_arithmetic, vector_width);
                 const auto result_type = vector_type_for(avx_float_arithmetic, result_width);
                 auto second = retag_expr(operands[1], input_type);
-                auto third = retag_expr(operands[2], input_type);
+                auto third = instruction.x86_evex_broadcast
+                    ? retag_expr(operands[2], floating_type(instruction.vector_element_bits))
+                    : retag_expr(operands[2], input_type);
                 const bool packed_double = instruction.opcode == Opcode::vaddpd || instruction.opcode == Opcode::vsubpd ||
                     instruction.opcode == Opcode::vmulpd || instruction.opcode == Opcode::vdivpd ||
                     instruction.opcode == Opcode::vxorpd || instruction.opcode == Opcode::vandpd;
@@ -3720,6 +3726,7 @@ a64_unhandled:
                 if (avx_float_arithmetic)
                     inputs.push_back(reg_expr({RegisterBank::mxcsr, 0, 32, false}));
                 Intrinsic effect{"x86_" + operation_name(instruction.opcode) + suffix +
+                                     (instruction.x86_evex_broadcast ? "_broadcast" : "") +
                                      mask_suffix + (avx_float_arithmetic ? "_mxcsr_control_status" : ""),
                     std::move(inputs),
                     std::holds_alternative<MemoryOperand>(instruction.operands[2]) ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};

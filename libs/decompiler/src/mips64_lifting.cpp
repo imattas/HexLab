@@ -73,6 +73,16 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
         if (!items.empty()) branch.indirect_target = operand(items.front());
         return branch;
     }
+    if (op == Opcode::mips64_tge || op == Opcode::mips64_tgeu ||
+        op == Opcode::mips64_tlt || op == Opcode::mips64_tltu ||
+        op == Opcode::mips64_teq || op == Opcode::mips64_tne) {
+        const char *name = op == Opcode::mips64_tge ? "mips64_tge_conditional_trap" :
+            op == Opcode::mips64_tgeu ? "mips64_tgeu_conditional_trap" :
+            op == Opcode::mips64_tlt ? "mips64_tlt_conditional_trap" :
+            op == Opcode::mips64_tltu ? "mips64_tltu_conditional_trap" :
+            op == Opcode::mips64_teq ? "mips64_teq_conditional_trap" : "mips64_tne_conditional_trap";
+        return intrinsic(instruction, name, IntrinsicMemoryEffect::none);
+    }
 
     const auto fp_memory = [](ExpressionPtr address, std::uint16_t bits) -> ExpressionPtr {
         if (!address || !std::holds_alternative<MemoryValue>(address->value)) return address;
