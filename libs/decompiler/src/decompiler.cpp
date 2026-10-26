@@ -5725,6 +5725,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<const LiftedBlock *> no;
             std::vector<std::pair<std::string, std::string>> yes_phi_copies;
             std::vector<std::pair<std::string, std::string>> no_phi_copies;
+            bool yes_break = false;
+            bool no_break = false;
         };
         struct NestedLoopBody {
             const LiftedBlock *header = nullptr;
@@ -5861,6 +5863,142 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         }
                         if (!prefix_valid || diamond_predecessors[nested_branch->id.value] !=
                                 std::set<std::uint64_t>{predecessor}) continue;
+                        // A nested loop-body branch may leave through exactly
+                        // one direct edge to the already validated loop exit.
+                        // Its other edge must rejoin the outer sibling path;
+                        // the exit block itself is emitted after the loop.
+                        const auto *nested_test = terminal_conditional(*nested_branch);
+                        const bool break_true = nested_test && nested_test->true_target ==
+                            std::optional<Address>{exit_block->begin};
+                        const bool break_false = nested_test && nested_test->false_target ==
+                            std::optional<Address>{exit_block->begin};
+                        const bool exact_branch_edges = nested_branch->successors.size() == 2 && nested_test &&
+                            nested_test->true_target && nested_test->false_target &&
+                            std::count_if(nested_branch->successors.begin(), nested_branch->successors.end(),
+                                [&](const auto &edge) { return edge_targets(edge, *nested_test->true_target); }) == 1 &&
+                            std::count_if(nested_branch->successors.begin(), nested_branch->successors.end(),
+                                [&](const auto &edge) { return edge_targets(edge, *nested_test->false_target); }) == 1;
+                        if (break_true != break_false && exact_branch_edges &&
+                            diamond_predecessors[exit_block->id.value].contains(nested_branch->id.value) &&
+                            exit_block->phis.empty() &&
+                            !exit_block->memory_phi && exit_block->memory_partition_phis.empty()) {
+                            const Address continue_address = break_true ? *nested_test->false_target :
+                                *nested_test->true_target;
+                            std::vector<const LiftedBlock *> continue_path;
+                            auto *cursor = find_block(continue_address);
+                            auto continue_predecessor = nested_branch->id.value;
+                            const LiftedBlock *join = nullptr;
+                            bool continue_valid = true;
+                            std::set<std::uint64_t> seen_continue;
+                            while (cursor && cursor != exit_block && cursor != header && cursor != entry &&
+                                   !occupied.contains(cursor->id.value) &&
+                                   seen_continue.insert(cursor->id.value).second &&
+                                   continue_path.size() < function.blocks.size()) {
+                                if (std::find(sibling_path.begin(), sibling_path.end(), cursor) != sibling_path.end()) {
+                                    join = cursor;
+                                    break;
+                                }
+                                if (!cursor->phis.empty() || cursor->switch_dispatch || contains_return(*cursor) ||
+                                    !has_only_simple_statements(*cursor) || !valid_diamond_memory_phi(*cursor) ||
+                                    cursor->successors.size() != 1 || !cursor->successors.front().target ||
+                                    (cursor->successors.front().kind != BlockEdgeKind::jump &&
+                                     cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                                    !has_unconditional_edge(*cursor, *cursor->successors.front().target) ||
+                                    diamond_predecessors[cursor->id.value] !=
+                                        std::set<std::uint64_t>{continue_predecessor}) {
+                                    continue_valid = false;
+                                    break;
+                                }
+                                continue_path.push_back(cursor);
+                                continue_predecessor = cursor->id.value;
+                                cursor = find_block(*cursor->successors.front().target);
+                            }
+                            if (continue_valid && join && join != exit_block && !excluded(join) &&
+                                !contains_return(*join) && !join->switch_dispatch &&
+                                has_only_simple_statements(*join) && valid_diamond_memory_phi(*join)) {
+                                auto sibling_position = std::find(sibling_path.begin(), sibling_path.end(), join);
+                                std::vector<const LiftedBlock *> sibling_arm(sibling_path.begin(), sibling_position);
+                                auto sibling_predecessor = branch.id.value;
+                                for (std::size_t i = 0; i < sibling_arm.size(); ++i) {
+                                    const auto *block = sibling_arm[i];
+                                    const auto *next = i + 1 == sibling_arm.size() ? join : sibling_arm[i + 1];
+                                    if (!block->phis.empty() || block->switch_dispatch || contains_return(*block) ||
+                                        !has_only_simple_statements(*block) || !valid_diamond_memory_phi(*block) ||
+                                        !has_unconditional_edge(*block, next->begin) ||
+                                        (block->successors.front().kind != BlockEdgeKind::jump &&
+                                         block->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                                        diamond_predecessors[block->id.value] !=
+                                            std::set<std::uint64_t>{sibling_predecessor}) {
+                                        continue_valid = false;
+                                        break;
+                                    }
+                                    sibling_predecessor = block->id.value;
+                                }
+                                const auto *continue_tail = continue_path.empty() ? nested_branch :
+                                    continue_path.back();
+                                if (std::any_of(sibling_arm.begin(), sibling_arm.end(), [&](const auto *block) {
+                                        return block == nested_branch ||
+                                            std::find(continue_path.begin(), continue_path.end(), block) !=
+                                                continue_path.end();
+                                    })) continue_valid = false;
+                                std::set<std::uint64_t> expected{continue_tail->id.value, sibling_predecessor};
+                                if (continue_valid && expected.size() == 2 &&
+                                    diamond_predecessors[join->id.value] == expected) {
+                                    std::vector<std::pair<std::string, std::string>> continue_copies;
+                                    std::vector<std::pair<std::string, std::string>> sibling_copies;
+                                    bool phi_valid = true;
+                                    for (const auto &phi : join->phis) {
+                                        if (phi.inputs.size() != 2) { phi_valid = false; break; }
+                                        const auto input_for = [&](std::uint64_t predecessor_id) {
+                                            return std::find_if(phi.inputs.begin(), phi.inputs.end(),
+                                                [&](const auto &input) { return input.predecessor.value == predecessor_id; });
+                                        };
+                                        const auto continue_input = input_for(continue_tail->id.value);
+                                        const auto sibling_input = input_for(sibling_predecessor);
+                                        if (continue_input == phi.inputs.end() || sibling_input == phi.inputs.end()) {
+                                            phi_valid = false;
+                                            break;
+                                        }
+                                        const auto destination = register_name(phi.destination, phi.version);
+                                        continue_copies.emplace_back(destination,
+                                            register_name(phi.destination, continue_input->version));
+                                        sibling_copies.emplace_back(destination,
+                                            register_name(phi.destination, sibling_input->version));
+                                    }
+                                    if (phi_valid) {
+                                        LoopConditionalBody break_region;
+                                        break_region.branch = nested_branch;
+                                        break_region.join = join;
+                                        break_region.yes_break = break_true;
+                                        break_region.no_break = break_false;
+                                        if (break_true) {
+                                            break_region.no = continue_path;
+                                            break_region.no_phi_copies = std::move(continue_copies);
+                                        } else {
+                                            break_region.yes = continue_path;
+                                            break_region.yes_phi_copies = std::move(continue_copies);
+                                        }
+                                        if (nested_on_true) {
+                                            region.yes.assign(nested_path.begin(), nested_path.begin() +
+                                                static_cast<std::ptrdiff_t>(nested_index));
+                                            region.no = std::move(sibling_arm);
+                                            region.yes_nested = std::make_shared<LoopConditionalBody>(
+                                                std::move(break_region));
+                                            region.no_phi_copies = std::move(sibling_copies);
+                                        } else {
+                                            region.no.assign(nested_path.begin(), nested_path.begin() +
+                                                static_cast<std::ptrdiff_t>(nested_index));
+                                            region.yes = std::move(sibling_arm);
+                                            region.no_nested = std::make_shared<LoopConditionalBody>(
+                                                std::move(break_region));
+                                            region.yes_phi_copies = std::move(sibling_copies);
+                                        }
+                                        region.join = join;
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
                         auto nested = analyze_loop_diamond(*nested_branch, nested_occupied, region_exit,
                                                            true, true, false, depth + 1);
                         if (!nested)
@@ -5888,11 +6026,13 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             sibling_predecessor = block->id.value;
                         }
                         if (!sibling_valid) continue;
-                        const auto *nested_yes_tail = nested->yes.empty() ? nested->branch : nested->yes.back();
-                        const auto *nested_no_tail = nested->no.empty() ? nested->branch : nested->no.back();
                         const auto *sibling_tail = sibling_arm.empty() ? &branch : sibling_arm.back();
-                        std::set<std::uint64_t> expected{
-                            nested_yes_tail->id.value, nested_no_tail->id.value, sibling_tail->id.value};
+                        std::set<std::uint64_t> expected;
+                        if (!nested->yes_break)
+                            expected.insert((nested->yes.empty() ? nested->branch : nested->yes.back())->id.value);
+                        if (!nested->no_break)
+                            expected.insert((nested->no.empty() ? nested->branch : nested->no.back())->id.value);
+                        expected.insert(sibling_tail->id.value);
                         if (nested->latch_to_header) {
                             expected.insert(entry->id.value);
                             if (nested->join != header || expected.size() != 4 ||
@@ -5910,6 +6050,22 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                 return item.predecessor == sibling_tail->id;
                             });
                             if (input == phi.inputs.end()) { phis_valid = false; break; }
+                            if (nested->yes_break || nested->no_break) {
+                                const auto continue_tail = nested->yes_break ?
+                                    (nested->no.empty() ? nested->branch : nested->no.back()) :
+                                    (nested->yes.empty() ? nested->branch : nested->yes.back());
+                                const auto continue_input = std::find_if(phi.inputs.begin(), phi.inputs.end(),
+                                    [&](const auto &item) { return item.predecessor == continue_tail->id; });
+                                if (continue_input == phi.inputs.end()) { phis_valid = false; break; }
+                            } else {
+                                const auto *nested_yes_tail = nested->yes.empty() ? nested->branch : nested->yes.back();
+                                const auto *nested_no_tail = nested->no.empty() ? nested->branch : nested->no.back();
+                                if (std::none_of(phi.inputs.begin(), phi.inputs.end(), [&](const auto &item) {
+                                        return item.predecessor == nested_yes_tail->id;
+                                    }) || std::none_of(phi.inputs.begin(), phi.inputs.end(), [&](const auto &item) {
+                                        return item.predecessor == nested_no_tail->id;
+                                    })) { phis_valid = false; break; }
+                            }
                             sibling_copies.emplace_back(register_name(phi.destination, phi.version),
                                                         register_name(phi.destination, input->version));
                         }
@@ -6518,7 +6674,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 out << prefix << "if (" << branch_condition_text(*branch) << ") {\n";
                 const auto emit_arm = [&](const std::vector<const LiftedBlock *> &blocks,
                                           const std::shared_ptr<LoopConditionalBody> &nested,
-                                          const std::vector<std::pair<std::string, std::string>> &copies) {
+                                          const std::vector<std::pair<std::string, std::string>> &copies,
+                                          bool breaks) {
+                    if (breaks) {
+                        out << std::string(indent + 4, ' ') << "break;\n";
+                        return;
+                    }
                     for (const auto *arm_block : blocks) emit_block(*arm_block, indent + 4, true);
                     if (nested) {
                         emit_loop_conditional(*nested, indent + 4);
@@ -6531,9 +6692,9 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         emit_parallel_copies(out, copies, indent + 4);
                     }
                 };
-                emit_arm(region.yes, region.yes_nested, region.yes_phi_copies);
+                emit_arm(region.yes, region.yes_nested, region.yes_phi_copies, region.yes_break);
                 out << prefix << "} else {\n";
-                emit_arm(region.no, region.no_nested, region.no_phi_copies);
+                emit_arm(region.no, region.no_nested, region.no_phi_copies, region.no_break);
                 out << prefix << "}\n";
             };
             for (const auto *block : loop_body) {
