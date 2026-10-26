@@ -413,8 +413,15 @@ Result<StopReply> Client::wait_stop_reply(std::chrono::milliseconds timeout, std
     }
 }
 Status Client::send_resume(std::string_view command, std::stop_token stop) {
+    const auto hex_digits = [](std::string_view value) {
+        return !value.empty() && value.find_first_not_of("0123456789abcdefABCDEF") == std::string_view::npos;
+    };
+    const bool legacy_continue_or_step = (command == "c" || command == "s") ||
+        ((command.starts_with('c') || command.starts_with('s')) && command.size() <= 17 && hex_digits(command.substr(1)));
+    const bool legacy_signal_resume = command.size() == 3 &&
+        (command.front() == 'C' || command.front() == 'S') && hex_digits(command.substr(1));
     if (command.empty() || command.size() > max_packet_ ||
-        !(command == "c" || command == "s" || command.starts_with("c") || command.starts_with("s") || command.starts_with("vCont;")))
+        !(legacy_continue_or_step || legacy_signal_resume || command.starts_with("vCont;")))
         return Error{ErrorCode::invalid_argument, "invalid RSP resume command"};
     if (command.starts_with("vCont;")) {
         auto actions = command.substr(6);
@@ -423,14 +430,19 @@ Status Client::send_resume(std::string_view command, std::stop_token stop) {
         while (!actions.empty()) {
             const auto end = actions.find(';');
             const auto action = actions.substr(0, end);
-            if (action.empty() || (action.front() != 'c' && action.front() != 's' && action.front() != 't'))
+            if (action.empty() || (action.front() != 'c' && action.front() != 's' && action.front() != 't' &&
+                action.front() != 'C' && action.front() != 'S'))
                 return Error{ErrorCode::invalid_argument, "invalid RSP vCont action list"};
             const auto colon = action.find(':');
+            const auto kind = colon == std::string_view::npos ? action : action.substr(0, colon);
+            const bool signal_action = kind.size() == 3 && (kind.front() == 'C' || kind.front() == 'S') &&
+                hex_digits(kind.substr(1));
+            if (kind != "c" && kind != "s" && kind != "t" && !signal_action)
+                return Error{ErrorCode::invalid_argument, "invalid RSP vCont action kind"};
             if (colon == std::string_view::npos) {
-                if (action != "c" && action != "s")
+                if (kind != "c" && kind != "s" && !signal_action)
                     return Error{ErrorCode::invalid_argument, "unqualified RSP vCont action is not supported"};
             } else {
-                const auto kind = action.substr(0, colon);
                 const auto selector = action.substr(colon + 1);
                 const auto valid_hex_id = [](std::string_view value) {
                     std::uint64_t parsed = 0;
@@ -444,7 +456,7 @@ Status Client::send_resume(std::string_view command, std::stop_token stop) {
                     const auto dot = qualified.find('.');
                     if (dot != std::string_view::npos && valid_hex_id(qualified.substr(0, dot))) {
                         const auto thread = qualified.substr(dot + 1);
-                        valid_selector = (thread == "-1" && kind == "c") || valid_hex_id(thread);
+                        valid_selector = (thread == "-1" && (kind == "c" || kind == "C")) || valid_hex_id(thread);
                     }
                 } else {
                     valid_selector = valid_hex_id(selector);
@@ -490,8 +502,8 @@ Status Client::send_resume(std::string_view command, std::stop_token stop) {
 }
 Status Client::send_vcont(std::string_view action, std::stop_token stop) {
     if (action.empty() || action.find(';') != std::string_view::npos ||
-        (action.front() != 'c' && action.front() != 's'))
-        return Error{ErrorCode::invalid_argument, "vCont resume requires exactly one continue or step action"};
+        (action.front() != 'c' && action.front() != 's' && action.front() != 'C' && action.front() != 'S'))
+        return Error{ErrorCode::invalid_argument, "vCont resume requires one continue or step action"};
     const auto colon = action.find(':');
     if (colon == std::string_view::npos || colon == 0 || colon + 1 == action.size())
         return Error{ErrorCode::invalid_argument, "thread-qualified vCont action requires an exact thread ID"};
@@ -511,7 +523,10 @@ Status Client::send_vcont(std::string_view action, std::stop_token stop) {
     } else if (!valid_hex_id(id)) {
         return Error{ErrorCode::invalid_argument, "invalid thread ID in vCont action"};
     }
-    if (action.substr(0, colon) != "c" && action.substr(0, colon) != "s")
+    const auto kind = action.substr(0, colon);
+    if (kind != "c" && kind != "s" &&
+        !(kind.size() == 3 && (kind.front() == 'C' || kind.front() == 'S') &&
+          kind.substr(1).find_first_not_of("0123456789abcdefABCDEF") == std::string_view::npos))
         return Error{ErrorCode::invalid_argument, "unsupported vCont action"};
     return send_resume("vCont;" + std::string(action), stop);
 }
@@ -522,11 +537,14 @@ Status Client::send_vcont_actions(std::span<const std::string> actions, std::sto
     for (const auto& action : actions) {
         if (action.empty() || action.find(';') != std::string::npos || action.find(':') == std::string::npos)
             return Error{ErrorCode::invalid_argument, "vCont schedule actions must identify one exact thread"};
-        if (action.front() != 'c' && action.front() != 's' && action.front() != 't')
+        if (action.front() != 'c' && action.front() != 's' && action.front() != 't' &&
+            action.front() != 'C' && action.front() != 'S')
             return Error{ErrorCode::invalid_argument, "unsupported vCont schedule action"};
         const auto colon = action.find(':');
         const auto kind = std::string_view(action).substr(0, colon);
-        if (kind != "c" && kind != "s" && kind != "t")
+        const bool signal_action = kind.size() == 3 && (kind.front() == 'C' || kind.front() == 'S') &&
+            kind.substr(1).find_first_not_of("0123456789abcdefABCDEF") == std::string_view::npos;
+        if (kind != "c" && kind != "s" && kind != "t" && !signal_action)
             return Error{ErrorCode::invalid_argument, "invalid vCont schedule action"};
         const auto id = std::string_view(action).substr(colon + 1);
         const auto valid_hex_id = [](std::string_view value) {

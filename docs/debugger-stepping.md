@@ -67,6 +67,14 @@ thread. If the stop names a thread but the stub does not advertise
 thread-qualified step, the backend returns unsupported instead of risking a
 step on the wrong thread.
 This avoids stepping every thread and avoids treating the presence of the
-`vCont` packet as proof that every action is supported. HexLab still models one
-current stop at a time and does not enable non-stop mode or expose
-target-specific thread scheduling controls.
+`vCont` packet as proof that every action is supported. The RSP backend retains
+the signal number from the pending stop. The default `handled` disposition
+suppresses that signal; `not_handled` uses `Sxx` when the peer advertises the
+signal-bearing action, or legacy `Sxx` when the single-process resume path can
+target the stopped thread. A rejected or unsupported resume leaves the stop
+available for retry. `DebugSession::resume_threads` also sends an exact mixed
+per-thread `vCont` schedule, and can preserve/redeliver or suppress the pending
+signal on its owning thread. The schedule requires the peer to advertise the
+needed `c`, `s`, `t`, `C`, or `S` action, and never applies a signal
+disposition to a different thread. HexLab exposes one current stop event at a
+time, even when the remote is in non-stop mode.

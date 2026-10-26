@@ -116,6 +116,21 @@ Native backends implement bounded exact schedules described in
 [Native thread schedules](../libs/debugger/docs/thread-resume-schedules.md).
 A schedule is validated as one operation; it does not promise processor-atomic
 execution or rollback of instructions already executed after an OS resume.
+Stop signals are retained with the pending event. `continue_execution` and
+`single_step_execution` use the caller's disposition: `handled` suppresses a
+pending signal, while `not_handled` sends its signal number back to the stub.
+The RSP backend uses the signal-bearing `Cxx`/`Sxx` `vCont` forms only when
+the stub advertises those actions. For a single-process peer without the
+matching `vCont` action, the standard legacy `Cxx`/`Sxx` packet is used where
+the resume path can target the stopped thread safely. For scheduled resumes,
+an omitted disposition preserves and redelivers the pending signal, while
+`handled` suppresses it. A schedule may set a disposition only on the thread
+owning the pending stop. Signal actions require exactly two hex digits and an
+exact, validated thread identity. If the peer does not advertise the required
+signal action, resume returns unsupported and leaves the stop pending. A
+schedule cannot use `stop` for the pending signal's owner: that action cannot
+redeliver the signal, and acknowledging the stop would otherwise discard its
+disposition state. Rejecting it keeps the event available for retry.
 Multiprocess `W`/`X` exits retain their `process` field and only transition the
 session to exited when that field identifies its process. Missing or foreign
 exit identity reports unsupported rather than marking another process exited.
