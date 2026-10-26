@@ -421,6 +421,17 @@ stores stop that proof. Aggregate returns without a modeled result register rema
 untyped. Targets in a different register file and unsupported slot classes are
 left unresolved.
 
+Stack argument type back-propagation also requires the callee to load the exact
+ABI entry-relative slot. Loads at that offset must agree on a byte-aligned width;
+the width must equal the caller store width, and the observed stack-load range
+must not overlap another observed range. Compatible callsites must agree on the
+type before it constrains an unprototyped callee. Missing loads, conflicting
+widths or types, and overlapping layouts suppress that stack parameter
+inference. Explicit prototypes continue to define parameter locations and types
+and are never replaced by caller evidence. The analysis supports constant stack
+aliases and stack slots represented by the `AbiDescription`; dynamic, realigned,
+and otherwise unmodeled layouts remain unsupported.
+
 Explicit prototypes can model aggregate return registers when the decompiler
 can represent the classified result pieces. System V AMD64 delegates this
 decision to the shared eightbyte classifier. A single-location INTEGER or SSE

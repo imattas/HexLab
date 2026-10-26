@@ -315,8 +315,13 @@ Result<LoadedImage> load_elf(std::shared_ptr<const ByteStorage> storage, const E
                     mode = ExecutionMode::rv32;
             }
         } else if (header.machine == 8) {
-            architecture = header.is_64 ? Architecture::mips64 : Architecture::mips32;
-            mode = header.is_64 ? ExecutionMode::mips64 : ExecutionMode::mips32;
+            // EF_MIPS_ABI2 identifies the N32 ABI: ELFCLASS32 data model on
+            // the MIPS III+ 64-bit instruction set. Require ELF32 metadata;
+            // never infer N32 from machine or byte order alone.
+            constexpr std::uint32_t ef_mips_abi2 = 0x20;
+            const bool n32 = !header.is_64 && (header.flags & ef_mips_abi2) != 0;
+            architecture = (header.is_64 || n32) ? Architecture::mips64 : Architecture::mips32;
+            mode = (header.is_64 || n32) ? ExecutionMode::mips64 : ExecutionMode::mips32;
         } else if (header.machine == 20) {
             architecture = Architecture::powerpc;
             if (!header.is_64) mode = ExecutionMode::ppc32;

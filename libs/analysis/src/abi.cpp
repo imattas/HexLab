@@ -2217,6 +2217,11 @@ AbiSignatureClassification classify_abi_signature(const types::Type &function_ty
             return unsupported_declared("mips_n64 is only modeled for Linux MIPS64 N64 targets");
         selected = CallingConvention::mips_n64;
         break;
+    case FunctionConvention::mips_n32:
+        if (platform_default != CallingConvention::mips_n32)
+            return unsupported_declared("mips_n32 is only modeled for Linux MIPS N32 targets");
+        selected = CallingConvention::mips_n32;
+        break;
     case FunctionConvention::stdcall:
         if (platform_default != CallingConvention::x86_32_cdecl)
             return unsupported_declared("stdcall is only modeled for 32-bit x86 targets");

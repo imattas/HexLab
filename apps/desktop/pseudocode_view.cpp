@@ -674,7 +674,9 @@ decompiler::AbiDescription recovery_abi(const FunctionRecord &function, const Fu
     if (architecture == Architecture::riscv32) return decompiler::riscv32_ilp32_abi();
     if (architecture == Architecture::riscv64) return decompiler::riscv64_lp64_abi();
     if (architecture == Architecture::mips32) return decompiler::mips32_o32_abi();
-    if (architecture == Architecture::mips64) return decompiler::mips64_n64_abi();
+    if (architecture == Architecture::mips64)
+        return image && image->layout().space.width_bits == 32
+            ? decompiler::mips_n32_abi() : decompiler::mips64_n64_abi();
     return abi;
 }
 

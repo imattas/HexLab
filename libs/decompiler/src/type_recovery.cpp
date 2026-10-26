@@ -1163,6 +1163,15 @@ AbiDescription mips64_n64_abi() {
     return a;
 }
 
+AbiDescription mips_n32_abi() {
+    // N32 keeps 64-bit GPRs and eight-byte argument slots while pointers
+    // remain 32-bit. Its scalar subset shares the N64 register convention.
+    auto a = mips64_n64_abi();
+    a.name = "MIPS N32 hard-float scalar profile";
+    a.pointer_bits = 32;
+    return a;
+}
+
 static Result<TypeRecoveryResult> recover_types_impl(
     const LiftedFunction &fn, const AbiDescription &abi, types::TypePtr prototype,
     std::span<const types::TypePtr> parameter_constraints = {},
@@ -4179,6 +4188,49 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         std::vector<std::vector<Consensus>> consensus(count);
         for (std::size_t callee = 0; callee < count; ++callee)
             consensus[callee].resize(abi_slots[callee].size());
+        // A stack slot in the ABI map is only a location candidate. Require
+        // the callee body to load that exact entry-relative slot at one
+        // consistent width before accepting caller evidence for it.
+        const auto callee_stack_load_bits = [&](std::size_t callee, std::int64_t wanted)
+                -> std::optional<std::uint16_t> {
+            const auto &abi = abis[callee];
+            if (!abi.stack_argument_base) return {};
+            std::vector<PointerAlias> aliases;
+            for (const auto &block : current_ssa[callee].blocks)
+                for (const auto &instruction : block.instructions)
+                    if (const auto *assignment = std::get_if<Assign>(&instruction.statement))
+                        if (auto alias = pointer_alias(*assignment)) aliases.push_back(*alias);
+            std::optional<std::uint16_t> observed;
+            std::vector<std::pair<std::int64_t, std::uint16_t>> layout;
+            for (const auto &block : current_ssa[callee].blocks)
+                for (const auto &instruction : block.instructions) {
+                    const auto *assignment = std::get_if<Assign>(&instruction.statement);
+                    const auto *memory = assignment && assignment->value
+                        ? std::get_if<MemoryValue>(&assignment->value->value) : nullptr;
+                    if (!memory || !memory->base || memory->index || memory->absolute ||
+                        !memory->type.bits || memory->type.bits % 8) continue;
+                    const auto canonical = canonical_stack_address(
+                        key(*memory->base, memory->base_version), aliases);
+                    if (!canonical || (canonical->first != key(*abi.stack_argument_base) &&
+                                       canonical->first != key(*abi.stack_argument_base, 0))) continue;
+                    std::int64_t offset = 0;
+                    if (!checked_add(canonical->second, memory->displacement, offset)) continue;
+                    const auto bits = memory->type.bits;
+                    layout.emplace_back(offset, bits);
+                    if (offset != wanted) continue;
+                    if (observed && *observed != bits) return {};
+                    observed = bits;
+                }
+            if (!observed) return {};
+            const auto bytes = static_cast<std::int64_t>(*observed / 8);
+            for (const auto &[offset, bits] : layout) {
+                if (offset == wanted || !bits || bits % 8) continue;
+                std::int64_t end = 0, wanted_end = 0;
+                if (!checked_add(offset, bits / 8, end) || !checked_add(wanted, bytes, wanted_end)) return {};
+                if (offset < wanted_end && wanted < end) return {};
+            }
+            return observed;
+        };
         const auto stack_call_argument_type = [&](std::size_t caller, const LiftedBlock &block,
                 std::size_t call_position, const Call &call, const AbiArgumentSlot &slot) -> types::TypePtr {
             if (!slot.stack_offset || !abis[caller].stack_argument_base || !abis[caller].pointer_bits ||
@@ -4253,9 +4305,18 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                             candidate.valid = false;
                             continue;
                         }
+                        const auto loaded_bits = callee_stack_load_bits(callee, *callee_slot.stack_offset);
+                        if (!loaded_bits) {
+                            candidate.valid = false;
+                            continue;
+                        }
                         const auto type = stack_call_argument_type(caller, block, instruction_index, *call, callee_slot);
                         if (!type) {
                             if (!cycle) candidate.valid = false;
+                            continue;
+                        }
+                        if (type_bits(type) != *loaded_bits) {
+                            candidate.valid = false;
                             continue;
                         }
                         if (!candidate.type) candidate.type = type;

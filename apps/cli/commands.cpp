@@ -82,7 +82,8 @@ decompiler::AbiDescription cli_decompiler_abi(const Image &image, const ImageMet
     case Architecture::mips32:
         return decompiler::mips32_o32_abi();
     case Architecture::mips64:
-        return decompiler::mips64_n64_abi();
+        return image.layout().space.width_bits == 32 ? decompiler::mips_n32_abi()
+                                                       : decompiler::mips64_n64_abi();
     default:
         return {};
     }
