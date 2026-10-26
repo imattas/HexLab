@@ -1,31 +1,41 @@
-# Partitioned stack memory SSA
+# Partitioned memory SSA
 
-`to_ssa` retains its whole-memory versions and adds independent version chains
-for concrete stack slots proven by `recover_stack_variables`. The proof uses
-the existing frame-pointer/adjusted-stack-pointer alias analysis, rejects
-dynamic indexed frames and escaped frame addresses, and excludes overlapping
-or conflicting-width ranges. Each accepted local has a deterministic partition
-identity. A load carries its whole-memory version plus its partition identity
-and partition version; a store carries the same partition identity and local
-input/output versions. Join blocks receive a versioned phi for each written
-partition.
+`to_ssa` retains whole-memory versions and adds independent partition versions
+when it can prove enough about the accessed byte ranges. It still leaves the
+whole-memory chain in place for consumers that need conservative aliasing.
 
-The alias rule is byte-range based: two accesses share a partition only when
-stack recovery resolves them to the same exact, non-overlapping local slot.
-Stores to another proven slot do not change that partition's version. A store
-that cannot be assigned to a proven slot advances every partition, as do all
-calls and intrinsics with write or unknown memory effects. These effects also
-advance the existing whole-memory chain. Read-only and no-memory intrinsics do
-not invalidate partitions. This preserves ordering for aliases that fall back
-to ordinary memory SSA.
+The partitioner recognizes three bounded forms:
 
-Partition construction is bounded to 128 slots, 2,000,000 partition version
-events, and 65,536 phi inputs. If the partition count or work budget is
-exceeded, the function retains only whole-memory SSA. If stack recovery cannot
-prove a slot, that access also remains on the whole-memory chain.
+- **Stack slots:** `recover_stack_variables` proves exact, nonescaping,
+  nonoverlapping frame-relative slots. Dynamic indexed frames and escaped frame
+  addresses stay on whole-memory SSA.
+- **Absolute ranges:** a memory access with an explicit absolute address and a
+  byte-sized width of at most 256 bytes is grouped with overlapping ranges in
+  the same address space. A load or store uses the resulting connected-range
+  partition only when its exact byte range was observed and mapped.
+- **Pointer-relative ranges:** a base register must have a proven SSA pointer
+  origin through supported copies, constant offsets, and unanimous phi inputs.
+  The memory access must have no index register and a bounded byte width and
+  displacement. Ranges sharing the same root register version and overlapping
+  offsets are grouped together.
 
-This first version does not partition globals, heap allocations, arbitrary
-pointer aliases, or partial byte ranges. It adds local alias facts to the IR;
-passes that do not inspect `memory_partition` continue using the coarser
-`memory_version` dependency. No test suite is added or run as part of this
-compile-only work.
+The alias rule is byte-range based. A store advances its exact stack or
+absolute-range partition. A pointer-relative store advances every partition
+that might alias it; it preserves another range only when the partition has
+the same proven pointer root and its byte range is disjoint. Different pointer
+roots are not assumed to be disjoint. Calls and intrinsics with write or
+unknown memory effects advance every partition. Unclassified stores also
+advance every partition. These effects advance the whole-memory chain as well.
+Read-only and no-memory intrinsics do not invalidate partitions.
+
+Candidate absolute and pointer-relative range sets are each capped at 4,096
+ranges. The complete partition set is capped at 128 partitions, with 2,000,000
+partition events and 65,536 phi inputs. If these bounds are exceeded, or a
+range cannot be mapped to a proven partition, that access falls back to
+whole-memory SSA. If whole-function partition construction exceeds its budget,
+the function keeps only whole-memory SSA.
+
+This does not partition heap or global accesses whose address cannot be proven,
+aliases reached through unrelated roots, indexed addressing, or arbitrary
+pointer arithmetic. The IR keeps these partitions supplementary: passes that
+ignore `memory_partition` continue to use the coarser `memory_version` chain.
