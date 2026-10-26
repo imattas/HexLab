@@ -136,8 +136,35 @@ unresolved or extra edges, and memory-phi ambiguity retain the state-machine
 or explicit label/goto fallback. The recognizer is bounded to 1,024 blocks
 and 4,096 edges.
 
-Post-tested loop latches remain phi-free and must branch directly to the body
-entry or a single terminal return block.
+Post-tested loops with an explicit preheader also accept loop-carried register
+and memory SSA phis in a bounded linear form. A straight-line setup chain
+enters the loop header, a straight-line body ends at one conditional latch,
+and the latch branches back to the header or into a straight-line cleanup
+chain ending in a return. The header and latch may be the same block. Setup,
+body, latch, and cleanup blocks may carry register phis when each phi has
+exactly one input for every actual CFG predecessor; function-entry phis are
+rejected. Header predecessors must be exactly the preheader and latch, and
+each other non-entry block must have exactly its preceding chain block as its
+sole predecessor. Initial copies execute after setup, recurrent copies only
+on the backedge, and cleanup copies only on the exit edge. Multiple values
+use simultaneous copies, including loop-carried swaps. Whole-memory and
+per-partition memory phis require the same exact predecessor coverage and
+remain analysis-only; partition names must be nonempty and unique per block.
+
+The latch predicate is evaluated into `__hexlab_do_repeat` before recurrent
+copies can overwrite header values used by that predicate. The emitted
+`do ... while (__hexlab_do_repeat)` preserves either polarity of the original
+backedge condition. No header update executes on loop exit. The recognizer
+accepts at most 1,024 blocks, 4,096 edges, 4,096 register phis and 4,096 memory
+partition phis per block, 65,536 combined register/memory phi inputs, and 64
+cleanup blocks. It requires unique block IDs and addresses, exact resolved
+edge kinds and target block
+identities, complete function coverage, and a terminal return. Body branches,
+switches, side entries or exits, multiple latches, extra or duplicated edges,
+and malformed phis proceed to the existing region/state-machine/goto paths.
+
+The earlier function-entry post-tested recognizer still requires a phi-free
+latch and branches directly to the body entry or a straight-line return path.
 Unsupported or ambiguous loop shapes retain lossless explicit gotos.
 
 The acyclic structurer also handles nested regions with multiple explicit

@@ -5556,6 +5556,150 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         const auto &edge = std::get<Branch>(block.instructions.back().statement);
         return edge.condition == "true" && edge.true_target == std::optional<Address>{target} && !edge.false_target;
     };
+    // A post-tested loop with an explicit preheader has an initial header-phi
+    // edge as well as a recurrent edge. Keep this recognizer linear and prove
+    // the complete CFG before emitting either copy sequence.
+    auto try_ssa_post_tested_loop = [&]() -> std::optional<StructuredPseudocode> {
+        if (function.blocks.size() < 3 || function.blocks.size() > 1024) return {};
+        std::map<std::uint64_t, std::set<std::uint64_t>> predecessors;
+        std::set<std::uint64_t> ids;
+        std::set<std::pair<std::uint32_t, std::uint64_t>> addresses;
+        std::size_t edge_count = 0;
+        for (const auto &block : function.blocks) {
+            if (!ids.insert(block.id.value).second ||
+                !addresses.emplace(block.begin.space.value, block.begin.offset).second ||
+                block.switch_dispatch || !has_only_simple_statements(block)) return {};
+            std::set<std::uint64_t> targets;
+            for (const auto &edge : block.successors) {
+                if (++edge_count > 4096 || !edge.target) return {};
+                const auto *target = find_block(*edge.target);
+                if (!target || !edge_targets(edge, target->begin) ||
+                    !targets.insert(target->id.value).second) return {};
+                predecessors[target->id.value].insert(block.id.value);
+            }
+        }
+        if (!predecessors[entry->id.value].empty() || !entry->phis.empty() || entry->memory_phi ||
+            !entry->memory_partition_phis.empty()) return {};
+
+        const auto linear_successor = [&](const LiftedBlock &block) -> const LiftedBlock * {
+            if (contains_return(block) || block.successors.size() != 1 ||
+                !block.successors.front().target ||
+                (block.successors.front().kind != BlockEdgeKind::jump &&
+                 block.successors.front().kind != BlockEdgeKind::fallthrough) ||
+                !has_unconditional_edge(block, *block.successors.front().target)) return nullptr;
+            if (!block.instructions.empty()) {
+                const auto *transfer = std::get_if<Branch>(&block.instructions.back().statement);
+                if (transfer && transfer->indirect_target) return nullptr;
+            }
+            return find_block(*block.successors.front().target);
+        };
+        std::vector<const LiftedBlock *> path;
+        std::set<std::uint64_t> covered;
+        auto *current = entry;
+        const Branch *condition = nullptr;
+        while (current && covered.insert(current->id.value).second) {
+            path.push_back(current);
+            condition = terminal_conditional(*current);
+            if (condition) break;
+            current = linear_successor(*current);
+        }
+        if (!current || !condition || condition->indirect_target || contains_return(*current)) return {};
+        const auto *latch = current;
+        const auto true_header = std::find_if(path.begin(), path.end(), [&](const auto *block) {
+            return block->begin == *condition->true_target;
+        });
+        const auto false_header = std::find_if(path.begin(), path.end(), [&](const auto *block) {
+            return block->begin == *condition->false_target;
+        });
+        if ((true_header != path.end()) == (false_header != path.end())) return {};
+        const bool loops_on_true = true_header != path.end();
+        const auto header_position = loops_on_true ? true_header : false_header;
+        if (header_position == path.begin()) return {}; // Require a real initial incoming edge.
+        const auto *header = *header_position;
+        const auto header_offset = static_cast<std::size_t>(header_position - path.begin());
+        const auto *preheader = path[header_offset - 1];
+        if (predecessors[header->id.value] != std::set<std::uint64_t>{preheader->id.value, latch->id.value}) return {};
+        for (std::size_t i = 1; i < path.size(); ++i) {
+            if (i != header_offset &&
+                predecessors[path[i]->id.value] != std::set<std::uint64_t>{path[i - 1]->id.value}) return {};
+        }
+
+        std::vector<const LiftedBlock *> exit_path;
+        current = find_block(loops_on_true ? *condition->false_target : *condition->true_target);
+        auto expected_predecessor = latch->id.value;
+        while (current && exit_path.size() < 64 && covered.insert(current->id.value).second) {
+            if (predecessors[current->id.value] != std::set<std::uint64_t>{expected_predecessor}) return {};
+            exit_path.push_back(current);
+            if (has_only_terminal_return(*current)) break;
+            expected_predecessor = current->id.value;
+            current = linear_successor(*current);
+        }
+        if (exit_path.empty() || !has_only_terminal_return(*exit_path.back()) ||
+            covered.size() != function.blocks.size()) return {};
+
+        std::size_t phi_input_count = 0;
+        for (const auto &block : function.blocks) {
+            const auto &incoming = predecessors[block.id.value];
+            if (block.phis.size() > 4096 || block.memory_partition_phis.size() > 4096) return {};
+            const auto valid_phi = [&](const auto &phi) {
+                if (phi.inputs.size() != incoming.size() || phi.inputs.size() > 65536 - phi_input_count) return false;
+                phi_input_count += phi.inputs.size();
+                std::set<std::uint64_t> seen;
+                for (const auto &input : phi.inputs)
+                    if (!incoming.contains(input.predecessor.value) ||
+                        !seen.insert(input.predecessor.value).second) return false;
+                return seen == incoming;
+            };
+            for (const auto &phi : block.phis) if (!valid_phi(phi)) return {};
+            if (block.memory_phi && !valid_phi(*block.memory_phi)) return {};
+            std::set<std::string> partitions;
+            for (const auto &phi : block.memory_partition_phis)
+                if (phi.partition.empty() || !partitions.insert(phi.partition).second || !valid_phi(phi)) return {};
+        }
+        const auto edge_copies = [&](const LiftedBlock &target, BlockId source, unsigned indent) {
+            std::vector<std::pair<std::string, std::string>> copies;
+            for (const auto &phi : target.phis) {
+                const auto input = std::find_if(phi.inputs.begin(), phi.inputs.end(), [&](const auto &item) {
+                    return item.predecessor == source;
+                });
+                copies.emplace_back(register_name(phi.destination, phi.version),
+                                    register_name(phi.destination, input->version));
+            }
+            emit_parallel_copies(out, copies, indent);
+        };
+
+        out << "function " << address_label(function.entry) << "() {\n";
+        for (std::size_t i = 0; i < header_offset; ++i) {
+            emit_block(*path[i], 4, true);
+            edge_copies(*path[i + 1], path[i]->id, 4);
+        }
+        out << "    bool __hexlab_do_repeat;\n    do {\n";
+        for (std::size_t i = header_offset; i < path.size(); ++i) {
+            emit_block(*path[i], 8, true);
+            if (i + 1 < path.size()) edge_copies(*path[i + 1], path[i]->id, 8);
+        }
+        // Evaluate the branch before recurrent copies: the predicate may read
+        // a header-phi destination overwritten by those simultaneous updates.
+        const auto predicate = branch_condition_text(*condition);
+        out << "        __hexlab_do_repeat = " << (loops_on_true ? "(" + predicate + ")" : "!(" + predicate + ")")
+            << ";\n";
+        if (!header->phis.empty()) {
+            out << "        if (__hexlab_do_repeat) {\n";
+            edge_copies(*header, latch->id, 12);
+            out << "        }\n";
+        }
+        out << "    } while (__hexlab_do_repeat);\n";
+        auto previous = latch->id;
+        for (const auto *block : exit_path) {
+            edge_copies(*block, previous, 4);
+            emit_block(*block, 4, true);
+            previous = block->id;
+        }
+        out << "}\n";
+        return StructuredPseudocode{out.str(), false, {}};
+    };
+    if (auto structured = try_ssa_post_tested_loop()) return *structured;
+
     if (function.blocks.size() >= 4 && has_only_simple_statements(*entry) && entry->phis.empty() &&
         entry->successors.size() == 1 && entry->successors.front().target) {
         const auto *header = find_block(*entry->successors.front().target);
