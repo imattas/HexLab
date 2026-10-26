@@ -16,7 +16,7 @@ selection.
 | --- | --- | --- |
 | Windows | Win32 backend | x86/x64 process control and four-slot execution/data hardware breakpoints; native ARM32 builds expose stopped-thread GPR/NEON context edits, ARM/Thumb software breakpoints, bounded sequential-instruction steps and up to eight hardware execute breakpoints; native ARM64 builds support stopped-thread GPR/FPSIMD context access and safe edits, software BRK breakpoints with PSTATE single-step, and up to two execution plus two data hardware breakpoints |
 | Linux x86-64 | x86-64 ptrace backend | x86-64 and compat i386 targets, including register, memory, event, and breakpoint operations described in [Linux ptrace debugging](linux-ptrace-debugging.md) |
-| Linux AArch64 | AArch64 ptrace backend | AArch64 GPR/FPSIMD, process lifecycle, memory, software breakpoints, hardware execute/watchpoints, and per-thread run-state; scalable SVE state is conditional on kernel regset availability |
+| Linux AArch64 | AArch64 ptrace backend | AArch64 GPR/FPSIMD and conditional SVE state, optional read-only TTBR0 PAC masks, process lifecycle, memory, software breakpoints, hardware execute/watchpoints, and per-thread run-state |
 | macOS x86-64 / Apple Silicon | Darwin Mach/ptrace backend | Bounded thread enumeration, task-suspended per-thread register inspection/editing, memory and module/region inspection; single-thread process execution, stepping, and software breakpoints; multi-thread stop attribution/stepping and hardware watchpoints are unsupported |
 | Other OS/architecture combinations | Explicit unsupported backend | Native calls return `unsupported`; the library and RSP backend remain usable |
 

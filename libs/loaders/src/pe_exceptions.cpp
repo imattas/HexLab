@@ -336,6 +336,7 @@ Result<std::size_t> read_exception_directory(const Image &image, const Directory
             const auto codes_rva = std::uint64_t{unwind_rva} + 4;
             reader.array(codes_rva, code_count, 2);
             std::uint8_t previous_code_offset = 0xff;
+            bool has_frame_pointer_operation = false;
             for (std::uint16_t slot = 0; slot < code_count;) {
                 const auto slot_rva = codes_rva + std::uint64_t{slot} * 2;
                 const auto code = reader.bytes(slot_rva, 2);
@@ -384,8 +385,10 @@ Result<std::size_t> read_exception_directory(const Image &image, const Directory
                     decoded.stack_size = static_cast<std::uint32_t>(operation_info_value) * 8u + 8u;
                     break;
                 case 3: // UWOP_SET_FPREG
-                    require(operation_info_value == 0 && info.frame_register != 0,
-                            "UWOP_SET_FPREG requires OpInfo zero and a frame register");
+                    require(operation_info_value == 0 && info.frame_register != 0 &&
+                                !has_frame_pointer_operation,
+                            "UWOP_SET_FPREG has invalid OpInfo, frame-register, or duplicate encoding");
+                    has_frame_pointer_operation = true;
                     decoded.kind = PeUnwindOperationKind::set_frame_pointer;
                     decoded.register_number = info.frame_register;
                     decoded.stack_offset = std::uint32_t{info.frame_offset} * 16u;
@@ -444,6 +447,8 @@ Result<std::size_t> read_exception_directory(const Image &image, const Directory
                 info.operations.push_back(std::move(decoded));
                 slot = static_cast<std::uint16_t>(slot + consumed_slots);
             }
+            require((info.frame_register != 0) == has_frame_pointer_operation,
+                    "AMD64 UNWIND_INFO frame register and UWOP_SET_FPREG presence disagree");
 
             const auto tail_rva = codes_rva + std::uint64_t{code_count + (code_count & 1u)} * 2;
             const auto flags_source = [&](std::uint64_t rva, std::uint64_t size, std::uint32_t index) {

@@ -44,6 +44,7 @@ constexpr unsigned long nt_fpregset = 2;
 constexpr unsigned long nt_arm_hw_break = 0x402;
 constexpr unsigned long nt_arm_hw_watch = 0x403;
 constexpr unsigned long nt_arm_sve = 0x405;
+constexpr unsigned long nt_arm_pac_mask = 0x406;
 constexpr std::size_t aarch64_reg_count = 34; // x0-x30, sp, pc, pstate
 constexpr std::size_t aarch64_hwdebug_max_slots = 16;
 constexpr std::size_t aarch64_sve_max_vl = 8192; // Linux UAPI __SVE_VL_MAX (512 quadwords).
@@ -79,6 +80,11 @@ constexpr std::array<const char*, aarch64_reg_count> names = {
     "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30",
     "sp", "pc", "pstate"};
 struct Aarch64Regs { std::uint64_t value[aarch64_reg_count]{}; };
+struct Aarch64PacMask {
+    std::uint64_t data{};
+    std::uint64_t instruction{};
+};
+static_assert(sizeof(Aarch64PacMask) == 16);
 // Linux arm64 UAPI user_fpsimd_state: NT_FPREGSET exposes this fixed legacy
 // FPSIMD image even when the task also has a larger SVE vector length.
 struct alignas(16) Aarch64FpsimdRegs {
@@ -313,6 +319,21 @@ Status set_sve_state(pid_t tid, const Aarch64SveState& state) {
         return sys_error("PTRACE_SETREGSET NT_ARM_SVE");
     }
     return std::monostate{};
+}
+
+Result<Aarch64PacMask> get_pac_mask(pid_t tid) {
+    Aarch64PacMask mask{};
+    iovec io{&mask, sizeof(mask)};
+    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(nt_arm_pac_mask), &io) != 0) {
+        const int error = errno;
+        if (error == EINVAL || error == EIO || error == ENODEV || error == ENOSYS)
+            return Error{ErrorCode::unsupported, "Linux AArch64 pointer-authentication masks are unavailable"};
+        errno = error;
+        return sys_error("PTRACE_GETREGSET NT_ARM_PAC_MASK");
+    }
+    if (io.iov_len != sizeof(mask))
+        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_PAC_MASK regset has an unexpected size"};
+    return mask;
 }
 }
 
@@ -1069,6 +1090,16 @@ public:
             if (!fp && fp.error().code != ErrorCode::unsupported) return fp.error();
             if (fp) append_fpsimd(fp.value());
         } else return sve.error();
+        auto pac_mask = get_pac_mask(static_cast<pid_t>(thread));
+        if (pac_mask) {
+            auto append_pac_mask = [&](const char* name, std::uint64_t value) {
+                RegisterValue reg; reg.name = name; reg.byte_order = ByteOrder::little;
+                reg.group = "system"; reg.bytes.resize(sizeof(value));
+                std::memcpy(reg.bytes.data(), &value, sizeof(value)); out.push_back(std::move(reg));
+            };
+            append_pac_mask("pac_data_mask", pac_mask.value().data);
+            append_pac_mask("pac_instruction_mask", pac_mask.value().instruction);
+        } else if (pac_mask.error().code != ErrorCode::unsupported) return pac_mask.error();
         return out;
     }
     Status write_registers(ThreadId thread, std::span<const RegisterValue> writes) override {

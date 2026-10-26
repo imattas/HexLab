@@ -54,13 +54,25 @@ restore both snapshots if either update fails. Single-bank update failures
 also trigger a best-effort restore. Ptrace has no atomic multi-regset
 transaction; a failed rollback is reported and can leave mixed state.
 
-`NT_FPREGSET` represents the base FPSIMD view. SVE/SME vector and predicate
-state, scalable vector lengths, and other arm64 extension state are not
-exposed or modified. This implementation assumes the Linux arm64 UAPI
-`user_fpsimd_state` layout and the `NT_FPREGSET` regset note number; it does
-not infer layouts from arbitrary kernel responses. The current host is
-Windows, so this Linux-only source path has not been compiled or exercised
-here.
+When the target kernel exposes `NT_ARM_PAC_MASK`, register inspection also
+includes read-only `pac_data_mask` and `pac_instruction_mask` 64-bit values in
+the `system` group. These are the distinct TTBR0 data-pointer and
+instruction-pointer PAC masks defined by the Linux arm64 UAPI. They are
+omitted when the regset is unavailable; an unexpected returned size is treated
+as malformed instead of being guessed. The masks describe PAC bit positions,
+not authentication keys, and are not suitable for interpreting TTBR1/kernel
+pointers.
+
+`NT_FPREGSET` represents the base FPSIMD view. When `NT_ARM_SVE` is available,
+the register view also exposes the active vector length, `z0`-`z31`,
+`p0`-`p15`, `ffr`, and FPSR/FPCR; `vN` and `dN` remain aliases of the low
+128- and 64-bit portions of `zN`. SVE register writes preserve the rest of the
+returned regset and reject conflicting writes through aliases. SVE vector
+length metadata is read-only here, and SME streaming/ZA state is not exposed
+or modified. The implementation validates Linux arm64 UAPI regset lengths and
+layout bounds rather than guessing layouts from arbitrary kernel responses.
+The current host is Windows, so this Linux-only source path has not been
+compiled or exercised here.
 
 Memory writes require every tracked target thread to be stopped. Writes that
 overlap active software breakpoints keep the `INT3` byte installed and update
