@@ -257,20 +257,53 @@ bool valid_type_token(const std::optional<std::uint32_t> &token) {
 std::optional<std::uint32_t> directly_constructed_throw_type(
     const ManagedMethodAnalysis &method, std::size_t instruction_index,
     const std::map<std::uint32_t, ManagedCallSignature> &signatures,
-    const std::set<std::uint32_t> &block_leaders) {
+    const std::set<std::uint32_t> &semantic_leaders) {
     if (instruction_index >= method.instructions.size() ||
         std::string_view(method.instructions[instruction_index].mnemonic) != "throw" ||
         method.instructions[instruction_index].status != CilInstructionStatus::decoded ||
-        block_leaders.contains(method.instructions[instruction_index].offset))
+        semantic_leaders.contains(method.instructions[instruction_index].offset))
         return {};
+    bool saw_load = false;
+    std::optional<std::uint32_t> round_trip_local;
+    std::size_t trace_steps = 0;
     while (instruction_index > 0) {
+        if (++trace_steps > 64) return {};
         const auto &previous = method.instructions[--instruction_index];
         const auto operation = std::string_view(previous.mnemonic);
+        // Do not trace values through any basic-block entry. EH and handler
+        // boundaries can seed a different evaluation stack without a branch.
         if (operation == "nop") {
-            if (block_leaders.contains(previous.offset)) return {};
+            if (semantic_leaders.contains(previous.offset)) return {};
+            continue;
+        }
+        // A successful castclass preserves the runtime object's exact type.
+        // Permit this narrow straight-line wrapper around newobj, but do not
+        // cross a block boundary where the cast input could have another origin.
+        if (operation == "castclass" && previous.status == CilInstructionStatus::decoded) {
+            if (semantic_leaders.contains(previous.offset)) return {};
+            continue;
+        }
+        const bool load_local = operation == "ldloc" || operation == "ldloc.s" ||
+            operation == "ldloc.0" || operation == "ldloc.1" || operation == "ldloc.2" || operation == "ldloc.3";
+        const bool store_local = operation == "stloc" || operation == "stloc.s" ||
+            operation == "stloc.0" || operation == "stloc.1" || operation == "stloc.2" || operation == "stloc.3";
+        if (!saw_load && load_local && previous.status == CilInstructionStatus::decoded) {
+            if (semantic_leaders.contains(previous.offset)) return {};
+            const auto index = index_operand(previous, 0x06);
+            if (index == UINT32_MAX) return {};
+            round_trip_local = index;
+            saw_load = true;
+            continue;
+        }
+        if (saw_load && store_local && previous.status == CilInstructionStatus::decoded) {
+            if (semantic_leaders.contains(previous.offset)) return {};
+            const auto index = index_operand(previous, 0x0a);
+            if (index == UINT32_MAX || !round_trip_local || index != *round_trip_local) return {};
+            saw_load = false;
             continue;
         }
         if (operation != "newobj" || previous.status != CilInstructionStatus::decoded) return {};
+        if (saw_load) return {};
         const auto token = call_token(previous);
         if (!token) return {};
         const auto signature = signatures.find(*token);
@@ -419,6 +452,9 @@ Result<ManagedCilDecompilation> decompile_managed_method(
 
     std::unordered_map<std::uint32_t, std::size_t> instruction_at;
     std::set<std::uint32_t> leaders{method.instructions.front().offset};
+    // Keep semantic entries distinct from later per-instruction exceptional
+    // source splits. Value-origin proofs may cross the latter, never the former.
+    std::set<std::uint32_t> semantic_leaders{method.instructions.front().offset};
     for (const auto &clause : method.body->exception_clauses) {
         const auto valid_range = [&](std::uint32_t start, std::uint32_t length) {
             return length != 0 && start <= method.body->code_size && length <= method.body->code_size - start;
@@ -434,6 +470,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
             if (clause.filter_offset >= clause.handler_offset || clause.handler_offset > method.body->code_size)
                 return failure(ErrorCode::malformed, "CIL filter region is empty or outside the method body");
             leaders.insert(clause.filter_offset);
+            semantic_leaders.insert(clause.filter_offset);
             if (!std::any_of(method.instructions.begin(), method.instructions.end(), [&](const auto &candidate) {
                     return candidate.offset >= clause.filter_offset && candidate.offset < clause.handler_offset &&
                            std::string_view(candidate.mnemonic) == "endfilter";
@@ -441,9 +478,17 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                 return failure(ErrorCode::unsupported, "CIL filter region has no modeled endfilter instruction");
         }
         leaders.insert(clause.try_offset);
-        if (clause.try_offset + clause.try_length < method.body->code_size) leaders.insert(clause.try_offset + clause.try_length);
+        semantic_leaders.insert(clause.try_offset);
+        if (clause.try_offset + clause.try_length < method.body->code_size) {
+            leaders.insert(clause.try_offset + clause.try_length);
+            semantic_leaders.insert(clause.try_offset + clause.try_length);
+        }
         leaders.insert(clause.handler_offset);
-        if (clause.handler_offset + clause.handler_length < method.body->code_size) leaders.insert(clause.handler_offset + clause.handler_length);
+        semantic_leaders.insert(clause.handler_offset);
+        if (clause.handler_offset + clause.handler_length < method.body->code_size) {
+            leaders.insert(clause.handler_offset + clause.handler_length);
+            semantic_leaders.insert(clause.handler_offset + clause.handler_length);
+        }
     }
     const auto in_region = [](std::uint32_t offset, std::uint32_t start, std::uint32_t length) {
         return offset >= start && offset - start < length;
@@ -507,10 +552,16 @@ Result<ManagedCilDecompilation> decompile_managed_method(
         }
         const bool terminal = mnemonic == "ret" || mnemonic == "throw" || mnemonic == "rethrow" ||
                               mnemonic == "endfinally" || mnemonic == "endfilter";
-        if (terminal && i + 1 < method.instructions.size()) leaders.insert(instruction.offset + instruction.size);
+        if (terminal && i + 1 < method.instructions.size()) {
+            leaders.insert(instruction.offset + instruction.size);
+            semantic_leaders.insert(instruction.offset + instruction.size);
+        }
         // Continuation tables use the actual endfinally as their source.
         // Its block may follow a nontrivial handler body.
-        if (mnemonic == "endfinally") leaders.insert(instruction.offset);
+        if (mnemonic == "endfinally") {
+            leaders.insert(instruction.offset);
+            semantic_leaders.insert(instruction.offset);
+        }
         const CilExceptionClause *innermost_handler = nullptr;
         bool inside_try = false;
         for (const auto &clause : method.body->exception_clauses) {
@@ -542,7 +593,10 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                 });
             if (filter == method.body->exception_clauses.end())
                 return failure(ErrorCode::malformed, "CIL endfilter is outside a filter region");
-            if (i + 1 < method.instructions.size()) leaders.insert(instruction.offset + instruction.size);
+            if (i + 1 < method.instructions.size()) {
+                leaders.insert(instruction.offset + instruction.size);
+                semantic_leaders.insert(instruction.offset + instruction.size);
+            }
         }
         const bool inside_filter_code = std::any_of(method.body->exception_clauses.begin(), method.body->exception_clauses.end(),
             [&](const auto &clause) {
@@ -594,10 +648,20 @@ Result<ManagedCilDecompilation> decompile_managed_method(
         }
         if (const auto *branch = std::get_if<CilBranchOperand>(&instruction.operand)) {
             leaders.insert(branch->target_offset);
-            if (i + 1 < method.instructions.size()) leaders.insert(next);
+            semantic_leaders.insert(branch->target_offset);
+            if (i + 1 < method.instructions.size()) {
+                leaders.insert(next);
+                semantic_leaders.insert(next);
+            }
         } else if (const auto *table = std::get_if<CilSwitchOperand>(&instruction.operand)) {
-            for (const auto target : table->target_offsets) leaders.insert(target);
-            if (i + 1 < method.instructions.size()) leaders.insert(next);
+            for (const auto target : table->target_offsets) {
+                leaders.insert(target);
+                semantic_leaders.insert(target);
+            }
+            if (i + 1 < method.instructions.size()) {
+                leaders.insert(next);
+                semantic_leaders.insert(next);
+            }
         }
     }
     if (method.instructions.back().offset + method.instructions.back().size != method.body->code_size)
@@ -666,7 +730,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
     if (!method.body->exception_clauses.empty()) {
         result.complete = false;
         result.lifted.diagnostics.push_back(
-            "CIL exception regions expose ordered catch/filter dispatch, filter failures as false results, and explicit finally/fault continuations; type matching is proven only for direct newobj throws with validated in-module assignability, while other runtime exception types, exact throwability, and full unwind semantics remain incomplete");
+            "CIL exception regions expose ordered catch/filter dispatch, filter failures as false results, and explicit finally/fault continuations; type matching is proven only for straight-line newobj throws optionally wrapped by castclass/nop or one unchanged local round trip with validated in-module assignability, while other runtime exception types, exact throwability, and full unwind semantics remain incomplete");
     }
     result.lifted.id = {method.method.token};
     result.lifted.entry = il_address(starts.front());

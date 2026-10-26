@@ -28,6 +28,21 @@ std::uint64_t width_mask(std::uint16_t bits) {
 ExpressionPtr constant_expression(const ConstantValue &constant) {
     return std::make_shared<Expression>(Expression{constant.type, constant});
 }
+ExpressionPtr x87_constant_expression(X87Binary80 value) {
+    const ValueType type{TypeKind::floating, 80, false};
+    return std::make_shared<Expression>(Expression{type, X87Binary80Value{value}});
+}
+std::optional<X87Binary80Value> fold_x87_unary(const UnaryValue &unary, ValueType result_type) {
+    const auto *operand = unary.operand ? std::get_if<X87Binary80Value>(&unary.operand->value) : nullptr;
+    if (!operand || result_type.kind != TypeKind::floating || result_type.bits != 80 ||
+        unary.operand->type.kind != TypeKind::floating || unary.operand->type.bits != 80)
+        return {};
+    X87UnaryArithmetic operation;
+    if (unary.operation == "x87_fchs") operation = X87UnaryArithmetic::change_sign;
+    else if (unary.operation == "x87_fabs") operation = X87UnaryArithmetic::absolute;
+    else return {};
+    return X87Binary80Value{evaluate_x87_unary(operand->value, 0, operation).value};
+}
 
 std::optional<ConstantValue> fold_unary(const UnaryValue &unary, ValueType result_type) {
     const auto *operand = unary.operand ? std::get_if<ConstantValue>(&unary.operand->value) : nullptr;
@@ -431,7 +446,8 @@ bool pure_expression_tree(const ExpressionPtr &expression, std::size_t &nodes, s
     if (!expression) return true;
     if (++nodes > 512 || depth > 32) return false;
     if (std::holds_alternative<RegisterValue>(expression->value) ||
-        std::holds_alternative<ConstantValue>(expression->value)) return true;
+        std::holds_alternative<ConstantValue>(expression->value) ||
+        std::holds_alternative<X87Binary80Value>(expression->value)) return true;
     if (const auto *unary = std::get_if<UnaryValue>(&expression->value))
         return pure_expression_tree(unary->operand, nodes, depth + 1);
     if (const auto *binary = std::get_if<BinaryValue>(&expression->value))
@@ -566,6 +582,8 @@ ExpressionPtr simplify_expression(const ExpressionPtr &expression,
     }
     if (auto *unary = std::get_if<UnaryValue>(&copy->value)) {
         unary->operand = simplify_expression(unary->operand, constants, allow_register_propagation, require_matching_type);
+        if (auto folded = fold_x87_unary(*unary, copy->type))
+            return std::make_shared<Expression>(Expression{copy->type, *folded});
         if (auto folded = fold_unary(*unary, copy->type)) return constant_expression(*folded);
         return copy;
     }
@@ -602,6 +620,63 @@ void simplify_statement(Statement &statement, const std::map<Key, ConstantValue>
                 output = simplify_expression(output, constants, allow_register_propagation, require_matching_type);
         }
     }, statement);
+}
+
+void propagate_x87_binary80_constants(LiftedFunction &function) {
+    for (auto &block : function.blocks) {
+        std::map<Key, X87Binary80> constants;
+        for (auto &instruction : block.instructions) {
+            if (auto *assignment = std::get_if<Assign>(&instruction.statement)) {
+                if (assignment->destination.bank != RegisterBank::x87) continue;
+                if (!assignment->destination_version) {
+                    // An unversioned stack-register write has unknown aliasing;
+                    // discard all payload facts before continuing.
+                    constants.clear();
+                    continue;
+                }
+                const auto destination = key(assignment->destination, *assignment->destination_version);
+                const auto *unary = assignment->value
+                    ? std::get_if<UnaryValue>(&assignment->value->value) : nullptr;
+                const auto *source = unary && unary->operand
+                    ? std::get_if<RegisterValue>(&unary->operand->value) : nullptr;
+                if (unary && source && source->reg.bank == RegisterBank::x87 && source->version &&
+                    (unary->operation == "x87_fchs" || unary->operation == "x87_fabs")) {
+                    const auto found = constants.find(key(source->reg, *source->version));
+                    if (found != constants.end()) {
+                        const auto operation = unary->operation == "x87_fchs"
+                            ? X87UnaryArithmetic::change_sign : X87UnaryArithmetic::absolute;
+                        const auto value = evaluate_x87_unary(found->second, 0, operation).value;
+                        assignment->value = x87_constant_expression(value);
+                        constants[destination] = value;
+                        continue;
+                    }
+                }
+                if (const auto *literal = assignment->value
+                        ? std::get_if<X87Binary80Value>(&assignment->value->value) : nullptr)
+                    constants[destination] = literal->value;
+                else
+                    constants.erase(destination);
+                continue;
+            }
+            if (auto *intrinsic = std::get_if<Intrinsic>(&instruction.statement)) {
+                // Opaque x87 effects invalidate prior payload facts; retain
+                // only explicitly modeled literal parallel outputs.
+                constants.clear();
+                const auto count = std::min(intrinsic->register_writes.size(),
+                    std::min(intrinsic->register_output_versions.size(), intrinsic->register_output_values.size()));
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto reg = intrinsic->register_writes[i];
+                    if (reg.bank != RegisterBank::x87) continue;
+                    const auto *literal = intrinsic->register_output_values[i]
+                        ? std::get_if<X87Binary80Value>(&intrinsic->register_output_values[i]->value) : nullptr;
+                    if (literal)
+                        constants[key(reg, intrinsic->register_output_versions[i])] = literal->value;
+                }
+                continue;
+            }
+            if (std::holds_alternative<Call>(instruction.statement)) constants.clear();
+        }
+    }
 }
 
 struct SsaDefinitionRef {
@@ -1371,6 +1446,7 @@ static Result<LiftedFunction> simplify_constants_once(const LiftedFunction &inpu
             }
         }
     }
+    propagate_x87_binary80_constants(result);
     return result;
 }
 

@@ -45,6 +45,10 @@ struct ConstantValue {
     ValueType type;
     bool operator==(const ConstantValue &) const = default;
 };
+struct X87Binary80Value {
+    X87Binary80 value;
+    bool operator==(const X87Binary80Value &) const = default;
+};
 struct MemoryValue {
     ValueType type;
     std::optional<RegisterOperand> base, index;
@@ -85,7 +89,8 @@ struct UnaryValue { std::string operation; ExpressionPtr operand; };
 struct BinaryValue { std::string operation; ExpressionPtr left, right; };
 struct Expression {
     ValueType type;
-    std::variant<RegisterValue, ConstantValue, MemoryValue, UnaryValue, BinaryValue, UnknownValue, VariableValue> value;
+    std::variant<RegisterValue, ConstantValue, X87Binary80Value, MemoryValue, UnaryValue, BinaryValue,
+                 UnknownValue, VariableValue> value;
 };
 
 struct Assign { RegisterOperand destination; ExpressionPtr value; std::optional<std::uint32_t> destination_version; };

@@ -25,7 +25,8 @@ bool valid_bitvector(const Expression &e) {
 bool pure(const ExpressionPtr &expression) {
     if (!expression) return false;
     if (std::holds_alternative<RegisterValue>(expression->value) ||
-        std::holds_alternative<ConstantValue>(expression->value)) return true;
+        std::holds_alternative<ConstantValue>(expression->value) ||
+        std::holds_alternative<X87Binary80Value>(expression->value)) return true;
     if (const auto *unary = std::get_if<UnaryValue>(&expression->value)) return pure(unary->operand);
     if (const auto *binary = std::get_if<BinaryValue>(&expression->value))
         return pure(binary->left) && pure(binary->right);
@@ -68,6 +69,10 @@ std::size_t expression_hash(const ExpressionPtr &expression) {
         hash = mix_hash(hash, reg->reg.width);
         hash = mix_hash(hash, reg->reg.high_byte);
         hash = mix_hash(hash, reg->version.value_or(UINT32_MAX));
+    } else if (const auto *value = std::get_if<X87Binary80Value>(&expression->value)) {
+        hash = mix_hash(hash, static_cast<std::size_t>(value->value.significand));
+        hash = mix_hash(hash, static_cast<std::size_t>(value->value.significand >> 32));
+        hash = mix_hash(hash, value->value.sign_exponent);
     } else if (const auto *value = std::get_if<ConstantValue>(&expression->value)) {
         hash = mix_hash(hash, static_cast<std::size_t>(value->value));
         hash = mix_hash(hash, static_cast<std::size_t>(value->value >> 32));
@@ -137,6 +142,8 @@ bool structurally_equal(const ExpressionPtr &a, const ExpressionPtr &b) {
         return *x == std::get<RegisterValue>(b->value);
     if (const auto *x = std::get_if<ConstantValue>(&a->value))
         return *x == std::get<ConstantValue>(b->value);
+    if (const auto *x = std::get_if<X87Binary80Value>(&a->value))
+        return *x == std::get<X87Binary80Value>(b->value);
     if (const auto *x = std::get_if<UnaryValue>(&a->value)) {
         const auto &y = std::get<UnaryValue>(b->value);
         return x->operation == y.operation && structurally_equal(x->operand, y.operand);

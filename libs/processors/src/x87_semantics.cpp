@@ -12,6 +12,9 @@ constexpr std::uint16_t fsw_invalid = 1u << 0, fsw_error_summary = 1u << 7;
 constexpr std::uint16_t fsw_c0 = 1u << 8, fsw_c1 = 1u << 9, fsw_c2 = 1u << 10;
 constexpr std::uint16_t fsw_c3 = 1u << 14, fsw_busy = 1u << 15;
 constexpr std::uint16_t fcw_invalid_mask = 1u << 0;
+constexpr std::uint16_t fsw_precision = 1u << 5;
+constexpr std::uint16_t fcw_precision_mask = 1u << 5;
+constexpr std::uint16_t fcw_rounding_mask = 3u << 10;
 constexpr std::uint32_t eflags_cf = 1u << 0, eflags_pf = 1u << 2, eflags_af = 1u << 4;
 constexpr std::uint32_t eflags_zf = 1u << 6, eflags_sf = 1u << 7, eflags_of = 1u << 11;
 constexpr std::uint32_t eflags_compare_mask = eflags_cf | eflags_pf | eflags_af | eflags_zf | eflags_sf | eflags_of;
@@ -97,6 +100,62 @@ std::uint32_t with_eflags(std::uint32_t flags, X87Relation relation) noexcept {
     case X87Relation::greater: break;
     }
     return flags;
+}
+} // namespace
+
+namespace {
+struct RoundedMagnitude {
+    std::uint64_t value = 0;
+    bool inexact = false;
+    bool overflow = false;
+    bool incremented = false;
+};
+
+RoundedMagnitude round_magnitude(const Decoded &decoded, std::uint8_t rounding,
+                                bool truncate) noexcept {
+    const int shift = static_cast<int>(decoded.exponent) - 16383 - 63;
+    if (decoded.kind == Class::zero) return {};
+    if (shift >= 0) {
+        if (shift >= 64 || decoded.significand > (UINT64_MAX >> shift))
+            return {0, false, true};
+        return {decoded.significand << shift, false, false, false};
+    }
+    const unsigned discarded = static_cast<unsigned>(-shift);
+    std::uint64_t integral = 0;
+    bool inexact = false, increment = false;
+    if (discarded < 64) {
+        integral = decoded.significand >> discarded;
+        const auto remainder = decoded.significand & ((std::uint64_t{1} << discarded) - 1);
+        inexact = remainder != 0;
+        if (!truncate && inexact) {
+            switch (rounding & 3) {
+            case 0: {
+                const auto halfway = std::uint64_t{1} << (discarded - 1);
+                increment = remainder > halfway || (remainder == halfway && (integral & 1));
+                break;
+            }
+            case 1: increment = decoded.negative; break;
+            case 2: increment = !decoded.negative; break;
+            default: break;
+            }
+        }
+    } else {
+        inexact = decoded.significand != 0;
+        if (!truncate && inexact) {
+            switch (rounding & 3) {
+            case 0: increment = discarded == 64 && decoded.significand > (std::uint64_t{1} << 63); break;
+            case 1: increment = decoded.negative; break;
+            case 2: increment = !decoded.negative; break;
+            default: break;
+            }
+        }
+    }
+    if (increment) ++integral;
+    return {integral, inexact, false, increment};
+}
+
+std::uint16_t signal_exception(std::uint16_t status, std::uint16_t exception) noexcept {
+    return static_cast<std::uint16_t>(status | exception | fsw_error_summary | fsw_busy);
 }
 } // namespace
 
@@ -220,6 +279,71 @@ std::optional<X87CompareResult> evaluate_x87_compare(const X87CompareRequest &re
     else
         result.status_word = with_condition_codes(result.status_word, relation);
     return result;
+}
+
+std::optional<X87IntegerConvertResult>
+evaluate_x87_to_integer(const X87IntegerConvertRequest &request) noexcept {
+    if (request.destination_width != 16 && request.destination_width != 32 &&
+        request.destination_width != 64)
+        return {};
+
+    const auto decoded = decode(request.value);
+    const bool special_invalid = decoded.kind == Class::unsupported ||
+        decoded.kind == Class::infinity || is_nan(decoded.kind);
+    const auto rounded = special_invalid ? RoundedMagnitude{0, false, true, false} :
+        round_magnitude(decoded, static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10),
+                        request.truncate);
+    const std::uint64_t positive_limit = request.destination_width == 64
+        ? static_cast<std::uint64_t>(INT64_MAX)
+        : (std::uint64_t{1} << (request.destination_width - 1)) - 1;
+    const std::uint64_t negative_limit = request.destination_width == 64
+        ? (std::uint64_t{1} << 63)
+        : (std::uint64_t{1} << (request.destination_width - 1));
+    const bool out_of_range = rounded.overflow ||
+        (decoded.negative ? rounded.value > negative_limit : rounded.value > positive_limit);
+    const bool invalid = special_invalid || out_of_range;
+    X87IntegerConvertResult result;
+    result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
+    result.invalid_operation = invalid;
+    if (!request.truncate && rounded.inexact && (decoded.negative != rounded.incremented))
+        result.status_word |= fsw_c1;
+
+    if (invalid) {
+        result.status_word |= fsw_invalid;
+        if ((request.control_word & fcw_invalid_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_invalid);
+            result.completed = false;
+            return result;
+        }
+        result.destination_bits = std::uint64_t{1} << (request.destination_width - 1);
+        return result;
+    }
+
+    const bool precision_unmasked = rounded.inexact && (request.control_word & fcw_precision_mask) == 0;
+    if (rounded.inexact) result.status_word |= fsw_precision;
+    if (precision_unmasked) {
+        result.status_word = signal_exception(result.status_word, fsw_precision);
+        result.precision = true;
+        result.completed = false;
+        return result;
+    }
+
+    std::uint64_t bits = rounded.value;
+    if (decoded.negative) bits = std::uint64_t{0} - bits;
+    if (request.destination_width != 64)
+        bits &= (std::uint64_t{1} << request.destination_width) - 1;
+    result.destination_bits = bits;
+    result.precision = rounded.inexact;
+    return result;
+}
+
+X87UnaryResult evaluate_x87_unary(X87Binary80 value, std::uint16_t status_word,
+                                  X87UnaryArithmetic operation) noexcept {
+    if (operation == X87UnaryArithmetic::change_sign)
+        value.sign_exponent ^= sign_mask;
+    else
+        value.sign_exponent &= static_cast<std::uint16_t>(~sign_mask);
+    return {value, status_word};
 }
 
 } // namespace hexlab

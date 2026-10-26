@@ -67,4 +67,40 @@ HEXLAB_PROCESSORS_EXPORT std::optional<X87Relation> compare_x87_binary80(X87Bina
 HEXLAB_PROCESSORS_EXPORT std::optional<X87CompareResult>
 evaluate_x87_compare(const X87CompareRequest &request) noexcept;
 
+struct X87IntegerConvertRequest {
+    X87Binary80 value;
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+    std::uint8_t destination_width = 32; // FIST/FISTP support 16, 32, or 64 bits.
+    bool truncate = false; // FISTTP ignores RC and truncates toward zero.
+};
+
+struct X87IntegerConvertResult {
+    std::optional<std::uint64_t> destination_bits;
+    std::uint16_t status_word = 0;
+    bool completed = true;
+    bool invalid_operation = false;
+    bool precision = false;
+    bool operator==(const X87IntegerConvertResult &) const = default;
+};
+
+// Evaluate FIST/FISTP/FISTTP's numeric conversion, integer-indefinite result,
+// precision/invalid sticky bits, and masked/unmasked exception retirement.
+// A missing destination value means an unmasked exception prevented the store.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87IntegerConvertResult>
+evaluate_x87_to_integer(const X87IntegerConvertRequest &request) noexcept;
+
+enum class X87UnaryArithmetic : std::uint8_t { change_sign, absolute };
+struct X87UnaryResult {
+    X87Binary80 value;
+    std::uint16_t status_word = 0;
+    bool operator==(const X87UnaryResult &) const = default;
+};
+
+// Exact bit-level FCHS/FABS operations. On a valid nonempty ST(0), these
+// change only the sign bit and leave the supplied status word unchanged.
+HEXLAB_PROCESSORS_EXPORT X87UnaryResult
+evaluate_x87_unary(X87Binary80 value, std::uint16_t status_word,
+                   X87UnaryArithmetic operation) noexcept;
+
 } // namespace hexlab

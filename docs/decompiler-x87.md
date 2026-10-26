@@ -14,6 +14,14 @@ invalidates all eight logical stack registers in SSA; this prevents values
 from being incorrectly carried across a stack rotation. The concrete
 ST(i)-to-physical-register permutation and TOP/tag values remain opaque.
 
+The IR includes exact binary80 literals for `FLD1` and `FLDZ` when their
+logical stack output is known. A same-block `FCHS` or `FABS` over one of these
+proven literals is folded through the exact processor semantic helper; inputs
+that remain register values stay symbolic. FIST/FISTP/FISTTP remain named
+memory-writing intrinsics with decoded stack deltas. The lifter has no proven
+FCW/FSW values or concrete memory input for these instructions, so it does not
+invent a converted store value or claim exception retirement.
+
 The decoder reports `FCOMI`, `FUCOMI`, `FCOMIP`, and `FUCOMIP` as reads of two
 80-bit stack registers, writes to x87 status, and writes to EFLAGS. The
 decompiler preserves each instruction as an `x87_<mnemonic>` intrinsic, so the
