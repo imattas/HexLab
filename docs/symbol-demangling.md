@@ -35,16 +35,24 @@ operators are rendered from their Microsoft operator codes, including arithmetic
 comparisons, shifts, logical/bitwise operators, indexing, calls, comma,
 compound assignments, allocation, and deallocation. The bounded MSVC special-name
 subset also renders vftables (`??_7`), vbtables (`??_8`), RTTI type descriptors
-(`??_R0`), RTTI base-class arrays (`??_R2`), RTTI class-hierarchy descriptors
+(`??_R0`), RTTI base-class descriptors (`??_R1`), RTTI base-class arrays
+(`??_R2`), RTTI class-hierarchy descriptors
 (`??_R3`), and RTTI complete-object locators (`??_R4`) when their complete
 terminators and name/type encodings are valid. Scalar and vector deleting
 destructor symbols (`??_G` and `??_E`) are also rendered from their member
 function encoding, including access/virtual qualifiers, return type, calling
-convention, and the hidden `unsigned int` parameter when present. RTTI
-base-class descriptors (`??_R1`), vcall and adjustment thunks, local tables,
-and other special names remain unsupported because their payloads require
-additional integer/backreference grammar or target-specific adjustment
-interpretation. It renders recognized
+convention, and the hidden `unsigned int` parameter when present. Vcall and
+adjustment thunks, local tables, and other special names remain unsupported.
+For `??_R1`, the bounded presentation grammar is
+`??_R1<number><signed-number><number><number><qualified-name>8`; the numeric
+fields follow the MSVC number syntax below, and only the second field accepts
+the optional negative marker. The result presents their encoded values in ABI
+order as `RTTI Base Class Descriptor at (n,n,n,n)`. The parser does not infer
+runtime object-layout adjustment semantics from those values. Qualified names
+use the existing bounded MSVC scope/template-name subset. LLVM's Microsoft
+demangler parses this intrinsic's field order and signedness in its
+[parser implementation](https://github.com/microsoft/llvm/blob/master/llvm/lib/Demangle/MicrosoftDemangle.cpp).
+It renders recognized
 calling-convention markers. The raw spelling
 remains available in CLI output next to the rendered form.
 
@@ -79,6 +87,15 @@ pointer-to-member and function-pointer types, and many calling-convention/type
 codes are unsupported in the Microsoft grammar. The Itanium pointer forms
 described above are supported. Malformed numeric values, missing hexadecimal terminators,
 and configured size/depth/component overflows retain the original symbol text.
+The `??_R1` integer fields use MSVC's `<number> ::= [?] <non-negative integer>`
+encoding: `0` through `9` represent 1 through 10; otherwise one or more `A`–`P`
+hexadecimal digits terminated by `@` represent the value (`A` is zero). A
+negative marker is accepted only for the second descriptor field. Numeric
+values are checked against `uint64_t`; a negative magnitude is limited to
+`INT64_MAX`, and the final rendered label is subject to `max_output_bytes`.
+Numeric overflow, a negative unsigned field, incomplete encoding, or a missing
+final `8` preserves the raw symbol. LLVM documents and implements this grammar in its
+[Microsoft demangler](https://github.com/microsoft/llvm/blob/master/llvm/lib/Demangle/MicrosoftDemangle.cpp).
 Array ranks and dimensions use ABI-encoded integer forms and remain bounded by
 the configured nesting/component limits. The parser deliberately
 does not invoke platform demangling libraries or external processes, so results

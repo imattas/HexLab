@@ -82,7 +82,9 @@ enum class RiscvOpcode {
     vfsgnj_vv, vfsgnj_vf, vfsgnjn_vv, vfsgnjn_vf, vfsgnjx_vv, vfsgnjx_vf,
     vfmin_vv, vfmin_vf, vfmax_vv, vfmax_vf,
     vmfeq_vv, vmfeq_vf, vmfne_vv, vmfne_vf, vmflt_vv, vmflt_vf, vmfle_vv, vmfle_vf,
-    vmfgt_vf, vmfge_vf
+    vmfgt_vf, vmfge_vf,
+    vfmacc_vv, vfmacc_vf, vfnmacc_vv, vfnmacc_vf, vfmsac_vv, vfmsac_vf, vfnmsac_vv, vfnmsac_vf,
+    vfmadd_vv, vfmadd_vf, vfnmadd_vv, vfnmadd_vf, vfmsub_vv, vfmsub_vf, vfnmsub_vv, vfnmsub_vf
 };
 
 struct RiscvRegister {

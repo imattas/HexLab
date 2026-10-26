@@ -574,7 +574,20 @@ class Msvc {
                     if (!take('@') || !take('8') || at_ != s_.size()) throw Failure{DemangleStatus::malformed};
                     return checked(type_name + " `RTTI Type Descriptor'");
                 }
-                if (rtti == '1') throw Failure{DemangleStatus::unsupported}; // base descriptor has four signed/unsigned fields
+                if (rtti == '1') {
+                    // LLVM's Microsoft demangler decodes these in order as
+                    // unsigned, signed, unsigned, unsigned fields. Keep them
+                    // as encoded descriptor values; this presentation does not
+                    // infer object-layout or pointer-adjustment behavior.
+                    const auto nv_offset = descriptor_number(false);
+                    const auto vbptr_offset = descriptor_number(true);
+                    const auto vbtable_offset = descriptor_number(false);
+                    const auto attributes = descriptor_number(false);
+                    const auto name = scoped();
+                    if (!take('8') || at_ != s_.size()) throw Failure{DemangleStatus::malformed};
+                    return checked(name + "::`RTTI Base Class Descriptor at (" + nv_offset + "," +
+                                   vbptr_offset + "," + vbtable_offset + "," + attributes + ")'");
+                }
                 const char *label = rtti == '2' ? "`RTTI Base Class Array'" :
                                     rtti == '3' ? "`RTTI Class Hierarchy Descriptor'" : nullptr;
                 if (rtti == '4') label = "`RTTI Complete Object Locator'";
@@ -686,6 +699,33 @@ class Msvc {
             append(static_cast<std::size_t>(s_[at_++] - 'A'));
         if (!take('@')) throw Failure{DemangleStatus::malformed};
         return value;
+    }
+    std::string descriptor_number(bool is_signed) {
+        const bool negative = take('?');
+        if (negative && !is_signed) throw Failure{DemangleStatus::malformed};
+        if (at_ >= s_.size()) throw Failure{DemangleStatus::malformed};
+        std::uint64_t value = 0;
+        const char first = s_[at_++];
+        if (first >= '0' && first <= '9') {
+            value = static_cast<std::uint64_t>(first - '0') + 1;
+        } else {
+            if (first < 'A' || first > 'P') throw Failure{DemangleStatus::unsupported};
+            value = static_cast<std::uint64_t>(first - 'A');
+            bool terminated = false;
+            while (at_ < s_.size()) {
+                const char c = s_[at_++];
+                if (c == '@') { terminated = true; break; }
+                if (c < 'A' || c > 'P') throw Failure{DemangleStatus::malformed};
+                const auto digit = static_cast<std::uint64_t>(c - 'A');
+                if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 16)
+                    throw Failure{DemangleStatus::resource_limit};
+                value = value * 16 + digit;
+            }
+            if (!terminated) throw Failure{DemangleStatus::malformed};
+        }
+        if (negative && value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+            throw Failure{DemangleStatus::resource_limit};
+        return (negative ? "-" : "") + std::to_string(value);
     }
     std::string plain_component() {
         const auto end=s_.find('@',at_);
