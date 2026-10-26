@@ -560,6 +560,7 @@ std::string operation_name(Opcode opcode) {
     case Opcode::m6502_ror: return "ROR";
     case Opcode::add: case Opcode::a64_add: case Opcode::a32_add: return "add";
     case Opcode::sub: case Opcode::a64_sub: case Opcode::a32_sub: return "sub";
+    case Opcode::a64_bfm: return "a64_bfm";
     case Opcode::a32_rsb: return "rsb";
     case Opcode::a32_adc: return "adc";
     case Opcode::a32_sbc: return "sbc";
@@ -1932,6 +1933,52 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             auto inserted = std::make_shared<Expression>(Expression{integer_type(destination.width),
                 BinaryValue{"or", std::move(kept), value}});
             return Assign{destination, std::move(inserted)};
+        }
+        if (instruction.opcode == Opcode::a64_bfm) {
+            // BFM preserves all destination bits outside the selected field.
+            // Non-wrapping encodings extract into bit zero (BFXIL); wrapping
+            // encodings insert the low source bits at width-immr (BFI/BFC).
+            if (instruction.operands.size() != 4) goto a64_unhandled;
+            const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+            const auto *source = std::get_if<RegisterOperand>(&instruction.operands[1]);
+            const auto *rotate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+            const auto *limit = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+            const auto valid_register = [](const RegisterOperand *reg) {
+                return reg && !reg->high_byte &&
+                    ((reg->bank == RegisterBank::arm64_gpr && reg->index < 31) ||
+                     (reg->bank == RegisterBank::arm64_zero && reg->index == 31));
+            };
+            if (!valid_register(destination) || !valid_register(source) ||
+                (destination->width != 32 && destination->width != 64) ||
+                destination->width != source->width || !rotate || !limit ||
+                rotate->encoded_width != 6 || limit->encoded_width != 6 ||
+                rotate->effective_width != destination->width || limit->effective_width != destination->width ||
+                rotate->is_signed || limit->is_signed ||
+                rotate->value >= destination->width || limit->value >= destination->width)
+                goto a64_unhandled;
+            if (destination->bank == RegisterBank::arm64_zero) return ignored_write();
+            const auto width = static_cast<unsigned>(destination->width);
+            const auto r = static_cast<unsigned>(rotate->value);
+            const auto s = static_cast<unsigned>(limit->value);
+            const auto count = s >= r ? s - r + 1 : s + 1;
+            const auto shift = s >= r ? 0u : width - r;
+            const auto low_mask = count == 64 ? UINT64_MAX : (UINT64_C(1) << count) - 1;
+            const auto field_mask = low_mask << shift;
+            const auto preserved_mask = ~field_mask & (width == 64 ? UINT64_MAX : UINT64_C(0xffffffff));
+            ExpressionPtr inserted = operand_expr(instruction.operands[1]);
+            if (s >= r && r)
+                inserted = std::make_shared<Expression>(Expression{integer_type(width),
+                    BinaryValue{"shr", std::move(inserted), constant_expr(r, width)}});
+            inserted = std::make_shared<Expression>(Expression{integer_type(width),
+                BinaryValue{"and", std::move(inserted), constant_expr(low_mask, width)}});
+            if (shift)
+                inserted = std::make_shared<Expression>(Expression{integer_type(width),
+                    BinaryValue{"shl", std::move(inserted), constant_expr(shift, width)}});
+            auto preserved = std::make_shared<Expression>(Expression{integer_type(width),
+                BinaryValue{"and", reg_expr(*destination), constant_expr(preserved_mask, width)}});
+            auto value = std::make_shared<Expression>(Expression{integer_type(width),
+                BinaryValue{"or", std::move(preserved), std::move(inserted)}});
+            return Assign{*destination, std::move(value)};
         }
         if (destination_operand && instruction.operands.size() >= 3 &&
             (instruction.opcode == Opcode::a64_ubfm || instruction.opcode == Opcode::a64_sbfm)) {
@@ -5027,6 +5074,7 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             // architecturally zero-extended 64-bit X view. The shared SSA key
             // includes width, so represent both definitions explicitly.
             if (a64_context && (decoded.opcode == Opcode::a64_madd || decoded.opcode == Opcode::a64_msub ||
+                                decoded.opcode == Opcode::a64_bfm ||
                                 decoded.opcode == Opcode::a64_udiv || decoded.opcode == Opcode::a64_sdiv ||
                                 decoded.opcode == Opcode::a64_csel || decoded.opcode == Opcode::a64_csinc ||
                                 decoded.opcode == Opcode::a64_csinv || decoded.opcode == Opcode::a64_csneg)) {

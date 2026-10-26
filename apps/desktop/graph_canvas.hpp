@@ -17,6 +17,8 @@ class GraphCanvas final : public wxPanel {
     std::optional<GraphHit> hit_test(wxPoint) const;
     std::size_t visible_nodes() const;
     wxString focus_description() const;
+    // The focused graph source, never a previously selected listing row.
+    std::optional<Location> source_location() const;
     bool focus_node(GraphNodeId, bool navigate_to_location = true);
     // Cycles the graph-local node focus and navigates linked views when the
     // focused node has a location. A rejected address leaves graph focus intact.
@@ -31,6 +33,9 @@ class GraphCanvas final : public wxPanel {
     // Returns false when the source graph is stale or the destination was
     // rejected. Follow actions must not use the listing's prior selection.
     std::function<bool(Location)> navigate;
+    // Desktop selection synchronization captures the immutable source graph
+    // so the receiver can reject stale document/image/revision bindings.
+    std::function<bool(std::shared_ptr<const ProjectGraph>, Location)> synchronize_selection;
     std::function<void(Location, GraphContextAction)> context_action;
     std::function<bool(Location, GraphContextAction)> context_action_available;
     // Follow the exact graph instruction, independently of the asynchronously
@@ -93,6 +98,7 @@ class GraphCanvas final : public wxPanel {
     void move_dragged_node(wxPoint);
     void select_node_range(GraphNodeId, bool extend, bool toggle);
     void activate(wxPoint, bool follow);
+    bool navigate_location(Location);
     void show_context_menu(wxPoint);
     void paint(wxPaintEvent &);
 };

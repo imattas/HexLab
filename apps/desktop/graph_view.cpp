@@ -73,11 +73,29 @@ GraphView::GraphView(wxWindow *parent) : wxPanel(parent) {
                        "Enter or double click: follow target. Shift+Up/Down or Left/Right: pan. Home: fit.");
     status_ = new wxStaticText(this, wxID_ANY, "Select a recovered function");
     status_->SetName("graph-status");
+    auto *source_bar = new wxBoxSizer(wxHORIZONTAL);
+    show_listing_ = new wxButton(this, wxID_ANY, "Show listing");
+    show_listing_->SetName("graph-show-listing");
+    show_listing_->Enable(false);
+    show_listing_->SetToolTip("Open the listing at the selected graph source address without following its target.");
+    show_pseudocode_ = new wxButton(this, wxID_ANY, "Show pseudocode");
+    show_pseudocode_->SetName("graph-show-pseudocode");
+    show_pseudocode_->Enable(false);
+    show_pseudocode_->SetToolTip("Open pseudocode at the selected graph source address without following its target.");
+    source_bar->Add(show_listing_, 0, wxALL, pad);
+    source_bar->Add(show_pseudocode_, 0, wxALL, pad);
+    source_bar->Add(status_, 1, wxALIGN_CENTER_VERTICAL | wxALL, pad);
     stack->Add(bar, 0, wxEXPAND);
     stack->Add(canvas, 1, wxEXPAND);
-    stack->Add(status_, 0, wxALL, pad);
+    stack->Add(source_bar, 0, wxEXPAND);
     SetSizer(stack);
     canvas->focus_changed = [this] { refresh_status(); };
+    const auto open_source = [this](bool pseudocode) {
+        const auto location = canvas->source_location();
+        if (location && show_source) show_source(canvas->graph(), *location, pseudocode);
+    };
+    show_listing_->Bind(wxEVT_BUTTON, [open_source](wxCommandEvent &) { open_source(false); });
+    show_pseudocode_->Bind(wxEVT_BUTTON, [open_source](wxCommandEvent &) { open_source(true); });
     find->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { find_node(1, true); });
     find_previous->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { find_node(-1, false); });
     find_next->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { find_node(1, false); });
@@ -154,6 +172,10 @@ void GraphView::refresh_status() {
     }
     if (canvas->selected_node_count() > 1)
         label += wxString::Format("; %zu graph nodes selected", canvas->selected_node_count());
+    const auto location = canvas->source_location();
+    show_listing_->Enable(location.has_value());
+    show_pseudocode_->Enable(location && std::holds_alternative<Address>(*location));
+    if (location) label += "; source " + location_text(*location);
     status_->SetLabel(label);
 }
 void GraphView::update(const ProjectSnapshot *project, std::optional<Location> selection, GraphKind kind,

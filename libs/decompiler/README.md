@@ -78,6 +78,12 @@ SIMD, system state, carry-dependent arithmetic, and complete architectural
 flag-state SSA are outside this scalar lifting slice; unsupported instructions
 remain explicit intrinsics rather than guessed expressions.
 
+Scalar A64 `BFM` also lifts to typed field masks, shifts, and a merge with the
+old destination. This covers `BFI`, `BFXIL`, and zero-source `BFC`, including
+W-form zero extension into the X view; malformed forms retain an intrinsic.
+See [preserving bitfield moves](../../docs/a64-preserving-bitfields.md) for the
+accepted encoding and operand bounds.
+
 `simplify_constants` is an optional SSA pass. It propagates proven constant
 versions across blocks and folds fixed-width add/subtract/multiply, bitwise,
 shift, zero-extension, and sign-extension expressions. Arithmetic wraps at the

@@ -665,7 +665,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::enter) return "enter";
     if ((op >= Opcode::a32_b && op <= Opcode::t32_mul) || op == Opcode::arm_tbb || op == Opcode::arm_tbh)
         return arm32_detail::mnemonic(op, condition);
-    if ((op >= Opcode::a64_b && op <= Opcode::a64_strh) || op == Opcode::a64_sbfm || op == Opcode::a64_ubfm ||
+    if ((op >= Opcode::a64_b && op <= Opcode::a64_strh) || op == Opcode::a64_sbfm || op == Opcode::a64_ubfm || op == Opcode::a64_bfm ||
         op == Opcode::a64_ccmp || op == Opcode::a64_ccmn)
         return a64_detail::mnemonic(op, condition);
     static constexpr const char *names[]{"mov",  "movzx", "movsx", "movsxd",  "lea",   "push",    "pop", "leave",

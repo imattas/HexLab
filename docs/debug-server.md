@@ -78,9 +78,11 @@ succeeds; the failure is returned or attached to the owned stop event. Linux
 ptrace operations cannot atomically roll back instructions that already ran
 before a peer resume failure.
 
-The server advertises `vContSupported+`; `vCont?` reports `vCont;c;s` on native
-target/backend combinations that implement instruction stepping, and `vCont;c`
-otherwise (including Windows ARM32). Supported execution forms are:
+The server advertises `vContSupported+`; `vCont?` reports `vCont;c;t;s` on native
+target/backend combinations that implement instruction stepping, and `vCont;c;t`
+otherwise (including Windows ARM32). Backends supporting scheduled signal
+disposition also advertise `C` and, when stepping is supported, `S`. Supported
+execution forms are:
 
 | Packet | Behavior |
 | --- | --- |
@@ -90,6 +92,9 @@ otherwise (including Windows ARM32). Supported execution forms are:
 | `vCont;s`, `vCont;s:-1` | Request a step for every live thread. Current native backends accept this only for a single-thread target; they reject general multi-thread stepping. |
 | `vCont;c:TID` | Resume only the selected thread, keeping unmatched threads stopped. Linux supports non-event-thread selection within its bounded subset; Windows requires the event owner to run. |
 | `vCont;c:0` | Select the event thread as the server's choice for `0` (any thread), then use exact thread continuation or the one-live-thread equivalent. |
+| `vCont;t:TID;c` | Keep the exact live thread stopped and continue its peers, subject to native scheduling restrictions. `t:0` selects the event owner. |
+| `vCont;c:TID;t`, `vCont;c:TID;t:-1` | Continue only the exact live thread and explicitly keep the remaining threads stopped. |
+| `vCont;t`, `vCont;t:-1`, `vCont;t:TID` | A stop-only result returns `E01` while retaining the owned event; this all-stop server requires at least one thread to continue or step. |
 | `Hc0`, `Hc-1`, `HcTID` | Set the execution selection for legacy `c`/`s` packets. Positive IDs must identify a live thread. This selection does not affect `vCont` or register access. |
 | `c[ADDR]` | Continue the session with `Hc0` or `Hc-1`; a positive `HcTID` selection resumes only that thread when it owns the stop and the backend supports exact thread continuation. |
 | `s[ADDR]` | Step the stop thread with `Hc0` or a matching positive `HcTID`. With `Hc-1`, require that it is the only live thread. |
@@ -106,8 +111,8 @@ list and all selectors are validated before changing target state. The first
 matching action applies to each live thread, and unmatched threads stay stopped.
 Continuing every live thread retains the ordinary process-wide continuation
 path. Every other result becomes one complete `DebugSession::resume_threads`
-schedule, including explicit stop actions for unmatched live threads. The
-pending event owner must be represented. Backends validate the whole plan and
+schedule, including explicit `t` actions and stop actions for unmatched live
+threads. The pending event owner must be represented. Backends validate the whole plan and
 reject unsupported combinations without replacing them with global continue.
 Linux x86/x64 and AArch64 accept one selected thread continuing or stepping, or
 a continue-only subset; breakpoint step-over and deferred-event restrictions
@@ -120,18 +125,29 @@ For example, with A owning the stop and C remaining stopped,
 `vCont;c:A;c:B` continues A and B on supported Linux and Windows targets;
 `vCont;c:A` continues A alone; `vCont;s:B` steps B on supported Linux stops
 while holding A, and is rejected on Windows; `vCont;s:A;s:A` steps A once.
-`vCont;s:A;c` still fails on current native multi-thread targets because it
-combines a step with other runnable threads. Shadowed actions do not override
-earlier matches. A failed or empty thread snapshot,
+`vCont;s:A;c` combines an event-owner step with peer continuations on supported
+Linux stops and is rejected on Windows. Shadowed actions do not override
+earlier matches: `vCont;t:A;c` keeps A stopped, while `vCont;c;t:A`
+continues every thread because the first action already matches A. Explicit
+stop actions retain any pending native signal for the held event owner.
+They do not request a new stop notification for already stopped threads.
+A failed or empty thread snapshot,
 unknown or malformed selector, multiprocess ID,
-signal-delivery action, range step, or stop action returns `E01` without
-consuming the event. IDs are bounded to 64-bit hexadecimal values; only literal
+unsupported signal-delivery action, range step, or stop-only result returns
+`E01` without consuming the event. IDs are bounded to 64-bit hexadecimal values; only literal
 `0` and `-1` are special selectors. Rejected requests never fall back to a
 global continue unless it is equivalent for a single-live-thread target.
 
-Target restart/kill, multiprocess sessions, non-stop mode, simultaneous native
-multi-thread steps, step/continue mixtures and server-side signal-delivery
-control remain unsupported. General thread selection is honored for register
+The `t` integration uses the existing all-stop event and native schedule API.
+It does not enable `QNonStop` or accept execution packets while a run is in
+progress. The GDB protocol requires zero-signal stop replies when `t` actually
+interrupts a running thread in non-stop mode; this server does not implement
+that operation ([GDB packet specification](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Packets.html)).
+
+Target restart/kill, multiprocess sessions, non-stop mode and simultaneous native
+multi-thread steps remain unsupported. Server-side signal control is limited to suppressing or redelivering
+the pending event owner's signal on backends with scheduled disposition support.
+General thread selection is honored for register
 access; legacy `s` still selects the event thread, while `vCont` can select
 another thread where the native scheduling backend supports it. The selector meanings follow the
 [GDB RSP packet specification](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Packets.html).
