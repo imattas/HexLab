@@ -6305,6 +6305,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<std::pair<std::string, std::string>> no_phi_copies;
             bool yes_break = false;
             bool no_break = false;
+            std::vector<const LiftedBlock *> yes_break_path;
+            std::vector<const LiftedBlock *> no_break_path;
         };
         struct NestedLoopBody {
             const LiftedBlock *header = nullptr;
@@ -6466,14 +6468,45 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         if (!prefix_valid || diamond_predecessors[nested_branch->id.value] !=
                                 std::set<std::uint64_t>{predecessor}) continue;
                         // A nested loop-body branch may leave through exactly
-                        // one direct edge to the already validated loop exit.
-                        // Its other edge must rejoin the outer sibling path;
-                        // the exit block itself is emitted after the loop.
+                        // one edge to the validated exit, optionally through a
+                        // bounded straight-line cleanup chain. Its other edge
+                        // must rejoin the outer sibling path.
                         const auto *nested_test = terminal_conditional(*nested_branch);
-                        const bool break_true = nested_test && nested_test->true_target ==
-                            std::optional<Address>{exit_block->begin};
-                        const bool break_false = nested_test && nested_test->false_target ==
-                            std::optional<Address>{exit_block->begin};
+                        const auto trace_break_path = [&](const std::optional<Address> &target)
+                            -> std::optional<std::vector<const LiftedBlock *>> {
+                            if (!target) return std::nullopt;
+                            std::vector<const LiftedBlock *> path;
+                            auto *cursor = find_block(*target);
+                            auto predecessor_id = nested_branch->id.value;
+                            std::set<std::uint64_t> seen;
+                            while (cursor && cursor != exit_block && cursor != header && cursor != entry &&
+                                   cursor != region_exit && path.size() < 64 &&
+                                   !occupied.contains(cursor->id.value) &&
+                                   seen.insert(cursor->id.value).second) {
+                                if (!cursor->phis.empty() || cursor->switch_dispatch || contains_return(*cursor) ||
+                                    !has_only_simple_statements(*cursor) || cursor->memory_phi ||
+                                    !cursor->memory_partition_phis.empty() || cursor->successors.size() != 1 ||
+                                    !cursor->successors.front().target ||
+                                    (cursor->successors.front().kind != BlockEdgeKind::jump &&
+                                     cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                                    !has_unconditional_edge(*cursor, *cursor->successors.front().target) ||
+                                    diamond_predecessors[cursor->id.value] != std::set<std::uint64_t>{predecessor_id})
+                                    return std::nullopt;
+                                path.push_back(cursor);
+                                predecessor_id = cursor->id.value;
+                                cursor = find_block(*cursor->successors.front().target);
+                            }
+                            if (cursor != exit_block ||
+                                !diamond_predecessors[exit_block->id.value].contains(predecessor_id))
+                                return std::nullopt;
+                            return path;
+                        };
+                        const auto true_break_path = nested_test ? trace_break_path(nested_test->true_target) :
+                            std::nullopt;
+                        const auto false_break_path = nested_test ? trace_break_path(nested_test->false_target) :
+                            std::nullopt;
+                        const bool break_true = true_break_path.has_value();
+                        const bool break_false = false_break_path.has_value();
                         const bool exact_branch_edges = nested_branch->successors.size() == 2 && nested_test &&
                             nested_test->true_target && nested_test->false_target &&
                             std::count_if(nested_branch->successors.begin(), nested_branch->successors.end(),
@@ -6481,7 +6514,6 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             std::count_if(nested_branch->successors.begin(), nested_branch->successors.end(),
                                 [&](const auto &edge) { return edge_targets(edge, *nested_test->false_target); }) == 1;
                         if (break_true != break_false && exact_branch_edges &&
-                            diamond_predecessors[exit_block->id.value].contains(nested_branch->id.value) &&
                             exit_block->phis.empty() &&
                             !exit_block->memory_phi && exit_block->memory_partition_phis.empty()) {
                             const Address continue_address = break_true ? *nested_test->false_target :
@@ -6541,7 +6573,17 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                 if (std::any_of(sibling_arm.begin(), sibling_arm.end(), [&](const auto *block) {
                                         return block == nested_branch ||
                                             std::find(continue_path.begin(), continue_path.end(), block) !=
-                                                continue_path.end();
+                                                continue_path.end() ||
+                                            (break_true && std::find(true_break_path->begin(), true_break_path->end(), block) !=
+                                                true_break_path->end()) ||
+                                            (break_false && std::find(false_break_path->begin(), false_break_path->end(), block) !=
+                                                false_break_path->end());
+                                    })) continue_valid = false;
+                                const auto &break_path = break_true ? *true_break_path : *false_break_path;
+                                if (std::any_of(break_path.begin(), break_path.end(), [&](const auto *block) {
+                                        return std::find(continue_path.begin(), continue_path.end(), block) !=
+                                                continue_path.end() ||
+                                            std::find(sibling_arm.begin(), sibling_arm.end(), block) != sibling_arm.end();
                                     })) continue_valid = false;
                                 std::set<std::uint64_t> expected{continue_tail->id.value, sibling_predecessor};
                                 if (continue_valid && expected.size() == 2 &&
@@ -6573,6 +6615,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                         break_region.join = join;
                                         break_region.yes_break = break_true;
                                         break_region.no_break = break_false;
+                                        if (break_true) break_region.yes_break_path = *true_break_path;
+                                        if (break_false) break_region.no_break_path = *false_break_path;
                                         if (break_true) {
                                             break_region.no = continue_path;
                                             break_region.no_phi_copies = std::move(continue_copies);
@@ -6998,6 +7042,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         const auto claim_region = [&](const auto &region, const auto &self) -> void {
                             for (const auto *arm_block : region.yes) loop_body_ids.insert(arm_block->id.value);
                             for (const auto *arm_block : region.no) loop_body_ids.insert(arm_block->id.value);
+                            for (const auto *path_block : region.yes_break_path) loop_body_ids.insert(path_block->id.value);
+                            for (const auto *path_block : region.no_break_path) loop_body_ids.insert(path_block->id.value);
                             for (const auto *nested : {region.yes_nested.get(), region.no_nested.get()}) {
                                 if (!nested) continue;
                                 loop_body_ids.insert(nested->branch->id.value);
@@ -7420,8 +7466,10 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 const auto emit_arm = [&](const std::vector<const LiftedBlock *> &blocks,
                                           const std::shared_ptr<LoopConditionalBody> &nested,
                                           const std::vector<std::pair<std::string, std::string>> &copies,
-                                          bool breaks) {
+                                          bool breaks,
+                                          const std::vector<const LiftedBlock *> &break_path) {
                     if (breaks) {
+                        for (const auto *path_block : break_path) emit_block(*path_block, indent + 4, true);
                         out << std::string(indent + 4, ' ') << "break;\n";
                         return;
                     }
@@ -7437,9 +7485,11 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         emit_parallel_copies(out, copies, indent + 4);
                     }
                 };
-                emit_arm(region.yes, region.yes_nested, region.yes_phi_copies, region.yes_break);
+                emit_arm(region.yes, region.yes_nested, region.yes_phi_copies, region.yes_break,
+                         region.yes_break_path);
                 out << prefix << "} else {\n";
-                emit_arm(region.no, region.no_nested, region.no_phi_copies, region.no_break);
+                emit_arm(region.no, region.no_nested, region.no_phi_copies, region.no_break,
+                         region.no_break_path);
                 out << prefix << "}\n";
             };
             for (const auto *block : loop_body) {

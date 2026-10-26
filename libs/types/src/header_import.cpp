@@ -188,11 +188,16 @@ private:
     static constexpr std::size_t max_operations = 4096;
 
     static int precedence(std::string_view op) {
-        if (op == "|") return 1;
-        if (op == "^") return 2;
-        if (op == "&") return 3;
-        if (op == "+" || op == "-") return 4;
-        if (op == "*" || op == "/" || op == "%") return 5;
+        if (op == "||") return 1;
+        if (op == "&&") return 2;
+        if (op == "|") return 3;
+        if (op == "^") return 4;
+        if (op == "&") return 5;
+        if (op == "==" || op == "!=") return 6;
+        if (op == "<" || op == ">" || op == "<=" || op == ">=") return 7;
+        if (op == "<<" || op == ">>") return 8;
+        if (op == "+" || op == "-") return 9;
+        if (op == "*" || op == "/" || op == "%") return 10;
         return 0;
     }
 
@@ -208,12 +213,17 @@ private:
         enter(depth);
         auto left = parse_unary(depth + 1);
         for (;;) {
-            const auto op = peek();
+            std::string op(peek());
+            if (!done() && position_ + 1 < tokens_.size()) {
+                const auto pair = op + tokens_[position_ + 1].text;
+                if (pair == "||" || pair == "&&" || pair == "==" || pair == "!=" ||
+                    pair == "<=" || pair == ">=" || pair == "<<" || pair == ">>") op = pair;
+            }
             const auto op_precedence = precedence(op);
             if (op_precedence < minimum) break;
             if (++operations_ > max_operations)
                 fail(ErrorCode::resource_limit, "integer constant expression exceeds its operation limit");
-            ++position_;
+            position_ += op.size();
             const auto right = parse_binary(op_precedence + 1, depth + 1);
             left = apply(op, left, right);
         }
@@ -292,6 +302,21 @@ private:
         if (op == "&") return left & right;
         if (op == "^") return left ^ right;
         if (op == "|") return left | right;
+        if (op == "<<" || op == ">>") {
+            if (right < 0 || right >= 64) fail(ErrorCode::malformed, "invalid shift count in integer constant expression");
+            if (op == ">>") return left >> right;
+            if (left < 0 || (right && static_cast<std::uint64_t>(left) > (static_cast<std::uint64_t>(maximum) >> right)))
+                fail(ErrorCode::overflow, "integer constant expression left shift overflows");
+            return static_cast<std::int64_t>(static_cast<std::uint64_t>(left) << right);
+        }
+        if (op == "<") return left < right;
+        if (op == ">") return left > right;
+        if (op == "<=") return left <= right;
+        if (op == ">=") return left >= right;
+        if (op == "==") return left == right;
+        if (op == "!=") return left != right;
+        if (op == "&&") return left && right;
+        if (op == "||") return left || right;
         fail(ErrorCode::unsupported, "unsupported operator in integer constant expression");
     }
 

@@ -2993,11 +2993,13 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         if (!result) impl_->controller->documents().report_error(*id, result.error());
     };
     ui.source->navigate = ui.listing->navigate;
-    ui.source->toggle_project_breakpoint = [this](Address address) {
+    ui.source->toggle_project_breakpoint = [this](std::shared_ptr<const DocumentSnapshot> expected, Address address) {
+        if (!expected || impl_->state().current() != expected) return false;
         const auto id = projects().active_document();
-        if (!id) return false;
+        if (!id || *id != expected->id) return false;
         const auto project = projects().project(*id);
-        if (!project || !project->state || project->mode == database::ProjectMode::read_only) return false;
+        if (!expected->project || !project || project != expected->project || !project->state ||
+            project->mode == database::ProjectMode::read_only) return false;
         const auto &breakpoints = project->state->user->breakpoints;
         const auto existing = std::find_if(breakpoints.begin(), breakpoints.end(), [&](const auto &item) {
             return item.address == address && item.kind == database::ProjectBreakpointKind::software;

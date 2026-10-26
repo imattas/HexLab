@@ -22,7 +22,7 @@ class SourceView final : public wxPanel {
     void select(Location location);
 
     std::function<void(Location)> navigate;
-    std::function<bool(Address)> toggle_project_breakpoint;
+    std::function<bool(std::shared_ptr<const DocumentSnapshot>, Address)> toggle_project_breakpoint;
 
   private:
     struct SourceRow {
