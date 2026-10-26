@@ -323,14 +323,18 @@ upper-lane merge behavior remain outside this slice. See the
 [implementation plan](superpowers/plans/2026-10-22-x86-simd.md) for the
 integration contract and test matrix.
 
-The variable packed shift family adds EVEX.128/.256/.512 `vpsllv{w,d,q}`,
-`vpsrlv{w,d,q}`, and `vpsrav{w,d,q}`. The word forms use map 2 opcodes
+The variable packed shift family adds AVX2 VEX.128/.256
+`vpsllv{d,q}`, `vpsrlv{d,q}`, and `vpsravd`, plus EVEX.128/.256/.512
+`vpsllv{w,d,q}`, `vpsrlv{w,d,q}`, and `vpsrav{w,d,q}`. The word forms use map 2 opcodes
 10/11/12 (logical right, arithmetic right, logical left); dword and qword
 forms use 45/46/47 respectively, with W selecting qword forms and W=0
-selecting dwords. The first vector source supplies per-lane shift counts,
-while the vector register or full-width memory source supplies shifted data.
+selecting dwords. The first vector source supplies shifted data; the second
+vector source (the ModRM register or full-width memory operand) supplies
+per-lane shift counts.
 K masking applies per destination lane; merge masking reads the old destination,
 and zeroing writes zero to inactive lanes. Counts at or above lane width produce
-zero for logical shifts and sign-fill for arithmetic shifts. The current typed
-decompiler retains lane shape and mask effects; the pure AVX lane evaluator
-does not evaluate these shifts.
+zero for logical shifts and sign-fill for arithmetic shifts. The pure VEX
+evaluator computes dword/qword AVX2 lane results; the EVEX evaluator also
+applies result-lane writemasks. VEX `vpsravd` treats W as ignored; qword
+arithmetic-right shifts are available only in EVEX. The typed decompiler
+retains the lane shape and, for EVEX, mask effects.

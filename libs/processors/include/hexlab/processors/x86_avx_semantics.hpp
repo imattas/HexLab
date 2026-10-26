@@ -58,6 +58,15 @@ inline std::optional<IntegerDataflowShape> integer_dataflow_shape(Opcode opcode)
         return IntegerDataflowShape{64, 64, 64, false, false, false};
     case Opcode::vpminsb: case Opcode::vpmaxsb: case Opcode::vpsignb:
         return IntegerDataflowShape{8, 8, 8, true, true, true};
+    // VEX packed variable shifts use SRC1 as the data vector and SRC2 as the
+    // per-lane count vector. Arithmetic-right data lanes are signed; counts
+    // are always interpreted as unsigned values.
+    case Opcode::vpsllvd: case Opcode::vpsrlvd:
+        return IntegerDataflowShape{32, 32, 32, false, false, false};
+    case Opcode::vpsllvq: case Opcode::vpsrlvq:
+        return IntegerDataflowShape{64, 64, 64, false, false, false};
+    case Opcode::vpsravd:
+        return IntegerDataflowShape{32, 32, 32, true, false, true};
     case Opcode::vpminsd: case Opcode::vpmaxsd: case Opcode::vpsignd: case Opcode::vpmulld:
     case Opcode::vphaddd: case Opcode::vphsubd:
         return IntegerDataflowShape{32, 32, 32, true, true, true};
@@ -210,6 +219,16 @@ inline bool is_greater_compare(Opcode opcode) noexcept {
     return opcode == Opcode::vpcmpgtb || opcode == Opcode::vpcmpgtw ||
            opcode == Opcode::vpcmpgtd || opcode == Opcode::vpcmpgtq;
 }
+inline bool is_variable_shift(Opcode opcode) noexcept {
+    switch (opcode) {
+    case Opcode::vpsllvw: case Opcode::vpsllvd: case Opcode::vpsllvq:
+    case Opcode::vpsrlvw: case Opcode::vpsrlvd: case Opcode::vpsrlvq:
+    case Opcode::vpsravw: case Opcode::vpsravd: case Opcode::vpsravq:
+        return true;
+    default:
+        return false;
+    }
+}
 
 template <std::size_t Size>
 inline void evaluate_integer_dataflow(Opcode opcode, IntegerDataflowShape shape,
@@ -299,6 +318,23 @@ inline void evaluate_integer_dataflow(Opcode opcode, IntegerDataflowShape shape,
                 const auto rhs = signed_lane(right, shape.second_bits);
                 std::uint64_t value = 0;
                 switch (opcode) {
+                case Opcode::vpsllvw: case Opcode::vpsllvd: case Opcode::vpsllvq:
+                    value = right >= shape.result_bits ? 0 : left << right;
+                    break;
+                case Opcode::vpsrlvw: case Opcode::vpsrlvd: case Opcode::vpsrlvq:
+                    value = right >= shape.result_bits ? 0 : left >> right;
+                    break;
+                case Opcode::vpsravw: case Opcode::vpsravd: case Opcode::vpsravq: {
+                    const auto width = static_cast<unsigned>(shape.result_bits);
+                    const bool negative = (left & (UINT64_C(1) << (width - 1))) != 0;
+                    if (right >= width) value = negative ? mask : 0;
+                    else if (right == 0) value = left;
+                    else {
+                        value = left >> right;
+                        if (negative) value |= (~UINT64_C(0)) << (width - right);
+                    }
+                    break;
+                }
                 case Opcode::vpcmpeqb: case Opcode::vpcmpeqw: case Opcode::vpcmpeqd:
                     value = left == right ? mask : 0; break;
                 case Opcode::vpcmpgtb: case Opcode::vpcmpgtw: case Opcode::vpcmpgtd:
@@ -389,6 +425,7 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
     using namespace x86_avx_detail;
     if (instruction.context.architecture != Architecture::x86_64 ||
         instruction.context.mode != ExecutionMode::x86_64 || instruction.operands.size() < 2 ||
+        instruction.x86_evex ||
         instruction.x86_opmask || instruction.x86_opmask_zeroing)
         return std::nullopt;
 
@@ -506,6 +543,8 @@ inline std::optional<X86EvexIntegerResult> evaluate_x86_evex_integer(
     const auto active_bytes = vector_bits / 8;
     if(const auto dataflow=integer_dataflow_shape(instruction.opcode))
         evaluate_integer_dataflow(instruction.opcode,*dataflow,source1,source2,result.bytes,active_bytes);
+    else if (is_variable_shift(instruction.opcode))
+        evaluate_integer_dataflow(instruction.opcode,*shape,source1,source2,result.bytes,active_bytes);
     else if (instruction.opcode == Opcode::vpandd || instruction.opcode == Opcode::vpandq ||
              instruction.opcode == Opcode::vpord || instruction.opcode == Opcode::vporq ||
              instruction.opcode == Opcode::vpxord || instruction.opcode == Opcode::vpxorq) {

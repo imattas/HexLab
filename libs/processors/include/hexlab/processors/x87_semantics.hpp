@@ -90,6 +90,28 @@ struct X87IntegerConvertResult {
 HEXLAB_PROCESSORS_EXPORT std::optional<X87IntegerConvertResult>
 evaluate_x87_to_integer(const X87IntegerConvertRequest &request) noexcept;
 
+struct X87RoundToIntegralRequest {
+    X87Binary80 value;
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+};
+
+struct X87RoundToIntegralResult {
+    std::optional<X87Binary80> value;
+    std::uint16_t status_word = 0;
+    // FSW condition codes C0/C2/C3 are architecturally undefined for FRNDINT.
+    std::uint16_t status_word_defined_mask = 0xffff;
+    bool completed = true;
+    bool precision = false;
+    bool operator==(const X87RoundToIntegralResult &) const = default;
+};
+
+// Evaluate FRNDINT for finite normal/subnormal and pseudo-denormal binary80
+// inputs, plus infinities. NaNs and unsupported encodings return no result so
+// their special-value behavior is not guessed.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87RoundToIntegralResult>
+evaluate_x87_round_to_integral(const X87RoundToIntegralRequest &request) noexcept;
+
 enum class X87UnaryArithmetic : std::uint8_t { change_sign, absolute };
 struct X87UnaryResult {
     X87Binary80 value;

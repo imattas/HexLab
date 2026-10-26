@@ -414,6 +414,48 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
     }
     if (i.opcode == Opcode::ppc_mulli && ops.size() == 3)
         return assign(binary("mul", operand(ops[1]), operand(ops[2]), width));
+    // The word multiply/divide instructions operate on 32-bit operands even
+    // in PPC64 mode and sign- or zero-extend their 32-bit result. Keep the
+    // architectural divide operations named so their divide-by-zero and
+    // signed-overflow behavior is not confused with host-language division.
+    if (ops.size() == 3 && dst && dst->bank == RegisterBank::ppc_gpr &&
+        (i.opcode == Opcode::ppc_mullw || i.opcode == Opcode::ppc_mulld ||
+         i.opcode == Opcode::ppc_divw || i.opcode == Opcode::ppc_divwu ||
+         i.opcode == Opcode::ppc_divd || i.opcode == Opcode::ppc_divdu)) {
+        const bool word = i.opcode == Opcode::ppc_mullw || i.opcode == Opcode::ppc_divw ||
+                          i.opcode == Opcode::ppc_divwu;
+        const bool division = i.opcode != Opcode::ppc_mullw && i.opcode != Opcode::ppc_mulld;
+        const bool unsigned_operation = i.opcode == Opcode::ppc_divwu || i.opcode == Opcode::ppc_divdu;
+        const auto operation_width = static_cast<std::uint16_t>(word ? 32 : 64);
+        if ((word && width != 32 && width != 64) || (!word && width != 64) ||
+            dst->width != width || i.register_writes.empty() || i.register_writes.front() != *dst)
+            return effect(i, "ppc_malformed_mul_div");
+        const auto *left = std::get_if<R>(&ops[1]);
+        const auto *right = std::get_if<R>(&ops[2]);
+        if (!left || !right || left->bank != RegisterBank::ppc_gpr || right->bank != RegisterBank::ppc_gpr ||
+            left->width != width || right->width != width)
+            return effect(i, "ppc_malformed_mul_div");
+        auto lhs = reg({left->bank, left->index, operation_width, false});
+        auto rhs = reg({right->bank, right->index, operation_width, false});
+        ExpressionPtr value;
+        if (!division) {
+            value = binary("mul", std::move(lhs), std::move(rhs), operation_width);
+        } else {
+            const auto name = std::string("ppc_") + (unsigned_operation ? "udiv" : "sdiv") +
+                              (word ? "w" : "d");
+            value = std::make_shared<Expression>(Expression{integer(operation_width),
+                BinaryValue{name, std::move(lhs), std::move(rhs)}});
+        }
+        if (word && width == 64)
+            value = unary(unsigned_operation ? "zext32" : "sext", std::move(value), 64);
+        const bool record = i.register_writes.size() == 2 &&
+                            i.register_writes[1] == R{RegisterBank::ppc_cr, 0, 4, false};
+        if (i.register_writes.size() != (record ? 2u : 1u))
+            return effect(i, "ppc_malformed_mul_div");
+        if (record)
+            return effect_with_outputs(i, "ppc_record_mul_div", {value, ppc_record_cr0(value, width)});
+        return assign(std::move(value));
+    }
     if (i.opcode == Opcode::ppc_cmpi || i.opcode == Opcode::ppc_cmpli || i.opcode == Opcode::ppc_cmp || i.opcode == Opcode::ppc_cmpl) {
         if (ops.size() < 3 || i.register_writes.size() != 1) return effect(i, "ppc_malformed_compare");
         const auto *field = std::get_if<R>(&ops[0]);
