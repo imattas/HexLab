@@ -140,12 +140,70 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
     }
 
     // Bit-preserving GPR/FPR transfers are ordinary SSA values. FCSR control
-    // views remain explicit intrinsics because their bit-level aliases are
-    // not modeled here; the aggregate FCSR word is representable directly.
+    // views map to fields in the aggregate FCSR word below.
     if (op >= Opcode::mips64_mfc1 && op <= Opcode::mips64_ctc1) {
         if (items.size() == 2) {
             const auto *general = std::get_if<RegisterOperand>(&items[0]);
             const auto *cop = std::get_if<RegisterOperand>(&items[1]);
+            const RegisterOperand fcsr_register{RegisterBank::mips_fcsr, 0, 32, false};
+            const auto fcsr_value = [&] { return reg(fcsr_register); };
+            const auto sign_extend_control = [&](ExpressionPtr value) {
+                return unary("sext", std::move(value), 64);
+            };
+            const auto extract_control_view = [&](std::uint8_t index) -> ExpressionPtr {
+                auto value = fcsr_value();
+                if (index == 25) {
+                    // FCCR[7:1] aliases FCSR[31:25], and FCCR[0]
+                    // aliases FCSR[23].
+                    auto upper = binary("and", binary("shr", value, constant(24, 32), 32), constant(0xfe, 32), 32);
+                    auto zero = binary("and", binary("shr", fcsr_value(), constant(23, 32), 32), constant(1, 32), 32);
+                    return binary("or", std::move(upper), std::move(zero), 32);
+                }
+                if (index == 26) {
+                    // FEXR exposes Cause[17:12] and Flags[6:2].
+                    return binary("and", std::move(value), constant(0x0003f07c, 32), 32);
+                }
+                if (index == 28) {
+                    // FENR exposes Enables[11:7], FS at bit 2, and RM[1:0].
+                    auto enabled = binary("and", value, constant(0x00000f80, 32), 32);
+                    auto flush = binary("and", binary("shr", fcsr_value(), constant(22, 32), 32), constant(4, 32), 32);
+                    auto rounding = binary("and", fcsr_value(), constant(3, 32), 32);
+                    return binary("or", binary("or", std::move(enabled), std::move(flush), 32),
+                                  std::move(rounding), 32);
+                }
+                return {};
+            };
+            const auto update_control_view = [&](std::uint8_t index, ExpressionPtr source) -> ExpressionPtr {
+                source = unary("trunc32", std::move(source), 32);
+                auto old = fcsr_value();
+                if (index == 25) {
+                    constexpr std::uint64_t mask = UINT64_C(0xfe800000);
+                    auto preserved = binary("and", old, constant(static_cast<std::uint32_t>(~mask), 32), 32);
+                    auto upper = binary("and", source, constant(0xfe, 32), 32);
+                    upper = binary("shl", std::move(upper), constant(24, 32), 32);
+                    auto zero = binary("and", source, constant(1, 32), 32);
+                    zero = binary("shl", std::move(zero), constant(23, 32), 32);
+                    return binary("or", std::move(preserved),
+                                  binary("or", std::move(upper), std::move(zero), 32), 32);
+                }
+                if (index == 26) {
+                    constexpr std::uint32_t mask = 0x0003f07c;
+                    return binary("or", binary("and", old, constant(static_cast<std::uint32_t>(~mask), 32), 32),
+                                  binary("and", source, constant(mask, 32), 32), 32);
+                }
+                if (index == 28) {
+                    constexpr std::uint32_t mask = 0x01000f83;
+                    auto preserved = binary("and", old, constant(static_cast<std::uint32_t>(~mask), 32), 32);
+                    auto enabled = binary("and", source, constant(0x00000f80, 32), 32);
+                    auto flush = binary("and", source, constant(4, 32), 32);
+                    flush = binary("shl", std::move(flush), constant(22, 32), 32);
+                    auto rounding = binary("and", source, constant(3, 32), 32);
+                    return binary("or", std::move(preserved),
+                                  binary("or", binary("or", std::move(enabled), std::move(flush), 32),
+                                         std::move(rounding), 32), 32);
+                }
+                return {};
+            };
             if (general && cop && general->bank == RegisterBank::mips_gpr && general->width == 64) {
                 if (op == Opcode::mips64_mfc1 && cop->bank == RegisterBank::mips_fpr && cop->width == 32)
                     return assign(unary("sext", unary("bitcast_f32", operand(items[1]), 32), 64));
@@ -154,6 +212,12 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
                 if (op == Opcode::mips64_cfc1 && cop->bank == RegisterBank::mips_fcsr && cop->index == 0 &&
                     cop->width == 32)
                     return assign(unary("sext", operand(items[1]), 64));
+                if (op == Opcode::mips64_cfc1 && cop->bank == RegisterBank::mips_fcsr &&
+                    (cop->index == 25 || cop->index == 26 || cop->index == 28) && cop->width == 32) {
+                    auto view = extract_control_view(cop->index);
+                    if (!view) return std::nullopt;
+                    return assign(sign_extend_control(std::move(view)));
+                }
             }
             if (general && cop && general->bank == RegisterBank::mips_gpr && general->width == 64) {
                 if (op == Opcode::mips64_mtc1 && cop->bank == RegisterBank::mips_fpr && cop->width == 32) {
@@ -165,6 +229,12 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
                 if (op == Opcode::mips64_ctc1 && cop->bank == RegisterBank::mips_fcsr && cop->index == 0 &&
                     cop->width == 32)
                     return Assign{*cop, unary("trunc32", operand(items[0]), 32)};
+                if (op == Opcode::mips64_ctc1 && cop->bank == RegisterBank::mips_fcsr &&
+                    (cop->index == 25 || cop->index == 26 || cop->index == 28) && cop->width == 32) {
+                    auto updated = update_control_view(cop->index, operand(items[0]));
+                    if (!updated) return std::nullopt;
+                    return Assign{fcsr_register, std::move(updated)};
+                }
             }
         }
         static constexpr const char *names[]{"mips64.mfc1.sext32", "mips64.dmfc1", "mips64.cfc1.sext32",
