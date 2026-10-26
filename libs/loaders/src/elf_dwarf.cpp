@@ -97,17 +97,33 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
         require(rel.offset <= target.size() && width <= target.size() - rel.offset, "DWARF relocation field exceeds target section");
         const auto max_value = width == 8 ? UINT64_MAX : std::uint64_t(UINT32_MAX);
         std::uint64_t sum = symbol->value;
-        if (*rel.addend >= 0) {
+        if (x64 && rel.type == 1) {
+            // R_X86_64_64 stores the low 64 bits of S+A.
+            sum += static_cast<std::uint64_t>(*rel.addend);
+        } else if (x64 && rel.type == 11 && *rel.addend < 0) {
+            const auto magnitude = static_cast<std::uint64_t>(-(*rel.addend + 1)) + 1;
+            require(symbol->value >= magnitude || magnitude - symbol->value <= (std::uint64_t{1} << 31),
+                    "R_X86_64_32S DWARF relocation result overflows signed field");
+            if (symbol->value >= magnitude) {
+                sum = symbol->value - magnitude;
+                require(sum <= INT32_MAX, "R_X86_64_32S DWARF relocation result overflows signed field");
+            } else {
+                const auto negative_magnitude = magnitude - symbol->value;
+                require(negative_magnitude <= (std::uint64_t{1} << 31),
+                        "R_X86_64_32S DWARF relocation result overflows signed field");
+                sum = std::uint32_t(0u - static_cast<std::uint32_t>(negative_magnitude));
+            }
+        } else if (*rel.addend >= 0) {
             const auto add = static_cast<std::uint64_t>(*rel.addend);
             require(sum <= max_value && add <= max_value - sum, "DWARF absolute relocation result overflows field");
             sum += add;
+            if (x64 && rel.type == 11)
+                require(sum <= INT32_MAX, "R_X86_64_32S DWARF relocation result overflows signed field");
         } else {
             const auto magnitude = static_cast<std::uint64_t>(-(*rel.addend + 1)) + 1;
             require(sum >= magnitude, "DWARF absolute relocation result is negative");
             sum -= magnitude;
         }
-        if (x64 && rel.type == 11)
-            require(sum <= INT32_MAX, "R_X86_64_32S DWARF relocation result overflows signed field");
         put(target, rel.offset, width, sum);
     }
 }
