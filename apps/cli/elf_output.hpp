@@ -57,6 +57,58 @@ inline void elf_description(std::ostream &out, const ImageMetadata &metadata, co
         out << "  section #" << section.index << " name=" << elf_text(section.name) << " type=" << section.type
             << " flags=" << elf_hex(section.flags) << " file=" << elf_hex(section.offset)
             << " size=" << elf_hex(section.size) << " link=" << section.link << '\n';
+    constexpr std::size_t max_gnu_property_rows = 512;
+    constexpr std::size_t max_gnu_property_preview = 32;
+    out << "ELF GNU properties: " << elf.gnu_properties.size() << '\n';
+    const auto shown_gnu_properties = std::min(elf.gnu_properties.size(), max_gnu_property_rows);
+    for (std::size_t index = 0; index < shown_gnu_properties; ++index) {
+        const auto &property = elf.gnu_properties[index];
+        out << "  property=" << elf_hex(property.type) << " size=" << property.data.size()
+            << " note-file=" << elf_hex(property.note_file_offset)
+            << " property-file=" << elf_hex(property.property_file_offset)
+            << " data-file=" << elf_hex(property.data_file_offset);
+        if (property.program)
+            out << " program=" << *property.program;
+        if (property.section)
+            out << " section=" << *property.section;
+        out << " data-prefix=0x";
+        const auto previous_fill = out.fill();
+        const auto preview = std::min(property.data.size(), max_gnu_property_preview);
+        for (std::size_t byte = 0; byte < preview; ++byte)
+            out << std::hex << std::setw(2) << std::setfill('0')
+                << std::to_integer<unsigned>(property.data[byte]);
+        out << std::dec << std::setfill(previous_fill);
+        if (preview < property.data.size())
+            out << "...";
+        if (property.value32) {
+            const auto value = *property.value32;
+            const auto emit_feature = [&](std::string_view feature, bool &first) {
+                if (!first)
+                    out << ',';
+                out << feature;
+                first = false;
+            };
+            if ((header.machine == 3 || header.machine == 62) && property.type == 0xc0000002) {
+                out << " x86-feature-1-and=";
+                bool first = true;
+                if (value & 1) emit_feature("IBT", first);
+                if (value & 2) emit_feature("SHSTK", first);
+                if (value & ~3U) emit_feature("unknown-bits=" + elf_hex(value & ~3U), first);
+                if (first) out << "none";
+            } else if (header.machine == 183 && property.type == 0xc0000000) {
+                out << " aarch64-feature-1-and=";
+                bool first = true;
+                if (value & 1) emit_feature("BTI", first);
+                if (value & 2) emit_feature("PAC", first);
+                if (value & 4) emit_feature("GCS", first);
+                if (value & ~7U) emit_feature("unknown-bits=" + elf_hex(value & ~7U), first);
+                if (first) out << "none";
+            }
+        }
+        out << '\n';
+    }
+    if (shown_gnu_properties < elf.gnu_properties.size())
+        out << "  property-output-capped=true omitted=" << elf.gnu_properties.size() - shown_gnu_properties << '\n';
     out << "ELF symbol tables: " << elf.symbol_tables.size() << '\n';
     for (const auto &table : elf.symbol_tables) {
         out << "  symbol-table file:" << elf_hex(table.source.file_offset)

@@ -1,7 +1,8 @@
 # Mach-O chained-fixup bounds and resolution
 
 The loader decodes chained fixup imports, segment starts, page chains and
-pointer records for supported little-endian 64-bit Mach-O images. It retains
+pointer records for supported little-endian 32-bit and 64-bit Mach-O images
+when the pointer format's field width matches the selected slice. It retains
 raw pointer words and the source file/address coordinates. Rebase targets and
 bind imports are exposed through the existing Mach-O dyld resolver; pointer
 authentication remains metadata and is not applied. Kernel-cache formats 8
@@ -16,6 +17,28 @@ pointers retain their PAC metadata and remain unresolved by the runtime
 resolver. Resolvable unauthenticated format-7 rebases and bind metadata flow
 through the same resolver and persisted-provenance checks as formats 1, 9,
 and 12.
+
+ARM64e firmware format 10 stores 8-byte words with a 4-byte chain stride.
+Unauthenticated targets are VM addresses and use the existing direct-target
+resolver path; bind fields retain the standard ARM64e import/addend encoding.
+Authenticated target and diversity/key metadata are preserved, while runtime
+resolution reports authenticated pointers as unresolved because PAC is not
+applied. Apple defines these field semantics; Ghidra's current implementation
+was used as a secondary format/stride cross-check.
+
+ARM64e segmented format 14 stores an 8-byte field with a 4-byte chain stride.
+The parser retains the lower 32-bit target payload (4-bit segment index plus
+28-bit segment offset), the 12-bit next field, and authenticated diversity,
+address-diversity, and key fields. It leaves every format-14 row incomplete
+because this loader has no segmented-address table, so no target address is
+assembled or resolved. The current Ghidra implementation does not enumerate
+format 14; Apple's header is the format authority for this decode.
+
+The 32-bit cache (format 4) and firmware (format 5) pointer formats retain
+their bounded 30-bit/2-bit and 26-bit/6-bit target/next fields respectively,
+and follow their 4-byte-stride chains. Their target bases require dyld cache or
+firmware mapping context, so the rows remain explicitly incomplete and no
+rebase address is inferred. These formats are accepted only in 32-bit slices.
 
 The parser applies these hard limits before allocating symbol strings or
 following chain records:

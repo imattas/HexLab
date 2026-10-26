@@ -57,6 +57,11 @@ struct AbiDescription {
     // argument position (for example Windows x64); others allocate each
     // register class independently (for example System V AMD64).
     bool shared_integer_float_argument_positions = false;
+    // The ABI may place an individual input directly in memory while some
+    // register classes remain available. This permits local callee-side
+    // evidence retention only; it does not establish source order or
+    // call-site argument slots.
+    bool allow_direct_stack_input_evidence = false;
     std::vector<RegisterOperand> caller_saved_registers;
 };
 
@@ -112,6 +117,15 @@ struct RecoveredStackVariable {
     types::TypePtr type;
 };
 
+// A stack read may prove that a function consumes a typed ABI input without
+// proving its source parameter ordinal. This evidence stays separate from the
+// inferred prototype so it cannot be mistaken for an ordered formal.
+struct UnresolvedStackArgumentEvidence {
+    std::int64_t offset = 0;
+    std::uint16_t bits = 0;
+    types::TypePtr candidate_type;
+};
+
 struct TypeRecoveryResult {
     std::vector<RecoveredVariable> variables;
     std::vector<RecoveredStackVariable> stack_variables;
@@ -119,6 +133,7 @@ struct TypeRecoveryResult {
     // Candidate signature inferred from observed ABI register use and return
     // statements. This is a heuristic proposal, not a proven source prototype.
     types::TypePtr inferred_prototype;
+    std::vector<UnresolvedStackArgumentEvidence> unresolved_stack_arguments;
     std::vector<std::string> diagnostics;
 };
 

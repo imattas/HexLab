@@ -83,9 +83,13 @@ std::pair<std::uint8_t, std::uint8_t> layout(std::uint16_t format) {
     case 11: // DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE
         return {std::uint8_t{8}, std::uint8_t{1}};
     case 3:
+    case 4: // DYLD_CHAINED_PTR_32_CACHE
+    case 5: // DYLD_CHAINED_PTR_32_FIRMWARE
         return {std::uint8_t{4}, std::uint8_t{4}};
     case 1:
     case 7: // DYLD_CHAINED_PTR_ARM64E_KERNEL: 8-byte word, 4-byte chain stride
+    case 10: // DYLD_CHAINED_PTR_ARM64E_FIRMWARE: 8-byte word, 4-byte stride
+    case 14: // DYLD_CHAINED_PTR_ARM64E_SEGMENTED: 8-byte word, 4-byte stride
     case 9:
     case 12:
     case 13: // DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE
@@ -126,6 +130,32 @@ void pointer_bits(MachOChainedPointer &row, const MachOChainedStarts &starts) {
                 row.scalar_value = static_cast<std::uint32_t>(*row.target - bias);
             }
         }
+    } else if (format == 4) {
+        // Cache-relative targets need the cache mapping context to resolve.
+        // Preserve the exact 30-bit target and 2-bit next field only.
+        row.next = static_cast<std::uint16_t>((raw >> 30) & 0x3);
+        row.target = raw & UINT64_C(0x3fffffff);
+        row.target_is_offset = true;
+        row.complete = false;
+    } else if (format == 5) {
+        // Firmware targets need firmware image context; retain their encoded
+        // 26-bit target and 6-bit next field without inventing a base.
+        row.next = static_cast<std::uint16_t>((raw >> 26) & 0x3f);
+        row.target = raw & UINT64_C(0x03ffffff);
+        row.complete = false;
+    } else if (format == 14) {
+        // Preserve the packed 4-bit segment index and 28-bit segment offset
+        // as an unassembled target payload. Resolution needs the segmented
+        // format's address table, which this image model does not carry.
+        row.target = raw & UINT32_MAX;
+        row.next = static_cast<std::uint16_t>((raw >> 51) & 0xfff);
+        row.authenticated = bool(raw >> 63);
+        if (row.authenticated) {
+            row.diversity = static_cast<std::uint16_t>((raw >> 32) & 0xffff);
+            row.address_diversity = bool((raw >> 48) & 1);
+            row.key = static_cast<std::uint8_t>((raw >> 49) & 3);
+        }
+        row.complete = false;
     } else if (format == 8 || format == 11) {
         // Kernel-cache targets are relative to one of several cache images.
         // Retain their encoded target/authentication fields, but keep the row
@@ -174,7 +204,7 @@ void pointer_bits(MachOChainedPointer &row, const MachOChainedStarts &starts) {
         } else {
             row.target = raw & UINT64_C(0x7ffffffffff);
             row.high8 = static_cast<std::uint8_t>((raw >> 43) & 0xff);
-            row.target_is_offset = format != 1;
+            row.target_is_offset = format != 1 && format != 10;
         }
     }
 }

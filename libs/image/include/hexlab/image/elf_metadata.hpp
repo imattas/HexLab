@@ -118,12 +118,20 @@ struct ElfInterpreter {
     bool operator==(const ElfInterpreter &) const = default;
 };
 struct ElfNote {
-    std::uint32_t program = 0;
+    std::optional<std::uint32_t> program, section;
     std::uint64_t file_offset = 0, description_file_offset = 0;
     std::uint32_t type = 0;
     std::string name;
     std::vector<std::byte> description;
     bool operator==(const ElfNote &) const = default;
+};
+struct ElfGnuProperty {
+    std::optional<std::uint32_t> program, section;
+    std::uint64_t note_file_offset = 0, property_file_offset = 0, data_file_offset = 0;
+    std::uint32_t type = 0;
+    std::vector<std::byte> data;
+    std::optional<std::uint32_t> value32;
+    bool operator==(const ElfGnuProperty &) const = default;
 };
 enum class ElfCoreThreadStatus { decoded, unsupported, malformed };
 struct ElfCoreRegister {
@@ -317,6 +325,7 @@ struct ElfMetadata {
     bool relocations_complete = true;
     std::optional<ElfInterpreter> interpreter;
     std::vector<ElfNote> notes;
+    std::vector<ElfGnuProperty> gnu_properties;
     std::optional<ElfCoreInfo> core;
     std::vector<ElfSourceLine> source_lines;
     // Parsed project-importable DWARF v4/v5 records. The parser retains its

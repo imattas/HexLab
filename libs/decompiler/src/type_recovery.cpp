@@ -1163,6 +1163,7 @@ AbiDescription x86_64_windows_abi() {
 }
 AbiDescription x86_64_system_v_abi() {
     AbiDescription a; a.name = "x86-64 System V"; a.pointer_bits = 64;
+    a.allow_direct_stack_input_evidence = true;
     a.integer_argument_registers = {gpr(7),gpr(6),gpr(2),gpr(1),gpr(8),gpr(9)};
     a.caller_saved_registers = {gpr(0),gpr(1),gpr(2),gpr(6),gpr(7),gpr(8),gpr(9),gpr(10),gpr(11),
                                 {RegisterBank::flags,0,64,false}};
@@ -3035,7 +3036,18 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 if (const auto *fact = incoming_register_fact(reg)) floating_facts.emplace_back(reg, *fact);
             if (!stack_arguments.empty()) {
                 unresolved_argument_order = true;
-                result.diagnostics.push_back("System V AMD64 stack argument evidence is not classifiable without a prototype");
+                if (abi.allow_direct_stack_input_evidence) {
+                    for (const auto &[offset, fact] : stack_arguments) {
+                        auto candidate = make_type(*fact, abi.pointer_bits, nested_layout_work);
+                        result.unresolved_stack_arguments.push_back(
+                            {offset, fact->bits, std::move(candidate)});
+                    }
+                    result.diagnostics.push_back(
+                        "System V AMD64 direct stack-input evidence was retained, but its source parameter ordinal is unresolved");
+                } else {
+                    result.diagnostics.push_back(
+                        "System V AMD64 stack argument evidence is not classifiable without a prototype");
+                }
             }
             if (!integer_facts.empty() && !floating_facts.empty()) {
                 unresolved_argument_order = true;
@@ -3752,6 +3764,7 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
             left.vector_return_register != right.vector_return_register ||
             left.caller_saved_registers != right.caller_saved_registers ||
             left.shared_integer_float_argument_positions != right.shared_integer_float_argument_positions ||
+            left.allow_direct_stack_input_evidence != right.allow_direct_stack_input_evidence ||
             left.stack_argument_base != right.stack_argument_base ||
             left.call_stack_adjustment != right.call_stack_adjustment)
             return false;
@@ -4270,6 +4283,44 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
     // Tarjan SCCs let unknown values on recursive edges remain pending while
     // an external, observed call site supplies the seed type.
     const auto count = raw.size();
+    using StackArgumentPredecessors = std::vector<std::vector<std::size_t>>;
+    using StackArgumentAddress = std::pair<std::uint32_t, std::uint64_t>;
+    std::vector<std::map<std::uint64_t, std::size_t>> stack_argument_blocks(count);
+    std::vector<std::map<StackArgumentAddress, std::size_t>> stack_argument_addresses(count);
+    std::vector<StackArgumentPredecessors> stack_argument_predecessors(count);
+    std::vector<std::vector<std::uint64_t>> stack_argument_block_ids(count);
+    for (std::size_t function_index = 0; function_index < count; ++function_index) {
+        const auto &blocks = raw[function_index].blocks;
+        stack_argument_predecessors[function_index].resize(blocks.size());
+        stack_argument_block_ids[function_index].reserve(blocks.size());
+        for (std::size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+            const auto &block = blocks[block_index];
+            stack_argument_block_ids[function_index].push_back(block.id.value);
+            if (!stack_argument_blocks[function_index].emplace(block.id.value, block_index).second ||
+                !stack_argument_addresses[function_index].emplace(
+                    StackArgumentAddress{block.begin.space.value, block.begin.offset}, block_index).second)
+                return Error{ErrorCode::invalid_argument,
+                    "Interprocedural stack argument analysis contains duplicate block identities"};
+        }
+        for (std::size_t source = 0; source < blocks.size(); ++source) {
+            for (const auto &edge : blocks[source].successors) {
+                std::optional<std::size_t> target;
+                if (edge.block) {
+                    const auto found = stack_argument_blocks[function_index].find(edge.block->value);
+                    if (found != stack_argument_blocks[function_index].end()) target = found->second;
+                } else if (edge.target) {
+                    const auto found = stack_argument_addresses[function_index].find(
+                        StackArgumentAddress{edge.target->space.value, edge.target->offset});
+                    if (found != stack_argument_addresses[function_index].end()) target = found->second;
+                }
+                if (target) stack_argument_predecessors[function_index][*target].push_back(source);
+            }
+        }
+        for (auto &predecessors : stack_argument_predecessors[function_index]) {
+            std::sort(predecessors.begin(), predecessors.end());
+            predecessors.erase(std::unique(predecessors.begin(), predecessors.end()), predecessors.end());
+        }
+    }
     std::vector<int> visit_index(count, -1), low_link(count, -1), component(count, -1);
     std::vector<std::size_t> stack;
     std::vector<bool> on_stack(count, false);
@@ -4346,53 +4397,103 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
     }
 
     struct StackCallArgument { RegisterValue value; std::uint16_t bits = 0; };
-    const auto stack_call_argument_value = [&](const AbiDescription &caller_abi,
-            const LiftedBlock &block, std::size_t call_position, const Call &call,
-            const AbiArgumentSlot &slot) -> std::optional<StackCallArgument> {
-        if (!slot.stack_offset || !caller_abi.stack_argument_base || !caller_abi.pointer_bits) return {};
+    const auto stack_call_argument_value = [&](std::size_t caller_index,
+            const LiftedFunction &caller_function, const std::vector<PointerAlias> &aliases,
+            const AbiDescription &caller_abi, const LiftedBlock &block,
+            std::size_t call_position, const Call &call, const AbiArgumentSlot &slot,
+            std::uint16_t expected_bits) -> std::optional<StackCallArgument> {
+        if (caller_index >= stack_argument_predecessors.size() || !slot.stack_offset ||
+            !caller_abi.stack_argument_base || !caller_abi.pointer_bits ||
+            !expected_bits || expected_bits % 8) return {};
         const auto base = *caller_abi.stack_argument_base;
         const auto stack_input = std::find_if(call.register_inputs.begin(), call.register_inputs.end(),
             [&](const RegisterValue &value) { return value.reg == base; });
         if (stack_input == call.register_inputs.end()) return {};
-        std::vector<PointerAlias> aliases;
-        for (std::size_t i = 0; i < call_position; ++i)
-            if (const auto *assignment = std::get_if<Assign>(&block.instructions[i].statement))
-                if (auto alias = pointer_alias(*assignment)) aliases.push_back(*alias);
         const auto stack_pointer = canonical_stack_address(key(base, stack_input->version), aliases);
         if (!stack_pointer || (stack_pointer->first != key(base) && stack_pointer->first != key(base, 0))) return {};
         std::int64_t outgoing_offset = 0;
         if (!checked_add(stack_pointer->second, *slot.stack_offset, outgoing_offset) ||
             !checked_subtract(outgoing_offset, caller_abi.call_stack_adjustment, outgoing_offset)) return {};
-
-        for (std::size_t cursor = call_position; cursor > 0;) {
-            const auto &statement = block.instructions[--cursor].statement;
-            if (std::holds_alternative<Call>(statement)) return {};
-            if (const auto *intrinsic = std::get_if<Intrinsic>(&statement)) {
-                if (intrinsic->memory_effect == IntrinsicMemoryEffect::write ||
-                    intrinsic->memory_effect == IntrinsicMemoryEffect::unknown) return {};
-                continue;
+        const auto block_identity = stack_argument_blocks[caller_index].find(block.id.value);
+        if (block_identity == stack_argument_blocks[caller_index].end() ||
+            block_identity->second >= caller_function.blocks.size()) return {};
+        constexpr std::size_t max_path_work = 4096;
+        std::size_t path_work = 0;
+        std::set<std::size_t> active;
+        std::function<std::optional<StackCallArgument>(std::size_t, std::size_t)> scan_path;
+        scan_path = [&](std::size_t block_index, std::size_t instruction_limit)
+                -> std::optional<StackCallArgument> {
+            if (block_index >= caller_function.blocks.size() || path_work >= max_path_work ||
+                block_index >= stack_argument_block_ids[caller_index].size() ||
+                caller_function.blocks[block_index].id.value != stack_argument_block_ids[caller_index][block_index] ||
+                !active.insert(block_index).second) return {};
+            ++path_work;
+            const auto &path_block = caller_function.blocks[block_index];
+            const auto limit = std::min(instruction_limit, path_block.instructions.size());
+            for (std::size_t cursor = limit; cursor > 0;) {
+                if (path_work++ >= max_path_work) { active.erase(block_index); return {}; }
+                const auto &statement = path_block.instructions[--cursor].statement;
+                if (std::holds_alternative<Call>(statement)) { active.erase(block_index); return {}; }
+                if (const auto *intrinsic = std::get_if<Intrinsic>(&statement)) {
+                    if (intrinsic->memory_effect == IntrinsicMemoryEffect::write ||
+                        intrinsic->memory_effect == IntrinsicMemoryEffect::unknown) {
+                        active.erase(block_index);
+                        return {};
+                    }
+                    continue;
+                }
+                const auto *store = std::get_if<Store>(&statement);
+                if (!store) continue;
+                const auto *address = store->address ? std::get_if<MemoryValue>(&store->address->value) : nullptr;
+                if (!address || !address->base || address->index || address->absolute) {
+                    active.erase(block_index);
+                    return {};
+                }
+                const auto canonical = canonical_stack_address(key(*address->base, address->base_version), aliases);
+                std::int64_t store_offset = 0;
+                if (!canonical || canonical->first != stack_pointer->first ||
+                    !checked_add(canonical->second, address->displacement, store_offset)) {
+                    active.erase(block_index);
+                    return {};
+                }
+                const std::uint16_t store_bits = store->value ? store->value->type.bits : std::uint16_t{0};
+                if (!store_bits || store_bits % 8) { active.erase(block_index); return {}; }
+                const auto store_bytes = static_cast<std::int64_t>(store_bits / 8);
+                const auto expected_bytes = static_cast<std::int64_t>(expected_bits / 8);
+                std::int64_t store_end = 0, slot_end = 0;
+                if (!checked_add(store_offset, store_bytes, store_end) ||
+                    !checked_add(outgoing_offset, expected_bytes, slot_end)) {
+                    active.erase(block_index);
+                    return {};
+                }
+                if (store_end <= outgoing_offset || slot_end <= store_offset) continue;
+                if (store_offset != outgoing_offset || store_bits != expected_bits) {
+                    active.erase(block_index);
+                    return {};
+                }
+                const auto *value = store->value ? std::get_if<RegisterValue>(&store->value->value) : nullptr;
+                active.erase(block_index);
+                return value ? std::optional<StackCallArgument>{StackCallArgument{*value, store_bits}}
+                             : std::optional<StackCallArgument>{};
             }
-            const auto *store = std::get_if<Store>(&statement);
-            if (!store) continue;
-            const auto *address = store->address ? std::get_if<MemoryValue>(&store->address->value) : nullptr;
-            if (!address || !address->base || address->index || address->absolute) return {};
-            const auto canonical = canonical_stack_address(key(*address->base, address->base_version), aliases);
-            std::int64_t store_offset = 0;
-            if (!canonical || canonical->first != stack_pointer->first ||
-                !checked_add(canonical->second, address->displacement, store_offset)) return {};
-            const std::uint16_t store_bits = store->value ? store->value->type.bits : std::uint16_t{0};
-            if (!store_bits || store_bits % 8) return {};
-            const auto store_bytes = static_cast<std::int64_t>(store_bits / 8);
-            std::int64_t store_end = 0, slot_end = 0;
-            if (!checked_add(store_offset, store_bytes, store_end) ||
-                !checked_add(outgoing_offset, store_bytes, slot_end)) return {};
-            if (store_end <= outgoing_offset || slot_end <= store_offset) continue;
-            if (store_offset != outgoing_offset) return {};
-            const auto *value = store->value ? std::get_if<RegisterValue>(&store->value->value) : nullptr;
-            return value ? std::optional<StackCallArgument>{StackCallArgument{*value, store_bits}}
-                         : std::optional<StackCallArgument>{};
-        }
-        return {};
+
+            const auto &predecessors = stack_argument_predecessors[caller_index][block_index];
+            if (predecessors.empty()) { active.erase(block_index); return {}; }
+            std::optional<StackCallArgument> unanimous;
+            for (const auto predecessor : predecessors) {
+                const auto candidate = scan_path(predecessor,
+                    caller_function.blocks[predecessor].instructions.size());
+                if (!candidate || (unanimous &&
+                    (unanimous->value != candidate->value || unanimous->bits != candidate->bits))) {
+                    active.erase(block_index);
+                    return {};
+                }
+                unanimous = candidate;
+            }
+            active.erase(block_index);
+            return unanimous;
+        };
+        return scan_path(block_identity->second, call_position);
     };
 
     struct StackParameterLoads {
@@ -4499,6 +4600,7 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
 
         std::vector<LiftedFunction> current_ssa;
         std::vector<TypeRecoveryResult> recovered;
+        std::vector<std::vector<PointerAlias>> current_ssa_pointer_aliases(count);
         current_ssa.reserve(count);
         recovered.reserve(count);
         for (std::size_t i = 0; i < count; ++i) {
@@ -4506,6 +4608,11 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
             if (!effects) return effects.error();
             auto converted = to_ssa(effects.value(), tracked_registers);
             if (!converted) return converted.error();
+            auto &stack_aliases = current_ssa_pointer_aliases[i];
+            for (const auto &block : converted.value().blocks)
+                for (const auto &instruction : block.instructions)
+                    if (const auto *assignment = std::get_if<Assign>(&instruction.statement))
+                        if (auto alias = pointer_alias(*assignment)) stack_aliases.push_back(*alias);
             std::vector<RegisterValue> known_inputs;
             std::set<Key> known_input_keys;
             std::map<Key, KnownTypedRegister> typed_argument_candidates;
@@ -4595,9 +4702,11 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                         if (!signature || !argument_slot.stack_offset) continue;
                         const auto &parameter_type = signature->parameters()[parameter_index].type;
                         if (!matches_slot_class(argument_slot.value_class, unqualified_type(parameter_type))) continue;
-                        const auto stacked = stack_call_argument_value(abis[i], block, instruction_index,
-                                                                       *call, argument_slot);
-                        if (!stacked || !type_bits(parameter_type) || stacked->bits != type_bits(parameter_type)) continue;
+                        const auto parameter_bits = type_bits(parameter_type);
+                        if (!parameter_bits) continue;
+                        const auto stacked = stack_call_argument_value(i, converted.value(), stack_aliases,
+                            abis[i], block, instruction_index, *call, argument_slot, parameter_bits);
+                        if (!stacked || stacked->bits != parameter_bits) continue;
                         const auto actual_key = key(stacked->value.reg, stacked->value.version);
                         if (known_input_keys.insert(actual_key).second) known_inputs.push_back(stacked->value);
                         if (!typed_argument_candidates.contains(actual_key) && typed_argument_candidates.size() >= 4096) {
@@ -4699,59 +4808,20 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
             return cached->second;
         };
         const auto stack_call_argument_type = [&](std::size_t caller, const LiftedBlock &block,
-                std::size_t call_position, const Call &call, const AbiArgumentSlot &slot) -> types::TypePtr {
-            if (!slot.stack_offset || !abis[caller].stack_argument_base || !abis[caller].pointer_bits ||
-                !call.direct_target) return {};
-            const auto base = *abis[caller].stack_argument_base;
-            const auto stack_input = std::find_if(call.register_inputs.begin(), call.register_inputs.end(),
-                [&](const RegisterValue &value) { return value.reg == base; });
-            if (stack_input == call.register_inputs.end()) return {};
-            std::vector<PointerAlias> aliases;
-            for (std::size_t i = 0; i < call_position; ++i)
-                if (const auto *assignment = std::get_if<Assign>(&block.instructions[i].statement))
-                    if (auto alias = pointer_alias(*assignment)) aliases.push_back(*alias);
-            const auto stack_pointer = canonical_stack_address(key(base, stack_input->version), aliases);
-            if (!stack_pointer || (stack_pointer->first != key(base) && stack_pointer->first != key(base, 0))) return {};
-            std::int64_t outgoing_offset = 0;
-            if (!checked_add(stack_pointer->second, *slot.stack_offset, outgoing_offset) ||
-                !checked_subtract(outgoing_offset, abis[caller].call_stack_adjustment, outgoing_offset)) return {};
-
-            for (std::size_t cursor = call_position; cursor > 0;) {
-                const auto &statement = block.instructions[--cursor].statement;
-                if (std::holds_alternative<Call>(statement)) return {};
-                if (const auto *intrinsic = std::get_if<Intrinsic>(&statement)) {
-                    if (intrinsic->memory_effect == IntrinsicMemoryEffect::write ||
-                        intrinsic->memory_effect == IntrinsicMemoryEffect::unknown) return {};
-                    continue;
-                }
-                const auto *store = std::get_if<Store>(&statement);
-                if (!store) continue;
-                const auto *address = store->address ? std::get_if<MemoryValue>(&store->address->value) : nullptr;
-                if (!address || !address->base || address->index || address->absolute) return {};
-                const auto canonical = canonical_stack_address(key(*address->base, address->base_version), aliases);
-                std::int64_t store_offset = 0;
-                if (!canonical || canonical->first != stack_pointer->first ||
-                    !checked_add(canonical->second, address->displacement, store_offset)) return {};
-                const auto store_bits = store->value ? store->value->type.bits : 0;
-                if (!store_bits || store_bits % 8) return {};
-                const auto store_bytes = static_cast<std::int64_t>(store_bits / 8);
-                std::int64_t store_end = 0, slot_end = 0;
-                if (!checked_add(store_offset, store_bytes, store_end) ||
-                    !checked_add(outgoing_offset, store_bytes, slot_end)) return {};
-                if (store_end <= outgoing_offset || slot_end <= store_offset) continue;
-                if (store_offset != outgoing_offset || store_bits > UINT16_MAX) return {};
-                const auto *value = std::get_if<RegisterValue>(&store->value->value);
-                if (!value) return {};
-                const auto recovered_value = std::find_if(recovered[caller].variables.begin(), recovered[caller].variables.end(),
-                    [&](const RecoveredVariable &variable) {
-                        return variable.reg == value->reg && variable.version == value->version;
-                    });
-                return recovered_value != recovered[caller].variables.end() &&
-                       type_bits(recovered_value->type) == store_bits &&
-                       matches_slot_class(slot.value_class, unqualified_type(recovered_value->type))
-                    ? recovered_value->type : types::TypePtr{};
-            }
-            return {};
+                std::size_t call_position, const Call &call, const AbiArgumentSlot &slot,
+                std::uint16_t expected_bits) -> types::TypePtr {
+            const auto stacked = stack_call_argument_value(caller, current_ssa[caller],
+                current_ssa_pointer_aliases[caller], abis[caller], block, call_position,
+                call, slot, expected_bits);
+            if (!stacked) return {};
+            const auto recovered_value = std::find_if(recovered[caller].variables.begin(),
+                recovered[caller].variables.end(), [&](const RecoveredVariable &variable) {
+                    return variable.reg == stacked->value.reg && variable.version == stacked->value.version;
+                });
+            return recovered_value != recovered[caller].variables.end() &&
+                   type_bits(recovered_value->type) == expected_bits &&
+                   matches_slot_class(slot.value_class, unqualified_type(recovered_value->type))
+                ? recovered_value->type : types::TypePtr{};
         };
         for (std::size_t caller = 0; caller < count; ++caller) {
             for (const auto &block : current_ssa[caller].blocks) for (std::size_t instruction_index = 0;
@@ -4778,7 +4848,8 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                             candidate.valid = false;
                             continue;
                         }
-                        const auto type = stack_call_argument_type(caller, block, instruction_index, *call, callee_slot);
+                        const auto type = stack_call_argument_type(caller, block, instruction_index,
+                            *call, callee_slot, loads->bits);
                         if (!type) {
                             if (!cycle) candidate.valid = false;
                             continue;
