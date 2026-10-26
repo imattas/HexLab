@@ -46,7 +46,7 @@ constexpr std::array<HexLabCapability, 17> host_capabilities{{
     {sizeof(HexLabCapability), 1, 10, 0, "loader.image"},
     {sizeof(HexLabCapability), 1, 7, 0, "processor.semantic.v2"},
     {sizeof(HexLabCapability), 1, 16, 0, "processor.semantic.v3"},
-    {sizeof(HexLabCapability), 1, 22, 0, "processor.ir.scalar"},
+    {sizeof(HexLabCapability), 1, 23, 0, "processor.ir.scalar"},
     {sizeof(HexLabCapability), 1, 9, 0, "analysis.provider"},
     {sizeof(HexLabCapability), 1, 15, 0, "document.active"},
     {sizeof(HexLabCapability), 1, 17, 0, "debugger.active"},

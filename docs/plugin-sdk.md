@@ -646,12 +646,16 @@ if (project.open(project_path, true) == 0 && project.analyze() == 0) {
 }
 ```
 
-## Pure scalar instruction IR (ABI 1.22)
+## Pure scalar instruction IR (ABI 1.22–1.23)
 
 `HexLabProcessorExtension` now has a size-gated, append-only `decode_ir` callback.
-The `processor.ir.scalar` v1.22 host capability accepts bounded typed integer
-DAGs with exact register effects and parallel outputs. Hosts opt into common-IR
-lifting through `plugins::lift_function_with_extensions`; snapshot fingerprints
+The `processor.ir.scalar` v1.23 host capability accepts bounded typed integer
+DAGs with exact register effects and parallel outputs. ABI 1.23 adds exact
+equality and signed/unsigned ordering predicates without changing the record
+layout. Existing modules requiring v1.22 remain compatible and can use the
+original operation set; a v1.23 requirement is rejected by a host that only
+implements the v1.22 operations. Hosts opt into common-IR lifting through
+`plugins::lift_function_with_extensions`; snapshot fingerprints
 and semantic generations are validated before formulas reach SSA/pseudocode.
 Older processor descriptors and core lift overloads remain supported. See
 [plugin scalar instruction IR](plugin-scalar-ir.md) for the precise record,
