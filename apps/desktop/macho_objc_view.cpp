@@ -1,7 +1,9 @@
 #include "macho_objc_view.hpp"
 
 #include "project_view.hpp"
+#include "hexlab/analysis/macho_objc_types.hpp"
 #include <algorithm>
+#include <string_view>
 
 namespace hexlab::desktop {
 namespace {
@@ -32,6 +34,23 @@ bool add(std::vector<MachOObjCViewRow> &rows, std::string kind, std::string owne
 }
 
 std::string value(const std::optional<std::string> &v) { return v.value_or("<unavailable>"); }
+
+std::string objc_type_component(std::string_view name) {
+    constexpr char hex[] = "0123456789ABCDEF";
+    std::string result;
+    for (const auto ch : name) {
+        const auto byte = static_cast<unsigned char>(ch);
+        if ((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+            (byte >= '0' && byte <= '9') || byte == '_') {
+            result.push_back(static_cast<char>(byte));
+        } else {
+            result.push_back('%');
+            result.push_back(hex[byte >> 4]);
+            result.push_back(hex[byte & 15]);
+        }
+    }
+    return result;
+}
 
 void add_method(std::vector<MachOObjCViewRow> &rows, const MachOObjCMethod &method,
                 const std::string &owner, std::string kind) {
@@ -175,6 +194,130 @@ wxString macho_objc_view_cell(const MachOObjCViewRow &row, int column, const Ima
     case 5: return wxString::FromUTF8(row.provenance.c_str());
     default: return wxString::FromUTF8(row.details.c_str());
     }
+}
+
+MachOObjCTypeImportPlan macho_objc_type_import_plan(
+    const MachOObjCScan &scan, const std::vector<database::TypeDefinition> &existing) {
+    MachOObjCTypeImportPlan plan;
+    const auto add_definition = [&](std::string name, types::TypePtr type,
+                                    std::string section, std::uint64_t slot_index,
+                                    std::uint64_t record_offset, std::uint64_t record_size) {
+        if (!type) return;
+        database::DwarfSourceOrigin origin{"Mach-O ObjC2", std::move(section), slot_index,
+                                           record_offset, std::max<std::uint64_t>(record_size, 1)};
+        auto prior = std::find_if(existing.begin(), existing.end(), [&](const auto &item) { return item.name == name; });
+        if (prior != existing.end()) {
+            auto old_encoding = types::encode(*prior->type);
+            auto new_encoding = types::encode(*type);
+            if (old_encoding && new_encoding && old_encoding.value() == new_encoding.value() && prior->origin == origin)
+                return;
+            plan.conflicts.push_back(name + " already exists with different content or provenance");
+            return;
+        }
+        plan.definitions.push_back({std::move(name), std::move(type), {}, std::move(origin),
+                                    database::DeclarationKind::type, {}});
+    };
+    const auto make_methods = [](const MachOObjCList &list, bool is_static) {
+        std::vector<types::Method> methods;
+        for (const auto &method : list.methods) {
+            if (method.selector && method.signature && method.signature_status == "parsed")
+                methods.push_back({*method.selector, method.signature, types::MemberAccess::unknown,
+                                   types::MemberDispatch::unknown, 0, is_static});
+        }
+        return methods;
+    };
+    for (std::size_t index = 0; index < scan.classes.size(); ++index) {
+        const auto &row = scan.classes[index];
+        if (!row.name || row.name_status != "resolved" || !row.class_address) {
+            plan.skipped.push_back("Class record #" + std::to_string(index) + " lacks a resolved class name or address");
+            continue;
+        }
+        const auto class_type_name = "ObjC2.Class." + objc_type_component(*row.name);
+        const auto meta_type_name = "ObjC2.Meta." + objc_type_component(*row.name);
+        const auto import_instance_methods_without_layout = [&] {
+            auto methods = make_methods(row.methods, false);
+            if (methods.empty()) return;
+            auto incomplete = types::Type::incomplete_aggregate(types::Kind::structure, class_type_name);
+            if (!incomplete) return;
+            auto with_methods = types::Type::with_methods(incomplete.value(), std::move(methods));
+            if (with_methods)
+                add_definition(class_type_name, with_methods.value(), "__objc_classlist",
+                               row.classlist_index, row.class_address->offset, 1);
+        };
+        if (row.metaclass_address) {
+            auto meta = types::Type::incomplete_aggregate(types::Kind::structure, meta_type_name);
+            if (meta) {
+                auto meta_methods = types::Type::with_methods(meta.value(), make_methods(row.class_methods, true));
+                if (meta_methods)
+                    add_definition(meta_type_name, meta_methods.value(), "__objc_metaclass",
+                                   row.classlist_index, row.metaclass_address->offset, 1);
+            }
+        } else if (!row.class_methods.methods.empty()) {
+            plan.skipped.push_back("Class " + *row.name + " has class methods but no validated metaclass address");
+        }
+        if (!row.instance_size || *row.instance_size == 0) {
+            plan.skipped.push_back("Class " + *row.name + " has no proven instance extent");
+            import_instance_methods_without_layout();
+            continue;
+        }
+        const bool ivar_extent_validated = row.ivars.status == "null" ||
+            row.ivars.status.ends_with("/extent-validated");
+        if (!ivar_extent_validated) {
+            plan.skipped.push_back("Class " + *row.name + " has no validated ivar-list extent");
+            import_instance_methods_without_layout();
+            continue;
+        }
+        std::vector<types::Member> members;
+        std::uint64_t cursor = 0;
+        bool valid = true;
+        for (const auto &ivar : row.ivars.ivars) {
+            if (!ivar.name || ivar.name_status != "resolved" || !ivar.type_encoding ||
+                ivar.type_status != "resolved" || !ivar.offset || !ivar.size || *ivar.offset < cursor ||
+                *ivar.offset > *row.instance_size || *ivar.size > *row.instance_size - *ivar.offset) {
+                valid = false; break;
+            }
+            auto parsed = parse_macho_objc_property_encoding(*ivar.type_encoding,
+                MachOObjCEncodingLimits{4096, 32, 256, scan.pointer_bytes});
+            if (!parsed || parsed.value().status != "parsed" || !parsed.value().type ||
+                !parsed.value().type->size() || *parsed.value().type->size() != *ivar.size) {
+                valid = false; break;
+            }
+            if (*ivar.offset > cursor) {
+                auto byte = types::Type::integer("objc_byte", 1, 1, false);
+                auto padding = byte ? types::Type::array(byte.value(), *ivar.offset - cursor) : hexlab::Result<types::TypePtr>(byte.error());
+                if (!padding) { valid = false; break; }
+                members.push_back({"__objc_opaque_" + std::to_string(cursor), padding.value(), cursor,
+                                   {}, {}, 1});
+            }
+            members.push_back({*ivar.name, parsed.value().type, *ivar.offset, {}, {}, 1});
+            cursor = static_cast<std::uint64_t>(*ivar.offset) + *ivar.size;
+        }
+        if (!valid) {
+            plan.skipped.push_back("Class " + *row.name + " has an ivar without a proven type, size, or non-overlapping offset");
+            import_instance_methods_without_layout();
+            continue;
+        }
+        if (cursor < *row.instance_size) {
+            auto byte = types::Type::integer("objc_byte", 1, 1, false);
+            auto padding = byte ? types::Type::array(byte.value(), *row.instance_size - cursor) : hexlab::Result<types::TypePtr>(byte.error());
+            if (!padding) { plan.skipped.push_back("Class " + *row.name + " has an unrepresentable instance extent"); continue; }
+            members.push_back({"__objc_opaque_" + std::to_string(cursor), padding.value(), cursor, {}, {}, 1});
+        }
+        if (members.empty()) {
+            plan.skipped.push_back("Class " + *row.name + " has no representable instance storage");
+            import_instance_methods_without_layout();
+            continue;
+        }
+        auto structure = types::Type::structure(class_type_name, std::move(members),
+                                                *row.instance_size, 1);
+        if (!structure) { plan.skipped.push_back("Class " + *row.name + ": " + structure.error().message); import_instance_methods_without_layout(); continue; }
+        auto class_type = types::Type::with_methods(structure.value(), make_methods(row.methods, false));
+        if (!class_type) { plan.skipped.push_back("Class " + *row.name + " has invalid method declarations"); continue; }
+        add_definition(class_type_name, class_type.value(), "__objc_classlist",
+                       row.classlist_index, row.class_address->offset, *row.instance_size);
+
+    }
+    return plan;
 }
 
 } // namespace hexlab::desktop

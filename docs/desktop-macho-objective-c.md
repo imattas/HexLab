@@ -21,3 +21,25 @@ limit only; it does not change the scanner result, its budgets, or project
 persistence. A partial or unavailable scan remains labeled with its status and
 reason. Unsupported runtime forms are shown only as the scanner reports them;
 the view does not infer runtime relationships.
+
+The **Import Objective-C types** action writes eligible declarations into the
+current project through the normal project command/history path. It creates
+`ObjC2.Class.<name>` declarations with an exact instance size when every
+decoded ivar has a supported type, matching encoded size, and a resolved,
+non-overlapping offset. Unmodeled bytes are retained as opaque byte arrays so
+the imported offsets and extent remain exact. Parsed instance method
+signatures are attached to the class aggregate. Class methods are attached to
+an incomplete `ObjC2.Meta.<name>` aggregate only when the scanner validated a
+metaclass address. The parsed method signature retains its receiver and
+selector parameters.
+
+Types retain project provenance naming the Mach-O ObjC2 class-list or
+metaclass record, its class-list index, metadata address, and instance size
+when known. Reimporting identical definitions is a no-op. A same-name type
+with different content or provenance is reported as a conflict and left
+untouched. The import reports records skipped because their layouts or
+addresses are not proven. It does not infer superclass storage, property
+backing ivars, protocol conformance methods, category overrides, or a
+metaclass object layout. When an instance layout cannot be represented but
+parsed instance methods exist, the class declaration is retained as an
+incomplete aggregate with those methods.
