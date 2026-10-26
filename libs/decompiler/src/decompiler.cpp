@@ -5782,13 +5782,21 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             }
         }
         const auto valid_diamond_memory_phi = [&](const LiftedBlock &block) {
-            if (!block.memory_phi) return true;
             const auto &incoming = diamond_predecessors[block.id.value];
-            if (block.memory_phi->inputs.size() != incoming.size()) return false;
-            std::set<std::uint64_t> seen;
-            for (const auto &input : block.memory_phi->inputs)
-                if (!incoming.contains(input.predecessor.value) ||
-                    !seen.insert(input.predecessor.value).second) return false;
+            const auto valid_inputs = [&](const auto &phi) {
+                if (phi.inputs.size() != incoming.size()) return false;
+                std::set<std::uint64_t> seen;
+                for (const auto &input : phi.inputs)
+                    if (!incoming.contains(input.predecessor.value) ||
+                        !seen.insert(input.predecessor.value).second) return false;
+                return seen == incoming;
+            };
+            if (block.memory_phi && !valid_inputs(*block.memory_phi)) return false;
+            if (block.memory_partition_phis.size() > 4096) return false;
+            std::set<std::string> partitions;
+            for (const auto &phi : block.memory_partition_phis)
+                if (phi.partition.empty() || !partitions.insert(phi.partition).second ||
+                    !valid_inputs(phi)) return false;
             return true;
         };
         std::function<std::optional<LoopConditionalBody>(const LiftedBlock &,
