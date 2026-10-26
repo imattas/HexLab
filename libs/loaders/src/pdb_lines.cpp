@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <set>
 #include <string_view>
 
 namespace hexlab {
@@ -136,7 +137,8 @@ Result<std::size_t> attach_pdb_locals(LoadedImage &image, const types::PdbDataba
 
 Result<std::size_t> attach_pdb_inline_sites(LoadedImage &image, const types::PdbDatabase &pdb,
                                             const types::PdbLocalTable &locals,
-                                            const types::PdbSourceLineTable &lines) {
+                                            const types::PdbSourceLineTable &lines,
+                                            std::stop_token stop) {
     if (!image.image || !image.metadata.pe)
         return Error{ErrorCode::unsupported, "PDB inline sites require a loaded PE image"};
     std::size_t matches = 0;
@@ -155,25 +157,57 @@ Result<std::size_t> attach_pdb_inline_sites(LoadedImage &image, const types::Pdb
     for (const auto &file : lines.files)
         if (!files.emplace(Key{file.module_index, file.source_file_id}, &file).second)
             return Error{ErrorCode::malformed, "Ambiguous inline source-file identity during PE binding"};
+    std::set<std::uint32_t> wanted_inlinee_ids;
+    for (const auto &site : locals.inline_sites) wanted_inlinee_ids.insert(site.inlinee_id);
+    std::map<std::uint32_t, std::string> inlinee_names;
+    std::map<std::uint32_t, types::CodeViewIdKind> inlinee_kinds;
+    std::string id_stream_diagnostic;
+    if (!wanted_inlinee_ids.empty()) {
+        const std::vector<std::uint32_t> requested_ids(wanted_inlinee_ids.begin(), wanted_inlinee_ids.end());
+        auto ids = types::parse_pdb_ids(pdb, requested_ids, stop);
+        if (ids) {
+            for (const auto &id : ids.value().records) {
+                if (!wanted_inlinee_ids.contains(id.index)) continue;
+                inlinee_kinds.emplace(id.index, id.kind);
+                if (id.kind == types::CodeViewIdKind::function ||
+                    id.kind == types::CodeViewIdKind::member_function)
+                    inlinee_names.emplace(id.index, id.name);
+            }
+        } else if (ids.error().code == ErrorCode::canceled) {
+            return ids.error();
+        } else {
+            id_stream_diagnostic = "; IPI names unavailable: " + ids.error().message;
+        }
+    }
     const auto base = image.load_base.value_or(image.metadata.preferred_base);
     std::vector<PePdbInlineSite> output;
     std::size_t storage = 0;
     constexpr std::size_t max_storage = 128ull * 1024 * 1024;
     for (const auto &site : locals.inline_sites) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "PDB inline-site binding canceled"};
         PePdbInlineSite row;
         row.module_index = site.module_index; row.section = site.procedure_section;
         row.record_offset = site.record_offset; row.inlinee_id = site.inlinee_id;
         row.depth = site.depth; row.parent_record_offset = site.parent_record_offset;
         row.procedure_name = site.procedure_name; row.unsupported_opcode = site.unsupported_opcode;
+        if (const auto name = inlinee_names.find(site.inlinee_id); name != inlinee_names.end())
+            row.inlinee_name = name->second;
+        else if (const auto kind = inlinee_kinds.find(site.inlinee_id); kind != inlinee_kinds.end())
+            row.status = kind->second == types::CodeViewIdKind::unsupported ?
+                "inlinee IPI leaf unsupported" : "inlinee IPI ID is not LF_FUNC_ID or LF_MFUNC_ID";
+        else if (id_stream_diagnostic.empty()) row.status = "inlinee IPI ID missing from stream";
+        else row.status = "inlinee IPI name unresolved";
         row.annotation_offset = site.annotation_offset;
-        row.status = site.unsupported_opcode ? "unsupported annotation opcode " + std::to_string(*site.unsupported_opcode) +
-            " at byte " + std::to_string(site.annotation_offset) : "explicit-length ranges";
-        if (!site.unsupported_opcode && site.ranges.empty()) row.status = "no explicit-length ranges";
+        row.status += (row.status.empty() ? "" : "; ") + (site.unsupported_opcode ? "unsupported annotation opcode " + std::to_string(*site.unsupported_opcode) +
+            " at byte " + std::to_string(site.annotation_offset) : "explicit-length ranges");
+        if (!site.unsupported_opcode && site.ranges.empty()) row.status += "; no explicit-length ranges";
+        row.status += id_stream_diagnostic;
         const auto inlinee = inlinees.find({site.module_index, site.inlinee_id});
         if (inlinee == inlinees.end()) row.status += "; inlinee source identity unavailable";
         if (const auto signature = unsupported_signatures.find(site.module_index); signature != unsupported_signatures.end())
             row.status += "; unsupported InlineeLines signature " + std::to_string(signature->second);
         if (!site.unsupported_opcode) for (const auto &range : site.ranges) {
+            if (stop.stop_requested()) return Error{ErrorCode::canceled, "PDB inline-site binding canceled"};
             PePdbInlineRange attached;
             attached.size = range.size;
             const auto offset = std::uint64_t{site.procedure_offset} + range.code_offset;
@@ -198,7 +232,7 @@ Result<std::size_t> attach_pdb_inline_sites(LoadedImage &image, const types::Pdb
                 if (file != files.end() && line > 0 && line <= UINT32_MAX) {
                     attached.source_path = file->second->path;
                     attached.line = static_cast<std::uint32_t>(line);
-                } else row.status = "inline source file or line unavailable";
+                } else row.status += "; inline source file or line unavailable";
             }
             const auto bytes = sizeof(PePdbInlineRange) + attached.source_path.size();
             if (bytes > max_storage - storage)
@@ -206,7 +240,7 @@ Result<std::size_t> attach_pdb_inline_sites(LoadedImage &image, const types::Pdb
             storage += bytes;
             row.ranges.push_back(std::move(attached));
         }
-        const auto bytes = sizeof(PePdbInlineSite) + row.procedure_name.size() + row.status.size();
+        const auto bytes = sizeof(PePdbInlineSite) + row.procedure_name.size() + row.inlinee_name.size() + row.status.size();
         if (bytes > max_storage - storage || output.size() >= 250'000)
             return Error{ErrorCode::resource_limit, "PE inline-site output exceeds limit"};
         storage += bytes;
@@ -277,7 +311,8 @@ Result<bool> bind_local_pe_pdb(LoadedImage &image, const std::filesystem::path &
     }
     if (locals) {
         const types::PdbSourceLineTable no_lines;
-        auto attached = attach_pdb_inline_sites(image, database.value(), locals.value(), lines ? lines.value() : no_lines);
+        auto attached = attach_pdb_inline_sites(image, database.value(), locals.value(),
+                                                lines ? lines.value() : no_lines, stop);
         if (!attached && !partial_warning("inline site", attached.error())) return attached.error();
     }
     if (symbols) {

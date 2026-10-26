@@ -1391,9 +1391,10 @@ ReferenceProducerGraph riscv_reference_graph(std::uint64_t instruction, const Ri
     return graph;
 }
 
-template <class RegisterState, class Transfer>
+template <class RegisterState, class Transfer, class EdgeTransfer>
 void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_token stop,
-                                  RegisterReferenceFacts &result, Transfer &&transfer) {
+                                  RegisterReferenceFacts &result, Transfer &&transfer,
+                                  EdgeTransfer &&edge_transfer) {
     constexpr std::size_t max_propagation_blocks = 100000;
     constexpr std::size_t max_propagation_edges = 1000000;
     // Keep local facts useful when a very large or malformed CFG exceeds the
@@ -1408,6 +1409,7 @@ void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_
     std::map<BlockId, const BasicBlock *> blocks;
     std::map<BlockId, std::set<BlockId>> predecessors;
     std::map<BlockId, std::set<BlockId>> successors;
+    std::map<BlockId, std::vector<std::pair<BlockId, const BlockSuccessor *>>> predecessor_edges;
     std::set<BlockId> entries;
     std::map<BlockId, std::set<FunctionId>> owners;
     std::map<FunctionId, bool> complete_functions;
@@ -1437,6 +1439,7 @@ void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_
                 }
                 predecessors[*successor.block].insert(id);
                 successors[id].insert(*successor.block);
+                predecessor_edges[*successor.block].push_back({id, &successor});
             }
     }
     for (const auto &function : functions.functions) {
@@ -1470,21 +1473,22 @@ void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_
         if (!entries.contains(id) && found_predecessors != predecessors.end() &&
             !found_predecessors->second.empty()) {
             bool first = true;
-            for (const auto predecessor : found_predecessors->second) {
+            for (const auto &[predecessor, edge] : predecessor_edges[id]) {
                 const auto state = outputs.find(predecessor);
                 if (state == outputs.end()) {
                     incoming.clear();
                     first = false;
                     break;
                 }
+                auto edge_state = edge_transfer(*blocks.at(predecessor), *edge, state->second);
                 if (first) {
-                    incoming = state->second;
+                    incoming = std::move(edge_state);
                     first = false;
                     continue;
                 }
                 for (auto value = incoming.begin(); value != incoming.end();) {
-                    const auto matching = state->second.find(value->first);
-                    if (matching == state->second.end() ||
+                    const auto matching = edge_state.find(value->first);
+                    if (matching == edge_state.end() ||
                         !merge_register_value(value->second, matching->second))
                         value = incoming.erase(value);
                     else
@@ -1560,15 +1564,15 @@ void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_
             RegisterState incoming;
             bool first = true;
             bool entry_path = entries.contains(id);
-            const auto pred = predecessors.find(id);
-            if (pred != predecessors.end()) for (const auto source : pred->second) {
+            for (const auto &[source, edge] : predecessor_edges[id]) {
                 if (cyclic.contains(source)) continue;
                 const auto state = outputs.find(source);
                 if (state == outputs.end()) { safe = false; break; }
-                if (first) { incoming = state->second; first = false; }
+                auto edge_state = edge_transfer(*blocks.at(source), *edge, state->second);
+                if (first) { incoming = std::move(edge_state); first = false; }
                 else for (auto it = incoming.begin(); it != incoming.end();) {
-                    const auto match = state->second.find(it->first);
-                    if (match == state->second.end() || !merge_register_value(it->second, match->second))
+                    const auto match = edge_state.find(it->first);
+                    if (match == edge_state.end() || !merge_register_value(it->second, match->second))
                         it = incoming.erase(it);
                     else ++it;
                 }
@@ -1591,16 +1595,16 @@ void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_
                 RegisterState incoming;
                 bool first = true;
                 bool has_entry_path = entries.contains(id);
-                const auto pred = predecessors.find(id);
-                if (pred != predecessors.end()) for (const auto source : pred->second) {
+                for (const auto &[source, edge] : predecessor_edges[id]) {
                     const RegisterState *state = nullptr;
                     if (cyclic.contains(source)) state = &states.at(source);
                     else if (outputs.contains(source)) state = &outputs.at(source);
                     if (!state) { safe = false; break; }
-                    if (first) { incoming = *state; first = false; }
+                    auto edge_state = edge_transfer(*blocks.at(source), *edge, *state);
+                    if (first) { incoming = std::move(edge_state); first = false; }
                     else for (auto it = incoming.begin(); it != incoming.end();) {
-                        auto match = state->find(it->first);
-                        if (match == state->end() || !merge_register_value(it->second, match->second))
+                        auto match = edge_state.find(it->first);
+                        if (match == edge_state.end() || !merge_register_value(it->second, match->second))
                             it = incoming.erase(it);
                         else ++it;
                     }
@@ -1633,6 +1637,15 @@ void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_
             reference_detail::canceled(stop);
             (void)transfer(*block, RegisterState{});
         }
+}
+
+template <class RegisterState, class Transfer>
+void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_token stop,
+                                  RegisterReferenceFacts &result, Transfer &&transfer) {
+    propagate_cfg_register_values<RegisterState>(functions, stop, result, transfer,
+        [](const BasicBlock &, const BlockSuccessor &, RegisterState incoming) {
+            return incoming;
+        });
 }
 using ProducerRegisterKey = std::tuple<RegisterBank, std::uint8_t, std::uint32_t>;
 using ProducerRegisterState = std::map<ProducerRegisterKey, std::vector<std::uint64_t>>;
@@ -2891,6 +2904,61 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
     constexpr std::array<std::pair<std::uint8_t, std::uint32_t>, 4> arm_flag_facts{{
         {std::uint8_t{8}, negative_fact_register}, {std::uint8_t{4}, zero_fact_register},
         {std::uint8_t{2}, carry_fact_register}, {std::uint8_t{1}, overflow_fact_register}}};
+    const auto arm_flag_value = [&](const RegisterState &state, ExecutionMode mode, Address at,
+                                    std::uint8_t mask) -> std::optional<bool> {
+        const auto fact_key = std::find_if(arm_flag_facts.begin(), arm_flag_facts.end(),
+            [&](const auto &entry) { return entry.first == mask; });
+        if (fact_key == arm_flag_facts.end()) return {};
+        const auto found = state.find({mode, fact_key->second});
+        if (found == state.end() || found->second.space != at.space || found->second.offset > 1)
+            return {};
+        return found->second.offset != 0;
+    };
+    const auto arm_condition_from_flags = [](std::uint8_t condition, const Arm32Nzcv &flags)
+        -> std::optional<bool> {
+        switch (condition) {
+        case 0: return flags.z;                          // EQ
+        case 1: return !flags.z;                         // NE
+        case 2: return flags.c;                          // CS/HS
+        case 3: return !flags.c;                         // CC/LO
+        case 4: return flags.n;                          // MI
+        case 5: return !flags.n;                         // PL
+        case 6: return flags.v;                          // VS
+        case 7: return !flags.v;                         // VC
+        case 8: return flags.c && !flags.z;              // HI
+        case 9: return !flags.c || flags.z;              // LS
+        case 10: return flags.n == flags.v;              // GE
+        case 11: return flags.n != flags.v;              // LT
+        case 12: return !flags.z && flags.n == flags.v;  // GT
+        case 13: return flags.z || flags.n != flags.v;   // LE
+        default: return {};
+        }
+    };
+    const auto arm_condition_value = [&](const Instruction &instruction, const RegisterState &state)
+        -> std::optional<bool> {
+        if (!instruction.arm || instruction.arm->predicate != ArmPredicate::condition ||
+            instruction.condition >= 14)
+            return {};
+        const std::array<std::optional<bool>, 4> known{
+            arm_flag_value(state, instruction.context.mode, instruction.address, 8),
+            arm_flag_value(state, instruction.context.mode, instruction.address, 4),
+            arm_flag_value(state, instruction.context.mode, instruction.address, 2),
+            arm_flag_value(state, instruction.context.mode, instruction.address, 1)};
+        std::optional<bool> outcome;
+        for (unsigned candidate = 0; candidate < 16; ++candidate) {
+            const Arm32Nzcv flags{(candidate & 8) != 0, (candidate & 4) != 0,
+                                  (candidate & 2) != 0, (candidate & 1) != 0};
+            const std::array<bool, 4> values{flags.n, flags.z, flags.c, flags.v};
+            bool compatible = true;
+            for (std::size_t bit = 0; bit < known.size(); ++bit)
+                if (known[bit] && *known[bit] != values[bit]) { compatible = false; break; }
+            if (!compatible) continue;
+            const auto candidate_outcome = arm_condition_from_flags(instruction.condition, flags);
+            if (!candidate_outcome || (outcome && *outcome != *candidate_outcome)) return {};
+            outcome = candidate_outcome;
+        }
+        return outcome;
+    };
     const auto process_block = [&](const BasicBlock &block, RegisterState registers) {
         for (const auto &fact : block.instructions) {
             reference_detail::canceled(stop);
@@ -2919,41 +2987,15 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     return {};
                 return found->second.offset != 0;
             };
-            const auto current_flag = [&](std::uint8_t mask) -> std::optional<bool> {
-                const auto fact_key = std::find_if(arm_flag_facts.begin(), arm_flag_facts.end(),
-                    [&](const auto &entry) { return entry.first == mask; });
-                if (fact_key == arm_flag_facts.end()) return {};
-                const auto found = registers.find({mode, fact_key->second});
-                if (found == registers.end() || found->second.space != instruction.address.space ||
-                    found->second.offset > 1)
-                    return {};
-                return found->second.offset != 0;
+            const auto current_flag = [&](std::uint8_t mask) {
+                return arm_flag_value(registers, mode, instruction.address, mask);
             };
             std::optional<bool> predicate_executes;
             if (instruction.arm) {
                 if (instruction.arm->predicate == ArmPredicate::always) {
                     predicate_executes = true;
-                } else if (instruction.arm->predicate == ArmPredicate::condition) {
-                    const auto n = current_flag(8), z = current_flag(4);
-                    const auto c = current_flag(2), v = current_flag(1);
-                    switch (instruction.condition) {
-                    case 0: if (z) predicate_executes = *z; break;       // EQ
-                    case 1: if (z) predicate_executes = !*z; break;      // NE
-                    case 2: if (c) predicate_executes = *c; break;       // CS/HS
-                    case 3: if (c) predicate_executes = !*c; break;      // CC/LO
-                    case 4: if (n) predicate_executes = *n; break;       // MI
-                    case 5: if (n) predicate_executes = !*n; break;      // PL
-                    case 6: if (v) predicate_executes = *v; break;       // VS
-                    case 7: if (v) predicate_executes = !*v; break;      // VC
-                    case 8: if (c && z) predicate_executes = *c && !*z; break; // HI
-                    case 9: if (c && z) predicate_executes = !*c || *z; break; // LS
-                    case 10: if (n && v) predicate_executes = *n == *v; break; // GE
-                    case 11: if (n && v) predicate_executes = *n != *v; break; // LT
-                    case 12: if (n && z && v) predicate_executes = !*z && *n == *v; break; // GT
-                    case 13: if (n && z && v) predicate_executes = *z || *n != *v; break; // LE
-                    default: break;
-                    }
-                }
+                } else if (instruction.arm->predicate == ArmPredicate::condition)
+                    predicate_executes = arm_condition_value(instruction, registers);
             }
             // A known-false predicated instruction has no architectural effects.
             // Preserve all facts through it; unknown predicates retain the
@@ -3320,7 +3362,61 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
         }
         return registers;
     };
-    propagate_cfg_register_values<RegisterState>(functions, stop, result, process_block);
+    const auto refine_arm_edge = [&](const BasicBlock &block, const BlockSuccessor &edge,
+                                     RegisterState incoming) {
+        if (edge.kind != BlockEdgeKind::conditional_true &&
+            edge.kind != BlockEdgeKind::conditional_false)
+            return incoming;
+        const Instruction *branch = nullptr;
+        for (const auto &fact : block.instructions)
+            if (fact && fact->instruction.address == edge.source) {
+                branch = &fact->instruction;
+                break;
+            }
+        if (!branch || !branch->arm || branch->arm->predicate != ArmPredicate::condition ||
+            branch->condition >= 14)
+            return incoming;
+
+        const std::array<std::uint8_t, 4> masks{8, 4, 2, 1};
+        std::array<std::optional<bool>, 4> known{};
+        for (std::size_t i = 0; i < masks.size(); ++i)
+            known[i] = arm_flag_value(incoming, branch->context.mode, branch->address, masks[i]);
+
+        std::array<bool, 4> first_values{};
+        std::array<bool, 4> invariant{true, true, true, true};
+        bool found_path = false;
+        for (unsigned candidate = 0; candidate < 16; ++candidate) {
+            const Arm32Nzcv flags{(candidate & 8) != 0, (candidate & 4) != 0,
+                                  (candidate & 2) != 0, (candidate & 1) != 0};
+            const std::array<bool, 4> values{flags.n, flags.z, flags.c, flags.v};
+            bool compatible = true;
+            for (std::size_t i = 0; i < known.size(); ++i)
+                if (known[i] && *known[i] != values[i]) { compatible = false; break; }
+            if (!compatible) continue;
+            const auto taken = arm_condition_from_flags(branch->condition, flags);
+            if (!taken || *taken != (edge.kind == BlockEdgeKind::conditional_true)) continue;
+            if (!found_path) {
+                first_values = values;
+                found_path = true;
+            } else {
+                for (std::size_t i = 0; i < invariant.size(); ++i)
+                    if (first_values[i] != values[i]) invariant[i] = false;
+            }
+        }
+        // An impossible or unsupported edge is left untouched; only refine
+        // when at least one consistent NZCV assignment reaches it.
+        if (!found_path) return incoming;
+        for (std::size_t i = 0; i < masks.size(); ++i) {
+            if (!invariant[i]) continue;
+            const auto fact = std::find_if(arm_flag_facts.begin(), arm_flag_facts.end(),
+                [&](const auto &entry) { return entry.first == masks[i]; });
+            if (fact != arm_flag_facts.end())
+                incoming[{branch->context.mode, fact->second}] =
+                    Address{branch->address.space, first_values[i] ? 1u : 0u};
+        }
+        return incoming;
+    };
+    propagate_cfg_register_values<RegisterState>(functions, stop, result, process_block, refine_arm_edge);
     return result;
 }
 }

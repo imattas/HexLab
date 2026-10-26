@@ -497,8 +497,9 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
                 static_cast<unsigned long long>(range->section_offset)) : wxString("unavailable");
         case 1: return range ? wxString::Format("%u", range->size) : wxString{};
         case 2: return range && range->line ? text(range->source_path) + wxString::Format(":%u", range->line) : wxString("unavailable");
-        case 3: return wxString::Format("0x%X", site.inlinee_id);
-        case 4: return wxString::Format("module %u, site 0x%X, depth %u", site.module_index, site.record_offset, site.depth) +
+        case 3: return site.inlinee_name.empty() ? wxString::Format("0x%X", site.inlinee_id) : text(site.inlinee_name);
+        case 4: return (site.inlinee_name.empty() ? wxString::Format("IPI 0x%X", site.inlinee_id) : text(site.inlinee_name)) + ": " +
+            wxString::Format("module %u, site 0x%X, depth %u", site.module_index, site.record_offset, site.depth) +
             (site.parent_record_offset ? wxString::Format(", parent 0x%X", *site.parent_record_offset) : wxString{}) + " / " + text(site.procedure_name);
         default: return text(site.status);
         }

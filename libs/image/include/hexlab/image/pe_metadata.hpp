@@ -646,7 +646,7 @@ struct PePdbInlineSite {
     std::optional<std::uint32_t> parent_record_offset;
     std::optional<std::uint32_t> unsupported_opcode;
     std::uint32_t annotation_offset = 0;
-    std::string procedure_name, status;
+    std::string procedure_name, inlinee_name, status;
     std::vector<PePdbInlineRange> ranges;
     bool operator==(const PePdbInlineSite &) const = default;
 };

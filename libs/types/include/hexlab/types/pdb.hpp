@@ -303,6 +303,12 @@ HEXLAB_TYPES_EXPORT Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &dat
 // Other ID leaves retain their leaf ID and original record byte extent.
 HEXLAB_TYPES_EXPORT Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database,
                                                      std::stop_token stop = {});
+// Parses and validates the whole IPI stream while retaining only the sorted,
+// unique requested indices. The returned stream's index bounds still describe
+// the full stream; records contains only matching indices.
+HEXLAB_TYPES_EXPORT Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database,
+                                                     std::span<const std::uint32_t> requested_indices,
+                                                     std::stop_token stop = {});
 // Resolve LF_TYPESERVER2 through a caller supplied bounded resolver. Each returned TPI remains a separate index namespace; exact GUID+age is required. Nested server chains are followed with cycle and count bounds.
 HEXLAB_TYPES_EXPORT Result<PdbTypeServerSet> resolve_pdb_type_servers(const PdbDatabase &, const PdbTypeServerResolver &, std::size_t max_servers = 64, std::stop_token stop = {});
 // Parse and resolve the bounded DBI Type Server Map. Namespace selectors are

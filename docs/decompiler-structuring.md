@@ -109,16 +109,18 @@ arm blocks, and ambiguous joins retain the state-machine or goto fallback.
 
 A pre-tested parent loop accepts a bounded conditional decision tree whose
 leaves follow disjoint, phi-free unconditional chains back to the loop header.
-The tree may contain up to eight latch tails and four nested branch levels.
-The header must have exactly the preheader and every latch tail as CFG
-predecessors, and every header phi must contain exactly one input for each
-predecessor. Each leaf emits its own simultaneous edge copies and `continue`,
-so the header condition is reevaluated after every latch. Branches and chains
-must have exact recorded edges and unique predecessors; shared latches,
-overlapping paths, extra header predecessors, or larger/deeper trees use the
-state-machine or explicit label/goto path. Parent and child diamonds use the
-same bounded validation: at most 1,024 blocks and 4,096 edges, unique block IDs
-and addresses, resolved edges matching recorded block IDs, and complete
+The number of latch leaves is derived from the validated CFG rather than a
+separate leaf-count threshold: every distinct leaf tail must be an exact
+predecessor of the header, and the header predecessor set must equal the
+preheader plus all of those tails. Every header phi must contain exactly one
+input for each predecessor. Each leaf emits its own simultaneous edge copies
+and `continue`, so the header condition is reevaluated after every latch.
+Branches and chains must have exact recorded edges and unique predecessors;
+shared latches, overlapping paths, extra header predecessors, and malformed
+phis use the state-machine or explicit label/goto path. Parent and child
+diamonds use the same bounded validation: at most 1,024 blocks and 4,096
+edges, unique block IDs and addresses, resolved edges matching recorded block
+IDs, a 32-level nested-child depth budget, and complete
 whole-memory and partition-memory phi predecessor inputs on the consumed
 region. The prepass rejects loop-diamond structuring for functions with more
 than 65,536 combined whole-memory and partition-memory phi inputs, and each
