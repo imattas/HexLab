@@ -76,9 +76,27 @@ struct JvmRecordComponent {
     std::optional<std::string> signature;
     bool operator==(const JvmRecordComponent &) const = default;
 };
+// Optional class-path facts supplied by a linker or project loader. Names alone
+// are not JVM type identities: defining loader identity is part of every node
+// and edge. Missing nodes/edges remain unresolved rather than guessed.
+struct JvmTypeIdentity {
+    std::string class_name, defining_loader;
+    bool operator==(const JvmTypeIdentity &) const = default;
+};
+struct JvmHierarchyClass {
+    JvmTypeIdentity identity;
+    std::optional<JvmTypeIdentity> superclass;
+    std::vector<JvmTypeIdentity> interfaces;
+    bool complete = false;
+    bool operator==(const JvmHierarchyClass &) const = default;
+};
 struct JvmMetadata {
     std::uint16_t minor_version = 0, major_version = 0, access_flags = 0, this_class = 0, super_class = 0;
     std::string class_name, super_name;
+    // Empty identity means the defining loader is unknown. In that state only
+    // same-class-name proofs are possible; hierarchy traversal is disabled.
+    std::string defining_loader;
+    std::vector<JvmHierarchyClass> known_hierarchy;
     std::vector<JvmConstant> constant_pool; // JVM's one-based indices; unusable slots are tag 0.
     std::vector<std::string> interfaces;
     std::vector<JvmRecordComponent> record_components;

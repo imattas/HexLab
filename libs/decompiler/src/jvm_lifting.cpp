@@ -2,12 +2,14 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <set>
 
 namespace hexlab::decompiler {
 namespace {
@@ -139,6 +141,7 @@ struct ReferenceIdentity {
     JvmVerificationKind kind = JvmVerificationKind::object;
     std::string descriptor;
     std::uint32_t allocation_offset = 0;
+    std::string defining_loader;
     bool operator==(const ReferenceIdentity &) const = default;
 };
 using Reference = std::optional<ReferenceIdentity>;
@@ -157,6 +160,134 @@ Reference reference_descriptor(std::string_view descriptor) {
 Reference reference_class(std::string_view name) {
     if (name.empty()) return {};
     return reference_descriptor(name.front() == '[' ? std::string(name) : "L" + std::string(name) + ";");
+}
+using TypeId = JvmTypeIdentity;
+using TypeKey = std::pair<std::string, std::string>;
+TypeKey type_key(const TypeId &id) { return {id.defining_loader, id.class_name}; }
+constexpr std::size_t max_hierarchy_nodes = 16'384;
+constexpr std::size_t max_hierarchy_edges = 65'536;
+constexpr std::size_t max_walk_nodes = 16'384;
+constexpr std::size_t max_walk_edges = 65'536;
+constexpr std::size_t max_query_nodes = 65'536;
+constexpr std::size_t max_query_edges = 262'144;
+constexpr std::size_t max_common_candidates = 256;
+struct HierarchyWork { std::size_t nodes = 0, edges = 0; };
+struct HierarchyIndex {
+    JvmHierarchyClass self;
+    std::map<TypeKey, JvmHierarchyClass> nodes;
+};
+std::optional<HierarchyIndex> index_hierarchy(const JvmMetadata &md) {
+    if (md.defining_loader.empty() || md.class_name.empty() || md.known_hierarchy.size() > max_hierarchy_nodes) return {};
+    HierarchyIndex index;
+    index.self.identity = {md.class_name, md.defining_loader};
+    index.self.complete = true;
+    if (!md.super_name.empty()) index.self.superclass = TypeId{md.super_name, md.defining_loader};
+    for (const auto &name : md.interfaces) index.self.interfaces.push_back({name, md.defining_loader});
+    std::size_t edges = 0;
+    bool supplied_self = false;
+    for (const auto &node : md.known_hierarchy) {
+        if (node.identity.class_name.empty() || node.identity.defining_loader.empty() ||
+            node.interfaces.size() > max_hierarchy_edges - std::min(edges, max_hierarchy_edges)) return {};
+        edges += node.interfaces.size() + (node.superclass ? 1u : 0u);
+        if (edges > max_hierarchy_edges) return {};
+        const auto valid_edge = [](const TypeId &edge) { return !edge.class_name.empty() && !edge.defining_loader.empty(); };
+        if ((node.superclass && !valid_edge(*node.superclass)) ||
+            !std::all_of(node.interfaces.begin(), node.interfaces.end(), valid_edge)) return {};
+        if (node.identity == index.self.identity) {
+            // The analyzed class may appear once in the supplied graph only
+            // when its complete direct edges exactly match the classfile.
+            if (supplied_self || !node.complete || node.superclass != index.self.superclass ||
+                node.interfaces != index.self.interfaces) return {};
+            supplied_self = true;
+            continue;
+        }
+        if (!index.nodes.emplace(type_key(node.identity), node).second) return {};
+    }
+    index.nodes.emplace(type_key(index.self.identity), index.self);
+    return index;
+}
+std::optional<std::vector<TypeId>> complete_ancestors(const HierarchyIndex &index, const TypeId &start, HierarchyWork &work) {
+    if (start.defining_loader.empty() || start.class_name.empty()) return {};
+    struct Frame { const JvmHierarchyClass *node; std::size_t next_edge; };
+    std::vector<TypeId> result;
+    std::vector<Frame> stack;
+    std::map<TypeKey, unsigned char> colors;
+    std::size_t visited_nodes = 0, visited_edges = 0;
+    const auto push = [&](const TypeId &id) -> bool {
+        if (++visited_nodes > max_walk_nodes || ++work.nodes > max_query_nodes) return false;
+        const auto found = index.nodes.find(type_key(id));
+        if (found == index.nodes.end() || !found->second.complete) return false;
+        const auto key = type_key(id);
+        const auto color = colors.find(key);
+        if (color != colors.end()) return color->second == 2; // gray is a cycle; black is a DAG convergence
+        colors.emplace(key, 1);
+        result.push_back(id);
+        stack.push_back({&found->second, 0});
+        return true;
+    };
+    if (!push(start)) return {};
+    while (!stack.empty()) {
+        auto &frame = stack.back();
+        const auto edge_count = frame.node->interfaces.size() + (frame.node->superclass ? 1u : 0u);
+        if (frame.next_edge == edge_count) {
+            colors[type_key(frame.node->identity)] = 2;
+            stack.pop_back();
+            continue;
+        }
+        if (++visited_edges > max_walk_edges || ++work.edges > max_query_edges) return {};
+        const TypeId &edge = frame.node->superclass && frame.next_edge == 0
+            ? *frame.node->superclass
+            : frame.node->interfaces[frame.next_edge++ - (frame.node->superclass ? 1u : 0u)];
+        if (frame.node->superclass && frame.next_edge == 0) ++frame.next_edge;
+        const auto color = colors.find(type_key(edge));
+        if (color != colors.end()) {
+            if (color->second == 1) return {};
+            continue;
+        }
+        if (!push(edge)) return {};
+    }
+    return result;
+}
+Reference hierarchy_join(const HierarchyIndex &index, HierarchyWork &work, const ReferenceIdentity &left, const ReferenceIdentity &right) {
+    const auto to_id = [](const ReferenceIdentity &value) -> std::optional<TypeId> {
+        if (value.descriptor.size() < 3 || value.descriptor.front() != 'L' || value.descriptor.back() != ';' ||
+            value.defining_loader.empty()) return {};
+        return TypeId{value.descriptor.substr(1, value.descriptor.size() - 2), value.defining_loader};
+    };
+    auto a = to_id(left), b = to_id(right);
+    if (!a || !b || a->defining_loader != b->defining_loader) return {};
+    auto aa = complete_ancestors(index, *a, work), bb = complete_ancestors(index, *b, work);
+    if (!aa || !bb) return {};
+    std::vector<TypeId> common;
+    std::set<TypeKey> right_ancestors;
+    for (const auto &x : *bb) right_ancestors.insert(type_key(x));
+    for (const auto &x : *aa) if (right_ancestors.contains(type_key(x))) common.push_back(x);
+    if (common.empty() || common.size() > max_common_candidates) return {};
+    std::vector<TypeId> minimal;
+    std::size_t comparisons = 0;
+    for (const auto &candidate : common) {
+        bool has_more_specific = false;
+        for (const auto &other : common) if (other != candidate) {
+            if (++comparisons > max_walk_edges) return {};
+            auto ancestors = complete_ancestors(index, other, work);
+            if (!ancestors) return {};
+            if (std::any_of(ancestors->begin(), ancestors->end(), [&](const auto &ancestor) {
+                return type_key(ancestor) == type_key(candidate);
+            })) has_more_specific = true;
+        }
+        if (!has_more_specific) minimal.push_back(candidate);
+    }
+    if (minimal.size() != 1) return {};
+    auto joined = reference_class(minimal.front().class_name);
+    if (joined) joined->defining_loader = minimal.front().defining_loader;
+    return joined;
+}
+bool hierarchy_assignable(const HierarchyIndex &index, HierarchyWork &work, const ReferenceIdentity &actual, const ReferenceIdentity &expected) {
+    if (actual == expected) return true;
+    auto ancestors = complete_ancestors(index, TypeId{actual.descriptor.size() > 2 ? actual.descriptor.substr(1, actual.descriptor.size()-2) : "", actual.defining_loader}, work);
+    if (!ancestors || expected.defining_loader.empty() || expected.descriptor.size() < 3 || expected.descriptor.front() != 'L' || expected.descriptor.back() != ';') return false;
+    const TypeId target{expected.descriptor.substr(1, expected.descriptor.size()-2), expected.defining_loader};
+    return std::find(ancestors->begin(), ancestors->end(), target) != ancestors->end();
 }
 Reference method_reference_result(std::string_view descriptor) {
     const auto end = descriptor.find(')');
@@ -187,6 +318,10 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
     for(const auto &b:snapshot.blocks){if(!b)return Error{ErrorCode::invalid_argument,"JVM snapshot has a null basic block"};if(!blocks.emplace(b->id.value,b).second)return Error{ErrorCode::invalid_argument,"JVM snapshot has duplicate basic-block IDs"};}
     const auto count = function.blocks.size();
     if (!count) return no("function has no basic blocks");
+    // Build one bounded immutable graph index per lifted method. The subsequent
+    // dataflow worklist may revisit joins many times, so it must not rebuild it.
+    const auto hierarchy = metadata ? index_hierarchy(*metadata) : std::optional<HierarchyIndex>{};
+    HierarchyWork hierarchy_work;
     std::map<std::uint64_t, std::size_t> block_positions;
     std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> address_positions;
     std::vector<const BasicBlock *> sources(count);
@@ -293,6 +428,8 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             return found == identities.end() ? Reference{} : found->second;
         };
         const auto evidence = [&](ExpressionPtr value, Reference reference) {
+            if (reference && reference->defining_loader.empty() && metadata)
+                reference->defining_loader = metadata->defining_loader;
             if (references && value->type == ref32()) identities[value] = std::move(reference);
             return value;
         };
@@ -758,10 +895,11 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         if (!metadata || !method || !code) return {};
         switch (type.kind) {
         case JvmVerificationKind::null_value:
-            return ReferenceIdentity{type.kind, {}, 0};
+            return ReferenceIdentity{type.kind, {}, 0, metadata->defining_loader};
         case JvmVerificationKind::uninitialized_this: {
             auto value = reference_class(metadata->class_name);
             if (value) value->kind = type.kind;
+            if (value) value->defining_loader = metadata->defining_loader;
             return value;
         }
         case JvmVerificationKind::object: {
@@ -779,6 +917,7 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 if (!descriptor || (value && value != descriptor)) return {};
                 value = std::move(descriptor);
             }
+            if (value) value->defining_loader = metadata->defining_loader;
             return value;
         }
         case JvmVerificationKind::uninitialized: {
@@ -791,7 +930,7 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             const auto name = cp_class_name(*metadata, *index);
             if (!name || name.value().starts_with("[")) return {};
             auto value = reference_class(name.value());
-            if (value) { value->kind = type.kind; value->allocation_offset = type.uninitialized_offset; }
+            if (value) { value->kind = type.kind; value->allocation_offset = type.uninitialized_offset; value->defining_loader = metadata->defining_loader; }
             return value;
         }
         default: return {};
@@ -816,16 +955,8 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         if (!left_name || !right_name) return {};
         // Every catch clause (including catch-all) receives a Throwable.
         // For named catches this relies on the classfile's catch-type contract.
-        if (*left_name == "java/lang/Throwable" || *right_name == "java/lang/Throwable")
-            return reference_class("java/lang/Throwable");
-        if (!metadata) return {};
-        const auto current = metadata->class_name;
-        const auto parent = metadata->super_name;
-        if (*left_name == current && *right_name == parent)
-            return reference_class(*right_name);
-        if (*right_name == current && *left_name == parent)
-            return reference_class(*left_name);
-        return {};
+        if (!hierarchy) return {};
+        return hierarchy_join(*hierarchy, hierarchy_work, *left, *right);
     };
     std::map<std::pair<std::uint32_t, std::uint64_t>, HandlerCatchEvidence> handler_catch_evidence;
     if (code && metadata) for (const auto &handler : code->exception_table) {
@@ -840,6 +971,7 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 return no("exception handler has an invalid catch class");
             caught = reference_class(name.value());
         }
+        if (caught) caught->defining_loader = metadata->defining_loader;
         auto &evidence = handler_catch_evidence[{target_address.space.value, target_address.offset}];
         if (!evidence.seen) {
             evidence.seen = true;
@@ -907,10 +1039,16 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         auto merged = *reference_entries[target];
         if (merged.stack.size() != incoming.stack.size())
             return no("reference evidence disagrees with stack shape");
-        for (std::size_t slot = 0; slot < merged.locals.size(); ++slot)
-            if (merged.locals[slot] != incoming.locals[slot]) merged.locals[slot].reset();
-        for (std::size_t slot = 0; slot < merged.stack.size(); ++slot)
-            if (merged.stack[slot] != incoming.stack[slot]) merged.stack[slot].reset();
+        const auto join = [&](Reference &a, const Reference &b) {
+            if (a == b) return;
+            if (hierarchy && a && b && a->kind == JvmVerificationKind::object && b->kind == JvmVerificationKind::object) {
+                auto widened = hierarchy_join(*hierarchy, hierarchy_work, *a, *b);
+                if (widened) { a = std::move(widened); return; }
+            }
+            a.reset();
+        };
+        for (std::size_t slot = 0; slot < merged.locals.size(); ++slot) join(merged.locals[slot], incoming.locals[slot]);
+        for (std::size_t slot = 0; slot < merged.stack.size(); ++slot) join(merged.stack[slot], incoming.stack[slot]);
         if (merged == *reference_entries[target]) return false;
         reference_entries[target] = std::move(merged);
         work.push_back(target);
@@ -926,13 +1064,15 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             // facts, so a later aload cannot resurrect a discarded identity.
             for (std::size_t slot = 0; slot < state.stack.size(); ++slot) {
                 if (slot >= frame->stack.size() ||
-                    state.stack[slot] != verifier_reference(frame->stack[slot])) state.stack[slot].reset();
+                    (!hierarchy || !state.stack[slot] || !verifier_reference(frame->stack[slot]) ||
+                     !hierarchy_assignable(*hierarchy, hierarchy_work, *state.stack[slot], *verifier_reference(frame->stack[slot])))) state.stack[slot].reset();
             }
             std::array<Reference, 256> constrained{};
             std::size_t slot = 0;
             for (const auto &local : frame->locals) {
                 const auto expected = verifier_reference(local);
-                if (slot < constrained.size() && expected && state.locals[slot] == expected)
+                if (slot < constrained.size() && expected && state.locals[slot] && hierarchy &&
+                    hierarchy_assignable(*hierarchy, hierarchy_work, *state.locals[slot], *expected))
                     constrained[slot] = state.locals[slot];
                 slot += local.kind == JvmVerificationKind::long_value || local.kind == JvmVerificationKind::double_value ? 2u : 1u;
             }
@@ -998,7 +1138,8 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             stack_slots += type->bits == 64 ? 2u : 1u;
             if (*type == ref32()) {
                 const auto expected = verifier_reference(frame->stack[slot]);
-                if (!expected || !state.stack[slot] || expected != state.stack[slot])
+                if (!expected || !state.stack[slot] || !hierarchy ||
+                    !hierarchy_assignable(*hierarchy, hierarchy_work, *state.stack[slot], *expected))
                     return no("reference stack join/backedge has unknown or unequal verifier identities");
             }
         }
@@ -1009,8 +1150,8 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             const auto type = verifier_value_type(local.kind);
             if (type && *type == ref32()) {
                 const auto expected = verifier_reference(local);
-                if (local_slot >= state.locals.size() || !expected || !state.locals[local_slot] ||
-                    expected != state.locals[local_slot])
+                if (local_slot >= state.locals.size() || !expected || !state.locals[local_slot] || !hierarchy ||
+                    !hierarchy_assignable(*hierarchy, hierarchy_work, *state.locals[local_slot], *expected))
                     return no("reference stack join/backedge has unproved verifier local identities");
             } else if (local.kind != JvmVerificationKind::top && local_slot < state.locals.size() && state.locals[local_slot])
                 return no("StackMapTable primitive local conflicts with reference evidence");

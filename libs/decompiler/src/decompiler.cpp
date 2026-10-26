@@ -6646,6 +6646,11 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<LoopSwitchArm> arms;
             const LiftedBlock *continuation = nullptr;
         };
+        // Keep recursive discovery and emission shallow enough for native
+        // stacks while allowing substantially deeper bodies than the former
+        // eight-level cutoff. The enclosing diamond CFG is also bounded to
+        // 1,024 blocks, and recursive children must claim distinct blocks.
+        constexpr unsigned max_loop_child_depth = 32;
         std::map<std::uint64_t, NestedLoopBody> nested_loop_bodies;
         std::map<std::uint64_t, LoopConditionalBody> conditional_loop_bodies;
         std::set<std::uint64_t> conditional_phi_joins;
@@ -6718,7 +6723,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             const auto *test = terminal_conditional(branch);
             // Each caller separately proves any register phis on this branch
             // were lowered by the preceding region.
-            if (!diamond_cfg_valid || !test || depth > 8) return std::nullopt;
+            if (!diamond_cfg_valid || !test || depth > max_loop_child_depth) return std::nullopt;
             if (contains_return(branch) || branch.switch_dispatch ||
                 !has_only_simple_statements(branch) || !valid_diamond_memory_phi(branch))
                 return std::nullopt;
@@ -6748,10 +6753,10 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             region.branch = &branch;
             region.yes = trace(*test->true_target);
             region.no = trace(*test->false_target);
-            // Permit a small recursive tree of conditional arms. The
-            // recursive analyzer still validates every three-way join and
-            // every edge-specific phi before the region can be emitted.
-            if (allow_nested_arm && depth < 8) {
+            // Permit a bounded recursive tree of conditional arms. The
+            // analyzer validates every three-way join and edge-specific phi
+            // before emission; max_loop_child_depth bounds native recursion.
+            if (allow_nested_arm && depth < max_loop_child_depth) {
                 const auto attach_nested_arm = [&](bool nested_on_true) {
                     const auto &nested_path = nested_on_true ? region.yes : region.no;
                     const auto &sibling_path = nested_on_true ? region.no : region.yes;

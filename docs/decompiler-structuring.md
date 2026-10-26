@@ -317,7 +317,12 @@ a one-level conditional diamond and complete switch dispatch inside a
 pre-tested loop, each with one shared continuation. Incomplete switch
 metadata retains the explicit goto fallback.
 
-A pre-tested loop-body diamond may contain one further bounded side exit: the
+A pre-tested loop-body diamond may contain nested conditional child bodies up
+to 32 levels deep. Discovery, phi validation, ownership checks, and emission
+remain recursive, but that explicit depth budget bounds native call-stack use;
+the CFG is separately limited to 1,024 blocks and each nested child must claim
+distinct blocks. Deeper trees retain the explicit fallback. A diamond may also
+contain one bounded side exit: the
 final conditional in one outer diamond arm may branch directly to the loop's
 already validated exit block while its other edge follows a straight-line path
 to the outer in-loop join. The exit block must be phi-free (including memory

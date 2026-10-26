@@ -16,7 +16,11 @@
 namespace hexlab::desktop {
 struct PdbFunctionIdRow {
     std::uint32_t index = 0, leaf = 0, parent_scope = 0, class_type = 0, function_type = 0;
+    std::uint32_t parent_string_id = 0, related_type = 0, source_file_id = 0, line_number = 0;
+    std::uint16_t module_index = 0;
+    std::uint32_t reference_count = 0;
     std::uint32_t record_offset = 0, record_size = 0;
+    std::vector<std::uint32_t> references;
     std::string kind, name, signature, status;
     bool resolved = false, imported = false;
 };

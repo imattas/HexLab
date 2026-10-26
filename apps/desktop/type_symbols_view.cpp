@@ -12,6 +12,8 @@
 #include <wx/dialog.h>
 #include <wx/stattext.h>
 #include <algorithm>
+#include <array>
+#include <string_view>
 #include <map>
 #include <charconv>
 #include <sstream>
@@ -381,7 +383,7 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
     auto *pdb_id_page = new wxPanel(pages_);
     auto *pdb_id_layout = new wxBoxSizer(wxVERTICAL);
     pdb_id_layout->Add(new wxStaticText(pdb_id_page, wxID_ANY,
-        "CodeView IPI function identifiers are joined to exact TPI records. Resolved prototypes are imported as named project types; no function names or assignments are changed."),
+        "CodeView IPI function identifiers and build/source metadata are inspected with their exact record references. Resolved prototypes are imported as named project types; no function names or assignments are changed."),
         0, wxEXPAND | wxALL, FromDIP(4));
     pdb_ids_ = new VirtualTable(pdb_id_page, "pdb-function-identifiers",
         {"IPI index", "Kind", "Name", "TPI function", "Record offset", "Status"});
@@ -1005,7 +1007,7 @@ void TypeSymbolsView::refresh_pdb_function_id_details() {
                 pdb_id_details_->ChangeValue(text(pdb_id_identity_ + "\n" + pdb_id_diagnostic_));
         } else {
             pdb_id_details_->ChangeValue(text("PDB identity: " + pdb_id_identity_ +
-                "\nSelect a function identifier to inspect its exact references, source extent, signature, and import status."));
+                "\nSelect an IPI record to inspect its exact references, source extent, and decoded metadata."));
         }
         return;
     }
@@ -1014,20 +1016,62 @@ void TypeSymbolsView::refresh_pdb_function_id_details() {
     details << "PDB identity: " << pdb_id_identity_ << "\n"
             << "IPI index: 0x" << std::hex << item.index << "\n"
             << "Kind: " << item.kind << " (leaf 0x" << item.leaf << ")\n"
-            << "Name: " << item.name << "\n"
             << "Source IPI bytes: [0x" << item.record_offset << ", 0x"
-            << static_cast<std::uint64_t>(item.record_offset) + item.record_size << ")\n"
-            << "Parent IPI scope: ";
-    if (item.parent_scope) details << "0x" << item.parent_scope;
-    else details << "none (global)";
-    details << "\nClass TPI index: ";
-    if (item.class_type) details << "0x" << item.class_type;
-    else details << "none";
-    details << "\nFunction TPI index: 0x" << item.function_type
-            << "\nStatus: " << item.status;
-    if (!item.signature.empty()) details << "\nSignature: " << item.signature;
-    if (item.imported) details << "\nImported as a source-scoped project function type.";
-    else if (item.resolved) details << "\nSignature resolved but not imported (project type already exists or import budget was reached).";
+            << static_cast<std::uint64_t>(item.record_offset) + item.record_size << ")\n";
+    const auto id_name = [&](std::uint32_t id) -> const std::string * {
+        const auto found = std::lower_bound(pdb_function_ids_.begin(), pdb_function_ids_.end(), id,
+            [](const auto &candidate, std::uint32_t index) { return candidate.index < index; });
+        return found != pdb_function_ids_.end() && found->kind == "string ID" ? &found->name : nullptr;
+    };
+    if (item.kind == "function" || item.kind == "member function") {
+        details << "Name: " << item.name << "\nParent IPI scope: ";
+        if (item.parent_scope) details << "0x" << item.parent_scope;
+        else details << "none (global)";
+        details << "\nClass TPI index: ";
+        if (item.class_type) details << "0x" << item.class_type;
+        else details << "none";
+        details << "\nFunction TPI index: 0x" << item.function_type
+                << "\nStatus: " << item.status;
+        if (!item.signature.empty()) details << "\nSignature: " << item.signature;
+        if (item.imported) details << "\nImported as a source-scoped project function type.";
+        else if (item.resolved) details << "\nSignature resolved but not imported (project type already exists or import budget was reached).";
+    } else if (item.kind == "build info") {
+        static constexpr std::array<std::string_view, 5> fields{
+            "Current directory", "Build tool", "Source file", "Program database", "Command line"};
+        details << "Build metadata:\n";
+        for (std::size_t i = 0; i < item.references.size(); ++i) {
+            details << "  " << (i < fields.size() ? fields[i] : std::string_view("Unknown field"))
+                    << " (IPI 0x" << item.references[i] << "): ";
+            const auto value = id_name(item.references[i]);
+            details << (value ? *value : "<missing or non-string LF_STRING_ID>") << "\n";
+        }
+        details << "Status: " << item.status;
+    } else if (item.kind == "string ID") {
+        details << "String: " << item.name << "\nParent substring-list IPI index: ";
+        if (item.parent_string_id) details << "0x" << item.parent_string_id;
+        else details << "none";
+        details << "\nStatus: " << item.status;
+    } else if (item.kind == "substring list") {
+        details << "String-fragment count: " << item.reference_count << "\nFragments (bounded preview):\n";
+        for (const auto ref : item.references) {
+            const auto value = id_name(ref);
+            details << "  IPI 0x" << ref << ": "
+                    << (value ? *value : "<missing or non-string LF_STRING_ID>") << "\n";
+        }
+        if (item.reference_count > item.references.size())
+            details << "  ... " << (item.reference_count - item.references.size()) << " additional references omitted\n";
+        details << "Status: " << item.status;
+    } else if (item.kind == "UDT source line" || item.kind == "UDT module source line") {
+        details << "UDT TPI index: 0x" << item.related_type << "\nSource file IPI index: 0x"
+                << item.source_file_id << "\nSource file: ";
+        const auto value = id_name(item.source_file_id);
+        details << (value ? *value : "<missing or non-string LF_STRING_ID>")
+                << "\nLine: " << std::dec << item.line_number;
+        if (item.kind == "UDT module source line") details << "\nDBI module index: " << item.module_index;
+        details << "\nStatus: " << item.status;
+    } else {
+        details << "Name: " << item.name << "\nStatus: " << item.status;
+    }
     pdb_id_details_->ChangeValue(text(details.str()));
 }
 
@@ -1212,14 +1256,35 @@ void TypeSymbolsView::import_pdb_types() {
             row.parent_scope = source.parent_scope;
             row.class_type = source.class_type;
             row.function_type = source.function_type;
+            row.parent_string_id = source.parent_string_id;
+            row.related_type = source.related_type;
+            row.source_file_id = source.source_file_id;
+            row.line_number = source.line_number;
+            row.module_index = source.module_index;
+            row.reference_count = static_cast<std::uint32_t>(std::min<std::size_t>(source.references.size(), UINT32_MAX));
+            if (source.kind == types::CodeViewIdKind::build_info) row.references = source.references;
+            else if (source.kind == types::CodeViewIdKind::substring_list) {
+                constexpr std::size_t preview_limit = 8;
+                row.references.assign(source.references.begin(),
+                    source.references.begin() + static_cast<std::ptrdiff_t>(std::min(preview_limit, source.references.size())));
+            }
             row.record_offset = source.record_offset;
             row.record_size = source.record_size;
             row.name = source.name;
-            row.kind = source.kind == types::CodeViewIdKind::function ? "function"
-                : source.kind == types::CodeViewIdKind::member_function ? "member function" : "unsupported";
+            switch (source.kind) {
+            case types::CodeViewIdKind::function: row.kind = "function"; break;
+            case types::CodeViewIdKind::member_function: row.kind = "member function"; break;
+            case types::CodeViewIdKind::build_info: row.kind = "build info"; break;
+            case types::CodeViewIdKind::substring_list: row.kind = "substring list"; break;
+            case types::CodeViewIdKind::string_id: row.kind = "string ID"; break;
+            case types::CodeViewIdKind::udt_source_line: row.kind = "UDT source line"; break;
+            case types::CodeViewIdKind::udt_module_source_line: row.kind = "UDT module source line"; break;
+            default: row.kind = "unsupported"; break;
+            }
             row.status = source.kind == types::CodeViewIdKind::unsupported
                 ? "unsupported IPI leaf; inspect raw leaf and record extent"
-                : "not joined to TPI yet";
+                : (source.kind == types::CodeViewIdKind::function || source.kind == types::CodeViewIdKind::member_function
+                    ? "not joined to TPI yet" : "metadata references not joined yet");
             pdb_function_ids_.push_back(std::move(row));
         }
     }
@@ -1434,9 +1499,16 @@ void TypeSymbolsView::import_pdb_types() {
                     continue;
                 }
                 row.resolved = found->second->resolved;
-                if (row.resolved) {
-                    row.signature = types::format(*found->second->signature);
-                    row.status = "resolved; awaiting project import";
+                if (row.kind == "function" || row.kind == "member function") {
+                    if (row.resolved && found->second->signature) {
+                        row.signature = types::format(*found->second->signature);
+                        row.status = "resolved; awaiting project import";
+                    } else {
+                        row.resolved = false;
+                        row.status = "unresolved: " + found->second->diagnostic;
+                    }
+                } else if (row.resolved) {
+                    row.status = "metadata references resolved";
                 } else {
                     row.status = "unresolved: " + found->second->diagnostic;
                 }
@@ -1760,7 +1832,7 @@ void TypeSymbolsView::import_pdb_types() {
         if (!server_warning.empty()) diagnostics.push_back({source_name, DiagnosticSeverity::warning, "Type-server loading was partial: " + server_warning, {}, {}});
         if (unresolved_id_count || unsupported_id_count)
             diagnostics.push_back({source_name, DiagnosticSeverity::warning,
-                "IPI function records: " + std::to_string(unresolved_id_count) + " unresolved and " +
+                "IPI records: " + std::to_string(unresolved_id_count) + " unresolved and " +
                 std::to_string(unsupported_id_count) + " unsupported.", {}, {}});
         for (const auto &row : pdb_data_symbol_rows_) {
             if (row.resolved || row.status.empty()) continue;

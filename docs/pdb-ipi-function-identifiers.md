@@ -50,6 +50,19 @@ Build-info lists are limited to the five defined fields, record counts are
 bounded by stream extents and the parser's two-million-record cap, and all
 fixed fields and strings are read within each record boundary.
 
+The desktop IPI page labels all seven supported record kinds instead of
+presenting non-function metadata as an unsupported leaf. Selecting
+`LF_BUILDINFO` resolves its string-ID references into the ordered fields
+current directory, build tool, source file, program database, and command line.
+Selecting a string ID shows its parent substring-list reference; a substring
+list previews at most eight referenced strings; UDT source records show the
+referenced source string, line, TPI type index, and optional module index.
+Reference IDs and exact byte extents remain visible. This is a bounded
+inspection view: it does not persist build metadata or rewrite paths from the
+recorded working directory. The field order follows LLVM's
+[`BuildInfoRecord`](https://www.llvm.org/doxygen/TypeRecord_8h_source.html)
+definition.
+
 This still does not decode ID records in object-file sections or linker-
 generated ID forms. Unresolved records are reported to callers, and unresolved
 or ambiguous procedure references are left unassigned.

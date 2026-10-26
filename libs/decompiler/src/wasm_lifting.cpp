@@ -301,8 +301,13 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     return unsupported("indexed block type is unavailable or out of range");
                 const auto &signature = metadata->function_types[static_cast<std::size_t>(signed_bt)];
                 if (signature.parameter_count != signature.parameter_types.size() ||
-                    signature.result_count != signature.result_types.size() || !signature.parameter_types.empty())
-                    return unsupported("indexed block type parameters or metadata are outside the bounded subset");
+                    signature.result_count != signature.result_types.size())
+                    return unsupported("indexed block type metadata is inconsistent");
+                for (const auto type : signature.parameter_types) {
+                    const auto converted = wasm_value_type(type);
+                    if (!converted) return unsupported("indexed block type contains an unsupported parameter type");
+                    block_parameters.push_back(*converted);
+                }
                 if (signature.result_types.size() > max_stack)
                     return Error{ErrorCode::resource_limit, "WebAssembly block result count exceeds 128 values"};
                 for (const auto type : signature.result_types) {
@@ -401,6 +406,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     // MVP subset); block/if labels take their result value. The normal end of
     // every typed label produces its result value.
     std::vector<std::optional<Shape>> branch_shapes(labels.size()),end_shapes(labels.size());
+    std::vector<std::optional<std::size_t>> label_heights(labels.size());
     std::vector<std::vector<std::size_t>> predecessors(starts.size());
     std::vector<std::size_t> work{0};std::vector<bool> queued(starts.size());queued[0]=true;entries[0]=Shape{};
     const auto shape_pop=[&](Shape &stack,ValueType expected)->Result<ValueType>{if(stack.empty())return unsupported("operand stack underflow");auto actual=stack.back();stack.pop_back();if(expected.kind!=TypeKind::unknown&&actual!=expected)return unsupported("operand stack type mismatch");return actual;};
@@ -425,7 +431,11 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             if(op==2||op==3||op==4){
                 const auto li=*opener_label[n];
                 if(op==4){auto c=shape_pop(stack,integer(32));if(!c)return c.error();}
+                for(auto it=labels[li].parameters.rbegin();it!=labels[li].parameters.rend();++it){auto p=shape_pop(stack,*it);if(!p)return p.error();}
+                label_heights[li]=stack.size();
+                stack.insert(stack.end(),labels[li].parameters.begin(),labels[li].parameters.end());
                 Shape end_shape=stack;
+                end_shape.resize(*label_heights[li]);
                 end_shape.insert(end_shape.end(), labels[li].result_types.begin(), labels[li].result_types.end());
                 if(end_shapes[li]&&*end_shapes[li]!=end_shape)return unsupported("control label receives incompatible operand stacks");
                 end_shapes[li]=end_shape;
@@ -434,8 +444,9 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 branch_shapes[li]=std::move(branch_shape);
                 continue;
             }
-            if(op==1||op==5)continue;
-            if(op==0x0b){if(end_label[n]){if(!end_shapes[*end_label[n]]||*end_shapes[*end_label[n]]!=stack)return unsupported("block end has an incompatible operand stack");}else if(n==function_end){auto result=signature_results();if(!result)return result.error();if(stack!=result.value())return unsupported("function end result stack does not match its signature");}continue;}
+            if(op==1)continue;
+            if(op==5){const auto li=active_labels[n].back();if(!label_heights[li])return unsupported("if stack height is unavailable");if(!matching_suffix(stack,labels[li].result_types))return unsupported("if then arm result types mismatch");stack.resize(*label_heights[li]);stack.insert(stack.end(),labels[li].result_types.begin(),labels[li].result_types.end());continue;}
+            if(op==0x0b){if(end_label[n]){const auto li=*end_label[n];if(!label_heights[li]||!matching_suffix(stack,labels[li].result_types))return unsupported("block end result types mismatch");stack.resize(*label_heights[li]);stack.insert(stack.end(),labels[li].result_types.begin(),labels[li].result_types.end());if(!end_shapes[li]||*end_shapes[li]!=stack)return unsupported("block end has an incompatible operand stack");}else if(n==function_end){auto result=signature_results();if(!result)return result.error();if(stack!=result.value())return unsupported("function end result stack does not match its signature");}continue;}
             if(op==0x0f){auto result=signature_results();if(!result)return result.error();if(!matching_suffix(stack,result.value()))return unsupported("return stack does not match the function result types");continue;}
             if(op==0x00)break;
             if(op==0x1a){auto v=shape_pop(stack,{});if(!v)return v.error();continue;}
@@ -542,7 +553,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         exits[bi]=stack;
         for(const auto &edge:successors[bi]){
             Shape edge_shape=stack;
-            if(edge.label){if(!branch_shapes[*edge.label])return unsupported("branch reaches a label before its stack shape is known");if(*branch_shapes[*edge.label]!=edge_shape)return unsupported("branch would trim or reshape the operand stack at its target");}
+            if(edge.label){const auto li=*edge.label;if(!branch_shapes[li]||!label_heights[li])return unsupported("branch reaches a label before its stack shape is known");const auto &types=labels[li].kind==3?labels[li].parameters:labels[li].result_types;if(!matching_suffix(edge_shape,types)||edge_shape.size()<*label_heights[li]+types.size())return unsupported("branch values do not match target label types");edge_shape.resize(*label_heights[li]);edge_shape.insert(edge_shape.end(),types.begin(),types.end());if(*branch_shapes[li]!=edge_shape)return unsupported("branch stack prefix disagrees at its target");if(edge_shape!=stack)return unsupported("branch stack trimming is not representable on this CFG edge");}
             auto &inputs=predecessors[edge.target];if(std::find(inputs.begin(),inputs.end(),bi)==inputs.end())inputs.push_back(bi);
             if(!entries[edge.target]){entries[edge.target]=edge_shape;if(!queued[edge.target]){work.push_back(edge.target);queued[edge.target]=true;}}
             else if(*entries[edge.target]!=edge_shape)return unsupported("operand stack shapes disagree at a control-flow join");
@@ -629,8 +640,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             if(op==0x01)continue;
             if(op==2||op==3){continue;}
             if(op==4){auto cond=pop(integer(32));if(!cond)return cond.error();const auto li=*opener_label[n];const auto yes=code[n+1]->instruction.address;const auto target=labels[li].else_index<code.size()?labels[li].else_index+1:labels[li].end+1;emit(n,Branch{"wasm_if",yes,code[target]->instruction.address,cond.value()});continue;}
-            if(op==5){const auto li=active_labels[n].back();const auto target=labels[li].end+1;emit(n,Branch{"true",code[target]->instruction.address,{}});continue;}
-            if(op==0x0b){if(n==function_end){auto result=emit_return(n,function_result_types.value());if(!result)return result.error();}continue;}
+            if(op==5){const auto li=active_labels[n].back();auto values=take_results(labels[li].result_types);if(!values)return values.error();if(!label_heights[li]||stack.size()<*label_heights[li])return unsupported("if then-arm stack height is unavailable");stack.resize(*label_heights[li]);stack.insert(stack.end(),values.value().begin(),values.value().end());const auto target=labels[li].end+1;emit(n,Branch{"true",code[target]->instruction.address,{}});continue;}
+            if(op==0x0b){if(end_label[n]){const auto li=*end_label[n];auto values=take_results(labels[li].result_types);if(!values)return values.error();if(!label_heights[li]||stack.size()<*label_heights[li])return unsupported("block stack height is unavailable");stack.resize(*label_heights[li]);stack.insert(stack.end(),values.value().begin(),values.value().end());}else if(n==function_end){auto result=emit_return(n,function_result_types.value());if(!result)return result.error();}continue;}
             if(op==0x0f){auto result=emit_return(n,function_result_types.value());if(!result)return result.error();continue;}
             if(op==0x0c||op==0x0d){auto depth=immediate(i);if(!depth)return unsupported("branch depth unavailable");const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(*depth)];const auto target=labels[li].kind==3?labels[li].opener+1:labels[li].end+1;if(op==0x0c)emit(n,Branch{"true",code[target]->instruction.address,{}});else{auto cond=pop(integer(32));if(!cond)return cond.error();emit(n,Branch{"br_if",code[target]->instruction.address,n+1<code.size()?std::optional<Address>{code[n+1]->instruction.address}:std::nullopt,cond.value()});}continue;}
             if(op==0x0e){auto selector=pop(integer(32));if(!selector)return selector.error();auto targets=table_targets(n);if(!targets)return targets.error();LiftedBlock::SwitchDispatch dispatch;dispatch.selector=selector.value();for(const auto &target:targets.value()){const auto target_block=block_for(target.target);if(!target_block)return unsupported("br_table target is not a basic block");const auto address=code[starts[*target_block]]->instruction.address;if(target.value)dispatch.cases.push_back({*target.value,address});else dispatch.default_target=address;}lifted.switch_dispatch=std::move(dispatch);continue;}
