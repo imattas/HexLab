@@ -124,10 +124,17 @@ Post-tested loops can also contain a sequence of one-level conditional diamonds
 before the latch. Each branch arm must be a disjoint phi-free straight-line
 chain, both arms must reach the same block, and the join must have exactly the
 two arm tails as predecessors. The formatter emits each arm inside `if`/`else`
-and emits the join once. Nested diamonds, side exits from an arm, unresolved or
-extra edges, memory/register phis, and joins outside the loop body still use the
-state-machine or explicit label/goto fallback. The recognizer is bounded to
-1,024 blocks and 4,096 edges.
+and emits the join once. One arm may contain a single nested conditional
+diamond. Its two disjoint arms may reconverge at an inner join before the outer
+join, or reach the outer join directly alongside the sibling arm. A distinct
+inner join may continue through a straight-line chain to the outer join. Each
+consumed join requires exactly its actual CFG predecessors, and each register
+phi requires exactly one input from every such predecessor. The formatter
+emits parallel register-phi copies on those predecessor edges before emitting
+the join once. Side entries, side exits, overlapping arms, deeper nesting,
+unresolved or extra edges, and memory-phi ambiguity retain the state-machine
+or explicit label/goto fallback. The recognizer is bounded to 1,024 blocks
+and 4,096 edges.
 
 Post-tested loop latches remain phi-free and must branch directly to the body
 entry or a single terminal return block.

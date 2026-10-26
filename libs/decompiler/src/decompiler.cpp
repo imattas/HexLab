@@ -6526,6 +6526,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             const LiftedBlock *join = nullptr;
             std::vector<const LiftedBlock *> yes;
             std::vector<const LiftedBlock *> no;
+            std::shared_ptr<DoLoopDiamond> yes_nested;
+            std::shared_ptr<DoLoopDiamond> no_nested;
+            std::vector<const LiftedBlock *> yes_after;
+            std::vector<const LiftedBlock *> no_after;
+            std::vector<std::pair<std::string, std::string>> yes_phi_copies;
+            std::vector<std::pair<std::string, std::string>> no_phi_copies;
         };
         struct DoLoopSwitchArm {
             Address target{};
@@ -6539,6 +6545,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<DoLoopSwitchArm> arms;
         };
         std::vector<DoLoopDiamond> diamonds;
+        std::set<std::uint64_t> consumed_phi_joins;
         std::map<std::uint64_t, DoLoopSwitch> switches;
         std::set<std::uint64_t> do_body_ids;
         std::map<std::uint64_t, std::set<std::uint64_t>> predecessors;
@@ -6597,6 +6604,38 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             }
             return true;
         };
+        const auto validate_join_phis = [&](const LiftedBlock &join,
+            const std::set<std::uint64_t> &incoming,
+            std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> &copies) {
+            if (incoming.size() < 2 || predecessors[join.id.value] != incoming || join.memory_phi ||
+                join.switch_dispatch || contains_return(join) || !has_only_simple_statements(join))
+                return false;
+            for (const auto &phi : join.phis) {
+                if (phi.inputs.size() != incoming.size()) return false;
+                std::set<std::uint64_t> seen;
+                for (const auto &input : phi.inputs) {
+                    if (!incoming.contains(input.predecessor.value) ||
+                        !seen.insert(input.predecessor.value).second) return false;
+                    copies[input.predecessor.value].emplace_back(
+                        register_name(phi.destination, phi.version),
+                        register_name(phi.destination, input.version));
+                }
+                if (seen != incoming) return false;
+            }
+            return true;
+        };
+        const auto first_shared = [](const std::vector<const LiftedBlock *> &yes,
+                                     const std::vector<const LiftedBlock *> &no) {
+            std::pair<std::size_t, std::size_t> result{yes.size(), no.size()};
+            for (std::size_t yi = 0; yi < yes.size(); ++yi) {
+                const auto found = std::find(no.begin(), no.end(), yes[yi]);
+                if (found == no.end()) continue;
+                const auto ni = static_cast<std::size_t>(found - no.begin());
+                if (result.first == yes.size() || yi + ni < result.first + result.second)
+                    result = {yi, ni};
+            }
+            return result;
+        };
 
         const LiftedBlock *current = entry;
         std::optional<std::set<std::uint64_t>> expected_predecessors;
@@ -6615,7 +6654,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 latch = current;
                 break;
             }
-            if (current->phis.size() || current->memory_phi || contains_return(*current) ||
+            if ((!current->phis.empty() && !consumed_phi_joins.contains(current->id.value)) ||
+                current->memory_phi || contains_return(*current) ||
                 (!current->switch_dispatch && !has_only_simple_statements(*current))) {
                 body_valid = false;
                 break;
@@ -6710,58 +6750,178 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 continue;
             }
             if (current_condition) {
-                if (current->successors.size() != 2 || !current_condition->true_target ||
-                    !current_condition->false_target || *current_condition->true_target == *current_condition->false_target ||
-                    (!edge_targets(current->successors[0], *current_condition->true_target) &&
-                     !edge_targets(current->successors[1], *current_condition->true_target)) ||
-                    (!edge_targets(current->successors[0], *current_condition->false_target) &&
-                     !edge_targets(current->successors[1], *current_condition->false_target))) {
+                if (!conditional_edges_match_targets(*current, *current_condition)) {
                     body_valid = false;
                     break;
                 }
                 const auto yes_path = trace_linear(*current_condition->true_target);
                 const auto no_path = trace_linear(*current_condition->false_target);
                 if (!yes_path || !no_path) { body_valid = false; break; }
-                const LiftedBlock *join = nullptr;
-                std::size_t yes_join = 0, no_join = 0;
-                for (std::size_t yi = 0; yi < yes_path->size(); ++yi) {
-                    const auto found = std::find(no_path->begin(), no_path->end(), (*yes_path)[yi]);
-                    if (found == no_path->end()) continue;
-                    const auto ni = static_cast<std::size_t>(found - no_path->begin());
-                    if (!join || yi + ni < yes_join + no_join) {
-                        join = (*yes_path)[yi];
-                        yes_join = yi;
-                        no_join = ni;
-                    }
-                }
-                if (!join || join == current || join->phis.size() || join->memory_phi ||
-                    !validate_linear_arm(std::vector<const LiftedBlock *>(yes_path->begin(), yes_path->begin() +
-                                                   static_cast<std::ptrdiff_t>(yes_join)), *current, *join) ||
-                    !validate_linear_arm(std::vector<const LiftedBlock *>(no_path->begin(), no_path->begin() +
-                                                   static_cast<std::ptrdiff_t>(no_join)), *current, *join)) {
-                    body_valid = false;
-                    break;
-                }
                 DoLoopDiamond region;
                 region.branch = current;
-                region.join = join;
-                region.yes.assign(yes_path->begin(), yes_path->begin() + static_cast<std::ptrdiff_t>(yes_join));
-                region.no.assign(no_path->begin(), no_path->begin() + static_cast<std::ptrdiff_t>(no_join));
-                const auto *yes_tail = region.yes.empty() ? current : region.yes.back();
-                const auto *no_tail = region.no.empty() ? current : region.no.back();
-                if (predecessors[join->id.value] != std::set<std::uint64_t>{yes_tail->id.value, no_tail->id.value}) {
-                    body_valid = false;
-                    break;
+                const auto [yes_join, no_join] = first_shared(*yes_path, *no_path);
+                if (yes_join < yes_path->size()) {
+                    region.join = (*yes_path)[yes_join];
+                    region.yes.assign(yes_path->begin(), yes_path->begin() +
+                        static_cast<std::ptrdiff_t>(yes_join));
+                    region.no.assign(no_path->begin(), no_path->begin() +
+                        static_cast<std::ptrdiff_t>(no_join));
+                    const auto *yes_tail = region.yes.empty() ? current : region.yes.back();
+                    const auto *no_tail = region.no.empty() ? current : region.no.back();
+                    std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> copies;
+                    if (region.join == current || yes_tail == no_tail ||
+                        !validate_linear_arm(region.yes, *current, *region.join) ||
+                        !validate_linear_arm(region.no, *current, *region.join) ||
+                        !validate_join_phis(*region.join, {yes_tail->id.value, no_tail->id.value}, copies)) {
+                        body_valid = false;
+                        break;
+                    }
+                    region.yes_phi_copies = std::move(copies[yes_tail->id.value]);
+                    region.no_phi_copies = std::move(copies[no_tail->id.value]);
+                } else {
+                    // Exactly one outer arm may end in an inner conditional.
+                    const bool nested_on_true = !yes_path->empty() &&
+                        terminal_conditional(*yes_path->back()) != nullptr;
+                    const auto &nested_path = nested_on_true ? *yes_path : *no_path;
+                    const auto &sibling_path = nested_on_true ? *no_path : *yes_path;
+                    if (nested_path.empty() || sibling_path.empty() ||
+                        !terminal_conditional(*nested_path.back()) ||
+                        terminal_conditional(*sibling_path.back())) {
+                        body_valid = false;
+                        break;
+                    }
+                    const auto *inner_branch = nested_path.back();
+                    const auto *inner_test = terminal_conditional(*inner_branch);
+                    if (!inner_branch->phis.empty() || inner_branch->memory_phi ||
+                        !has_only_simple_statements(*inner_branch) ||
+                        !conditional_edges_match_targets(*inner_branch, *inner_test)) {
+                        body_valid = false;
+                        break;
+                    }
+                    const auto inner_yes_path = trace_linear(*inner_test->true_target);
+                    const auto inner_no_path = trace_linear(*inner_test->false_target);
+                    if (!inner_yes_path || !inner_no_path) { body_valid = false; break; }
+                    const auto [inner_yes_join, inner_no_join] = first_shared(*inner_yes_path, *inner_no_path);
+                    if (inner_yes_join == inner_yes_path->size()) { body_valid = false; break; }
+                    auto nested = std::make_shared<DoLoopDiamond>();
+                    nested->branch = inner_branch;
+                    nested->join = (*inner_yes_path)[inner_yes_join];
+                    nested->yes.assign(inner_yes_path->begin(), inner_yes_path->begin() +
+                        static_cast<std::ptrdiff_t>(inner_yes_join));
+                    nested->no.assign(inner_no_path->begin(), inner_no_path->begin() +
+                        static_cast<std::ptrdiff_t>(inner_no_join));
+                    const auto *inner_yes_tail = nested->yes.empty() ? inner_branch : nested->yes.back();
+                    const auto *inner_no_tail = nested->no.empty() ? inner_branch : nested->no.back();
+                    const auto continuation = trace_linear(nested->join->begin);
+                    if (!continuation) { body_valid = false; break; }
+                    const auto [outer_join_index, sibling_join_index] = first_shared(*continuation, sibling_path);
+                    if (outer_join_index == continuation->size()) { body_valid = false; break; }
+                    region.join = (*continuation)[outer_join_index];
+                    auto &prefix = nested_on_true ? region.yes : region.no;
+                    auto &suffix = nested_on_true ? region.yes_after : region.no_after;
+                    auto &sibling = nested_on_true ? region.no : region.yes;
+                    prefix.assign(nested_path.begin(), nested_path.end() - 1);
+                    suffix.assign(continuation->begin(), continuation->begin() +
+                        static_cast<std::ptrdiff_t>(outer_join_index));
+                    sibling.assign(sibling_path.begin(), sibling_path.begin() +
+                        static_cast<std::ptrdiff_t>(sibling_join_index));
+                    const auto *prefix_tail = prefix.empty() ? current : prefix.back();
+                    const auto *sibling_tail = sibling.empty() ? current : sibling.back();
+                    if (inner_yes_tail == inner_no_tail || sibling_tail == inner_yes_tail ||
+                        sibling_tail == inner_no_tail || region.join == current ||
+                        nested->join == inner_branch ||
+                        !validate_linear_arm(prefix, *current, *inner_branch) ||
+                        predecessors[inner_branch->id.value] != std::set<std::uint64_t>{prefix_tail->id.value} ||
+                        !validate_linear_arm(nested->yes, *inner_branch, *nested->join) ||
+                        !validate_linear_arm(nested->no, *inner_branch, *nested->join) ||
+                        !validate_linear_arm(sibling, *current, *region.join)) {
+                        body_valid = false;
+                        break;
+                    }
+                    std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> inner_copies;
+                    if (nested->join == region.join) {
+                        if (!suffix.empty() ||
+                            !validate_join_phis(*region.join,
+                                {inner_yes_tail->id.value, inner_no_tail->id.value, sibling_tail->id.value},
+                                inner_copies)) body_valid = false;
+                        if (body_valid) {
+                            auto &sibling_copies = nested_on_true ? region.no_phi_copies : region.yes_phi_copies;
+                            sibling_copies = std::move(inner_copies[sibling_tail->id.value]);
+                        }
+                    } else {
+                        if (suffix.empty() || suffix.front() != nested->join ||
+                            !validate_join_phis(*nested->join,
+                                {inner_yes_tail->id.value, inner_no_tail->id.value}, inner_copies))
+                            body_valid = false;
+                        auto predecessor = nested->join->id.value;
+                        for (std::size_t i = 1; body_valid && i < suffix.size(); ++i) {
+                            const auto *block = suffix[i];
+                            const auto *next = i + 1 < suffix.size() ? suffix[i + 1] : region.join;
+                            if (!block->phis.empty() || block->memory_phi || block->switch_dispatch ||
+                                terminal_conditional(*block) || contains_return(*block) ||
+                                !has_only_simple_statements(*block) ||
+                                block->successors.size() != 1 ||
+                                (block->successors.front().kind != BlockEdgeKind::jump &&
+                                 block->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                                predecessors[block->id.value] != std::set<std::uint64_t>{predecessor} ||
+                                !has_unconditional_edge(*block, next->begin)) body_valid = false;
+                            predecessor = block->id.value;
+                        }
+                        const auto *outer_nested_tail = suffix.back();
+                        std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> outer_copies;
+                        if (body_valid && (nested->join->successors.size() != 1 ||
+                            (nested->join->successors.front().kind != BlockEdgeKind::jump &&
+                             nested->join->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                            !has_unconditional_edge(*nested->join,
+                                suffix.size() > 1 ? suffix[1]->begin : region.join->begin) ||
+                            outer_nested_tail == sibling_tail ||
+                            !validate_join_phis(*region.join,
+                                {outer_nested_tail->id.value, sibling_tail->id.value}, outer_copies)))
+                            body_valid = false;
+                        if (body_valid) {
+                            auto &nested_copies = nested_on_true ? region.yes_phi_copies : region.no_phi_copies;
+                            auto &sibling_copies = nested_on_true ? region.no_phi_copies : region.yes_phi_copies;
+                            nested_copies = std::move(outer_copies[outer_nested_tail->id.value]);
+                            sibling_copies = std::move(outer_copies[sibling_tail->id.value]);
+                        }
+                    }
+                    if (!body_valid) break;
+                    nested->yes_phi_copies = std::move(inner_copies[inner_yes_tail->id.value]);
+                    nested->no_phi_copies = std::move(inner_copies[inner_no_tail->id.value]);
+                    if (nested_on_true) region.yes_nested = std::move(nested);
+                    else region.no_nested = std::move(nested);
                 }
                 if (!do_body_ids.insert(current->id.value).second) body_valid = false;
-                for (const auto *block : region.yes)
-                    if (!do_body_ids.insert(block->id.value).second) body_valid = false;
-                for (const auto *block : region.no)
-                    if (!do_body_ids.insert(block->id.value).second) body_valid = false;
+                const auto claim_blocks = [&](const auto &self, const DoLoopDiamond &item) -> void {
+                    for (const auto *block : item.yes)
+                        if (!do_body_ids.insert(block->id.value).second) body_valid = false;
+                    for (const auto *block : item.no)
+                        if (!do_body_ids.insert(block->id.value).second) body_valid = false;
+                    if (item.yes_nested) {
+                        if (!do_body_ids.insert(item.yes_nested->branch->id.value).second) body_valid = false;
+                        self(self, *item.yes_nested);
+                    }
+                    if (item.no_nested) {
+                        if (!do_body_ids.insert(item.no_nested->branch->id.value).second) body_valid = false;
+                        self(self, *item.no_nested);
+                    }
+                    for (const auto *block : item.yes_after)
+                        if (!do_body_ids.insert(block->id.value).second) body_valid = false;
+                    for (const auto *block : item.no_after)
+                        if (!do_body_ids.insert(block->id.value).second) body_valid = false;
+                };
+                claim_blocks(claim_blocks, region);
                 if (!body_valid) break;
+                if (!region.join->phis.empty()) consumed_phi_joins.insert(region.join->id.value);
+                if (region.yes_nested && region.yes_nested->join != region.join &&
+                    !region.yes_nested->join->phis.empty())
+                    consumed_phi_joins.insert(region.yes_nested->join->id.value);
+                if (region.no_nested && region.no_nested->join != region.join &&
+                    !region.no_nested->join->phis.empty())
+                    consumed_phi_joins.insert(region.no_nested->join->id.value);
                 diamonds.push_back(std::move(region));
-                expected_predecessors = std::set<std::uint64_t>{yes_tail->id.value, no_tail->id.value};
-                current = join;
+                expected_predecessors = predecessors[diamonds.back().join->id.value];
+                current = diamonds.back().join;
                 if (top_level_seen.contains(current->id.value)) { body_valid = false; break; }
                 continue;
             }
@@ -6856,12 +7016,27 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         const auto &diamond = *region->second;
                         const auto *diamond_condition = terminal_conditional(*diamond.branch);
                         if (!diamond_condition) return fallback("post-tested loop diamond lost its branch");
-                        emit_block(*diamond.branch, 8, true);
-                        out << "        if (" << branch_condition_text(*diamond_condition) << ") {\n";
-                        for (const auto *arm_block : diamond.yes) emit_block(*arm_block, 12, true);
-                        out << "        } else {\n";
-                        for (const auto *arm_block : diamond.no) emit_block(*arm_block, 12, true);
-                        out << "        }\n";
+                        const auto emit_diamond = [&](const auto &self, const DoLoopDiamond &item,
+                                                      unsigned indent) -> void {
+                            const auto *test = terminal_conditional(*item.branch);
+                            emit_block(*item.branch, indent, true);
+                            const std::string spaces(indent, ' ');
+                            out << spaces << "if (" << branch_condition_text(*test) << ") {\n";
+                            const auto emit_arm = [&](const std::vector<const LiftedBlock *> &prefix,
+                                const std::shared_ptr<DoLoopDiamond> &nested,
+                                const std::vector<const LiftedBlock *> &after,
+                                const std::vector<std::pair<std::string, std::string>> &copies) {
+                                for (const auto *block : prefix) emit_block(*block, indent + 4, true);
+                                if (nested) self(self, *nested, indent + 4);
+                                for (const auto *block : after) emit_block(*block, indent + 4, true);
+                                emit_parallel_copies(out, copies, indent + 4);
+                            };
+                            emit_arm(item.yes, item.yes_nested, item.yes_after, item.yes_phi_copies);
+                            out << spaces << "} else {\n";
+                            emit_arm(item.no, item.no_nested, item.no_after, item.no_phi_copies);
+                            out << spaces << "}\n";
+                        };
+                        emit_diamond(emit_diamond, diamond, 8);
                         current = diamond.join;
                     } else {
                         emit_block(*current, 8, true);
