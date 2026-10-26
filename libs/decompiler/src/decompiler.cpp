@@ -6046,7 +6046,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             }
                         }
                         auto nested = analyze_loop_diamond(*nested_branch, nested_occupied, region_exit,
-                                                           true, true, false, depth + 1);
+                                                           true, true, true, depth + 1);
                         if (!nested)
                             continue;
                         const auto join_position = std::find(sibling_path.begin(), sibling_path.end(), nested->join);
@@ -6080,8 +6080,28 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             expected.insert((nested->no.empty() ? nested->branch : nested->no.back())->id.value);
                         expected.insert(sibling_tail->id.value);
                         if (nested->latch_to_header) {
+                            const auto collect_latch_tails = [&](const auto &self,
+                                const LoopConditionalBody &tree, std::set<std::uint64_t> &tails) -> bool {
+                                if (!tree.latch_to_header || tree.yes_break || tree.no_break) return false;
+                                const auto collect_arm = [&](const std::vector<const LiftedBlock *> &blocks,
+                                    const std::shared_ptr<LoopConditionalBody> &child) {
+                                    if (child) return self(self, *child, tails);
+                                    const auto *tail = blocks.empty() ? tree.branch : blocks.back();
+                                    return tail && tails.insert(tail->id.value).second;
+                                };
+                                return collect_arm(tree.yes, tree.yes_nested) &&
+                                    collect_arm(tree.no, tree.no_nested);
+                            };
+                            std::set<std::uint64_t> nested_tails;
+                            if (nested->join != header ||
+                                !collect_latch_tails(collect_latch_tails, *nested, nested_tails) ||
+                                nested_tails.size() > 8)
+                                continue;
+                            expected = nested_tails;
+                            expected.insert(sibling_tail->id.value);
                             expected.insert(entry->id.value);
-                            if (nested->join != header || expected.size() != 4 ||
+                            if (nested_tails.size() < 2 ||
+                                expected.size() != nested_tails.size() + 2 || expected.size() > 10 ||
                                 diamond_predecessors[nested->join->id.value] != expected)
                                 continue;
                         } else if (nested->join == header || expected.size() != 3 ||
@@ -6092,6 +6112,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         bool phis_valid = true;
                         for (const auto &phi : nested->join->phis) {
                             if (phi.inputs.size() != expected.size()) { phis_valid = false; break; }
+                            std::set<std::uint64_t> phi_predecessors;
+                            for (const auto &item : phi.inputs)
+                                if (!expected.contains(item.predecessor.value) ||
+                                    !phi_predecessors.insert(item.predecessor.value).second)
+                                    phis_valid = false;
+                            if (!phis_valid || phi_predecessors != expected) { phis_valid = false; break; }
                             const auto input = std::find_if(phi.inputs.begin(), phi.inputs.end(), [&](const auto &item) {
                                 return item.predecessor == sibling_tail->id;
                             });
@@ -6638,6 +6664,10 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             header != entry && body_start != entry && exit_block != entry && body_start != header &&
             exit_block != header && exit_block != body_start &&
             header->instructions.size() == 1 && has_only_simple_statements(*header) &&
+            valid_diamond_memory_phi(*header) &&
+            std::all_of(loop_body.begin(), loop_body.end(), [&](const auto *block) {
+                return valid_diamond_memory_phi(*block);
+            }) &&
             has_unconditional_edge(*entry, header->begin) &&
             exit_path_valid && std::none_of(exit_path.begin(), exit_path.end(), [&](const auto *block) {
                 return loop_body_ids.contains(block->id.value) || block == header || block == entry;
@@ -6679,8 +6709,24 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             };
             for (const auto &[_, region] : conditional_loop_bodies)
                 add_region_back_edges(add_region_back_edges, region);
+            std::set<std::uint64_t> expected_header_predecessors{entry->id.value};
+            for (const auto *back_edge : back_edges)
+                if (!expected_header_predecessors.insert(back_edge->id.value).second)
+                    valid_loop_phis = false;
+            if (back_edges.size() > 8 ||
+                diamond_predecessors[header->id.value] != expected_header_predecessors)
+                valid_loop_phis = false;
             for (const auto &phi : header->phis) {
                 if (phi.inputs.size() != back_edges.size() + 1) { valid_loop_phis = false; break; }
+                std::set<std::uint64_t> phi_predecessors;
+                for (const auto &input : phi.inputs)
+                    if (!expected_header_predecessors.contains(input.predecessor.value) ||
+                        !phi_predecessors.insert(input.predecessor.value).second)
+                        valid_loop_phis = false;
+                if (!valid_loop_phis || phi_predecessors != expected_header_predecessors) {
+                    valid_loop_phis = false;
+                    break;
+                }
                 const auto initial = std::find_if(phi.inputs.begin(), phi.inputs.end(), [&](const auto &input) {
                     return input.predecessor == entry->id;
                 });
