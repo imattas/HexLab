@@ -32,7 +32,7 @@ Own `libs/types/src/header_import.cpp` and focused header-import documentation. 
 
 ### Task 2: Windows native hardware breakpoints
 
-Own debugger public API, Windows native backend, focused docs, and only tightly coupled desktop controls. Support per-process execution breakpoints and aligned 1/2/4/8-byte data watchpoints through x86/x64 debug registers, with a four-slot cap and lifecycle-safe per-thread application/removal. Other backends must report unsupported capability without changing their behavior.
+First audit the existing Windows native backend and public API. If x86/x64 support is already present, document its actual four-slot, alignment, watchpoint-kind, thread-lifecycle, hit-attribution, and cleanup limits rather than reimplementing it. Fix backend code only for a concrete lifecycle defect. Other backends must retain their current behavior.
 
 ### Task 3: WebAssembly MVP globals and indirect calls
 
@@ -45,6 +45,6 @@ Root reviews workstream scope, failure behavior, and source/API compatibility be
 ## Progress
 
 - [ ] Task 1 implementation, review, and `hexlab_types` Debug build.
-- [ ] Task 2 implementation, review, and `hexlab_debugger` plus desktop Debug builds.
+- [x] Task 2 audit: x86/x64 four-slot execution and write/access watchpoints were already implemented; platform docs and ledger now describe lifecycle behavior and read-only watchpoint limits. Debug `hexlab_debugger` and desktop-components builds passed; no tests/runtime validation.
 - [ ] Task 3 implementation, review, and loader/decompiler/CLI Debug builds.
 - [ ] Integrated source review, capability-ledger update, final builds, and push.
