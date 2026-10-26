@@ -146,6 +146,16 @@ automatic library naming remain future work.
 
 ## FLAIR text patterns
 
+The desktop **Analysis → Scan FLAIR Catalog and Browse Results** workflow
+imports `.pat`, gzip-wrapped `.pat.gz`, and binary `.sig` catalogs (versions
+5–10), then scans the active writable project’s recovered functions. The
+results window reports catalog provenance, parsed pattern count, target, scan
+completeness, comparison counts, and candidate names with provenance. Ambiguous
+entries are marked explicitly. Recognition evidence is stored in the project’s
+analysis cache and the scan can be repeated after changing catalogs or project
+analysis. This workflow does not rename functions. It displays up to 2,000
+entries per scan report; the project evidence retains the full bounded result.
+
 The analysis API also imports the human-readable FLAIR `.pat` format with
 `parse_flirt_pat`. The caller supplies the architecture, execution mode, and
 catalog provenance because `.pat` lines do not carry those fields. Each
