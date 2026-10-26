@@ -54,7 +54,15 @@ class descriptor, method name, and prototype. This preserves code-unit-relative
 branch offsets and prevents instructions in different methods from sharing
 addresses. Packed/sparse switch payloads are validated from the referring
 instruction and their targets remain in that method's address space. The
-loader exposes parsed debug metadata to `inspect` and project inspection; it
+validator requires the complete payload and every case target to stay in the
+same initialized executable method mapping; a case must have a complete code
+unit and cannot point inside its own payload. Validated tables retain the
+payload's original file offset and byte extent. Each case retains the source
+file offsets of its key and target words (packed keys derive from the shared
+`first_key` word). These offsets are reconstructed from the source image when
+an instruction is loaded from the derived cache.
+
+The loader exposes parsed debug metadata to `inspect` and project inspection; it
 does not import DEX classes, methods, or strings into the shared symbol/type
 model. Source rows use byte offsets in the method address space; local scopes
 are half-open byte ranges. Parameter names are retained in prototype order,

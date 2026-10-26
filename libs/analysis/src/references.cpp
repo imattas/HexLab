@@ -2352,7 +2352,7 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                         memory->base->index == 31 || memory->base->width != 64 || i >= instruction.access.size())
                         continue;
                     const auto base = registers.find(memory->base->index);
-                    if (base == registers.end())
+                    if (base == registers.end() || base->second.space != instruction.address.space)
                         continue;
                     const auto add_magnitude = [](std::uint64_t value, std::uint64_t magnitude,
                                                   bool subtract) -> std::optional<std::uint64_t> {

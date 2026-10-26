@@ -4,6 +4,7 @@
 #include "hexlab/image/metadata.hpp"
 
 #include <optional>
+#include <string>
 
 namespace hexlab {
 
@@ -21,7 +22,8 @@ struct SwitchCase {
 enum class SwitchEntryEncoding {
     absolute_pointer,
     signed_offset_from_table,
-    thumb_scaled_pc_relative
+    thumb_scaled_pc_relative,
+    signed_offset_from_target_base
 };
 
 struct SwitchSite {
@@ -30,6 +32,9 @@ struct SwitchSite {
     RegisterOperand selector{RegisterBank::gpr, 0, 0, false};
     std::uint8_t scale = 0;
     SwitchEntryEncoding entry_encoding = SwitchEntryEncoding::absolute_pointer;
+    // Present when the encoded signed displacement uses a separately
+    // materialized code base instead of the table address.
+    std::optional<Address> target_base;
     std::vector<SwitchCase> cases;
     // Present only when an unsigned compare/branch proves a case count and
     // default destination for the dispatch. Counts are in [1, 4096]; cases may
@@ -39,6 +44,7 @@ struct SwitchSite {
     // False means the table ended at an invalid/unreadable value or the scan
     // reached its hard entry limit; the recovered prefix remains usable.
     bool complete = true;
+    std::optional<std::string> incomplete_reason;
     bool operator==(const SwitchSite &) const = default;
 };
 
@@ -65,9 +71,10 @@ struct SwitchAnalysis {
 // AUIPC[/ADDI]/SLLI/ADD/LW/ADD/JALR form resolves signed 32-bit offsets
 // relative to the table base. A proven adjacent SLTIU/BEQ guard can bound
 // either table; arbitrary register-value propagation remains unsupported.
-// AArch64 also recognizes
-// contiguous ADR/LDR/BR and ADRP/ADD/LDR/BR sequences
-// when ADR/ADRP and ADD resolve the table base and LDR indexes 64-bit absolute
+// AArch64 also recognizes contiguous ADR/LDR/BR and ADRP/ADD/LDR/BR
+// absolute-pointer sequences, and a contiguous LDRSW/ADR/ADD/BR form in
+// which signed entries use a separately resolved code base.
+// ADR/ADRP and ADD resolve the table base and LDR indexes 64-bit absolute
 // pointers with a 64-bit register shifted by three. Every form reads
 // at most 4096 entries. Targets must decode as instructions in executable,
 // file-backed image bytes. Recovery is limited to recognized instruction

@@ -1471,11 +1471,11 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 const auto carry = boolean_binary("bit_extract", wide_sum, constant_expr(8, 9));
                 const auto zero = boolean_binary("eq", result_byte, constant_expr(0, 8));
                 const auto negative = boolean_binary("bit_extract", result_byte, constant_expr(7, 8));
-                auto sign_inputs = binary("and", binary(subtract ? "xor" : "and",
-                    subtract ? binary("xor", lhs, rhs) :
-                        std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"bitnot", binary("xor", lhs, rhs)}}),
-                    binary("xor", lhs, result_byte)), constant_expr(0x80, 8));
-                const auto overflow = boolean_binary("bit_extract", sign_inputs, constant_expr(7, 8));
+                const auto operand_signs = binary("xor", lhs, rhs);
+                const auto overflow_signs = subtract ? operand_signs :
+                    std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"bitnot", operand_signs}});
+                const auto overflow_bits = binary("and", overflow_signs, binary("xor", lhs, result_byte));
+                const auto overflow = boolean_binary("bit_extract", overflow_bits, constant_expr(7, 8));
                 const auto preserved = binary("and", status_value, constant_expr(0x3c, 8));
                 const auto binary_status = binary("or",
                     binary("or", binary("or", preserved, bit(carry, 0)), bit(zero, 1)),

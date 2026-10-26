@@ -20,6 +20,8 @@ std::uint32_t le32(std::uint16_t a, std::uint16_t b) { return std::uint32_t(a) |
 }
 
 DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
+    if (at.offset & 1)
+        return fail(DecodeStatus::invalid, "DEX instruction address is not code-unit aligned");
     std::uint16_t first = 0;
     if (!code_unit(bytes, 0, first)) return fail(DecodeStatus::truncated, "truncated DEX code unit");
     const auto op = std::uint8_t(first & 0xff), hi = std::uint8_t(first >> 8);

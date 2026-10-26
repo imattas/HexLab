@@ -529,6 +529,9 @@ struct ArmInstructionInfo {
 struct DexSwitchCase {
     std::int32_t value = 0;
     Address target{{0}, 0};
+    // Source bytes in the DEX file. Packed keys all derive from first_key;
+    // sparse keys each have their own source word.
+    FileOffset key_source{0}, target_source{0};
     bool operator==(const DexSwitchCase &) const = default;
 };
 struct DexSwitchTable {
@@ -537,6 +540,8 @@ struct DexSwitchTable {
     // True only after the payload has been read and validated against source bytes.
     bool validated = false;
     std::vector<DexSwitchCase> cases;
+    FileOffset payload_source{0};
+    std::uint32_t payload_bytes = 0;
     bool operator==(const DexSwitchTable &) const = default;
 };
 struct JvmSwitchCase {
