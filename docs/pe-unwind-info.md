@@ -2,14 +2,16 @@
 
 The PE exception-directory reader decodes x64 runtime-function entries and their version 1 `UNWIND_INFO`. Each runtime range retains source provenance and a normalized prolog-operation list. The decoder covers `PUSH_NONVOL`, both `ALLOC_LARGE` encodings, `ALLOC_SMALL`, `SET_FPREG`, `SAVE_NONVOL` and `_FAR`, `SAVE_XMM128` and `_FAR`, and `PUSH_MACHFRAME`. Handler records and chained runtime-function records are retained, and chained metadata is decoded recursively with cycle and depth checks.
 
-The exception table is committed as one metadata batch: malformed bounds, flags, operation slots, handler references, language payload records, or chains reject the table rather than publishing a partial result. Directory rows must have strictly increasing starts and non-overlapping extents. Within each version-one `UNWIND_INFO`, a nonzero frame-register field must have exactly one `UWOP_SET_FPREG`; a zero frame-register field must have none. Parsed runtime ranges can seed function discovery. The metadata is descriptive; it does not evaluate unwind operations against a live register context or execute target handlers.
+The exception table is committed as one metadata batch: malformed bounds, flags, operation slots, handler references, language payload records, or chains reject the table rather than publishing a partial result. Directory rows must have strictly increasing starts and non-overlapping extents. The recorded prolog length must fit inside its owning runtime-function extent, including for chained unwind records. Within each version-one `UNWIND_INFO`, a nonzero frame-register field must have exactly one `UWOP_SET_FPREG`; a zero frame-register field must have none. Parsed runtime ranges can seed function discovery. The metadata is descriptive; it does not evaluate unwind operations against a live register context or execute target handlers.
 
 For AMD64, the loader resolves handler identity only from an exact named export at the handler RVA or a canonical `FF 25 rel32` import thunk (optionally preceded by `ENDBR64`) whose computed slot exactly matches a parsed named import. When that identity is `__C_specific_handler`, its DWORD count and 16-byte scope records are decoded. Count, a 1 MiB payload budget, and table extent are bounded by the image; scope ranges must lie inside the owning runtime-function range, and nonzero filter/finally and jump targets must point to initialized executable bytes. Every record keeps its source spans. A malformed recognized table rejects the whole exception directory atomically.
 
 For a resolved `__CxxFrameHandler3`, the loader decodes the fixed 40-byte
 `FuncInfo` header (magic `0x19930522`) and its
 bounded unwind map, try-block map, handler arrays, IP-to-state map, and optional
-exception-specification type list. State predecessors, try/catch ranges,
+exception-specification type list. The FuncInfo EHFlags word retains its source
+and names the `/EHs`, dynamic-stack-alignment, and noexcept bits while keeping
+unknown bits explicit. State predecessors, try/catch ranges,
 relative type and handler pointers, type-descriptor strings, and nonzero cleanup
 action RVAs are validated. Source spans are retained for decoded rows and
 referenced TypeDescriptors. The 1 MiB per-function C++ metadata budget includes

@@ -27,9 +27,46 @@ std::string hex_thread_token(std::uint64_t value) {
 }
 
 struct TargetRegister { std::string name, group; std::size_t number = 0, bits = 0; };
-struct TargetDescription { Architecture architecture = Architecture::unknown; bool big_endian = false; std::vector<TargetRegister> registers; };
+struct TargetDescription {
+    Architecture architecture = Architecture::unknown;
+    bool big_endian = false;
+    bool endian_declared = false;
+    std::vector<TargetRegister> registers;
+};
 struct RemoteThreadDescription { std::string id, name; ThreadState state = ThreadState::unknown; };
 struct RemoteProcessDescription { std::uint64_t id = 0; std::string command; };
+Architecture target_architecture(std::string_view name) {
+    std::string normalized(name);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (normalized == "i386" || normalized == "i386:x86-32") return Architecture::x86;
+    if (normalized == "i386:x86-64" || normalized == "i386:x86_64" ||
+        normalized == "i386:x86-64:intel" || normalized == "i386:x64-32")
+        return Architecture::x86_64;
+    if (normalized == "aarch64" || normalized == "aarch64_be" || normalized.starts_with("aarch64:") ||
+        normalized == "aarch64: little endian" || normalized == "aarch64: big endian")
+        return Architecture::arm64;
+    if (normalized == "arm" || normalized.starts_with("armv") || normalized.starts_with("arm:"))
+        return Architecture::arm;
+    if (normalized == "riscv32" || normalized.starts_with("riscv:rv32")) return Architecture::riscv32;
+    if (normalized == "riscv64" || normalized.starts_with("riscv:rv64")) return Architecture::riscv64;
+    if (normalized == "mips64" || normalized.starts_with("mips64:") ||
+        normalized.starts_with("mips:isa64") || normalized.starts_with("mips:64"))
+        return Architecture::mips64;
+    if (normalized == "mips32" || normalized.starts_with("mips32:") ||
+        normalized.starts_with("mips:isa32") || normalized.starts_with("mips:32"))
+        return Architecture::mips32;
+    if (normalized == "powerpc" || normalized.starts_with("powerpc:") ||
+        normalized == "ppc" || normalized.starts_with("ppc:"))
+        return Architecture::powerpc;
+    return Architecture::unknown;
+}
+std::optional<bool> target_architecture_endian(std::string_view name) {
+    if (name == "aarch64_be" || name == "aarch64: big endian") return true;
+    if (name == "aarch64: little endian") return false;
+    return std::nullopt;
+}
 bool xml_name_char(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == ':' || c == '.'; }
 bool valid_thread_wire_id(std::string_view value) {
     const auto positive_id = [](std::string_view text) {
@@ -517,8 +554,13 @@ Status parse_target_xml_document(std::string_view xml, TargetXmlContext& context
             return Error{ErrorCode::unsupported, "unsupported target XML include namespace"};
         if (tag == "target") {
             if (const auto endian = attrs.find("endian"); endian != attrs.end()) {
-                if (endian->second == "big") out.big_endian = true;
-                else if (endian->second != "little") return Error{ErrorCode::malformed, "unknown target XML byte order"};
+                const bool big_endian = endian->second == "big";
+                if (endian->second != "big" && endian->second != "little")
+                    return Error{ErrorCode::malformed, "unknown target XML byte order"};
+                if (out.endian_declared && out.big_endian != big_endian)
+                    return Error{ErrorCode::malformed, "target XML contains conflicting byte-order declarations"};
+                out.big_endian = big_endian;
+                out.endian_declared = true;
             }
         } else if (tag == "feature") {
             const auto name = attrs.find("name"); if (name == attrs.end() || name->second.empty()) return Error{ErrorCode::malformed, "target XML feature has no name"};
@@ -548,12 +590,18 @@ Status parse_target_xml_document(std::string_view xml, TargetXmlContext& context
             auto name = xml.substr(pos, close - pos);
             while (!name.empty() && std::isspace(static_cast<unsigned char>(name.front()))) name.remove_prefix(1);
             while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back()))) name.remove_suffix(1);
-            if (name == "i386:x86-64" || name == "i386:x86_64") out.architecture = Architecture::x86_64;
-            else if (name == "i386" || name == "i386:x86-32") out.architecture = Architecture::x86;
-            else if (name == "aarch64" || name == "aarch64: little endian") out.architecture = Architecture::arm64;
-            else if (name == "arm" || name.starts_with("armv")) out.architecture = Architecture::arm;
-            else if (name.starts_with("riscv:rv64") || name == "riscv64") out.architecture = Architecture::riscv64;
-            else out.architecture = Architecture::unknown;
+            const auto architecture = target_architecture(name);
+            if (architecture != Architecture::unknown) {
+                if (out.architecture != Architecture::unknown && out.architecture != architecture)
+                    return Error{ErrorCode::malformed, "target XML contains conflicting architecture declarations"};
+                out.architecture = architecture;
+            }
+            if (const auto endian = target_architecture_endian(name)) {
+                if (out.endian_declared && out.big_endian != *endian)
+                    return Error{ErrorCode::malformed, "target XML architecture conflicts with its byte-order declaration"};
+                out.big_endian = *endian;
+                out.endian_declared = true;
+            }
             if (stack.size() >= 64) return Error{ErrorCode::resource_limit, "target XML nesting exceeds 64"};
             stack.push_back(tag);
             pos = close; continue;

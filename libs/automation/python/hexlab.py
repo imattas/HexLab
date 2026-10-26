@@ -1696,6 +1696,24 @@ class DebuggerSession:
         """Connect through HexLab's GDB Remote Serial Protocol backend."""
         return self._call("connect_remote", host, port)
 
+    def attach_remote_process(self, process_id):
+        """Select another inferior from a multiprocess extended-remote session.
+
+        The ID must come from ``processes()``. A successful selection replaces
+        the active inferior and any pending stop event for the previous one.
+        """
+        _unsigned(process_id, "process_id")
+        if process_id == 0:
+            raise ValueError("process_id must be nonzero")
+        return self._call("attach_remote_process", process_id)
+
+    def detach_remote_process(self, process_id):
+        """Detach a secondary listed inferior while retaining the active one."""
+        _unsigned(process_id, "process_id")
+        if process_id == 0:
+            raise ValueError("process_id must be nonzero")
+        return self._call("detach_remote_process", process_id)
+
     def wait_event(self, timeout_ms=1000, *, cancel=None):
         """Wait for a debugger event; an optional token cancels the wait promptly."""
         if cancel is None:
@@ -1911,6 +1929,7 @@ class DebuggerWorker:
     """
     _METHODS = frozenset({
         "state", "processes", "launch", "attach", "connect_remote",
+        "attach_remote_process", "detach_remote_process",
         "continue_event", "single_step", "interrupt", "terminate", "detach",
         "read_memory", "write_memory", "evaluate_expression", "search_memory",
         "threads", "thread_run_states", "resume_threads", "modules",
@@ -2167,6 +2186,8 @@ class DebuggerWorker:
             if method in self._ACK_METHODS:
                 if not args or self._pending_sequence is None or args[0] != self._pending_sequence:
                     raise ValueError("event sequence does not identify the worker's current pending stop")
+            if method == "attach_remote_process" and self._pending_sequence is not None:
+                raise ValueError("acknowledge the worker's pending stop event before selecting another remote process")
             call_args = list(args)
             call_kwargs = dict(kwargs)
             if method == "search_memory":

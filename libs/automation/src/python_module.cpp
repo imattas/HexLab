@@ -505,6 +505,16 @@ PyObject* call_debugger(PyObject*,PyObject* args){return guarded([&]()->PyObject
     }
     if(method=="attach"){count(values,1);const auto process_id=number(argument(values,0));auto process=without_gil([&]{return session.attach(process_id);});return encode_process(take(std::move(process)));}
     if(method=="connect_remote"){count(values,2);auto port=number32(argument(values,1));if(port==0||port>65535)invalid("remote port must be in 1..65535");const auto host=text(argument(values,0));auto process=without_gil([&]{return session.connect_remote(host,static_cast<std::uint16_t>(port));});return encode_process(take(std::move(process)));}
+    if(method=="attach_remote_process"){
+        count(values,1);auto* raw_id=argument(values,0);if(PyBool_Check(raw_id))invalid("remote process ID must be an unsigned integer, not bool");
+        const auto process_id=number(raw_id);if(process_id==0)invalid("remote process ID must be nonzero");
+        auto process=without_gil([&]{return session.attach_remote_process(process_id);});return encode_process(take(std::move(process)));
+    }
+    if(method=="detach_remote_process"){
+        count(values,1);auto* raw_id=argument(values,0);if(PyBool_Check(raw_id))invalid("remote process ID must be an unsigned integer, not bool");
+        const auto process_id=number(raw_id);if(process_id==0)invalid("remote process ID must be nonzero");
+        take(without_gil([&]{return session.detach_remote_process(process_id);}));return none();
+    }
     if(method=="wait_event"){
         if(PyTuple_Size(values)==1){
             const auto timeout=number(argument(values,0));if(timeout>600000)invalid("event timeout exceeds600000ms");

@@ -325,6 +325,9 @@ Result<std::size_t> read_exception_directory(const Image &image, const Directory
             info.frame_register = static_cast<std::uint8_t>(frame & 0x0fu);
             info.frame_offset = static_cast<std::uint8_t>(frame >> 4);
             require(info.version == 1, "AMD64 UNWIND_INFO version is unsupported", ErrorCode::unsupported);
+            require(function_begin < function_end &&
+                        info.size_of_prolog <= function_end - function_begin,
+                    "AMD64 UNWIND_INFO prolog exceeds its runtime-function extent");
             require((info.flags & ~7u) == 0,
                     "AMD64 UNWIND_INFO has reserved flags");
             require((info.flags & 4u) == 0 || (info.flags & 3u) == 0,
@@ -942,6 +945,10 @@ Result<std::size_t> read_exception_directory(const Image &image, const Directory
                     cxx.unwind_help = reader.integer<std::int32_t>(payload_rva + 28);
                     cxx.es_type_list_rva = reader.integer<std::uint32_t>(payload_rva + 32);
                     cxx.eh_flags = reader.integer<std::int32_t>(payload_rva + 36);
+                    cxx.has_ehs_flag = (static_cast<std::uint32_t>(cxx.eh_flags) & 0x1u) != 0;
+                    cxx.has_dynamic_stack_alignment = (static_cast<std::uint32_t>(cxx.eh_flags) & 0x2u) != 0;
+                    cxx.is_noexcept = (static_cast<std::uint32_t>(cxx.eh_flags) & 0x4u) != 0;
+                    cxx.unknown_eh_flags = static_cast<std::uint32_t>(cxx.eh_flags) & ~0x7u;
                     require(cxx.magic == 0x19930522u,
                             "AMD64 C++ FuncInfo magic is unsupported", ErrorCode::unsupported);
                     require(cxx.max_state >= 0 && static_cast<std::uint32_t>(cxx.max_state) <= record_limit,
@@ -973,6 +980,7 @@ Result<std::size_t> read_exception_directory(const Image &image, const Directory
                     std::uint64_t cxx_metadata_bytes = payload_size;
                     payload.status = PeHandlerPayloadStatus::decoded_cxx_func_info;
                     cxx.source = flags_source(payload_rva, 40, 0);
+                    cxx.eh_flags_source = flags_source(payload_rva + 36, 4, 0);
                     payload.source = cxx.source;
                     payload.cxx_func_info = cxx;
                     payload.cxx_func_info->unwind_map.reserve(static_cast<std::size_t>(cxx.max_state));
