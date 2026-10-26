@@ -13,6 +13,7 @@ R lr(unsigned width) { return {RegisterBank::ppc_lr, 0, static_cast<std::uint16_
 R ctr(unsigned width) { return {RegisterBank::ppc_ctr, 0, static_cast<std::uint16_t>(width), false}; }
 R xer() { return {RegisterBank::ppc_xer, 0, 32, false}; }
 R fpr(unsigned index, unsigned bits) { return {RegisterBank::ppc_fpr, static_cast<std::uint8_t>(index), static_cast<std::uint16_t>(bits), false}; }
+R fpscr() { return {RegisterBank::ppc_fpscr, 0, 32, false}; }
 DecodeResult fail(DecodeStatus status, const char *why) { return {status, {}, why}; }
 std::uint32_t word(std::span<const std::byte> bytes, ByteOrder order) {
     std::uint32_t result = 0;
@@ -570,6 +571,50 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             }
         } else {
             return fail(DecodeStatus::unsupported, "PowerPC opcode-31 X-form is outside the enabled integer subset");
+        }
+    } else if (op == 63 && ((w >> 1) & 0x3ff) == 0) {
+        // Floating compare unordered. BF occupies the high three bits of the
+        // nominal FRT field; the remaining two bits are reserved.
+        if (rc || (rt & 3) != 0)
+            return fail(DecodeStatus::invalid, "PowerPC FCMPU has reserved fields set");
+        const auto field = cr((w >> 23) & 7);
+        const auto left = fpr(ra, 64), right = fpr(rb, 64);
+        i.opcode = Opcode::ppc_fcmpu;
+        i.operands = {field, left, right};
+        i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
+        i.register_reads = {left, right, fpscr()};
+        i.register_writes = {field, fpscr()};
+    } else if (op == 63 && ((w >> 1) & 0x3ff) == 32) {
+        // Floating compare ordered has the same operands/results as FCMPU,
+        // but its signaling-NaN/quiet-NaN exception behavior differs.
+        if (rc || (rt & 3) != 0)
+            return fail(DecodeStatus::invalid, "PowerPC FCMPO has reserved fields set");
+        const auto field = cr((w >> 23) & 7);
+        const auto left = fpr(ra, 64), right = fpr(rb, 64);
+        i.opcode = Opcode::ppc_fcmpo;
+        i.operands = {field, left, right};
+        i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
+        i.register_reads = {left, right, fpscr()};
+        i.register_writes = {field, fpscr()};
+    } else if (op == 63 && (((w >> 1) & 0x3ff) == 12 || ((w >> 1) & 0x3ff) == 40 ||
+                            ((w >> 1) & 0x3ff) == 72 || ((w >> 1) & 0x3ff) == 264)) {
+        const auto xo10 = (w >> 1) & 0x3ff;
+        if (rc)
+            return fail(DecodeStatus::unsupported, "PowerPC floating Rc forms require modeled FPSCR-to-CR1 effects");
+        if (ra != 0)
+            return fail(DecodeStatus::invalid, "PowerPC unary floating instruction has nonzero reserved fields");
+        const auto opcode = xo10 == 12 ? Opcode::ppc_frsp : xo10 == 40 ? Opcode::ppc_fneg :
+                            xo10 == 72 ? Opcode::ppc_fmr : Opcode::ppc_fabs;
+        const auto destination = fpr(rt, 64);
+        const auto source = fpr(rb, 64);
+        i.opcode = opcode;
+        i.operands = {destination, source};
+        i.access = {OperandAccess::write, OperandAccess::read};
+        i.register_writes = {destination};
+        i.register_reads = {source};
+        if (opcode == Opcode::ppc_frsp) {
+            i.register_reads.push_back(fpscr());
+            i.register_writes.push_back(fpscr());
         }
     } else if (op == 59 || op == 63) {
         const unsigned xo = (w >> 1) & 31;

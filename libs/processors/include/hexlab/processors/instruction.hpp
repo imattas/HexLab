@@ -12,7 +12,7 @@
 namespace hexlab {
 enum class DecodeStatus { decoded, unsupported, invalid, truncated };
 enum class FlowKind { fallthrough, call, conditional_branch, jump, ret, trap, switch_dispatch };
-enum class RegisterBank { gpr, ip, flags, segment, arm32_gpr, arm64_gpr, arm64_sp, arm64_zero, arm_flags, riscv_gpr, mips_gpr, mos6502, mips_hilo, mips_cp0, x87, ppc_gpr, ppc_cr, ppc_lr, ppc_ctr, xmm, riscv_fpr, riscv_fstatus, mips_fpr, mips_fcsr, cil_stack, ymm, riscv_vpr, riscv_vcsr, cil_continuation, ppc_xer, x87_status, x87_control, x87_tag, arm64_simd, dex_vreg, jvm_local, wasm_stack, mxcsr, zmm, opmask, ppc_fpr, jvm_stack };
+enum class RegisterBank { gpr, ip, flags, segment, arm32_gpr, arm64_gpr, arm64_sp, arm64_zero, arm_flags, riscv_gpr, mips_gpr, mos6502, mips_hilo, mips_cp0, x87, ppc_gpr, ppc_cr, ppc_lr, ppc_ctr, xmm, riscv_fpr, riscv_fstatus, mips_fpr, mips_fcsr, cil_stack, ymm, riscv_vpr, riscv_vcsr, cil_continuation, ppc_xer, x87_status, x87_control, x87_tag, arm64_simd, dex_vreg, jvm_local, wasm_stack, mxcsr, zmm, opmask, ppc_fpr, jvm_stack, ppc_fpscr };
 enum class Opcode {
     mov,
     movzx,
@@ -356,6 +356,8 @@ enum class Opcode {
     ppc_lfs, ppc_lfd, ppc_stfs, ppc_stfd,
     ppc_fadds, ppc_fsubs, ppc_fmuls, ppc_fdivs,
     ppc_fadd, ppc_fsub, ppc_fmul, ppc_fdiv,
+    // Appended scalar PowerPC floating-point operations.
+    ppc_fcmpu, ppc_fcmpo, ppc_fmr, ppc_fneg, ppc_fabs, ppc_frsp,
     // MIPS64 COP1 branch-likely forms, appended for persisted opcode stability.
     mips64_bc1tl, mips64_bc1fl,
     // AArch64 conditional selects and scalar division; appended for cache stability.

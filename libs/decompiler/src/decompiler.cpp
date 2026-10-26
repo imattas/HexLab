@@ -314,6 +314,8 @@ std::string register_name(RegisterOperand reg) {
         return "f" + std::to_string(reg.index);
     if (reg.bank == RegisterBank::ppc_fpr)
         return "f" + std::to_string(reg.index);
+    if (reg.bank == RegisterBank::ppc_fpscr)
+        return "fpscr";
     if (reg.bank == RegisterBank::mips_fcsr)
         return "fcsr";
     if (reg.bank == RegisterBank::riscv_fstatus)
@@ -3328,7 +3330,7 @@ std::string expression_text(const Expression &expression) {
             return value.operation + "(" + operand + ")";
         } else if constexpr (std::is_same_v<T, BinaryValue>) {
             if (value.operation == "a64_udiv" || value.operation == "a64_sdiv" ||
-                value.operation.rfind("wasm_", 0) == 0)
+                value.operation.rfind("wasm_", 0) == 0 || value.operation.rfind("ppc_fcmp_", 0) == 0)
                 return value.operation + "(" + expression_text(*value.left) + ", " +
                        expression_text(*value.right) + ")";
             if (value.operation == "frem" || value.operation == "fcgt_un" || value.operation == "fclt_un" ||
