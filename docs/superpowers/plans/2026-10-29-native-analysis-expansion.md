@@ -24,6 +24,8 @@
 
 ## Progress
 
+- Resolved indirect-call prototype propagation now requires exact caller/target ABI identity after a bounded unique in-set address proof. Windows Debug `hexlab_decompiler` build passed; no tests run.
+
 - [x] Task 1: ARM64 static Mach-O linking, including a generic API entry point and retained compatibility wrapper.
 - [x] Task 2: fixed-point CIL stack flow with exact stack-shape validation and loop/join phis.
 - [x] Task 3: PPC32/PPC64/MIPS64 cross-architecture reference propagation through the bounded CFG analysis.
