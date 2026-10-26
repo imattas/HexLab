@@ -635,6 +635,43 @@ std::optional<CallingConvention> classifier_convention(const AbiDescription &abi
     return {};
 }
 
+struct HiddenResultPointerInfo {
+    RegisterOperand reg;
+    types::TypePtr pointer_type;
+};
+
+std::optional<HiddenResultPointerInfo> hidden_result_pointer_info(
+    const AbiDescription &abi, const types::TypePtr &result_type) {
+    if (!result_type || (abi.name != "x86-64 System V" && abi.name != "AArch64 AAPCS64"))
+        return {};
+    const auto result = unqualified_type(result_type);
+    if (!result || (result->kind() != types::Kind::structure && result->kind() != types::Kind::array) ||
+        !result->size() || *result->size() == 0)
+        return {};
+    const auto convention = classifier_convention(abi);
+    if (!convention) return {};
+    auto signature = types::Type::function(result_type, {}, false);
+    if (!signature) return {};
+    const auto classified = classify_abi_signature(*convention, *signature.value());
+    if (!classified.result.supported || !classified.result.indirect ||
+        !classified.hidden_result_pointer.supported ||
+        !classified.hidden_result_pointer.indirect ||
+        classified.hidden_result_pointer.locations.size() != 1 || !classified.pointer_size)
+        return {};
+    const auto &location = classified.hidden_result_pointer.locations.front();
+    if (location.kind != AbiLocationKind::register_ ||
+        location.role != AbiLocationRole::hidden_result_argument || location.duplicate ||
+        location.value_offset != 0 || location.size != classified.pointer_size ||
+        (location.placement_size && location.placement_size != classified.pointer_size))
+        return {};
+    const auto reg = classified_register(location.register_name);
+    if (!reg || reg->width != static_cast<std::uint16_t>(classified.pointer_size * 8)) return {};
+    const auto pointer_type = types::Type::pointer(result_type, classified.pointer_size,
+                                                    classified.pointer_size);
+    if (!pointer_type) return {};
+    return HiddenResultPointerInfo{*reg, pointer_type.value()};
+}
+
 std::vector<AbiArgumentSlot> aapcs64_prototype_slots(const types::TypePtr &prototype) {
     std::vector<AbiArgumentSlot> slots;
     if (!prototype || prototype->kind() != types::Kind::function || prototype->parameters().size() > 256)
@@ -3501,6 +3538,11 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
             if (!add_register(reg)) return Error{ErrorCode::resource_limit, "Interprocedural ABI register map exceeds its budget"};
         if (abis[i].stack_argument_base && !add_register(*abis[i].stack_argument_base))
             return Error{ErrorCode::resource_limit, "Interprocedural ABI stack-base register exceeds its budget"};
+        if (explicit_prototypes[i]) {
+            const auto hidden = hidden_result_pointer_info(abis[i], explicit_prototypes[i]->result_type());
+            if (hidden && !add_register(hidden->reg))
+                return Error{ErrorCode::resource_limit, "Interprocedural hidden-result register map exceeds its budget"};
+        }
     }
 
     struct ExternalCallee {
@@ -3563,6 +3605,10 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                                   external.abi.vector_return_register})
             if (result && !add_external_register(*result))
                 return Error{ErrorCode::resource_limit, "External call ABI register map exceeds its 256-register budget"};
+        if (const auto hidden = hidden_result_pointer_info(external.abi,
+                                                           external.prototype->result_type());
+            hidden && !add_external_register(hidden->reg))
+            return Error{ErrorCode::resource_limit, "External hidden-result register map exceeds its 256-register budget"};
     }
 
     // An indirect target is usable only when its value is proven to be one
@@ -3946,6 +3992,8 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                     call->result_type = type;
                 else if (target_abi->name == "AArch64 AAPCS64" && aapcs64_hfa_return_pieces(type))
                     call->result_type = type;
+                else if (hidden_result_pointer_info(*target_abi, type))
+                    call->result_type = type;
             }
         }
 
@@ -3963,6 +4011,18 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
             std::map<Key, KnownTypedRegister> typed_argument_candidates;
             std::set<Key> ambiguous_typed_arguments;
             bool typed_argument_budget_exhausted = false;
+            if (explicit_prototypes[i]) {
+                const auto hidden = hidden_result_pointer_info(
+                    abis[i], explicit_prototypes[i]->result_type());
+                if (hidden) {
+                    const RegisterValue incoming{hidden->reg, 0};
+                    const auto incoming_key = key(incoming.reg, incoming.version);
+                    typed_argument_candidates.emplace(incoming_key,
+                        KnownTypedRegister{incoming, hidden->pointer_type});
+                    known_input_keys.insert(incoming_key);
+                    known_inputs.push_back(incoming);
+                }
+            }
             for (const auto &block : converted.value().blocks) for (std::size_t instruction_index = 0;
                     instruction_index < block.instructions.size(); ++instruction_index) {
                 const auto &instruction = block.instructions[instruction_index];
@@ -4053,6 +4113,26 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                         actual_key, KnownTypedRegister{*actual, parameter_type});
                     if (!inserted && !same_type(candidate->second.type, parameter_type))
                         ambiguous_typed_arguments.insert(actual_key);
+                }
+                if (signature) {
+                    const auto hidden = hidden_result_pointer_info(*target_abi, signature->result_type());
+                    if (hidden) {
+                        const auto actual = std::find_if(call->register_inputs.begin(), call->register_inputs.end(),
+                            [&](const RegisterValue &value) { return value.reg == hidden->reg; });
+                        if (actual != call->register_inputs.end()) {
+                            const auto actual_key = key(actual->reg, actual->version);
+                            if (known_input_keys.insert(actual_key).second) known_inputs.push_back(*actual);
+                            if (!typed_argument_candidates.contains(actual_key) &&
+                                typed_argument_candidates.size() >= 4096) {
+                                typed_argument_budget_exhausted = true;
+                            } else {
+                                const auto [candidate, inserted] = typed_argument_candidates.emplace(
+                                    actual_key, KnownTypedRegister{*actual, hidden->pointer_type});
+                                if (!inserted && !same_type(candidate->second.type, hidden->pointer_type))
+                                    ambiguous_typed_arguments.insert(actual_key);
+                            }
+                        }
+                    }
                 }
             }
             std::vector<KnownTypedRegister> known_argument_types;
