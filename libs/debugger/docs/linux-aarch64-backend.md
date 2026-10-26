@@ -20,7 +20,8 @@ separate debugger daemon. The x86-64 host build continues to select
   exit. Cloned TIDs are range-checked and the configured thread limit is
   enforced before waiting for the child's initial ptrace stop.
 - Reading and writing `x0` through `x30`, `sp`, `pc`, and `pstate` through the Linux
-  `NT_PRSTATUS` regset.
+  `NT_PRSTATUS` regset. `w0` through `w30` and `wsp` expose their low 32-bit
+  aliases; `fp` and `lr` alias `x29` and `x30`.
 - Process and thread listing, and ptrace memory reads and writes.
 - Reading and writing the fixed Linux `NT_FPREGSET` FPSIMD view (`v0` through `v31`,
   `fpsr`, and `fpcr`) when the kernel exposes it. Scalar `d0` through `d31`
@@ -41,10 +42,14 @@ that helper returns `regs->pc`. The ptrace `NT_PRSTATUS` GPR view exposes the
 same PC field, so breakpoint matching and rewind use the BRK instruction's
 address directly.
 
-The register interface reports each general register as an eight-byte value
-with explicit little-endian metadata, including when optional vector state is
-unavailable. This also makes general registers usable by watch and breakpoint
-condition expressions. The build requires an LP64 little-endian AArch64 host;
+The register interface reports each full general register as an eight-byte
+value and each W alias as a four-byte value, with explicit little-endian
+metadata, including when optional vector state is unavailable. A W write
+zero-extends into its X register, and a WSP write zero-extends into SP. A
+write batch rejects two names for the same underlying general register (such
+as `x29` and `fp`, or `x0` and `w0`) before changing target state. PC writes
+must be four-byte aligned. This also makes general registers usable by watch
+and breakpoint condition expressions. The build requires an LP64 little-endian AArch64 host;
 other host/tracee byte orders and ILP32 tracer builds are unsupported.
 
 D-register writes update the low eight bytes of the existing V/Z payload and

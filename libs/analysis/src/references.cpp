@@ -2354,7 +2354,73 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                     const auto base = registers.find(memory->base->index);
                     if (base == registers.end())
                         continue;
-                    const auto target = riscv_add(base->second.offset, memory->displacement, 64);
+                    const auto add_magnitude = [](std::uint64_t value, std::uint64_t magnitude,
+                                                  bool subtract) -> std::optional<std::uint64_t> {
+                        if (subtract) {
+                            if (magnitude > value) return {};
+                            return value - magnitude;
+                        }
+                        if (magnitude > UINT64_MAX - value) return {};
+                        return value + magnitude;
+                    };
+                    const auto add_displacement = [&](std::uint64_t value, std::int64_t displacement) {
+                        const bool subtract = displacement < 0;
+                        const auto magnitude = subtract
+                            ? static_cast<std::uint64_t>(-(displacement + 1)) + 1
+                            : static_cast<std::uint64_t>(displacement);
+                        return add_magnitude(value, magnitude, subtract);
+                    };
+                    auto target_offset = add_displacement(base->second.offset, memory->displacement);
+                    if (!target_offset)
+                        continue;
+                    if (memory->index) {
+                        const auto &index = *memory->index;
+                        if (memory->scale != 1 || memory->index_shift_amount >= 64 ||
+                            (index.bank != RegisterBank::arm64_gpr && index.bank != RegisterBank::arm64_zero) ||
+                            (index.width != 32 && index.width != 64) ||
+                            (index.bank == RegisterBank::arm64_zero && index.index != 31) ||
+                            (index.bank == RegisterBank::arm64_gpr && index.index == 31))
+                            continue;
+                        std::uint64_t raw_index = 0;
+                        if (index.bank == RegisterBank::arm64_gpr) {
+                            const auto known = registers.find(index.index);
+                            if (known == registers.end() || known->second.space != instruction.address.space)
+                                continue;
+                            raw_index = known->second.offset;
+                        }
+                        bool negative_index = false;
+                        std::uint64_t index_magnitude = 0;
+                        if (memory->index_extend == "sxtw") {
+                            if (index.width != 32) continue;
+                            const auto signed_index = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(raw_index));
+                            negative_index = signed_index < 0;
+                            index_magnitude = negative_index
+                                ? static_cast<std::uint64_t>(-(static_cast<std::int64_t>(signed_index) + 1)) + 1
+                                : static_cast<std::uint64_t>(signed_index);
+                        } else if (memory->index_extend == "sxtx") {
+                            if (index.width != 64) continue;
+                            const auto signed_index = std::bit_cast<std::int64_t>(raw_index);
+                            negative_index = signed_index < 0;
+                            index_magnitude = negative_index
+                                ? static_cast<std::uint64_t>(-(signed_index + 1)) + 1
+                                : static_cast<std::uint64_t>(signed_index);
+                        } else if (memory->index_extend == "uxtw") {
+                            if (index.width != 32) continue;
+                            index_magnitude = static_cast<std::uint32_t>(raw_index);
+                        } else if (memory->index_extend.empty()) {
+                            if (index.width != 64) continue; // UXTX
+                            index_magnitude = raw_index;
+                        } else {
+                            continue;
+                        }
+                        if (index_magnitude > (UINT64_MAX >> memory->index_shift_amount))
+                            continue;
+                        index_magnitude <<= memory->index_shift_amount;
+                        target_offset = add_magnitude(*target_offset, index_magnitude, negative_index);
+                        if (!target_offset)
+                            continue;
+                    }
+                    const auto target = *target_offset;
                     const auto access_width = std::max<std::uint64_t>(1, (memory->data_width + 7) / 8);
                     const Address address{base->second.space, target};
                     if (riscv_target_segment(*image, address, instruction.access[i], access_width)) {
@@ -2366,8 +2432,7 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                                     return written.bank == destination->bank && written.index == destination->index;
                                 });
                         if (instruction.opcode == Opcode::a64_ldr && instruction.access[i] == OperandAccess::read &&
-                            memory->data_width == 64 && !memory->index && memory->scale == 1 &&
-                            memory->index_extend.empty() && memory->index_shift_amount == 0 && destination_written)
+                            memory->data_width == 64 && destination_written)
                             if (const auto value = static_pointer_load(*image, relocations, address, 64))
                                 loaded_pointer = std::pair{destination->index, *value};
                     }

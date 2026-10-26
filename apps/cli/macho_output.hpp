@@ -317,9 +317,12 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
             out << " address=" << format_location(*row.place, image);
         if (row.file_place)
             out << " field=file:" << macho_hex(row.file_place->value);
-        if (row.target)
-            out << " payload=" << macho_hex(*row.target) << " header-relative=" << row.target_is_offset
-                << " high8=" << macho_hex(row.high8);
+        if (row.target) {
+            out << " payload=" << macho_hex(*row.target) << " header-relative=" << row.target_is_offset;
+            if (m.chained_starts[row.starts].pointer_format == 13)
+                out << " shared-cache-relative=1";
+            out << " high8=" << macho_hex(row.high8);
+        }
         if (row.import_index)
             out << " import-index=" << *row.import_index;
         if (row.import_row)

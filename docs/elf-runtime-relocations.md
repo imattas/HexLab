@@ -39,6 +39,7 @@ ELF64 x86-64, AArch64, PPC64, and RISC-V `ET_DYN` records, with these types:
 | AArch64 | `R_AARCH64_JUMP_SLOT` | 1026 | `S` |
 | PPC64 | `R_PPC64_ADDR64` | 38 | `S + A` (low 64 bits) |
 | PPC64 | `R_PPC64_GLOB_DAT` | 20 | `S + A` (low 64 bits) |
+| PPC64 | `R_PPC64_JMP_SLOT` | 21 | `S` |
 | PPC64 | `R_PPC64_RELATIVE` | 22 | `B + A` |
 | RISC-V LP64 | `R_RISCV_32` | 1 | `S + A` (unsigned 32-bit field) |
 | RISC-V LP64 | `R_RISCV_64` | 2 | `S + A` (low 64 bits) |
@@ -76,15 +77,16 @@ applied by this runtime overlay; the separate AArch64 P32/ELF32 profile is not
 implemented.
 
 The little-endian PPC64 ELF64 profile applies `R_PPC64_RELATIVE`,
-`R_PPC64_ADDR64`, and `R_PPC64_GLOB_DAT` from dynamic RELA tables. Relative
+`R_PPC64_ADDR64`, `R_PPC64_GLOB_DAT`, and `R_PPC64_JMP_SLOT` from dynamic RELA tables. Relative
 records use `B + A` and require symbol index zero. `ADDR64` and `GLOB_DAT` use
 `S + A` and write the low 64 bits; `GLOB_DAT` addends are retained and applied
 as specified by the PowerPC64 ABI. Targets must be complete, writable,
-initialized eight-byte fields aligned to eight bytes. External symbols use the
+initialized eight-byte fields aligned to eight bytes. `JMP_SLOT` writes the
+resolved symbol address as a scalar pointer; PLT instruction sequences are not
+interpreted. External symbols use the
 same exact caller-supplied dependency and GNU-version binding rules as other
-supported symbol relocations. `R_PPC64_JMP_SLOT` remains unapplied because its
-ABI-defined PLT entry initialization is not modeled as a scalar pointer patch;
-big-endian PPC64 and other PPC64 dynamic relocation types remain skipped.
+supported symbol relocations; big-endian PPC64 and other PPC64 dynamic
+relocation types remain skipped.
 
 ELF64 pointer relocations and `R_X86_64_64` targets must be complete
 eight-byte fields in writable, initialized load memory. The x86-64 `PC32`,

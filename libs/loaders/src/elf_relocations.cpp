@@ -192,6 +192,7 @@ Field field(const ElfHeader &header, std::uint32_t type) {
     if (header.machine == 21 && header.is_64) {
         switch (type) {
         case 20: return {K::global_data, 8}; // R_PPC64_GLOB_DAT
+        case 21: return {K::jump_slot, 8}; // R_PPC64_JMP_SLOT
         case 22: return {K::base_relative, 8}; // R_PPC64_RELATIVE
         case 38: return {K::absolute, 8}; // R_PPC64_ADDR64
         default: break;

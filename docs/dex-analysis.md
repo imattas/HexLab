@@ -3,7 +3,7 @@
 HexLab recognizes standard little-endian DEX versions 035 through 040. The
 bounded loader validates the header and map-list bounds, string/type/prototype/
 field/method/class identifier tables, modified UTF-8 string lengths, encoded
-class-data method lists, and each defined method's `code_item` instruction and
+class-data field/method lists, and each defined method's `code_item` instruction and
 try/catch extents. Ordered typed and catch-all handlers are retained against
 half-open method-relative protected ranges, with checked non-overlap/order and
 aggregate row budgets. Function recovery adds explicit exception successors
@@ -14,8 +14,32 @@ method-relative source rows, parameter names, and local-variable live ranges.
 The interpreter validates register, string, type, and code-address references,
 requires an `end_sequence`, and caps each program at two million opcodes and
 the aggregate retained debug metadata at two million rows/64 MiB. DEX 041
-containers, reverse-endian files, checksum/signature verification, annotations,
-encoded static values, and verifier semantics are not implemented.
+containers, reverse-endian files, checksum/signature verification, annotation
+visibility interpretation, and verifier semantics are not implemented. Class
+static initializers are retained as class/field-linked `encoded_value` trees.
+Scalar payloads retain their DEX tag, encoded width, normalized payload bits, and exact
+file offset; index-valued tags are checked against their identifier table.
+Nested arrays and encoded annotations retain child order, with annotation
+element names represented by string-table indices. Static-value decoding is
+bounded to 250,000 nodes, 64 MiB of accounted metadata, and 64 nesting levels;
+values may not outnumber a class's encoded static fields. Omitted trailing
+entries remain omitted, as in the DEX format; the loader does not synthesize
+language defaults or resolve referenced indices to names.
+
+DEX annotation directories, annotation sets, and parameter annotation-set
+reference lists are also retained. Annotation items are deduplicated by their
+file offset and linked to class definitions, declared fields, declared methods,
+or individual prototype parameters. Each annotation keeps its visibility byte,
+type index, ordered named values, item offset, and value offsets. Directory
+member indexes must be ordered and identify members actually declared by that
+class; annotation-set types and element names must be strictly ordered, and
+parameter reference-list lengths must match the method prototype. The loader
+caps annotation items at 250,000, annotation sets, set entries, directory
+entries, parameter slots, and links at one million each, and annotation model
+accounting at 64 MiB. These counts share the encoded-value 250,000-node,
+64-MiB-accounted, 64-level limits with static initializers. It does not
+interpret build/runtime/system visibility, resolve annotation names, apply
+retention policy, or validate annotation declarations against class semantics.
 
 DEX catch edges are conservative metadata: the analysis does not resolve class
 hierarchies to prune handlers or prove which typed catch receives a thrown

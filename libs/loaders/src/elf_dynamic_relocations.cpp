@@ -368,7 +368,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             const bool riscv64 = riscv && metadata.header.is_64;
             const bool riscv32 = riscv && !metadata.header.is_64;
             const auto relative_type = i386 || x64 ? 8u : arm32 ? 23u : ppc64 ? 22u : riscv ? 3u : 1027u;
-            const auto jump_slot_type = i386 || x64 ? 7u : arm32 ? 22u : riscv ? 5u : 1026u;
+            const auto jump_slot_type = i386 || x64 ? 7u : arm32 ? 22u : ppc64 ? 21u : riscv ? 5u : 1026u;
             const bool ordinary_subset = metadata.header.order == ByteOrder::little &&
                                          ((metadata.header.is_64 &&
                                            (metadata.header.machine == 62 || metadata.header.machine == 183 || ppc64 || riscv64)) ||
@@ -383,7 +383,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             }
             const bool relative = relocation.kind == ElfRelocationKind::base_relative &&
                                   (packed_relative || relocation.type == relative_type);
-            const bool symbol_slot = (!riscv && !ppc64 &&
+            const bool symbol_slot = (!riscv &&
                                       ((relocation.type == (arm32 ? 21u : i386 || x64 ? 6u : 1025u) &&
                                         relocation.kind == ElfRelocationKind::global_data) ||
                                        (relocation.type == jump_slot_type &&
@@ -431,7 +431,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     : x64
                     ? "Supported dynamic types are R_X86_64_64, PC32, 32, 32S, RELATIVE, GLOB_DAT, and JUMP_SLOT"
                     : ppc64
-                    ? "Supported dynamic types are R_PPC64_RELATIVE, GLOB_DAT, and ADDR64"
+                    ? "Supported dynamic types are R_PPC64_RELATIVE, GLOB_DAT, JMP_SLOT, and ADDR64"
                     : "Supported dynamic types are R_AARCH64_ABS64, RELATIVE, GLOB_DAT, and JUMP_SLOT");
                 continue;
             }

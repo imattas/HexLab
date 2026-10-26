@@ -87,6 +87,7 @@ std::pair<std::uint8_t, std::uint8_t> layout(std::uint16_t format) {
     case 1:
     case 9:
     case 12:
+    case 13: // DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE
         return {std::uint8_t{8}, std::uint8_t{8}};
     default:
         return {std::uint8_t{0}, std::uint8_t{0}};
@@ -134,6 +135,21 @@ void pointer_bits(MachOChainedPointer &row, const MachOChainedStarts &starts) {
         row.diversity = static_cast<std::uint16_t>((raw >> 32) & 0xffff);
         row.address_diversity = bool((raw >> 48) & 1);
         row.key = static_cast<std::uint8_t>((raw >> 49) & 3);
+        row.complete = false;
+    } else if (format == 13) {
+        // The target is relative to the dyld shared cache, whose base is not
+        // available from a standalone Mach-O image. Retain the chain and its
+        // exact payload without presenting an image-relative rebase.
+        row.authenticated = bool(raw >> 63);
+        row.next = static_cast<std::uint16_t>((raw >> 52) & 0x7ff);
+        row.target = raw & UINT64_C(0x3ffffffff);
+        if (row.authenticated) {
+            row.diversity = static_cast<std::uint16_t>((raw >> 34) & 0xffff);
+            row.address_diversity = bool((raw >> 50) & 1);
+            row.key = static_cast<std::uint8_t>(((raw >> 51) & 1) ? 2 : 0); // DA or IA.
+        } else {
+            row.high8 = static_cast<std::uint8_t>((raw >> 34) & 0xff);
+        }
         row.complete = false;
     } else {
         row.bind = bool(raw & (UINT64_C(1) << 62));

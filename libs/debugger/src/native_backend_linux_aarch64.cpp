@@ -80,6 +80,24 @@ constexpr std::array<const char*, aarch64_reg_count> names = {
     "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30",
     "sp", "pc", "pstate"};
 struct Aarch64Regs { std::uint64_t value[aarch64_reg_count]{}; };
+struct Aarch64GprName {
+    std::size_t index{};
+    bool low_word{};
+};
+
+std::optional<Aarch64GprName> gpr_name(std::string_view name) {
+    const auto full = std::find_if(names.begin(), names.end(), [&](const char* candidate) { return name == candidate; });
+    if (full != names.end()) return Aarch64GprName{static_cast<std::size_t>(full - names.begin()), false};
+    if (name == "fp") return Aarch64GprName{29, false};
+    if (name == "lr") return Aarch64GprName{30, false};
+    if (name == "wsp") return Aarch64GprName{31, true};
+    if (name.size() < 2 || name.front() != 'w' || (name.size() > 2 && name[1] == '0')) return std::nullopt;
+    std::size_t index{};
+    const auto parsed = std::from_chars(name.data() + 1, name.data() + name.size(), index);
+    if (parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size() || index > 30)
+        return std::nullopt;
+    return Aarch64GprName{index, true};
+}
 struct Aarch64PacMask {
     std::uint64_t data{};
     std::uint64_t instruction{};
@@ -1028,11 +1046,24 @@ public:
     }
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread) override {
         auto valid = require_stopped_thread(thread); if (!valid) return valid.error();
-        auto regs = get_regs(static_cast<pid_t>(thread)); if (!regs) return regs.error(); std::vector<RegisterValue> out; out.reserve(names.size());
+        auto regs = get_regs(static_cast<pid_t>(thread)); if (!regs) return regs.error(); std::vector<RegisterValue> out; out.reserve(names.size() + 34);
         for (std::size_t i = 0; i < names.size(); ++i) {
             RegisterValue r; r.name = names[i]; r.bytes.resize(8); r.byte_order = ByteOrder::little;
             r.group = i == 33 ? "status" : "general";
             std::memcpy(r.bytes.data(), &regs.value().value[i], 8); out.push_back(std::move(r));
+        }
+        for (std::size_t i = 0; i < 31; ++i) {
+            RegisterValue r; r.name = "w" + std::to_string(i); r.bytes.resize(4); r.byte_order = ByteOrder::little;
+            r.group = "general";
+            std::memcpy(r.bytes.data(), &regs.value().value[i], 4); out.push_back(std::move(r));
+        }
+        for (const auto& alias : {std::pair{"wsp", Aarch64GprName{31, true}},
+                                  std::pair{"fp", Aarch64GprName{29, false}},
+                                  std::pair{"lr", Aarch64GprName{30, false}}}) {
+            RegisterValue r; r.name = alias.first; r.bytes.resize(alias.second.low_word ? 4 : 8);
+            r.byte_order = ByteOrder::little; r.group = "general";
+            std::memcpy(r.bytes.data(), &regs.value().value[alias.second.index], r.bytes.size());
+            out.push_back(std::move(r));
         }
         auto append_bytes = [&](std::string name, const std::byte* data, std::size_t size) {
             RegisterValue reg; reg.name = std::move(name); reg.byte_order = ByteOrder::little;
@@ -1106,6 +1137,7 @@ public:
         auto valid = require_stopped_thread(thread); if (!valid) return valid;
         const auto tid = static_cast<pid_t>(thread);
         bool has_gpr = false, has_vector = false, has_sve_specific = false;
+        std::array<bool, aarch64_reg_count> writes_gpr{};
         std::array<bool, 32> writes_v{}, writes_z{}, writes_d{};
         std::set<std::string> seen;
         auto parse_indexed = [](std::string_view name, char prefix, std::size_t count, std::size_t& index) {
@@ -1122,7 +1154,7 @@ public:
                 return Error{ErrorCode::invalid_argument, "AArch64 register writes require little-endian bytes"};
             if (!seen.insert(reg.name).second)
                 return Error{ErrorCode::invalid_argument, "AArch64 register write contains a duplicate register"};
-            const auto gpr = std::find(names.begin(), names.end(), reg.name);
+            const auto gpr = gpr_name(reg.name);
             const auto fp = std::find(fpsimd_names.begin(), fpsimd_names.end(), reg.name);
             const bool status = reg.name == "fpsr" || reg.name == "fpcr";
             std::size_t index{};
@@ -1134,8 +1166,18 @@ public:
             const bool ffr = reg.name == "ffr";
             if (reg.name == "sve_vl" || reg.name == "sve_max_vl")
                 return Error{ErrorCode::unsupported, "SVE vector length metadata is read-only; changing it requires a separate prctl operation"};
-            if (gpr != names.end()) {
-                if (reg.bytes.size() != 8) return Error{ErrorCode::invalid_argument, "AArch64 GPR width mismatch"};
+            if (gpr) {
+                if (reg.bytes.size() != (gpr->low_word ? 4u : 8u))
+                    return Error{ErrorCode::invalid_argument, "AArch64 GPR width mismatch"};
+                if (writes_gpr[gpr->index])
+                    return Error{ErrorCode::invalid_argument, "write one alias for each AArch64 general register"};
+                writes_gpr[gpr->index] = true;
+                if (gpr->index == 32) {
+                    std::uint64_t pc{};
+                    std::memcpy(&pc, reg.bytes.data(), sizeof(pc));
+                    if (pc % 4 != 0)
+                        return Error{ErrorCode::invalid_argument, "AArch64 PC must be four-byte aligned"};
+                }
                 has_gpr = true;
             } else if (fp != fpsimd_names.end()) {
                 if (reg.bytes.size() != 16) return Error{ErrorCode::invalid_argument, "AArch64 FPSIMD register width mismatch"};
@@ -1193,9 +1235,14 @@ public:
         }
         auto gpr_after = gpr_before ? gpr_before.value() : Aarch64Regs{};
         for (const auto& reg : writes) {
-            const auto gpr = std::find(names.begin(), names.end(), reg.name);
-            if (gpr != names.end()) {
-                std::memcpy(&gpr_after.value[static_cast<std::size_t>(gpr - names.begin())], reg.bytes.data(), 8);
+            if (const auto gpr = gpr_name(reg.name)) {
+                if (gpr->low_word) {
+                    std::uint32_t low{};
+                    std::memcpy(&low, reg.bytes.data(), sizeof(low));
+                    gpr_after.value[gpr->index] = low; // Wn/WSP writes zero-extend into Xn/SP.
+                } else {
+                    std::memcpy(&gpr_after.value[gpr->index], reg.bytes.data(), 8);
+                }
                 continue;
             }
         }

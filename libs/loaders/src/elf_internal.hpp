@@ -74,6 +74,7 @@ Result<bool> read_dwarf_info(const ByteStorage &, ElfMetadata &, Budget &, std::
                              std::shared_ptr<const ByteStorage> supplementary_package = {},
                              std::shared_ptr<const ByteStorage> split_debug_package = {});
 Result<bool> read_unwind_ranges(const ByteStorage &, const Image &, ElfMetadata &, Budget &, std::stop_token);
+Result<bool> read_arm_ehabi(const ByteStorage &, const Image &, ElfMetadata &, Budget &, std::stop_token);
 void parse_debug_frame_section(const ByteStorage &, const Image &, const ElfMetadata &, const ElfSection &,
                               Budget &, std::stop_token, std::vector<ElfUnwindRange> &,
                               std::vector<ElfEhFrameFunction> &);
