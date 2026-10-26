@@ -50,6 +50,67 @@ const ElfSection *debug_section(const ElfMetadata &metadata, std::string_view na
     }
     return found;
 }
+
+// Apply only ordinary absolute data relocations into DWARF sections. These
+// sections contain data fields; instruction relocations are deliberately not
+// decoded or rewritten here. ET_REL symbol values are section-relative.
+void relocate_dwarf_data(const ElfMetadata &metadata,
+                         const std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> &buffers) {
+    const auto bytes_for = [&](std::uint32_t section) -> std::vector<std::uint8_t> * {
+        for (const auto &[index, bytes] : buffers) if (index == section) return bytes;
+        return nullptr;
+    };
+    const auto put = [&](std::vector<std::uint8_t> &bytes, std::uint64_t offset,
+                         std::uint8_t width, std::uint64_t value) {
+        require(offset <= bytes.size() && width <= bytes.size() - offset,
+                "DWARF relocation field exceeds target section");
+        for (std::uint8_t i = 0; i < width; ++i)
+            bytes[static_cast<std::size_t>(offset) + i] = static_cast<std::uint8_t>(value >> (8 * i));
+    };
+    for (const auto &rel : metadata.relocations) {
+        if (!rel.target_section || !bytes_for(*rel.target_section)) continue;
+        require(metadata.header.object_type == 1, "DWARF section relocations are supported only for ET_REL objects", ErrorCode::unsupported);
+        const bool x64 = metadata.header.machine == 62;
+        const bool a64 = metadata.header.machine == 183;
+        std::uint8_t width = 0;
+        if (x64 && rel.type == 1) width = 8;          // R_X86_64_64
+        else if (x64 && (rel.type == 10 || rel.type == 11)) width = 4; // R_X86_64_32/32S
+        else if (a64 && rel.type == 257) width = 8;  // R_AARCH64_ABS64
+        else if (a64 && rel.type == 258) width = 4;  // R_AARCH64_ABS32
+        else throw Failure{{ErrorCode::unsupported, "unsupported ELF relocation in DWARF section (type " + std::to_string(rel.type) + ")"}};
+        require(metadata.header.order == ByteOrder::little, "big-endian DWARF relocation is unsupported", ErrorCode::unsupported);
+        require(rel.field_size && *rel.field_size == width, "DWARF relocation width is not proven");
+        require(rel.explicit_addend && rel.addend.has_value(), "DWARF relocation requires a proven explicit addend", ErrorCode::unsupported);
+        require(rel.symbol_index_validated && rel.symbol_table.has_value(), "DWARF relocation symbol provenance is unavailable", ErrorCode::unsupported);
+        const ElfSymbol *symbol = nullptr;
+        std::size_t symbol_matches = 0;
+        for (const auto &candidate : metadata.symbols) {
+            if (!candidate.table || *candidate.table >= metadata.symbol_tables.size()) continue;
+            const auto &table = metadata.symbol_tables[*candidate.table];
+            if (table.source.section == rel.symbol_table->section && candidate.index == rel.symbol_index) {
+                symbol = &candidate; ++symbol_matches;
+            }
+        }
+        require(symbol_matches == 1 && symbol && symbol->state == ElfSymbolState::defined && symbol->section_index < metadata.sections.size(),
+                "DWARF relocation symbol is not a uniquely defined section symbol", ErrorCode::unsupported);
+        auto &target = *bytes_for(*rel.target_section);
+        require(rel.offset <= target.size() && width <= target.size() - rel.offset, "DWARF relocation field exceeds target section");
+        const auto max_value = width == 8 ? UINT64_MAX : std::uint64_t(UINT32_MAX);
+        std::uint64_t sum = symbol->value;
+        if (*rel.addend >= 0) {
+            const auto add = static_cast<std::uint64_t>(*rel.addend);
+            require(sum <= max_value && add <= max_value - sum, "DWARF absolute relocation result overflows field");
+            sum += add;
+        } else {
+            const auto magnitude = static_cast<std::uint64_t>(-(*rel.addend + 1)) + 1;
+            require(sum >= magnitude, "DWARF absolute relocation result is negative");
+            sum -= magnitude;
+        }
+        if (x64 && rel.type == 11)
+            require(sum <= INT32_MAX, "R_X86_64_32S DWARF relocation result overflows signed field");
+        put(target, rel.offset, width, sum);
+    }
+}
 const ElfSection *optional_debug_section(const ElfMetadata &metadata, std::string_view a,
                                           std::string_view b = {}) {
     const auto *first = debug_section(metadata, a);
@@ -427,6 +488,18 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
         if (supplementary && supplementary->size) supplementary_bytes = read_debug_bytes(storage, metadata, *supplementary, budget, stop);
         if (location_lists && location_lists->size) location_list_bytes = read_debug_bytes(storage, metadata, *location_lists, budget, stop);
         if (locations && locations->size) location_bytes = read_debug_bytes(storage, metadata, *locations, budget, stop);
+        std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> relocation_buffers;
+        const auto add_reloc_buffer = [&](const ElfSection *section, std::vector<std::uint8_t> &bytes) {
+            if (section && !bytes.empty()) {
+                const auto index = static_cast<std::uint32_t>(section - metadata.sections.data());
+                relocation_buffers.emplace_back(index, &bytes);
+            }
+        };
+        add_reloc_buffer(info, info_bytes); add_reloc_buffer(abbrev, abbrev_bytes);
+        add_reloc_buffer(strings, string_bytes); add_reloc_buffer(string_offsets, string_offset_bytes);
+        add_reloc_buffer(addresses, address_bytes); add_reloc_buffer(line_strings, line_string_bytes);
+        add_reloc_buffer(location_lists, location_list_bytes); add_reloc_buffer(locations, location_bytes);
+        relocate_dwarf_data(metadata, relocation_buffers);
         canceled(stop);
         symbols::DwarfSections dwarf_sections;
         dwarf_sections.source_id = "ELF .debug_info";
