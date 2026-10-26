@@ -4,6 +4,8 @@
 #include "hexlab/analysis/macho_objc_types.hpp"
 #include <algorithm>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace hexlab::desktop {
 namespace {
@@ -199,6 +201,13 @@ wxString macho_objc_view_cell(const MachOObjCViewRow &row, int column, const Ima
 MachOObjCTypeImportPlan macho_objc_type_import_plan(
     const MachOObjCScan &scan, const std::vector<database::TypeDefinition> &existing) {
     MachOObjCTypeImportPlan plan;
+    std::unordered_map<std::string, std::size_t> class_name_counts;
+    class_name_counts.reserve(scan.classes.size());
+    for (const auto &row : scan.classes) {
+        if (row.name && row.name_status == "resolved")
+            ++class_name_counts[*row.name];
+    }
+    std::unordered_set<std::string> reported_duplicate_names;
     const auto add_definition = [&](std::string name, types::TypePtr type,
                                     std::string section, std::uint64_t slot_index,
                                     std::uint64_t record_offset, std::uint64_t record_size) {
@@ -230,6 +239,12 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
         const auto &row = scan.classes[index];
         if (!row.name || row.name_status != "resolved" || !row.class_address) {
             plan.skipped.push_back("Class record #" + std::to_string(index) + " lacks a resolved class name or address");
+            continue;
+        }
+        if (class_name_counts[*row.name] > 1) {
+            if (reported_duplicate_names.insert(*row.name).second)
+                plan.skipped.push_back("Class name " + *row.name +
+                    " appears in multiple runtime records; all matching records were skipped");
             continue;
         }
         const auto class_type_name = "ObjC2.Class." + objc_type_component(*row.name);
