@@ -8,10 +8,14 @@ remain attached to the source image. A copy-on-write overlay holds changes, so
 neither the input file nor the original loaded image is modified.
 
 For ordinary dynamic REL/RELA records, the supported profile is little-endian
-ELF64 x86-64 or AArch64 `ET_DYN`, with these types:
+ELF32 i386 `ET_DYN` REL records and little-endian ELF64 x86-64 or AArch64
+`ET_DYN` records, with these types:
 
 | Architecture | Relocation | Type | Formula |
 | --- | --- | ---: | --- |
+| i386 | `R_386_RELATIVE` | 8 | `B + A` |
+| i386 | `R_386_GLOB_DAT` | 6 | `S` |
+| i386 | `R_386_JMP_SLOT` | 7 | `S` |
 | x86-64 | `R_X86_64_RELATIVE` | 8 | `B + A` |
 | x86-64 | `R_X86_64_GLOB_DAT` | 6 | `S` |
 | x86-64 | `R_X86_64_JUMP_SLOT` | 7 | `S` |
@@ -19,10 +23,15 @@ ELF64 x86-64 or AArch64 `ET_DYN`, with these types:
 | AArch64 | `R_AARCH64_GLOB_DAT` | 1025 | `S` |
 | AArch64 | `R_AARCH64_JUMP_SLOT` | 1026 | `S` |
 
-Every patch target must be a complete eight-byte field in writable,
-initialized load memory. RELATIVE requires symbol index zero. RELA uses its
-explicit signed addend; REL uses the signed 64-bit value sampled from the
-original target bytes. Symbol-slot relocations require a validated nonzero
+ELF64 patch targets must be complete eight-byte fields in writable,
+initialized load memory. ELF32 i386 targets must be complete four-byte fields
+in writable, initialized load memory. Its RELATIVE addend is the unsigned
+32-bit word sampled from the original target bytes, and `B + A` must fit in
+32 bits. ELF32 runtime addresses, symbol values, and rebased segment extents
+are checked against the 32-bit address space. i386 RELA runtime records are
+left skipped. RELATIVE requires symbol index zero. ELF64 RELA uses its
+explicit signed addend; ELF64 REL uses the signed 64-bit value sampled from
+the original target bytes. Symbol-slot relocations require a validated nonzero
 symbol index tied to the relocation table's symbol table. They apply only
 when the referenced symbol is defined in the same image (or `SHN_ABS`), is not
 TLS or GNU IFUNC, and yields a checked 64-bit value. For regular definitions,
@@ -39,7 +48,11 @@ not open dependency paths or infer addresses from filenames. Applied external
 rows retain the relocation index, caller binding index, and supplied runtime
 address in `ElfRuntimeImage::resolved_symbols`. The binding table is capped at
 65,536 rows and individual library, symbol, and version names at 4,096 bytes.
-RELA symbol-slot addends are ignored as required by these relocation formulas.
+RELA symbol-slot addends are ignored as required by these relocation formulas;
+i386 GLOB_DAT and JMP_SLOT likewise use `S` without an addend. Applied rows
+retain their original relocation row index in `applied_indices`; external
+symbol rows additionally identify the exact caller binding in
+`resolved_symbols`.
 Results are encoded in file byte order. The original bytes are retained as
 each patch's expected value. Overlapping relocation fields are all left
 unapplied. Duplicate table aliases are deduplicated by their original
@@ -62,7 +75,10 @@ GNU symbol-version metadata is retained by the loader, and relocation lookup
 uses the exact dynamic symbol-table index. Caller-supplied bindings add exact
 version-aware external symbol matching without runtime library loading. TLS,
 IFUNC, copy, instruction, and retained non-dynamic section relocations remain
-unapplied; automatic dependency discovery and loading are not modeled.
+unapplied; automatic dependency discovery and loading are not modeled. The
+i386 runtime profile is little-endian `ET_DYN` with dynamic-table-owned REL
+rows only. Other i386 relocation types, RELA rows, and big-endian i386 images
+remain explicit skips.
 
 `ElfLoadOptions::runtime_load_bias` requests this stage from `load_elf`.
 `LoadedImage::image` and its link-time metadata remain unchanged; optional
@@ -79,5 +95,6 @@ See
 symbol-index, field-boundary, overlap, metadata-preservation, and load-bias
 overflow coverage.
 
-The formulas follow the [x86-64 System V ABI relocation table](https://refspecs.linuxfoundation.org/elf/x86_64-SysV-psABI.pdf)
+The formulas follow the [i386 System V ABI relocation table](https://refspecs.linuxfoundation.org/elf/abi386-4.pdf),
+the [x86-64 System V ABI relocation table](https://refspecs.linuxfoundation.org/elf/x86_64-SysV-psABI.pdf)
 and the [AAELF64 relocation table](https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst).

@@ -145,31 +145,39 @@ std::uint64_t relative_value(std::uint64_t load_bias, std::int64_t addend) {
                     ErrorCode::overflow);
     return load_bias - magnitude;
 }
-void shift_address(Address &address, std::uint64_t bias) {
+void shift_address(Address &address, std::uint64_t bias, bool elf32) {
     runtime_require(address.space.value == 0, "Runtime rebasing supports only the ELF primary address domain");
     address.offset = shifted(address.offset, bias);
+    runtime_require(!elf32 || address.offset <= UINT32_MAX,
+                    "ELF32 runtime address exceeds the 32-bit address space", ErrorCode::overflow);
 }
-void shift_layout(ImageLayout &layout, std::uint64_t bias) {
+void shift_layout(ImageLayout &layout, std::uint64_t bias, bool elf32) {
     runtime_require(layout.domains.empty(), "Runtime rebasing does not support section-domain ELF objects");
     for (auto &segment : layout.segments) {
-        shift_address(segment.begin, bias);
+        shift_address(segment.begin, bias, elf32);
         runtime_require(segment.size <= UINT64_MAX - segment.begin.offset,
                         "ELF runtime segment extent overflows after load bias", ErrorCode::overflow);
+        runtime_require(!elf32 || segment.size <= UINT32_MAX - segment.begin.offset,
+                        "ELF32 runtime segment exceeds the 32-bit address space", ErrorCode::overflow);
     }
-    for (auto &entry : layout.entries) shift_address(entry, bias);
+    for (auto &entry : layout.entries) shift_address(entry, bias, elf32);
     for (auto &range : layout.code_exclusions) {
-        shift_address(range.begin, bias);
+        shift_address(range.begin, bias, elf32);
         runtime_require(range.size <= UINT64_MAX - range.begin.offset,
                         "ELF runtime code exclusion overflows after load bias", ErrorCode::overflow);
+        runtime_require(!elf32 || range.size <= UINT32_MAX - range.begin.offset,
+                        "ELF32 runtime code exclusion exceeds the 32-bit address space", ErrorCode::overflow);
     }
     for (auto &range : layout.encrypted_ranges) {
-        shift_address(range.begin, bias);
+        shift_address(range.begin, bias, elf32);
         runtime_require(range.size <= UINT64_MAX - range.begin.offset,
                         "ELF runtime encrypted range overflows after load bias", ErrorCode::overflow);
+        runtime_require(!elf32 || range.size <= UINT32_MAX - range.begin.offset,
+                        "ELF32 runtime encrypted range exceeds the 32-bit address space", ErrorCode::overflow);
     }
     if (layout.arm_profile) {
-        for (auto &range : layout.arm_profile->ranges) shift_address(range.begin, bias);
-        for (auto &root : layout.arm_profile->roots) shift_address(root.at, bias);
+        for (auto &range : layout.arm_profile->ranges) shift_address(range.begin, bias, elf32);
+        for (auto &root : layout.arm_profile->roots) shift_address(root.at, bias, elf32);
     }
 }
 const ElfSymbol *runtime_symbol(const ElfMetadata &metadata, const ElfRelocation &relocation) {
@@ -313,21 +321,25 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 throw RuntimeRelocationFailure{{ErrorCode::canceled, "ELF runtime relocation canceled"}};
             const auto &relocation = metadata.relocations[static_cast<std::size_t>(index)];
             const bool packed_relative = relr_rows.contains(index);
+            const bool i386 = !metadata.header.is_64 && metadata.header.machine == 3 &&
+                              metadata.header.order == ByteOrder::little;
             const bool x64 = metadata.header.machine == 62;
             const bool riscv64 = metadata.header.machine == 243;
-            const auto relative_type = x64 ? 8u : riscv64 ? 3u : 1027u;
-            const auto jump_slot_type = x64 ? 7u : riscv64 ? 5u : 1026u;
+            const auto relative_type = i386 || x64 ? 8u : riscv64 ? 3u : 1027u;
+            const auto jump_slot_type = i386 || x64 ? 7u : riscv64 ? 5u : 1026u;
             const auto symbol_addend_type = riscv64 ? 2u : 0u;
-            const bool ordinary_subset = metadata.header.is_64 && metadata.header.order == ByteOrder::little &&
-                                         (metadata.header.machine == 62 || metadata.header.machine == 183 || riscv64);
+            const bool ordinary_subset = metadata.header.order == ByteOrder::little &&
+                                         ((metadata.header.is_64 &&
+                                           (metadata.header.machine == 62 || metadata.header.machine == 183 || riscv64)) ||
+                                          i386);
             if (!packed_relative && !ordinary_subset) {
-                skip(index, "Ordinary REL/RELA runtime relocations are currently limited to supported little-endian ELF64 architectures");
+                skip(index, "Ordinary REL/RELA runtime relocations are unsupported for this ELF class, byte order, or architecture");
                 continue;
             }
             const bool relative = relocation.kind == ElfRelocationKind::base_relative &&
                                   (packed_relative || relocation.type == relative_type);
             const bool symbol_slot = (!riscv64 &&
-                                      ((relocation.type == (x64 ? 6u : 1025u) &&
+                                      ((relocation.type == (i386 || x64 ? 6u : 1025u) &&
                                         relocation.kind == ElfRelocationKind::global_data) ||
                                        (relocation.type == jump_slot_type &&
                                         relocation.kind == ElfRelocationKind::jump_slot))) ||
@@ -336,11 +348,17 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             const bool symbol_with_addend = riscv64 && relocation.type == symbol_addend_type &&
                                             relocation.kind == ElfRelocationKind::absolute;
             if (!relative && !symbol_slot && !symbol_with_addend) {
-                skip(index, x64
+                skip(index, i386
+                    ? "Supported dynamic types are R_386_RELATIVE, R_386_GLOB_DAT, and R_386_JMP_SLOT"
+                    : x64
                     ? "Supported dynamic types are R_X86_64_RELATIVE, GLOB_DAT, and JUMP_SLOT"
                     : riscv64
                         ? "Supported dynamic types are R_RISCV_RELATIVE, R_RISCV_64, and R_RISCV_JUMP_SLOT"
                         : "Supported dynamic types are R_AARCH64_RELATIVE, GLOB_DAT, and JUMP_SLOT");
+                continue;
+            }
+            if (i386 && relocation.explicit_addend) {
+                skip(index, "ELF32 i386 runtime relocation support requires REL implicit addends");
                 continue;
             }
             if (relative && !relocation.addend) {
@@ -357,12 +375,21 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             std::optional<ElfRuntimeImage::ResolvedSymbol> external_resolution;
             if (relative) {
                 try {
-                    value = relative_value(load_bias, *relocation.addend);
+                    // REL addends are unsigned ELF32 words. The parser keeps
+                    // the sampled word in a signed carrier; recover its exact
+                    // 32-bit pattern before applying B + A.
+                    if (i386) {
+                        const auto addend = static_cast<std::uint64_t>(
+                            static_cast<std::uint32_t>(*relocation.addend));
+                        value = shifted(addend, load_bias);
+                    } else {
+                        value = relative_value(load_bias, *relocation.addend);
+                    }
                 } catch (const RuntimeRelocationFailure &) {
                     skip(index, "Relative relocation result overflows the runtime address space");
                     continue;
                 }
-                if (!metadata.header.is_64 && value > UINT32_MAX) {
+                if (i386 && value > UINT32_MAX) {
                     skip(index, "ELF32 relative relocation result exceeds the 32-bit address space");
                     continue;
                 }
@@ -411,6 +438,10 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                         continue;
                     }
                 }
+                if (i386 && value > UINT32_MAX) {
+                    skip(index, "ELF32 symbol address exceeds the 32-bit address space");
+                    continue;
+                }
                 if (symbol_with_addend) {
                     if (!relocation.addend) {
                         skip(index, relocation.explicit_addend
@@ -422,7 +453,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 }
             }
             const auto word = metadata.header.is_64 ? UINT64_C(8) : UINT64_C(4);
-            const auto expected_width = packed_relative ? word : UINT64_C(8);
+            const auto expected_width = packed_relative || i386 ? word : UINT64_C(8);
             if (!relocation.place || !relocation.file_place || relocation.field_size != expected_width) {
                 skip(index, "Relocation target is not a complete file-backed field of the supported width");
                 continue;
@@ -490,7 +521,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
         auto overlay = make_overlay(source.image->storage(), patches);
         if (!overlay) return overlay.error();
         auto layout = source.image->layout();
-        shift_layout(layout, load_bias);
+        shift_layout(layout, load_bias, !metadata.header.is_64);
         auto image = Image::create(std::move(overlay.value()), std::move(layout));
         if (!image) return image.error();
         result.image = std::move(image.value());
