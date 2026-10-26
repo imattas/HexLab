@@ -56,10 +56,11 @@ unmodeled alignment, and ambiguous stack changes never produce an extent.
 
 For MIPS32, the analyzer tracks constant `ADDIU`/`ADDI` adjustments of `$sp`,
 constant `$fp`/`$s8` relations to `$sp`, and `$sp` restoration from that frame
-register through the `ADDU`/`ADD`/`OR` move idioms. Direct `$sp`- and `$fp`-based
-memory operands then share the same entry-SP-relative slot model. Other writes
-to `$sp` or the tracked `$fp` invalidate the affected relation and keep the
-result partial rather than guessing.
+register through the `ADDU`/`ADD`/`OR` move idioms. For MIPS64, it also tracks
+`DADDI`/`DADDIU` adjustments and `DADD`/`DADDU` frame-pointer move idioms. Direct
+`$sp`- and `$fp`-based memory operands then share the same entry-SP-relative slot
+model. Other writes to `$sp` or the tracked `$fp` invalidate the affected
+relation and keep the result partial rather than guessing.
 
 For RV32/RV64, constant `ADDI sp,sp,imm` adjustments, recognized
 `ANDI sp,sp,-A` alignments for A = 2, 4, 8 or 16, `ADDI` relations between

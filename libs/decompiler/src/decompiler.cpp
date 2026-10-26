@@ -783,6 +783,64 @@ ExpressionPtr a64_nzcv_logical(ExpressionPtr result) {
     return std::make_shared<Expression>(Expression{integer_type(4), BinaryValue{"or", n, z}});
 }
 
+ExpressionPtr arm32_nzcv_arithmetic(Opcode opcode, ExpressionPtr left, ExpressionPtr right,
+                                    ExpressionPtr result, ExpressionPtr prior_flags) {
+    if (!left || !right || !result || !prior_flags || left->type.bits != 32 ||
+        right->type.bits != 32 || result->type.bits != 32 || prior_flags->type.bits != 4)
+        return {};
+    const bool reverse = opcode == Opcode::a32_rsb || opcode == Opcode::a32_rsc;
+    const auto lhs = reverse ? right : left;
+    const auto rhs = reverse ? left : right;
+    const bool add = opcode == Opcode::a32_add || opcode == Opcode::a32_adc || opcode == Opcode::a32_cmn;
+    const bool with_carry = opcode == Opcode::a32_adc || opcode == Opcode::a32_sbc || opcode == Opcode::a32_rsc;
+    if (!add && opcode != Opcode::a32_sub && opcode != Opcode::a32_rsb &&
+        opcode != Opcode::a32_sbc && opcode != Opcode::a32_rsc && opcode != Opcode::a32_cmp)
+        return {};
+
+    const auto carry_in = boolean_unary("arm_flag_c", prior_flags);
+    const auto sign_lhs = boolean_unary("signbit", lhs);
+    const auto sign_rhs = boolean_unary("signbit", rhs);
+    const auto sign_result = boolean_unary("signbit", result);
+    const auto different_inputs = boolean_binary("bool_xor", sign_lhs, sign_rhs);
+    const auto sign_changed = boolean_binary("bool_xor", sign_lhs, sign_result);
+    const auto overflow = boolean_binary("bool_and",
+        add ? boolean_unary("not", different_inputs) : different_inputs, sign_changed);
+
+    ExpressionPtr carry;
+    if (add && with_carry) {
+        auto partial = std::make_shared<Expression>(Expression{integer_type(32),
+            BinaryValue{"add", lhs, rhs}});
+        auto widened_carry = std::make_shared<Expression>(Expression{integer_type(32),
+            UnaryValue{"zext", carry_in}});
+        carry = boolean_binary("bool_or", boolean_binary("carry_add", lhs, rhs),
+                               boolean_binary("carry_add", std::move(partial), std::move(widened_carry)));
+    } else if (add) {
+        carry = boolean_binary("carry_add", lhs, rhs);
+    } else if (with_carry) {
+        // SBC/RSC subtract 1-C. C is set exactly when the subtraction does
+        // not borrow; when an incoming borrow exists, equality also borrows.
+        carry = boolean_binary("bool_or",
+            boolean_binary("bool_and", carry_in, boolean_binary("uge", lhs, rhs)),
+            boolean_binary("bool_and", boolean_unary("not", carry_in), boolean_binary("ugt", lhs, rhs)));
+    } else {
+        carry = boolean_binary("uge", lhs, rhs);
+    }
+
+    const auto zero = boolean_binary("eq", result, constant_expr(0, 32));
+    const auto placed = [](ExpressionPtr flag, unsigned shift) -> ExpressionPtr {
+        auto widened = std::make_shared<Expression>(Expression{integer_type(4),
+            UnaryValue{"zext", std::move(flag)}});
+        return std::make_shared<Expression>(Expression{integer_type(4),
+            BinaryValue{"shl", std::move(widened), constant_expr(shift, 4)}});
+    };
+    auto packed = std::make_shared<Expression>(Expression{integer_type(4),
+        BinaryValue{"or", placed(sign_result, 3), placed(zero, 2)}});
+    auto arithmetic = std::make_shared<Expression>(Expression{integer_type(4),
+        BinaryValue{"or", placed(std::move(carry), 1), placed(overflow, 0)}});
+    return std::make_shared<Expression>(Expression{integer_type(4),
+        BinaryValue{"or", std::move(packed), std::move(arithmetic)}});
+}
+
 ExpressionPtr a64_nzcv_predicate(std::uint8_t condition, ExpressionPtr flags) {
     if (condition >= 14) return boolean_constant(true);
     if (!flags || flags->type.bits != 4) return {};
@@ -2862,7 +2920,32 @@ a64_unhandled:
                                  opcode == Opcode::a32_orr || opcode == Opcode::a32_bic ||
                                  opcode == Opcode::a32_mov || opcode == Opcode::a32_mvn ||
                                  opcode == Opcode::a32_tst || opcode == Opcode::a32_teq;
-            const auto append_logical_flags = [&](Intrinsic &effect) {
+            const auto append_flags = [&](Intrinsic &effect) {
+                if (!logical) {
+                    if (!instruction.arm->flags_known || instruction.arm->flags_written != 15 ||
+                        instruction.arm->writes_pc)
+                        return;
+                    const auto packed = arm32_nzcv_arithmetic(opcode, left, right, value,
+                        reg_expr({RegisterBank::arm_flags, 0, 4, false}));
+                    if (!packed) return;
+                    effect.operands.push_back(boolean_binary("bit_extract", packed, constant_expr(3, 4)));
+                    effect.operands.push_back(boolean_binary("bit_extract", packed, constant_expr(2, 4)));
+                    effect.operands.push_back(boolean_binary("bit_extract", packed, constant_expr(1, 4)));
+                    effect.operands.push_back(boolean_binary("bit_extract", packed, constant_expr(0, 4)));
+                    ExpressionPtr output_value = value;
+                    auto output_flags = packed;
+                    if (instruction.arm->predicate == ArmPredicate::condition && instruction.condition < 14) {
+                        const auto flags = reg_expr({RegisterBank::arm_flags, 0, 4, false});
+                        const auto predicate = arm32_condition_expr(instruction.condition, flags, true);
+                        output_flags = arm32_select(predicate, std::move(output_flags), flags);
+                        if (!compare)
+                            output_value = arm32_select(predicate, std::move(output_value), reg_expr(*destination));
+                    }
+                    effect.register_output_values = compare
+                        ? std::vector<ExpressionPtr>{std::move(output_flags)}
+                        : std::vector<ExpressionPtr>{std::move(output_value), std::move(output_flags)};
+                    return;
+                }
                 const auto flags = reg_expr({RegisterBank::arm_flags, 0, 4, false});
                 auto n = boolean_unary("signbit", value);
                 auto z = boolean_binary("eq", value, constant_expr(0, value->type.bits));
@@ -2918,8 +3001,7 @@ a64_unhandled:
                     effect.operands.insert(effect.operands.begin(), arm32_condition_expr(instruction.condition, reg_expr({RegisterBank::arm_flags, 0, 4, false})));
                 effect.operands.push_back(constant_expr(instruction.arm->flags_written, 8));
                 effect.operands.push_back(constant_expr(instruction.arm->flags_known ? 1 : 0, 1));
-                if (logical)
-                    append_logical_flags(effect);
+                append_flags(effect);
                 effect.register_writes = {{RegisterBank::arm_flags, 0, 4, false}};
                 return effect;
             }
@@ -2938,8 +3020,7 @@ a64_unhandled:
                     Intrinsic effect{"arm_guarded_data_" + operation, {guarded, left, right}, IntrinsicMemoryEffect::none};
                     effect.operands.push_back(constant_expr(instruction.arm->flags_written, 8));
                     effect.operands.push_back(constant_expr(instruction.arm->flags_known ? 1 : 0, 1));
-                    if (logical)
-                        append_logical_flags(effect);
+                    append_flags(effect);
                     effect.register_writes = {*destination, {RegisterBank::arm_flags, 0, 4, false}};
                     return effect;
                 }
@@ -2950,8 +3031,7 @@ a64_unhandled:
             Intrinsic effect{"arm_data_" + operation, {value, left, right}, IntrinsicMemoryEffect::none};
             effect.operands.push_back(constant_expr(instruction.arm->flags_written, 8));
             effect.operands.push_back(constant_expr(instruction.arm->flags_known ? 1 : 0, 1));
-            if (logical)
-                append_logical_flags(effect);
+            append_flags(effect);
             effect.register_writes = {*destination, {RegisterBank::arm_flags, 0, 4, false}};
             return effect;
         }

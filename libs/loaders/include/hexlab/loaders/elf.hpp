@@ -109,9 +109,9 @@ struct ElfRuntimeRelocationLimits {
     std::size_t max_symbol_bindings = 65'536;
 };
 // Applies packed RELR pointer-relative entries for ELF32/ELF64 ET_DYN images
-// in either byte order, plus little-endian ELF32 i386 RELATIVE/GLOB_DAT/
-// JMP_SLOT REL, and little-endian ELF64 x86-64/AArch64/PPC64/RISC-V
-// REL/RELA subsets. RELATIVE uses B + A; supported symbol relocations use
+// in either byte order, plus little-endian ELF32 i386/ARM/RISC-V and ELF64
+// x86-64/AArch64/PPC64/RISC-V ordinary REL/RELA subsets. RELATIVE uses B + A;
+// supported symbol relocations use
 // the architecture-specific S/A formulas described in elf-runtime-relocations.md.
 // ELF32 i386 RELATIVE uses an unsigned implicit 32-bit addend; ELF64 REL
 // uses the validated signed implicit addend, while ELF64 RELA uses its

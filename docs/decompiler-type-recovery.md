@@ -456,3 +456,20 @@ the caller's matching register input as a pointer to the declared result layout.
 The call result type is retained as prototype metadata; the pass does not infer
 stores through the buffer as a materialized aggregate value. Incomplete or
 ambiguous layouts, missing register snapshots, and other ABIs remain unresolved.
+
+PowerPC64 scalar recovery selects the ELFv2 profile only for an ELF64
+`EM_PPC64` little-endian image whose `e_flags & EF_PPC64_ABI` value is 2. Raw
+PPC64, big-endian ELF, ELFv1, and files with another ABI flag do not receive a
+guessed profile. The supported scalar map uses R3-R10 and F1-F13 for incoming
+integer and floating values, R3/F1 for integer/floating results, and R1-relative
+parameter-save-area stack locations from the shared ELFv2 classifier. With an
+explicit prototype, supported scalar register and stack arguments use that map.
+Without one, register reads do not establish source parameter order because
+GPR and FPR allocation is independent and unused incoming arguments are
+possible; observed argument-register or stack use therefore leaves the
+candidate parameter list unresolved. Integer-only 8-byte structures use R3,
+and supported 16-byte structures are projected across R3/R4. Larger supported
+structures use the classifier's hidden R3 result pointer. Variadic placement,
+vector arguments, and aggregate layouts outside that bounded classifier subset
+remain unsupported by this decompiler path.
+The profile follows the [OpenPOWER 64-bit ELF ABI specification](https://openpower.foundation/specifications/64bitelfabi/).
