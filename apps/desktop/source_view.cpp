@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -19,6 +20,7 @@ namespace {
 constexpr std::uintmax_t max_source_bytes = 1024u * 1024u;
 constexpr std::int64_t context_lines = 20;
 constexpr std::size_t max_source_path_bytes = 32u * 1024u;
+constexpr std::size_t max_line_addresses = 4096;
 
 std::optional<Address> address_for(const DocumentSnapshot &document, Location location) {
     if (const auto *address = std::get_if<Address>(&location))
@@ -145,17 +147,18 @@ SourceView::SourceView(wxWindow *parent) : wxPanel(parent) {
     next_mapping_->SetToolTip("Move to the next machine address mapped to this source line.");
     toggle_breakpoint_ = new wxButton(this, wxID_ANY, "Toggle project breakpoint");
     toggle_breakpoint_->SetName("source-toggle-project-breakpoint");
-    toggle_breakpoint_->SetToolTip("Add or remove a saved software breakpoint at the selected source-line address.");
+    toggle_breakpoint_->SetToolTip("Add or remove a saved software breakpoint at the selected mapped address.");
     auto *source_splitter = new wxSplitterWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                                   wxSP_LIVE_UPDATE | wxSP_3D);
     source_ = new wxTextCtrl(source_splitter, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize,
                              wxTE_MULTILINE | wxTE_READONLY | wxTE_DONTWRAP | wxTE_RICH2);
     source_->SetName("source-code-view");
     mapped_instructions_ = new VirtualTable(source_splitter, "source-line-instructions",
-                                             {"Address", "Instruction", "Mapping"});
+                                             {"Address", "Instruction", "Mapping", "Project breakpoint"});
     mapped_instructions_->SetColumnWidth(0, FromDIP(130));
     mapped_instructions_->SetColumnWidth(1, FromDIP(420));
     mapped_instructions_->SetColumnWidth(2, FromDIP(135));
+    mapped_instructions_->SetColumnWidth(3, FromDIP(150));
     source_splitter->SetMinimumPaneSize(FromDIP(72));
     source_splitter->SplitHorizontally(source_, mapped_instructions_, FromDIP(300));
     status_->SetName("source-code-status");
@@ -183,12 +186,15 @@ SourceView::SourceView(wxWindow *parent) : wxPanel(parent) {
             status_->SetLabel("Select a source line with a mapped address first");
             return;
         }
-        const auto index = std::min(selected_line_address_index_, selected_line_addresses_.size() - 1);
-        const auto address = selected_line_addresses_[index];
-        if (toggle_project_breakpoint && toggle_project_breakpoint(address))
+        const auto selected = mapped_instructions_->selected_row();
+        const auto index = selected && *selected < instruction_mappings_.size()
+            ? *selected : std::min(selected_line_address_index_, selected_line_addresses_.size() - 1);
+        const auto address = selected && *selected < instruction_mappings_.size()
+            ? instruction_mappings_[*selected].address : selected_line_addresses_[index];
+        if (toggle_project_breakpoint && document_ && toggle_project_breakpoint(document_, address)) {
             status_->SetLabel(wxString::Format("Project breakpoint toggled at 0x%llX",
                                                static_cast<unsigned long long>(address.offset)));
-        else
+        } else
             status_->SetLabel("Could not update project breakpoint; check project mode and status");
     });
     mapped_instructions_->activate = [this](std::size_t row) {
@@ -386,15 +392,19 @@ void SourceView::render_source_row(const SourceRow &source_row, Address context_
     }
     updating_ = false;
     selected_line_addresses_.clear();
+    bool line_addresses_truncated = false;
+    std::set<std::pair<std::uint64_t, std::uint64_t>> seen_line_addresses;
     for (const auto &row : rows_)
-        if (row.path == selected->path && row.address.space == context_address.space && row.line == selected->line &&
-            std::find(selected_line_addresses_.begin(), selected_line_addresses_.end(), row.address) ==
-                selected_line_addresses_.end())
+        if (row.path == selected->path && row.address.space == context_address.space && row.line == selected->line) {
+            const auto key = std::pair{row.address.space.value, row.address.offset};
+            if (seen_line_addresses.contains(key)) continue;
+            if (seen_line_addresses.size() == max_line_addresses) {
+                line_addresses_truncated = true;
+                break;
+            }
+            seen_line_addresses.insert(key);
             selected_line_addresses_.push_back(row.address);
-    std::stable_sort(selected_line_addresses_.begin(), selected_line_addresses_.end(), [](Address left, Address right) {
-        if (left.space.value != right.space.value) return left.space.value < right.space.value;
-        return left.offset < right.offset;
-    });
+        }
     selected_line_address_index_ = 0;
     for (std::size_t i = 0; i < selected_line_addresses_.size(); ++i)
         if (selected_line_addresses_[i].space == context_address.space &&
@@ -406,6 +416,8 @@ void SourceView::render_source_row(const SourceRow &source_row, Address context_
         " — line %lld, address 0x%llX, %zu mapped addresses (%zu shown below)",
         static_cast<long long>(selected->line), static_cast<unsigned long long>(selected->address.offset),
         selected_line_addresses_.size(), instruction_mappings_.size()));
+    if (line_addresses_truncated)
+        status_->SetLabel(status_->GetLabel() + "; additional unique addresses omitted by the 4096-address limit");
     if (!selected->scope.empty()) status_->SetLabel(status_->GetLabel() + " / " + text(selected->scope));
 }
 
@@ -417,13 +429,15 @@ void SourceView::render_instruction_mappings(const std::string &path, std::int64
         return;
     }
     std::vector<Address> addresses;
+    std::set<std::pair<std::uint64_t, std::uint64_t>> seen_addresses;
     for (const auto &row : rows_)
-        if (row.path == path && row.line == line && row.address.space == space &&
-            std::find(addresses.begin(), addresses.end(), row.address) == addresses.end())
+        if (row.path == path && row.line == line && row.address.space == space) {
+            const auto key = std::pair{row.address.space.value, row.address.offset};
+            if (seen_addresses.contains(key)) continue;
+            if (seen_addresses.size() == max_line_addresses) break;
+            seen_addresses.insert(key);
             addresses.push_back(row.address);
-    std::sort(addresses.begin(), addresses.end(), [](Address left, Address right) {
-        return left.offset < right.offset;
-    });
+        }
 
     const std::vector<Instruction> *analysis_instructions = nullptr;
     const std::vector<std::shared_ptr<const InstructionFact>> *project_instructions = nullptr;
@@ -435,9 +449,6 @@ void SourceView::render_instruction_mappings(const std::string &path, std::int64
     else if (!document_->project && document_->analysis)
         analysis_instructions = &document_->analysis->instructions;
 
-    constexpr std::size_t row_limit = 4096;
-    if (addresses.size() > row_limit)
-        addresses.resize(row_limit);
     instruction_mappings_.reserve(addresses.size());
     for (const auto address : addresses) {
         wxString formatted;
@@ -478,10 +489,19 @@ void SourceView::render_instruction_mappings(const std::string &path, std::int64
         switch (column) {
         case 0: return wxString::Format("0x%llX", static_cast<unsigned long long>(item.address.offset));
         case 1: return item.instruction;
-        default: return item.state;
+        case 2: return item.state;
+        default:
+            if (document_ && document_->project && document_->project->state && document_->project->state->user) {
+                const auto &saved = document_->project->state->user->breakpoints;
+                const auto found = std::find_if(saved.begin(), saved.end(), [&](const auto &bp) {
+                    return bp.address == item.address && bp.kind == database::ProjectBreakpointKind::software;
+                });
+                if (found != saved.end()) return found->enabled ? wxString("Enabled") : wxString("Disabled");
+            }
+            return wxString("—");
         }
     });
-    mapped_instructions_->fit_columns({0, 1, 2});
+    mapped_instructions_->fit_columns({0, 1, 2, 3});
 }
 
 void SourceView::select_source_line() {

@@ -31,3 +31,11 @@ and **Next address** move through those mappings in address order. The selected
 address stays synchronized with disassembly, bytes, pseudocode, and the graph.
 Selecting a different visible source line starts at its first mapped address in
 the active address space.
+
+The mapped-address table lists up to 4,096 distinct addresses for the selected
+line and shows whether each address has a saved project software breakpoint.
+Select a row and use **Toggle project breakpoint** to add or remove the saved
+breakpoint at that address. With no table row selected, the currently selected
+line mapping is used. Double-clicking a mapped row navigates to that address.
+The action is available only for a writable project and is rejected if the
+document snapshot shown by the Source page is no longer the active snapshot.

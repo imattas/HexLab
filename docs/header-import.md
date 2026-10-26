@@ -42,13 +42,19 @@ Anonymous namespaces and namespace members other than types remain unsupported.
 An integer constant-expression evaluator supports decimal, octal, and
 hexadecimal literals; previously bound integral template parameters;
 `true`/`false`; parentheses; unary `+`, `-`, `~`; arithmetic `+`, `-`, `*`,
-`/`, `%`; and bitwise `&`, `^`, `|`. It is used for non-type template
+`/`, `%`; shifts `<<`, `>>`; relational `<`, `>`, `<=`, `>=`; equality `==`,
+`!=`; logical `&&`, `||`; and bitwise `&`, `^`, `|`, with C++-style operator
+precedence. It is used for non-type template
 arguments, non-type defaults (which may refer to earlier parameters), and
 fixed array extents in instantiated templates. Final non-type values and array
 extents must be non-negative; negative results, division by zero, overflow,
 unknown names, and unsupported operators fail explicitly. Each expression is
 limited to 4096 tokens and operations and the configured parser nesting limit.
-No compiler is invoked.
+Logical operators evaluate both operands; conditional `?:`, comma expressions,
+unsigned expression arithmetic, and general C++ constant evaluation are not
+implemented. In template argument and default expressions, operators spelled
+with `<` or `>` must be parenthesized so they are not confused with template
+delimiters. No compiler is invoked.
 
 Alias and `class`/`struct`/`union` templates support type parameters,
 integral non-type parameters, template-template parameters, and a trailing

@@ -324,6 +324,17 @@ the break under its original predicate and emits the shared in-loop join once.
 Other nested exit targets, side-path assignments, exit phis, extra join
 predecessors, or ambiguous ownership retain the existing fallback.
 
+The final nested conditional may also send its break edge through up to 64
+phi-free straight-line cleanup blocks before reaching that same validated parent
+loop exit. Each cleanup block must have exactly the preceding branch or cleanup
+block as its CFG predecessor, one resolved unconditional jump or fallthrough,
+and no return, switch, or memory phi. Cleanup statements are emitted only under
+the break predicate, followed by `break`; the in-loop arm still reaches the
+shared diamond join and keeps its exact edge-specific parallel phi copies.
+Cleanup paths cannot overlap the in-loop continuation or sibling arm. Exit
+phis, branched or cyclic cleanup paths, side entries, and paths longer than 64
+blocks retain the existing fallback.
+
 The dedicated `decompiler_multiexit_structuring` test runs fixtures through SSA,
 constant and identity simplification, dead-code elimination, and formatting.
 An independent interpreter for the emitted fixture subset checks every branch
