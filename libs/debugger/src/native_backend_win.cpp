@@ -1934,8 +1934,20 @@ private:
         const bool thumb = (context.Cpsr & (1u << 5)) != 0;
         constexpr DWORD it_state = (3u << 25) | (0x3fu << 10);
         if (thumb && (context.Cpsr & it_state) != 0) {
-            CloseHandle(thread);
-            return Error{ErrorCode::unsupported, "ARM32 temporary-trap stepping is unavailable inside a Thumb IT block"};
+            // The successor trap is only unconditional after the last IT
+            // instruction. Earlier instructions may be skipped by their
+            // predicate, and the following instruction would still be inside
+            // ITSTATE, so a software BKPT there is not a safe step boundary.
+            const auto packed_it_state = static_cast<std::uint8_t>(
+                ((context.Cpsr >> 8) & 0xfcu) | ((context.Cpsr >> 25) & 3u));
+            // ITSTATE advances to zero after this instruction only when it is
+            // the final slot; then normal execution reaches the trap outside
+            // the conditional block regardless of whether the predicate passes.
+            if ((packed_it_state & 7u) != 0) {
+                CloseHandle(thread);
+                return Error{ErrorCode::unsupported,
+                    "ARM32 temporary-trap stepping is available only on the final sequential instruction in a Thumb IT block"};
+            }
         }
         std::uintptr_t pc = context.Pc;
         if ((pc & (thumb ? 1u : 3u)) != 0) {

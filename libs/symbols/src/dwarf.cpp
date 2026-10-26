@@ -667,6 +667,7 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
         if(!die.type)return malformed("DWARF cross-contribution resolver returned an empty DIE type");
         if(die.kind==DwarfReferencedDieKind::subprogram){if(die.type->kind()!=types::Kind::function||die.name.empty())return malformed("DWARF cross-contribution subprogram lacks a named function type");}
         else if(die.kind==DwarfReferencedDieKind::type){if(die.type->kind()==types::Kind::function||die.type->kind()==types::Kind::void_type)return malformed("DWARF cross-contribution type DIE returned a non-object type");}
+        else if(die.kind==DwarfReferencedDieKind::variable){if(die.name.empty()||die.type->kind()==types::Kind::function||die.type->kind()==types::Kind::void_type)return malformed("DWARF cross-contribution variable lacks a name or object type");}
         else return malformed("DWARF cross-contribution resolver returned an invalid DIE kind");
         auto encoded=types::encode(*die.type);if(!encoded)return encoded.error();
         const auto encoded_size=static_cast<std::uint64_t>(encoded.value().size());
@@ -1070,9 +1071,29 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
             if(d.tag==tag_variable||d.tag==tag_formal_parameter){
                 const auto scope_index=parent_function_index(i);const auto scope=scope_index?dies[*scope_index].offset:0;
                 if(d.tag==tag_formal_parameter&&!scope_index)continue;
-                const auto*n=str(d,attr_name);const auto*r=ref(d,attr_type);if(!n||!r)continue;
-                auto ty=resolve_type_reference(*r);if(!ty)return ty.error();
-                ImportedVariable v;v.name=*n;v.type=ty.value();v.is_parameter=d.tag==tag_formal_parameter;v.scope_offset=scope;v.origin=origin(sections,unit_offset,d);
+                const auto*n=str(d,attr_name);const auto*r=ref(d,attr_type);
+                std::string inherited_name;
+                types::TypePtr inherited_type;
+                if(!n||!r){
+                    if(d.tag==tag_formal_parameter)continue;
+                    for(const auto reference_attribute:{attr_specification,attr_abstract_origin}){
+                        const auto*reference=ref(d,reference_attribute);
+                        if(!reference||!reference->section_absolute)continue;
+                        const bool local_info=reference->offset>=sections.info_section_offset&&reference->offset-sections.info_section_offset<sections.info.size();
+                        if(local_info)continue;
+                        auto external_die=resolve_cross_contribution_die(reference->offset);if(!external_die)return external_die.error();
+                        if(external_die.value()->kind!=DwarfReferencedDieKind::variable)return malformed("cross-contribution variable specification or abstract origin does not target a variable DIE");
+                        inherited_name=external_die.value()->name;inherited_type=external_die.value()->type;break;
+                    }
+                }
+                const std::string *resolved_name=n;
+                if((!resolved_name||resolved_name->empty())&&!inherited_name.empty())resolved_name=&inherited_name;
+                if(!resolved_name||resolved_name->empty())continue;
+                types::TypePtr resolved_type;
+                if(r){auto ty=resolve_type_reference(*r);if(!ty)return ty.error();resolved_type=ty.value();}
+                else resolved_type=inherited_type;
+                if(!resolved_type)continue;
+                ImportedVariable v;v.name=*resolved_name;v.type=resolved_type;v.is_parameter=d.tag==tag_formal_parameter;v.scope_offset=scope;v.origin=origin(sections,unit_offset,d);
                 if(const auto*loc=attr(d,attr_location)){
                     auto ab=abbrevs.value().find(d.code);
                     auto spec=std::find_if(ab->second.attributes.begin(),ab->second.attributes.end(),[](const auto&a){return a.name==attr_location;});
