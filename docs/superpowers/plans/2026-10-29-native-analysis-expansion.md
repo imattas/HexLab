@@ -24,6 +24,8 @@
 
 ## Progress
 
+- Desktop FLIRT scanning now accepts `.pat`, `.pat.gz`, and `.sig`, persists bounded function-recognition evidence, and browses match provenance without changing names. Windows Debug `hexlab_desktop_components` and `hexlab` builds passed; no tests or UI run.
+
 - Resolved indirect-call prototype propagation now requires exact caller/target ABI identity after a bounded unique in-set address proof. Windows Debug `hexlab_decompiler` build passed; no tests run.
 
 - [x] Task 1: ARM64 static Mach-O linking, including a generic API entry point and retained compatibility wrapper.
