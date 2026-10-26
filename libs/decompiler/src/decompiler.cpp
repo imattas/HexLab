@@ -5897,7 +5897,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             // Permit a small recursive tree of conditional arms. The
             // recursive analyzer still validates every three-way join and
             // every edge-specific phi before the region can be emitted.
-            if (allow_nested_arm && depth < 4) {
+            if (allow_nested_arm && depth < 8) {
                 const auto attach_nested_arm = [&](bool nested_on_true) {
                     const auto &nested_path = nested_on_true ? region.yes : region.no;
                     const auto &sibling_path = nested_on_true ? region.no : region.yes;
@@ -7776,6 +7776,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 return !has_only_terminal_return(function.blocks[exit]);
             })) return {}; // only explicit returns terminate a multi-exit arm
 
+        std::size_t acyclic_phi_input_count = 0;
         for (std::size_t i = 0; i < count; ++i) {
             const auto &block = function.blocks[i];
             std::size_t branch_count = 0;
@@ -7800,29 +7801,29 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             if (contains_return(block) &&
                 (!has_only_terminal_return(block) || !successors[i].empty())) return {};
 
-            if ((!block.phis.empty() || block.memory_phi) && predecessors[i].empty()) return {};
-            if (block.phis.size() > 4096) return {};
-            for (const auto &phi : block.phis) {
-                if (phi.inputs.size() != predecessors[i].size()) return {};
+            if ((!block.phis.empty() || block.memory_phi || !block.memory_partition_phis.empty()) &&
+                predecessors[i].empty()) return {};
+            const auto validate_phi_inputs = [&](const auto &phi) {
+                if (phi.inputs.size() != predecessors[i].size() ||
+                    phi.inputs.size() > 65536 - acyclic_phi_input_count) return false;
+                acyclic_phi_input_count += phi.inputs.size();
                 std::set<std::uint64_t> seen_predecessors;
                 for (const auto &input : phi.inputs) {
                     const auto pred = id_index.find(input.predecessor.value);
                     if (pred == id_index.end() ||
                         std::find(predecessors[i].begin(), predecessors[i].end(), pred->second) == predecessors[i].end() ||
-                        !seen_predecessors.insert(input.predecessor.value).second) return {};
+                        !seen_predecessors.insert(input.predecessor.value).second) return false;
                 }
-            }
-            if (block.memory_phi) {
-                const auto &phi = *block.memory_phi;
-                if (phi.inputs.size() != predecessors[i].size()) return {};
-                std::set<std::uint64_t> seen_predecessors;
-                for (const auto &input : phi.inputs) {
-                    const auto pred = id_index.find(input.predecessor.value);
-                    if (pred == id_index.end() ||
-                        std::find(predecessors[i].begin(), predecessors[i].end(), pred->second) == predecessors[i].end() ||
-                        !seen_predecessors.insert(input.predecessor.value).second) return {};
-                }
-            }
+                return true;
+            };
+            if (block.phis.size() > 4096 ||
+                !std::all_of(block.phis.begin(), block.phis.end(), validate_phi_inputs)) return {};
+            if (block.memory_phi && !validate_phi_inputs(*block.memory_phi)) return {};
+            if (block.memory_partition_phis.size() > 4096) return {};
+            std::set<std::string> memory_partitions;
+            for (const auto &phi : block.memory_partition_phis)
+                if (phi.partition.empty() || !memory_partitions.insert(phi.partition).second ||
+                    !validate_phi_inputs(phi)) return {};
         }
 
         const std::size_t virtual_exit = count;
@@ -8038,34 +8039,30 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         }
         if (std::any_of(reachable.begin(), reachable.end(), [](bool value) { return !value; })) return {};
 
+        std::size_t machine_phi_input_count = 0;
         for (std::size_t i = 0; i < count; ++i) {
             const auto &block = function.blocks[i];
-            const auto validate_phi_inputs = [&](const auto &phis) {
-                if (phis.size() > 4096) return false;
-                for (const auto &phi : phis) {
-                    if (phi.inputs.size() != predecessors[i].size()) return false;
-                    std::set<std::uint64_t> seen;
-                    for (const auto &input : phi.inputs) {
-                        const auto pred = id_index.find(input.predecessor.value);
-                        if (pred == id_index.end() ||
-                            std::find(predecessors[i].begin(), predecessors[i].end(), pred->second) == predecessors[i].end() ||
-                            !seen.insert(input.predecessor.value).second) return false;
-                    }
-                }
-                return true;
-            };
-            if (!validate_phi_inputs(block.phis)) return {};
-            if (block.memory_phi) {
-                const auto &phi = *block.memory_phi;
-                if (phi.inputs.size() != predecessors[i].size()) return {};
+            const auto validate_one_phi = [&](const auto &phi) {
+                if (phi.inputs.size() != predecessors[i].size() ||
+                    phi.inputs.size() > 65536 - machine_phi_input_count) return false;
+                machine_phi_input_count += phi.inputs.size();
                 std::set<std::uint64_t> seen;
                 for (const auto &input : phi.inputs) {
                     const auto pred = id_index.find(input.predecessor.value);
                     if (pred == id_index.end() ||
                         std::find(predecessors[i].begin(), predecessors[i].end(), pred->second) == predecessors[i].end() ||
-                        !seen.insert(input.predecessor.value).second) return {};
+                        !seen.insert(input.predecessor.value).second) return false;
                 }
-            }
+                return true;
+            };
+            if (block.phis.size() > 4096 ||
+                !std::all_of(block.phis.begin(), block.phis.end(), validate_one_phi) ||
+                (block.memory_phi && !validate_one_phi(*block.memory_phi)) ||
+                block.memory_partition_phis.size() > 4096) return {};
+            std::set<std::string> memory_partitions;
+            for (const auto &phi : block.memory_partition_phis)
+                if (phi.partition.empty() || !memory_partitions.insert(phi.partition).second ||
+                    !validate_one_phi(phi)) return {};
         }
 
         std::ostringstream machine;

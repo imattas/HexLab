@@ -87,7 +87,7 @@ expected incoming edge. It may contain SSA phis when each phi has exactly one
 input from each tail; the formatter emits those edge copies at the end of the
 corresponding `if`/`else` arm, including on a direct branch-to-continuation
 edge, then emits the continuation once. A parent-loop arm may also contain up
-to four recursively nested conditionals whose arm joins converge at the same
+to eight recursively nested conditionals whose arm joins converge at the same
 outer continuation. At each level the continuation has exactly three incoming
 edges: the two inner arm tails and the current outer sibling tail. Its phis
 must contain one input for each edge; inner-edge copies are emitted in the
@@ -190,7 +190,12 @@ straight-line outer sibling and terminal returns from the shared conditional;
 more complex shared nonterminal regions still use explicit gotos.
 
 The acyclic structurer requires every block to be reachable,
-valid in-function edges, and complete SSA phi inputs for every predecessor. It
+valid in-function edges, and complete register, whole-memory, and
+partition-memory SSA phi inputs for every predecessor. Partition names must
+be nonempty and unique within a block. Across the function, at most 65,536
+register and memory-phi inputs are accepted; each block is limited to 4,096
+register phis and 4,096 partition-memory phis. Malformed or over-budget phi
+data uses the state-machine or explicit label/goto fallback. It
 also accepts complete switch dispatches within conditional regions or other
 switch arms. It finds the nearest common post-dominator of all distinct case
 and default destinations, groups labels that share one destination, emits each
