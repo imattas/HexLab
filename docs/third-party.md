@@ -24,7 +24,7 @@ Persistent-project work uses SQLite 3.54.1 as a separate shared runtime. The unm
 
 FLIRT compressed `.sig` catalog bodies use the vendored miniz 3.1.2 zlib-compatible inflater. Only the static, inflate-only API is built into `hexlab_analysis`; no runtime DLL or network fetch is required. Upstream license, source hashes, and the local build configuration are recorded in `third_party/miniz/provenance.json`; the MIT notice is installed under `share/hexlab/licenses/miniz`.
 
-The bounded EFI standard-compression decoder adapts the decoder structure from TianoCore EDK II `BaseTools/Source/C/Common/Decompress.c`. It supports EFI compression type 1 with four position bits; the TianoCore BSD-2-Clause-Patent notice is retained in `libs/firmware/EDK2-LICENSE.txt` and installed under `share/hexlab/licenses/firmware`. The exact source, safety changes, and remaining opaque formats are documented in `docs/uefi-standard-compression.md`.
+The bounded EFI compression decoder adapts the decoder structure from TianoCore EDK II `BaseTools/Source/C/Common/Decompress.c`. It supports PI EFI compression type 1 with four position bits and the legacy Tiano type-2 variant with five position bits; type 2 is not a PI-defined compression value. The TianoCore BSD-2-Clause-Patent notice is retained in `libs/firmware/EDK2-LICENSE.txt` and installed under `share/hexlab/licenses/firmware`. The exact source, safety changes, and remaining opaque formats are documented in `docs/uefi-standard-compression.md`.
 
 ## Upstream code reuse
 

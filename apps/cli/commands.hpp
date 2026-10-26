@@ -7,4 +7,5 @@ namespace hexlab::cli {
 int run_cli(std::span<const std::wstring_view> arguments,std::ostream& out,std::ostream& err);
 int run_compare_cli(std::span<const std::wstring_view> arguments,std::ostream& out,std::ostream& err);
 int run_uefi_firmware_cli(std::span<const std::wstring_view> arguments,std::ostream& out,std::ostream& err);
+int run_uefi_capsule_cli(std::span<const std::wstring_view> arguments,std::ostream& out,std::ostream& err);
 }

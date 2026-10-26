@@ -2,6 +2,7 @@
 #include "argument_text.hpp"
 #include "project_arguments.hpp"
 #include "hexlab/firmware/uefi_volume.hpp"
+#include "hexlab/firmware/uefi_capsule.hpp"
 #include "hexlab/image/image.hpp"
 #include <iomanip>
 #include <limits>
@@ -204,6 +205,57 @@ int run_uefi_firmware_cli(std::span<const std::wstring_view> args, std::ostream 
     } catch (const std::exception &error) {
         err << "UEFI firmware: " << error.what() << '\n';
         return 1;
+    }
+}
+
+int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
+    if (args.size() != 4 || args[0] != L"inspect" || args[2] != L"--format" || args[3] != L"uefi-capsule")
+        return -1;
+    try {
+        auto opened = FileStorage::open(path_from_wide(args[1]));
+        if (!opened) { err << "UEFI capsule: " << opened.error().message << '\n'; return 1; }
+        const auto &file = opened.value();
+        if (file->size() > 512ull * 1024 * 1024 || file->size() > (std::numeric_limits<std::size_t>::max)()) {
+            err << "UEFI capsule: input exceeds 512 MiB inspection limit\n"; return 1;
+        }
+        auto read = file->read_at({0}, static_cast<std::size_t>(file->size()));
+        if (!read) { err << "UEFI capsule: " << read.error().message << '\n'; return 1; }
+        const auto view = std::move(read.value());
+        auto parsed = firmware::parse_uefi_fmp_capsule(view.bytes);
+        if (!parsed) { err << "UEFI capsule: " << parsed.error().message << '\n'; return 1; }
+        const auto &capsule = parsed.value();
+        out << "Format: UEFI FMP Capsule\n"
+            << "Capsule: guid=" << firmware::uefi_guid_string(capsule.capsule_guid)
+            << " header-size=" << hex_value(capsule.header_size)
+            << " flags=" << hex_value(capsule.flags)
+            << " image-size=" << hex_value(capsule.image_size) << '\n'
+            << "FMP: version=" << capsule.fmp_version
+            << " embedded-drivers=" << capsule.embedded_driver_count
+            << " payloads=" << capsule.payload_count << '\n';
+        for (std::size_t i = 0; i < capsule.items.size(); ++i) {
+            const auto &item = capsule.items[i];
+            out << "  Item[" << i << "] kind="
+                << (item.kind == firmware::UefiCapsuleItemKind::embedded_driver ? "embedded-driver" : "fmp-payload")
+                << " file-offset=" << hex_value(item.file_offset) << " size=" << hex_value(item.size);
+            if (item.kind == firmware::UefiCapsuleItemKind::fmp_payload) {
+                out << " image-header-version=" << item.image_header_version
+                    << " image-type-guid=" << firmware::uefi_guid_string(item.image_type_guid)
+                    << " image-index=" << static_cast<unsigned>(item.image_index)
+                    << " image-size=" << hex_value(item.update_image_size)
+                    << " payload-offset=" << hex_value(item.payload_offset)
+                    << " vendor-code-size=" << hex_value(item.vendor_code_size)
+                    << " vendor-code-offset=" << hex_value(item.vendor_code_offset);
+                if (item.image_header_version >= 2) out << " hardware-instance=" << hex_value(item.hardware_instance);
+                if (item.image_header_version >= 3) out << " image-capsule-support=" << hex_value(item.image_capsule_support);
+            }
+            out << '\n';
+        }
+        if (capsule.image_size < view.bytes.size())
+            out << "Trailing bytes: " << (view.bytes.size() - capsule.image_size) << '\n';
+        out << "Payload contents were not extracted or executed.\n";
+        return 0;
+    } catch (const std::exception &error) {
+        err << "UEFI capsule: " << error.what() << '\n'; return 1;
     }
 }
 } // namespace hexlab::cli

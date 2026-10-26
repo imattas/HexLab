@@ -14,6 +14,7 @@ constexpr std::uint16_t fsw_c3 = 1u << 14, fsw_busy = 1u << 15;
 constexpr std::uint16_t fcw_invalid_mask = 1u << 0;
 constexpr std::uint16_t fsw_precision = 1u << 5;
 constexpr std::uint16_t fcw_precision_mask = 1u << 5;
+constexpr std::uint16_t fcw_overflow_mask = 1u << 3;
 constexpr std::uint16_t fcw_rounding_mask = 3u << 10;
 constexpr std::uint32_t eflags_cf = 1u << 0, eflags_pf = 1u << 2, eflags_af = 1u << 4;
 constexpr std::uint32_t eflags_zf = 1u << 6, eflags_sf = 1u << 7, eflags_of = 1u << 11;
@@ -156,6 +157,27 @@ RoundedMagnitude round_magnitude(const Decoded &decoded, std::uint8_t rounding,
 
 std::uint16_t signal_exception(std::uint16_t status, std::uint16_t exception) noexcept {
     return static_cast<std::uint16_t>(status | exception | fsw_error_summary | fsw_busy);
+}
+
+struct Product128 { std::uint64_t hi, lo; };
+Product128 multiply_u64(std::uint64_t a, std::uint64_t b) noexcept {
+    const std::uint64_t a0 = static_cast<std::uint32_t>(a), a1 = a >> 32;
+    const std::uint64_t b0 = static_cast<std::uint32_t>(b), b1 = b >> 32;
+    const std::uint64_t p00 = a0*b0, p01 = a0*b1, p10 = a1*b0, p11 = a1*b1;
+    const std::uint64_t middle = (p00 >> 32) + static_cast<std::uint32_t>(p01) + static_cast<std::uint32_t>(p10);
+    return {p11 + (p01 >> 32) + (p10 >> 32) + (middle >> 32),
+            (middle << 32) | static_cast<std::uint32_t>(p00)};
+}
+
+bool round_up(bool negative, std::uint8_t rc, std::uint64_t retained,
+              bool guard, bool sticky) noexcept {
+    if (!guard && !sticky) return false;
+    switch (rc & 3) {
+    case 0: return guard && (sticky || (retained & 1));
+    case 1: return negative;
+    case 2: return !negative;
+    default: return false;
+    }
 }
 } // namespace
 
@@ -381,6 +403,99 @@ evaluate_x87_round_to_integral(const X87RoundToIntegralRequest &request) noexcep
     const auto exponent = static_cast<std::uint16_t>(highest_bit + 16383u);
     result.value = X87Binary80{significand,
         static_cast<std::uint16_t>(exponent | (negative ? sign_mask : 0))};
+    return result;
+}
+
+std::optional<X87ArithmeticResult> evaluate_x87_multiply(const X87MultiplyRequest &request) noexcept {
+    if (((request.control_word >> 8) & 3) == 1) return {};
+    const auto a = decode(request.left), b = decode(request.right);
+    const bool a_numeric = a.kind == Class::finite || a.kind == Class::zero;
+    const bool b_numeric = b.kind == Class::finite || b.kind == Class::zero;
+    if (!a_numeric || !b_numeric) return {};
+    const bool negative = a.negative != b.negative;
+    if (a.kind == Class::zero || b.kind == Class::zero) {
+        X87ArithmeticResult result;
+        result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
+        result.value = X87Binary80{0, static_cast<std::uint16_t>(negative ? sign_mask : 0)};
+        return result;
+    }
+    auto a_sig = a.significand, b_sig = b.significand;
+    auto a_exp = static_cast<int>(a.exponent == 0 ? 1 : a.exponent);
+    auto b_exp = static_cast<int>(b.exponent == 0 ? 1 : b.exponent);
+    if ((a_sig & integer_bit) == 0) {
+        const auto shift = std::countl_zero(a_sig);
+        a_sig <<= shift;
+        a_exp -= static_cast<int>(shift);
+    }
+    if ((b_sig & integer_bit) == 0) {
+        const auto shift = std::countl_zero(b_sig);
+        b_sig <<= shift;
+        b_exp -= static_cast<int>(shift);
+    }
+    const auto product = multiply_u64(a_sig, b_sig);
+    const bool top = (product.hi >> 63) != 0;
+    std::uint64_t significand = top ? (product.hi >> 0) : ((product.hi << 1) | (product.lo >> 63));
+    const std::uint64_t tail = top ? product.lo : (product.lo << 1);
+    int exponent = a_exp + b_exp - 16383 + (top ? 1 : 0);
+    const auto pc = static_cast<std::uint8_t>((request.control_word >> 8) & 3);
+    const unsigned precision = pc == 0 ? 24 : pc == 2 ? 53 : 64;
+    const unsigned discard = 64 - precision;
+    std::uint64_t retained = significand >> discard;
+    bool guard = false, sticky = tail != 0;
+    if (discard) {
+        guard = ((significand >> (discard - 1)) & 1) != 0;
+        const auto mask = (std::uint64_t{1} << (discard - 1)) - 1;
+        sticky = sticky || (significand & mask) != 0;
+    } else {
+        guard = (tail >> 63) != 0;
+        sticky = (tail & (UINT64_MAX >> 1)) != 0;
+    }
+    const bool inexact = guard || sticky;
+    const bool increment = round_up(negative,
+        static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10), retained, guard, sticky);
+    const auto precision_max = precision == 64 ? UINT64_MAX : ((std::uint64_t{1} << precision) - 1);
+    const bool carry = increment && retained == precision_max;
+    if (increment) ++retained;
+    if (carry) {
+        retained = std::uint64_t{1} << (precision - 1);
+        ++exponent;
+    }
+    significand = retained << discard;
+
+    X87ArithmeticResult result;
+    result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
+    if (inexact && increment) result.status_word |= fsw_c1;
+    const bool overflow = exponent >= 0x7fff;
+    if (overflow) {
+        result.overflow = true;
+        result.precision = true;
+        result.status_word |= static_cast<std::uint16_t>((1u<<3) | fsw_precision);
+        if ((request.control_word & fcw_overflow_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, 1u<<3);
+            result.completed = false;
+            return result;
+        }
+        const auto rc = static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10);
+        const bool infinity = rc == 0 || (rc == 1 && negative) || (rc == 2 && !negative);
+        result.value = infinity ? X87Binary80{integer_bit, static_cast<std::uint16_t>(0x7fff | (negative ? sign_mask : 0))}
+                                : X87Binary80{UINT64_MAX, static_cast<std::uint16_t>(0x7ffe | (negative ? sign_mask : 0))};
+        if ((request.control_word & fcw_precision_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_precision);
+            result.completed = false;
+            result.value.reset();
+        }
+        return result;
+    }
+    if (exponent <= 0) return {}; // gradual-underflow rounding is deliberately unsupported for now
+    if (inexact) result.status_word |= fsw_precision;
+    if (inexact && (request.control_word & fcw_precision_mask) == 0) {
+        result.precision = true;
+        result.status_word = signal_exception(result.status_word, fsw_precision);
+        result.completed = false;
+        return result;
+    }
+    result.precision = inexact;
+    result.value = X87Binary80{significand, static_cast<std::uint16_t>(exponent | (negative ? sign_mask : 0))};
     return result;
 }
 

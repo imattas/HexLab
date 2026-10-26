@@ -151,8 +151,17 @@ std::optional<DynamicMemoryRange> dynamic_memory_range(const MemoryValue &memory
             if (memory.index->width != 32 || index->second > std::numeric_limits<std::uint32_t>::max()) return {};
             index_value = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(index->second));
         } else if (memory.index_extend == "sxtx") {
-            if (memory.index->width != 64) return {};
+            if (memory.index->width != 64 || memory.base->width != 64) return {};
             index_value = std::bit_cast<std::int64_t>(index->second);
+        } else if (memory.index_extend == "uxtx") {
+            // UXTX (also rendered by A64 assemblers as LSL when the shift is
+            // present) preserves the full 64-bit unsigned index. Dynamic
+            // partition offsets are signed, so values outside that domain
+            // cannot be represented without wrapping and must stay on the
+            // whole-memory chain.
+            if (memory.index->width != 64 || memory.base->width != 64 ||
+                index->second > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return {};
+            index_value = static_cast<std::int64_t>(index->second);
         } else {
             return {};
         }

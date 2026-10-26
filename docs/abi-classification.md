@@ -75,10 +75,18 @@ The member must have its required 16-byte alignment, otherwise the aggregate is
 memory-class. If an aggregate cannot fit in every required argument register,
 register allocation rolls back for that aggregate and the whole value is
 assigned to an aligned stack slot. Aggregates larger than 16 bytes or containing
-unaligned members use memory. A memory-class result reports its hidden buffer
+unaligned members use memory. An aggregate containing a binary80 field is
+memory-class even when it is at most 16 bytes; binary80 itself keeps its scalar
+ST0 result and stack argument rules. A memory-class result reports its hidden buffer
 pointer separately in `hidden_result_pointer` at RDI and reports the returned
 buffer address in RAX. The hidden pointer consumes the first integer argument
 register, while declared arguments retain their original indices.
+The [System V AMD64 psABI](https://gitlab.com/x86-psABIs/x86-64-ABI/-/blob/master/x86-64-ABI/low-level-sys-info.tex)
+defines the X87/X87UP memory cleanup rule. Ghidra's [x86-64 GCC compiler
+specification](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/x86/data/languages/x86-64-gcc.cspec)
+was also consulted for its joined-register and stack-fallback organization;
+HexLab retains the aggregate's per-eightbyte classes so mixed register pieces
+and this memory-class case can be represented explicitly.
 
 Microsoft x64 assigns each declared argument a single ordinal position shared
 by the four register slots (RCX/RDX/R8/R9 for integer or pointer values and
