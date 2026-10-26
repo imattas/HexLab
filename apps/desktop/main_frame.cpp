@@ -76,6 +76,7 @@
 #include <atomic>
 #include <cstddef>
 #include <chrono>
+#include <charconv>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
@@ -97,6 +98,21 @@ constexpr long maximum_restored_documents = 32;
 constexpr std::size_t maximum_persisted_path_characters = 32768;
 constexpr std::size_t maximum_persisted_recipe_bytes = 65536;
 constexpr char recipe_hex_digits[] = "0123456789abcdef";
+std::string encode_session_integer(std::uint64_t value) {
+    char buffer[16];
+    const auto converted = std::to_chars(buffer, buffer + sizeof(buffer), value, 16);
+    return converted.ec == std::errc{} ? std::string(buffer, converted.ptr) : std::string{};
+}
+std::optional<std::uint64_t> decode_session_integer(const wxString &value) {
+    const auto encoded = value.utf8_str();
+    if (!encoded || encoded.length() == 0 || encoded.length() > 16) return std::nullopt;
+    std::uint64_t decoded = 0;
+    const char *begin = encoded.data();
+    const char *end = begin + encoded.length();
+    const auto parsed = std::from_chars(begin, end, decoded, 16);
+    if (parsed.ec != std::errc{} || parsed.ptr != end) return std::nullopt;
+    return decoded;
+}
 std::string encode_recipe_hex(std::span<const std::byte> bytes) {
     std::string encoded;
     encoded.reserve(bytes.size() * 2);
@@ -633,6 +649,7 @@ struct MainFrame::Impl {
     bool session_restore_activation_pending = false;
     std::vector<DocumentId> session_restore_documents;
     std::optional<DocumentId> session_restore_active;
+    std::optional<Location> session_restore_location;
     wxTimer compare_timer;
     struct CompareWork {
         std::mutex mutex;
@@ -1608,6 +1625,12 @@ struct MainFrame::Impl {
                 if (active_survived) {
                     mark_active_document(*session_restore_active);
                     controller->activate(*session_restore_active);
+                    if (session_restore_location) {
+                        auto moved = controller->documents().navigate(*session_restore_active,
+                                                                       *session_restore_location);
+                        if (moved) sync();
+                        else frame.SetStatusText("The saved cursor location is no longer mapped.");
+                    }
                     return;
                 }
             }
@@ -4067,6 +4090,7 @@ void MainFrame::RestoreWorkspaceSession() {
     std::vector<DocumentId> restored_documents;
     restored_documents.reserve(static_cast<std::size_t>(count));
     std::optional<DocumentId> restored_active;
+    std::optional<Location> restored_location;
     std::size_t skipped = 0;
     for (long index = 0; index < count; ++index) {
         wxString saved, kind, mode;
@@ -4125,11 +4149,26 @@ void MainFrame::RestoreWorkspaceSession() {
         const auto documents = projects().documents();
         if (!documents.empty()) {
             restored_documents.push_back(documents.back().id);
-            if (index == active) restored_active = documents.back().id;
+            if (index == active) {
+                restored_active = documents.back().id;
+                wxString location_kind, space_text, offset_text;
+                if (config->Read(wxString::Format("Document%ldLocationKind", index), &location_kind) &&
+                    config->Read(wxString::Format("Document%ldLocationSpace", index), &space_text) &&
+                    config->Read(wxString::Format("Document%ldLocationOffset", index), &offset_text)) {
+                    const auto space = decode_session_integer(space_text);
+                    const auto offset = decode_session_integer(offset_text);
+                    if (offset && location_kind == "file")
+                        restored_location = Location{FileOffset{*offset}};
+                    else if (space && *space <= UINT32_MAX && offset && location_kind == "address")
+                        restored_location = Location{Address{AddressSpaceId{static_cast<std::uint32_t>(*space)},
+                                                             *offset}};
+                }
+            }
         }
     }
     impl_->session_restore_documents = std::move(restored_documents);
     impl_->session_restore_active = restored_active;
+    impl_->session_restore_location = std::move(restored_location);
     impl_->session_restore_activation_pending = !impl_->session_restore_documents.empty();
     config->SetPath(previous_path);
     if (skipped)
@@ -4140,7 +4179,13 @@ void MainFrame::SaveWorkspaceSession() {
     auto *config = wxConfigBase::Get(false);
     if (!config) return;
     const auto documents = projects().documents();
-    struct SavedEntry { std::filesystem::path path; wxString kind; wxString mode; wxString recipe; };
+    struct SavedEntry {
+        std::filesystem::path path;
+        wxString kind;
+        wxString mode;
+        wxString recipe;
+        std::optional<Location> location;
+    };
     std::vector<SavedEntry> entries;
     entries.reserve(std::min<std::size_t>(documents.size(), maximum_restored_documents));
     long active = -1;
@@ -4171,6 +4216,9 @@ void MainFrame::SaveWorkspaceSession() {
         }
         if (entry.path.native().size() > maximum_persisted_path_characters) continue;
         if (active_id && document.id == *active_id) active = static_cast<long>(entries.size());
+        if (active_id && document.id == *active_id && projects().active_document() == active_id) {
+            if (const auto selected = impl_->state().selection()) entry.location = *selected;
+        }
         entries.push_back(std::move(entry));
     }
     const auto previous_path = config->GetPath();
@@ -4182,8 +4230,25 @@ void MainFrame::SaveWorkspaceSession() {
         config->Write(wxString::Format("Document%ldPath", number), wxString(entries[index].path.wstring()));
         config->Write(wxString::Format("Document%ldKind", number), entries[index].kind);
         config->Write(wxString::Format("Document%ldMode", number), entries[index].mode);
+        config->DeleteEntry(wxString::Format("Document%ldLocationKind", number));
+        config->DeleteEntry(wxString::Format("Document%ldLocationSpace", number));
+        config->DeleteEntry(wxString::Format("Document%ldLocationOffset", number));
         if (!entries[index].recipe.empty())
             config->Write(wxString::Format("Document%ldRecipe", number), entries[index].recipe);
+        if (entries[index].location) {
+            if (const auto *address = std::get_if<Address>(&*entries[index].location)) {
+                config->Write(wxString::Format("Document%ldLocationKind", number), "address");
+                config->Write(wxString::Format("Document%ldLocationSpace", number),
+                              wxString::FromUTF8(encode_session_integer(address->space.value)));
+                config->Write(wxString::Format("Document%ldLocationOffset", number),
+                              wxString::FromUTF8(encode_session_integer(address->offset)));
+            } else {
+                config->Write(wxString::Format("Document%ldLocationKind", number), "file");
+                config->Write(wxString::Format("Document%ldLocationSpace", number), "0");
+                config->Write(wxString::Format("Document%ldLocationOffset", number),
+                              wxString::FromUTF8(encode_session_integer(std::get<FileOffset>(*entries[index].location).value)));
+            }
+        }
     }
     config->SetPath(previous_path);
     config->Flush();

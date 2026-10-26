@@ -606,6 +606,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::xadd) return "xadd";
     if (op == Opcode::cmpxchg) return "cmpxchg";
     if (op == Opcode::xchg) return "xchg";
+    if (op == Opcode::bswap) return "bswap";
+    if (op == Opcode::popcnt) return "popcnt";
     if (op == Opcode::cbw) return "cbw";
     if (op == Opcode::cwde) return "cwde";
     if (op == Opcode::cdqe) return "cdqe";

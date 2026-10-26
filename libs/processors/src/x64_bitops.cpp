@@ -5,6 +5,29 @@ bool bit_operations(State &s, std::uint8_t opcode, bool extended) {
     if (!extended)
         return false;
 
+    if (opcode >= 0xc8 && opcode <= 0xcf) {
+        // BSWAP uses a fixed 32-bit operand outside long mode; in long mode
+        // REX.W selects the 64-bit form and 66 is ignored by the encoding.
+        const std::uint16_t width = s.rules.long_mode() ? ((s.rex & 8) ? 64 : 32) : s.width();
+        if (width != 32 && width != 64)
+            invalid("BSWAP does not support a 16-bit operand");
+        s.i.opcode = Opcode::bswap;
+        s.operand(s.reg(opcode & 7, width, (s.rex & 1) != 0), OperandAccess::read_write);
+        return true;
+    }
+
+    if (opcode == 0xb8) {
+        if (s.group1 != 0xf3)
+            invalid("POPCNT requires the F3 mandatory prefix");
+        s.i.opcode = Opcode::popcnt;
+        const auto m = modrm(s, s.width());
+        s.operand(m.reg, OperandAccess::write);
+        s.operand(m.rm, OperandAccess::read);
+        // POPCNT clears CF/PF/AF/SF/OF and sets ZF when its source is zero.
+        s.flags_write = true;
+        return true;
+    }
+
     if (opcode == 0xa4 || opcode == 0xa5 || opcode == 0xac || opcode == 0xad) {
         const auto width = s.width();
         const auto m = modrm(s, width, width);

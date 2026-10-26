@@ -2290,7 +2290,7 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                 propagated = true;
             } else if (((!mips64 && (instruction.opcode == Opcode::mips_addi ||
                                      instruction.opcode == Opcode::mips_addiu || instruction.opcode == Opcode::mips_ori)) ||
-                        (mips64 && (instruction.opcode == Opcode::mips_addi || instruction.opcode == Opcode::mips_addiu ||
+                        (mips64 && (instruction.opcode == Opcode::mips64_addi || instruction.opcode == Opcode::mips64_addiu ||
                                     instruction.opcode == Opcode::mips64_daddiu || instruction.opcode == Opcode::mips_ori))) &&
                        instruction.operands.size() == 3) {
                 const auto *dst = architecture_register(instruction, 0, RegisterBank::mips_gpr, width);
@@ -2306,8 +2306,8 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                         std::optional<std::uint64_t> address;
                         if (instruction.opcode == Opcode::mips_ori) {
                             address = base_value | *immediate;
-                        } else if (mips64 && (instruction.opcode == Opcode::mips_addi ||
-                                              instruction.opcode == Opcode::mips_addiu)) {
+                        } else if (mips64 && (instruction.opcode == Opcode::mips64_addi ||
+                                              instruction.opcode == Opcode::mips64_addiu)) {
                             const auto base_word = static_cast<std::int32_t>(base_value);
                             const bool sign_extended_word =
                                 static_cast<std::uint64_t>(static_cast<std::int64_t>(base_word)) == base_value;
@@ -2326,6 +2326,59 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                             address = riscv_add(base_value, displacement, width);
                         }
                         if (address) target = Address{space, width == 32 ? *address & UINT64_C(0xffffffff) : *address};
+                    }
+                }
+                erase_written();
+                if (dst && dst->index != 0 && target) {
+                    registers[dst->index] = *target;
+                    if (riscv_target_segment(*image, *target, OperandAccess::address))
+                        result.immediate_targets[{fact->id, 2}] = *target;
+                }
+                propagated = true;
+            } else if (mips64 && instruction.operands.size() == 3 &&
+                       (instruction.opcode == Opcode::mips64_add || instruction.opcode == Opcode::mips64_addu ||
+                        instruction.opcode == Opcode::mips64_sub || instruction.opcode == Opcode::mips64_subu ||
+                        instruction.opcode == Opcode::mips64_daddu || instruction.opcode == Opcode::mips64_dsubu)) {
+                const auto *dst = architecture_register(instruction, 0, RegisterBank::mips_gpr, 64);
+                const auto *left = architecture_register(instruction, 1, RegisterBank::mips_gpr, 64);
+                const auto *right = architecture_register(instruction, 2, RegisterBank::mips_gpr, 64);
+                std::optional<Address> target;
+                if (dst && dst->index != 0 && left && right) {
+                    std::optional<Address> left_value, right_value;
+                    if (left->index == 0) left_value = Address{instruction.address.space, 0};
+                    else if (const auto found = registers.find(left->index); found != registers.end())
+                        left_value = found->second;
+                    if (right->index == 0) right_value = Address{instruction.address.space, 0};
+                    else if (const auto found = registers.find(right->index); found != registers.end())
+                        right_value = found->second;
+                    if (left_value && right_value && left_value->space == instruction.address.space &&
+                        right_value->space == instruction.address.space) {
+                        const bool subtract = instruction.opcode == Opcode::mips64_sub ||
+                                              instruction.opcode == Opcode::mips64_subu ||
+                                              instruction.opcode == Opcode::mips64_dsubu;
+                        const bool word = instruction.opcode == Opcode::mips64_add ||
+                                          instruction.opcode == Opcode::mips64_addu ||
+                                          instruction.opcode == Opcode::mips64_sub ||
+                                          instruction.opcode == Opcode::mips64_subu;
+                        if (word) {
+                            const auto lhs = static_cast<std::int32_t>(left_value->offset);
+                            const auto rhs = static_cast<std::int32_t>(right_value->offset);
+                            const auto wide = subtract ? static_cast<std::int64_t>(lhs) - rhs :
+                                                        static_cast<std::int64_t>(lhs) + rhs;
+                            const bool trapping = instruction.opcode == Opcode::mips64_add ||
+                                                  instruction.opcode == Opcode::mips64_sub;
+                            if (!trapping || (wide >= INT32_MIN && wide <= INT32_MAX)) {
+                                const auto low = static_cast<std::uint32_t>(wide);
+                                target = Address{instruction.address.space,
+                                    static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(low)))};
+                            }
+                        } else {
+                            const auto lhs = left_value->offset, rhs = right_value->offset;
+                            if (!subtract && lhs <= UINT64_MAX - rhs)
+                                target = Address{instruction.address.space, lhs + rhs};
+                            else if (subtract && lhs >= rhs)
+                                target = Address{instruction.address.space, lhs - rhs};
+                        }
                     }
                 }
                 erase_written();

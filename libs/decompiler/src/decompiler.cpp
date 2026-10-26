@@ -837,6 +837,55 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
 
     const bool x86_context = instruction.context.architecture == Architecture::x86 ||
                              instruction.context.architecture == Architecture::x86_64;
+    if (x86_context && instruction.opcode == Opcode::bswap && operands.size() == 1) {
+        const auto destination = as_register(instruction.operands.front());
+        if (destination && destination->bank == RegisterBank::gpr &&
+            (destination->width == 32 || destination->width == 64) &&
+            operands.front()->type.bits == destination->width) {
+            auto value = std::make_shared<Expression>(Expression{integer_type(destination->width),
+                UnaryValue{"bswap" + std::to_string(destination->width), operands.front()}});
+            return Assign{*destination, std::move(value)};
+        }
+    }
+    if (x86_context && instruction.opcode == Opcode::popcnt && instruction.operands.size() == 2) {
+        const auto destination = as_register(instruction.operands[0]);
+        const auto flags = std::find_if(instruction.register_writes.begin(), instruction.register_writes.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        if (destination && destination->bank == RegisterBank::gpr &&
+            (destination->width == 16 || destination->width == 32 || destination->width == 64) &&
+            operands[1]->type.bits == destination->width && flags != instruction.register_writes.end() &&
+            (flags->width == 16 || flags->width == 32 || flags->width == 64)) {
+            auto source = retag_expr(operands[1], integer_type(destination->width));
+            auto count = std::make_shared<Expression>(Expression{integer_type(destination->width),
+                UnaryValue{"popcnt", source}});
+            constexpr std::uint64_t affected_flags = (UINT64_C(1) << 0) | (UINT64_C(1) << 2) |
+                (UINT64_C(1) << 4) | (UINT64_C(1) << 6) | (UINT64_C(1) << 7) | (UINT64_C(1) << 11);
+            auto retained_flags = std::make_shared<Expression>(Expression{integer_type(flags->width),
+                BinaryValue{"and", reg_expr(*flags), constant_expr(~affected_flags, flags->width)}});
+            auto zero = boolean_binary("eq", source, constant_expr(0, destination->width));
+            auto zf = std::make_shared<Expression>(Expression{integer_type(flags->width),
+                BinaryValue{"shl", std::make_shared<Expression>(Expression{integer_type(flags->width),
+                    UnaryValue{"zext", std::move(zero)}}), constant_expr(6, flags->width)}});
+            auto new_flags = std::make_shared<Expression>(Expression{integer_type(flags->width),
+                BinaryValue{"or", std::move(retained_flags), std::move(zf)}});
+
+            Intrinsic effect{"x86_popcnt_i" + std::to_string(destination->width), {source},
+                is_memory(instruction.operands[1]) ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = integer_type(destination->width);
+            for (const auto written : effect.register_writes) {
+                if (written == *destination)
+                    effect.register_output_values.push_back(count);
+                else if (written == *flags)
+                    effect.register_output_values.push_back(new_flags);
+                else
+                    return Intrinsic{"x86_popcnt_unmodeled_output", {source}, IntrinsicMemoryEffect::unknown};
+            }
+            if (effect.register_output_values.size() != effect.register_writes.size())
+                return Intrinsic{"x86_popcnt_unmodeled_output", {source}, IntrinsicMemoryEffect::unknown};
+            return effect;
+        }
+    }
     if (x86_context && (instruction.opcode == Opcode::push || instruction.opcode == Opcode::pop ||
                         instruction.opcode == Opcode::pushf || instruction.opcode == Opcode::popf ||
                         instruction.opcode == Opcode::pusha || instruction.opcode == Opcode::popa ||
