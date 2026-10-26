@@ -48,6 +48,12 @@ The bounded COP1 S/D/W scalar subset lifts to floating-typed FPR values.
 D arithmetic, comparisons, conversions, and W rounding forms remain named
 `mips.*` intrinsics with decoded FPR/FCSR effects and conversion result types.
 `BC1T` and `BC1F` produce branches over the selected `mips.fccN` predicate.
+`MFC1` and `MTC1` are typed 32-bit bitcasts between GPR and FPR values;
+`CFC1` and `CTC1` on aggregate FCSR31 are exact 32-bit copies, and a write
+projects its condition-code bits into FCC0-FCC7 SSA. FCCR25 writes conservatively
+clobber all FCC state because its bit-level mapping is not modeled; FEXR26 and
+FENR28 remain named effects with an aggregate FCSR dependency. MIPS64-only
+doubleword transfer forms are not decoded in this MIPS32 mode.
 The decoder records one delay slot; MIPS analysis owns and orders the slot
 through its explicit CFG edge. Intrinsic FCSR condition/flag behavior, IEEE
 arithmetic/conversion results, and runtime rounding remain abstract.

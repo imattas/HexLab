@@ -3,6 +3,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -62,7 +63,7 @@ struct Reader {
 struct Proto { std::uint32_t return_type = 0; std::vector<std::uint16_t> parameters; };
 struct Method { std::uint16_t owner = 0, proto = 0; std::uint32_t name = 0; };
 struct Field { std::uint16_t owner = 0, type = 0; std::uint32_t name = 0; };
-struct Code { std::uint32_t method = 0; std::uint64_t file_offset = 0; std::uint32_t byte_size = 0, debug = 0, registers = 0, ins = 0; };
+struct Code { std::uint32_t method = 0; std::uint64_t file_offset = 0; std::uint32_t byte_size = 0, debug = 0, registers = 0, ins = 0; std::vector<DexExceptionRegion> exception_regions; };
 
 bool extent(std::uint64_t off, std::uint64_t count, std::uint64_t stride, std::uint64_t size) {
     return off <= size && (!count || (stride && count <= (size - off) / stride));
@@ -235,6 +236,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
     std::vector<Code> code;
     std::unordered_set<std::uint32_t> class_data_offsets;
     std::uint64_t total_code_units=0;
+    std::uint64_t total_try_items=0, total_catch_handlers=0;
     for(std::uint32_t ci=0;ci<class_count;++ci){
         if(stop.stop_requested())return Error{ErrorCode::canceled,"DEX class-data parsing canceled"};
         ids.seek(class_off+std::size_t(ci)*32);std::uint32_t class_type=0,access=0,super=0,interfaces=0,source_file=0,annotations=0,class_data=0,static_values=0;
@@ -264,24 +266,33 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
                 if(debug&&(debug<data_off||debug>=std::uint64_t(data_off)+data_size))return Error{ErrorCode::malformed,"DEX debug_info offset is outside data section"};
                 total_code_units+=insns;if(total_code_units>UINT32_MAX/2)return Error{ErrorCode::resource_limit,"DEX mapped code exceeds the method address-space budget"};
                 const auto insns_off=cr.pos; cr.skip(std::size_t(insns)*2);
+                std::vector<DexExceptionRegion> exception_regions;
                 if(tries){
                     if(insns&1){std::uint16_t padding=0;if(!cr.u16(padding)||padding)return Error{ErrorCode::malformed,"DEX code_item try padding is invalid"};}
                     if(!extent(cr.pos,tries,8,file_size))return Error{ErrorCode::malformed,"DEX try_item table exceeds input"};
-                    std::vector<std::uint16_t> handler_refs; handler_refs.reserve(tries);
-                    for(std::uint16_t n=0;n<tries;++n){std::uint32_t start=0;std::uint16_t count=0,handler=0;if(!cr.u32(start)||!cr.u16(count)||!cr.u16(handler)||!count||std::uint64_t(start)+count>insns)return Error{ErrorCode::malformed,"DEX try_item range is invalid"};handler_refs.push_back(handler);}
+                    total_try_items+=tries;if(total_try_items>2'000'000)return Error{ErrorCode::resource_limit,"Aggregate DEX try_item count exceeds two million"};
+                    struct TryItem { std::uint32_t start=0; std::uint16_t count=0, handler=0; };
+                    std::vector<TryItem> try_items; try_items.reserve(tries);
+                    std::uint64_t previous_end=0;
+                    for(std::uint16_t n=0;n<tries;++n){std::uint32_t start=0;std::uint16_t count=0,handler=0;if(!cr.u32(start)||!cr.u16(count)||!cr.u16(handler)||!count||std::uint64_t(start)+count>insns||start<previous_end)return Error{ErrorCode::malformed,"DEX try_item ranges are invalid, overlapping, or unordered"};previous_end=std::uint64_t(start)+count;try_items.push_back({start,count,handler});}
                     const auto handlers_base=cr.pos;
                     std::uint32_t handlers=0;if(!cr.uleb(handlers)||handlers>max_items)return Error{ErrorCode::malformed,"DEX catch handler list count is invalid"};
-                    std::vector<std::uint16_t> handler_starts; handler_starts.reserve(handlers);
-                    for(std::uint32_t n=0;n<handlers;++n){if(cr.pos-handlers_base>UINT16_MAX)return Error{ErrorCode::resource_limit,"DEX catch handler offsets exceed encoding range"};handler_starts.push_back(static_cast<std::uint16_t>(cr.pos-handlers_base));std::int32_t typed=0;if(!cr.sleb(typed))return Error{ErrorCode::malformed,"Truncated DEX catch handler"};const auto typed_count=std::uint32_t(typed<0?-std::int64_t(typed):typed);if(typed_count>max_items)return Error{ErrorCode::resource_limit,"DEX catch handler exceeds item budget"};for(std::uint32_t j=0;j<typed_count;++j){std::uint32_t type=0,addr=0;if(!cr.uleb(type)||!cr.uleb(addr)||type>=types.size()||addr>=insns)return Error{ErrorCode::malformed,"DEX typed catch entry is invalid"};}if(typed<=0){std::uint32_t addr=0;if(!cr.uleb(addr)||addr>=insns)return Error{ErrorCode::malformed,"DEX catch-all address is invalid"};}}
-                    for(const auto ref:handler_refs)if(std::find(handler_starts.begin(),handler_starts.end(),ref)==handler_starts.end())return Error{ErrorCode::malformed,"DEX try_item references a missing catch handler"};
+                    std::map<std::uint16_t,std::vector<DexExceptionHandler>> handler_lists;
+                    for(std::uint32_t n=0;n<handlers;++n){if(cr.pos-handlers_base>UINT16_MAX)return Error{ErrorCode::resource_limit,"DEX catch handler offsets exceed encoding range"};const auto handler_offset=static_cast<std::uint16_t>(cr.pos-handlers_base);std::int32_t typed=0;if(!cr.sleb(typed))return Error{ErrorCode::malformed,"Truncated DEX catch handler"};const auto typed_count=static_cast<std::uint32_t>(typed<0?-std::int64_t(typed):typed);if(typed_count>max_items)return Error{ErrorCode::resource_limit,"DEX catch handler exceeds item budget"};total_catch_handlers+=typed_count+(typed<=0?1u:0u);if(total_catch_handlers>4'000'000)return Error{ErrorCode::resource_limit,"Aggregate DEX catch handlers exceed four million"};std::vector<DexExceptionHandler> decoded;decoded.reserve(typed_count+(typed<=0?1u:0u));for(std::uint32_t j=0;j<typed_count;++j){std::uint32_t type=0,addr=0;if(!cr.uleb(type)||!cr.uleb(addr)||type>=types.size()||addr>=insns)return Error{ErrorCode::malformed,"DEX typed catch entry is invalid"};decoded.push_back({addr*2,type});}if(typed<=0){std::uint32_t addr=0;if(!cr.uleb(addr)||addr>=insns)return Error{ErrorCode::malformed,"DEX catch-all address is invalid"};decoded.push_back({addr*2,std::nullopt});}handler_lists.emplace(handler_offset,std::move(decoded));}
+                    exception_regions.reserve(try_items.size());
+                    for(const auto &item:try_items){const auto found=handler_lists.find(item.handler);if(found==handler_lists.end())return Error{ErrorCode::malformed,"DEX try_item references a missing catch handler"};total_catch_handlers+=found->second.size();if(total_catch_handlers>4'000'000)return Error{ErrorCode::resource_limit,"Expanded DEX try/catch associations exceed four million"};exception_regions.push_back({item.start*2,(item.start+item.count)*2,found->second});}
                 }
                 if(insns==0||cr.pos>data_end)return Error{ErrorCode::malformed,"DEX code_item is empty or extends outside data section"};
-                code.push_back({static_cast<std::uint32_t>(method_idx),insns_off,insns*2,debug,registers,ins});
+                code.push_back({static_cast<std::uint32_t>(method_idx),insns_off,insns*2,debug,registers,ins,std::move(exception_regions)});
             }
         }
     }
     if(code.size()>max_items)return Error{ErrorCode::resource_limit,"DEX defined method count exceeds address-space budget"};
     DexMetadata dex_metadata;
+    dex_metadata.code.reserve(code.size());
+    for (auto &compiled : code)
+        dex_metadata.code.push_back({compiled.method,compiled.registers,compiled.ins,std::move(compiled.exception_regions)});
+    std::sort(dex_metadata.code.begin(),dex_metadata.code.end(),[](const DexMethodCode &a,const DexMethodCode &b){return a.method_index<b.method_index;});
     std::uint64_t total_debug_rows = 0;
     std::size_t total_debug_bytes = 0;
     for (const auto &compiled : code) {

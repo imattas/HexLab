@@ -1132,6 +1132,55 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
             }
         }
     }
+    // DEX code_items carry half-open protected ranges and ordered encoded
+    // catch handlers. Add conservative exceptional successors only from
+    // opcodes with observable Dalvik exception behavior; catch matching is
+    // intentionally not guessed here, so every handler for the active try is
+    // retained in table order.
+    if (instruction.context.architecture == Architecture::dex && metadata.dex &&
+        !instruction.encoded_bytes().empty() && address.space.value != 0) {
+        const auto raw = std::to_integer<std::uint8_t>(instruction.encoded_bytes().front());
+        const bool may_throw = raw == 0x1a || raw == 0x1b || raw == 0x1c ||
+                               (raw >= 0x1d && raw <= 0x27) ||
+                               (raw >= 0x44 && raw <= 0x78) || raw == 0x93 || raw == 0x94 ||
+                               raw == 0x9e || raw == 0x9f || raw == 0xb3 || raw == 0xb4 ||
+                               raw == 0xbe || raw == 0xbf || raw == 0xd3 || raw == 0xd4 ||
+                               raw == 0xdb || raw == 0xdc || (raw >= 0xfa && raw <= 0xff);
+        if (may_throw) {
+            const auto method_index = static_cast<std::uint64_t>(address.space.value) - 1;
+            const auto &methods = metadata.dex->code;
+            const auto method = std::lower_bound(methods.begin(), methods.end(), method_index,
+                [](const DexMethodCode &candidate, std::uint64_t index) {
+                    return candidate.method_index < index;
+                });
+            if (method != methods.end() && method->method_index == method_index) {
+                const auto &regions = method->exception_regions;
+                const auto after = std::upper_bound(regions.begin(), regions.end(), address.offset,
+                    [](std::uint64_t offset, const DexExceptionRegion &region) {
+                        return offset < region.begin;
+                    });
+                if (after != regions.begin()) {
+                    const auto &region = *std::prev(after);
+                    if (address.offset >= region.begin && address.offset < region.end) {
+                        constexpr std::size_t max_dex_handlers_per_instruction = 4096;
+                        if (region.handlers.size() > max_dex_handlers_per_instruction) {
+                            output->complete = false;
+                            value.stop = FunctionStop{address, FunctionStopReason::unsupported,
+                                "DEX try/catch handler list exceeds the bounded CFG successor budget"};
+                        } else {
+                            for (const auto &handler : region.handlers) {
+                                const Address target{address.space, handler.address};
+                                if (std::none_of(value.edges.begin(), value.edges.end(), [&](const NodeEdge &edge) {
+                                        return edge.kind == BlockEdgeKind::exception && edge.target == target;
+                                    }))
+                                    value.edges.push_back({target, BlockEdgeKind::exception});
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (analysis_detail::has_delay_slot(instruction)) {
         const auto slot = take(analysis_detail::delay_slot_address(instruction));
         auto &after_slot = delayed_edges[slot];
@@ -1545,7 +1594,7 @@ namespace hexlab {
 Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     Sha256 hash;
     constexpr std::string_view version =
-        "hexlab-functions-v52/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v3/mips64-arithmetic-reference-v1/dex-switch-flow-v1/jvm-switch-flow-v1/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v3/guard-multiblock-v1/unicode-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
+        "hexlab-functions-v53/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v3/mips64-arithmetic-reference-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v1/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v3/guard-multiblock-v1/unicode-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
         "elf-reference-provenance-v1/elf-arithmetic-v2/macho-symbol-roots-v1/macho-relocation-flow-v1/"
         "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1";
     (void)hash.update(std::as_bytes(std::span(version)));

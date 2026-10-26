@@ -194,6 +194,12 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     });
     if (code.empty()) return unsupported("empty or unavailable function body");
 
+    constexpr std::size_t max_instructions = 100000;
+    constexpr std::size_t max_blocks = 16384;
+    constexpr std::size_t max_nesting = 128;
+    constexpr std::size_t max_stack = 128;
+    if (code.size() > max_instructions) return Error{ErrorCode::resource_limit, "WebAssembly function exceeds the instruction limit"};
+
     const auto function_index = static_cast<std::uint32_t>(function.entry.space.value);
     const auto signature_for = [&](std::uint64_t index) -> const WasmFunctionType * {
         if (!metadata || index > UINT32_MAX || index >= metadata->function_type_indices.size()) return nullptr;
@@ -203,8 +209,9 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     };
     const WasmFunctionType *function_signature = function.entry.space.value <= UINT32_MAX
         ? signature_for(function_index) : nullptr;
-    if (function_signature && function_signature->result_types.size() > 1)
-        return unsupported("multi-value function results are not modeled");
+    if (function_signature && (function_signature->result_count != function_signature->result_types.size() ||
+        function_signature->result_types.size() > max_stack))
+        return unsupported("function result metadata is inconsistent or exceeds the 128-value bound");
     const WasmFunctionLocals *declared_locals = nullptr;
     if (metadata) {
         const auto found = std::find_if(metadata->function_locals.begin(), metadata->function_locals.end(),
@@ -267,16 +274,10 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         return result;
     };
 
-    constexpr std::size_t max_instructions = 100000;
-    constexpr std::size_t max_blocks = 16384;
-    constexpr std::size_t max_nesting = 128;
-    constexpr std::size_t max_stack = 128;
-    if (code.size() > max_instructions) return Error{ErrorCode::resource_limit, "WebAssembly function exceeds the instruction limit"};
-
     struct Label {
         std::uint8_t kind;
         std::size_t opener, end, else_index;
-        std::optional<ValueType> result_type;
+        std::vector<ValueType> parameters, result_types;
     };
     std::vector<Label> labels;
     std::vector<std::size_t> nesting;
@@ -290,15 +291,29 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             auto bt=immediate(code[n]->instruction);
             if (!bt) return unsupported("block type immediate unavailable");
             const auto signed_bt=static_cast<std::int64_t>(*bt);
-            std::optional<ValueType> result_type;
-            if (signed_bt == -1) result_type = integer(32);
-            else if (signed_bt == -2) result_type = integer(64);
-            else if (signed_bt == -3) result_type = floating(32);
-            else if (signed_bt == -4) result_type = floating(64);
-            else if (signed_bt != -64)
-                return unsupported("indexed or unsupported block result type");
+            std::vector<ValueType> block_parameters, result_types;
+            if (signed_bt == -1) result_types.push_back(integer(32));
+            else if (signed_bt == -2) result_types.push_back(integer(64));
+            else if (signed_bt == -3) result_types.push_back(floating(32));
+            else if (signed_bt == -4) result_types.push_back(floating(64));
+            else if (signed_bt != -64) {
+                if (!metadata || signed_bt < 0 || static_cast<std::uint64_t>(signed_bt) >= metadata->function_types.size())
+                    return unsupported("indexed block type is unavailable or out of range");
+                const auto &signature = metadata->function_types[static_cast<std::size_t>(signed_bt)];
+                if (signature.parameter_count != signature.parameter_types.size() ||
+                    signature.result_count != signature.result_types.size() || !signature.parameter_types.empty())
+                    return unsupported("indexed block type parameters or metadata are outside the bounded subset");
+                if (signature.result_types.size() > max_stack)
+                    return Error{ErrorCode::resource_limit, "WebAssembly block result count exceeds 128 values"};
+                for (const auto type : signature.result_types) {
+                    const auto converted = wasm_value_type(type);
+                    if (!converted) return unsupported("indexed block type contains an unsupported result type");
+                    result_types.push_back(*converted);
+                }
+            }
             if (nesting.size() >= max_nesting) return Error{ErrorCode::resource_limit, "WebAssembly control nesting exceeds 128 labels"};
-            label_for_opener[n]=labels.size(); labels.push_back({op,n,code.size(),code.size(),result_type}); nesting.push_back(labels.size()-1);
+            label_for_opener[n]=labels.size(); labels.push_back({op,n,code.size(),code.size(),
+                std::move(block_parameters), std::move(result_types)}); nesting.push_back(labels.size()-1);
         } else if (op==5) {
             if (nesting.empty() || labels[nesting.back()].kind != 4 || labels[nesting.back()].else_index != code.size()) return unsupported("malformed else nesting");
             labels[nesting.back()].else_index=n;
@@ -311,7 +326,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     }
     if (!nesting.empty()) return unsupported("unterminated structured control");
     for (const auto &label : labels)
-        if (label.kind == 4 && label.result_type && label.else_index == code.size())
+        if (label.kind == 4 && label.else_index == code.size() && !label.result_types.empty())
             return unsupported("a result-typed if requires an else arm");
 
     if (function_end != code.size()-1) return unsupported("function has no final end operator");
@@ -389,6 +404,20 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     std::vector<std::vector<std::size_t>> predecessors(starts.size());
     std::vector<std::size_t> work{0};std::vector<bool> queued(starts.size());queued[0]=true;entries[0]=Shape{};
     const auto shape_pop=[&](Shape &stack,ValueType expected)->Result<ValueType>{if(stack.empty())return unsupported("operand stack underflow");auto actual=stack.back();stack.pop_back();if(expected.kind!=TypeKind::unknown&&actual!=expected)return unsupported("operand stack type mismatch");return actual;};
+    const auto signature_results = [&]() -> Result<std::vector<ValueType>> {
+        std::vector<ValueType> result;
+        if (!function_signature) return result;
+        for (const auto type : function_signature->result_types) {
+            const auto converted = wasm_value_type(type);
+            if (!converted) return unsupported("function signature contains an unsupported result type");
+            result.push_back(*converted);
+        }
+        return result;
+    };
+    const auto matching_suffix = [](const Shape &stack, const std::vector<ValueType> &types) {
+        if (stack.size() < types.size()) return false;
+        return std::equal(types.begin(), types.end(), stack.end() - static_cast<std::ptrdiff_t>(types.size()));
+    };
     while(!work.empty()){
         const auto bi=work.back();work.pop_back();queued[bi]=false;
         Shape stack=*entries[bi];const auto begin=starts[bi],finish=bi+1<starts.size()?starts[bi+1]:code.size();
@@ -397,7 +426,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 const auto li=*opener_label[n];
                 if(op==4){auto c=shape_pop(stack,integer(32));if(!c)return c.error();}
                 Shape end_shape=stack;
-                if(labels[li].result_type)end_shape.push_back(*labels[li].result_type);
+                end_shape.insert(end_shape.end(), labels[li].result_types.begin(), labels[li].result_types.end());
                 if(end_shapes[li]&&*end_shapes[li]!=end_shape)return unsupported("control label receives incompatible operand stacks");
                 end_shapes[li]=end_shape;
                 Shape branch_shape=labels[li].kind==3?stack:end_shape;
@@ -406,8 +435,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 continue;
             }
             if(op==1||op==5)continue;
-            if(op==0x0b){if(end_label[n]){if(!end_shapes[*end_label[n]]||*end_shapes[*end_label[n]]!=stack)return unsupported("block end has an incompatible operand stack");}else if(stack.size()>1)return unsupported("function end has extra stack values");continue;}
-            if(op==0x0f){if(stack.size()>1)return unsupported("return has extra operand stack values");continue;}
+            if(op==0x0b){if(end_label[n]){if(!end_shapes[*end_label[n]]||*end_shapes[*end_label[n]]!=stack)return unsupported("block end has an incompatible operand stack");}else if(n==function_end){auto result=signature_results();if(!result)return result.error();if(stack!=result.value())return unsupported("function end result stack does not match its signature");}continue;}
+            if(op==0x0f){auto result=signature_results();if(!result)return result.error();if(!matching_suffix(stack,result.value()))return unsupported("return stack does not match the function result types");continue;}
             if(op==0x00)break;
             if(op==0x1a){auto v=shape_pop(stack,{});if(!v)return v.error();continue;}
             if(op==0x1b){auto c=shape_pop(stack,integer(32));if(!c)return c.error();auto a=shape_pop(stack,{});if(!a)return a.error();auto b=shape_pop(stack,a.value());if(!b)return b.error();stack.push_back(a.value());continue;}
@@ -447,16 +476,16 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 if (!callee || callee->parameter_count != callee->parameter_types.size() ||
                     callee->result_count != callee->result_types.size())
                     return unsupported("direct call target or function signature metadata is unavailable");
-                if (callee->parameter_types.size() > max_stack || callee->result_types.size() > 1)
-                    return unsupported("direct call has too many parameters or multiple results");
+                if (callee->parameter_types.size() > max_stack || callee->result_types.size() > max_stack)
+                    return Error{ErrorCode::resource_limit, "direct call exceeds the 128-value parameter/result bound"};
                 for (auto it = callee->parameter_types.rbegin(); it != callee->parameter_types.rend(); ++it) {
                     const auto type = wasm_value_type(*it);
                     if (!type) return unsupported("direct call parameter type is unsupported");
                     auto argument = shape_pop(stack, *type);
                     if (!argument) return argument.error();
                 }
-                if (!callee->result_types.empty()) {
-                    const auto type = wasm_value_type(callee->result_types.front());
+                for (const auto result : callee->result_types) {
+                    const auto type = wasm_value_type(result);
                     if (!type) return unsupported("direct call result type is unsupported");
                     stack.push_back(*type);
                 }
@@ -468,8 +497,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     return unsupported("call_indirect type metadata is unavailable");
                 const auto &callee = metadata->function_types[*type_index];
                 if (callee.parameter_count != callee.parameter_types.size() || callee.result_count != callee.result_types.size() ||
-                    callee.parameter_types.size() > 127 || callee.result_types.size() > 1)
-                    return unsupported("call_indirect supports at most 127 numeric parameters and one result");
+                    callee.parameter_types.size() > 127 || callee.result_types.size() > max_stack)
+                    return Error{ErrorCode::resource_limit, "call_indirect exceeds the 127-parameter or 128-result bound"};
                 auto table_slot = shape_pop(stack, integer(32));
                 if (!table_slot) return table_slot.error();
                 for (auto it = callee.parameter_types.rbegin(); it != callee.parameter_types.rend(); ++it) {
@@ -478,8 +507,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     auto argument = shape_pop(stack, *type);
                     if (!argument) return argument.error();
                 }
-                if (!callee.result_types.empty()) {
-                    auto type = wasm_value_type(callee.result_types.front());
+                for (const auto result : callee.result_types) {
+                    auto type = wasm_value_type(result);
                     if (!type) return unsupported("call_indirect result type is unsupported");
                     stack.push_back(*type);
                 }
@@ -520,6 +549,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         }
     }
 
+    auto function_result_types = signature_results();
+    if (!function_result_types) return function_result_types.error();
     LiftedFunction out{function.id,function.entry,{},{}};
     std::vector<std::vector<std::uint32_t>> output_versions(starts.size()),phi_versions(starts.size());
     std::array<std::uint32_t,256> versions{};
@@ -544,6 +575,41 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         if(!predecessors[bi].empty())for(std::size_t slot=0;slot<entries[bi]->size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};if(predecessors[bi].size()>1)stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,phi_versions[bi][slot]}}));else{const auto pred=predecessors[bi].front();if(slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack value is unavailable"};stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,output_versions[pred][slot]}}));}}
         auto pop=[&](ValueType expected)->Result<ExpressionPtr>{if(stack.empty())return unsupported("operand stack underflow");auto v=stack.back();stack.pop_back();if(expected.kind!=TypeKind::unknown&&v->type!=expected)return unsupported("operand stack type mismatch");return v;};
         auto emit=[&](std::size_t n,Statement statement){const auto *fact=code[n];lifted.instructions.push_back({{fact->instruction.address,fact->id},std::move(statement)});};
+        const auto take_results = [&](const std::vector<ValueType> &types) -> Result<std::vector<ExpressionPtr>> {
+            std::vector<ExpressionPtr> values(types.size());
+            for (std::size_t i = types.size(); i > 0; --i) {
+                auto value = pop(types[i - 1]);
+                if (!value) return value.error();
+                values[i - 1] = value.value();
+            }
+            return values;
+        };
+        const auto emit_return = [&](std::size_t n, const std::vector<ValueType> &types) -> Result<bool> {
+            auto values = take_results(types);
+            if (!values) return values.error();
+            if (values.value().size() > 1) {
+                emit(n, Intrinsic{"wasm_return_values", std::move(values.value()), IntrinsicMemoryEffect::none});
+                emit(n, Return{});
+            } else {
+                emit(n, Return{values.value().empty() ? ExpressionPtr{} : values.value().front()});
+            }
+            return true;
+        };
+        const auto append_call_results = [&](Intrinsic &call,
+                                             const std::vector<std::uint8_t> &type_codes) -> Result<bool> {
+            if (type_codes.size() > max_stack - stack.size())
+                return Error{ErrorCode::resource_limit, "WebAssembly call results exceed the 128-value operand-stack bound"};
+            for (const auto code : type_codes) {
+                const auto type = wasm_value_type(code);
+                if (!type) return unsupported("call result type is unsupported");
+                const auto slot = stack.size();
+                const RegisterOperand reg{RegisterBank::wasm_stack, static_cast<std::uint8_t>(slot), type->bits, false};
+                call.register_writes.push_back(reg);
+                if (type_codes.size() == 1) call.result_type = *type;
+                stack.push_back(std::make_shared<Expression>(Expression{*type, RegisterValue{reg, 0}}));
+            }
+            return true;
+        };
         if (bi == 0 && !local_types.empty()) {
             const auto parameter_count = function_signature ? function_signature->parameter_types.size() : 0;
             const auto *origin = code[begin];
@@ -564,8 +630,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             if(op==2||op==3){continue;}
             if(op==4){auto cond=pop(integer(32));if(!cond)return cond.error();const auto li=*opener_label[n];const auto yes=code[n+1]->instruction.address;const auto target=labels[li].else_index<code.size()?labels[li].else_index+1:labels[li].end+1;emit(n,Branch{"wasm_if",yes,code[target]->instruction.address,cond.value()});continue;}
             if(op==5){const auto li=active_labels[n].back();const auto target=labels[li].end+1;emit(n,Branch{"true",code[target]->instruction.address,{}});continue;}
-            if(op==0x0b){if(n==function_end){if(stack.size()>1)return unsupported("function end has extra stack values");emit(n,Return{stack.empty()?ExpressionPtr{}:stack.back()});}continue;}
-            if(op==0x0f){if(stack.size()>1)return unsupported("return has extra operand stack values");emit(n,Return{stack.empty()?ExpressionPtr{}:stack.back()});continue;}
+            if(op==0x0b){if(n==function_end){auto result=emit_return(n,function_result_types.value());if(!result)return result.error();}continue;}
+            if(op==0x0f){auto result=emit_return(n,function_result_types.value());if(!result)return result.error();continue;}
             if(op==0x0c||op==0x0d){auto depth=immediate(i);if(!depth)return unsupported("branch depth unavailable");const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(*depth)];const auto target=labels[li].kind==3?labels[li].opener+1:labels[li].end+1;if(op==0x0c)emit(n,Branch{"true",code[target]->instruction.address,{}});else{auto cond=pop(integer(32));if(!cond)return cond.error();emit(n,Branch{"br_if",code[target]->instruction.address,n+1<code.size()?std::optional<Address>{code[n+1]->instruction.address}:std::nullopt,cond.value()});}continue;}
             if(op==0x0e){auto selector=pop(integer(32));if(!selector)return selector.error();auto targets=table_targets(n);if(!targets)return targets.error();LiftedBlock::SwitchDispatch dispatch;dispatch.selector=selector.value();for(const auto &target:targets.value()){const auto target_block=block_for(target.target);if(!target_block)return unsupported("br_table target is not a basic block");const auto address=code[starts[*target_block]]->instruction.address;if(target.value)dispatch.cases.push_back({*target.value,address});else dispatch.default_target=address;}lifted.switch_dispatch=std::move(dispatch);continue;}
             if(op==0x1a){auto v=pop({});if(!v)return v.error();continue;}
@@ -614,8 +680,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 if (!index || !callee || callee->parameter_count != callee->parameter_types.size() ||
                     callee->result_count != callee->result_types.size())
                     return unsupported("direct call target or function signature metadata is unavailable");
-                if (callee->parameter_types.size() > max_stack || callee->result_types.size() > 1)
-                    return unsupported("direct call has too many parameters or multiple results");
+                if (callee->parameter_types.size() > max_stack || callee->result_types.size() > max_stack)
+                    return Error{ErrorCode::resource_limit, "direct call exceeds the 128-value parameter/result bound"};
                 std::vector<ExpressionPtr> arguments(callee->parameter_types.size());
                 for (std::size_t argument = callee->parameter_types.size(); argument > 0; --argument) {
                     const auto type = wasm_value_type(callee->parameter_types[argument - 1]);
@@ -628,18 +694,9 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 call.name = "wasm_call_function_" + std::to_string(*index);
                 call.operands = std::move(arguments);
                 call.memory_effect = IntrinsicMemoryEffect::unknown;
-                if (!callee->result_types.empty()) {
-                    const auto type = wasm_value_type(callee->result_types.front());
-                    if (!type) return unsupported("direct call result type is unsupported");
-                    const auto result_slot = stack.size();
-                    const RegisterOperand reg{RegisterBank::wasm_stack, static_cast<std::uint8_t>(result_slot), type->bits, false};
-                    call.result_type = *type;
-                    call.register_writes.push_back(reg);
-                    emit(n, std::move(call));
-                    stack.push_back(std::make_shared<Expression>(Expression{*type, RegisterValue{reg, 0}}));
-                } else {
-                    emit(n, std::move(call));
-                }
+                auto result_values = append_call_results(call, callee->result_types);
+                if (!result_values) return result_values.error();
+                emit(n, std::move(call));
                 if (stack.size() > max_stack)
                     return Error{ErrorCode::resource_limit, "WebAssembly operand stack exceeds 128 values"};
                 continue;
@@ -653,8 +710,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 const auto *callee = &metadata->function_types[static_cast<std::size_t>(*type_index)];
                 if (callee->parameter_count != callee->parameter_types.size() ||
                     callee->result_count != callee->result_types.size() ||
-                    callee->parameter_types.size() > 127 || callee->result_types.size() > 1)
-                    return unsupported("call_indirect supports at most 127 numeric parameters and one result");
+                    callee->parameter_types.size() > 127 || callee->result_types.size() > max_stack)
+                    return Error{ErrorCode::resource_limit, "call_indirect exceeds the 127-parameter or 128-result bound"};
                 if (stack.empty() || stack.back()->type != integer(32))
                     return unsupported("call_indirect table index is unavailable or not i32");
                 auto table_index_value = stack.back();
@@ -672,16 +729,9 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 call.operands = std::move(arguments);
                 call.operands.push_back(std::move(table_index_value));
                 call.memory_effect = IntrinsicMemoryEffect::unknown;
-                if (!callee->result_types.empty()) {
-                    const auto result_type = wasm_value_type(callee->result_types.front());
-                    if (!result_type) return unsupported("call_indirect result type is unsupported");
-                    const auto result_slot = stack.size();
-                    const RegisterOperand reg{RegisterBank::wasm_stack, static_cast<std::uint8_t>(result_slot), result_type->bits, false};
-                    call.result_type = *result_type;
-                    call.register_writes.push_back(reg);
-                    emit(n, std::move(call));
-                    stack.push_back(std::make_shared<Expression>(Expression{*result_type, RegisterValue{reg, 0}}));
-                } else emit(n, std::move(call));
+                auto result_values = append_call_results(call, callee->result_types);
+                if (!result_values) return result_values.error();
+                emit(n, std::move(call));
                 continue;
             }
             if (op >= 0x28 && op <= 0x3e) {

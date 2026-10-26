@@ -282,6 +282,10 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips64_mtc1: return "mtc1";
     case Opcode::mips64_dmtc1: return "dmtc1";
     case Opcode::mips64_ctc1: return "ctc1";
+    case Opcode::mips_mfc1: return "mfc1";
+    case Opcode::mips_cfc1: return "cfc1";
+    case Opcode::mips_mtc1: return "mtc1";
+    case Opcode::mips_ctc1: return "ctc1";
     case Opcode::mips64_cvt_l_s: return "cvt.l.s";
     case Opcode::mips64_cvt_l_d: return "cvt.l.d";
     case Opcode::mips64_cvt_s_l: return "cvt.s.l";

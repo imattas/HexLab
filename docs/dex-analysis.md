@@ -4,13 +4,25 @@ HexLab recognizes standard little-endian DEX versions 035 through 040. The
 bounded loader validates the header and map-list bounds, string/type/prototype/
 field/method/class identifier tables, modified UTF-8 string lengths, encoded
 class-data method lists, and each defined method's `code_item` instruction and
-try/catch extents. Bounded `debug_info_item` programs are also decoded into
+try/catch extents. Ordered typed and catch-all handlers are retained against
+half-open method-relative protected ranges, with checked non-overlap/order and
+aggregate row budgets. Function recovery adds explicit exception successors
+from Dalvik opcodes with observable exception behavior; it preserves every
+handler for the active range without guessing runtime type matches. Bounded
+`debug_info_item` programs are also decoded into
 method-relative source rows, parameter names, and local-variable live ranges.
 The interpreter validates register, string, type, and code-address references,
 requires an `end_sequence`, and caps each program at two million opcodes and
 the aggregate retained debug metadata at two million rows/64 MiB. DEX 041
 containers, reverse-endian files, checksum/signature verification, annotations,
 encoded static values, and verifier semantics are not implemented.
+
+DEX catch edges are conservative metadata: the analysis does not resolve class
+hierarchies to prune handlers or prove which typed catch receives a thrown
+object. Handler targets are still validated against the method code extent, and
+try ranges must be sorted and non-overlapping. A handler list above the
+per-instruction CFG edge budget marks recovery incomplete instead of dropping
+the excess edges silently.
 
 Every defined method's Dalvik instruction stream is mapped to its own 32-bit
 address space beginning at offset zero. Its image segment is named with the
