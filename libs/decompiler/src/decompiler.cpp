@@ -5841,7 +5841,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         const auto *nested_branch = nested_path[nested_index];
                         if (nested_index + 1 != nested_path.size() || !terminal_conditional(*nested_branch) ||
                             !nested_branch->phis.empty() || nested_branch->switch_dispatch ||
-                            !has_only_simple_statements(*nested_branch)) continue;
+                            !has_only_simple_statements(*nested_branch) ||
+                            !valid_diamond_memory_phi(*nested_branch)) continue;
                         std::set<std::uint64_t> nested_occupied = occupied;
                         nested_occupied.insert(branch.id.value);
                         bool prefix_valid = true;
