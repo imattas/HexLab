@@ -7,9 +7,9 @@ entry points are shifted by `B`; original file offsets and relocation metadata
 remain attached to the source image. A copy-on-write overlay holds changes, so
 neither the input file nor the original loaded image is modified.
 
-For ordinary dynamic REL/RELA records, the supported profile is little-endian
-ELF32 i386 and ARM `ET_DYN` dynamic records and little-endian ELF64 x86-64 or AArch64
-`ET_DYN` records, with these types:
+For ordinary dynamic REL/RELA records, the supported profiles include
+little-endian ELF32 i386, ARM, and RISC-V `ET_DYN` records, plus little-endian
+ELF64 x86-64, AArch64, PPC64, and RISC-V `ET_DYN` records, with these types:
 
 | Architecture | Relocation | Type | Formula |
 | --- | --- | ---: | --- |
@@ -23,6 +23,9 @@ ELF32 i386 and ARM `ET_DYN` dynamic records and little-endian ELF64 x86-64 or AA
 | ARM | `R_ARM_GLOB_DAT` | 21 | `(S + A) | T` (low 32 bits) |
 | ARM | `R_ARM_JUMP_SLOT` | 22 | `S` for REL; `S + A` for RELA |
 | ARM | `R_ARM_RELATIVE` | 23 | `B + A` |
+| RISC-V ILP32 | `R_RISCV_32` | 1 | `S + A` (unsigned 32-bit field) |
+| RISC-V ILP32 | `R_RISCV_RELATIVE` | 3 | `B + A` (32-bit field) |
+| RISC-V ILP32 | `R_RISCV_JUMP_SLOT` | 5 | `S` |
 | x86-64 | `R_X86_64_64` | 1 | `S + A` (64-bit field) |
 | x86-64 | `R_X86_64_PC32` | 2 | `S + A - P` (signed 32-bit field) |
 | x86-64 | `R_X86_64_32` | 10 | `S + A` (unsigned 32-bit field) |
@@ -37,6 +40,21 @@ ELF32 i386 and ARM `ET_DYN` dynamic records and little-endian ELF64 x86-64 or AA
 | PPC64 | `R_PPC64_ADDR64` | 38 | `S + A` (low 64 bits) |
 | PPC64 | `R_PPC64_GLOB_DAT` | 20 | `S + A` (low 64 bits) |
 | PPC64 | `R_PPC64_RELATIVE` | 22 | `B + A` |
+| RISC-V LP64 | `R_RISCV_32` | 1 | `S + A` (unsigned 32-bit field) |
+| RISC-V LP64 | `R_RISCV_64` | 2 | `S + A` (low 64 bits) |
+| RISC-V LP64 | `R_RISCV_RELATIVE` | 3 | `B + A` |
+| RISC-V LP64 | `R_RISCV_JUMP_SLOT` | 5 | `S` |
+
+The RISC-V profile applies the same pointer-sized relative and jump-slot
+operations for ILP32 and LP64, and supports the ABI's 32-bit absolute dynamic
+relocation for either class. `R_RISCV_32` must fit its unsigned 32-bit field;
+ELF32 runtime bases, symbol addresses, relative results, and rebased extents
+must also fit in 32 bits. ELF32 `R_RISCV_64`, big-endian RISC-V, `GLOB_DAT`,
+TLS, COPY, IFUNC, and instruction-field relocations remain unapplied. External
+symbol relocations require an exact caller-supplied dependency and symbol
+binding; the loader does not discover or load libraries. ELF32 RELATIVE REL
+addends are read as unsigned 32-bit pointer words; RELA records use their
+signed explicit addend before the 32-bit result check.
 
 The ARM profile is little-endian ELF32 `ET_DYN` and supports dynamic REL and
 RELA records for `R_ARM_ABS32`, `R_ARM_REL32`, `R_ARM_GLOB_DAT`,

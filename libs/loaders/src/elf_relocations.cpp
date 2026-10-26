@@ -197,17 +197,19 @@ Field field(const ElfHeader &header, std::uint32_t type) {
         default: break;
         }
     }
-    if (header.machine == 243 && header.is_64) {
+    if (header.machine == 243) {
         switch (type) {
         case 1: return {K::absolute, 4}; // R_RISCV_32
-        case 2: return {K::absolute, 8}; // R_RISCV_64
-        case 3: return {K::base_relative, 8}; // R_RISCV_RELATIVE
+        case 2:
+            if (header.is_64) return {K::absolute, 8}; // R_RISCV_64
+            break;
+        case 3: return {K::base_relative, word}; // R_RISCV_RELATIVE
         case 4: return {K::copy, {}}; // R_RISCV_COPY
-        case 5: return {K::jump_slot, 8}; // R_RISCV_JUMP_SLOT
-        case 6: case 7: return {K::tls, 8};
-        case 8: case 9: case 10: case 11: return {K::tls, 8};
+        case 5: return {K::jump_slot, word}; // R_RISCV_JUMP_SLOT
+        case 6: case 8: case 10: return {K::tls, 4};
+        case 7: case 9: case 11: return {K::tls, 8};
         case 12: return {K::tls, 2 * word}; // R_RISCV_TLSDESC
-        case 58: return {K::ifunc, 8}; // R_RISCV_IRELATIVE
+        case 58: return {K::ifunc, word}; // R_RISCV_IRELATIVE
         default: break;
         }
     }

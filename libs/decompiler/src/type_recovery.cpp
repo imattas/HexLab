@@ -627,10 +627,20 @@ std::optional<RegisterOperand> classified_register(std::string_view name) {
     return {};
 }
 
+std::optional<RegisterOperand> ppc64_classified_register(std::string_view name) {
+    if (name.size() < 2 || (name[0] != 'R' && name[0] != 'F')) return {};
+    unsigned index = 0;
+    const auto parsed = std::from_chars(name.data() + 1, name.data() + name.size(), index);
+    if (parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size() || index >= 32) return {};
+    return RegisterOperand{name[0] == 'R' ? RegisterBank::ppc_gpr : RegisterBank::ppc_fpr,
+                           static_cast<std::uint8_t>(index), 64, false};
+}
+
 std::optional<CallingConvention> classifier_convention(const AbiDescription &abi) {
     if (abi.name == "x86-64 System V") return CallingConvention::sysv_x86_64;
     if (abi.name == "x86-64 Windows") return CallingConvention::windows_x64;
     if (abi.name == "AArch64 AAPCS64") return CallingConvention::aapcs64;
+    if (abi.name == "PowerPC64 ELFv2") return CallingConvention::ppc64le_elfv2;
     if (abi.name == "x86-32 cdecl") return CallingConvention::x86_32_cdecl;
     return {};
 }
@@ -642,7 +652,8 @@ struct HiddenResultPointerInfo {
 
 std::optional<HiddenResultPointerInfo> hidden_result_pointer_info(
     const AbiDescription &abi, const types::TypePtr &result_type) {
-    if (!result_type || (abi.name != "x86-64 System V" && abi.name != "AArch64 AAPCS64"))
+    if (!result_type || (abi.name != "x86-64 System V" && abi.name != "AArch64 AAPCS64" &&
+                         abi.name != "PowerPC64 ELFv2"))
         return {};
     const auto result = unqualified_type(result_type);
     if (!result || (result->kind() != types::Kind::structure && result->kind() != types::Kind::array) ||
@@ -664,7 +675,9 @@ std::optional<HiddenResultPointerInfo> hidden_result_pointer_info(
         location.value_offset != 0 || location.size != classified.pointer_size ||
         (location.placement_size && location.placement_size != classified.pointer_size))
         return {};
-    const auto reg = classified_register(location.register_name);
+    const auto reg = abi.name == "PowerPC64 ELFv2"
+        ? ppc64_classified_register(location.register_name)
+        : classified_register(location.register_name);
     if (!reg || reg->width != static_cast<std::uint16_t>(classified.pointer_size * 8)) return {};
     const auto pointer_type = types::Type::pointer(result_type, classified.pointer_size,
                                                     classified.pointer_size);
@@ -724,6 +737,32 @@ std::vector<AbiArgumentSlot> aapcs64_prototype_slots(const types::TypePtr &proto
         const auto allocation = std::max<std::uint64_t>(8, (*type->size() + 7) & ~std::uint64_t{7});
         if (allocation > static_cast<std::uint64_t>((1 << 20) - stack_offset)) break;
         stack_offset += static_cast<std::int64_t>(allocation);
+    }
+    return slots;
+}
+
+std::vector<AbiArgumentSlot> ppc64_elfv2_prototype_slots(const types::TypePtr &prototype) {
+    std::vector<AbiArgumentSlot> slots;
+    if (!prototype || prototype->kind() != types::Kind::function || prototype->parameters().size() > 256)
+        return slots;
+    const auto classified = classify_abi_signature(CallingConvention::ppc64le_elfv2, *prototype);
+    if (classified.arguments.size() != prototype->parameters().size()) return slots;
+    for (std::size_t index = 0; index < classified.arguments.size(); ++index) {
+        const auto &argument = classified.arguments[index];
+        const auto &type = prototype->parameters()[index].type;
+        const auto parameter_type = unqualified_type(type);
+        const auto value_class = parameter_type && parameter_type->kind() == types::Kind::floating
+            ? AbiValueClass::floating : AbiValueClass::integer;
+        if (!argument.supported || argument.locations.size() != 1 || !type) continue;
+        const auto &location = argument.locations.front();
+        if (location.kind == AbiLocationKind::register_) {
+            const auto reg = ppc64_classified_register(location.register_name);
+            if (!reg) continue;
+            slots.push_back({value_class, *reg, {}, static_cast<std::uint16_t>(index)});
+        } else if (location.stack_offset <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            slots.push_back({value_class, {}, static_cast<std::int64_t>(location.stack_offset),
+                             static_cast<std::uint16_t>(index)});
+        }
     }
     return slots;
 }
@@ -919,6 +958,70 @@ std::optional<std::vector<Sysv64ReturnPiece>> sysv64_aggregate_return_pieces(
         cursor += piece.size;
     }
     if (cursor != *aggregate->size()) return {};
+    return pieces;
+}
+
+std::optional<std::vector<Sysv64ReturnPiece>> ppc64_aggregate_return_pieces(
+    const types::TypePtr &input) {
+    const auto aggregate = unqualified_type(input);
+    if (!aggregate || aggregate->kind() != types::Kind::structure || !aggregate->size() ||
+        *aggregate->size() != 16)
+        return {};
+    const auto signature = types::Type::function(input, {}, false);
+    if (!signature) return {};
+    const auto classified = classify_abi_signature(CallingConvention::ppc64le_elfv2, *signature.value());
+    const auto &result = classified.result;
+    if (!result.supported || result.indirect || result.locations.size() != 2) return {};
+
+    std::vector<Sysv64ReturnPiece> pieces;
+    pieces.reserve(2);
+    for (std::size_t index = 0; index < result.locations.size(); ++index) {
+        const auto &location = result.locations[index];
+        if (location.kind != AbiLocationKind::register_ || location.role != AbiLocationRole::value ||
+            location.value_offset != index * 8 || location.size != 8 ||
+            location.register_name != "R" + std::to_string(3 + index))
+            return {};
+        const auto reg = ppc64_classified_register(location.register_name);
+        if (!reg || reg->bank != RegisterBank::ppc_gpr || reg->width != 64) return {};
+
+        std::vector<const types::Member *> members;
+        const auto begin = static_cast<std::uint64_t>(location.value_offset);
+        const auto end = begin + location.size;
+        for (const auto &member : aggregate->members()) {
+            if (!member.type || !member.has_fixed_offset() || member.bit_width || member.bit_offset ||
+                !member.type->size() || member.offset > *aggregate->size() ||
+                *member.type->size() > *aggregate->size() - member.offset)
+                return {};
+            const auto member_end = member.offset + *member.type->size();
+            if (member_end <= begin || member.offset >= end) continue;
+            if (member.offset < begin || member_end > end) return {};
+            const auto type = unqualified_type(member.type);
+            if (!type || (type->kind() != types::Kind::boolean && type->kind() != types::Kind::integer &&
+                          type->kind() != types::Kind::enumeration && type->kind() != types::Kind::pointer))
+                return {};
+            members.push_back(&member);
+        }
+        std::sort(members.begin(), members.end(), [](const auto *left, const auto *right) {
+            return left->offset < right->offset;
+        });
+        std::uint64_t cursor = begin;
+        for (const auto *member : members) {
+            if (member->offset != cursor) return {};
+            cursor += *member->type->size();
+        }
+        if (cursor != end || members.empty()) return {};
+        types::TypePtr piece_type;
+        if (members.size() == 1 && members.front()->offset == begin &&
+            *members.front()->type->size() == location.size) {
+            piece_type = members.front()->type;
+        } else {
+            auto integer = types::Type::integer("ppc64_aggregate_piece", location.size, 1, false);
+            if (!integer) return {};
+            piece_type = integer.value();
+        }
+        pieces.push_back({*reg, static_cast<std::uint8_t>(begin),
+                          static_cast<std::uint8_t>(location.size), std::move(piece_type)});
+    }
     return pieces;
 }
 
@@ -1172,6 +1275,42 @@ AbiDescription mips_n32_abi() {
     return a;
 }
 
+AbiDescription ppc64le_elfv2_abi() {
+    AbiDescription a;
+    a.name = "PowerPC64 ELFv2";
+    a.pointer_bits = 64;
+    for (unsigned index = 3; index <= 10; ++index)
+        a.integer_argument_registers.push_back(
+            {RegisterBank::ppc_gpr, static_cast<std::uint8_t>(index), 64, false});
+    a.integer_return_register = RegisterOperand{RegisterBank::ppc_gpr, 3, 64, false};
+    for (unsigned index = 1; index <= 13; ++index)
+        a.floating_argument_registers.push_back(
+            {RegisterBank::ppc_fpr, static_cast<std::uint8_t>(index), 64, false});
+    a.floating_return_register = RegisterOperand{RegisterBank::ppc_fpr, 1, 64, false};
+    a.stack_argument_base = RegisterOperand{RegisterBank::ppc_gpr, 1, 64, false};
+    // The first eight doublewords are assigned to R3-R10. Stack locations in
+    // the caller's parameter-save area follow the 32-byte linkage area.
+    for (std::int64_t offset = 96; offset < 96 + 8 * 32; offset += 8)
+        a.stack_argument_offsets.push_back(offset);
+
+    for (unsigned index : {0u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 12u})
+        a.caller_saved_registers.push_back(
+            {RegisterBank::ppc_gpr, static_cast<std::uint8_t>(index), 64, false});
+    for (unsigned index = 0; index <= 13; ++index)
+        a.caller_saved_registers.push_back(
+            {RegisterBank::ppc_fpr, static_cast<std::uint8_t>(index), 64, false});
+    for (unsigned index = 0; index <= 19; ++index)
+        a.caller_saved_registers.push_back(
+            {RegisterBank::ppc_vr, static_cast<std::uint8_t>(index), 128, false});
+    for (unsigned index : {0u, 1u, 5u, 6u, 7u})
+        a.caller_saved_registers.push_back(
+            {RegisterBank::ppc_cr, static_cast<std::uint8_t>(index), 4, false});
+    a.caller_saved_registers.push_back({RegisterBank::ppc_lr, 0, 64, false});
+    a.caller_saved_registers.push_back({RegisterBank::ppc_ctr, 0, 64, false});
+    a.caller_saved_registers.push_back({RegisterBank::ppc_xer, 0, 64, false});
+    return a;
+}
+
 static Result<TypeRecoveryResult> recover_types_impl(
     const LiftedFunction &fn, const AbiDescription &abi, types::TypePtr prototype,
     std::span<const types::TypePtr> parameter_constraints = {},
@@ -1296,6 +1435,7 @@ static Result<TypeRecoveryResult> recover_types_impl(
                      returned_aggregate->kind() == types::Kind::array)) {
                     const auto pieces = sysv64_aggregate_return_pieces(s.result_type);
                     const auto hfa_pieces = aapcs64_hfa_return_pieces(s.result_type);
+                    const auto ppc_pieces = ppc64_aggregate_return_pieces(s.result_type);
                     const auto apply_piece = [&](const auto &piece) {
                         for (std::size_t n = 0; n < s.register_writes.size(); ++n) {
                             if (s.register_writes[n] != piece.reg || n >= s.register_output_versions.size()) continue;
@@ -1315,6 +1455,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
                         }
                     } else if (hfa_pieces) {
                         for (const auto &piece : *hfa_pieces) apply_piece(piece);
+                    } else if (ppc_pieces) {
+                        for (const auto &piece : *ppc_pieces) apply_piece(piece);
                     }
                 }
             }
@@ -1472,7 +1614,9 @@ static Result<TypeRecoveryResult> recover_types_impl(
                         constrained_type = pointer.value();
                     }
                     if (location.kind == AbiLocationKind::register_) {
-                        if (const auto reg = classified_register(location.register_name))
+                        if (const auto reg = abi.name == "PowerPC64 ELFv2"
+                                ? ppc64_classified_register(location.register_name)
+                                : classified_register(location.register_name))
                             constrain_register(*reg, constrained_type);
                     } else if (location.stack_offset <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
                         constrain_stack_slot(static_cast<std::int64_t>(location.stack_offset), constrained_type);
@@ -1521,6 +1665,14 @@ static Result<TypeRecoveryResult> recover_types_impl(
             }
             // Unsupported trailing parameters remain unconstrained here; the
             // ABI slot map reports the same boundary to interprocedural recovery.
+        } else if (abi.name == "PowerPC64 ELFv2") {
+            for (const auto &slot : ppc64_elfv2_prototype_slots(prototype)) {
+                if (!slot.parameter_index || *slot.parameter_index >= parameters.size()) continue;
+                const auto &parameter_type = parameters[*slot.parameter_index].type;
+                if (!parameter_type) continue;
+                if (slot.reg) constrain_register(*slot.reg, parameter_type);
+                else if (slot.stack_offset) constrain_stack_slot(*slot.stack_offset, parameter_type);
+            }
         } else if (abi.shared_integer_float_argument_positions) {
             for (std::size_t position = 0; position < parameters.size(); ++position) {
                 const auto &param = parameters[position].type;
@@ -1550,7 +1702,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
     } else {
         for (std::size_t n = 0; n < abi.integer_argument_registers.size(); ++n) {
             types::TypePtr param;
-            if (abi.arguments.empty() && n < parameter_constraints.size()) param = parameter_constraints[n];
+            if (abi.arguments.empty() && abi.name != "PowerPC64 ELFv2" &&
+                n < parameter_constraints.size()) param = parameter_constraints[n];
             if (param) constrain_register(abi.integer_argument_registers[n], param);
         }
     }
@@ -2744,6 +2897,23 @@ static Result<TypeRecoveryResult> recover_types_impl(
                     result.diagnostics.push_back("non-contiguous AAPCS64 argument register evidence leaves inferred parameters unknown");
                 }
             }
+        } else if (abi.name == "PowerPC64 ELFv2") {
+            bool observed_argument = !stack_arguments.empty();
+            for (const auto reg : abi.integer_argument_registers)
+                observed_argument = observed_argument || incoming_register_fact(reg) != nullptr;
+            for (const auto reg : abi.floating_argument_registers)
+                observed_argument = observed_argument || incoming_register_fact(reg) != nullptr;
+            if (observed_argument) {
+                // ELFv2 assigns GPR and FPR arguments independently while
+                // source order advances a separate parameter-save-area slot.
+                // Reads alone cannot prove that earlier arguments were absent,
+                // so register/stack use cannot be turned into ordered parameter
+                // declarations without a prototype or call-site evidence.
+                unresolved_argument_order = true;
+                inferred_parameters.clear();
+                result.diagnostics.push_back(
+                    "PowerPC64 ELFv2 argument use does not establish source order without a prototype; inferred parameters are omitted");
+            }
         } else if (abi.name != "x86-64 Windows" && abi.name != "x86-64 System V" && !abi.arguments.empty()) {
             // The explicit ordered slot map is the ABI's source of argument
             // order. It can describe interleaved register classes and stack
@@ -3332,6 +3502,9 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         if (abi.name == "x86-64 System V" && prototype && prototype->kind() == types::Kind::function) {
             return sysv64_prototype_slots(prototype);
         }
+        if (abi.name == "PowerPC64 ELFv2")
+            return prototype && prototype->kind() == types::Kind::function
+                ? ppc64_elfv2_prototype_slots(prototype) : std::vector<AbiArgumentSlot>{};
         if (abi.name == "MIPS64 Linux N64 hard-float scalar profile" &&
             prototype && prototype->kind() == types::Kind::function) {
             std::vector<AbiArgumentSlot> slots;
@@ -3419,15 +3592,19 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         if (!aggregate || !aggregate->size() || (*aggregate->size() == 0) ||
             (aggregate->kind() != types::Kind::structure && aggregate->kind() != types::Kind::array))
             return {};
-        if (abi.name == "x86-64 System V") {
+        if (abi.name == "x86-64 System V" || abi.name == "PowerPC64 ELFv2") {
             const auto signature = types::Type::function(type, {}, false);
             if (!signature) return {};
-            const auto classified = classify_abi_signature(CallingConvention::sysv_x86_64, *signature.value());
+            const auto convention = classifier_convention(abi);
+            if (!convention) return {};
+            const auto classified = classify_abi_signature(*convention, *signature.value());
             if (!classified.result.supported || classified.result.indirect ||
                 classified.result.locations.size() != 1 ||
                 classified.result.locations.front().role != AbiLocationRole::value)
                 return {};
-            return classified_register(classified.result.locations.front().register_name);
+            return abi.name == "PowerPC64 ELFv2"
+                ? ppc64_classified_register(classified.result.locations.front().register_name)
+                : classified_register(classified.result.locations.front().register_name);
         }
         if (abi.name != "x86-64 Windows" && abi.name != "AArch64 AAPCS64") return {};
         if (abi.name == "AArch64 AAPCS64") {
@@ -4020,6 +4197,8 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                 if (target_abi->name == "x86-64 System V" && sysv64_aggregate_return_pieces(type))
                     call->result_type = type;
                 else if (target_abi->name == "AArch64 AAPCS64" && aapcs64_hfa_return_pieces(type))
+                    call->result_type = type;
+                else if (target_abi->name == "PowerPC64 ELFv2" && ppc64_aggregate_return_pieces(type))
                     call->result_type = type;
                 else if (hidden_result_pointer_info(*target_abi, type))
                     call->result_type = type;

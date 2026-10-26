@@ -84,6 +84,13 @@ decompiler::AbiDescription cli_decompiler_abi(const Image &image, const ImageMet
     case Architecture::mips64:
         return image.layout().space.width_bits == 32 ? decompiler::mips_n32_abi()
                                                        : decompiler::mips64_n64_abi();
+    case Architecture::powerpc:
+        if (image.layout().mode == ExecutionMode::ppc64 && metadata.elf &&
+            metadata.elf->header.is_64 && metadata.elf->header.machine == 21 &&
+            metadata.elf->header.order == ByteOrder::little &&
+            (metadata.elf->header.flags & 3u) == 2u)
+            return decompiler::ppc64le_elfv2_abi();
+        return {};
     default:
         return {};
     }

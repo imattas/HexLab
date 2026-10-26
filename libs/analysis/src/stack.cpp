@@ -338,7 +338,7 @@ bool transfer(const Instruction &instruction, FlowState &state) {
     if ((instruction.context.architecture == Architecture::mips32 ||
          instruction.context.architecture == Architecture::mips64) &&
         (instruction.opcode == Opcode::mips_addiu || instruction.opcode == Opcode::mips_addi ||
-         instruction.opcode == Opcode::mips64_daddiu) &&
+         instruction.opcode == Opcode::mips64_daddi || instruction.opcode == Opcode::mips64_daddiu) &&
         instruction.operands.size() >= 3) {
         const auto immediate = immediate_value(instruction, 2);
         const bool dst_stack = mips_register(first, 29);
@@ -470,7 +470,8 @@ bool transfer(const Instruction &instruction, FlowState &state) {
     if ((instruction.context.architecture == Architecture::mips32 ||
          instruction.context.architecture == Architecture::mips64) &&
         (instruction.opcode == Opcode::mips_addu || instruction.opcode == Opcode::mips_add ||
-         instruction.opcode == Opcode::mips_or || instruction.opcode == Opcode::mips64_daddu) &&
+         instruction.opcode == Opcode::mips_or || instruction.opcode == Opcode::mips64_dadd ||
+         instruction.opcode == Opcode::mips64_daddu) &&
         instruction.operands.size() >= 3 &&
         (mips_register(second, 0) || mips_register(register_at(instruction, 2), 0))) {
         const auto source = mips_register(second, 0) ? register_at(instruction, 2) : second;

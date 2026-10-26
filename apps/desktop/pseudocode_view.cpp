@@ -677,6 +677,13 @@ decompiler::AbiDescription recovery_abi(const FunctionRecord &function, const Fu
     if (architecture == Architecture::mips64)
         return image && image->layout().space.width_bits == 32
             ? decompiler::mips_n32_abi() : decompiler::mips64_n64_abi();
+    if (architecture == Architecture::powerpc && abi.pointer_bits == 64 && project &&
+        project->loaded && project->loaded->metadata.elf) {
+        const auto &header = project->loaded->metadata.elf->header;
+        if (header.is_64 && header.machine == 21 && header.order == ByteOrder::little &&
+            (header.flags & 3u) == 2u)
+            return decompiler::ppc64le_elfv2_abi();
+    }
     return abi;
 }
 
