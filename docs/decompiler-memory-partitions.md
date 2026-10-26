@@ -23,9 +23,10 @@ The alias rule is byte-range based. A store advances its exact stack or
 absolute-range partition. A pointer-relative store advances every partition
 that might alias it; it preserves another range only when the partition has
 the same proven pointer root and its byte range is disjoint. Different pointer
-roots are not assumed to be disjoint. Calls and intrinsics with write or
-unknown memory effects advance every partition. Unclassified stores also
-advance every partition. These effects advance the whole-memory chain as well.
+roots are not assumed to be disjoint. Calls invalidate all absolute and
+pointer-relative partitions while preserving proven nonescaping stack slots.
+Intrinsics with write or unknown memory effects and unclassified stores
+invalidate every partition. These effects also advance the whole-memory chain.
 Read-only and no-memory intrinsics do not invalidate partitions.
 
 Candidate absolute and pointer-relative range sets are each capped at 4,096
