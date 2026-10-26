@@ -609,12 +609,15 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
                                              "vwmul.vv", "vwmul.vx"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vwmulu_vv)];
     }
-    if (op >= Opcode::rv_vfadd_vv && op <= Opcode::rv_vmfge_vf) {
+    if (op >= Opcode::rv_vfadd_vv && op <= Opcode::rv_vfnmsub_vf) {
         static constexpr const char *names[]{"vfadd.vv","vfadd.vf","vfsub.vv","vfsub.vf","vfmul.vv","vfmul.vf",
             "vfdiv.vv","vfdiv.vf","vfsgnj.vv","vfsgnj.vf","vfsgnjn.vv","vfsgnjn.vf",
             "vfsgnjx.vv","vfsgnjx.vf","vfmin.vv","vfmin.vf","vfmax.vv","vfmax.vf",
             "vmfeq.vv","vmfeq.vf","vmfne.vv","vmfne.vf","vmflt.vv","vmflt.vf",
-            "vmfle.vv","vmfle.vf","vmfgt.vf","vmfge.vf"};
+            "vmfle.vv","vmfle.vf","vmfgt.vf","vmfge.vf",
+            "vfmacc.vv","vfmacc.vf","vfnmacc.vv","vfnmacc.vf","vfmsac.vv","vfmsac.vf",
+            "vfnmsac.vv","vfnmsac.vf","vfmadd.vv","vfmadd.vf","vfnmadd.vv","vfnmadd.vf",
+            "vfmsub.vv","vfmsub.vf","vfnmsub.vv","vfnmsub.vf"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vfadd_vv)];
     }
     if (op >= Opcode::rv_sh1add && op <= Opcode::rv_slli_uw) {

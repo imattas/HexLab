@@ -220,6 +220,14 @@ bool decode_vector_floating(std::uint32_t w, RiscvInstruction &i) {
     case 0x02: op = scalar ? RiscvOpcode::vfsub_vf : RiscvOpcode::vfsub_vv; uses_rounding = flags = true; break;
     case 0x20: op = scalar ? RiscvOpcode::vfdiv_vf : RiscvOpcode::vfdiv_vv; uses_rounding = flags = true; break;
     case 0x24: op = scalar ? RiscvOpcode::vfmul_vf : RiscvOpcode::vfmul_vv; uses_rounding = flags = true; break;
+    case 0x29: op = scalar ? RiscvOpcode::vfmacc_vf : RiscvOpcode::vfmacc_vv; uses_rounding = flags = true; break;
+    case 0x2b: op = scalar ? RiscvOpcode::vfnmacc_vf : RiscvOpcode::vfnmacc_vv; uses_rounding = flags = true; break;
+    case 0x2d: op = scalar ? RiscvOpcode::vfmsac_vf : RiscvOpcode::vfmsac_vv; uses_rounding = flags = true; break;
+    case 0x2f: op = scalar ? RiscvOpcode::vfnmsac_vf : RiscvOpcode::vfnmsac_vv; uses_rounding = flags = true; break;
+    case 0x28: op = scalar ? RiscvOpcode::vfmadd_vf : RiscvOpcode::vfmadd_vv; uses_rounding = flags = true; break;
+    case 0x2a: op = scalar ? RiscvOpcode::vfnmadd_vf : RiscvOpcode::vfnmadd_vv; uses_rounding = flags = true; break;
+    case 0x2c: op = scalar ? RiscvOpcode::vfmsub_vf : RiscvOpcode::vfmsub_vv; uses_rounding = flags = true; break;
+    case 0x2e: op = scalar ? RiscvOpcode::vfnmsub_vf : RiscvOpcode::vfnmsub_vv; uses_rounding = flags = true; break;
     case 0x08: op = scalar ? RiscvOpcode::vfsgnj_vf : RiscvOpcode::vfsgnj_vv; break;
     case 0x09: op = scalar ? RiscvOpcode::vfsgnjn_vf : RiscvOpcode::vfsgnjn_vv; break;
     case 0x0a: op = scalar ? RiscvOpcode::vfsgnjx_vf : RiscvOpcode::vfsgnjx_vv; break;

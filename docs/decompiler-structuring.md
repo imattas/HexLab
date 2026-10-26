@@ -382,17 +382,27 @@ not a general C interpreter or an equivalence proof for arbitrary functions.
 
 Canonical pre-tested loops also accept a conditional break edge that reaches the
 loop's validated exit through a straight-line chain of at most 64 phi-free,
-side-effect-preserving blocks. Each path block must have exactly the preceding
-branch or path block as its predecessor, one unconditional jump or fallthrough,
-and no return, nested branch, switch, or memory phi. The shared exit may contain
-register phis when its predecessor set is exactly the loop-header condition
-failure edge plus one distinct final edge for every recognized break path, and
-every phi has exactly one input for each of those predecessors. The formatter
-emits each path's statements and simultaneous phi copies inside its break
-condition; copies for the loop-header failure edge execute after the loop
-condition fails. It then emits the shared exit block once. Shared path blocks,
-exit memory phis, extra predecessors on a path block, incomplete or duplicate
-phi inputs, and other ambiguous shapes retain the existing fallback.
+side-effect-preserving blocks. A cleanup chain may be shared by multiple
+conditional break edges when every edge enters the same head block. That head's
+predecessors must be exactly those recognized break branches, and every later
+path block must have exactly the preceding path block as its predecessor. All
+path blocks have one unconditional jump or fallthrough and no return, nested
+branch, switch, or memory phi. The shared exit may contain register phis when
+its predecessor set is exactly the loop-header condition failure edge plus one
+distinct final edge for each cleanup-chain tail. Multiple source break branches
+that share one chain contribute one CFG predecessor at that tail, even though
+the chain is emitted under each branch predicate. Every phi has exactly one
+input for each actual predecessor. A phi input from a shared tail is copied
+after the chain inside each corresponding source break condition; the same SSA
+input is valid because the cleanup chain itself has no merge phi. Copies for
+the loop-header failure edge execute after the loop condition fails. The formatter emits the shared
+exit block once. Different overlapping paths, side entries to later cleanup
+blocks, exit memory phis, incomplete or duplicate phi inputs, and other
+ambiguous shapes retain the existing fallback. The head-and-tail treatment
+follows the region bookkeeping in Ghidra's native
+[`LoopBody::mergeIdenticalHeads`](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/blockaction.cc#L2975-L3019);
+HexLab adds an explicit predecessor and SSA-phi proof before emitting C-like
+breaks, and does not copy Ghidra source.
 
 Nested pre-tested child loops accept the same bounded cleanup chain on a
 conditional break edge. Every cleanup block must be single-entry from its

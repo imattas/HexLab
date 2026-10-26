@@ -235,6 +235,22 @@ std::optional<RiscvVectorEffect> riscv_vector_effect(Opcode opcode) {
     case Opcode::rv_vfmin_vf: return RiscvVectorEffect{"vfmin.vf", false, true};
     case Opcode::rv_vfmax_vv: return RiscvVectorEffect{"vfmax.vv", false, true};
     case Opcode::rv_vfmax_vf: return RiscvVectorEffect{"vfmax.vf", false, true};
+    case Opcode::rv_vfmacc_vv: return RiscvVectorEffect{"vfmacc.vv", false, true};
+    case Opcode::rv_vfmacc_vf: return RiscvVectorEffect{"vfmacc.vf", false, true};
+    case Opcode::rv_vfnmacc_vv: return RiscvVectorEffect{"vfnmacc.vv", false, true};
+    case Opcode::rv_vfnmacc_vf: return RiscvVectorEffect{"vfnmacc.vf", false, true};
+    case Opcode::rv_vfmsac_vv: return RiscvVectorEffect{"vfmsac.vv", false, true};
+    case Opcode::rv_vfmsac_vf: return RiscvVectorEffect{"vfmsac.vf", false, true};
+    case Opcode::rv_vfnmsac_vv: return RiscvVectorEffect{"vfnmsac.vv", false, true};
+    case Opcode::rv_vfnmsac_vf: return RiscvVectorEffect{"vfnmsac.vf", false, true};
+    case Opcode::rv_vfmadd_vv: return RiscvVectorEffect{"vfmadd.vv", false, true};
+    case Opcode::rv_vfmadd_vf: return RiscvVectorEffect{"vfmadd.vf", false, true};
+    case Opcode::rv_vfnmadd_vv: return RiscvVectorEffect{"vfnmadd.vv", false, true};
+    case Opcode::rv_vfnmadd_vf: return RiscvVectorEffect{"vfnmadd.vf", false, true};
+    case Opcode::rv_vfmsub_vv: return RiscvVectorEffect{"vfmsub.vv", false, true};
+    case Opcode::rv_vfmsub_vf: return RiscvVectorEffect{"vfmsub.vf", false, true};
+    case Opcode::rv_vfnmsub_vv: return RiscvVectorEffect{"vfnmsub.vv", false, true};
+    case Opcode::rv_vfnmsub_vf: return RiscvVectorEffect{"vfnmsub.vf", false, true};
     case Opcode::rv_vmfeq_vv: return RiscvVectorEffect{"vmfeq.vv", true, true};
     case Opcode::rv_vmfeq_vf: return RiscvVectorEffect{"vmfeq.vf", true, true};
     case Opcode::rv_vmfne_vv: return RiscvVectorEffect{"vmfne.vv", true, true};
@@ -6982,6 +6998,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         };
         std::vector<LoopBreakPath> loop_breaks;
         std::set<std::uint64_t> loop_break_path_ids;
+        std::map<std::uint64_t, std::vector<const LiftedBlock *>> shared_loop_break_paths;
+        std::map<std::uint64_t, std::set<std::uint64_t>> shared_loop_break_sources;
         std::vector<std::pair<const LiftedBlock *, bool>> loop_continues;
         struct LoopConditionalReturn {
             const LiftedBlock *branch = nullptr;
@@ -7548,6 +7566,14 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<const LiftedBlock *> path;
             if (!exit_block) return std::nullopt;
             if (target == exit_block->begin) return path;
+            const auto *target_block = find_block(target);
+            if (target_block) {
+                const auto shared = shared_loop_break_paths.find(target_block->id.value);
+                if (shared != shared_loop_break_paths.end()) {
+                    shared_loop_break_sources[target_block->id.value].insert(predecessor);
+                    return shared->second;
+                }
+            }
             std::set<std::uint64_t> seen;
             auto *candidate = find_block(target);
             while (candidate && candidate != exit_block && candidate != body_start &&
@@ -7562,7 +7588,18 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                    (candidate->successors.front().kind == BlockEdgeKind::jump ||
                     candidate->successors.front().kind == BlockEdgeKind::fallthrough) &&
                    has_unconditional_edge(*candidate, *candidate->successors.front().target) &&
-                   diamond_predecessors[candidate->id.value] == std::set<std::uint64_t>{predecessor}) {
+                   (diamond_predecessors[candidate->id.value] == std::set<std::uint64_t>{predecessor} ||
+                    (path.empty() && diamond_predecessors[candidate->id.value].contains(predecessor) &&
+                     std::all_of(diamond_predecessors[candidate->id.value].begin(),
+                         diamond_predecessors[candidate->id.value].end(), [&](const auto source_id) {
+                             const auto source = std::find_if(function.blocks.begin(), function.blocks.end(),
+                                 [&](const auto &block) { return block.id.value == source_id; });
+                             if (source == function.blocks.end()) return false;
+                             const auto *source_condition = terminal_conditional(*source);
+                             return source_condition && source_condition->true_target && source_condition->false_target &&
+                                 (*source_condition->true_target == candidate->begin ||
+                                  *source_condition->false_target == candidate->begin);
+                         })))) {
                 path.push_back(candidate);
                 predecessor = candidate->id.value;
                 candidate = find_block(*candidate->successors.front().target);
@@ -7683,12 +7720,19 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 const bool false_continues = *body_condition->false_target == header->begin;
                 if (true_exits != false_exits) {
                     const auto &break_path = true_exits ? *true_exit_path : *false_exit_path;
+                    const auto *path_head = break_path.empty() ? nullptr : break_path.front();
+                    const bool shared_path = path_head && shared_loop_break_paths.contains(path_head->id.value);
+                    if (path_head && !shared_path) {
+                        shared_loop_break_paths.emplace(path_head->id.value, break_path);
+                        shared_loop_break_sources[path_head->id.value].insert(body->id.value);
+                    }
                     for (const auto *path_block : break_path)
-                        if (!loop_break_path_ids.insert(path_block->id.value).second) {
+                        if (!loop_break_path_ids.insert(path_block->id.value).second && !shared_path) {
                             loop_body_edges_valid = false;
                             break;
                         }
                     if (!loop_body_edges_valid) break;
+                    if (shared_path) shared_loop_break_sources[path_head->id.value].insert(body->id.value);
                     loop_breaks.push_back({body, true_exits, break_path});
                     next_address = true_exits ? *body_condition->false_target : *body_condition->true_target;
                 } else {
@@ -8075,17 +8119,27 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             if (next_address == header->begin) break;
             body = find_block(next_address);
         }
+        for (const auto &[head_id, sources] : shared_loop_break_sources) {
+            const auto head = std::find_if(function.blocks.begin(), function.blocks.end(),
+                [&](const auto &candidate) { return candidate.id.value == head_id; });
+            if (head == function.blocks.end() || sources.size() < 2 ||
+                diamond_predecessors[head_id] != sources) {
+                loop_body_edges_valid = false;
+                break;
+            }
+        }
         std::vector<std::pair<std::string, std::string>> loop_condition_exit_phi_copies;
         if (exit_block && !exit_block->phis.empty()) {
             std::set<std::uint64_t> expected_exit_predecessors{header->id.value};
-            std::map<std::uint64_t, LoopBreakPath *> break_by_predecessor;
+            std::map<std::uint64_t, std::vector<LoopBreakPath *>> break_by_predecessor;
             for (auto &loop_break : loop_breaks) {
                 const auto *tail = loop_break.path.empty() ? loop_break.branch : loop_break.path.back();
-                if (!tail || !break_by_predecessor.emplace(tail->id.value, &loop_break).second ||
-                    !expected_exit_predecessors.insert(tail->id.value).second) {
+                if (!tail) {
                     loop_body_edges_valid = false;
                     break;
                 }
+                break_by_predecessor[tail->id.value].push_back(&loop_break);
+                expected_exit_predecessors.insert(tail->id.value);
             }
             if (loop_body_edges_valid && diamond_predecessors[exit_block->id.value] != expected_exit_predecessors)
                 loop_body_edges_valid = false;
@@ -8116,7 +8170,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             loop_body_edges_valid = false;
                             break;
                         }
-                        found->second->exit_phi_copies.push_back(std::move(copy));
+                        for (auto *loop_break : found->second)
+                            loop_break->exit_phi_copies.push_back(copy);
                     }
                 }
                 if (!loop_body_edges_valid || seen_predecessors != expected_exit_predecessors) {

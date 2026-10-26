@@ -147,6 +147,23 @@ operations require an implementation setting with SEW 32 or 64; SEW 16 and
 other unsupported settings remain runtime constraints rather than being
 evaluated by this stateless decoder.
 
+The eight single-width fused multiply-add/subtract operations (`vfmacc`,
+`vfnmacc`, `vfmsac`, `vfnmsac`, `vfmadd`, `vfnmadd`, `vfmsub`, and `vfnmsub`)
+are recognized in `.vv` and `.vf` forms. They retain `frm` and accrued
+`fflags` dependencies, masked `v0`, and old `vd` input; `.vf` retains its FPR
+scalar source. Each remains a named floating-vector intrinsic because this
+stateless decode/lift path does not choose a runtime rounding mode or compute
+fused IEEE lane results and exception flags.
+
+The fused instruction equations and operand-overwrite forms follow the
+[RISC-V V specification, §30.1.13.6](https://docs.riscv.org/reference/isa/unpriv/v-st-ext.html#vector-single-width-floating-point-fused-multiply-add-instructions).
+For comparison with Ghidra's RISC-V SLEIGH work, see its
+[RVV SLEIGH support change](https://github.com/NationalSecurityAgency/ghidra/pull/5778);
+that change describes instruction recognition and explicitly notes that it
+does not yet provide p-code semantics, so this implementation uses the ISA
+specification for operation effects rather than treating SLEIGH as an
+authoritative semantic source.
+
 The decompiler keeps the operations as named floating-vector or boolean-mask
 intrinsics. Every operation retains implicit `vl`, `vtype`, and `vstart` reads,
 the normal-completion `vstart` write, masked `v0`, and the old destination
@@ -175,7 +192,7 @@ injection is bitwise and does not raise flags. Floating arithmetic, dynamic
 rounding, inexact/underflow/overflow/divide-by-zero flags, and wider or
 half-precision lanes remain outside the evaluator.
 
-Fused multiply-add, reductions, conversions, classification, reciprocal and
+Reductions, conversions, classification, reciprocal and
 square-root operations, widening floating-point arithmetic, half-precision
 vector operations, and all other vector floating-point encodings remain
 unsupported. A recognized FP funct6 with a reserved operand class is invalid;

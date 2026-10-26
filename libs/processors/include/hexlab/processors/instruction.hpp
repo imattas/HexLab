@@ -421,6 +421,10 @@ enum class Opcode {
     rv_vfsgnjx_vv, rv_vfsgnjx_vf, rv_vfmin_vv, rv_vfmin_vf, rv_vfmax_vv, rv_vfmax_vf,
     rv_vmfeq_vv, rv_vmfeq_vf, rv_vmfne_vv, rv_vmfne_vf, rv_vmflt_vv, rv_vmflt_vf,
     rv_vmfle_vv, rv_vmfle_vf, rv_vmfgt_vf, rv_vmfge_vf,
+    // RVV single-width fused floating multiply-add/subtract; append for ID stability.
+    rv_vfmacc_vv, rv_vfmacc_vf, rv_vfnmacc_vv, rv_vfnmacc_vf, rv_vfmsac_vv, rv_vfmsac_vf,
+    rv_vfnmsac_vv, rv_vfnmsac_vf, rv_vfmadd_vv, rv_vfmadd_vf, rv_vfnmadd_vv, rv_vfnmadd_vf,
+    rv_vfmsub_vv, rv_vfmsub_vf, rv_vfnmsub_vv, rv_vfnmsub_vf,
     // Appended AVX packed floating division forms; preserve stored opcode IDs.
     vdivps, vdivpd,
     // AArch64 preserving bitfield move; append to preserve persisted IDs.
