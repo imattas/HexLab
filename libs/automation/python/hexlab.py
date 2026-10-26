@@ -5,9 +5,14 @@ trusted Python programs. Close projects explicitly or use a with statement.
 """
 import os
 import json
+import math
 import tempfile
+import time
+from concurrent.futures import Future
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
+from queue import Empty, Full, Queue
+from threading import Event, Lock, Thread, current_thread
 import _hexlab
 
 API_VERSION = 1
@@ -1865,3 +1870,378 @@ class DebuggerSession:
 
     def __exit__(self, *exception):
         self.close()
+
+
+class DebuggerJob:
+    """Thread-safe result handle for one queued ``DebuggerWorker`` operation."""
+    __slots__ = ("_future", "_cancel_token", "job_id")
+
+    def __init__(self, job_id, future, cancel_token):
+        self.job_id = job_id
+        self._future = future
+        self._cancel_token = cancel_token
+
+    def cancel(self):
+        """Cancel queued work or request cooperative cancellation if running."""
+        self._cancel_token.cancel()
+        return self._future.cancel()
+
+    @property
+    def done(self):
+        return self._future.done()
+
+    def result(self, timeout=None):
+        return self._future.result(timeout)
+
+    def exception(self, timeout=None):
+        return self._future.exception(timeout)
+
+    def add_done_callback(self, callback):
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        self._future.add_done_callback(lambda _future: callback(self))
+
+
+class DebuggerWorker:
+    """Asynchronous thread-safe command and event bridge for one debugger.
+
+    A private non-daemon thread creates and owns the native ``DebuggerSession``.
+    Other threads submit bounded jobs and receive detached event dictionaries;
+    session methods never run on the caller or GUI thread.
+    """
+    _METHODS = frozenset({
+        "state", "processes", "launch", "attach", "connect_remote",
+        "continue_event", "single_step", "interrupt", "terminate", "detach",
+        "read_memory", "write_memory", "evaluate_expression", "search_memory",
+        "threads", "thread_run_states", "resume_threads", "modules",
+        "memory_regions", "registers", "write_registers", "breakpoints",
+        "add_breakpoint", "remove_breakpoint", "enable_breakpoint",
+        "set_breakpoint_ignore_count", "set_breakpoint_condition",
+        "set_breakpoint_logpoint",
+    })
+    _ACK_METHODS = frozenset({"continue_event", "single_step", "resume_threads"})
+    _WAIT_TIMEOUT_MESSAGES = frozenset({
+        "debug event wait timed out", "remote target has not stopped yet",
+    })
+    _MAX_INPUT_BYTES = 16 * 1024 * 1024
+    _MAX_QUEUED_INPUT_BYTES = 64 * 1024 * 1024
+    _MAX_INPUT_ITEMS = 65536
+    _MAX_QUEUED_INPUT_ITEMS = 262144
+    _MAX_INPUT_DEPTH = 16
+
+    def __init__(self, *, max_pending=32, max_events=128,
+                 event_poll_ms=50, shutdown_timeout=5.0):
+        for value, label in ((max_pending, "max_pending"), (max_events, "max_events")):
+            if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 256:
+                raise ValueError(f"{label} must be in 1..256")
+        if not isinstance(event_poll_ms, int) or isinstance(event_poll_ms, bool) or not 10 <= event_poll_ms <= 250:
+            raise ValueError("event_poll_ms must be in 10..250")
+        if (not isinstance(shutdown_timeout, (int, float)) or isinstance(shutdown_timeout, bool) or
+                not math.isfinite(shutdown_timeout) or not 0 <= shutdown_timeout <= 60):
+            raise ValueError("shutdown_timeout must be in 0..60 seconds")
+        self._commands = Queue(maxsize=max_pending)
+        self._events = Queue(maxsize=max_events)
+        self._event_poll_ms = event_poll_ms
+        self._shutdown_timeout = float(shutdown_timeout)
+        self._shutdown = CancellationToken()
+        self._lock = Lock()
+        self._closed = False
+        self._next_job_id = 1
+        self._queued_input_bytes = 0
+        self._queued_input_items = 0
+        self._active_job = None
+        self._pending_sequence = None
+        self._failure = None
+        self._stopped = Event()
+        self._ready = Future()
+        self._thread = Thread(target=self._run, name="HexLab debugger worker", daemon=False)
+        self._thread.start()
+        try:
+            self._ready.result(timeout=10)
+        except BaseException:
+            self.close(timeout=self._shutdown_timeout)
+            raise
+
+    def submit(self, method, *args, **kwargs):
+        """Queue one allowed ``DebuggerSession`` call and return its job handle.
+
+        Inputs are detached at submission time and bounded to 16 MiB and 65,536
+        values. ``wait_event`` is intentionally not a job: this worker pumps
+        events automatically into its bounded event queue.
+        """
+        if not isinstance(method, str) or method not in self._METHODS:
+            raise ValueError("unsupported asynchronous debugger operation")
+        if method == "search_memory" and "cancel" in kwargs:
+            raise ValueError("search_memory cancellation is controlled by its DebuggerJob")
+        if method == "launch":
+            if not args:
+                raise TypeError("launch requires an executable path")
+            args = (os.fspath(args[0]),) + tuple(args[1:])
+            if len(args) > 1:
+                if not isinstance(args[1], (list, tuple)) or len(args[1]) > 4096:
+                    raise ValueError("launch arguments must be a sequence of at most 4096 paths or strings")
+                args = (args[0], tuple(os.fspath(arg) for arg in args[1])) + tuple(args[2:])
+            if "working_directory" in kwargs:
+                kwargs["working_directory"] = os.fspath(kwargs["working_directory"])
+        if method == "state" and (args or kwargs):
+            raise TypeError("state does not accept arguments")
+        if method == "write_memory" and len(args) > 1 and len(args[1]) > 1024 * 1024:
+            raise ValueError("debugger memory writes are limited to 1 MiB")
+        budget = [0, 0, set()]
+        args = self._snapshot_input(tuple(args), budget)
+        kwargs = self._snapshot_input(dict(kwargs), budget)
+        input_bytes = budget[0]
+        input_items = budget[1]
+        future = Future()
+        cancel = CancellationToken()
+        with self._lock:
+            if self._closed or self._stopped.is_set():
+                cancel.cancel()
+                raise RuntimeError("debugger worker is closed")
+            if input_bytes > self._MAX_QUEUED_INPUT_BYTES - self._queued_input_bytes:
+                cancel.cancel()
+                raise RuntimeError("debugger worker queued input budget is full")
+            if input_items > self._MAX_QUEUED_INPUT_ITEMS - self._queued_input_items:
+                cancel.cancel()
+                raise RuntimeError("debugger worker queued value budget is full")
+            job_id = self._next_job_id
+            self._next_job_id += 1
+            job = DebuggerJob(job_id, future, cancel)
+            try:
+                self._commands.put_nowait((job, method, args, kwargs, input_bytes, input_items))
+            except Full:
+                cancel.cancel()
+                raise RuntimeError("debugger worker command queue is full") from None
+            self._queued_input_bytes += input_bytes
+            self._queued_input_items += input_items
+        return job
+
+    def get_event(self, timeout=None):
+        """Return the next detached stop event, or ``None`` after worker exit.
+
+        Events are never dropped. When the bounded queue fills, the worker stops
+        polling until a consumer drains it, leaving the target stopped.
+        """
+        if timeout is not None:
+            if (not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or
+                    not math.isfinite(timeout) or timeout < 0):
+                raise ValueError("timeout must be a nonnegative number or None")
+            deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return self._events.get_nowait()
+            except Empty:
+                pass
+            if self._stopped.is_set() and self._events.empty():
+                if self._failure is not None:
+                    raise RuntimeError("debugger worker failed") from self._failure
+                return None
+            wait = 0.05
+            if timeout is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out waiting for debugger event")
+                wait = min(wait, remaining)
+            try:
+                return self._events.get(timeout=wait)
+            except Empty:
+                continue
+
+    def close(self, *, timeout=None):
+        """Request orderly detach and join; return False if the call outlives timeout."""
+        if timeout is None:
+            timeout = self._shutdown_timeout
+        if (not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or
+                not math.isfinite(timeout) or timeout < 0):
+            raise ValueError("timeout must be a nonnegative number")
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                self._shutdown.cancel()
+                if self._active_job is not None:
+                    self._active_job._cancel_token.cancel()
+        self._cancel_queued(RuntimeError("debugger worker is closing"))
+        if current_thread() is self._thread:
+            return False
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def __enter__(self):
+        if self._closed:
+            raise RuntimeError("debugger worker is closed")
+        return self
+
+    def __exit__(self, *exception):
+        self.close()
+
+    @classmethod
+    def _snapshot_input(cls, value, budget, depth=0):
+        if depth > cls._MAX_INPUT_DEPTH:
+            raise ValueError("debugger job input is nested too deeply")
+        budget[1] += 1
+        if budget[1] > cls._MAX_INPUT_ITEMS:
+            raise ValueError("debugger job contains too many input values")
+        if value is None or type(value) in (bool, float):
+            budget[0] += 8
+            cls._check_input_budget(value, budget)
+            return value
+        if type(value) is int:
+            integer_bytes = max(8, (value.bit_length() + 7) // 8)
+            budget[0] += integer_bytes
+            cls._check_input_budget(value, budget)
+            return value
+        if isinstance(value, str):
+            if len(value) > cls._MAX_INPUT_BYTES - budget[0]:
+                raise ValueError("debugger job input exceeds 16 MiB")
+            encoded = value.encode("utf-8")
+            budget[0] += len(encoded)
+            clone = encoded.decode("utf-8")
+            return cls._check_input_budget(clone, budget)
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            source_size = value.nbytes if isinstance(value, memoryview) else len(value)
+            if source_size > cls._MAX_INPUT_BYTES - budget[0]:
+                raise ValueError("debugger job input exceeds 16 MiB")
+            clone = bytes(value)
+            budget[0] += len(clone)
+            return cls._check_input_budget(clone, budget)
+        if isinstance(value, ThreadResumeKind):
+            budget[0] += 8
+            cls._check_input_budget(value, budget)
+            return value
+        if isinstance(value, ThreadResumeAction):
+            thread_id = cls._snapshot_input(value.thread_id, budget, depth + 1)
+            kind = cls._snapshot_input(value.kind, budget, depth + 1)
+            return ThreadResumeAction(thread_id, kind)
+        if isinstance(value, (list, tuple)):
+            if id(value) in budget[2]:
+                raise ValueError("cyclic debugger job inputs are unsupported")
+            budget[2].add(id(value))
+            result = tuple(cls._snapshot_input(item, budget, depth + 1) for item in value)
+            budget[2].remove(id(value))
+            return result
+        if isinstance(value, dict):
+            if id(value) in budget[2]:
+                raise ValueError("cyclic debugger job inputs are unsupported")
+            budget[2].add(id(value))
+            result = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise TypeError("debugger job mapping keys must be strings")
+                budget[0] += len(key.encode("utf-8"))
+                cls._check_input_budget(None, budget)
+                result[key] = cls._snapshot_input(item, budget, depth + 1)
+            budget[2].remove(id(value))
+            return result
+        raise TypeError("debugger job inputs must be immutable scalar, sequence, mapping, or byte values")
+
+    @classmethod
+    def _check_input_budget(cls, value, budget):
+        if budget[0] > cls._MAX_INPUT_BYTES:
+            raise ValueError("debugger job input exceeds 16 MiB")
+        return value
+
+    def _publish_event(self, event):
+        # Ordinary backpressure never drops a stop. Explicit close abandons an
+        # event still in transit because session.close() detaches the target.
+        while not self._shutdown.cancelled:
+            try:
+                self._events.put(event, timeout=0.05)
+                return True
+            except Full:
+                continue
+        return False
+
+    def _execute(self, session, job, method, args, kwargs):
+        future = job._future
+        if not future.set_running_or_notify_cancel():
+            return
+        with self._lock:
+            closing = self._closed
+            if not closing:
+                self._active_job = job
+        if closing:
+            job._cancel_token.cancel()
+            future.set_exception(RuntimeError("debugger worker is closing"))
+            return
+        try:
+            if method in self._ACK_METHODS:
+                if not args or self._pending_sequence is None or args[0] != self._pending_sequence:
+                    raise ValueError("event sequence does not identify the worker's current pending stop")
+            call_args = list(args)
+            call_kwargs = dict(kwargs)
+            if method == "search_memory":
+                if "cancel" in call_kwargs:
+                    raise ValueError("search_memory cancellation is controlled by its DebuggerJob")
+                call_kwargs["cancel"] = job._cancel_token
+            if method == "state":
+                result = session.state
+            else:
+                result = getattr(session, method)(*call_args, **call_kwargs)
+            if method in self._ACK_METHODS:
+                self._pending_sequence = None
+            future.set_result(result)
+        except BaseException as error:
+            if not future.done():
+                future.set_exception(error)
+        finally:
+            with self._lock:
+                if self._active_job is job:
+                    self._active_job = None
+
+    def _cancel_queued(self, error):
+        while True:
+            try:
+                job, _method, _args, _kwargs, input_bytes, input_items = self._commands.get_nowait()
+            except Empty:
+                break
+            with self._lock:
+                self._queued_input_bytes -= input_bytes
+                self._queued_input_items -= input_items
+            job._cancel_token.cancel()
+            if not job._future.done():
+                job._future.set_exception(error)
+
+    def _run(self):
+        session = None
+        try:
+            session = DebuggerSession.native()
+            self._ready.set_result(True)
+            while not self._shutdown.cancelled:
+                try:
+                    command = self._commands.get(timeout=0.025)
+                except Empty:
+                    if (session.state not in (DebuggerSession.RUNNING, DebuggerSession.STOPPED) or
+                            self._pending_sequence is not None):
+                        continue
+                    try:
+                        event = session.wait_event(
+                            timeout_ms=self._event_poll_ms, cancel=self._shutdown)
+                    except AnalysisCancelled:
+                        if self._shutdown.cancelled:
+                            break
+                        raise
+                    except Error as error:
+                        if error.message in self._WAIT_TIMEOUT_MESSAGES:
+                            continue
+                        raise
+                    self._pending_sequence = event["sequence"]
+                    if not self._publish_event(event):
+                        break
+                    continue
+                with self._lock:
+                    self._queued_input_bytes -= command[4]
+                    self._queued_input_items -= command[5]
+                self._execute(session, *command[:4])
+        except BaseException as error:
+            self._failure = error
+            if not self._ready.done():
+                self._ready.set_exception(error)
+        finally:
+            if session is not None:
+                try:
+                    session.close()
+                except BaseException as error:
+                    if self._failure is None:
+                        self._failure = error
+            self._cancel_queued(RuntimeError("debugger worker stopped"))
+            self._stopped.set()

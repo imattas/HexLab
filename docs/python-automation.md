@@ -520,6 +520,49 @@ that created the session. The API does not silently resume a target or install
 Python-side event callbacks. Backend capability differences are reported as
 `hexlab.Error`.
 
+`DebuggerWorker` provides asynchronous, cross-thread control when caller threads
+must not own or block on the session. It creates `DebuggerSession` on a private
+worker thread, pumps stop events there, and returns detached event dictionaries
+through `get_event(timeout=...)`. Operations are submitted by name and return a
+`DebuggerJob`; call `job.result(timeout)` to retrieve the result or exception.
+For example:
+
+```python
+with hexlab.DebuggerWorker() as debugger:
+    process = debugger.submit("launch", "./sample", ["--version"]).result(10)
+    event = debugger.get_event(timeout=10)
+    print(process["architecture"], event["sequence"], event["kind"])
+    debugger.submit("continue_event", event["sequence"]).result(5)
+```
+
+Allowed operation names are `state`, `processes`, `launch`, `attach`,
+`connect_remote`, `continue_event`, `single_step`, `interrupt`, `terminate`,
+`detach`, `read_memory`, `write_memory`, `evaluate_expression`,
+`search_memory`, `threads`, `thread_run_states`, `resume_threads`, `modules`,
+`memory_regions`, `registers`, `write_registers`, `breakpoints`,
+`add_breakpoint`, `remove_breakpoint`, `enable_breakpoint`,
+`set_breakpoint_ignore_count`, `set_breakpoint_condition`, and
+`set_breakpoint_logpoint`. Each job snapshots scalar, sequence, mapping, and
+byte inputs at submission, with a 16 MiB and 65,536-value limit. The command
+queue defaults to 32 jobs and accepts at most 256, with shared 64 MiB and
+262,144-value queued-input budgets. The event queue defaults to 128 and accepts
+at most 256. If the event queue fills, polling pauses and no stop event is
+discarded while the worker remains active. An explicit `close()` can abandon
+an event still waiting to enter a full queue as it detaches the target. The
+worker records the current event sequence and rejects acknowledgements for any
+stale or different sequence; the backend still checks thread ownership and
+schedule support.
+
+`job.cancel()` cancels queued jobs or requests cooperative cancellation for a
+running `search_memory` job. Other in-flight debugger operations do not accept
+cancellation. `close()` requests prompt cancellation of the event pump, cancels
+queued work, detaches an active session on its owner thread, and joins for up to
+the configured timeout (five seconds by default); it returns `False` if an
+in-flight non-cancellable native operation has not returned yet. Retrying
+`close()` continues the join. Use the context manager and explicitly drain events;
+it does not auto-continue a stopped target. Multiple event consumers share the
+queue, so each event is delivered to only one consumer.
+
 `evaluate_expression(thread_id, expression)` evaluates the bounded register and
 memory expression language against a stopped thread and returns an unsigned
 64-bit result. Expressions are limited to 256 UTF-8 bytes; register names and
@@ -566,7 +609,8 @@ Each project and its SQLite store belong to the thread that opened them. Use and
 close the project on that thread; do not transfer a live owner to another thread.
 Most native calls are synchronous and retain the GIL. Debugger launch, attach,
 remote connection, and event waits release it for the duration of those bounded
-calls; this does not add a general asynchronous task API. Project and archive
+calls; `DebuggerWorker` supplies the separate asynchronous debugger command and
+event queue. Project and archive
 owners remain bound to their creating thread. Native C++ operations accept stop
 tokens where underlying work supports cancellation. Python scripts are ordinary
 trusted programs; there is no sandbox or forced timeout. `hexlab_python` remains
