@@ -85,6 +85,7 @@ HEXLAB_DECOMPILER_EXPORT AbiDescription riscv32_ilp32_abi();
 HEXLAB_DECOMPILER_EXPORT AbiDescription riscv64_lp64_abi();
 HEXLAB_DECOMPILER_EXPORT AbiDescription mips32_o32_abi();
 HEXLAB_DECOMPILER_EXPORT AbiDescription mips64_n64_abi();
+HEXLAB_DECOMPILER_EXPORT AbiDescription mips_n32_abi();
 
 struct RecoveredVariable {
     RegisterOperand reg;

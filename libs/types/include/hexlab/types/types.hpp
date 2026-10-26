@@ -12,7 +12,7 @@
 namespace hexlab::types {
 enum class Kind { void_type, boolean, integer, floating, pointer, array, structure, union_type, enumeration, function, named_reference, vector, qualified };
 enum class Qualifier : std::uint8_t { const_ = 1, volatile_ = 2, restrict_ = 4 };
-enum class FunctionConvention : std::uint8_t { platform_default, c_decl, stdcall, fastcall, thiscall, vectorcall, sysv_abi, ms_abi, aapcs64, aapcs32, mips_n64 };
+enum class FunctionConvention : std::uint8_t { platform_default, c_decl, stdcall, fastcall, thiscall, vectorcall, sysv_abi, ms_abi, aapcs64, aapcs32, mips_n64, mips_n32 };
 using TypePtr = std::shared_ptr<const class Type>;
 class Type;
 HEXLAB_TYPES_EXPORT std::string format(const Type &type);

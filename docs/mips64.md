@@ -39,7 +39,21 @@ operand shapes or ranges fail closed rather than rendering an approximate
 bitfield operation.
 
 
-The shared ABI classifier exposes an explicit mips_n64 convention for Linux N64 signatures. It models integer/pointer scalars in A0-A7, floating scalars in the matching F12-F19 argument slot, integer-only structure/union arguments up to 32 bytes as 8-byte chunks across A0-A7 and the stack, array parameters as indirect pointers, scalar returns in V0/F0, and integer-only aggregate returns up to 16 bytes in V0/V1. Larger aggregate returns use a hidden A0 result pointer. Stack overflow arguments use aligned 8-byte slots with 16-byte stack alignment. Floating-field/vector/recursive/unresolved aggregates, unsupported scalar widths, vectors, variadic signatures, and aggregates over 32 bytes are rejected; floating-field aggregate returns require the additional F0/F2 PCS rules and stay unsupported. This models the Linux N64 hard-float source ABI for declared prototypes; the API has no endian or soft-float selector, so it neither selects nor claims the soft-float variant. N32 and O32 are explicit but unsupported selectors; N64 classification is never inferred from ELF class alone.
+The shared ABI classifier exposes an explicit mips_n64 convention for Linux N64 signatures. It models integer/pointer scalars in A0-A7, floating scalars in the matching F12-F19 argument slot, integer-only structure/union arguments up to 32 bytes as 8-byte chunks across A0-A7 and the stack, array parameters as indirect pointers, scalar returns in V0/F0, and integer-only aggregate returns up to 16 bytes in V0/V1. Larger aggregate returns use a hidden A0 result pointer. Stack overflow arguments use aligned 8-byte slots with 16-byte stack alignment. Floating-field/vector/recursive/unresolved aggregates, unsupported scalar widths, vectors, variadic signatures, and aggregates over 32 bytes are rejected; floating-field aggregate returns require the additional F0/F2 PCS rules and stay unsupported. This models the Linux N64 hard-float source ABI for declared prototypes; the API has no endian or soft-float selector, so it neither selects nor claims the soft-float variant. N64 classification is never inferred from ELF class alone. The MIPS N32 scalar profile is described below; N32 and O32 aggregate and variadic details remain outside this N64 classifier description.
 
 
 Integer encoding and operation details follow the [MIPS64 Instruction Set Reference, Revision 5.04](https://repo.oss.cipunited.com/archives/mips_pdf/MD00087-2B-MIPS64BIS-AFP-05.04.pdf), including the REGIMM branch-and-link operation and LL/SC result effects.
+# Linux MIPS N32 ELF
+
+ELF32 `EM_MIPS` inputs with `EF_MIPS_ABI2` (`e_flags & 0x20`) are routed to
+the MIPS64 instruction decoder while their image address space remains 32-bit.
+This recognizes the N32 ELF ABI marker; ELF32 MIPS files without that marker
+continue to use the MIPS32 decoder. ELF64 MIPS continues to use MIPS64.
+
+The loader does not infer N32 from ELF class alone. The N32 decoder route
+currently provides the shared MIPS64 instruction subset and a 32-bit address
+space. CLI and pseudocode decompilation select the N32 ABI profile from that
+address-space width; it uses 32-bit pointers and 64-bit argument registers and
+slots. The type system also accepts an explicit `mips_n32` function
+convention. N32-specific relocation, unwind, and core-register integration
+remain incomplete. Variadic N32 classification remains unsupported.
