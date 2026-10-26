@@ -233,6 +233,37 @@ bool decode_vector_multiply(std::uint32_t w, RiscvInstruction &i) {
     return true;
 }
 
+bool decode_vector_multiply_add(std::uint32_t w, RiscvInstruction &i) {
+    const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
+    const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
+    const unsigned funct3 = (w >> 12) & 7, vd = (w >> 7) & 31;
+    if (funct3 != 2 && funct3 != 6)
+        return false; // RVV 1.0 provides only OPMVV and OPMVX multiply-add forms.
+    const bool scalar = funct3 == 6;
+    RiscvOpcode op;
+    switch (funct6) {
+    case 0x2d: op = scalar ? RiscvOpcode::vmacc_vx : RiscvOpcode::vmacc_vv; break;
+    case 0x2f: op = scalar ? RiscvOpcode::vnmsac_vx : RiscvOpcode::vnmsac_vv; break;
+    case 0x29: op = scalar ? RiscvOpcode::vmadd_vx : RiscvOpcode::vmadd_vv; break;
+    case 0x2b: op = scalar ? RiscvOpcode::vnmsub_vx : RiscvOpcode::vnmsub_vv; break;
+    default: return false;
+    }
+    i.opcode = op;
+    operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
+    read_vector_destination(i, vd);
+    // Unlike the other binary integer operations, the architectural assembly
+    // syntax orders rs1/vs1 before vs2 for this three-source family.
+    if (scalar)
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vs1)}, RiscvOperandAccess::read);
+    else
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vs1), false, true}, RiscvOperandAccess::read);
+    operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
+    if (!vm)
+        i.register_reads.push_back(RiscvRegister{0, false, true});
+    i.vector_masked = !vm;
+    return true;
+}
+
 bool decode_vector_divide(std::uint32_t w, RiscvInstruction &i) {
     const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
     const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
@@ -810,7 +841,8 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
             unsupported = "reserved or unimplemented vector-configuration encoding";
             return false;
         }
-        if (decode_vector_integer(w, i) || decode_vector_compare(w, i) || decode_vector_shift_minmax(w, i) ||
+        if (decode_vector_integer(w, i) || decode_vector_compare(w, i) || decode_vector_multiply_add(w, i) ||
+            decode_vector_shift_minmax(w, i) ||
             decode_vector_multiply(w, i) || decode_vector_divide(w, i) || decode_vector_permutation(w, i)) {
             read_vector_configuration(i);
             return true;
@@ -819,7 +851,8 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
             const unsigned funct6 = w >> 26, funct3 = (w >> 12) & 7;
             const bool implemented = funct6 == 0 || funct6 == 2 || funct6 == 3 || funct6 == 4 || funct6 == 5 || funct6 == 6 ||
                                      funct6 == 7 || funct6 == 9 || funct6 == 10 || funct6 == 11 ||
-                                     funct6 == 0x25 || funct6 == 0x28 || funct6 == 0x29 ||
+                                     funct6 == 0x25 || funct6 == 0x28 || funct6 == 0x29 || funct6 == 0x2b ||
+                                     funct6 == 0x2d || funct6 == 0x2f ||
                                      funct6 == 0x0c || funct6 == 0x0e || funct6 == 0x0f ||
                                      (funct6 >= 0x18 && funct6 <= 0x1f) || (funct6 >= 0x20 && funct6 <= 0x23);
             if (implemented && (funct3 == 0 || funct3 == 3 || funct3 == 4))

@@ -312,7 +312,8 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
 
     enum class Operation { add, sub, rsub, bit_and, bit_or, bit_xor, shl, shr, sar,
                            minu, min, maxu, max, mul, mulh, mulhu, mulhsu,
-                           divu, div, remu, rem, eq, ne, ltu, lt, leu, le, gtu, gt };
+                           divu, div, remu, rem, eq, ne, ltu, lt, leu, le, gtu, gt,
+                           vmacc, vnmsac, vmadd, vnmsub };
     Operation operation;
     bool vector_rhs = false, scalar_rhs = false, immediate_rhs = false, mask_result = false;
     switch (opcode) {
@@ -340,6 +341,10 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
     RV_VECTOR_PAIR(vdiv_vv, vdiv_vx, div);
     RV_VECTOR_PAIR(vremu_vv, vremu_vx, remu);
     RV_VECTOR_PAIR(vrem_vv, vrem_vx, rem);
+    RV_VECTOR_PAIR(vmacc_vv, vmacc_vx, vmacc);
+    RV_VECTOR_PAIR(vnmsac_vv, vnmsac_vx, vnmsac);
+    RV_VECTOR_PAIR(vmadd_vv, vmadd_vx, vmadd);
+    RV_VECTOR_PAIR(vnmsub_vv, vnmsub_vx, vnmsub);
     case RiscvOpcode::vmseq_vv: operation = Operation::eq; vector_rhs = true; mask_result = true; break;
     case RiscvOpcode::vmseq_vx: operation = Operation::eq; scalar_rhs = true; mask_result = true; break;
     case RiscvOpcode::vmseq_vi: operation = Operation::eq; immediate_rhs = true; mask_result = true; break;
@@ -414,6 +419,10 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
         case Operation::div: value = signed_divide(lhs, rhs, sew, false); break;
         case Operation::remu: value = unsigned_divide(lhs, rhs, sew, true); break;
         case Operation::rem: value = signed_divide(lhs, rhs, sew, true); break;
+        case Operation::vmacc: value = (operands.old_destination[static_cast<std::size_t>(lane)] + lhs * rhs) & mask; break;
+        case Operation::vnmsac: value = (operands.old_destination[static_cast<std::size_t>(lane)] - lhs * rhs) & mask; break;
+        case Operation::vmadd: value = (lhs + operands.old_destination[static_cast<std::size_t>(lane)] * rhs) & mask; break;
+        case Operation::vnmsub: value = (lhs - operands.old_destination[static_cast<std::size_t>(lane)] * rhs) & mask; break;
         case Operation::eq: value = lhs == rhs; break;
         case Operation::ne: value = lhs != rhs; break;
         case Operation::ltu: value = lhs < rhs; break;

@@ -380,7 +380,10 @@ enum class Opcode {
     // VMX VX-form integer operations; append to preserve persisted opcode IDs.
     ppc_vaddubm, ppc_vadduhm, ppc_vadduwm,
     ppc_vsububm, ppc_vsubuhm, ppc_vsubuwm,
-    ppc_vand, ppc_vandc, ppc_vor, ppc_vxor, ppc_vnor
+    ppc_vand, ppc_vandc, ppc_vor, ppc_vxor, ppc_vnor,
+    // RVV non-widening integer multiply-accumulate forms; preserve prior IDs.
+    rv_vmacc_vv, rv_vmacc_vx, rv_vnmsac_vv, rv_vnmsac_vx,
+    rv_vmadd_vv, rv_vmadd_vx, rv_vnmsub_vv, rv_vnmsub_vx
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

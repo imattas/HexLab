@@ -77,11 +77,21 @@ scalar GPR read for VX, the vector destination write, and an implicit v0 read
 when masked. Generic formatting and decompilation preserve the mnemonic, input
 registers, mask, and destination effects. Analysis consumes the ordinary
 register-effect records; it does not infer lane values or fixed vector width.
-VI multiply forms, widening and multiply-accumulate forms remain unsupported.
+VI multiply forms and widening multiply forms remain unsupported.
 Vector divide and remainder VV/VX forms are decoded, formatted, lifted, and
 available in the bounded integer lane evaluator.
 
-Decompiler typing for the 69 decoded integer elementwise forms is shared across
+The non-widening integer multiply-accumulate family now includes VMACC, VNMSAC,
+VMADD, and VNMSUB in VV/VX forms. Their destructive destination is recorded as
+an input dependency alongside both multiplicands, and masked forms retain the
+implicit v0 read. The lane evaluator computes the low SEW bits of each product
+and accumulation, preserves inactive and tail destination lanes, and uses the
+distinct accumulator-versus-multiplicand equations for the two instruction
+pairs. Decode forms and operand ordering follow the official RVV 1.0
+[multiply-add specification](https://docs.riscv.org/reference/isa/v20240411/unpriv/v-st-ext.html#vector-single-width-integer-multiply-add-instructions).
+Widening integer multiply-add forms remain unsupported.
+
+Decompiler typing for the 77 decoded integer elementwise forms is shared across
 arithmetic, bitwise, shift, min/max, multiply/divide/remainder, and comparison
 families. Data outputs are opaque width-independent vectors; comparison outputs
 identify predicate mask bits without assuming VLEN or a lane count. The lifter

@@ -62,7 +62,9 @@ enum class RiscvOpcode {
     // Indexed single-field integer vector memory forms; appended for ID stability.
     vluxei, vloxei, vsuxei, vsoxei,
     // Zbb scalar count operations, appended for decoder ID stability.
-    clz, ctz, cpop, clzw, ctzw, cpopw
+    clz, ctz, cpop, clzw, ctzw, cpopw,
+    // Non-widening integer multiply-accumulate/subtract; destructive vd forms.
+    vmacc_vv, vmacc_vx, vnmsac_vv, vnmsac_vx, vmadd_vv, vmadd_vx, vnmsub_vv, vnmsub_vx
 };
 
 struct RiscvRegister {
