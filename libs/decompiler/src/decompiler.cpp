@@ -288,6 +288,8 @@ std::string register_name(RegisterOperand reg) {
         return "jvm_stack_" + std::to_string(reg.index);
     if (reg.bank == RegisterBank::wasm_stack)
         return "wasm_stack_" + std::to_string(reg.index);
+    if (reg.bank == RegisterBank::wasm_local)
+        return "wasm_local_" + std::to_string(reg.index);
     if (reg.bank == RegisterBank::cil_continuation)
         return "cil_continuation";
     if (reg.bank == RegisterBank::mos6502) {
@@ -5065,6 +5067,17 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 if (statement.x86_stack_effect) stream << " /* " << x86_stack_effect_text(*statement.x86_stack_effect) << " */";
             } else if constexpr (std::is_same_v<T, Intrinsic>) {
                 if(statement.name.starts_with("plugin_scalar_")&&format_register_output_values(stream,statement))return;
+                if (statement.name.starts_with("wasm_call_function_") && statement.register_writes.size() == 1) {
+                    const auto version = statement.register_output_versions.empty()
+                        ? std::optional<std::uint32_t>{} : std::optional<std::uint32_t>{statement.register_output_versions.front()};
+                    stream << register_name(statement.register_writes.front(), version) << " = " << statement.name << '(';
+                    for (std::size_t i = 0; i < statement.operands.size(); ++i) {
+                        if (i) stream << ", ";
+                        stream << expression_text(*statement.operands[i]);
+                    }
+                    stream << ");";
+                    return;
+                }
                 if (!statement.register_output_values.empty() &&
                     statement.register_output_values.size() == statement.register_writes.size()) {
                     for (std::size_t i = 0; i < statement.register_output_values.size(); ++i) {

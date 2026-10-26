@@ -1175,6 +1175,8 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
     wasm.type_count = type_count;
     wasm.defined_functions = static_cast<std::uint32_t>(function_types.size());
     wasm.function_type_indices.insert(wasm.function_type_indices.end(), function_types.begin(), function_types.end());
+    std::size_t retained_local_types = 0;
+    wasm.function_locals.reserve(bodies.size());
     for (const auto &body : bodies) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "WebAssembly body validation canceled"};
         parse_reason.clear(); unsupported_payload = false;
@@ -1184,6 +1186,15 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
             return Error{canceled ? ErrorCode::canceled : limited ? ErrorCode::resource_limit :
                          unsupported_payload ? ErrorCode::unsupported : ErrorCode::malformed,
                          "WebAssembly body validation failed: " + parse_reason};
+        if (body.local_count > max_vector_items - retained_local_types)
+            return Error{ErrorCode::resource_limit, "WebAssembly expanded local metadata exceeds the one-million-type limit"};
+        WasmFunctionLocals locals;
+        locals.function_index = body.index;
+        locals.value_types.reserve(body.local_count);
+        for (const auto &[count, type] : body.local_groups)
+            locals.value_types.insert(locals.value_types.end(), count, type);
+        retained_local_types += locals.value_types.size();
+        wasm.function_locals.push_back(std::move(locals));
     }
     auto table_applied = apply_initial_table_elements(wasm, wasm_diagnostics);
     if (!table_applied) return table_applied.error();
