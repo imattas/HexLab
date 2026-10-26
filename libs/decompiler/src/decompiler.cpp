@@ -282,6 +282,10 @@ std::string register_name(RegisterOperand reg) {
     if (reg.bank == RegisterBank::x87_control) return "fcw";
     if (reg.bank == RegisterBank::x87_tag) return "ftw";
     if (reg.bank == RegisterBank::mxcsr) return "mxcsr";
+    if (reg.bank == RegisterBank::xmm) return "xmm" + std::to_string(reg.index);
+    if (reg.bank == RegisterBank::ymm) return "ymm" + std::to_string(reg.index);
+    if (reg.bank == RegisterBank::zmm) return "zmm" + std::to_string(reg.index);
+    if (reg.bank == RegisterBank::opmask) return "k" + std::to_string(reg.index);
     if (reg.bank == RegisterBank::cil_stack)
         return "stack_" + std::to_string(reg.index);
     if (reg.bank == RegisterBank::jvm_stack)

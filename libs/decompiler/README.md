@@ -27,13 +27,16 @@ source lane is explicitly identified as `x86_low_f32` or `x86_low_f64`.
 `MOVSS`/`MOVSD` use the same source typing and retain their decoded register
 writes or memory effects. Pseudocode names the operation and type shape, while
 the IR preserves the decoded XMM writes and memory read/write classification.
+Diagnostic and structured pseudocode render XMM, YMM, ZMM, and opmask registers
+as `xmmN`, `ymmN`, `zmmN`, and `kN`, including SSA versions and phi edge copies.
+These names keep vector and mask values distinct from `rN` general registers.
 
 This layer does not claim complete SSE semantics: it does not model MXCSR,
 floating-point exception flags, NaN behavior, or exact upper-lane merge/zero
 rules for scalar moves and arithmetic. Those details stay inside explicit
 operation names and full-register inputs/outputs instead of guessed lane
-assignments. AVX/VEX/EVEX is not in the currently decoded subset, so it is not
-lifted here.
+assignments. This section describes the initial SSE2 layer; later VEX/EVEX
+slices have their own bounded coverage.
 
 `format_pseudocode` is the lossless diagnostic formatter: it prints each lifted
 basic block with labels and preserves control transfers as gotos.
