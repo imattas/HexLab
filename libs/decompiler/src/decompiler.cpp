@@ -26,6 +26,76 @@ ExpressionRegisterKey expression_register_key(RegisterOperand reg,
     return {static_cast<unsigned>(reg.bank), reg.index, reg.width, reg.high_byte,
             version.value_or(0), version.has_value()};
 }
+RegisterOperand x87_physical(RegisterOperand reg, std::uint8_t top) {
+    if (reg.bank == RegisterBank::x87 && reg.index < 8)
+        reg.index = static_cast<std::uint8_t>((top + reg.index) & 7);
+    return reg;
+}
+ExpressionPtr remap_x87_expression(const ExpressionPtr &expression, std::uint8_t top) {
+    if (!expression) return expression;
+    auto copy = std::make_shared<Expression>(*expression);
+    if (auto *reg = std::get_if<RegisterValue>(&copy->value)) {
+        reg->reg = x87_physical(reg->reg, top);
+    } else if (auto *memory = std::get_if<MemoryValue>(&copy->value)) {
+        if (memory->base) memory->base = x87_physical(*memory->base, top);
+        if (memory->index) memory->index = x87_physical(*memory->index, top);
+    } else if (auto *unary = std::get_if<UnaryValue>(&copy->value)) {
+        unary->operand = remap_x87_expression(unary->operand, top);
+    } else if (auto *binary = std::get_if<BinaryValue>(&copy->value)) {
+        binary->left = remap_x87_expression(binary->left, top);
+        binary->right = remap_x87_expression(binary->right, top);
+    }
+    return copy;
+}
+void remap_x87_statement(Statement &statement, std::uint8_t top, std::uint8_t write_top) {
+    std::visit([&](auto &node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, Assign>) {
+            node.destination = x87_physical(node.destination, write_top);
+            node.value = remap_x87_expression(node.value, top);
+        } else if constexpr (std::is_same_v<T, Store>) {
+            node.address = remap_x87_expression(node.address, top);
+            node.value = remap_x87_expression(node.value, top);
+        } else if constexpr (std::is_same_v<T, Call>) {
+            node.indirect_target = remap_x87_expression(node.indirect_target, top);
+            if (node.return_register) node.return_register = x87_physical(*node.return_register, top);
+            for (auto &reg : node.register_writes) reg = x87_physical(reg, write_top);
+            for (auto &reg : node.abi_upper_half_writes) reg = x87_physical(reg, top);
+            for (auto &input : node.register_inputs) input.reg = x87_physical(input.reg, top);
+        } else if constexpr (std::is_same_v<T, Branch>) {
+            node.predicate = remap_x87_expression(node.predicate, top);
+            node.indirect_target = remap_x87_expression(node.indirect_target, top);
+        } else if constexpr (std::is_same_v<T, Return>) {
+            node.value = remap_x87_expression(node.value, top);
+        } else if constexpr (std::is_same_v<T, Intrinsic>) {
+            for (auto &operand : node.operands) operand = remap_x87_expression(operand, top);
+            for (auto &reg : node.register_writes) reg = x87_physical(reg, write_top);
+            for (auto &value : node.register_output_values) value = remap_x87_expression(value, top);
+        }
+    }, statement);
+}
+void refine_x87_stack_writes(Statement &statement, const Instruction &instruction) {
+    if (!instruction.x87_stack_delta) return;
+    auto *intrinsic = std::get_if<Intrinsic>(&statement);
+    if (!intrinsic) return;
+    std::erase_if(intrinsic->register_writes,
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::x87; });
+    const auto count = std::min(instruction.operands.size(), instruction.access.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        if (instruction.access[i] == OperandAccess::read) continue;
+        const auto *reg = std::get_if<RegisterOperand>(&instruction.operands[i]);
+        if (reg && reg->bank == RegisterBank::x87 &&
+            std::find(intrinsic->register_writes.begin(), intrinsic->register_writes.end(), *reg) ==
+                intrinsic->register_writes.end())
+            intrinsic->register_writes.push_back(*reg);
+    }
+    if (instruction.x87_stack_delta > 0) {
+        const RegisterOperand new_top{RegisterBank::x87, 0, 80, false};
+        if (std::find(intrinsic->register_writes.begin(), intrinsic->register_writes.end(), new_top) ==
+            intrinsic->register_writes.end())
+            intrinsic->register_writes.push_back(new_top);
+    }
+}
 } // namespace
 
 ExpressionTypeScope::ExpressionTypeScope(std::span<const RecoveredVariable> variables)
@@ -3908,12 +3978,14 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
     }
     std::map<std::uint64_t, std::optional<PendingX86Compare>> incoming_x86_flags, outgoing_x86_flags;
     std::map<std::uint64_t, std::optional<PendingA64Compare>> incoming_a64_flags, outgoing_a64_flags;
+    std::map<std::uint64_t, X87StackState> incoming_x87_stack, outgoing_x87_stack;
     while (!ready.empty()) {
         const auto id = ready.back();
         ready.pop_back();
         const auto &source = *owned_blocks.at(id);
         std::optional<PendingX86Compare> state;
         std::optional<PendingA64Compare> a64_state;
+        X87StackState x87_state;
         if (source.begin == function.entry) {
             state.reset();
             a64_state.reset();
@@ -3955,16 +4027,30 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
                 }
             }
             if (a64_equivalent && a64_have_first) a64_state = std::move(a64_candidate);
+
+            bool x87_have_first = false;
+            bool x87_equivalent = true;
+            X87StackState x87_candidate;
+            for (const auto predecessor : predecessors[id]) {
+                const auto found_state = outgoing_x87_stack.find(predecessor);
+                if (found_state == outgoing_x87_stack.end()) { x87_equivalent = false; break; }
+                if (!x87_have_first) { x87_candidate = found_state->second; x87_have_first = true; }
+                else x87_candidate = join_x87_stack_states(x87_candidate, found_state->second);
+            }
+            if (x87_equivalent && x87_have_first) x87_state = std::move(x87_candidate);
         }
         incoming_x86_flags[id] = state;
         incoming_a64_flags[id] = a64_state;
+        incoming_x87_stack[id] = x87_state;
         for (const auto &fact : source.instructions) {
             if (!fact) return Error{ErrorCode::invalid_argument, "basic block contains a null instruction fact"};
             state = update_x86_flag_state(std::move(state), fact->instruction, fact->id);
             a64_state = update_a64_flag_state(std::move(a64_state), fact->instruction);
+            x87_state = transfer_x87_stack_state(x87_state, fact->instruction);
         }
         outgoing_x86_flags[id] = std::move(state);
         outgoing_a64_flags[id] = std::move(a64_state);
+        outgoing_x87_stack[id] = std::move(x87_state);
         for (const auto target : successors[id]) {
             auto &remaining = remaining_predecessors[target];
             if (remaining && --remaining == 0) ready.push_back(target);
@@ -3985,6 +4071,8 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
         std::optional<PendingA64Compare> pending_a64_compare;
         if (const auto incoming = incoming_a64_flags.find(id.value); incoming != incoming_a64_flags.end())
             pending_a64_compare = incoming->second;
+        auto x87_stack_state = incoming_x87_stack.contains(id.value)
+            ? incoming_x87_stack.at(id.value) : X87StackState{};
         for (const auto &fact : source.instructions) {
             if (!fact)
                 return Error{ErrorCode::invalid_argument, "basic block contains a null instruction fact"};
@@ -4004,6 +4092,18 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             }
             auto statement = extension_ir ? Statement{std::move(*extension_ir)} :
                 ppc_statement ? std::move(*ppc_statement) : lift_instruction(decoded, result.diagnostics);
+            const bool x87_instruction = (decoded.context.architecture == Architecture::x86 ||
+                decoded.context.architecture == Architecture::x86_64) && decoded.opcode == Opcode::x87;
+            if (auto *intrinsic = std::get_if<Intrinsic>(&statement); intrinsic && x87_instruction)
+                intrinsic->x87_stack_state = x87_stack_state;
+            const auto x87_post_state = transfer_x87_stack_state(x87_stack_state, decoded);
+            if (x87_instruction && x87_stack_state.top) {
+                detail::refine_x87_stack_writes(statement, decoded);
+                const auto write_top = decoded.x87_stack_delta > 0 && x87_post_state.top
+                    ? *x87_post_state.top : *x87_stack_state.top;
+                detail::remap_x87_statement(statement, *x87_stack_state.top, write_top);
+            }
+            x87_stack_state = x87_post_state;
             if (a64_context && (decoded.opcode == Opcode::a64_csel || decoded.opcode == Opcode::a64_csinc ||
                                 decoded.opcode == Opcode::a64_csinv || decoded.opcode == Opcode::a64_csneg) &&
                 decoded.operands.size() == 3) {

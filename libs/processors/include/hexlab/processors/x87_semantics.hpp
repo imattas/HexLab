@@ -1,11 +1,30 @@
 #pragma once
 
 #include "hexlab/processors/processors_export.hpp"
+#include "hexlab/processors/instruction.hpp"
 
 #include <cstdint>
 #include <optional>
+#include <array>
 
 namespace hexlab {
+
+enum class X87Tag : std::uint8_t { valid, zero, special, empty };
+
+// Abstract architectural stack state. A missing TOP or tag is deliberately
+// unknown; tags describe physical registers, while ST(i) is TOP-relative.
+struct X87StackState {
+    std::optional<std::uint8_t> top;
+    std::array<std::optional<X87Tag>, 8> tags{};
+    bool operator==(const X87StackState &) const = default;
+};
+
+HEXLAB_PROCESSORS_EXPORT X87StackState join_x87_stack_states(const X87StackState &left,
+                                                              const X87StackState &right) noexcept;
+HEXLAB_PROCESSORS_EXPORT X87StackState transfer_x87_stack_state(const X87StackState &input,
+                                                                 const Instruction &instruction) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<std::uint8_t> x87_physical_register(const X87StackState &state,
+                                                                          std::uint8_t logical_st) noexcept;
 
 // Canonical x87 80-bit extended value fields. The explicit integer bit is
 // bit 63 of significand; exponent is the raw 15-bit biased field.

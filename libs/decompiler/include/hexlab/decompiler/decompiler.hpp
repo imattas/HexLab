@@ -6,6 +6,7 @@
 #include "hexlab/image/jvm_metadata.hpp"
 #include "hexlab/image/wasm_metadata.hpp"
 #include "hexlab/loaders/managed.hpp"
+#include "hexlab/processors/x87_semantics.hpp"
 #include "hexlab/types/types.hpp"
 
 #include <memory>
@@ -172,6 +173,9 @@ struct Intrinsic {
     // x87 uses logical ST(i) indexes relative to TOP. Preserve push/pop depth
     // even when concrete stack rotation remains opaque in this IR.
     std::int8_t x87_stack_delta = 0;
+    // Abstract architectural TOP and physical tag state at this operation.
+    // Unknown fields remain empty when an environment restore or CFG join is opaque.
+    std::optional<X87StackState> x87_stack_state;
     // Optional explicit value formulas aligned with register_writes. When
     // present, each expression reads the pre-instruction state and defines
     // the corresponding output register in parallel.
