@@ -1453,8 +1453,8 @@ template<class Visitor> void statement_expressions(const Statement &statement, V
 
 bool register_aliases(RegisterOperand a, RegisterOperand b) {
     // Width/high-byte variants share storage. AVX and SSE names also overlap.
-    const bool vector_alias = (a.bank == RegisterBank::xmm || a.bank == RegisterBank::ymm) &&
-                              (b.bank == RegisterBank::xmm || b.bank == RegisterBank::ymm);
+    const bool vector_alias = (a.bank == RegisterBank::xmm || a.bank == RegisterBank::ymm || a.bank == RegisterBank::zmm) &&
+                              (b.bank == RegisterBank::xmm || b.bank == RegisterBank::ymm || b.bank == RegisterBank::zmm);
     return a.index == b.index && (a.bank == b.bank || vector_alias);
 }
 

@@ -190,7 +190,9 @@ DecodeResult decode_scalar(std::span<const std::byte> input, Address address, De
             const unsigned pp = p1 & 3;
             const bool w = (p1 & 0x80) != 0;
             const unsigned vvvv = ((~p1 >> 3) & 15) | (((~p2 >> 3) & 1) << 4);
-            const unsigned vector_bits = ((p2 >> 5) & 3) == 2 ? 512 : 0;
+            const auto vector_length = (p2 >> 5) & 3;
+            const unsigned vector_bits = vector_length == 0 ? 128 : vector_length == 1 ? 256 :
+                                         vector_length == 2 ? 512 : 0;
             const unsigned mask = p2 & 7;
             const bool zeroing = (p2 & 0x80) != 0;
             const bool broadcast = (p2 & 0x10) != 0;

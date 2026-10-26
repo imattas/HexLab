@@ -98,9 +98,11 @@ inline std::optional<IntegerDataflowShape> evex_integer_shape(Opcode opcode) noe
     default: return std::nullopt;
     }
 }
-inline bool is_zmm(const Operand &operand) noexcept {
+inline bool is_evex_vector(const Operand &operand, unsigned bits) noexcept {
     const auto *reg=std::get_if<RegisterOperand>(&operand);
-    return reg&&reg->bank==RegisterBank::zmm&&reg->width==512&&reg->index<32&&!reg->high_byte;
+    const auto bank = bits == 128 ? RegisterBank::xmm : bits == 256 ? RegisterBank::ymm : RegisterBank::zmm;
+    return reg && reg->bank == bank && reg->width == bits && reg->index < 32 &&
+           !reg->high_byte;
 }
 
 inline bool is_avx_integer_bitwise_or_compare(Opcode opcode) noexcept {
@@ -263,6 +265,10 @@ inline void evaluate_integer_dataflow(Opcode opcode, IntegerDataflowShape shape,
                 const auto rhs = signed_lane(right, shape.second_bits);
                 std::uint64_t value = 0;
                 switch (opcode) {
+                case Opcode::vpcmpeqb: case Opcode::vpcmpeqw: case Opcode::vpcmpeqd:
+                    value = left == right ? mask : 0; break;
+                case Opcode::vpcmpgtb: case Opcode::vpcmpgtw: case Opcode::vpcmpgtd:
+                    value = signed_lane(left, shape.first_bits) > signed_lane(right, shape.second_bits) ? mask : 0; break;
                 case Opcode::vpandn: value = ~left & right; break;
                 case Opcode::vpavgb: case Opcode::vpavgw: value = (left + right + 1) / 2; break;
                 case Opcode::vpminsb: case Opcode::vpminsd: value = static_cast<std::uint64_t>(std::min(lhs, rhs)); break;
@@ -437,7 +443,8 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
     return result;
 }
 
-// Exact bounded EVEX.512 integer dataflow with result-lane writemasking.
+// Exact bounded EVEX.128/.256/.512 integer dataflow with result-lane
+// writemasking. VL forms return zeroed bytes above their active vector width.
 // Sources and memory bytes are caller-owned. Merge masking requires the old
 // destination even when a supplied runtime mask happens to enable every lane.
 // This helper does not execute CPU feature checks, memory faults or FP state.
@@ -449,22 +456,26 @@ inline std::optional<X86EvexIntegerResult> evaluate_x86_evex_integer(
     using namespace x86_avx_detail;
     if (instruction.context.architecture != Architecture::x86_64 ||
         instruction.context.mode != ExecutionMode::x86_64 || instruction.operands.size() != 3 ||
-        instruction.vector_bits != 512 || (instruction.x86_opmask_zeroing && !instruction.x86_opmask))
+        !instruction.x86_evex ||
+        (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512) ||
+        (instruction.x86_opmask_zeroing && !instruction.x86_opmask))
         return std::nullopt;
     const auto shape=evex_integer_shape(instruction.opcode);
     if(!shape||(instruction.vector_element_bits&&instruction.vector_element_bits!=shape->result_bits))return std::nullopt;
     const auto *memory=std::get_if<MemoryOperand>(&instruction.operands[2]);
-    if(!is_zmm(instruction.operands[0])||!is_zmm(instruction.operands[1])||
-       (!is_zmm(instruction.operands[2])&&(!memory||memory->data_width!=512)))return std::nullopt;
+    const auto vector_bits = static_cast<unsigned>(instruction.vector_bits);
+    if(!is_evex_vector(instruction.operands[0],vector_bits)||!is_evex_vector(instruction.operands[1],vector_bits)||
+       (!is_evex_vector(instruction.operands[2],vector_bits)&&(!memory||memory->data_width!=vector_bits)))return std::nullopt;
     if(instruction.x86_opmask&&(*instruction.x86_opmask==0||*instruction.x86_opmask>7))return std::nullopt;
     if(instruction.x86_opmask&&!instruction.x86_opmask_zeroing&&!old_destination)return std::nullopt;
-    X86EvexIntegerResult result{};result.vector_bits=512;
+    X86EvexIntegerResult result{};result.vector_bits=static_cast<std::uint16_t>(vector_bits);
+    const auto active_bytes = vector_bits / 8;
     if(const auto dataflow=integer_dataflow_shape(instruction.opcode))
-        evaluate_integer_dataflow(instruction.opcode,*dataflow,source1,source2,result.bytes,64);
-    else if(!evaluate_integer_lanes(instruction.opcode,shape->result_bits,source1,source2,result.bytes,64))return std::nullopt;
+        evaluate_integer_dataflow(instruction.opcode,*dataflow,source1,source2,result.bytes,active_bytes);
+    else if(!evaluate_integer_lanes(instruction.opcode,shape->result_bits,source1,source2,result.bytes,active_bytes))return std::nullopt;
     // Writemask bits index destination elements, not source elements. This
     // distinction matters for even-dword products and adjacent multiply-adds.
-    if(instruction.x86_opmask)for(unsigned lane=0;lane<512u/shape->result_bits;++lane){
+    if(instruction.x86_opmask)for(unsigned lane=0;lane<vector_bits/shape->result_bits;++lane){
         if((opmask_value>>lane)&1)continue;
         const auto lane_bytes=static_cast<unsigned>(shape->result_bits/8);
         const auto begin=lane*lane_bytes;

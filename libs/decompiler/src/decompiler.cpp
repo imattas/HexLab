@@ -2617,39 +2617,48 @@ a64_unhandled:
         }
     }
     if (const auto shape = x86_avx_detail::evex_integer_shape(instruction.opcode);
-        x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.vector_bits == 512 &&
+        x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
+        (instruction.vector_bits == 128 || instruction.vector_bits == 256 || instruction.vector_bits == 512) &&
         shape && instruction.operands.size() == 3 &&
         (!instruction.vector_element_bits || instruction.vector_element_bits == shape->result_bits) &&
         (!instruction.x86_opmask_zeroing || instruction.x86_opmask) &&
         (!instruction.x86_opmask || (*instruction.x86_opmask > 0 && *instruction.x86_opmask < 8))) {
         const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
-        if (x86_avx_detail::is_zmm(instruction.operands[0]) &&
-            x86_avx_detail::is_zmm(instruction.operands[1]) &&
-            (x86_avx_detail::is_zmm(instruction.operands[2]) || (memory && memory->data_width == 512))) {
-            const auto type_for = [](std::uint16_t lane, bool is_signed) {
-                return vector_type(512, TypeKind::integer, lane, static_cast<std::uint8_t>(512 / lane), is_signed);
+        const auto width = static_cast<unsigned>(instruction.vector_bits);
+        const auto vector_bank = width == 128 ? RegisterBank::xmm : width == 256 ? RegisterBank::ymm : RegisterBank::zmm;
+        const auto valid_register = [=](const Operand &operand) {
+            const auto *reg = std::get_if<RegisterOperand>(&operand);
+            return reg && reg->bank == vector_bank && reg->width == width &&
+                   reg->index < 32 && !reg->high_byte;
+        };
+        if (valid_register(instruction.operands[0]) && valid_register(instruction.operands[1]) &&
+            (valid_register(instruction.operands[2]) || (memory && memory->data_width == width))) {
+            const auto output_width = width < 512 ? 512u : width;
+            const auto type_for = [](std::uint16_t lane, bool is_signed, unsigned bits) {
+                return vector_type(bits, TypeKind::integer, lane, static_cast<std::uint8_t>(bits / lane), is_signed);
             };
-            const auto lane_name = [](std::uint16_t lane, bool is_signed) {
-                return std::string(is_signed ? "i" : "u") + std::to_string(lane) + "x" + std::to_string(512 / lane);
+            const auto lane_name = [=](std::uint16_t lane, bool is_signed) {
+                return std::string(is_signed ? "i" : "u") + std::to_string(lane) + "x" + std::to_string(width / lane);
             };
-            const auto result_type = type_for(shape->result_bits, shape->result_signed);
+            const auto result_type = type_for(shape->result_bits, shape->result_signed, output_width);
             std::vector<ExpressionPtr> inputs;
-            std::string masking = "_evex512_unmasked";
+            std::string masking = "_evex" + std::to_string(width) + "_unmasked";
             if (instruction.x86_opmask && !instruction.x86_opmask_zeroing)
-                inputs.push_back(retag_expr(operands[0], result_type));
+                inputs.push_back(retag_expr(operands[0], type_for(shape->result_bits, shape->result_signed, width)));
             // Preserve both source roles even when registers alias the old
             // destination. Multiply-add input lanes differ from output lanes.
-            inputs.push_back(retag_expr(operands[1], type_for(shape->first_bits, shape->first_signed)));
-            inputs.push_back(retag_expr(operands[2], type_for(shape->second_bits, shape->second_signed)));
+            inputs.push_back(retag_expr(operands[1], type_for(shape->first_bits, shape->first_signed, width)));
+            inputs.push_back(retag_expr(operands[2], type_for(shape->second_bits, shape->second_signed, width)));
             if (instruction.x86_opmask) {
                 inputs.push_back(reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false}));
-                masking = "_evex512_k" + std::to_string(*instruction.x86_opmask) +
+                masking = "_evex" + std::to_string(width) + "_k" + std::to_string(*instruction.x86_opmask) +
                     (instruction.x86_opmask_zeroing ? "_zero" : "_merge");
             }
             Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_" +
                 lane_name(shape->first_bits, shape->first_signed) + "_" +
                 lane_name(shape->second_bits, shape->second_signed) + "_to_" +
-                lane_name(shape->result_bits, shape->result_signed) + masking,
+                lane_name(shape->result_bits, shape->result_signed) +
+                (width < 512 ? "_zero_upper" : "") + masking,
                 std::move(inputs), memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
             effect.register_writes = instruction.register_writes;
             effect.result_type = result_type;
@@ -2658,7 +2667,7 @@ a64_unhandled:
     }
     if (const auto shape = x86_avx_detail::integer_dataflow_shape(instruction.opcode);
         x86 && instruction.context.mode == ExecutionMode::x86_64 && shape &&
-        instruction.operands.size() == 3 && !instruction.x86_opmask &&
+        instruction.operands.size() == 3 && !instruction.x86_evex && !instruction.x86_opmask &&
         !instruction.x86_opmask_zeroing) {
         const auto destination = as_register(instruction.operands[0]);
         const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
@@ -2714,15 +2723,22 @@ a64_unhandled:
         instruction.opcode == Opcode::vpmaxub || instruction.opcode == Opcode::vpmaxsw;
     const bool avx_integer_multiply = instruction.opcode == Opcode::vpmullw || instruction.opcode == Opcode::vpmulhw ||
         instruction.opcode == Opcode::vpmulhuw;
-    const bool avx_integer_lanes = avx_integer_arithmetic || avx_integer_subtraction || avx_integer_multiply || avx_integer_minmax;
-    const auto avx_integer_lane_bits = instruction.opcode == Opcode::vpaddb || instruction.opcode == Opcode::vpsubb ||
+    const bool avx_integer_compare = x86_avx_detail::is_equal_compare(instruction.opcode) ||
+                                     x86_avx_detail::is_greater_compare(instruction.opcode);
+    const bool avx_integer_lanes = !instruction.x86_evex &&
+        (avx_integer_arithmetic || avx_integer_subtraction || avx_integer_multiply ||
+         avx_integer_minmax || avx_integer_compare);
+    const auto avx_integer_lane_bits = instruction.opcode == Opcode::vpcmpeqb || instruction.opcode == Opcode::vpcmpgtb ||
+        instruction.opcode == Opcode::vpaddb || instruction.opcode == Opcode::vpsubb ||
         instruction.opcode == Opcode::vpaddsb || instruction.opcode == Opcode::vpaddusb ||
         instruction.opcode == Opcode::vpsubsb || instruction.opcode == Opcode::vpsubusb || instruction.opcode == Opcode::vpminub || instruction.opcode == Opcode::vpmaxub ? 8u
-        : instruction.opcode == Opcode::vpaddw || instruction.opcode == Opcode::vpsubw ||
+        : instruction.opcode == Opcode::vpcmpeqw || instruction.opcode == Opcode::vpcmpgtw ||
+          instruction.opcode == Opcode::vpaddw || instruction.opcode == Opcode::vpsubw ||
           instruction.opcode == Opcode::vpaddsw || instruction.opcode == Opcode::vpaddusw ||
           instruction.opcode == Opcode::vpsubsw || instruction.opcode == Opcode::vpsubusw ||
           instruction.opcode == Opcode::vpminsw || instruction.opcode == Opcode::vpmaxsw ? 16u
-        : instruction.opcode == Opcode::vpaddd || instruction.opcode == Opcode::vpsubd ? 32u
+        : instruction.opcode == Opcode::vpcmpeqd || instruction.opcode == Opcode::vpcmpgtd ||
+          instruction.opcode == Opcode::vpaddd || instruction.opcode == Opcode::vpsubd ? 32u
         : instruction.opcode == Opcode::vpaddq || instruction.opcode == Opcode::vpsubq ? 64u
         : avx_integer_multiply ? 16u : 0u;
     const bool avx_integer_bitwise = instruction.opcode == Opcode::vpand || instruction.opcode == Opcode::vpor ||
@@ -2735,8 +2751,13 @@ a64_unhandled:
                                  vector_width == 256 ? RegisterBank::ymm : RegisterBank::xmm;
         const bool supported_width = (vector_width == 128 || vector_width == 256 || vector_width == 512) &&
             ((destination && destination->bank == vector_bank) || (!destination && move_source && move_source->bank == vector_bank));
-        const bool vex128_zero_upper = vector_width == 128 && destination.has_value();
-        const auto result_width = static_cast<std::uint16_t>(vex128_zero_upper ? 256 : vector_width);
+        // VEX.128 clears the upper YMM half. EVEX.128/.256 clear the full
+        // upper portion of the physical ZMM register; the decoder records
+        // those wider writes explicitly. VEX.256 retains its YMM result.
+        const bool zero_upper = destination.has_value() &&
+            ((instruction.x86_evex && vector_width < 512) || (!instruction.x86_evex && vector_width == 128));
+        const auto result_width = static_cast<std::uint16_t>(zero_upper
+            ? (instruction.x86_evex ? 512 : 256) : vector_width);
         const auto vector_type_for = [&](bool floating, std::uint16_t width) {
             const auto lane_bits = avx_integer_lanes
                 ? static_cast<std::uint16_t>(avx_integer_lane_bits)
@@ -2775,7 +2796,7 @@ a64_unhandled:
                                   (instruction.x86_opmask_zeroing ? "_zero" : "_merge");
                 }
                 Intrinsic effect{"x86_vmovups_bits" + std::to_string(vector_width) +
-                                     (vex128_zero_upper ? "_zero_upper" : "") + mask_suffix, std::move(inputs),
+                                     (zero_upper ? "_zero_upper" : "") + mask_suffix, std::move(inputs),
                     store ? IntrinsicMemoryEffect::write :
                     std::holds_alternative<MemoryOperand>(source) ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
                 effect.register_writes = instruction.register_writes;
@@ -2794,20 +2815,20 @@ a64_unhandled:
                 const bool packed_double = instruction.opcode == Opcode::vaddpd || instruction.opcode == Opcode::vsubpd ||
                     instruction.opcode == Opcode::vmulpd || instruction.opcode == Opcode::vxorpd || instruction.opcode == Opcode::vandpd;
                 const std::string suffix = (avx_bitwise || avx_integer_bitwise)
-                    ? "_bits" + std::to_string(vector_width) + (vex128_zero_upper ? "_zero_upper" : "")
+                    ? "_bits" + std::to_string(vector_width) + (zero_upper ? "_zero_upper" : "")
                     : avx_integer_lanes
                         ? "_i" + std::to_string(avx_integer_lane_bits) + "x" +
                               std::to_string(vector_width / avx_integer_lane_bits) +
-                              (vex128_zero_upper ? "_zero_upper" : "")
+                              (zero_upper ? "_zero_upper" : "")
                         : "_f" + std::to_string(packed_double ? 64 : 32) + "x" +
                               std::to_string(vector_width / (packed_double ? 64 : 32)) +
-                              (vex128_zero_upper ? "_zero_upper" : "");
+                              (zero_upper ? "_zero_upper" : "");
                 std::vector<ExpressionPtr> inputs{std::move(second), std::move(third)};
                 std::string mask_suffix;
                 if (instruction.x86_opmask) {
                     const auto mask_index = *instruction.x86_opmask;
                     if (!instruction.x86_opmask_zeroing)
-                        inputs.insert(inputs.begin(), retag_expr(operands[0], result_type));
+                        inputs.insert(inputs.begin(), retag_expr(operands[0], input_type));
                     inputs.push_back(reg_expr({RegisterBank::opmask, mask_index, 64, false}));
                     mask_suffix = "_evex_k" + std::to_string(mask_index) +
                                   (instruction.x86_opmask_zeroing ? "_zero" : "_merge");
