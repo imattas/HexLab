@@ -239,6 +239,48 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
         unsupported("VEX opcode map is outside the enabled AVX subset");
     const auto vector_width = static_cast<std::uint16_t>(l ? 256 : 128);
     const auto bank = l ? RegisterBank::ymm : RegisterBank::xmm;
+    if (map == 1 && (opcode == 0x71 || opcode == 0x72 || opcode == 0x73)) {
+        if (pp != 1)
+            invalid("AVX2 immediate packed shifts require VEX.pp=66");
+        auto decoded = modrm(state, vector_width, vector_width);
+        Opcode operation{};
+        if (opcode == 0x71) {
+            if (decoded.group == 2) operation = Opcode::vpsrlw;
+            else if (decoded.group == 4) operation = Opcode::vpsraw;
+            else if (decoded.group == 6) operation = Opcode::vpsllw;
+            else invalid("Reserved AVX2 immediate word-shift group");
+        } else if (opcode == 0x72) {
+            if (decoded.group == 2) operation = Opcode::vpsrld;
+            else if (decoded.group == 4) operation = Opcode::vpsrad;
+            else if (decoded.group == 6) operation = Opcode::vpslld;
+            else invalid("Reserved AVX2 immediate dword-shift group");
+        } else {
+            if (decoded.group == 2) operation = Opcode::vpsrlq;
+            else if (decoded.group == 3) operation = Opcode::vpsrldq;
+            else if (decoded.group == 6) operation = Opcode::vpsllq;
+            else if (decoded.group == 7) operation = Opcode::vpslldq;
+            else invalid("Reserved AVX2 immediate qword/byte-shift group");
+        }
+        Operand source = std::move(decoded.rm);
+        if (auto *reg = std::get_if<RegisterOperand>(&source)) {
+            reg->bank = bank;
+            reg->width = vector_width;
+            reg->high_byte = false;
+        } else if (auto *memory = std::get_if<MemoryOperand>(&source)) {
+            memory->data_width = vector_width;
+        }
+        const RegisterOperand destination{bank, static_cast<std::uint8_t>(vvvv), vector_width, false};
+        state.i.opcode = operation;
+        state.i.vector_bits = vector_width;
+        if (const auto shape = x86_avx_detail::immediate_shift_shape(operation))
+            state.i.vector_element_bits = shape->result_bits;
+        if (!l)
+            state.i.register_writes.push_back({RegisterBank::ymm, destination.index, 256, false});
+        state.operand(destination, OperandAccess::write);
+        state.operand(std::move(source), OperandAccess::read);
+        state.operand(state.immediate(8, 8, false), OperandAccess::read);
+        return true;
+    }
     const bool move = map == 1 && (opcode == 0x10 || opcode == 0x11);
     // Dispatch each opcode map independently: identical bytes in 0F and 0F38
     // do not describe interchangeable operations.

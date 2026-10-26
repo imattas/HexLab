@@ -2,9 +2,11 @@
 
 `hexlab/types/layout.hpp` provides `layout(type, abi)` for calculating object
 layout from the immutable type graph. Supported data models are x86-32,
-x86-64, and AArch64. The result includes total size, alignment, ABI pointer
-width, aggregate member offsets, and explicit byte ranges for internal and
-tail padding. Existing stored member offsets and aggregate sizes are left
+x86-64, AArch64, and AArch32. The AArch32 profile uses four-byte pointers and
+an eight-byte maximum natural alignment for aggregate members. The result
+includes total size, alignment, ABI pointer width, aggregate member offsets,
+and explicit byte ranges for internal and tail padding. Existing stored member
+offsets and aggregate sizes are left
 untouched; they are metadata to compare against, not inputs to the calculation.
 The desktop Types & Symbols page uses the same API to inspect a selected type;
 its ABI selector follows the loaded image when available and can be changed

@@ -333,7 +333,7 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
     type_filter_->SetHint("Filter by name or type shape");
     type_search_bar->Add(type_filter_, 1, wxEXPAND);
     type_layout->Add(type_search_bar, 0, wxEXPAND | wxALL, FromDIP(4));
-    wxArrayString abi_choices{"x86-32", "x86-64", "AArch64"};
+    wxArrayString abi_choices{"x86-32", "x86-64", "AArch64", "AArch32"};
     layout_abi_ = new wxChoice(type_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, abi_choices);
     layout_abi_->SetName("type-layout-abi");
     layout_abi_->SetSelection(1);
@@ -542,6 +542,7 @@ void TypeSymbolsView::update(std::optional<DocumentId> document, std::shared_ptr
         case Architecture::x86: layout_abi_->SetSelection(0); break;
         case Architecture::x86_64: layout_abi_->SetSelection(1); break;
         case Architecture::arm64: layout_abi_->SetSelection(2); break;
+        case Architecture::arm: layout_abi_->SetSelection(3); break;
         default: break;
         }
         layout_abi_initialized_ = true;
@@ -747,15 +748,19 @@ void TypeSymbolsView::refresh_layout() {
         layout_details_->SetValue("Select a type to inspect its ABI layout.");
         return;
     }
-    types::Abi abi = layout_abi_->GetSelection() == 0 ? types::Abi::x86_32
-                     : layout_abi_->GetSelection() == 2 ? types::Abi::aarch64 : types::Abi::x86_64;
+    const auto abi_selection = layout_abi_->GetSelection();
+    const types::Abi abi = abi_selection == 0 ? types::Abi::x86_32
+                         : abi_selection == 2 ? types::Abi::aarch64
+                         : abi_selection == 3 ? types::Abi::aarch32 : types::Abi::x86_64;
     const auto &definition = project_->state->user->types[*row];
     auto computed = calculate_type_layout(*project_, definition.id, abi);
     if (!computed) {
         layout_details_->SetValue("Type: " + text(definition.name) + "\nLayout unavailable: " + text(computed.error().message));
         return;
     }
-    const char *abi_name = abi == types::Abi::x86_32 ? "x86-32" : abi == types::Abi::x86_64 ? "x86-64" : "AArch64";
+    const char *abi_name = abi == types::Abi::x86_32 ? "x86-32"
+                         : abi == types::Abi::x86_64 ? "x86-64"
+                         : abi == types::Abi::aarch64 ? "AArch64" : "AArch32";
     std::ostringstream report;
     report << "Type: " << definition.name << "\nABI: " << abi_name << "\nSize: " << computed.value().size
            << " bytes\nAlignment: " << computed.value().alignment << " bytes\n";
@@ -942,14 +947,20 @@ void TypeSymbolsView::import_header() {
     targets.Add("Linux / macOS 64-bit (LP64)");
     targets.Add("32-bit x86 (ILP32)");
     targets.Add("AArch64 (LP64)");
+    targets.Add("AArch32 (AAPCS32, ILP32)");
     wxSingleChoiceDialog target(this, "Choose the target data model for layout calculations.", "Header target ABI", targets);
     target.SetSelection(0);
     if (target.ShowModal() != wxID_OK) return;
     types::HeaderImportOptions options;
-    options.target_abi = target.GetSelection() == 2 ? types::Abi::x86_32
-                         : target.GetSelection() == 3 ? types::Abi::aarch64 : types::Abi::x86_64;
-    if (target.GetSelection() == 0) options.long_bytes = 4;
-    else if (target.GetSelection() == 2) { options.pointer_bytes = 4; options.long_bytes = 4; }
+    const auto target_selection = target.GetSelection();
+    options.target_abi = target_selection == 2 ? types::Abi::x86_32
+                         : target_selection == 3 ? types::Abi::aarch64
+                         : target_selection == 4 ? types::Abi::aarch32 : types::Abi::x86_64;
+    if (target_selection == 0) options.long_bytes = 4;
+    else if (target_selection == 2 || target_selection == 4) {
+        options.pointer_bytes = 4;
+        options.long_bytes = 4;
+    }
     auto parsed = types::import_c_header(source, options);
     if (!parsed) {
         if (diagnostics_changed) diagnostics_changed({{"Header import", DiagnosticSeverity::error, parsed.error().message, {}, {}}});

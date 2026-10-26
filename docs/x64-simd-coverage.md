@@ -17,6 +17,7 @@ families:
 | AVX packed floating decoder | VEX.128/.256 `vmovups`, `vaddps/pd`, `vsubps/pd`, `vmulps/pd`, `vdivps/pd`, `vxorps/pd`, `vandps/pd`; EVEX.128/.256/.512 `vaddps/pd`, `vsubps/pd`, `vmulps/pd`, `vdivps/pd` |
 | AVX2 packed integer subtraction | VEX.128/.256 `vpsubb/w/d/q` |
 | AVX2 packed integer comparisons | VEX.128/.256 `vpcmpeqb/w/d/q`, `vpcmpgtb/w/d/q` |
+| AVX2 immediate packed shifts | VEX.128/.256 `vpsllw/d/q`, `vpsrlw/d/q`, `vpsraw/d`, `vpslldq`, `vpsrldq` |
 | AVX2 packed word multiply | VEX.128/.256 `vpmullw`, `vpmulhw`, `vpmulhuw` |
 | AVX2 packed integer dataflow | VEX.128/.256 `vpandn`, `vpavgb/w`, `vpsignb/w/d`, `vpsadbw` |
 | AVX2 remaining min/max | VEX.128/.256 `vpminsb/sd/uw/ud`, `vpmaxsb/sd/uw/ud` |
@@ -338,8 +339,8 @@ expanded subset; no tests were run.
 
 Other EVEX opcodes and exact floating-point execution remain unsupported. MMX, most AVX/VEX forms,
 packed floating-point execution, remaining packed integer forms
-(including packed shifts in VEX forms, absolute value, rounded high-word
-multiply, immediate shuffles/blends, cross-128-bit permutations, and unsigned comparisons),
+(including absolute value, rounded high-word multiply, immediate shuffles/blends,
+cross-128-bit permutations, and unsigned comparisons),
 other compare/test instructions, precise MXCSR flag/rounding behavior, and exact
 upper-lane merge behavior remain outside this slice. See the
 [design](superpowers/specs/2026-10-22-x86-simd-design.md) and
@@ -361,3 +362,13 @@ evaluator computes dword/qword AVX2 lane results; the EVEX evaluator also
 applies result-lane writemasks. VEX `vpsravd` treats W as ignored; qword
 arithmetic-right shifts are available only in EVEX. The typed decompiler
 retains the lane shape and, for EVEX, mask effects.
+
+The AVX2 immediate packed-shift family decodes VEX.128/.256 `vpsllw/d/q`,
+`vpsrlw/d/q`, `vpsraw/d`, and the per-128-bit-lane byte shifts `vpslldq` and
+`vpsrldq`. The VEX.vvvv field selects the non-destructive destination, ModRM
+r/m supplies the vector source, and the final operand is an unsigned imm8.
+Shift counts at or above the element width produce zero for logical shifts and
+sign-fill for arithmetic shifts; byte shifts at or above 16 clear each 128-bit
+lane. XMM destinations clear the upper YMM half. The pure lane evaluator and
+typed decompiler intrinsic retain the immediate count, lane width, memory read,
+and upper-half effect.

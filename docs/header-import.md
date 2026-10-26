@@ -157,7 +157,7 @@ accepted. GNU `aligned` without an explicit value and aligned scalar objects
 remain unsupported and fail explicitly. Prefix, between-type-and-declarator,
 and trailing aligned/packed attributes on named aggregate members are
 supported. Named integral bitfields are supported when the caller supplies an
-explicit target ABI (`x86_32`, `x86_64`, or `aarch64`) in
+explicit target ABI (`x86_32`, `x86_64`, `aarch64`, or `aarch32`) in
 `HeaderImportOptions::target_abi`. The importer accepts positive-width named
 fields and unnamed zero-width struct barriers. It stores an LSB-relative bit
 offset and a byte offset to the allocation unit. Consecutive fields share a
@@ -167,6 +167,11 @@ allocation policy, not a promise to reproduce every compiler's ABI rules.
 Unnamed nonzero fields, zero-width union fields, non-integral bases, and widths
 larger than their declared storage type are rejected. Anonymous members remain
 unsupported.
+
+The desktop header-import dialog exposes an AArch32 AAPCS32 ILP32 profile;
+it sets pointer and `long` widths to four bytes and selects the existing
+AArch32 type-layout ABI. This selects data-model sizes and aggregate layout,
+not a compiler-specific calling-convention or bitfield-allocation emulation.
 
 Unknown Microsoft `__declspec` layout attributes are rejected explicitly.
 Microsoft `__cdecl`, `__stdcall`,

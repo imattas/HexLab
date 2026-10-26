@@ -72,6 +72,13 @@ model. Source rows use byte offsets in the method address space; local scopes
 are half-open byte ranges. Parameter names are retained in prototype order,
 while source line rows do not include columns.
 
+The desktop Source pane indexes DEX line rows in each method address space, so
+source navigation stays method-relative. The pseudocode Variables pane applies
+a debug local name only to a uniquely named SSA value for the matching virtual
+register while that local's half-open live range contains the instruction.
+It also lists decoded local types/ranges and named parameters as read-only DEX
+metadata; parameter-to-register bindings are not inferred.
+
 The decoder supports the common scalar move, result, return, constant, string
 reference, monitor, throw, goto, conditional branch, packed/sparse switch,
 invoke, `filled-new-array`/`filled-new-array/range`, and integer/floating arithmetic encodings listed in the supported-subset

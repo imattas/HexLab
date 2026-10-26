@@ -1161,6 +1161,60 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     std::map<std::string, std::string> recovered_local_types;
     std::map<std::string, std::string> recovered_local_names;
     std::map<std::string, std::string> recovered_local_comments;
+    const DexMethodDebug *dex_debug = nullptr;
+    if (project_ && project_->loaded && project_->loaded->metadata.dex &&
+        match->function->entry.space.value > 0 &&
+        match->function->entry.space.value - 1 <= UINT32_MAX) {
+        const auto method_index = static_cast<std::uint32_t>(match->function->entry.space.value - 1);
+        const auto &methods = project_->loaded->metadata.dex->methods;
+        const auto found = std::find_if(methods.begin(), methods.end(), [&](const auto &method) {
+            return method.method_index == method_index;
+        });
+        if (found != methods.end()) dex_debug = &*found;
+    }
+    if (dex_debug && dex_debug->locals.size() <= 100'000) {
+        std::map<std::string, std::set<std::string, std::less<>>, std::less<>> candidates;
+        const auto offer_register = [&](RegisterOperand reg, std::optional<std::uint32_t> version, Address at) {
+            if (reg.bank != RegisterBank::dex_vreg || !version || reg.index > 255) return;
+            for (const auto &local : dex_debug->locals) {
+                if (local.register_index != reg.index || !local.name || !source_identifier(*local.name) ||
+                    at.space != match->function->entry.space || at.offset < local.begin || at.offset >= local.end)
+                    continue;
+                candidates[register_token(reg, version)].insert(*local.name);
+            }
+        };
+        for (const auto &block : pseudocode_function.blocks) {
+            for (const auto &phi : block.phis)
+                offer_register(phi.destination, phi.version, block.begin);
+            for (const auto &instruction : block.instructions) {
+                std::visit([&](const auto &statement) {
+                    using T = std::decay_t<decltype(statement)>;
+                    if constexpr (std::is_same_v<T, decompiler::Assign>) {
+                        offer_register(statement.destination, statement.destination_version, instruction.origin.address);
+                    } else if constexpr (std::is_same_v<T, decompiler::Call>) {
+                        for (std::size_t i = 0; i < statement.register_output_versions.size() &&
+                             i < statement.register_writes.size(); ++i)
+                            offer_register(statement.register_writes[i], statement.register_output_versions[i],
+                                           instruction.origin.address);
+                        if (statement.return_register &&
+                            std::find(statement.register_writes.begin(), statement.register_writes.end(),
+                                      *statement.return_register) == statement.register_writes.end())
+                            offer_register(*statement.return_register, statement.return_version,
+                                           instruction.origin.address);
+                    } else if constexpr (std::is_same_v<T, decompiler::Intrinsic>) {
+                        if (statement.register_writes.size() == statement.register_output_versions.size())
+                            for (std::size_t i = 0; i < statement.register_writes.size(); ++i)
+                                offer_register(statement.register_writes[i], statement.register_output_versions[i],
+                                               instruction.origin.address);
+                    }
+                }, instruction.statement);
+            }
+        }
+        for (const auto &[token, names] : candidates) if (names.size() == 1) {
+            recovered_local_types.emplace(token, std::string{});
+            recovered_local_names.emplace(token, *names.begin());
+        }
+    }
     if (recovered_types) for (const auto &variable : recovered_types.value().stack_variables)
         recovered_local_types.emplace(variable.name, recovered_type_text(variable.type, variable.bits));
     auto local_type_evidence = named_stack
@@ -1304,6 +1358,31 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
             variables_list_->SetItem(row, 3, text(token));
             variable_links_.push_back({token, token, match->function->entry, {}});
             variable_definition_rows_.push_back(match->function->entry);
+        }
+    }
+    if (dex_debug && dex_debug->locals.size() <= 100'000) {
+        for (const auto &local : dex_debug->locals) {
+            const auto name = local.name && !local.name->empty() ? *local.name
+                                                                 : "v" + std::to_string(local.register_index);
+            const auto row = variables_list_->InsertItem(variables_list_->GetItemCount(), text(name));
+            variables_list_->SetItem(row, 1, text(local.type.value_or("")));
+            variables_list_->SetItem(row, 2,
+                location_text(Address{match->function->entry.space, local.begin}, image));
+            const auto range_label = wxString::Format(
+                "DEX v%u [0x%llx, 0x%llx) (read-only debug range)",
+                static_cast<unsigned>(local.register_index),
+                static_cast<unsigned long long>(local.begin),
+                static_cast<unsigned long long>(local.end));
+            variables_list_->SetItem(row, 3, range_label);
+        }
+    }
+    if (dex_debug) {
+        for (std::size_t i = 0; i < dex_debug->parameter_names.size() && i < 255; ++i) {
+            if (!dex_debug->parameter_names[i] || dex_debug->parameter_names[i]->empty()) continue;
+            const auto row = variables_list_->InsertItem(variables_list_->GetItemCount(),
+                                                         text(*dex_debug->parameter_names[i]));
+            variables_list_->SetItem(row, 2, text("DEX parameter #" + std::to_string(i)));
+            variables_list_->SetItem(row, 3, text("parameter name (register binding unresolved)"));
         }
     }
     rename_variable_->Enable(editable && !variables_.empty());
