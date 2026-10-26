@@ -90,3 +90,12 @@ interface edges plus uniquely bound external TypeRefs. It returns false when a
 chain contains an unresolved reference or the bounded traversal cannot prove
 the relation. Generic TypeSpec substitution and strong-name public-key-to-token
 conversion are not inferred by this resolver.
+
+Method-shaped `MemberRef` signatures now carry recursively substituted
+`ManagedTypeSignature` trees when their TypeSpec owner resolves to an
+arity-validated local TypeDef. Substitution walks
+pointer/byref, array, generic-instantiation, and nested TypeSpec nodes, and
+applies both owner `VAR` and MethodSpec `MVAR` argument vectors. An open
+argument that has no corresponding supplied value remains a VAR/MVAR node.
+External or unbound constructor identity, invalid arity, cyclic TypeSpec trees,
+and exhausted traversal budgets never produce guessed substitutions.

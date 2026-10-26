@@ -100,6 +100,42 @@ const ManagedTypeSignature* generic_instance_root(const ManagedTypeSignature& si
   const auto* root=resolved_type_spec_root(signature);
   return root&&root->element_type==0x15?root:nullptr;
 }
+// Substitute only the two ECMA-335 generic-variable spaces for which a
+// metadata owner supplies an ordered argument vector. Missing arguments are
+// legal open variables and stay intact. Expansion is bounded independently
+// from signature resolution so recursive argument trees cannot grow without
+// limit.
+Result<ManagedTypeSignature> substitute_signature(
+    const ManagedTypeSignature& source,
+    const std::vector<ManagedTypeSignature>& type_arguments,
+    const std::vector<ManagedTypeSignature>& method_arguments,
+    unsigned depth=0, std::size_t* budget_ptr=nullptr,
+    std::set<std::uint64_t>* active_ptr=nullptr){
+  std::size_t local_budget=100000;
+  std::set<std::uint64_t> local_active;
+  auto& budget=budget_ptr?*budget_ptr:local_budget;
+  auto& active=active_ptr?*active_ptr:local_active;
+  if(depth>16)return Error{ErrorCode::resource_limit,"Generic signature substitution nesting exceeds limit"};
+  if(!budget--)return Error{ErrorCode::resource_limit,"Generic signature substitution node limit exceeded"};
+  const auto* arguments=source.element_type==0x13?&type_arguments:
+      source.element_type==0x1e?&method_arguments:nullptr;
+  if(arguments&&source.generic_index<arguments->size()){
+    const auto key=(std::uint64_t{source.element_type}<<32)|source.generic_index;
+    if(!active.insert(key).second)return source;
+    auto result=(*arguments)[source.generic_index];
+    // Revisit the inserted argument so composed open substitutions resolve
+    // transitively while unbound VAR/MVAR nodes remain explicit.
+    if(result.element_type==0x13||result.element_type==0x1e){auto next=substitute_signature(result,type_arguments,method_arguments,depth+1,&budget,&active);active.erase(key);if(!next)return next.error();return next.value();}
+    for(auto& child:result.children){auto next=substitute_signature(child,type_arguments,method_arguments,depth+1,&budget,&active);if(!next){active.erase(key);return next.error();}child=std::move(next.value());}
+    if(result.type_spec_signature){auto next=substitute_signature(*result.type_spec_signature,type_arguments,method_arguments,depth+1,&budget,&active);if(!next){active.erase(key);return next.error();}result.type_spec_signature=std::make_shared<ManagedTypeSignature>(std::move(next.value()));}
+    active.erase(key);
+    return result;
+  }
+  auto result=source;
+  for(auto& child:result.children){auto next=substitute_signature(child,type_arguments,method_arguments,depth+1,&budget,&active);if(!next)return next.error();child=std::move(next.value());}
+  if(result.type_spec_signature){auto next=substitute_signature(*result.type_spec_signature,type_arguments,method_arguments,depth+1,&budget,&active);if(!next)return next.error();result.type_spec_signature=std::make_shared<ManagedTypeSignature>(std::move(next.value()));}
+  return result;
+}
 }
 
 namespace {
@@ -253,6 +289,24 @@ Result<std::map<std::uint32_t,ManagedMethodSignature>> parse_managed_call_signat
   }
   std::set<std::uint32_t> active_specs;std::size_t resolution_budget=100000;
   for(auto& [token,signature]:result){(void)token;auto resolved=resolve_type_signature(signature.return_type,catalog.value(),active_specs,0,resolution_budget);if(!resolved)return resolved.error();for(auto& parameter:signature.parameter_types){resolved=resolve_type_signature(parameter,catalog.value(),active_specs,0,resolution_budget);if(!resolved)return resolved.error();}for(auto& argument:signature.method_spec_arguments){resolved=resolve_type_signature(argument,catalog.value(),active_specs,0,resolution_budget);if(!resolved)return resolved.error();}}
+  // Publish substituted signature trees only when the owner instantiation is
+  // backed by an arity-checked local TypeDef.
+  for(auto& [token,signature]:result){
+    (void)token;
+    bool type_identity_proven=signature.declaring_type_arguments.empty();
+    if(!signature.declaring_type_arguments.empty()&&signature.declaring_type_generic_arguments_valid){
+      const auto owner=specifications.find(signature.declaring_type_token);
+      if(owner!=specifications.end())if(const auto* instance=generic_instance_root(owner->second->signature)){
+        const auto constructed=instance->metadata_type_token;
+        if((constructed>>24)==2)type_identity_proven=instance->generic_instance_arity_valid;
+      }
+    }
+    if(!type_identity_proven)continue;
+    std::size_t substitution_budget=100000;
+    auto substitute=[&](ManagedTypeSignature& type)->Result<bool>{auto value=substitute_signature(type,signature.declaring_type_arguments,signature.method_spec_arguments,0,&substitution_budget);if(!value)return value.error();type=std::move(value.value());return true;};
+    auto applied=substitute(signature.return_type);if(!applied)return applied.error();
+    for(auto& parameter:signature.parameter_types){applied=substitute(parameter);if(!applied)return applied.error();}
+  }
   return result;
 }
 
