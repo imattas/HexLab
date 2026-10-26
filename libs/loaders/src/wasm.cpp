@@ -767,6 +767,7 @@ Result<bool> map_linear_memory(WasmMetadata &metadata, ImageLayout &layout,
 
 bool parse_globals(Reader &r, std::uint32_t &count, std::uint32_t imported_count,
                    std::vector<GlobalType> &globals,
+                   WasmMetadata &metadata,
                    std::string &reason, bool &unsupported) {
     if (!r.uleb(count) || count > max_vector_items) { reason = "invalid global vector count"; return false; }
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -797,6 +798,7 @@ bool parse_globals(Reader &r, std::uint32_t &count, std::uint32_t imported_count
         }
         if (!r.byte(end) || end != 0x0b) { reason = "global initializer must contain one expression and end"; return false; }
         globals.push_back({type, mutability != 0});
+        metadata.globals.push_back({type, mutability != 0, false});
     }
     if (r.position != r.bytes.size()) { reason = "trailing bytes in global section"; return false; }
     return true;
@@ -1105,13 +1107,15 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
             valid = parse_imports(section, type_count, wasm, section_begin, name_bytes,
                                   parse_reason, unsupported_payload);
             if (valid) for (const auto &entry : wasm.imports)
-                if (entry.kind == WasmExternalKind::global)
+                if (entry.kind == WasmExternalKind::global) {
                     globals.push_back({*entry.global_value_type, entry.global_mutable});
+                    wasm.globals.push_back({*entry.global_value_type, entry.global_mutable, true});
+                }
         }
         else if (id == 3) valid = parse_functions(section, type_count, function_types);
         else if (id == 4) valid = parse_tables(section, wasm.defined_tables, wasm, parse_reason, unsupported_payload);
         else if (id == 5) valid = parse_memories(section, wasm.defined_memories, wasm, parse_reason, unsupported_payload);
-        else if (id == 6) valid = parse_globals(section, wasm.defined_globals, wasm.imported_globals, globals,
+        else if (id == 6) valid = parse_globals(section, wasm.defined_globals, wasm.imported_globals, globals, wasm,
                                                 parse_reason, unsupported_payload);
         else if (id == 7) valid = parse_exports(section, wasm, section_begin, name_bytes, parse_reason, unsupported_payload);
         else if (id == 8) valid = parse_start(section, wasm, section_begin, parse_reason);
