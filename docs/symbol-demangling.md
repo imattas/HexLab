@@ -73,14 +73,22 @@ parser counts components across the complete parse and separately limits its
 substitution dictionary to 256 entries and 64 KiB of retained strings by default
 (`max_substitutions` and `max_substitution_bytes`).
 
+Local Itanium names now parse their enclosing function encoding, entity name,
+and decimal discriminator. Lambda closure type names (`Ul...E_`) and numbered
+unnamed types (`Ut..._`) are rendered as stable placeholders such as
+`<lambda(int)#0>` and `<unnamed-type#2>`; this preserves the distinction
+between closures without pretending to reconstruct source capture syntax.
+These forms remain bounded by the usual input, depth, component, and output
+limits. Nested local entities and lambda signatures use the same supported
+type grammar as ordinary names.
+
 This is not a complete implementation of either ABI. The Itanium substitutions
 described below, array/function/member-pointer types, and selected template
-parameters are recognized; vendor extensions, local names, many
-expression-valued template arguments, and broad operator/type encodings remain
-incomplete, including Itanium local names, expression calls/casts/conditionals,
+parameters are recognized; vendor extensions, local-name discriminator
+variants, expression-valued template arguments, and broader operator/type
+encodings remain incomplete, including expression calls/casts/conditionals,
 template parameter references inside expressions, and unrecognized vendor
-qualifiers. Microsoft
-thunks and other special names,
+qualifiers. Microsoft thunks and other special names,
 non-integral template values (including pointers, member pointers, symbol
 references, `auto` values, and parameter packs), template backreferences,
 pointer-to-member and function-pointer types, and many calling-convention/type

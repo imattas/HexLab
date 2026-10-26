@@ -97,13 +97,17 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
     export_all_->SetName("strings-export-all");
     export_all_->Enable(false);
     filter_row->Add(export_all_, 0, wxEXPAND | wxLEFT, FromDIP(4));
+    comment_ = new wxButton(this, wxID_ANY, "Comment selected string...");
+    comment_->SetName("strings-comment");
+    comment_->Enable(false);
+    filter_row->Add(comment_, 0, wxEXPAND | wxLEFT, FromDIP(4));
     layout->Add(filter_row, 0, wxEXPAND | wxALL, FromDIP(4));
 
     auto *splitter = new wxSplitterWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                            wxSP_LIVE_UPDATE | wxSP_3D);
     auto *string_panel = new wxPanel(splitter);
     auto *string_layout = new wxBoxSizer(wxVERTICAL);
-    strings_ = new VirtualTable(string_panel, "strings-list", {"Address / offset", "Text", "Encoding", "Bytes"});
+    strings_ = new VirtualTable(string_panel, "strings-list", {"Address / offset", "Text", "Encoding", "Bytes", "Comment"});
     string_layout->Add(strings_, 1, wxEXPAND);
     string_panel->SetSizer(string_layout);
 
@@ -134,6 +138,11 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
     filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { filter_timer_.StartOnce(120); });
     export_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_strings(true); });
     export_all_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_strings(false); });
+    comment_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        if (!selected_string_ || !comment) return;
+        const auto location = string_location(*selected_string_);
+        if (location) comment(*location);
+    });
     filter_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent &) {
         filter_timer_.Stop();
         refresh_strings();
@@ -220,11 +229,19 @@ void StringBrowserView::refresh_strings() {
                                  document_->image.get());
         case 1: return text(record.preview);
         case 2: return encoding_text(record.encoding);
-        default: return wxString::Format("%llu", static_cast<unsigned long long>(record.byte_length));
+        case 3: return wxString::Format("%llu", static_cast<unsigned long long>(record.byte_length));
+        default: {
+            if (!document_->project) return wxString{};
+            const auto location = record.address ? Location{*record.address} : Location{record.file_offset};
+            const auto *annotation = annotation_at(*document_->project, location);
+            return annotation ? text(annotation->comment) : wxString{};
+        }
         }
     });
     export_->Enable(document_ && !visible_strings_.empty());
     export_all_->Enable(document_ && !document_->strings().records.empty());
+    comment_->Enable(document_ && selected_string_ && *selected_string_ < document_->strings().records.size() &&
+                     static_cast<bool>(comment));
     if (previous) {
         const auto visible = std::find(visible_strings_.begin(), visible_strings_.end(), *previous);
         if (visible != visible_strings_.end()) {
@@ -233,6 +250,7 @@ void StringBrowserView::refresh_strings() {
             return;
         }
         selected_string_.reset();
+        comment_->Enable(false);
         reference_offset_ = 0;
         refresh_references();
     }
@@ -362,6 +380,7 @@ void StringBrowserView::choose_string(std::size_t record_index, bool navigate_to
     if (!document_ || record_index >= document_->strings().records.size())
         return;
     selected_string_ = record_index;
+    comment_->Enable(static_cast<bool>(comment));
     reference_offset_ = 0;
     refresh_references();
     if (navigate_to_string && navigate) {
@@ -461,6 +480,7 @@ void StringBrowserView::clear_selection() {
     strings_->clear_selection();
     references_->clear_selection();
     selected_string_.reset();
+    comment_->Enable(false);
     reference_offset_ = 0;
     refresh_references();
 }

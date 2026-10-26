@@ -3099,6 +3099,26 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     };
     ui.center->AddPage(pages, "Binary");
     ui.listing->navigate = [this](Location location) { Navigate(location); };
+    ui.strings->comment = [this](Location location) {
+        const auto id = projects().active_document();
+        if (!id) return;
+        const auto project = projects().project(*id);
+        if (!project || !project->state || project->mode == database::ProjectMode::read_only) {
+            impl_->log_to(*id, "String comments require a writable project.");
+            return;
+        }
+        const auto *existing = annotation_at(*project, location);
+        auto dialog = edit_dialog(this, "Comment string", "Project comment:",
+                                  existing ? text(existing->comment) : wxString{}, true,
+                                  [location](const wxString &value) -> Result<ProjectCommand> {
+                                      const auto encoded = value.utf8_str();
+                                      return ProjectCommand{Comment{
+                                          location, std::string(encoded.data(), encoded.length())}};
+                                  });
+        if (!dialog) return;
+        auto result = impl_->controller->execute(*id, std::move(*dialog));
+        if (!result) impl_->controller->documents().report_error(*id, result.error());
+    };
     ui.bytes->navigate = ui.listing->navigate;
     ui.bytes->submit = [this](ProjectCommand command) {
         const auto id = projects().active_document();

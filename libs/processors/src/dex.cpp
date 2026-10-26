@@ -3,6 +3,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 namespace hexlab {
@@ -49,8 +50,102 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         }
     };
     if (op == 0x00) {
-        if (hi) return fail(DecodeStatus::unsupported, "DEX payload pseudo-instruction is not decoded");
-        text = "nop";
+        if (!hi) {
+            text = "nop";
+        } else {
+            if (at.offset & 3)
+                return fail(DecodeStatus::invalid, "DEX payload is not four-byte aligned");
+            constexpr unsigned max_payload_bytes = 32000;
+            std::uint16_t count_or_width = 0;
+            if (!code_unit(bytes, 1, count_or_width))
+                return fail(DecodeStatus::truncated, "truncated DEX payload header");
+            std::uint64_t payload_bytes = 0;
+            if (hi == 1 || hi == 2) {
+                const std::uint64_t count = count_or_width;
+                payload_bytes = hi == 1 ? 8 + count * 4 : 4 + count * 8;
+                if (payload_bytes > max_payload_bytes)
+                    return fail(DecodeStatus::unsupported, "DEX switch payload exceeds the bounded display limit");
+                if (hi == 1) {
+                    words = 4 + static_cast<unsigned>(count * 2);
+                    if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX packed-switch payload");
+                    const auto first_key = std::bit_cast<std::int32_t>(le32(word(2), word(3)));
+                    if (count && static_cast<std::int64_t>(first_key) + static_cast<std::int64_t>(count - 1) > INT32_MAX)
+                        return fail(DecodeStatus::invalid, "DEX packed-switch payload key range overflows signed 32 bits");
+                    text = "packed-switch-payload first-key=" + std::to_string(first_key) + " targets={";
+                    const auto shown = std::min<std::uint64_t>(count, 64);
+                    for (std::uint64_t i = 0; i < shown; ++i) {
+                        if (i) text += ", ";
+                        const auto key = static_cast<std::int64_t>(first_key) + static_cast<std::int64_t>(i);
+                        const auto target_units = std::bit_cast<std::int32_t>(le32(word(static_cast<unsigned>(4 + i * 2)),
+                                                                                   word(static_cast<unsigned>(5 + i * 2))));
+                        text += std::to_string(key) + ":" + std::to_string(static_cast<std::int64_t>(target_units) * 2);
+                    }
+                    if (shown < count) text += (shown ? ", ..." : "...");
+                    text += "}";
+                } else {
+                    words = 2 + static_cast<unsigned>(count * 4);
+                    if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX sparse-switch payload");
+                    std::optional<std::int32_t> previous_key;
+                    for (std::uint64_t i = 0; i < count; ++i) {
+                        const auto key = std::bit_cast<std::int32_t>(le32(
+                            word(static_cast<unsigned>(2 + i * 2)), word(static_cast<unsigned>(3 + i * 2))));
+                        if (previous_key && key <= *previous_key)
+                            return fail(DecodeStatus::invalid, "DEX sparse-switch payload keys are not strictly increasing");
+                        previous_key = key;
+                    }
+                    text = "sparse-switch-payload cases={";
+                    const auto shown = std::min<std::uint64_t>(count, 64);
+                    for (std::uint64_t i = 0; i < shown; ++i) {
+                        if (i) text += ", ";
+                        const auto key = std::bit_cast<std::int32_t>(le32(word(static_cast<unsigned>(2 + i * 2)),
+                                                                           word(static_cast<unsigned>(3 + i * 2))));
+                        const auto target_index = static_cast<unsigned>(2 + count * 2 + i * 2);
+                        const auto target_units = std::bit_cast<std::int32_t>(le32(word(target_index), word(target_index + 1)));
+                        text += std::to_string(key) + ":" + std::to_string(static_cast<std::int64_t>(target_units) * 2);
+                    }
+                    if (shown < count) text += (shown ? ", ..." : "...");
+                    text += "}";
+                }
+            } else if (hi == 3) {
+                const auto width = static_cast<std::uint64_t>(count_or_width);
+                if (width != 1 && width != 2 && width != 4 && width != 8)
+                    return fail(DecodeStatus::invalid, "DEX fill-array-data payload has invalid element width");
+                std::uint16_t size_low = 0, size_high = 0;
+                if (!code_unit(bytes, 2, size_low) || !code_unit(bytes, 3, size_high))
+                    return fail(DecodeStatus::truncated, "truncated DEX fill-array-data payload header");
+                const auto count = static_cast<std::uint64_t>(le32(size_low, size_high));
+                if (count > (std::numeric_limits<std::uint64_t>::max() - 8) / width)
+                    return fail(DecodeStatus::invalid, "DEX fill-array-data payload size overflows");
+                const auto data_bytes = count * width;
+                payload_bytes = 8 + data_bytes + (data_bytes & 1);
+                if (payload_bytes > max_payload_bytes)
+                    return fail(DecodeStatus::unsupported, "DEX fill-array-data payload exceeds the bounded display limit");
+                words = static_cast<unsigned>(payload_bytes / 2);
+                if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX fill-array-data payload");
+                text = "fill-array-data-payload width=" + std::to_string(width) + " count=" + std::to_string(count) + " values={";
+                const auto shown = std::min<std::uint64_t>(count, 32);
+                const auto data_at = std::uint64_t{8};
+                for (std::uint64_t i = 0; i < shown; ++i) {
+                    if (i) text += ", ";
+                    const auto byte_at = data_at + i * width;
+                    std::uint64_t value = 0;
+                    for (std::uint64_t b = 0; b < width; ++b)
+                        value |= std::uint64_t(std::to_integer<std::uint8_t>(bytes[static_cast<std::size_t>(byte_at + b)])) << (b * 8);
+                    text += "0x";
+                    static constexpr char digits[] = "0123456789abcdef";
+                    bool emitted = false;
+                    for (int shift = static_cast<int>(width * 8) - 4; shift >= 0; shift -= 4) {
+                        const auto nibble = static_cast<unsigned>((value >> shift) & 0xf);
+                        if (nibble || emitted || shift == 0) { text += digits[nibble]; emitted = true; }
+                    }
+                }
+                if (shown < count) text += (shown ? ", ..." : "...");
+                text += "}";
+            } else {
+                return fail(DecodeStatus::invalid, "unknown DEX payload identifier");
+            }
+            flow = FlowKind::data;
+        }
     } else if (op == 0xfe || op == 0xff) {
         words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX method-handle/type constant");
         text = std::string(op == 0xfe ? "const-method-handle " : "const-method-type ") + vr(hi) +
@@ -294,11 +389,17 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         text = std::string(names[op - 0xb0]) + " " + vr(hi & 15) + ", " + vr(hi >> 4);
     } else return fail(DecodeStatus::unsupported, "DEX opcode is outside the enabled scalar subset");
     const auto length = words * 2;
-    if (length > 10) return fail(DecodeStatus::invalid, "DEX instruction exceeds the supported instruction width");
+    if (flow == FlowKind::data && at.offset > UINT32_MAX - length)
+        return fail(DecodeStatus::invalid, "DEX payload extent exceeds its method address space");
+    if (flow != FlowKind::data && length > 10)
+        return fail(DecodeStatus::invalid, "DEX instruction exceeds the supported instruction width");
     if (bytes.size() < length) return fail(DecodeStatus::truncated, "truncated DEX instruction");
     Instruction instruction; instruction.context = {Architecture::dex, ExecutionMode::dex, ByteOrder::little};
-    instruction.address = at; instruction.length = static_cast<std::uint8_t>(length);
-    std::copy_n(bytes.begin(), length, instruction.bytes.begin());
+    instruction.address = at; instruction.length = length;
+    if (length > instruction.bytes.size())
+        instruction.extended_bytes.assign(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(length));
+    else
+        std::copy_n(bytes.begin(), length, instruction.bytes.begin());
     instruction.opcode = dex_switch ? Opcode::dex_switch : Opcode::dex;
     instruction.memory_read = op == 0x21 || op == 0x2b || op == 0x2c || (op >= 0x44 && op <= 0x4a) ||
                               (op >= 0x52 && op <= 0x58) || (op >= 0x60 && op <= 0x66);

@@ -66,6 +66,17 @@ file offsets of its key and target words (packed keys derive from the shared
 `first_key` word). These offsets are reconstructed from the source image when
 an instruction is loaded from the derived cache.
 
+The decoder recognizes aligned packed-switch, sparse-switch, and
+fill-array-data payloads as non-executable data directives. It validates their
+headers and complete byte extents, keeps the payload's method-relative address
+and exact encoded bytes, and formats up to 64 switch entries or 32 array values
+per line (with an explicit ellipsis for larger valid payloads). Payloads above
+32,000 bytes remain unsupported to keep instruction and derived-cache records
+bounded. A control-flow path that reaches a payload stops as invalid data;
+payload bytes never fall through into executable instructions. Switch dispatch
+analysis continues to validate a referenced payload against method bounds and
+case targets independently.
+
 Function recovery treats every defined `code_item` as a method entry.
 `invoke-direct` and `invoke-static` (including `/range`) references resolve to
 that entry only when the referenced method ID has a validated code item,
@@ -96,8 +107,7 @@ invoke, `filled-new-array`/`filled-new-array/range`, and integer/floating arithm
 source. It retains method call flow and direct intra-method branch targets.
 Reference operands are shown
 as table indices because string/type/field/method names are not yet attached to
-the decoded instruction. Array payloads and many core opcodes remain
-unsupported. Bounded packed/sparse switch tables are lifted to method CFG
+the decoded instruction. Many core opcodes remain unsupported. Bounded packed/sparse switch tables are lifted to method CFG
 dispatches with at most 64 cases; malformed payloads or targets outside the
 recovered method remain incomplete. No Dalvik verifier-wide type model is
 claimed. `inspect` and `disassemble` accept automatic detection or `--format

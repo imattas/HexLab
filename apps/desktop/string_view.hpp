@@ -17,6 +17,7 @@ class StringBrowserView final : public wxPanel {
     void select(Location);
     void clear_selection();
     std::function<void(Location)> navigate;
+    std::function<void(Location)> comment;
 
   private:
     static constexpr std::size_t reference_page_size_ = 128;
@@ -27,6 +28,7 @@ class StringBrowserView final : public wxPanel {
     wxStaticText *reference_summary_ = nullptr;
     wxButton *export_ = nullptr;
     wxButton *export_all_ = nullptr;
+    wxButton *comment_ = nullptr;
     wxButton *previous_references_ = nullptr;
     wxButton *next_references_ = nullptr;
     wxTimer filter_timer_;
