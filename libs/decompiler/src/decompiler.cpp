@@ -5855,7 +5855,13 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         const auto *body_start = condition ? find_block(*condition->true_target) : nullptr;
         const auto *exit_block = condition ? find_block(*condition->false_target) : nullptr;
         std::vector<const LiftedBlock *> loop_body;
-        std::vector<std::pair<const LiftedBlock *, bool>> loop_breaks;
+        struct LoopBreakPath {
+            const LiftedBlock *branch = nullptr;
+            bool break_on_true = true;
+            std::vector<const LiftedBlock *> path;
+        };
+        std::vector<LoopBreakPath> loop_breaks;
+        std::set<std::uint64_t> loop_break_path_ids;
         std::vector<std::pair<const LiftedBlock *, bool>> loop_continues;
         struct LoopConditionalReturn {
             const LiftedBlock *branch = nullptr;
@@ -6365,8 +6371,39 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         std::set<std::uint64_t> exit_path_ids;
         bool loop_body_edges_valid = true;
         bool exit_path_valid = true;
+        const auto trace_loop_exit_path = [&](Address target, std::uint64_t predecessor)
+            -> std::optional<std::vector<const LiftedBlock *>> {
+            std::vector<const LiftedBlock *> path;
+            if (!exit_block) return std::nullopt;
+            if (target == exit_block->begin) return path;
+            std::set<std::uint64_t> seen;
+            auto *candidate = find_block(target);
+            while (candidate && candidate != exit_block && candidate != body_start &&
+                   candidate != header && candidate != entry &&
+                   !loop_body_ids.contains(candidate->id.value) &&
+                   !loop_break_path_ids.contains(candidate->id.value) &&
+                   seen.insert(candidate->id.value).second && path.size() < 64 &&
+                   candidate->phis.empty() && !candidate->memory_phi &&
+                   candidate->memory_partition_phis.empty() && !contains_return(*candidate) &&
+                   !candidate->switch_dispatch && has_only_simple_statements(*candidate) &&
+                   candidate->successors.size() == 1 && candidate->successors.front().target &&
+                   (candidate->successors.front().kind == BlockEdgeKind::jump ||
+                    candidate->successors.front().kind == BlockEdgeKind::fallthrough) &&
+                   has_unconditional_edge(*candidate, *candidate->successors.front().target) &&
+                   diamond_predecessors[candidate->id.value] == std::set<std::uint64_t>{predecessor}) {
+                path.push_back(candidate);
+                predecessor = candidate->id.value;
+                candidate = find_block(*candidate->successors.front().target);
+            }
+            if (candidate != exit_block || !exit_block->phis.empty() || exit_block->memory_phi ||
+                !exit_block->memory_partition_phis.empty() ||
+                !diamond_predecessors[exit_block->id.value].contains(predecessor))
+                return std::nullopt;
+            return path;
+        };
         auto *body = body_start;
         while (body && body != header && body != entry && body != exit_block &&
+               !loop_break_path_ids.contains(body->id.value) &&
                loop_body.size() < function.blocks.size() && loop_body_ids.insert(body->id.value).second &&
                (body->phis.empty() || conditional_phi_joins.contains(body->id.value)) && !contains_return(*body) &&
                (body->switch_dispatch || has_only_simple_statements(*body)) &&
@@ -6455,12 +6492,32 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 }
             } else if (body_condition && body->successors.size() == 2 &&
                 body_condition->true_target && body_condition->false_target) {
-                const bool true_exits = *body_condition->true_target == exit_block->begin;
-                const bool false_exits = *body_condition->false_target == exit_block->begin;
+                const bool exact_condition_edges =
+                    std::count_if(body->successors.begin(), body->successors.end(), [&](const auto &edge) {
+                        return edge_targets(edge, *body_condition->true_target);
+                    }) == 1 &&
+                    std::count_if(body->successors.begin(), body->successors.end(), [&](const auto &edge) {
+                        return edge_targets(edge, *body_condition->false_target);
+                    }) == 1;
+                if (!exact_condition_edges) {
+                    loop_body_edges_valid = false;
+                    break;
+                }
+                const auto true_exit_path = trace_loop_exit_path(*body_condition->true_target, body->id.value);
+                const auto false_exit_path = trace_loop_exit_path(*body_condition->false_target, body->id.value);
+                const bool true_exits = true_exit_path.has_value();
+                const bool false_exits = false_exit_path.has_value();
                 const bool true_continues = *body_condition->true_target == header->begin;
                 const bool false_continues = *body_condition->false_target == header->begin;
                 if (true_exits != false_exits) {
-                    loop_breaks.emplace_back(body, true_exits);
+                    const auto &break_path = true_exits ? *true_exit_path : *false_exit_path;
+                    for (const auto *path_block : break_path)
+                        if (!loop_break_path_ids.insert(path_block->id.value).second) {
+                            loop_body_edges_valid = false;
+                            break;
+                        }
+                    if (!loop_body_edges_valid) break;
+                    loop_breaks.push_back({body, true_exits, break_path});
                     next_address = true_exits ? *body_condition->false_target : *body_condition->true_target;
                 } else {
                     const auto trace_return_path = [&](Address target) {
@@ -6799,6 +6856,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::all_of(function.blocks.begin(), function.blocks.end(), [&](const LiftedBlock &candidate) {
                 return &candidate == entry || &candidate == header || loop_body_ids.contains(candidate.id.value) ||
                     exit_path_ids.contains(candidate.id.value) ||
+                    loop_break_path_ids.contains(candidate.id.value) ||
                     std::any_of(loop_returns.begin(), loop_returns.end(), [&](const auto &side_exit) {
                         return std::find(side_exit.path.begin(), side_exit.path.end(), &candidate) !=
                             side_exit.path.end();
@@ -7014,12 +7072,15 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     continue;
                 }
                 const auto conditional_break = std::find_if(loop_breaks.begin(), loop_breaks.end(),
-                    [&](const auto &candidate) { return candidate.first == block; });
+                    [&](const auto &candidate) { return candidate.branch == block; });
                 if (conditional_break != loop_breaks.end()) {
                     const auto *body_condition = terminal_conditional(*block);
                     if (!body_condition) return fallback("loop break block has no valid conditional branch");
-                    out << "        if (" << (conditional_break->second ? branch_condition_text(*body_condition) :
-                        "!(" + branch_condition_text(*body_condition) + ")") << ") break;\n";
+                    out << "        if (" << (conditional_break->break_on_true ? branch_condition_text(*body_condition) :
+                        "!(" + branch_condition_text(*body_condition) + ")") << ") {\n";
+                    for (const auto *path_block : conditional_break->path)
+                        emit_block(*path_block, 12, true);
+                    out << "            break;\n        }\n";
                 }
                 const auto conditional_continue = std::find_if(loop_continues.begin(), loop_continues.end(),
                     [&](const auto &candidate) { return candidate.first == block; });

@@ -326,3 +326,13 @@ conditional, shuffled storage, straight-line setup, terminal phi copies, and
 lossless fallback for malformed phis, missing returns, cycles, and sharing
 across terminating regions. This is a bounded semantic check of those fixtures,
 not a general C interpreter or an equivalence proof for arbitrary functions.
+
+Canonical pre-tested loops also accept a conditional break edge that reaches the
+loop's validated exit through a straight-line chain of at most 64 phi-free,
+side-effect-preserving blocks. Each path block must have exactly the preceding
+branch or path block as its predecessor, one unconditional jump or fallthrough,
+and no return, nested branch, switch, or memory phi. The formatter emits those
+path statements inside the break condition, then resumes after the loop so the
+shared exit block executes once. Shared path blocks, exit phis, extra
+predecessors on a path block, and other ambiguous shapes retain the existing
+fallback.
