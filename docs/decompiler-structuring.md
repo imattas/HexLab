@@ -170,6 +170,15 @@ use simultaneous copies, including loop-carried swaps. Whole-memory and
 per-partition memory phis require the same exact predecessor coverage and
 remain analysis-only; partition names must be nonempty and unique per block.
 
+Alternatively, one body conditional may leave through a unique side-return
+chain of at most 64 blocks while its other edge continues toward the latch.
+Each return-chain block has exactly its preceding edge as predecessor; the
+last block has a terminal return. The formatter emits that chain only under
+the original branch predicate, lowers register phi copies on its actual
+incoming edges, and lowers the continuing edge before the remaining loop body.
+This shape cannot share return blocks with the latch cleanup path or contain
+another body conditional region; those CFGs retain explicit flow.
+
 The latch predicate is evaluated into `__hexlab_do_repeat` before recurrent
 copies can overwrite header values used by that predicate. The emitted
 `do ... while (__hexlab_do_repeat)` preserves either polarity of the original
@@ -179,7 +188,7 @@ partition phis per block, 65,536 combined register/memory phi inputs, and 64
 cleanup blocks. It requires unique block IDs and addresses, exact resolved
 edge kinds and target block
 identities, complete function coverage, and a terminal return. Further body branches,
-switches, side entries or exits, multiple latches, extra or duplicated edges,
+switches, side entries or ambiguous exits, multiple latches, extra or duplicated edges,
 and malformed phis proceed to the existing region/state-machine/goto paths.
 
 The earlier function-entry post-tested recognizer still requires a phi-free

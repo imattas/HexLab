@@ -7,7 +7,8 @@
 
 namespace hexlab::compare {
 namespace {
-constexpr std::array<char, 8> magic{'H','X','C','M','P','R','7','\0'};
+constexpr std::array<char, 8> magic{'H','X','C','M','P','R','8','\0'};
+constexpr std::array<char, 8> semantic_v7_magic{'H','X','C','M','P','R','7','\0'};
 constexpr std::array<char, 8> ignored_magic{'H','X','C','M','P','R','6','\0'};
 constexpr std::array<char, 8> block_diff_magic{'H','X','C','M','P','R','5','\0'};
 constexpr std::array<char, 8> block_magic{'H','X','C','M','P','R','4','\0'};
@@ -39,6 +40,7 @@ bool optional_u64(Writer &w, const std::optional<std::uint64_t> &v) { return w.u
 bool optional_u64(Reader &r, std::optional<std::uint64_t> &v) { std::uint8_t has; if(!r.u8(has)||has>1)return false; if(!has){v.reset();return true;} std::uint64_t x; if(!r.u64(x))return false;v=x;return true; }
 bool valid_instruction_diff(const FunctionInstructionDiff &diff) {
     std::uint64_t equal = 0, changed = 0, removed = 0, added = 0;
+    InstructionChangeEvidence semantic; semantic.available=diff.semantic.available;
     for (const auto &run : diff.runs) {
         if (run.kind > InstructionDiffKind::added || !run.old_count && !run.new_count ||
             run.old_count > UINT64_MAX - run.old_start || run.new_count > UINT64_MAX - run.new_start)
@@ -54,6 +56,14 @@ bool valid_instruction_diff(const FunctionInstructionDiff &diff) {
             const auto old_tail = run.old_count - paired, new_tail = run.new_count - paired;
             if (paired > UINT64_MAX - changed || old_tail > UINT64_MAX - removed || new_tail > UINT64_MAX - added) return false;
             changed += paired; removed += old_tail; added += new_tail;
+            if (run.semantic.available) {
+                if (!diff.semantic.available || run.semantic.opcode_changes>paired || run.semantic.flow_changes>paired ||
+                    run.semantic.operand_changes>paired || run.semantic.effect_changes>paired || run.semantic.unclassified_changes>paired) return false;
+                semantic.opcode_changes+=run.semantic.opcode_changes; semantic.flow_changes+=run.semantic.flow_changes;
+                semantic.operand_changes+=run.semantic.operand_changes; semantic.effect_changes+=run.semantic.effect_changes;
+                semantic.unclassified_changes+=run.semantic.unclassified_changes;
+            } else if (run.semantic.opcode_changes||run.semantic.flow_changes||run.semantic.operand_changes||
+                       run.semantic.effect_changes||run.semantic.unclassified_changes) return false;
             break;
         }
         case InstructionDiffKind::removed:
@@ -65,25 +75,34 @@ bool valid_instruction_diff(const FunctionInstructionDiff &diff) {
             added += run.new_count;
             break;
         }
+        if(run.kind!=InstructionDiffKind::changed && (run.semantic.available||run.semantic.opcode_changes||run.semantic.flow_changes||run.semantic.operand_changes||run.semantic.effect_changes||run.semantic.unclassified_changes)) return false;
     }
-    return equal == diff.equal_instructions && changed == diff.changed_instructions &&
+    return semantic.opcode_changes==diff.semantic.opcode_changes && semantic.flow_changes==diff.semantic.flow_changes &&
+           semantic.operand_changes==diff.semantic.operand_changes && semantic.effect_changes==diff.semantic.effect_changes &&
+           semantic.unclassified_changes==diff.semantic.unclassified_changes &&
+           equal == diff.equal_instructions && changed == diff.changed_instructions &&
            removed == diff.removed_instructions && added == diff.added_instructions;
 }
 bool write_instruction_diff(Writer &w, const FunctionInstructionDiff &diff) {
     if (!valid_instruction_diff(diff) || diff.runs.size() > max_records) return false;
     bool ok = w.u64(diff.equal_instructions) && w.u64(diff.changed_instructions) &&
               w.u64(diff.removed_instructions) && w.u64(diff.added_instructions) &&
-              w.u64(diff.runs.size());
-    for (const auto &run : diff.runs)
+              w.u64(diff.runs.size()) && w.u8(diff.semantic.available) && w.u64(diff.semantic.opcode_changes) &&
+              w.u64(diff.semantic.flow_changes) && w.u64(diff.semantic.operand_changes) && w.u64(diff.semantic.effect_changes) && w.u64(diff.semantic.unclassified_changes);
+    for (const auto &run : diff.runs) {
         ok = ok && w.u8(static_cast<std::uint8_t>(run.kind)) && w.u64(run.old_start) &&
              w.u64(run.new_start) && w.u64(run.old_count) && w.u64(run.new_count);
+        ok = ok && w.u8(run.semantic.available) && w.u64(run.semantic.opcode_changes) && w.u64(run.semantic.flow_changes) &&
+             w.u64(run.semantic.operand_changes) && w.u64(run.semantic.effect_changes) && w.u64(run.semantic.unclassified_changes);
+    }
     return ok;
 }
-bool read_instruction_diff(Reader &r, FunctionInstructionDiff &diff, std::uint64_t &remaining_runs) {
+bool read_instruction_diff(Reader &r, FunctionInstructionDiff &diff, std::uint64_t &remaining_runs, bool semantic_version) {
     std::uint64_t count = 0;
     if (!r.u64(diff.equal_instructions) || !r.u64(diff.changed_instructions) ||
         !r.u64(diff.removed_instructions) || !r.u64(diff.added_instructions) ||
         !r.u64(count) || count > remaining_runs) return false;
+    if (semantic_version) { std::uint8_t available=0; if(!r.u8(available)||available>1||!r.u64(diff.semantic.opcode_changes)||!r.u64(diff.semantic.flow_changes)||!r.u64(diff.semantic.operand_changes)||!r.u64(diff.semantic.effect_changes)||!r.u64(diff.semantic.unclassified_changes))return false; diff.semantic.available=available!=0; }
     remaining_runs -= count;
     diff.runs.reserve(static_cast<std::size_t>(count));
     for (std::uint64_t i = 0; i < count; ++i) {
@@ -93,6 +112,7 @@ bool read_instruction_diff(Reader &r, FunctionInstructionDiff &diff, std::uint64
             !r.u64(run.old_start) || !r.u64(run.new_start) ||
             !r.u64(run.old_count) || !r.u64(run.new_count)) return false;
         run.kind = static_cast<InstructionDiffKind>(kind);
+        if(semantic_version){std::uint8_t available=0;if(!r.u8(available)||available>1||!r.u64(run.semantic.opcode_changes)||!r.u64(run.semantic.flow_changes)||!r.u64(run.semantic.operand_changes)||!r.u64(run.semantic.effect_changes)||!r.u64(run.semantic.unclassified_changes))return false;run.semantic.available=available!=0;}
         diff.runs.push_back(run);
     }
     return valid_instruction_diff(diff);
@@ -164,10 +184,14 @@ Result<bool> save_session(const std::filesystem::path &path, const Session &s) {
         const auto &diff = body.diff;
         ok=ok&&w.u64(body.old_entry)&&w.u64(body.new_entry)&&w.u32(body.old_space)&&w.u32(body.new_space)&&
             w.u64(diff.equal_instructions)&&w.u64(diff.changed_instructions)&&
-            w.u64(diff.removed_instructions)&&w.u64(diff.added_instructions)&&w.u64(diff.runs.size());
+            w.u64(diff.removed_instructions)&&w.u64(diff.added_instructions)&&w.u64(diff.runs.size())&&
+            w.u8(diff.semantic.available)&&w.u64(diff.semantic.opcode_changes)&&w.u64(diff.semantic.flow_changes)&&
+            w.u64(diff.semantic.operand_changes)&&w.u64(diff.semantic.effect_changes)&&w.u64(diff.semantic.unclassified_changes);
         for (const auto &run : diff.runs)
             ok=ok&&w.u8(static_cast<std::uint8_t>(run.kind))&&w.u64(run.old_start)&&w.u64(run.new_start)&&
-                w.u64(run.old_count)&&w.u64(run.new_count);
+                w.u64(run.old_count)&&w.u64(run.new_count)&&w.u8(run.semantic.available)&&
+                w.u64(run.semantic.opcode_changes)&&w.u64(run.semantic.flow_changes)&&w.u64(run.semantic.operand_changes)&&
+                w.u64(run.semantic.effect_changes)&&w.u64(run.semantic.unclassified_changes);
         const auto &blocks=body.block_correspondence;
         ok=ok&&w.u64(blocks.matched)&&w.u64(blocks.added)&&w.u64(blocks.removed)&&w.u64(blocks.ambiguous)&&
            w.u8(blocks.budget_exhausted)&&w.u8(blocks.instruction_diff_budget_exhausted)&&
@@ -196,13 +220,14 @@ Result<Session> load_session(const std::filesystem::path &path) {
     if(ec||size>max_file_size) return invalid("comparison session is missing or exceeds the size limit");
     std::ifstream f(path,std::ios::binary); if(!f)return invalid("cannot open comparison session");
     Reader r{f}; std::array<char,8> got{}; Session s;
-    if(!r.bytes(got.data(),got.size())||(got!=magic&&got!=ignored_magic&&got!=block_diff_magic&&got!=block_magic&&got!=body_magic&&got!=evidence_magic&&got!=legacy_magic)||!r.string(s.old_name)||!r.string(s.new_name))return invalid("invalid comparison session header");
-    const bool has_ignored_summary = got == magic||got==ignored_magic;
+    if(!r.bytes(got.data(),got.size())||(got!=magic&&got!=semantic_v7_magic&&got!=ignored_magic&&got!=block_diff_magic&&got!=block_magic&&got!=body_magic&&got!=evidence_magic&&got!=legacy_magic)||!r.string(s.old_name)||!r.string(s.new_name))return invalid("invalid comparison session header");
+    const bool semantic_version = got == magic;
+    const bool has_ignored_summary = got == magic||got==semantic_v7_magic||got==ignored_magic;
     const bool has_evidence = got != legacy_magic;
-    const bool has_body_diffs = got == magic||got==ignored_magic||got==block_diff_magic||got==block_magic||got==body_magic;
-    const bool has_block_correspondence = got == magic||got==ignored_magic||got==block_diff_magic||got==block_magic;
-    const bool has_block_instruction_diffs = got == magic||got==ignored_magic||got==block_diff_magic;
-    const bool has_block_evidence = got == magic;
+    const bool has_body_diffs = got == magic||got==semantic_v7_magic||got==ignored_magic||got==block_diff_magic||got==block_magic||got==body_magic;
+    const bool has_block_correspondence = got == magic||got==semantic_v7_magic||got==ignored_magic||got==block_diff_magic||got==block_magic;
+    const bool has_block_instruction_diffs = got == magic||got==semantic_v7_magic||got==ignored_magic||got==block_diff_magic;
+    const bool has_block_evidence = got == magic||got==semantic_v7_magic;
     auto &x=s.report.summary;
     for(auto *v:{&x.compared_bytes,&x.equal_bytes,&x.changed_bytes,&x.added_bytes,&x.removed_bytes,&x.matched_regions,&x.added_regions,&x.removed_regions}) if(!r.u64(*v))return invalid("truncated comparison summary");
     if (has_ignored_summary && !r.u64(x.ignored_bytes)) return invalid("truncated comparison ignored-byte summary");
@@ -239,6 +264,7 @@ Result<Session> load_session(const std::filesystem::path &path) {
                !r.u64(diff.removed_instructions)||!r.u64(diff.added_instructions)||!r.u64(run_count)||
                run_count>max_records-total_body_runs)
                 return invalid("invalid function body diff record");
+            if(semantic_version){std::uint8_t available=0;if(!r.u8(available)||available>1||!r.u64(diff.semantic.opcode_changes)||!r.u64(diff.semantic.flow_changes)||!r.u64(diff.semantic.operand_changes)||!r.u64(diff.semantic.effect_changes)||!r.u64(diff.semantic.unclassified_changes))return invalid("invalid function semantic summary");diff.semantic.available=available!=0;}
             total_body_runs+=run_count;
             diff.runs.reserve(static_cast<std::size_t>(run_count));
             for (std::uint64_t run_index=0;run_index<run_count;++run_index) {
@@ -247,6 +273,7 @@ Result<Session> load_session(const std::filesystem::path &path) {
                 if(!r.u8(kind)||kind>static_cast<std::uint8_t>(InstructionDiffKind::added)||
                    !r.u64(run.old_start)||!r.u64(run.new_start)||!r.u64(run.old_count)||!r.u64(run.new_count))
                     return invalid("invalid function instruction diff run");
+                if(semantic_version){std::uint8_t available=0;if(!r.u8(available)||available>1||!r.u64(run.semantic.opcode_changes)||!r.u64(run.semantic.flow_changes)||!r.u64(run.semantic.operand_changes)||!r.u64(run.semantic.effect_changes)||!r.u64(run.semantic.unclassified_changes))return invalid("invalid function semantic run");run.semantic.available=available!=0;}
                 run.kind=static_cast<InstructionDiffKind>(kind);
                 diff.runs.push_back(run);
             }
@@ -285,7 +312,7 @@ Result<Session> load_session(const std::filesystem::path &path) {
                         std::uint8_t has_diff = 0, budget_limited = 0;
                         if (!r.u8(has_diff) || has_diff > 1 || !r.u8(budget_limited) || budget_limited > 1 ||
                             (has_diff && (row.kind == BlockMatchKind::ambiguous || budget_limited)) ||
-                            (has_diff && !read_instruction_diff(r, row.instruction_diff, remaining_block_diff_runs)))
+                            (has_diff && !read_instruction_diff(r, row.instruction_diff, remaining_block_diff_runs, semantic_version)))
                             return invalid("invalid block instruction diff");
                         row.instruction_diff_available = has_diff != 0;
                         row.instruction_diff_budget_exhausted = budget_limited != 0;

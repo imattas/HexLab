@@ -469,6 +469,33 @@ Result<bool> Project::save(std::stop_token stop) {
 Result<database::SavedProject> Project::save_as(const std::filesystem::path& path,std::stop_token stop) {
     auto valid=live_owner();if(!valid)return valid.error();return store_->save_as(path,database::ReplacePolicy::fail_if_exists,stop);
 }
+Result<database::SavedProject> Project::backup_to(const std::filesystem::path& path,bool replace,std::stop_token stop) {
+    auto valid=live_owner();if(!valid)return valid.error();
+    return store_->backup_to(path,replace?database::ReplacePolicy::replace_existing:database::ReplacePolicy::fail_if_exists,stop);
+}
+Result<BackupRotationInfo> Project::backup_to_rotating(const std::filesystem::path& base,std::size_t retain,std::stop_token stop) {
+    auto valid=live_owner();if(!valid)return valid.error();
+    auto result=store_->backup_to_rotating(base,retain,stop);if(!result)return result.error();
+    auto value=std::move(result.value());
+    return BackupRotationInfo{std::move(value.backup),value.removed_generations,value.retention_satisfied};
+}
+Result<BackupListInfo> Project::list_rotated_backups(const std::filesystem::path& base,std::stop_token stop) const {
+    auto valid=live_owner();if(!valid)return valid.error();
+    auto result=store_->list_rotated_backups(base,stop);if(!result)return result.error();
+    BackupListInfo output;output.complete=result.value().complete;output.backups.reserve(result.value().backups.size());
+    for(auto& row:result.value().backups)output.backups.push_back({std::move(row.backup),row.created_unix_ms});
+    return output;
+}
+Result<BackupPruneInfo> Project::prune_rotated_backups(const std::filesystem::path& base,std::size_t retain,std::stop_token stop) {
+    auto valid=live_owner();if(!valid)return valid.error();
+    auto result=store_->prune_rotated_backups(base,retain,stop);if(!result)return result.error();
+    return BackupPruneInfo{result.value().remaining,result.value().removed,result.value().retention_satisfied};
+}
+Result<database::SavedProject> Project::restore_backup_in_place(const std::filesystem::path& backup,
+        const std::filesystem::path& target,std::uint32_t version,std::stop_token stop) {
+    auto valid=version_ok(version);if(!valid)return valid.error();
+    return database::ProjectStore::restore_backup_in_place(backup,target,stop);
+}
 Result<ExportReceipt> Project::export_binary(const std::filesystem::path& path,std::stop_token stop) {
     auto s=snapshot();if(!s)return s.error();return export_patched(*s.value(),path,database::ReplacePolicy::fail_if_exists,stop);
 }

@@ -228,6 +228,14 @@ PyObject* encode_uuid(const database::ProjectUuid& uuid){
     for(auto byte:uuid){const auto value=std::to_integer<unsigned>(byte);result.push_back(digits[value>>4]);result.push_back(digits[value&15]);}
     return string(result);
 }
+std::string path_utf8(const std::filesystem::path& path){
+    const auto encoded=path.generic_u8string();
+    return {reinterpret_cast<const char*>(encoded.data()),encoded.size()};
+}
+PyObject* encode_saved_project(const database::SavedProject& row){
+    Object item(PyDict_New());set(item,"path",string(path_utf8(row.path)));set(item,"uuid",encode_uuid(row.uuid));
+    return item.release();
+}
 PyObject* encode_revisions(const database::ProjectRevisions& revisions){
     Object item(PyDict_New());set(item,"edit",integer(revisions.edit));set(item,"bytes",integer(revisions.bytes));
     set(item,"decisions",integer(revisions.decisions));return item.release();
@@ -641,6 +649,12 @@ PyObject* open_archive(PyObject*,PyObject* args){return guarded([&]()->PyObject*
     auto opened=without_gil([&]{return automation::Archive::open(source,version);});
     return archive_capsule(take(std::move(opened)));
 });}
+PyObject* restore_backup_in_place(PyObject*,PyObject* args){return guarded([&]()->PyObject*{
+    count(args,4);const auto backup=path(argument(args,0)),target=path(argument(args,1));
+    const auto version=number32(argument(args,2));
+    auto stop=argument(args,3)==Py_None?std::stop_token{}:stop_source(argument(args,3)).get_token();
+    return encode_saved_project(take(without_gil([&]{return Project::restore_backup_in_place(backup,target,version,stop);} )));
+});}
 PyObject* call_archive(PyObject*,PyObject* args){return guarded([&]()->PyObject*{
     count(args,3);auto& owner=archive(argument(args,0));const auto method=text(argument(args,1));auto* values=argument(args,2);
     if(method=="summary"){
@@ -1033,6 +1047,36 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
     }
     if(method=="save"){count(values,0);return PyBool_FromLong(take(p.save()));}
     if(method=="save_as"){count(values,1);take(p.save_as(path(argument(values,0))));return none();}
+    if(method=="backup_to"){
+        count(values,3);const auto destination=path(argument(values,0));const auto replace=boolean(argument(values,1));
+        auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();
+        return encode_saved_project(take(without_gil([&]{return p.backup_to(destination,replace,stop);} )));
+    }
+    if(method=="backup_to_rotating"){
+        count(values,3);const auto base=path(argument(values,0));const auto retain=size(argument(values,1));
+        auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();
+        const auto row=take(without_gil([&]{return p.backup_to_rotating(base,retain,stop);}));
+        Object result(PyDict_New());set(result,"backup",encode_saved_project(row.backup));
+        set(result,"removed_generations",integer(row.removed_generations));
+        set(result,"retention_satisfied",PyBool_FromLong(row.retention_satisfied));return result.release();
+    }
+    if(method=="list_rotated_backups"){
+        count(values,2);const auto base=path(argument(values,0));
+        auto stop=argument(values,1)==Py_None?std::stop_token{}:stop_source(argument(values,1)).get_token();
+        const auto listing=take(without_gil([&]{return p.list_rotated_backups(base,stop);}));
+        Object result(PyDict_New()),rows(PyList_New(0));
+        set(result,"complete",PyBool_FromLong(listing.complete));
+        for(const auto& row:listing.backups){Object item(PyDict_New());set(item,"backup",encode_saved_project(row.project));
+            set(item,"created_unix_ms",integer(row.created_unix_ms));append(rows,item.release());}
+        set(result,"backups",rows.release());return result.release();
+    }
+    if(method=="prune_rotated_backups"){
+        count(values,3);const auto base=path(argument(values,0));const auto retain=size(argument(values,1));
+        auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();
+        const auto row=take(without_gil([&]{return p.prune_rotated_backups(base,retain,stop);}));
+        Object result(PyDict_New());set(result,"remaining",integer(row.remaining));set(result,"removed",integer(row.removed));
+        set(result,"retention_satisfied",PyBool_FromLong(row.retention_satisfied));return result.release();
+    }
     if(method=="export"){count(values,1);auto receipt=take(p.export_binary(path(argument(values,0))));Object result(PyDict_New());set(result,"bytes",integer(receipt.bytes));set(result,"revision",integer(receipt.revision));return result.release();}
     if(method=="rename" || method=="comment"){
         count(values,3);auto at=location(argument(values,0));auto value=text(argument(values,1));auto group=number(argument(values,2));
@@ -1251,6 +1295,7 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
 PyMethodDef methods[]={
     {"open",open_project,METH_VARARGS,"Open a versioned native project owner."},
     {"open_archive",open_archive,METH_VARARGS,"Open a bounded, read-only archive owner."},
+    {"restore_backup_in_place",restore_backup_in_place,METH_VARARGS,"Restore a project backup into an existing project path."},
     {"archive_call",call_archive,METH_VARARGS,"Query an archive owner."},
     {"history_call",call_historical_state,METH_VARARGS,"Read an immutable exact-step historical projection."},
     {"create",create_project,METH_VARARGS,"Import input into a real project."},

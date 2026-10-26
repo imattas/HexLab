@@ -6395,7 +6395,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
     };
     // A post-tested loop with an explicit preheader has an initial header-phi
     // edge as well as a recurrent edge. Prove the complete CFG before emitting
-    // either copy sequence; one disjoint body diamond may rejoin before the latch.
+    // either copy sequence; one disjoint body diamond or side return is allowed.
     auto try_ssa_post_tested_loop = [&]() -> std::optional<StructuredPseudocode> {
         if (function.blocks.size() < 3 || function.blocks.size() > 1024) return {};
         std::map<std::uint64_t, std::set<std::uint64_t>> predecessors;
@@ -6436,7 +6436,14 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<const LiftedBlock *> yes, no;
             BlockId yes_tail{}, no_tail{};
         };
+        struct SideReturn {
+            const LiftedBlock *branch = nullptr, *continuation = nullptr;
+            const Branch *condition = nullptr;
+            bool on_true = false;
+            std::vector<const LiftedBlock *> path;
+        };
         std::optional<BodyDiamond> diamond;
+        std::optional<SideReturn> side_return;
         std::vector<const LiftedBlock *> path;
         std::set<std::uint64_t> covered;
         auto *current = entry;
@@ -6453,7 +6460,42 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 const bool yes_back = in_path(*condition->true_target);
                 const bool no_back = in_path(*condition->false_target);
                 if (yes_back != no_back) break;
-                if (yes_back || diamond) return {};
+                if (yes_back || diamond || side_return) return {};
+
+                const auto trace_return = [&](Address target)
+                    -> std::optional<std::vector<const LiftedBlock *>> {
+                    std::vector<const LiftedBlock *> result;
+                    std::set<std::uint64_t> seen;
+                    auto *cursor = find_block(target);
+                    auto predecessor = current->id;
+                    while (cursor && result.size() < 64 && seen.insert(cursor->id.value).second &&
+                           !covered.contains(cursor->id.value) &&
+                           predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor.value}) {
+                        result.push_back(cursor);
+                        if (has_only_terminal_return(*cursor)) return result;
+                        if (contains_return(*cursor) || terminal_conditional(*cursor)) return {};
+                        predecessor = cursor->id;
+                        cursor = linear_successor(*cursor);
+                    }
+                    return {};
+                };
+                const auto yes_return = trace_return(*condition->true_target);
+                const auto no_return = trace_return(*condition->false_target);
+                if (yes_return && no_return) return {};
+                if (yes_return || no_return) {
+                    const bool on_true = yes_return.has_value();
+                    const auto &return_path = on_true ? *yes_return : *no_return;
+                    const auto *continuation = find_block(on_true ? *condition->false_target
+                                                                 : *condition->true_target);
+                    if (!continuation || covered.contains(continuation->id.value) ||
+                        predecessors[continuation->id.value] !=
+                            std::set<std::uint64_t>{current->id.value}) return {};
+                    for (const auto *block : return_path) covered.insert(block->id.value);
+                    side_return = SideReturn{current, continuation, condition, on_true, return_path};
+                    current = continuation;
+                    condition = nullptr;
+                    continue;
+                }
 
                 struct Arm {
                     const LiftedBlock *join = nullptr;
@@ -6518,6 +6560,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             if (branch_position < header_position || branch_position == path.end() ||
                 branch_position + 1 == path.end() || *(branch_position + 1) != diamond->join) return {};
         }
+        if (side_return) {
+            const auto branch_position = std::find(path.begin(), path.end(), side_return->branch);
+            if (branch_position < header_position || branch_position == path.end() ||
+                branch_position + 1 == path.end() ||
+                *(branch_position + 1) != side_return->continuation) return {};
+        }
         const auto *preheader = path[header_offset - 1];
         if (predecessors[header->id.value] != std::set<std::uint64_t>{preheader->id.value, latch->id.value}) return {};
         for (std::size_t i = 1; i < path.size(); ++i) {
@@ -6576,6 +6624,21 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         }
         out << "    bool __hexlab_do_repeat;\n    do {\n";
         for (std::size_t i = header_offset; i < path.size(); ++i) {
+            if (side_return && path[i] == side_return->branch) {
+                emit_block(*side_return->branch, 8, true);
+                const auto predicate = branch_condition_text(*side_return->condition);
+                out << "        if (" << (side_return->on_true ? predicate : "!(" + predicate + ")")
+                    << ") {\n";
+                auto predecessor = side_return->branch->id;
+                for (const auto *block : side_return->path) {
+                    edge_copies(*block, predecessor, 12);
+                    emit_block(*block, 12, true);
+                    predecessor = block->id;
+                }
+                out << "        }\n";
+                edge_copies(*side_return->continuation, side_return->branch->id, 8);
+                continue;
+            }
             if (diamond && path[i] == diamond->branch) {
                 emit_block(*diamond->branch, 8, true);
                 out << "        if (" << branch_condition_text(*diamond->condition) << ") {\n";

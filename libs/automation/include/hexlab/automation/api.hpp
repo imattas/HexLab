@@ -97,6 +97,23 @@ struct ArchiveSymbolRecord {
     std::string name;
     std::size_t member_index = 0;
 };
+struct BackupInfo {
+    database::SavedProject project;
+    std::uint64_t created_unix_ms = 0;
+};
+struct BackupRotationInfo {
+    database::SavedProject backup;
+    std::size_t removed_generations = 0;
+    bool retention_satisfied = true;
+};
+struct BackupPruneInfo {
+    std::size_t remaining = 0, removed = 0;
+    bool retention_satisfied = true;
+};
+struct BackupListInfo {
+    std::vector<BackupInfo> backups;
+    bool complete = true;
+};
 enum class DebugImportKind { symbols, dwarf };
 // Dry-run counts come from the same workspace validator used by the commit.
 // A read-only owner can preview; importing still requires a writable owner.
@@ -213,6 +230,20 @@ public:
     HEXLAB_AUTOMATION_EXPORT Result<std::shared_ptr<const ProjectSnapshot>> analyze(std::stop_token={});
     HEXLAB_AUTOMATION_EXPORT Result<bool> save(std::stop_token={});
     HEXLAB_AUTOMATION_EXPORT Result<database::SavedProject> save_as(const std::filesystem::path&, std::stop_token={});
+    // Consistent restore-point backups preserve project UUID and history.
+    HEXLAB_AUTOMATION_EXPORT Result<database::SavedProject> backup_to(
+        const std::filesystem::path&, bool replace=false, std::stop_token={});
+    HEXLAB_AUTOMATION_EXPORT Result<BackupRotationInfo> backup_to_rotating(
+        const std::filesystem::path& base, std::size_t retain=5, std::stop_token={});
+    HEXLAB_AUTOMATION_EXPORT Result<BackupListInfo> list_rotated_backups(
+        const std::filesystem::path& base, std::stop_token={}) const;
+    HEXLAB_AUTOMATION_EXPORT Result<BackupPruneInfo> prune_rotated_backups(
+        const std::filesystem::path& base, std::size_t retain, std::stop_token={});
+    // Requires all project connections to the target to be closed. The caller
+    // must reopen it to refresh the workspace snapshot after replacement.
+    HEXLAB_AUTOMATION_EXPORT static Result<database::SavedProject> restore_backup_in_place(
+        const std::filesystem::path& backup, const std::filesystem::path& target,
+        std::uint32_t version=api_version, std::stop_token={});
     HEXLAB_AUTOMATION_EXPORT Result<ExportReceipt> export_binary(const std::filesystem::path&, std::stop_token={});
 private:
     Project(std::shared_ptr<database::ProjectStore> store, std::shared_ptr<ProjectSession> session)

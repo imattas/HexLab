@@ -10,6 +10,7 @@
 #include <wx/menu.h>
 #include <wx/msgdlg.h>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <type_traits>
 #include <fstream>
@@ -459,6 +460,15 @@ void CompareView::export_csv() {
         });
         const std::string old_function = match == function_matches_.end() ? std::string{} : match->old_name;
         const std::string new_function = match == function_matches_.end() ? std::string{} : match->new_name;
+        const auto &semantic = body.diff.semantic;
+        for (const auto &[label, value] : std::array<std::pair<const char *, std::uint64_t>, 5>{{
+                 {"Changed opcode facts", semantic.opcode_changes}, {"Changed flow facts", semantic.flow_changes},
+                 {"Changed operand signatures", semantic.operand_changes}, {"Changed effect signatures", semantic.effect_changes},
+                 {"Unclassified changed pairs", semantic.unclassified_changes}}})
+            output << csv_row({"function_semantic_summary", utf8(old_name_), utf8(new_name_), {}, {},
+                wxString::Format("0x%llX", static_cast<unsigned long long>(body.old_entry)).ToStdString(),
+                wxString::Format("0x%llX", static_cast<unsigned long long>(body.new_entry)).ToStdString(), {}, {}, {}, {}, {},
+                old_function, new_function, label, std::to_string(value), {}, {}, {}, {}});
         for (const auto &run : body.diff.runs)
             output << csv_row({"function_instruction_run", utf8(old_name_), utf8(new_name_),
                 utf8(function_diff_kind_text(run.kind)), {},
@@ -566,11 +576,16 @@ void CompareView::show_function_diff(std::size_t index) {
     }
     const auto &diff = found->diff;
     auto summary = wxString::Format(
-        "Instructions: equal %llu; changed %llu; removed %llu; added %llu. Blocks: matched %llu; added %llu; removed %llu; ambiguous %llu.",
+        "Instructions: equal %llu; changed %llu; removed %llu; added %llu. Semantic changes: opcode %llu, flow %llu, operands %llu, effects %llu, unclassified %llu. Blocks: matched %llu; added %llu; removed %llu; ambiguous %llu.",
         static_cast<unsigned long long>(diff.equal_instructions),
         static_cast<unsigned long long>(diff.changed_instructions),
         static_cast<unsigned long long>(diff.removed_instructions),
         static_cast<unsigned long long>(diff.added_instructions),
+        static_cast<unsigned long long>(diff.semantic.opcode_changes),
+        static_cast<unsigned long long>(diff.semantic.flow_changes),
+        static_cast<unsigned long long>(diff.semantic.operand_changes),
+        static_cast<unsigned long long>(diff.semantic.effect_changes),
+        static_cast<unsigned long long>(diff.semantic.unclassified_changes),
         static_cast<unsigned long long>(found->block_correspondence.matched),
         static_cast<unsigned long long>(found->block_correspondence.added),
         static_cast<unsigned long long>(found->block_correspondence.removed),
@@ -584,6 +599,12 @@ void CompareView::show_function_diff(std::size_t index) {
                                                          function_diff_kind_text(run.kind));
         function_diff_runs_->SetItem(row, 1, instruction_range(run.old_start, run.old_count));
         function_diff_runs_->SetItem(row, 2, instruction_range(run.new_start, run.new_count));
+        if (run.semantic.available) function_diff_runs_->SetItem(row, 0,
+            function_diff_kind_text(run.kind) + wxString::Format(" (op %llu, flow %llu, operand %llu, effect %llu)",
+                static_cast<unsigned long long>(run.semantic.opcode_changes),
+                static_cast<unsigned long long>(run.semantic.flow_changes),
+                static_cast<unsigned long long>(run.semantic.operand_changes),
+                static_cast<unsigned long long>(run.semantic.effect_changes)));
     }
     constexpr std::size_t visible_block_rows = 2000;
     const auto &block_rows = found->block_correspondence.blocks;
@@ -597,11 +618,16 @@ void CompareView::show_function_diff(std::size_t index) {
         if (block.instruction_diff_available) {
             const auto &local = block.instruction_diff;
             block_label += wxString::Format(
-                " (instructions equal %llu, changed %llu, removed %llu, added %llu)",
+                " (instructions equal %llu, changed %llu, removed %llu, added %llu; semantic opcode %llu, flow %llu, operands %llu, effects %llu, unclassified %llu)",
                 static_cast<unsigned long long>(local.equal_instructions),
                 static_cast<unsigned long long>(local.changed_instructions),
                 static_cast<unsigned long long>(local.removed_instructions),
-                static_cast<unsigned long long>(local.added_instructions));
+                static_cast<unsigned long long>(local.added_instructions),
+                static_cast<unsigned long long>(local.semantic.opcode_changes),
+                static_cast<unsigned long long>(local.semantic.flow_changes),
+                static_cast<unsigned long long>(local.semantic.operand_changes),
+                static_cast<unsigned long long>(local.semantic.effect_changes),
+                static_cast<unsigned long long>(local.semantic.unclassified_changes));
         } else if (block.instruction_diff_budget_exhausted) {
             block_label += " (instruction diff omitted: budget)";
         }
