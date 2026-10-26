@@ -3,8 +3,10 @@
 `recover_stack_variables` is a source-recovery pass over a lifted function. It
 recognizes negative, constant-offset accesses through the conventional x86
 frame registers (`rbp`/`ebp`) and stack pointer (`rsp`/`esp`), AArch64 frame
-register (`x29`) and stack pointer (`sp`), and AArch32 frame/stack registers
-(`r11`/`sp`). It follows constant register copies and add/sub adjustments,
+register (`x29`) and stack pointer (`sp`), AArch32 frame/stack registers
+(`r11`/`sp`), RISC-V frame pointer (`s0`/`x8`) and stack pointer (`sp`/`x2`),
+MIPS frame pointer (`$fp`/`$s8`/`$30`) and stack pointer (`$sp`/`$29`), and
+PowerPC stack pointer (`r1`) and conventional frame register (`r31`). It follows constant register copies and add/sub adjustments,
 including across blocks, back to one canonical frame-register SSA value. A
 phi is accepted only if all paths resolve to the same canonical register and
 offset. The analysis groups accesses by that canonical identity, checks that

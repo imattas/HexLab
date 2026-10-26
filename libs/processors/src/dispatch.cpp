@@ -272,6 +272,38 @@ ProcessorCapabilities processor_capabilities(DecodeContext context) noexcept {
         return {true, 15, "x86-16 scalar subset", {}};
     return {false, 0, {}, "This architecture and execution mode have no enabled decoder"};
 }
+std::span<const ProcessorVariantInfo> processor_variant_inventory() noexcept {
+    static constexpr std::array variants{
+        ProcessorVariantInfo{"x86-16", {Architecture::x86, ExecutionMode::x86_16, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"x86-32", {Architecture::x86, ExecutionMode::x86_32, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"x86-64", {Architecture::x86_64, ExecutionMode::x86_64, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"a32", {Architecture::arm, ExecutionMode::a32, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"thumb", {Architecture::arm, ExecutionMode::thumb, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"a64", {Architecture::arm64, ExecutionMode::a64, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"rv32", {Architecture::riscv32, ExecutionMode::rv32, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"rv64", {Architecture::riscv64, ExecutionMode::rv64, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"rv64c", {Architecture::riscv64, ExecutionMode::rv64c, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"mips32le", {Architecture::mips32, ExecutionMode::mips32, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"mips32be", {Architecture::mips32, ExecutionMode::mips32, ByteOrder::big}, {}},
+        ProcessorVariantInfo{"mips64le", {Architecture::mips64, ExecutionMode::mips64, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"mips64be", {Architecture::mips64, ExecutionMode::mips64, ByteOrder::big}, {}},
+        ProcessorVariantInfo{"ppc32le", {Architecture::powerpc, ExecutionMode::ppc32, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"ppc32be", {Architecture::powerpc, ExecutionMode::ppc32, ByteOrder::big}, {}},
+        ProcessorVariantInfo{"ppc64le", {Architecture::powerpc, ExecutionMode::ppc64, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"ppc64be", {Architecture::powerpc, ExecutionMode::ppc64, ByteOrder::big}, {}},
+        ProcessorVariantInfo{"6502", {Architecture::mos6502, ExecutionMode::m6502, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"wasm32", {Architecture::wasm, ExecutionMode::wasm32, ByteOrder::little}, {}, false},
+        ProcessorVariantInfo{"dex", {Architecture::dex, ExecutionMode::dex, ByteOrder::little}, {}},
+        ProcessorVariantInfo{"jvm", {Architecture::jvm, ExecutionMode::jvm, ByteOrder::big}, {}}
+    };
+    static const auto inventory = [] {
+        auto result = variants;
+        for (auto &variant : result)
+            variant.capabilities = processor_capabilities(variant.context);
+        return result;
+    }();
+    return inventory;
+}
 DecodeResult decode_instruction(DecodeContext context, std::span<const std::byte> bytes, Address at) {
     auto capability = processor_capabilities(context);
     if (!capability.can_decode)

@@ -44,6 +44,7 @@ std::string pdb_declaration_kind(types::PdbAggregateDeclarationKind kind) {
     case types::PdbAggregateDeclarationKind::static_data: return "static data";
     case types::PdbAggregateDeclarationKind::nested_type: return "nested type";
     case types::PdbAggregateDeclarationKind::method: return "method";
+    case types::PdbAggregateDeclarationKind::vftable_pointer: return "virtual table pointer type";
     }
     return "unknown";
 }

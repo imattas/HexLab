@@ -27,6 +27,7 @@
 #include "hexlab/loaders/macho_link.hpp"
 #include "hexlab/loaders/loader.hpp"
 #include "hexlab/processors/format.hpp"
+#include "hexlab/processors/decoder.hpp"
 #include "hexlab/plugins/runtime.hpp"
 #include "hexlab/decompiler/decompiler.hpp"
 #include "hexlab/decompiler/optimizer.hpp"
@@ -199,6 +200,75 @@ void write_archive_output(const std::filesystem::path &path, std::span<const std
     if (!success) throw std::runtime_error("Cannot finish writing archive member output file");
 #endif
 }
+std::string_view processor_architecture_label(Architecture architecture) {
+    switch (architecture) {
+    case Architecture::x86: return "x86";
+    case Architecture::x86_64: return "x86-64";
+    case Architecture::arm: return "ARM";
+    case Architecture::arm64: return "AArch64";
+    case Architecture::riscv32: return "RISC-V 32";
+    case Architecture::riscv64: return "RISC-V 64";
+    case Architecture::mips32: return "MIPS 32";
+    case Architecture::mips64: return "MIPS 64";
+    case Architecture::powerpc: return "PowerPC";
+    case Architecture::mos6502: return "MOS 6502";
+    case Architecture::wasm: return "WebAssembly";
+    case Architecture::dex: return "Dalvik";
+    case Architecture::jvm: return "JVM";
+    case Architecture::unknown: return "unknown";
+    }
+    return "unknown";
+}
+
+std::string_view processor_mode_label(ExecutionMode mode) {
+    switch (mode) {
+    case ExecutionMode::x86_16: return "16-bit";
+    case ExecutionMode::x86_32: return "32-bit";
+    case ExecutionMode::x86_64: return "64-bit";
+    case ExecutionMode::a32: return "A32";
+    case ExecutionMode::thumb: return "Thumb/Thumb-2";
+    case ExecutionMode::a64: return "A64";
+    case ExecutionMode::rv32: return "RV32";
+    case ExecutionMode::rv64: return "RV64";
+    case ExecutionMode::rv64c: return "RV64C";
+    case ExecutionMode::mips32: return "MIPS32";
+    case ExecutionMode::mips64: return "MIPS64";
+    case ExecutionMode::ppc32: return "32-bit";
+    case ExecutionMode::ppc64: return "64-bit";
+    case ExecutionMode::m6502: return "6502";
+    case ExecutionMode::wasm32: return "wasm32";
+    case ExecutionMode::dex: return "DEX";
+    case ExecutionMode::jvm: return "JVM bytecode";
+    case ExecutionMode::unknown: return "unknown";
+    }
+    return "unknown";
+}
+
+int processors_command(std::span<const std::wstring_view> arguments, std::ostream &out, std::ostream &err) {
+    if (!arguments.empty()) {
+        err << "Usage: hexlab_cli processors\n";
+        return 2;
+    }
+    out << "Decoder variants (bounded subsets; later-layer coverage varies):\n";
+    for (const auto &variant : processor_variant_inventory()) {
+        const auto &capability = variant.capabilities;
+        out << "  " << variant.id << "  " << processor_architecture_label(variant.context.architecture)
+            << " / " << processor_mode_label(variant.context.mode) << " / ";
+        if (variant.byte_order_applicable)
+            out << (variant.context.order == ByteOrder::little ? "little-endian" : "big-endian");
+        else
+            out << "byte order n/a";
+        out << "  " << (capability.can_decode ? "enabled" : "disabled");
+        if (capability.can_decode)
+            out << ", max " << static_cast<unsigned>(capability.max_instruction_bytes) << " bytes, "
+                << capability.display_name;
+        else if (!capability.reason.empty())
+            out << ": " << capability.reason;
+        out << '\n';
+    }
+    return 0;
+}
+
 void usage(std::ostream &out) {
     out << "Usage: hexlab_cli [--help | --version]\n"
            "       hexlab_cli inspect <path> [options]\n"
@@ -208,6 +278,7 @@ void usage(std::ostream &out) {
            "       hexlab_cli modules [--graph] <binary>...  (graph mode traverses dependencies from the first file)\n\n"
            "       hexlab_cli project --help  (persistent projects and editing)\n\n"
            "       hexlab_cli plugins scan <directory> [--json]  (data-only native plugin discovery)\n\n"
+           "       hexlab_cli processors  (supported decoder variants)\n\n"
            "       hexlab_cli archive list <archive>\n"
            "       hexlab_cli archive link-select <archive> --root-object <ET_REL>\n"
            "       hexlab_cli archive link-exec <archive> --root-object <ET_REL> --entry <symbol> --output <ET_EXEC>\n"
@@ -1268,6 +1339,8 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
         return run_project_cli(arguments.subspan(1), out, err);
     if (arguments[0] == L"plugins")
         return plugin_command(arguments.subspan(1), out, err);
+    if (arguments[0] == L"processors")
+        return processors_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"archive")
         return archive_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"jar")

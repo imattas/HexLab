@@ -592,7 +592,45 @@ class Msvc {
             if (!take(table_kind) || !take('B') || !take('@') || at_ != s_.size()) throw Failure{DemangleStatus::malformed};
             return checked(name + (code == '7' ? "::`vftable'" : "::`vbtable'"));
         }
+        if (code == 'G' || code == 'E')
+            return checked(deleting_destructor(code == 'G' ? "`scalar deleting destructor'" : "`vector deleting destructor'"));
         throw Failure{DemangleStatus::unsupported};
+    }
+    std::string deleting_destructor(std::string_view function_name) {
+        const auto owner = qualified_type_name(1);
+        if (at_ >= s_.size()) throw Failure{DemangleStatus::malformed};
+        const auto klass = function_class(s_[at_++]);
+        if (!klass.valid || !klass.member || klass.is_static) throw Failure{DemangleStatus::malformed};
+        std::string this_cv, ref;
+        if (peek() == 'E') ++at_;
+        if (peek() == 'G') { ref = " &"; ++at_; }
+        else if (peek() == 'H') { ref = " &&"; ++at_; }
+        if (at_ >= s_.size()) throw Failure{DemangleStatus::malformed};
+        const char cv = s_[at_++];
+        if (cv == 'R' || cv == 'B') this_cv = " const";
+        else if (cv == 'S' || cv == 'C') this_cv = " volatile";
+        else if (cv == 'T' || cv == 'D') this_cv = " const volatile";
+        else if (cv != 'Q' && cv != 'A') throw Failure{DemangleStatus::unsupported};
+        if (at_ >= s_.size()) throw Failure{DemangleStatus::malformed};
+        const char *call = calling_convention(s_[at_++]);
+        if (!call) throw Failure{DemangleStatus::unsupported};
+        const auto ret = type(0);
+        std::vector<std::string> args;
+        while (at_ < s_.size() && s_[at_] != '@' && s_[at_] != 'Z') {
+            if (args.size() >= limits_.max_components) throw Failure{DemangleStatus::resource_limit};
+            args.push_back(type(0));
+        }
+        if (args.size() == 1 && args.front() == "void") args.clear();
+        if (take('@')) {
+            if (!take('Z')) throw Failure{DemangleStatus::malformed};
+        } else if (!take('Z')) throw Failure{DemangleStatus::malformed};
+        if (at_ != s_.size()) throw Failure{DemangleStatus::malformed};
+        std::string out = klass.access;
+        if (klass.is_virtual) out += " virtual";
+        out += " " + ret + " " + call + " " + owner + "::" + std::string(function_name) + "(";
+        for (std::size_t i = 0; i < args.size(); ++i) { if (i) out += ", "; out += args[i]; }
+        out += ")" + this_cv + ref;
+        return out;
     }
     std::string rtti_type(std::size_t d) {
         depth(d);

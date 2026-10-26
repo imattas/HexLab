@@ -2991,6 +2991,9 @@ bool recognized_frame_register(RegisterOperand reg) {
     return (reg.bank == RegisterBank::gpr && reg.index == 5) ||
            (reg.bank == RegisterBank::arm64_gpr && reg.index == 29) ||
            (reg.bank == RegisterBank::arm32_gpr && reg.index == 11) ||
+           (reg.bank == RegisterBank::riscv_gpr && reg.index == 8) ||
+           (reg.bank == RegisterBank::mips_gpr && reg.index == 30) ||
+           (reg.bank == RegisterBank::ppc_gpr && (reg.index == 1 || reg.index == 31)) ||
            (reg.bank == RegisterBank::gpr && reg.index == 4) ||
            (reg.bank == RegisterBank::arm64_sp && reg.index == 0) ||
            (reg.bank == RegisterBank::arm32_gpr && reg.index == 13) ||
@@ -3002,7 +3005,8 @@ bool is_stack_pointer(RegisterOperand reg) {
            (reg.bank == RegisterBank::arm64_sp && reg.index == 0) ||
            (reg.bank == RegisterBank::arm32_gpr && reg.index == 13) ||
            (reg.bank == RegisterBank::riscv_gpr && reg.index == 2) ||
-           (reg.bank == RegisterBank::mips_gpr && reg.index == 29);
+           (reg.bank == RegisterBank::mips_gpr && reg.index == 29) ||
+           (reg.bank == RegisterBank::ppc_gpr && reg.index == 1);
 }
 
 bool checked_add(std::int64_t left, std::int64_t right, std::int64_t &result) {

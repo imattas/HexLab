@@ -37,10 +37,14 @@ compound assignments, allocation, and deallocation. The bounded MSVC special-nam
 subset also renders vftables (`??_7`), vbtables (`??_8`), RTTI type descriptors
 (`??_R0`), RTTI base-class arrays (`??_R2`), RTTI class-hierarchy descriptors
 (`??_R3`), and RTTI complete-object locators (`??_R4`) when their complete
-terminators and name/type encodings are valid. RTTI base-class descriptors
-(`??_R1`), vcall and adjustment thunks, local tables, and other special names
-remain unsupported because their payloads require additional integer/backreference
-grammar or target-specific adjustment interpretation. It renders recognized
+terminators and name/type encodings are valid. Scalar and vector deleting
+destructor symbols (`??_G` and `??_E`) are also rendered from their member
+function encoding, including access/virtual qualifiers, return type, calling
+convention, and the hidden `unsigned int` parameter when present. RTTI
+base-class descriptors (`??_R1`), vcall and adjustment thunks, local tables,
+and other special names remain unsupported because their payloads require
+additional integer/backreference grammar or target-specific adjustment
+interpretation. It renders recognized
 calling-convention markers. The raw spelling
 remains available in CLI output next to the rendered form.
 

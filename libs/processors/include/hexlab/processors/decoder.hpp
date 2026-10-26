@@ -9,8 +9,17 @@ struct ProcessorCapabilities {
     std::uint8_t max_instruction_bytes = 0;
     std::string_view display_name, reason;
 };
+struct ProcessorVariantInfo {
+    std::string_view id;
+    DecodeContext context;
+    ProcessorCapabilities capabilities;
+    bool byte_order_applicable = true;
+};
 // Static decoder support only, not decompiler/debugger or full-ISA coverage.
 HEXLAB_PROCESSORS_EXPORT ProcessorCapabilities processor_capabilities(DecodeContext) noexcept;
+// Canonical architecture/mode contexts known to the decoder. Each record's
+// capability value is derived from processor_capabilities at first use.
+HEXLAB_PROCESSORS_EXPORT std::span<const ProcessorVariantInfo> processor_variant_inventory() noexcept;
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_instruction(DecodeContext, std::span<const std::byte>, Address);
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_x86_32(std::span<const std::byte>, Address);
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_x86_16(std::span<const std::byte>, Address);
