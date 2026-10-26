@@ -903,6 +903,7 @@ Result<PdbFunctionIdImportResult> import_pdb_function_ids(const PdbIdStream &ids
             continue;
         }
         PdbImportedFunctionId imported_id;
+        imported_id.local_function_type = record.function_type;
         imported_id.index = record.index;
         imported_id.leaf = record.leaf;
         imported_id.kind = record.kind;
@@ -1005,6 +1006,150 @@ Result<PdbFunctionIdImportResult> import_pdb_function_ids(const PdbIdStream &ids
                 ++result.unresolved;
             }
         }
+    }
+    return result;
+}
+
+Result<PdbFunctionIdImportResult> import_pdb_function_ids(const PdbIdStream &root_ids,
+        const std::array<std::byte, 16> &root_guid, std::uint32_t root_age,
+        const PdbTypeServerSet &servers, const PdbTypeGraph &graph,
+        const PdbTypeImportResult &imported) {
+    PdbFunctionIdImportResult result;
+    std::map<std::pair<std::uint8_t, std::uint32_t>, const CodeViewTypeRecord *> types;
+    for (const auto &node : graph.nodes)
+        if (!types.emplace(std::pair{node.name_space, node.record.index}, &node.record).second)
+            return Error{ErrorCode::malformed, "Combined PDB TPI graph has duplicate namespaced indices"};
+
+    const auto selector_map = [](const std::vector<std::pair<std::uint8_t, std::uint8_t>> &mapping,
+                                 std::uint8_t local) -> std::optional<std::uint8_t> {
+        if (!local) return std::uint8_t{0};
+        std::optional<std::uint8_t> value;
+        for (const auto &[from, to] : mapping) if (from == local) {
+            if (value) return {};
+            value = to;
+        }
+        return value;
+    };
+    const auto append = [&](const PdbIdStream &ids, std::uint8_t owner_ns,
+                            const std::array<std::byte, 16> &guid, std::uint32_t age,
+                            const std::vector<std::pair<std::uint8_t, std::uint8_t>> &mapping) -> std::optional<Error> {
+        if (ids.type_index_begin < 0x1000 || ids.type_index_end < ids.type_index_begin ||
+            ids.type_index_end - ids.type_index_begin != ids.records.size())
+            return Error{ErrorCode::malformed, "PDB IPI index range does not match its records"};
+        std::map<std::uint32_t, const CodeViewIdRecord *> id_index;
+        for (std::size_t i = 0; i < ids.records.size(); ++i) {
+            const auto &id = ids.records[i];
+            if (id.index != ids.type_index_begin + i || !id_index.emplace(id.index, &id).second)
+                return Error{ErrorCode::malformed, "PDB IPI records are not uniquely ordered"};
+        }
+        for (const auto &id : ids.records) {
+            PdbImportedFunctionId row;
+            row.owner_guid = guid; row.owner_age = age; row.owner_namespace = owner_ns;
+            row.index = id.index; row.leaf = id.leaf; row.kind = id.kind;
+            row.parent_scope = id.parent_scope; row.class_type = id.class_type;
+            row.local_function_type = id.function_type; row.name = id.name;
+            row.record_offset = id.record_offset; row.record_size = id.record_size;
+            if (id.kind == CodeViewIdKind::unsupported) {
+                ++result.unsupported;
+                row.diagnostic = "Unsupported CodeView IPI leaf retained without a function join";
+                result.records.push_back(std::move(row));
+                continue;
+            }
+            const auto target_ns = selector_map(mapping, static_cast<std::uint8_t>(id.function_type >> 24));
+            row.function_namespace = target_ns.value_or(0xff);
+            const auto target_index = id.function_type & 0x00ffffffu;
+            const auto type = target_ns ? types.find({*target_ns, target_index}) : types.end();
+            if (id.name.empty()) row.diagnostic = "CodeView function ID has an empty name";
+            else if (id.kind == CodeViewIdKind::function && id.parent_scope && !id_index.contains(id.parent_scope))
+                row.diagnostic = "CodeView function ID parent scope is outside its owning IPI stream";
+            else if (id.kind == CodeViewIdKind::function && id.parent_scope &&
+                     id_index.at(id.parent_scope)->kind != CodeViewIdKind::function &&
+                     id_index.at(id.parent_scope)->kind != CodeViewIdKind::member_function)
+                row.diagnostic = "CodeView function ID parent scope is not a supported function ID";
+            else if (!target_ns) row.diagnostic = "CodeView function ID targets an unmapped or ambiguous TPI namespace";
+            else if (type == types.end()) row.diagnostic = "CodeView function ID target type is missing from the exact TPI namespace";
+            else if ((id.kind == CodeViewIdKind::function && type->second->kind != CodeViewTypeKind::procedure) ||
+                     (id.kind == CodeViewIdKind::member_function && type->second->kind != CodeViewTypeKind::member_function))
+                row.diagnostic = "CodeView function ID refers to the wrong TPI record kind";
+            else if (id.kind == CodeViewIdKind::member_function) {
+                const auto owner_ns_target = selector_map(mapping, static_cast<std::uint8_t>(id.class_type >> 24));
+                const auto owner_idx = id.class_type & 0x00ffffffu;
+                const auto member_class_ns = selector_map(mapping,
+                    static_cast<std::uint8_t>(type->second->member_class_type >> 24));
+                const auto member_class_idx = type->second->member_class_type & 0x00ffffffu;
+                const auto owner = owner_ns_target ? types.find({*owner_ns_target, owner_idx}) : types.end();
+                const auto function_owner = member_class_ns ? types.find({*member_class_ns, member_class_idx}) : types.end();
+                if (owner == types.end() || function_owner == types.end())
+                    row.diagnostic = "CodeView member-function owner is missing or unmapped";
+                else if (*owner_ns_target != *member_class_ns || owner_idx != member_class_idx)
+                    row.diagnostic = "CodeView member-function ID owner disagrees with LF_MFUNCTION";
+                else if (owner->second->kind != CodeViewTypeKind::class_type &&
+                         owner->second->kind != CodeViewTypeKind::structure &&
+                         owner->second->kind != CodeViewTypeKind::union_type)
+                    row.diagnostic = "CodeView member-function owner is not an aggregate";
+                else if (!imported.function_types.contains({*target_ns, target_index}))
+                    row.diagnostic = "CodeView function signature is unavailable in the project type model";
+                else row.signature = imported.function_types.at({*target_ns, target_index});
+            } else if (!imported.function_types.contains({*target_ns, target_index}))
+                row.diagnostic = "CodeView function signature is unavailable in the project type model";
+            else row.signature = imported.function_types.at({*target_ns, target_index});
+            row.resolved = row.signature != nullptr;
+            if (!row.resolved) ++result.unresolved;
+            result.records.push_back(std::move(row));
+        }
+        // Parent scopes are local to each IPI stream. Mark every member of a
+        // detected cycle unresolved without allowing one server's IDs to alias another's.
+        std::map<std::uint32_t, std::size_t> row_by_index;
+        for (std::size_t i = result.records.size(); i > 0; --i) {
+            const auto &row = result.records[i - 1];
+            if (row.owner_namespace == owner_ns && row.owner_guid == guid && row.owner_age == age)
+                row_by_index.emplace(row.index, i - 1);
+        }
+        std::vector<std::uint8_t> state(ids.records.size(), 0);
+        for (std::size_t start = 0; start < ids.records.size(); ++start) {
+            if (state[start]) continue;
+            std::vector<std::size_t> path;
+            auto current = ids.records[start].index;
+            bool cycle = false;
+            for (;;) {
+                if (current < ids.type_index_begin || current >= ids.type_index_end) break;
+                const auto offset = static_cast<std::size_t>(current - ids.type_index_begin);
+                if (state[offset] == 2) break;
+                if (state[offset] == 1) { cycle = true; break; }
+                const auto found = id_index.find(current);
+                if (found == id_index.end() || found->second->kind != CodeViewIdKind::function) break;
+                state[offset] = 1; path.push_back(offset);
+                current = found->second->parent_scope;
+                if (!current) break;
+            }
+            for (const auto offset : path) {
+                state[offset] = 2;
+                if (!cycle) continue;
+                const auto row = row_by_index.find(ids.records[offset].index);
+                if (row != row_by_index.end() && result.records[row->second].resolved) {
+                    auto &affected = result.records[row->second];
+                    affected.signature.reset(); affected.resolved = false;
+                    affected.diagnostic = "CodeView function ID parent-scope cycle";
+                    ++result.unresolved;
+                }
+            }
+        }
+        return {};
+    };
+    auto root = append(root_ids, 0, root_guid, root_age, servers.root_namespace_map);
+    if (root) return *root;
+    for (const auto &server : servers.namespaces) {
+        auto ids = parse_pdb_ids(server.database);
+        if (!ids) {
+            // Keep the exact server identity visible even when its IPI stream is absent or malformed.
+            PdbImportedFunctionId row;
+            row.owner_guid = server.request.guid; row.owner_age = server.request.age;
+            row.owner_namespace = server.index; row.diagnostic = ids.error().message;
+            ++result.unresolved; result.records.push_back(std::move(row));
+            continue;
+        }
+        auto added = append(ids.value(), server.index, server.request.guid, server.request.age, server.namespace_map);
+        if (added) return *added;
     }
     return result;
 }

@@ -85,6 +85,11 @@ struct PdbDataSymbolImportResult {
 };
 
 struct PdbImportedFunctionId {
+    std::array<std::byte, 16> owner_guid{};
+    std::uint32_t owner_age = 0;
+    std::uint8_t owner_namespace = 0;
+    std::uint8_t function_namespace = 0;
+    std::uint32_t local_function_type = 0;
     std::uint32_t index = 0;
     std::uint16_t leaf = 0;
     CodeViewIdKind kind = CodeViewIdKind::unsupported;
@@ -114,6 +119,11 @@ HEXLAB_TYPES_EXPORT Result<PdbTypeImportResult> import_pdb_type_graph(const PdbT
 // or mismatched references are retained as unresolved records with diagnostics.
 HEXLAB_TYPES_EXPORT Result<PdbFunctionIdImportResult> import_pdb_function_ids(
     const PdbIdStream &ids, const PdbTypeStream &types, const PdbTypeImportResult &imported);
+// Imports root and exact-identity type-server IPI streams. Type references use
+// the combined graph's namespace selectors; unresolved joins remain explicit.
+HEXLAB_TYPES_EXPORT Result<PdbFunctionIdImportResult> import_pdb_function_ids(
+    const PdbIdStream &root_ids, const std::array<std::byte, 16> &root_guid, std::uint32_t root_age,
+    const PdbTypeServerSet &servers, const PdbTypeGraph &graph, const PdbTypeImportResult &imported);
 // Joins parsed CodeView data-symbol rows to exact converted TPI records. It
 // does not pair by displayed name; unresolved or unsupported TPI references
 // remain visible with a per-row diagnostic.
