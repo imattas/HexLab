@@ -21,11 +21,42 @@ path to all valuations while the predicate-false path retains its prior
 valuations. Calls conservatively widen the continuing executed path because
 the callee may change flags. Terminal returns, traps, unsupported PC writes,
 and unresolved transfers retain guarded stops and possible skip edges. The
-model does not evaluate flag-producing instruction semantics, so it prunes
+A32/Thumb model does not evaluate flag-producing instruction semantics, so it prunes
 only contradictions implied by known predicate conditions. Unknown Thumb IT
 state remains conservative and does not narrow conditions. Shared block CFGs
 publish the union of edges reachable by their owners; per-owner edge filtering
 is not represented in the public CFG.
+
+AArch64 `B.cond` edges likewise constrain the possible NZCV nibbles, and
+decoded NZCV writes invalidate the old flag facts. A bounded scalar refinement
+then evaluates `ADDS`, `SUBS`, and `ANDS` (including `CMP`, `CMN`, and `TST`
+aliases) when their operands are proven. Arithmetic computes N/Z/C/V at the
+actual W/X width, including no-borrow C for subtraction; `ANDS` sets C/V to
+zero. `CCMP`/`CCMN` retain the encoded fallback nibble on a false condition and
+use the proven arithmetic flags on a true condition. An unknown arithmetic
+arm widens only that arm. The resulting flag sets flow through later blocks
+and conditional compares, so contradictory branch paths do not acquire
+trusted function ownership or establish callees.
+
+The refinement carries full X values from `MOVZ`/`MOVN`/`MOVK`, supported
+immediate and shifted-register add/subtract/logic forms, and conditional
+selects whose possible values agree. W writes zero-extend. A register value
+survives a join only when every discovered predecessor proves the same full
+value. Calls, opaque operations, function/chunk entries, differing execution
+contexts, and relocated operands discard the relevant proof. Stack pointers
+and memory contents are not treated as constants. Proven operands also prune
+`CBZ`/`CBNZ` and `TBZ`/`TBNZ` edges; otherwise both edges remain possible.
+This follows the scalar flag behavior in the
+[Arm A64 reference](https://documentation-service.arm.com/static/68da52dfbd7cab51328c0622).
+
+The pass is capped at 100,000 A64 instructions and 500,000 edges and solves only acyclic
+predecessor dependencies. Cyclic or incomplete regions retain local-only
+zero-register and identical-register proofs; they do not inherit speculative
+constants. Initial discovery still follows conservative paths before this
+refinement. Consequently, an overlap encountered during discovery remains a
+reported conflict even if a later proof excludes that path. The pass does not
+infer runtime memory values, floating-point flags, loop-carried constants, or
+general symbolic relationships between different unknown registers.
 
 Validated PE TLS callback entries are also roots because the loader invokes
 them independently of the image entry point. Callback RVAs are translated

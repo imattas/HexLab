@@ -261,10 +261,32 @@ register-passed arguments with matching ABI slot maps and complete structures
 up to 1 MiB. It copies only supported scalar and pointer fields, caps arrays at
 4096 elements and nested pointee depth at four, with a separate one-million-
 item per-function transfer budget and a cap of 4096 distinct caller values.
-Stack-passed pointer layouts, unions, unsupported field kinds, and pointers with
-unresolved named pointee definitions remain
-unsupported. All propagated shapes remain heuristic observations and do not
+Unions, unsupported field kinds, and pointers with unresolved named pointee
+definitions remain unsupported. All propagated shapes remain heuristic observations and do not
 establish a confirmed source declaration.
+
+Stack-passed pointer-to-structure shapes also flow from callers into an
+unprototyped callee. The existing ABI slot map, matching pointer width, exact
+same-block reaching store, and unanimous compatible caller types must prove
+the argument first. The callee must load that exact nonoverlapping entry-relative
+slot at pointer width into a full-width register. Only loads that still observe
+incoming memory (whole-memory version zero or a proven slot partition at version
+zero) receive the shape, so a reload after a slot overwrite does not inherit
+incoming argument fields. Constant stack aliases and each ABI's explicit call
+stack adjustment use the same proof as scalar stack arguments. This works with
+the configured integer/pointer stack slots, including x86 cdecl and Windows x64;
+no source parameter order is guessed for an ABI that cannot establish it.
+
+The transferred fields use the existing bounded layout merge rather than an
+exact type replacement. A callee's compatible local field observations can
+therefore add to the caller's shape, while conflicting widths suppress its
+aggregate inference. Explicit callee prototypes remain authoritative. Conflicting
+caller layouts, unknown nonrecursive callers, overlapping slot reads, unknown
+stores, dynamic stack addresses, and non-pointer-width transfers leave the shape
+unresolved. Each slot retains at most 4096 distinct loaded SSA values, within
+the existing 4096-value and one-million-item per-function transfer limits. This
+shape consensus participates in the same bounded call-component fixed point as
+parameter and return types.
 The pass caps the function set at 4,096, aggregate blocks at 100,000,
 instructions at 500,000, direct call edges at 250,000, tracked ABI registers
 at 256, and iterations at 32. Existing locally recovered parameter types are

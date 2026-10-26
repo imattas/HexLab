@@ -2468,9 +2468,9 @@ static Result<TypeRecoveryResult> recover_types_impl(
     if (pointer_layout_nonconvergent)
         result.diagnostics.push_back("pointer alias field propagation did not converge; aggregate layouts suppressed");
     if (applied_call_pointee_layout)
-        result.diagnostics.push_back("bounded pointee field evidence from compatible direct callees was applied to caller values");
+        result.diagnostics.push_back("bounded pointee field evidence from compatible call arguments was applied to SSA values");
     if (call_layout_budget_exhausted)
-        result.diagnostics.push_back("direct-call pointee layout propagation reached its work limit; remaining caller layouts were left unchanged");
+        result.diagnostics.push_back("call-argument pointee layout propagation reached its work limit; remaining SSA layouts were left unchanged");
     auto parameter_index = [&](const Fact &fact) -> std::optional<std::size_t> {
         if (!fact.constrained && !parameter_evidence.contains(key(fact.reg, fact.version))) return {};
         if (!fact.version || *fact.version != 0) return {};
@@ -4283,6 +4283,10 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
     };
 
     std::vector<std::vector<types::TypePtr>> constraints(count);
+    // Shape evidence is deliberately separate from exact parameter types:
+    // a callee's local pointer observations may describe only a subset of the
+    // caller's pointee. Merge fields instead of replacing that local type.
+    std::vector<std::vector<types::TypePtr>> stack_pointee_constraints(count);
     std::vector<std::vector<types::TypePtr>> baseline_parameter_types(count);
     std::vector<TypeRecoveryResult> current(count);
     for (std::size_t i = 0; i < count; ++i) {
@@ -4294,6 +4298,7 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         if (!recovered) return recovered.error();
         current[i] = std::move(recovered.value());
         constraints[i].resize(abi_slots[i].size());
+        stack_pointee_constraints[i].resize(abi_slots[i].size());
         baseline_parameter_types[i].resize(abi_slots[i].size());
         for (std::size_t slot = 0; slot < abi_slots[i].size(); ++slot) {
             if (!abi_slots[i][slot].reg) {
@@ -4368,6 +4373,69 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         return {};
     };
 
+    struct StackParameterLoads {
+        std::uint16_t bits = 0;
+        std::vector<RegisterValue> values;
+        bool values_complete = true;
+    };
+    const auto stack_parameter_loads = [&](const LiftedFunction &function,
+            const AbiDescription &abi, std::int64_t wanted) -> std::optional<StackParameterLoads> {
+        if (!abi.stack_argument_base) return {};
+        std::vector<PointerAlias> aliases;
+        for (const auto &block : function.blocks)
+            for (const auto &instruction : block.instructions)
+                if (const auto *assignment = std::get_if<Assign>(&instruction.statement))
+                    if (auto alias = pointer_alias(*assignment)) aliases.push_back(*alias);
+        StackParameterLoads result;
+        std::set<Key> loaded_keys;
+        std::vector<std::pair<std::int64_t, std::uint16_t>> layout;
+        for (const auto &block : function.blocks)
+            for (const auto &instruction : block.instructions) {
+                const auto *assignment = std::get_if<Assign>(&instruction.statement);
+                const auto *memory = assignment && assignment->value
+                    ? std::get_if<MemoryValue>(&assignment->value->value) : nullptr;
+                if (!memory || !memory->base || memory->index || memory->absolute ||
+                    !memory->type.bits || memory->type.bits % 8) continue;
+                const auto canonical = canonical_stack_address(
+                    key(*memory->base, memory->base_version), aliases);
+                if (!canonical || (canonical->first != key(*abi.stack_argument_base) &&
+                                   canonical->first != key(*abi.stack_argument_base, 0))) continue;
+                std::int64_t offset = 0;
+                if (!checked_add(canonical->second, memory->displacement, offset)) continue;
+                const auto bits = memory->type.bits;
+                layout.emplace_back(offset, bits);
+                if (offset != wanted) continue;
+                if (result.bits && result.bits != bits) return {};
+                result.bits = bits;
+                // A later reload of an overwritten argument slot is a local
+                // memory value, not the incoming call argument. A proven
+                // partition can remain at version zero despite unrelated
+                // prologue stores; otherwise require incoming whole memory.
+                const bool incoming_memory = memory->memory_partition && !memory->memory_partition->empty() &&
+                        memory->memory_partition_version
+                    ? *memory->memory_partition_version == 0
+                    : memory->memory_version && *memory->memory_version == 0;
+                if (!incoming_memory || assignment->destination.width != bits) continue;
+                const auto loaded_key = key(assignment->destination, assignment->destination_version);
+                if (!result.values_complete || !loaded_keys.insert(loaded_key).second) continue;
+                if (result.values.size() == 4096) {
+                    result.values.clear();
+                    result.values_complete = false;
+                    continue;
+                }
+                result.values.push_back({assignment->destination, assignment->destination_version});
+            }
+        if (!result.bits) return {};
+        const auto bytes = static_cast<std::int64_t>(result.bits / 8);
+        for (const auto &[offset, bits] : layout) {
+            if (offset == wanted) continue;
+            std::int64_t end = 0, wanted_end = 0;
+            if (!checked_add(offset, bits / 8, end) || !checked_add(wanted, bytes, wanted_end)) return {};
+            if (offset < wanted_end && wanted < end) return {};
+        }
+        return result;
+    };
+
     bool converged = false;
     for (std::uint32_t iteration = 0; iteration < max_iterations; ++iteration) {
         std::vector<LiftedFunction> prepared = raw;
@@ -4431,6 +4499,30 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                         KnownTypedRegister{incoming, hidden->pointer_type});
                     known_input_keys.insert(incoming_key);
                     known_inputs.push_back(incoming);
+                }
+            }
+            if (!explicit_prototypes[i]) {
+                for (std::size_t slot_index = 0; slot_index < abi_slots[i].size(); ++slot_index) {
+                    const auto &slot = abi_slots[i][slot_index];
+                    const auto &type = stack_pointee_constraints[i][slot_index];
+                    if (!slot.supported || slot.reg || !slot.stack_offset || !type) continue;
+                    const auto loads = stack_parameter_loads(converted.value(), abis[i], *slot.stack_offset);
+                    if (!loads || loads->bits != abis[i].pointer_bits) continue;
+                    if (!loads->values_complete) {
+                        typed_argument_budget_exhausted = true;
+                        continue;
+                    }
+                    for (const auto &loaded : loads->values) {
+                        const auto actual_key = key(loaded.reg, loaded.version);
+                        if (!typed_argument_candidates.contains(actual_key) && typed_argument_candidates.size() >= 4096) {
+                            typed_argument_budget_exhausted = true;
+                            continue;
+                        }
+                        const auto [candidate, inserted] = typed_argument_candidates.emplace(
+                            actual_key, KnownTypedRegister{loaded, type});
+                        if (!inserted && !same_type(candidate->second.type, type))
+                            ambiguous_typed_arguments.insert(actual_key);
+                    }
                 }
             }
             for (const auto &block : converted.value().blocks) for (std::size_t instruction_index = 0;
@@ -4560,7 +4652,7 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                                             known_inputs, known_argument_types);
             if (!typed) return typed.error();
             if (typed_argument_budget_exhausted)
-                typed.value().diagnostics.push_back("direct-call parameter type propagation reached its 4,096-value per-function limit");
+                typed.value().diagnostics.push_back("call-argument type propagation reached its 4,096-value per-function limit");
             current_ssa.push_back(std::move(converted.value()));
             recovered.push_back(std::move(typed.value()));
         }
@@ -4576,45 +4668,13 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         // A stack slot in the ABI map is only a location candidate. Require
         // the callee body to load that exact entry-relative slot at one
         // consistent width before accepting caller evidence for it.
-        const auto callee_stack_load_bits = [&](std::size_t callee, std::int64_t wanted)
-                -> std::optional<std::uint16_t> {
-            const auto &abi = abis[callee];
-            if (!abi.stack_argument_base) return {};
-            std::vector<PointerAlias> aliases;
-            for (const auto &block : current_ssa[callee].blocks)
-                for (const auto &instruction : block.instructions)
-                    if (const auto *assignment = std::get_if<Assign>(&instruction.statement))
-                        if (auto alias = pointer_alias(*assignment)) aliases.push_back(*alias);
-            std::optional<std::uint16_t> observed;
-            std::vector<std::pair<std::int64_t, std::uint16_t>> layout;
-            for (const auto &block : current_ssa[callee].blocks)
-                for (const auto &instruction : block.instructions) {
-                    const auto *assignment = std::get_if<Assign>(&instruction.statement);
-                    const auto *memory = assignment && assignment->value
-                        ? std::get_if<MemoryValue>(&assignment->value->value) : nullptr;
-                    if (!memory || !memory->base || memory->index || memory->absolute ||
-                        !memory->type.bits || memory->type.bits % 8) continue;
-                    const auto canonical = canonical_stack_address(
-                        key(*memory->base, memory->base_version), aliases);
-                    if (!canonical || (canonical->first != key(*abi.stack_argument_base) &&
-                                       canonical->first != key(*abi.stack_argument_base, 0))) continue;
-                    std::int64_t offset = 0;
-                    if (!checked_add(canonical->second, memory->displacement, offset)) continue;
-                    const auto bits = memory->type.bits;
-                    layout.emplace_back(offset, bits);
-                    if (offset != wanted) continue;
-                    if (observed && *observed != bits) return {};
-                    observed = bits;
-                }
-            if (!observed) return {};
-            const auto bytes = static_cast<std::int64_t>(*observed / 8);
-            for (const auto &[offset, bits] : layout) {
-                if (offset == wanted || !bits || bits % 8) continue;
-                std::int64_t end = 0, wanted_end = 0;
-                if (!checked_add(offset, bits / 8, end) || !checked_add(wanted, bytes, wanted_end)) return {};
-                if (offset < wanted_end && wanted < end) return {};
-            }
-            return observed;
+        std::vector<std::map<std::int64_t, std::optional<StackParameterLoads>>> stack_load_cache(count);
+        const auto callee_stack_loads = [&](std::size_t callee, std::int64_t offset)
+                -> const std::optional<StackParameterLoads> & {
+            auto [cached, inserted] = stack_load_cache[callee].try_emplace(offset);
+            if (inserted)
+                cached->second = stack_parameter_loads(current_ssa[callee], abis[callee], offset);
+            return cached->second;
         };
         const auto stack_call_argument_type = [&](std::size_t caller, const LiftedBlock &block,
                 std::size_t call_position, const Call &call, const AbiArgumentSlot &slot) -> types::TypePtr {
@@ -4691,8 +4751,8 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                             candidate.valid = false;
                             continue;
                         }
-                        const auto loaded_bits = callee_stack_load_bits(callee, *callee_slot.stack_offset);
-                        if (!loaded_bits) {
+                        const auto &loads = callee_stack_loads(callee, *callee_slot.stack_offset);
+                        if (!loads) {
                             candidate.valid = false;
                             continue;
                         }
@@ -4701,7 +4761,7 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                             if (!cycle) candidate.valid = false;
                             continue;
                         }
-                        if (type_bits(type) != *loaded_bits) {
+                        if (type_bits(type) != loads->bits) {
                             candidate.valid = false;
                             continue;
                         }
@@ -4743,11 +4803,28 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         }
 
         std::vector<std::vector<types::TypePtr>> next_constraints(count);
+        std::vector<std::vector<types::TypePtr>> next_stack_pointee_constraints(count);
         for (std::size_t callee = 0; callee < count; ++callee) {
             next_constraints[callee].resize(abi_slots[callee].size());
+            next_stack_pointee_constraints[callee].resize(abi_slots[callee].size());
             if (explicit_prototypes[callee]) continue;
             for (std::size_t slot = 0; slot < abi_slots[callee].size(); ++slot) {
                 const auto &value = consensus[callee][slot];
+                const auto argument_type = unqualified_type(value.type);
+                const auto pointee = argument_type && argument_type->kind() == types::Kind::pointer
+                    ? unqualified_type(argument_type->element()) : types::TypePtr{};
+                if (value.valid && value.saw_type && abi_slots[callee][slot].supported &&
+                    abi_slots[callee][slot].stack_offset && !abi_slots[callee][slot].reg &&
+                    abi_slots[callee][slot].value_class == AbiValueClass::integer &&
+                    argument_type && type_bits(argument_type) == abis[callee].pointer_bits &&
+                    pointee && pointee->kind() == types::Kind::structure) {
+                    const auto &loads = callee_stack_loads(callee, *abi_slots[callee][slot].stack_offset);
+                    if (loads && loads->values_complete && !loads->values.empty())
+                        next_stack_pointee_constraints[callee][slot] = value.type;
+                    else if (loads && !loads->values_complete)
+                        recovered[callee].diagnostics.push_back(
+                            "stack-argument pointee propagation reached its 4,096-loaded-value limit");
+                }
                 if (value.valid && value.saw_type &&
                     (!baseline_parameter_types[callee][slot] ||
                      same_type(baseline_parameter_types[callee][slot], value.type)))
@@ -4760,6 +4837,14 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
             for (std::size_t n = 0; n < constraints[i].size(); ++n)
                 if (!same_type(constraints[i][n], next_constraints[i][n])) { constraints_stable = false; break; }
         }
+        bool stack_pointee_constraints_stable = true;
+        for (std::size_t i = 0; i < count; ++i) {
+            for (std::size_t n = 0; n < stack_pointee_constraints[i].size(); ++n)
+                if (!same_type(stack_pointee_constraints[i][n], next_stack_pointee_constraints[i][n])) {
+                    stack_pointee_constraints_stable = false;
+                    break;
+                }
+        }
         bool returns_stable = true;
         for (std::size_t i = 0; i < count; ++i)
             if (!same_type(current[i].return_type, recovered[i].return_type) ||
@@ -4768,7 +4853,11 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
             }
         current = std::move(recovered);
         constraints = std::move(next_constraints);
-        if (constraints_stable && returns_stable) { converged = true; break; }
+        stack_pointee_constraints = std::move(next_stack_pointee_constraints);
+        if (constraints_stable && stack_pointee_constraints_stable && returns_stable) {
+            converged = true;
+            break;
+        }
     }
     if (!converged)
         for (auto &result : current)

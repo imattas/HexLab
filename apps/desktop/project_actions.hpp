@@ -24,7 +24,10 @@ enum ProjectActionId {
     exchange_import_id,
     patch_manager_id,
     backup_project_id,
-    restore_backup_id
+    restore_backup_id,
+    rotate_backups_id,
+    list_backups_id,
+    prune_backups_id
 };
 class ProjectActions {
   public:

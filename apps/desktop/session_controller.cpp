@@ -4,6 +4,7 @@
 #include <chrono>
 #include <new>
 #include <system_error>
+#include <type_traits>
 namespace hexlab::desktop {
 namespace {
 template <class T> T take(Result<T> result) {
@@ -41,6 +42,12 @@ SessionController::~SessionController() {
     if (backup_restore_ && backup_restore_->result.valid())
         backup_restore_->result.wait();
     backup_restore_.reset();
+    for (auto &job : backup_management_)
+        job.cancellation->request_stop();
+    for (auto &job : backup_management_)
+        if (job.result.valid())
+            job.result.wait();
+    backup_management_.clear();
     for (auto &scan : recovery_scans_)
         scan.cancellation->request_stop();
     for (auto &scan : recovery_scans_)
@@ -241,6 +248,67 @@ Result<ProjectOperationId> SessionController::backup_to(DocumentId id, std::file
                                              : database::ReplacePolicy::fail_if_exists);
     }, false);
 }
+Result<bool> SessionController::start_backup_management(DocumentId id, BackupManagementKind kind,
+                                                        std::size_t retain) {
+    auto &jobs = backup_management_;
+    if (std::any_of(jobs.begin(), jobs.end(), [id](const auto &job) { return job.document == id; }))
+        return Error{ErrorCode::busy, "Wait for the current backup operation to finish"};
+    std::optional<std::filesystem::path> path;
+    for (const auto &document : documents().documents())
+        if (document.id == id)
+            path = document.path;
+    if (!path)
+        return Error{ErrorCode::unsupported, "Save the project before managing rotated backups"};
+    if ((kind == BackupManagementKind::rotate || kind == BackupManagementKind::prune) &&
+        (retain == 0 || retain > 32))
+        return Error{ErrorCode::invalid_argument, "Backup retention must be from 1 through 32"};
+    try {
+        auto base_name = path->stem().native();
+        base_name += std::filesystem::path("-backups").native();
+        base_name += path->extension().native();
+        auto backup_base = path->parent_path() / std::filesystem::path(std::move(base_name));
+        auto cancellation = std::make_shared<std::stop_source>();
+        const auto token = cancellation->get_token();
+        auto result = std::async(std::launch::async,
+            [path = std::move(*path), base = std::move(backup_base), kind, retain, token]()
+                -> Result<BackupManagementResult> {
+                auto opened = database::ProjectStore::open(path, database::ProjectMode::read_only, token);
+                if (!opened)
+                    return opened.error();
+                if (kind == BackupManagementKind::rotate) {
+                    auto value = opened.value()->backup_to_rotating(base, retain, token);
+                    if (!value)
+                        return value.error();
+                    return BackupManagementResult{std::move(value.value())};
+                }
+                if (kind == BackupManagementKind::list) {
+                    auto value = opened.value()->list_rotated_backups(base, token);
+                    if (!value)
+                        return value.error();
+                    return BackupManagementResult{std::move(value.value())};
+                }
+                auto value = opened.value()->prune_rotated_backups(base, retain, token);
+                if (!value)
+                    return value.error();
+                return BackupManagementResult{std::move(value.value())};
+            });
+        jobs.push_back({id, std::move(cancellation), std::move(result)});
+        return true;
+    } catch (const std::system_error &error) {
+        return Error{ErrorCode::resource_limit, error.what()};
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot start backup management"};
+    }
+}
+Result<bool> SessionController::rotate_backups(DocumentId id, std::size_t retain) {
+    return start_backup_management(id, BackupManagementKind::rotate, retain);
+}
+Result<bool> SessionController::list_backups(DocumentId id) {
+    return start_backup_management(id, BackupManagementKind::list, 0);
+}
+Result<bool> SessionController::prune_backups(DocumentId id, std::size_t retain) {
+    return start_backup_management(id, BackupManagementKind::prune, retain);
+}
 Result<bool> SessionController::restore_backup(std::filesystem::path source, std::filesystem::path destination,
                                                bool replace, AnalysisOptions options) {
     if (backup_restore_)
@@ -343,6 +411,50 @@ void SessionController::poll() {
                 message(opened.value(), "Restored backup as a new project: " + wxString(restored.value().path.wstring()));
         }
         changed = true;
+    }
+    for (auto it = backup_management_.begin(); it != backup_management_.end();) {
+        if (it->result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+            ++it;
+            continue;
+        }
+        Result<BackupManagementResult> result = Error{ErrorCode::io, "Backup management failed"};
+        try {
+            result = it->result.get();
+        } catch (const std::bad_alloc &) {
+            result = Error{ErrorCode::resource_limit, "Backup management ran out of memory"};
+        } catch (const std::exception &error) {
+            result = Error{ErrorCode::io, error.what()};
+        } catch (...) {
+            result = Error{ErrorCode::io, "Unknown backup management failure"};
+        }
+        const auto document = it->document;
+        it = backup_management_.erase(it);
+        changed = true;
+        if (!result) {
+            manager_->report_error(document, result.error());
+            continue;
+        }
+        if (!message)
+            continue;
+        std::visit([&](const auto &value) {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, database::BackupRotationResult>) {
+                message(document, wxString("Created rotated backup: ") + wxString(value.backup.path.wstring()) +
+                    wxString::Format(" (%zu older generations removed%s).", value.removed_generations,
+                    value.retention_satisfied ? "" : "; retention limit was not fully met"));
+            } else if constexpr (std::is_same_v<T, database::BackupListing>) {
+                wxString summary = wxString::Format("Rotated backups (%zu listed%s):\n", value.backups.size(),
+                    value.complete ? "" : ", scan incomplete");
+                for (const auto &row : value.backups)
+                    summary += wxString(row.backup.path.filename().wstring()) + "\n";
+                if (value.backups.empty())
+                    summary += "No rotated backups found.";
+                message(document, std::move(summary));
+            } else {
+                message(document, wxString::Format("Pruned %zu rotated backups; %zu remain%s.", value.removed,
+                    value.remaining, value.retention_satisfied ? "" : " (retention limit was not fully met)"));
+            }
+        }, result.value());
     }
     for (auto document = receipts_.begin(); document != receipts_.end();) {
         DocumentId id{document->first};

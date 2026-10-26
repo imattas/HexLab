@@ -923,7 +923,8 @@ Result<PeFh4ExceptionPlan> plan_pe_fh4_exception(const PeMetadata &metadata, std
     }
     if (effective_kind == PeFh4ExceptionKind::non_cxx && fh4.has_ehs_flag) {
         plan.dispatch = PeFh4DispatchDisposition::continue_search;
-        plan.dispatch_source = fh4.source;
+        plan.dispatch_source = fh4.ehs_flag_source ? fh4.ehs_flag_source
+                                                   : std::optional<PeRecordSource>{fh4.source};
         plan.dispatch_diagnostic = "FH4 EHs metadata handles C++ exceptions only";
         return plan;
     }
@@ -969,12 +970,14 @@ Result<PeFh4ExceptionPlan> plan_pe_fh4_exception(const PeMetadata &metadata, std
     }
     if (uncertain_match || effective_kind == PeFh4ExceptionKind::unknown) {
         plan.dispatch = PeFh4DispatchDisposition::ambiguous;
-        plan.dispatch_source = fh4.source;
+        plan.dispatch_source = (fh4.has_ehs_flag && fh4.ehs_flag_source)
+            ? fh4.ehs_flag_source : std::optional<PeRecordSource>{fh4.source};
         plan.dispatch_diagnostic = "FH4 catch matching requires exception kind/type or unsupported type semantics";
     } else if (effective_kind == PeFh4ExceptionKind::cxx && fh4.is_noexcept && !fh4.is_catch_funclet) {
         plan.dispatch = PeFh4DispatchDisposition::terminate_noexcept;
         plan.dispatch_diagnostic = "C++ exception has no provable active handler in a noexcept function";
-        plan.dispatch_source = fh4.source;
+        plan.dispatch_source = fh4.noexcept_flag_source ? fh4.noexcept_flag_source
+                                                        : std::optional<PeRecordSource>{fh4.source};
     } else {
         plan.dispatch = PeFh4DispatchDisposition::continue_search;
         plan.dispatch_source = fh4.source;

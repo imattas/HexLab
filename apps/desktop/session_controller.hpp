@@ -5,8 +5,10 @@
 #include <filesystem>
 #include <map>
 #include <future>
+#include <cstdint>
 #include <optional>
 #include <stop_token>
+#include <variant>
 #include <vector>
 #include "hexlab/workspace/listing.hpp"
 #include "hexlab/workspace/project_graph.hpp"
@@ -33,6 +35,9 @@ class SessionController final : public wxEvtHandler {
     Result<ProjectOperationId> save(DocumentId);
     Result<ProjectOperationId> save_as(DocumentId, std::filesystem::path, bool replace = false);
     Result<ProjectOperationId> backup_to(DocumentId, std::filesystem::path, bool replace = false);
+    Result<bool> rotate_backups(DocumentId, std::size_t retain = 5);
+    Result<bool> list_backups(DocumentId);
+    Result<bool> prune_backups(DocumentId, std::size_t retain);
     Result<bool> restore_backup(std::filesystem::path source, std::filesystem::path destination,
                                 bool replace = false, AnalysisOptions = {});
     Result<ProjectOperationId> export_binary(DocumentId, std::filesystem::path, bool replace = false);
@@ -63,6 +68,7 @@ class SessionController final : public wxEvtHandler {
     DocumentManager &documents() { return *manager_; }
 
   private:
+    enum class BackupManagementKind : std::uint8_t { rotate, list, prune };
     std::shared_ptr<AnalysisPool> pool_;
     std::unique_ptr<DocumentManager> manager_;
     wxTimer timer_{this};
@@ -84,6 +90,15 @@ class SessionController final : public wxEvtHandler {
         std::future<Result<database::SavedProject>> result;
     };
     std::optional<BackupRestore> backup_restore_;
+    using BackupManagementResult = std::variant<database::BackupRotationResult, database::BackupListing,
+                                                database::BackupPruneResult>;
+    struct BackupManagement {
+        DocumentId document;
+        std::shared_ptr<std::stop_source> cancellation;
+        std::future<Result<BackupManagementResult>> result;
+    };
+    std::vector<BackupManagement> backup_management_;
+    Result<bool> start_backup_management(DocumentId, BackupManagementKind, std::size_t);
     void scan_recovery_candidates(std::filesystem::path, database::ProjectMode, Error);
     Result<ProjectOperationId> observe(DocumentId, std::function<Result<ProjectSubmission>(ProjectActor &)>,
                                        bool watch_write = true);

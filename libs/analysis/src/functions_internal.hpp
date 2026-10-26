@@ -2,6 +2,7 @@
 #include "hexlab/analysis/functions.hpp"
 #include "hexlab/analysis/relocations.hpp"
 #include "hexlab/core/encoding.hpp"
+#include <array>
 #include <deque>
 #include <map>
 #include <set>
@@ -84,6 +85,8 @@ class Recovery {
     AddressMap<Node> nodes;
     AddressMap<ThumbITState> thumb_states;
     AddressMap<std::uint16_t> reachable_flags;
+    // Each possible input A64 NZCV nibble maps to a set of output nibbles.
+    AddressMap<std::array<std::uint16_t, 16>> a64_flag_transfers;
     AddressMap<std::vector<FunctionSeed>> roots, all_seeds, valid_seeds;
     // Validated object-format function ranges constrain control-flow recovery
     // when no explicit user chunk definition overrides them.
@@ -116,12 +119,14 @@ class Recovery {
     bool within_chunks(Address entry, Address at, std::uint64_t size = 1) const;
     bool add_seed(AddressMap<std::vector<FunctionSeed>> &, FunctionSeed, bool enforce_budget = true);
     Node &node(Address, ThumbITState = {});
+    std::uint16_t edge_flags(const Node &, const NodeEdge &, std::uint16_t) const;
     std::shared_ptr<const FunctionSnapshot> run();
 
   private:
     void validate_decisions();
     void seed_roots();
     void discover();
+    void refine_a64_flow();
     void find_conflicts();
     void trusted_seeds();
     void assign_owners();

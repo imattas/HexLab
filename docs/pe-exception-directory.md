@@ -95,7 +95,11 @@ header. `plan_pe_fh4_exception` maps a live instruction pointer through the
 function's IP-to-state map, follows validated prior-state links to produce an
 ordered cleanup-action plan, and reports active try handlers with exact
 decorated-name catch identity, catch-object locations, continuation addresses,
-and source spans. Destructor-object actions report their object address;
+and source spans. The catch-funclet, EHs, and `noexcept` flags each retain the
+source byte for their decision; a `terminate_noexcept` candidate points to the
+`noexcept` flag byte, while EHs-specific non-C++ search decisions point to the
+EHs flag byte. FH4 has no dynamic exception type-list field, so the loader does
+not infer legacy `throw(T)` lists from it. Destructor-object actions report their object address;
 destructor-pointer actions read one checked 64-bit pointer slot through the
 caller memory reader. No destructor or catch code is invoked. The planner can
 classify a first source-backed handler candidate when exact decorated-name or
