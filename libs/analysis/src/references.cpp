@@ -1296,6 +1296,92 @@ RegisterReferenceFacts x86_register_reference_facts(const Image *image, const Re
     }
     return result;
 }
+struct RiscvAddressValue {
+    Address address;
+    ReferenceProducerGraph graph;
+    std::vector<std::uint64_t> tails;
+    bool operator==(const RiscvAddressValue &) const = default;
+};
+
+void riscv_add_dependency(ReferenceProducerGraph &graph, std::uint64_t child, std::uint64_t parent) {
+    const ReferenceProducerDependency edge{child, parent};
+    if (std::find(graph.dependencies.begin(), graph.dependencies.end(), edge) != graph.dependencies.end()) return;
+    std::set<std::uint64_t> nodes{child, parent};
+    for (const auto &existing : graph.dependencies) {
+        nodes.insert(existing.consumer_instruction_id);
+        nodes.insert(existing.producer_instruction_id);
+    }
+    if (nodes.size() > 64 || graph.dependencies.size() >= 128) {
+        graph.truncated = true;
+        return;
+    }
+    graph.dependencies.push_back(edge);
+}
+
+RiscvAddressValue riscv_definition(Address address, std::uint64_t instruction,
+                                    const RiscvAddressValue *source = nullptr) {
+    RiscvAddressValue result{address};
+    if (source) {
+        result.graph = source->graph;
+        for (const auto parent : source->tails)
+            riscv_add_dependency(result.graph, instruction, parent);
+    }
+    result.tails.push_back(instruction);
+    return result;
+}
+
+bool merge_register_value(RiscvAddressValue &into, const RiscvAddressValue &other) {
+    if (into.address != other.address) return false;
+    into.graph.ambiguous = into.graph.ambiguous || other.graph.ambiguous ||
+                           into.tails != other.tails || into.graph.dependencies != other.graph.dependencies;
+    into.graph.truncated = into.graph.truncated || other.graph.truncated;
+    into.graph.cycle = into.graph.cycle || other.graph.cycle;
+    for (const auto &edge : other.graph.dependencies)
+        riscv_add_dependency(into.graph, edge.consumer_instruction_id, edge.producer_instruction_id);
+    for (const auto tail : other.tails)
+        if (std::find(into.tails.begin(), into.tails.end(), tail) == into.tails.end()) {
+            if (into.tails.size() == 32) into.graph.truncated = true;
+            else into.tails.push_back(tail);
+        }
+    return true;
+}
+
+template <class Value>
+bool merge_register_value(Value &into, const Value &other) { return into == other; }
+
+ReferenceProducerGraph riscv_reference_graph(std::uint64_t instruction, const RiscvAddressValue &value) {
+    ReferenceProducerGraph graph;
+    graph.ambiguous = value.graph.ambiguous;
+    graph.truncated = value.graph.truncated;
+    std::map<std::uint64_t, std::vector<std::uint64_t>> parents;
+    for (const auto &edge : value.graph.dependencies)
+        parents[edge.consumer_instruction_id].push_back(edge.producer_instruction_id);
+    for (const auto tail : value.tails)
+        parents[instruction].push_back(tail);
+    std::set<std::uint64_t> visited, active;
+    std::function<void(std::uint64_t, std::size_t)> visit = [&](std::uint64_t child, std::size_t depth) {
+        if (active.contains(child)) { graph.cycle = true; graph.truncated = true; return; }
+        if (visited.contains(child)) return;
+        if (depth >= 32 || visited.size() >= 64) { graph.truncated = true; return; }
+        visited.insert(child);
+        active.insert(child);
+        if (const auto found = parents.find(child); found != parents.end())
+            for (const auto parent : found->second) {
+                if (graph.dependencies.size() >= 128) { graph.truncated = true; break; }
+                if (active.contains(parent)) { graph.cycle = true; graph.truncated = true; continue; }
+                if (!visited.contains(parent) && (visited.size() >= 64 || depth + 1 >= 32)) {
+                    graph.truncated = true;
+                    continue;
+                }
+                graph.dependencies.push_back({child, parent});
+                visit(parent, depth + 1);
+            }
+        active.erase(child);
+    };
+    visit(instruction, 0);
+    return graph;
+}
+
 template <class RegisterState, class Transfer>
 void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_token stop,
                                   RegisterReferenceFacts &result, Transfer &&transfer) {
@@ -1389,7 +1475,8 @@ void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_
                 }
                 for (auto value = incoming.begin(); value != incoming.end();) {
                     const auto matching = state->second.find(value->first);
-                    if (matching == state->second.end() || matching->second != value->second)
+                    if (matching == state->second.end() ||
+                        !merge_register_value(value->second, matching->second))
                         value = incoming.erase(value);
                     else
                         ++value;
@@ -1472,7 +1559,8 @@ void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_
                 if (first) { incoming = state->second; first = false; }
                 else for (auto it = incoming.begin(); it != incoming.end();) {
                     const auto match = state->second.find(it->first);
-                    if (match == state->second.end() || match->second != it->second) it = incoming.erase(it);
+                    if (match == state->second.end() || !merge_register_value(it->second, match->second))
+                        it = incoming.erase(it);
                     else ++it;
                 }
             }
@@ -1503,7 +1591,8 @@ void propagate_cfg_register_values(const FunctionSnapshot &functions, std::stop_
                     if (first) { incoming = *state; first = false; }
                     else for (auto it = incoming.begin(); it != incoming.end();) {
                         auto match = state->find(it->first);
-                        if (match == state->end() || match->second != it->second) it = incoming.erase(it);
+                        if (match == state->end() || !merge_register_value(it->second, match->second))
+                            it = incoming.erase(it);
                         else ++it;
                     }
                 }
@@ -1540,8 +1629,7 @@ using ProducerRegisterKey = std::tuple<RegisterBank, std::uint8_t, std::uint32_t
 using ProducerRegisterState = std::map<ProducerRegisterKey, std::vector<std::uint64_t>>;
 
 bool is_producer_architecture(Architecture architecture) {
-    return architecture == Architecture::riscv32 || architecture == Architecture::riscv64 ||
-           architecture == Architecture::arm || architecture == Architecture::arm64 ||
+    return architecture == Architecture::arm || architecture == Architecture::arm64 ||
            architecture == Architecture::mips32 || architecture == Architecture::mips64 ||
            architecture == Architecture::powerpc;
 }
@@ -1734,7 +1822,19 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const Relocatio
     RegisterReferenceFacts result;
     if (!image)
         return result;
-    using RegisterState = std::unordered_map<std::uint32_t, Address>;
+    using RegisterState = std::unordered_map<std::uint32_t, RiscvAddressValue>;
+    const auto record_producers = [&](ReferenceOperandKey key, std::uint64_t instruction,
+                                      const RiscvAddressValue &source) {
+        auto graph = riscv_reference_graph(instruction, source);
+        std::vector<std::uint64_t> producers;
+        for (const auto &edge : graph.dependencies)
+            if (std::find(producers.begin(), producers.end(), edge.producer_instruction_id) == producers.end() &&
+                producers.size() < 32)
+                producers.push_back(edge.producer_instruction_id);
+        if (!producers.empty()) result.producer_instruction_ids[key] = std::move(producers);
+        if (!graph.dependencies.empty() || graph.ambiguous || graph.truncated || graph.cycle)
+            result.producer_graphs[key] = std::move(graph);
+    };
     const auto process_block = [&](const BasicBlock &block, RegisterState registers) {
         for (const auto &fact : block.instructions) {
             reference_detail::canceled(stop);
@@ -1766,7 +1866,7 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const Relocatio
                     const auto value = static_cast<std::uint64_t>(*immediate);
                     const Address target{instruction.address.space,
                                          width == 32 ? value & UINT64_C(0xffffffff) : value};
-                    registers[dst->index] = target;
+                    registers[dst->index] = riscv_definition(target, fact->id);
                     if (riscv_target_segment(*image, target, OperandAccess::address))
                         result.immediate_targets[{fact->id, 1}] = target;
                 }
@@ -1778,7 +1878,7 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const Relocatio
                 if (dst && dst->index && dst->width == width && immediate) {
                     const Address target{instruction.address.space,
                                          riscv_add(instruction.address.offset, *immediate, width)};
-                    registers[dst->index] = target;
+                    registers[dst->index] = riscv_definition(target, fact->id);
                     if (riscv_target_segment(*image, target, OperandAccess::address))
                         result.immediate_targets[{fact->id, 1}] = target;
                 }
@@ -1789,22 +1889,28 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const Relocatio
                 const auto *src = riscv_register(instruction, 1);
                 const auto immediate = riscv_signed_immediate(instruction, 2, 12);
                 std::optional<Address> target;
+                std::optional<RiscvAddressValue> definition;
                 if (src && src->width == width && immediate) {
                     if (!src->index) {
                         const auto value = static_cast<std::uint64_t>(*immediate);
                         target = Address{instruction.address.space,
                                          width == 32 ? value & UINT64_C(0xffffffff) : value};
+                        definition = riscv_definition(*target, fact->id);
                     } else if (const auto base = registers.find(src->index); base != registers.end()) {
                         const auto value = instruction.opcode == Opcode::rv_ori
-                                               ? (base->second.offset | static_cast<std::uint64_t>(*immediate))
-                                               : riscv_add(base->second.offset, *immediate, width);
-                        target = Address{base->second.space,
+                                               ? (base->second.address.offset | static_cast<std::uint64_t>(*immediate))
+                                               : riscv_add(base->second.address.offset, *immediate, width);
+                        target = Address{base->second.address.space,
                                          width == 32 ? value & UINT64_C(0xffffffff) : value};
+                        definition = riscv_definition(*target, fact->id, &base->second);
+                        if (dst && dst->index && dst->width == width &&
+                            riscv_target_segment(*image, *target, OperandAccess::address))
+                            record_producers({fact->id, 2}, fact->id, base->second);
                     }
                 }
                 erase_written();
-                if (dst && dst->index && dst->width == width && target) {
-                    registers[dst->index] = *target;
+                if (dst && dst->index && dst->width == width && target && definition) {
+                    registers[dst->index] = std::move(*definition);
                     if (riscv_target_segment(*image, *target, OperandAccess::address))
                         result.immediate_targets[{fact->id, 2}] = *target;
                 }
@@ -1820,19 +1926,21 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const Relocatio
                     memory->base->index != 0 && memory->base->width == width) {
                     const auto base = registers.find(memory->base->index);
                     if (base != registers.end()) {
-                        auto target = Address{base->second.space,
-                                              riscv_add(base->second.offset, memory->displacement, width)};
+                        auto target = Address{base->second.address.space,
+                                              riscv_add(base->second.address.offset, memory->displacement, width)};
                         target.offset &= ~UINT64_C(1); // JALR clears the low target bit.
                         const auto *segment = image->segment_at(target);
                         if (segment && segment->executable && target.offset >= segment->begin.offset &&
-                            target.offset - segment->begin.offset < segment->size)
+                            target.offset - segment->begin.offset < segment->size) {
                             result.immediate_targets[{fact->id, 1}] = target;
+                            record_producers({fact->id, 1}, fact->id, base->second);
+                        }
                     }
                 }
             }
 
             if (!propagated) {
-                std::optional<std::pair<std::uint32_t, Address>> loaded_pointer;
+                std::optional<std::pair<std::uint32_t, RiscvAddressValue>> loaded_pointer;
                 for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
                     const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[i]);
                     if (!memory || !memory->base || memory->base->bank != RegisterBank::riscv_gpr ||
@@ -1842,11 +1950,12 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const Relocatio
                     if (base == registers.end())
                         continue;
                     const auto access = instruction.access[i];
-                    const Address target{base->second.space,
-                                         riscv_add(base->second.offset, memory->displacement, width)};
+                    const Address target{base->second.address.space,
+                                         riscv_add(base->second.address.offset, memory->displacement, width)};
                     const auto access_width = std::max<std::uint64_t>(1, (memory->data_width + 7) / 8);
                     if (riscv_target_segment(*image, target, access, access_width)) {
                         result.memory_targets[{fact->id, static_cast<std::uint32_t>(i)}] = target;
+                        record_producers({fact->id, static_cast<std::uint32_t>(i)}, fact->id, base->second);
                         const auto *destination = architecture_register(instruction, 0, RegisterBank::riscv_gpr, width);
                         const bool destination_written = destination && destination->index != 0 &&
                             std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
@@ -1855,7 +1964,8 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const Relocatio
                                 });
                         if (access == OperandAccess::read && memory->data_width == width && destination_written)
                             if (const auto value = static_pointer_load(*image, relocations, target, width))
-                                loaded_pointer = std::pair{destination->index, *value};
+                                loaded_pointer = std::pair{destination->index,
+                                    riscv_definition(*value, fact->id, &base->second)};
                     }
                 }
                 erase_written();
@@ -2638,10 +2748,20 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
             if (const auto found = x86_facts.producer_instruction_ids.find(key);
                 found != x86_facts.producer_instruction_ids.end())
                 append_unique_producers(ids, found->second);
+            if (const auto found = riscv_facts.producer_instruction_ids.find(key);
+                found != riscv_facts.producer_instruction_ids.end())
+                append_unique_producers(ids, found->second);
             if (const auto found = non_x86_producers.producer_instruction_ids.find(key);
                 found != non_x86_producers.producer_instruction_ids.end())
                 append_unique_producers(ids, found->second);
             return ids;
+        };
+        const auto producer_graph_for = [&](ReferenceOperandKey key) {
+            if (const auto found = x86_facts.producer_graphs.find(key);
+                found != x86_facts.producer_graphs.end()) return found->second;
+            if (const auto found = riscv_facts.producer_graphs.find(key);
+                found != riscv_facts.producer_graphs.end()) return found->second;
+            return ReferenceProducerGraph{};
         };
         const auto relocation_reason = macho ? UnresolvedReason::macho_relocation : UnresolvedReason::elf_relocation;
         const auto reason_for = [&](const OperandResolution &value) {
@@ -2861,10 +2981,8 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                             reference_provenance.kind = ReferenceProvenanceKind::dataflow;
                             reference_provenance.producer_instruction_ids =
                                 producer_ids_for({fact->id, static_cast<std::uint32_t>(i)});
-                            if (const auto graph = x86_facts.producer_graphs.find(
-                                    {fact->id, static_cast<std::uint32_t>(i)});
-                                graph != x86_facts.producer_graphs.end())
-                                reference_provenance.producer_graph = graph->second;
+                            reference_provenance.producer_graph =
+                                producer_graph_for({fact->id, static_cast<std::uint32_t>(i)});
                         }
                         append({{0},
                                 instruction.address,
@@ -2900,6 +3018,8 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                         reference_provenance.kind = ReferenceProvenanceKind::dataflow;
                         reference_provenance.producer_instruction_ids =
                             producer_ids_for({fact->id, static_cast<std::uint32_t>(i)});
+                        reference_provenance.producer_graph =
+                            producer_graph_for({fact->id, static_cast<std::uint32_t>(i)});
                     }
                     append({{0}, instruction.address, static_cast<std::uint32_t>(i), std::move(target), kind, access,
                             std::move(reference_provenance), {}});
@@ -2955,6 +3075,8 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                             reference_provenance.kind = ReferenceProvenanceKind::dataflow;
                             reference_provenance.producer_instruction_ids =
                                 producer_ids_for({fact->id, static_cast<std::uint32_t>(i)});
+                            reference_provenance.producer_graph =
+                                producer_graph_for({fact->id, static_cast<std::uint32_t>(i)});
                         }
                         append({{0},
                                 instruction.address,
@@ -3043,10 +3165,8 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                     reference.provenance.producer_instruction_ids =
                         producer_ids_for({fact->id, static_cast<std::uint32_t>(control_index)});
                 if (dataflow_target)
-                    if (const auto graph = x86_facts.producer_graphs.find(
-                            {fact->id, static_cast<std::uint32_t>(control_index)});
-                        graph != x86_facts.producer_graphs.end())
-                        reference.provenance.producer_graph = graph->second;
+                    reference.provenance.producer_graph =
+                        producer_graph_for({fact->id, static_cast<std::uint32_t>(control_index)});
             }
             if (target)
                 reference.target = Location{*target};
