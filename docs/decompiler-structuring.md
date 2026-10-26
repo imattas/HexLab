@@ -393,3 +393,15 @@ condition; copies for the loop-header failure edge execute after the loop
 condition fails. It then emits the shared exit block once. Shared path blocks,
 exit memory phis, extra predecessors on a path block, incomplete or duplicate
 phi inputs, and other ambiguous shapes retain the existing fallback.
+
+Nested pre-tested child loops accept the same bounded cleanup chain on a
+conditional break edge. Every cleanup block must be single-entry from its
+predecessor, phi-free, and end in one unconditional edge; paths cannot overlap
+the child body or another claimed region. Child-exit register phis are copied
+in parallel at the final cleanup edge while still inside the original break
+condition. The child exit predecessor proof uses the cleanup tail, so the
+header's condition-failure edge and every break edge must exactly account for
+the exit's phi inputs. Longer, shared, branched, or side-entered paths retain
+the existing fallback. This extends HexLab's bounded region walk using the
+same region-first structuring principle visible in Ghidra's native
+[`blockaction.cc`](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/blockaction.cc); no Ghidra source is copied.

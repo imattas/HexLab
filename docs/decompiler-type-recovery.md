@@ -399,9 +399,11 @@ independently from x0-x7. Scalar floating results use v0. Explicit prototypes
 also classify homogeneous floating-point aggregates (HFAs) with one to four
 contiguous members of the same supported floating type into consecutive SIMD
 argument registers; caller evidence for each member is propagated to the
-callee's aggregate parameter. Prototype slots that cannot be classified stop
-at the first unsupported parameter. HFA stack spills and aggregates with
-padding, unions, mixed member types, or more than four members remain
+callee's aggregate parameter. When all HFA members do not fit in the remaining
+SIMD argument registers, the allocator exhausts that register bank and assigns
+the complete aggregate to its aligned incoming stack slot. Prototype slots
+that cannot be classified stop at the first unsupported parameter. Aggregates
+with padding, unions, mixed member types, or more than four members remain
 unsupported. Multi-register HFA returns and ambiguous mixed-class argument
 evidence without a prototype are left unresolved. Without a prototype,
 argument inference is emitted only when evidence occupies a contiguous prefix

@@ -8,8 +8,9 @@ remain attached to the source image. A copy-on-write overlay holds changes, so
 neither the input file nor the original loaded image is modified.
 
 For ordinary dynamic REL/RELA records, the supported profiles include
-little-endian ELF32 i386, ARM, and RISC-V `ET_DYN` records, plus little-endian
-ELF64 x86-64, AArch64, PPC64, and RISC-V `ET_DYN` records, with these types:
+little-endian ELF32 i386, ARM, RISC-V, and the bounded x32 relative subset,
+plus little-endian ELF64 x86-64, AArch64, PPC64, and RISC-V `ET_DYN` records,
+with these types:
 
 | Architecture | Relocation | Type | Formula |
 | --- | --- | ---: | --- |
@@ -29,6 +30,8 @@ ELF64 x86-64, AArch64, PPC64, and RISC-V `ET_DYN` records, with these types:
 | RISC-V ILP32 | `R_RISCV_32` | 1 | `S + A` (unsigned 32-bit field) |
 | RISC-V ILP32 | `R_RISCV_RELATIVE` | 3 | `B + A` (32-bit field) |
 | RISC-V ILP32 | `R_RISCV_JUMP_SLOT` | 5 | `S` |
+| x86-64 ILP32 (x32) | `R_X86_64_RELATIVE` | 8 | `B + A` (32-bit class field) |
+| x86-64 ILP32 (x32) | `R_X86_64_RELATIVE64` | 38 | `B + A` (64-bit field) |
 | x86-64 | `R_X86_64_64` | 1 | `S + A` (64-bit field) |
 | x86-64 | `R_X86_64_PC32` | 2 | `S + A - P` (signed 32-bit field) |
 | x86-64 | `R_X86_64_32` | 10 | `S + A` (unsigned 32-bit field) |
@@ -53,6 +56,17 @@ ELF64 x86-64, AArch64, PPC64, and RISC-V `ET_DYN` records, with these types:
 | RISC-V LP64 | `R_RISCV_64` | 2 | `S + A` (low 64 bits) |
 | RISC-V LP64 | `R_RISCV_RELATIVE` | 3 | `B + A` |
 | RISC-V LP64 | `R_RISCV_JUMP_SLOT` | 5 | `S` |
+
+The x32 profile is deliberately limited to the two relative relocations above:
+`R_X86_64_RELATIVE` applies at the ELF32 class width, while
+`R_X86_64_RELATIVE64` always patches a 64-bit field. Both use the checked
+`B + A` calculation, and only little-endian `ET_DYN` images are accepted. The
+ILP32 ABI assigns `RELATIVE64` type 38 specifically to 64-bit fields; its
+reference table is the [x86-64 psABI](https://github.com/hjl-tools/x86-psABI/wiki/x86-64-psABI-1.0.pdf).
+Ghidra independently names type 38 `R_X86_64_RELATIVE64` in its
+[`X86_64_ElfRelocationType`](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/x86/src/main/java/ghidra/app/util/bin/format/elf/relocation/X86_64_ElfRelocationType.java)
+enum. Other x32 relocation types remain unapplied until their class-specific
+field widths and formulas are modeled.
 
 The RISC-V profile applies the same pointer-sized relative and jump-slot
 operations for ILP32 and LP64, and supports the ABI's 32-bit absolute dynamic

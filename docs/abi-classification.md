@@ -254,7 +254,9 @@ four uniquely addressable members are recursively flattened across nested
 structures, arrays, and unions when all members share a supported floating
 size. Overlaid union alternatives at the same byte offset count as one HFA
 member. An HFA uses one SIMD/FP register per member, or is placed wholly on the
-stack when that bank is exhausted. Other composites up to 16 bytes use
+stack when all of its members do not fit in the remaining SIMD/FP registers;
+the remaining SIMD/FP argument bank is then considered exhausted. The complete
+HFA occupies an aligned stack slot, rounded to an 8-byte size multiple. Other composites up to 16 bytes use
 consecutive `xN` registers when the whole value fits; larger composites are
 represented indirectly through `hidden_result_pointer` in `X8`.
 
