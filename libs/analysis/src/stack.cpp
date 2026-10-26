@@ -847,6 +847,53 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                 result.complete = false;
                 stack_extent_known = false;
             }
+            // AArch64 pair transfers have one memory operand but access two
+            // adjacent cells of the element width. Recover both stack slots
+            // only when the base is a tracked SP or frame pointer.
+            const bool arm64_pair = instruction.context.architecture == Architecture::arm64 &&
+                (instruction.opcode == Opcode::a64_ldp || instruction.opcode == Opcode::a64_stp);
+            const auto *pair_memory = arm64_pair
+                && instruction.operands.size() > 2
+                ? std::get_if<MemoryOperand>(&instruction.operands[2]) : nullptr;
+            const bool pair_sp = pair_memory && pair_memory->base &&
+                                 pair_memory->base->bank == RegisterBank::arm64_sp;
+            const bool pair_fp = pair_memory && pair_memory->base &&
+                                 pair_memory->base->bank == RegisterBank::arm64_gpr &&
+                                 pair_memory->base->index == 29;
+            if (arm64_pair && (!pair_memory || !pair_memory->base)) {
+                result.complete = false;
+            } else if (pair_sp || pair_fp) {
+                if (pair_memory->data_width == 0 || pair_memory->data_width % 8 != 0 ||
+                    pair_memory->index || pair_memory->ip_relative || pair_memory->address_width != 64 ||
+                    instruction.access.size() <= 2) {
+                    result.complete = false;
+                } else {
+                    const auto base = pair_sp ? state.stack_depth : state.frame_depth;
+                    const auto access = instruction.access[2];
+                    const bool read = access == OperandAccess::read || access == OperandAccess::read_write;
+                    const bool written = access == OperandAccess::write || access == OperandAccess::read_write;
+                    if (!base.known || (!read && !written)) {
+                        result.complete = false;
+                    } else {
+                        const auto element_bytes = static_cast<std::int64_t>(pair_memory->data_width / 8);
+                        std::int64_t first_offset = 0;
+                        if (!subtract_checked(pair_memory->displacement, base.value, first_offset)) {
+                            result.complete = false;
+                        } else {
+                            for (int element = 0; element < 2; ++element) {
+                                std::int64_t offset = first_offset;
+                                if (element && !add_checked(offset, element_bytes, offset)) {
+                                    result.complete = false;
+                                    continue;
+                                }
+                                if (!record_stack_slot(result, offset, pair_memory->data_width, read, written,
+                                                       false, instruction.address, access_detail_count))
+                                    return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
+                            }
+                        }
+                    }
+                }
+            }
             // PUSH and POP access the stack implicitly. Preserve the cell's
             // entry-SP offset before transfer() advances or restores SP.
             if ((instruction.context.architecture == Architecture::x86 ||
@@ -878,6 +925,8 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                 }
             }
             for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
+                if (arm64_pair && i == 2)
+                    continue; // Both cells were recorded above.
                 const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[i]);
                 if (!memory || !memory->base)
                     continue;

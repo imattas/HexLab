@@ -65,6 +65,8 @@ struct JvmCode {
 struct JvmMember {
     std::uint16_t access_flags = 0, name_index = 0, descriptor_index = 0;
     std::string name, descriptor;
+    // Exceptions attribute class names, in class-file declaration order.
+    std::optional<std::vector<std::string>> declared_exceptions;
     std::optional<JvmCode> code;
     bool operator==(const JvmMember &) const = default;
 };

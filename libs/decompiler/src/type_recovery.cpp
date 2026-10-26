@@ -1172,6 +1172,7 @@ static Result<TypeRecoveryResult> recover_types_impl(
     if (prototype && prototype->kind()!=types::Kind::function)
         return Error{ErrorCode::invalid_argument, "type recovery prototype must be a function type"};
     std::map<Key, Fact> facts;
+    std::map<Key, std::optional<bool>> division_signedness;
     // ABI snapshots describe liveness, not evidence that a callee consumes
     // every argument register. Only actual reads or known parameter uses count.
     std::set<Key> parameter_evidence;
@@ -1187,6 +1188,14 @@ static Result<TypeRecoveryResult> recover_types_impl(
     };
     auto register_expr=[&](const ExpressionPtr &e, auto &&self)->void {
         if (!e) return;
+        const auto record_division_operand = [&](const ExpressionPtr &operand, bool is_signed) {
+            if (!operand) return;
+            const auto *value = std::get_if<RegisterValue>(&operand->value);
+            if (!value) return;
+            const auto operand_key = key(value->reg, value->version);
+            auto [found, inserted] = division_signedness.emplace(operand_key, is_signed);
+            if (!inserted && found->second && *found->second != is_signed) found->second.reset();
+        };
         std::visit([&](const auto &x) {
             using T=std::decay_t<decltype(x)>;
             if constexpr(std::is_same_v<T,RegisterValue>) {
@@ -1234,7 +1243,16 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 }
                 if(x.index) { parameter_evidence.insert(key(*x.index, x.index_version)); ensure(*x.index,x.index_version); }
             } else if constexpr(std::is_same_v<T,UnaryValue>) self(x.operand,self);
-            else if constexpr(std::is_same_v<T,BinaryValue>) { self(x.left,self); self(x.right,self); }
+            else if constexpr(std::is_same_v<T,BinaryValue>) {
+                if (x.operation == "sdiv" || x.operation == "srem" || x.operation == "a64_sdiv") {
+                    record_division_operand(x.left, true);
+                    record_division_operand(x.right, true);
+                } else if (x.operation == "udiv" || x.operation == "urem" || x.operation == "a64_udiv") {
+                    record_division_operand(x.left, false);
+                    record_division_operand(x.right, false);
+                }
+                self(x.left,self); self(x.right,self);
+            }
         },e->value);
     };
     for (const auto &b:fn.blocks) {
@@ -1637,15 +1655,17 @@ static Result<TypeRecoveryResult> recover_types_impl(
     } else {
         call_layout_budget_exhausted = true;
     }
-    // Signed integer comparisons constrain the interpretation of the direct
-    // register operands. Conflicting signed and unsigned comparisons leave the
-    // integer type unknown rather than choosing whichever use was visited last.
+    // Signed comparisons and signed/unsigned division constrain the
+    // interpretation of direct register operands. Conflicting evidence leaves
+    // the integer type unknown rather than choosing whichever use came last.
     std::map<Key, std::uint8_t> comparison_signedness;
     const auto collect_comparison_operand = [&](const ExpressionPtr &expression, std::uint8_t evidence) {
         if (!expression) return;
         if (const auto *value = std::get_if<RegisterValue>(&expression->value))
             comparison_signedness[key(value->reg, value->version)] |= evidence;
     };
+    for (const auto &[operand, interpretation] : division_signedness)
+        comparison_signedness[operand] |= !interpretation ? 3 : *interpretation ? 1 : 2;
     const auto collect_comparisons = [&](const ExpressionPtr &expression, auto &&self) -> void {
         if (!expression) return;
         if (const auto *binary = std::get_if<BinaryValue>(&expression->value)) {
