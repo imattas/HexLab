@@ -1,10 +1,12 @@
 # Desktop Analysis Issues
 
 The Binary metadata notebook has an **Analysis issues** page for reviewing
-function recovery output. It lists non-normal function stops, incomplete
+function recovery output and load diagnostics. For projects it lists non-normal function stops, incomplete
 function boundaries, unconfirmed entry candidates, and overlapping function
-or decision records. It also receives transient diagnostics from C header and
-PDB type imports and from the decompiler. Each row includes its address, related address when
+or decision records. A binary opened without a project still shows the loader
+and inspection diagnostics retained by its immutable document snapshot. The
+page also receives transient diagnostics from C header and PDB type imports
+and from the decompiler. Each row includes its address, related address when
 available, owning function, and the analysis detail. Selecting a row navigates
 the disassembly to its primary address. The selection strip shows the finding
 summary and provides separate actions to navigate to its related address or
@@ -14,9 +16,9 @@ addresses with the full bounded detail for a report or project note.
 Use the category selector and text filter to narrow the list; the filter checks
 the primary, related, and owning-function addresses as well as the finding
 detail. Filtering preserves the selected finding while it remains visible.
-Function stops with ordinary `ret` and `trap` endings are omitted. The **Loader
-diagnostic categories list bounded loader/runtime-relocation diagnostics,
-header/PDB import messages, and decompiler lifting messages. Addressed diagnostics
+Function stops with ordinary `ret` and `trap` endings are omitted. The diagnostic
+categories list bounded loader/runtime-relocation diagnostics, file-only load
+and inspection messages, header/PDB import messages, and decompiler lifting messages. Addressed diagnostics
 can be navigated like other findings; diagnostics without an address remain
 visible and are marked as not location-specific. Decompiler messages are scoped
 to the selected function entry, without assigning an instruction address the
@@ -25,17 +27,20 @@ when the selected PDB uniquely matches the loaded PE. A function scope includes
 addressed diagnostics within that function's chunks and function-associated
 decompiler diagnostics, and hides unlocated diagnostics, which the status line reports.
 
-The view reads immutable project and loader snapshots and does not edit
+The view reads immutable project or file-only document snapshots and does not edit
 analysis decisions. It caps the combined list at 20,000 findings, admits up to
-up to 2,048 rows per diagnostic source (loader, runtime relocation, type
-import, and decompiler)
-within the combined cap, and scans at most 100,000 functions; the status line reports when those limits truncate
+2,048 rows per diagnostic source (loader, runtime relocation, type import, and
+decompiler) within the combined cap, and scans at most 100,000 functions; the status line reports when those limits truncate
 the view and whether analysis is partial.
 
 Type-import rows remain until the next completed header or PDB import replaces
 them; canceling an import leaves the last completed result visible. Decompiler
 rows reflect the current pseudocode render and clear when no recovered function
-is selected. These bounded UI results are kept per open document and are not persisted. Debugger output has no structured
+is selected. Switching or closing tabs clears the old document's visible loader
+diagnostics. A file-only tab has no recovered-function scope; its addressed
+diagnostics still navigate within that binary. TSV export is available for
+projects, whose protected paths prevent overwriting the source. These bounded
+UI results are kept per open document and are not persisted. Debugger output has no structured
 diagnostic model and is not included. The page does not re-run analysis,
 classify every candidate as a defect, or resolve conflicts; use the normal
 project edit commands after navigating to a finding when an analysis decision

@@ -208,13 +208,14 @@ AnalysisIssuesView::AnalysisIssuesView(wxWindow *parent) : wxPanel(parent) {
 }
 
 void AnalysisIssuesView::update(std::shared_ptr<const ProjectSnapshot> project) {
-    update({}, std::move(project), {});
+    update({}, std::move(project), {}, {});
 }
 
 void AnalysisIssuesView::update(std::optional<DocumentId> document, std::shared_ptr<const ProjectSnapshot> project,
-                                std::optional<Location> cursor) {
+                                std::optional<Location> cursor,
+                                std::shared_ptr<const DocumentSnapshot> document_snapshot) {
     const bool changed_document = document_ != document;
-    if (!changed_document && project_ == project && cursor_ == cursor)
+    if (!changed_document && project_ == project && document_snapshot_ == document_snapshot && cursor_ == cursor)
         return;
     if (changed_document) {
         remember_preference();
@@ -232,9 +233,11 @@ void AnalysisIssuesView::update(std::optional<DocumentId> document, std::shared_
     }
     const auto *incoming = project && project->functions ? project->functions.get() : nullptr;
     const auto *incoming_loader = project && project->loaded ? project->loaded.get() : nullptr;
-    const bool same_source = !changed_document && source_ == incoming && loader_source_ == incoming_loader;
+    const bool same_source = !changed_document && source_ == incoming && loader_source_ == incoming_loader &&
+                             document_snapshot_ == document_snapshot;
     const bool same_project = project_ == project;
     project_ = std::move(project);
+    document_snapshot_ = std::move(document_snapshot);
     cursor_ = cursor;
     if (!same_source) {
         source_ = incoming;
@@ -251,16 +254,32 @@ void AnalysisIssuesView::update(std::optional<DocumentId> document, std::shared_
     }
 }
 
+const Image *AnalysisIssuesView::active_image() const noexcept {
+    if (project_ && project_->loaded) return project_->loaded->image.get();
+    return document_snapshot_ ? document_snapshot_->image.get() : nullptr;
+}
+
 void AnalysisIssuesView::retain_documents(std::span<const DocumentInfo> documents) {
     if (document_ && std::none_of(documents.begin(), documents.end(), [this](const auto &document) {
             return document.id == *document_;
         })) {
         document_.reset();
+        document_snapshot_.reset();
+        project_.reset();
+        source_ = nullptr;
+        loader_source_ = nullptr;
+        cursor_.reset();
         selection_key_.reset();
         scope_entry_.reset();
+        scope_ranges_.clear();
+        scope_available_ = false;
+        scope_partial_ = false;
         scope_error_.clear();
         filter_->SetSelection(0);
         search_->ChangeValue({});
+        rows_.clear();
+        capped_ = false;
+        render();
     }
     std::erase_if(preferences_, [&](const auto &item) {
         return std::none_of(documents.begin(), documents.end(), [&](const auto &document) {
@@ -402,7 +421,7 @@ void AnalysisIssuesView::scope_to_cursor() {
 }
 
 void AnalysisIssuesView::update_scope_context() {
-    const auto *image = project_ && project_->loaded ? project_->loaded->image.get() : nullptr;
+    const auto *image = active_image();
     wxString label = "All recovered functions";
     if (scope_entry_) {
         label = "Pinned function: " + location_text(*scope_entry_, image);
@@ -436,24 +455,28 @@ wxString AnalysisIssuesView::kind_text(Kind kind) const {
 void AnalysisIssuesView::rebuild() {
     rows_.clear();
     capped_ = false;
-    if (!project_) {
+    if (!project_ && !document_snapshot_) {
         render();
         return;
     }
 
-    const auto *snapshot = project_->functions.get();
-    const auto *loaded = project_->loaded.get();
+    const auto *snapshot = project_ ? project_->functions.get() : nullptr;
+    const auto *loaded = project_ ? project_->loaded.get() : nullptr;
+    // Project loader diagnostics are authoritative for a project. A file-only
+    // document retains its loader result directly in DocumentSnapshot.
+    const auto *file_diagnostics = !project_ && document_snapshot_ ? &document_snapshot_->diagnostics : nullptr;
     const auto diagnostic_count = loaded
         ? std::min(max_loader_rows, loaded->diagnostics.size()) +
               std::min(max_loader_rows, loaded->runtime_relocation_diagnostics.size())
-        : 0;
+        : file_diagnostics ? std::min(max_loader_rows, file_diagnostics->size()) : 0;
     const auto active_type = document_ && type_diagnostics_.contains(document_->value) ? &type_diagnostics_.at(document_->value) : nullptr;
     const auto active_decompiler = document_ && decompiler_diagnostics_.contains(document_->value) ? &decompiler_diagnostics_.at(document_->value) : nullptr;
     const auto producer_count = std::min(max_loader_rows, active_type ? active_type->size() : 0) +
                                 std::min(max_loader_rows, active_decompiler ? active_decompiler->size() : 0);
     const auto diagnostic_total = diagnostic_count + producer_count;
-    const bool diagnostic_source_truncated = loaded &&
-        (loaded->diagnostics.size() > max_loader_rows || loaded->runtime_relocation_diagnostics.size() > max_loader_rows);
+    const bool diagnostic_source_truncated = loaded
+        ? loaded->diagnostics.size() > max_loader_rows || loaded->runtime_relocation_diagnostics.size() > max_loader_rows
+        : file_diagnostics && file_diagnostics->size() > max_loader_rows;
     const bool producer_source_truncated = (active_type && active_type->size() > max_loader_rows) ||
                                            (active_decompiler && active_decompiler->size() > max_loader_rows);
     const auto diagnostic_budget = std::min(max_loader_rows * 4, diagnostic_total);
@@ -525,6 +548,8 @@ void AnalysisIssuesView::rebuild() {
     if (loaded) {
         add_diagnostics(loaded->diagnostics, "Loader");
         add_diagnostics(loaded->runtime_relocation_diagnostics, "Runtime relocation");
+    } else if (file_diagnostics) {
+        add_diagnostics(*file_diagnostics, "File inspection");
     }
     const auto add_producer = [&](const std::vector<AnalysisIssueDiagnostic> *items, Kind kind) {
         if (!items) return;
@@ -555,7 +580,7 @@ void AnalysisIssuesView::rebuild() {
 
 wxString AnalysisIssuesView::cell(std::size_t row, int column) const {
     const auto &item = rows_[row];
-    const auto *image = project_ && project_->loaded ? project_->loaded->image.get() : nullptr;
+    const auto *image = active_image();
     switch (column) {
     case 0: return kind_text(item.kind);
     case 1: return item.address ? location_text(*item.address, image) : wxString{};
@@ -576,7 +601,7 @@ wxString AnalysisIssuesView::export_text() const {
     result += "# Filter\t" + tsv_field(filter_->GetStringSelection()) + "\n";
     result += "# Search\t" + tsv_field(search_->GetValue()) + "\n";
     result += "# Scope\t" + tsv_field(scope_entry_
-        ? "Function " + location_text(*scope_entry_, project_ && project_->loaded ? project_->loaded->image.get() : nullptr)
+        ? "Function " + location_text(*scope_entry_, active_image())
         : wxString("All recovered functions")) + "\n";
     if (scope_entry_ && (!scope_available_ || scope_partial_))
         result += "# Scope coverage\tFunction is unavailable or chunk coverage is partial\n";
@@ -597,7 +622,8 @@ wxString AnalysisIssuesView::export_text() const {
 }
 
 void AnalysisIssuesView::export_visible() {
-    if (visible_rows_.empty())
+    // File-only documents do not carry protected source paths in this view.
+    if (visible_rows_.empty() || !project_)
         return;
     // Capture the current filtered rows before the modal picker is shown.
     const auto output = export_text();
@@ -668,7 +694,9 @@ void AnalysisIssuesView::render() {
     table_->activate = [this](std::size_t row) { activate_row(row); };
     update_selection();
     update_scope_context();
-    if (!project_ || (!project_->functions && rows_.empty())) {
+    if (!project_ && !document_snapshot_) {
+        status_->SetLabel("No document is selected.");
+    } else if (project_ && !project_->functions && rows_.empty()) {
         status_->SetLabel("No derived function analysis is available for this document.");
     } else {
         wxString status = wxString::Format("%llu findings shown",
@@ -678,13 +706,13 @@ void AnalysisIssuesView::render() {
         if (scope_entry_) status += "; pinned function scope";
         if (capped_)
             status += "; view bounded to 20,000 findings (at most 2,048 each from loader, runtime relocation, type import, and decompiler) and 100,000 functions";
-        if (project_->functions && !project_->functions->complete)
+        if (project_ && project_->functions && !project_->functions->complete)
             status += "; function analysis is incomplete";
-        if (project_->status == DerivedStatus::incomplete)
+        if (project_ && project_->status == DerivedStatus::incomplete)
             status += "; analysis is partial";
-        else if (project_->status == DerivedStatus::pending)
+        else if (project_ && project_->status == DerivedStatus::pending)
             status += "; analysis is pending";
-        if (!project_->reason.empty())
+        if (project_ && !project_->reason.empty())
             status += "; " + preview_text(project_->reason, 180);
         if (scope_entry_ && std::any_of(rows_.begin(), rows_.end(), [](const Row &row) {
                 return (row.kind == Kind::loader_diagnostic || row.kind == Kind::type_import_diagnostic ||
@@ -693,7 +721,7 @@ void AnalysisIssuesView::render() {
             status += "; unlocated diagnostics are hidden by function scope";
         status_->SetLabel(status);
     }
-    export_->Enable(!visible_rows_.empty());
+    export_->Enable(project_ && !visible_rows_.empty());
 }
 
 void AnalysisIssuesView::activate_row(std::size_t visible) {
@@ -721,7 +749,7 @@ void AnalysisIssuesView::step(bool forward) {
 }
 
 wxString AnalysisIssuesView::finding_text(const Row &row) const {
-    const auto *image = project_ && project_->loaded ? project_->loaded->image.get() : nullptr;
+    const auto *image = active_image();
     wxString report = kind_text(row.kind) + "\nAddress: " +
                       (row.address ? location_text(*row.address, image) : wxString("not location-specific"));
     if (row.related) report += "\nRelated: " + location_text(*row.related, image);
@@ -757,11 +785,11 @@ void AnalysisIssuesView::update_selection() {
         go_related_->Enable(false);
         go_function_->Enable(false);
         copy_issue_->Enable(false);
-        export_->Enable(!visible_rows_.empty());
+        export_->Enable(project_ && !visible_rows_.empty());
         detail_->ChangeValue("Select a finding to inspect its details. Previous/Next follow the filtered findings; Alt+Up/Down also work within this pane.");
         return;
     }
-    const auto *image = project_ && project_->loaded ? project_->loaded->image.get() : nullptr;
+    const auto *image = active_image();
     wxString detail = kind_text(row->kind) + " at " +
                       (row->address ? location_text(*row->address, image) : wxString("no address")) + ": " + row->detail;
     const auto position = selected ? *selected + 1 : 0;
@@ -773,7 +801,7 @@ void AnalysisIssuesView::update_selection() {
     go_related_->Enable(row->related.has_value());
     go_function_->Enable(row->function_entry.has_value());
     copy_issue_->Enable(true);
-    export_->Enable(!visible_rows_.empty());
+    export_->Enable(project_ && !visible_rows_.empty());
 }
 
 } // namespace hexlab::desktop

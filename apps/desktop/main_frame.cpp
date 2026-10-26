@@ -1939,7 +1939,7 @@ struct MainFrame::Impl {
         }
         references->update(id, shown ? shown->project : nullptr, state().selection());
         if (analysis_issues)
-            analysis_issues->update(id, shown ? shown->project : nullptr, state().selection());
+            analysis_issues->update(id, shown ? shown->project : nullptr, state().selection(), shown);
         pseudocode->diagnostics_changed = [this, id](std::vector<AnalysisIssueDiagnostic> diagnostics) {
             if (analysis_issues) analysis_issues->set_decompiler_diagnostics(id, std::move(diagnostics));
         };

@@ -3,6 +3,7 @@
 #include "data_views.hpp"
 #include "analysis_issue_diagnostic.hpp"
 #include "hexlab/workspace/project.hpp"
+#include "hexlab/workspace/document.hpp"
 #include "hexlab/workspace/document_manager.hpp"
 
 #include <wx/choice.h>
@@ -19,7 +20,8 @@ class AnalysisIssuesView final : public wxPanel {
     explicit AnalysisIssuesView(wxWindow *parent);
 
     void update(std::shared_ptr<const ProjectSnapshot> project);
-    void update(std::optional<DocumentId>, std::shared_ptr<const ProjectSnapshot>, std::optional<Location>);
+    void update(std::optional<DocumentId>, std::shared_ptr<const ProjectSnapshot>, std::optional<Location>,
+                std::shared_ptr<const DocumentSnapshot> document_snapshot = {});
     void retain_documents(std::span<const DocumentInfo>);
     void set_type_diagnostics(std::optional<DocumentId>, std::vector<AnalysisIssueDiagnostic>);
     void set_decompiler_diagnostics(std::optional<DocumentId>, std::vector<AnalysisIssueDiagnostic>);
@@ -65,6 +67,7 @@ class AnalysisIssuesView final : public wxPanel {
     wxTextCtrl *detail_ = nullptr;
     VirtualTable *table_ = nullptr;
     std::shared_ptr<const ProjectSnapshot> project_;
+    std::shared_ptr<const DocumentSnapshot> document_snapshot_;
     const FunctionSnapshot *source_ = nullptr;
     const LoadedImage *loader_source_ = nullptr;
     std::map<std::uint64_t, std::vector<AnalysisIssueDiagnostic>> type_diagnostics_, decompiler_diagnostics_;
@@ -84,6 +87,7 @@ class AnalysisIssuesView final : public wxPanel {
     void rebuild();
     void render();
     void update_selection();
+    const Image *active_image() const noexcept;
     void remember_preference();
     void rebuild_scope();
     void update_scope_context();
