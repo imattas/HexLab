@@ -420,16 +420,21 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             const bool i386 = !metadata.header.is_64 && metadata.header.machine == 3 &&
                               metadata.header.order == ByteOrder::little;
             const bool x64 = metadata.header.machine == 62;
+            const bool x32 = !metadata.header.is_64 && x64 && metadata.header.order == ByteOrder::little;
             const bool ppc64 = metadata.header.machine == 21;
             const bool riscv = metadata.header.machine == 243;
             const bool riscv64 = riscv && metadata.header.is_64;
             const bool riscv32 = riscv && !metadata.header.is_64;
             const auto relative_type = i386 || x64 ? 8u : arm32 ? 23u : ppc64 ? 22u : riscv ? 3u : 1027u;
             const auto jump_slot_type = i386 || x64 ? 7u : arm32 ? 22u : ppc64 ? 21u : riscv ? 5u : 1026u;
+            const bool x32_relative = x32 && relocation.type == 8 &&
+                                      relocation.kind == ElfRelocationKind::base_relative;
+            const bool x32_relative64 = x32 && relocation.type == 38 &&
+                                        relocation.kind == ElfRelocationKind::base_relative;
             const bool ordinary_subset = metadata.header.order == ByteOrder::little &&
                                          ((metadata.header.is_64 &&
                                            (metadata.header.machine == 62 || metadata.header.machine == 183 || ppc64 || riscv64)) ||
-                                          i386 || arm32 || riscv32);
+                                          i386 || arm32 || riscv32 || x32_relative || x32_relative64);
             if (!packed_relative && !ordinary_subset) {
                 skip(index, "Ordinary REL/RELA runtime relocations are unsupported for this ELF class, byte order, or architecture");
                 continue;
@@ -439,7 +444,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 continue;
             }
             const bool relative = relocation.kind == ElfRelocationKind::base_relative &&
-                                  (packed_relative || relocation.type == relative_type);
+                                  (packed_relative || relocation.type == relative_type || x32_relative64);
             const bool symbol_slot = (!riscv &&
                                       ((relocation.type == (arm32 ? 21u : i386 || x64 ? 6u : 1025u) &&
                                         relocation.kind == ElfRelocationKind::global_data) ||
@@ -532,7 +537,8 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     // REL addends are unsigned ELF32 words. The parser keeps
                     // the sampled word in a signed carrier; recover its exact
                     // 32-bit pattern before applying B + A.
-                    if (i386 || arm32 || (riscv32 && !relocation.explicit_addend)) {
+                    if (i386 || arm32 || (riscv32 && !relocation.explicit_addend) ||
+                        (x32_relative && !relocation.explicit_addend)) {
                         const auto addend = static_cast<std::uint64_t>(
                             static_cast<std::uint32_t>(*relocation.addend));
                         value = shifted(addend, load_bias);
@@ -543,7 +549,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     skip(index, "Relative relocation result overflows the runtime address space");
                     continue;
                 }
-                if ((i386 || arm32 || riscv32) && value > UINT32_MAX) {
+                if ((i386 || arm32 || riscv32 || x32_relative) && value > UINT32_MAX) {
                     skip(index, "ELF32 relative relocation result exceeds the 32-bit address space");
                     continue;
                 }
@@ -782,7 +788,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 }
             }
             const auto word = metadata.header.is_64 ? UINT64_C(8) : UINT64_C(4);
-            const auto expected_width = packed_relative || i386 || arm32 || riscv32 ? word :
+            const auto expected_width = packed_relative || i386 || arm32 || riscv32 || x32_relative ? word :
                 (riscv_32 || x64_pc32 || x64_32 || x64_32s || aarch64_abs32 || aarch64_prel32)
                     ? UINT64_C(4)
                     : (aarch64_abs16 || aarch64_prel16) ? UINT64_C(2) : UINT64_C(8);

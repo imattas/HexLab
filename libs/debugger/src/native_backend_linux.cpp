@@ -886,18 +886,24 @@ public:
             const auto step_action = std::find_if(runnable.begin(), runnable.end(), [](const auto *action) {
                 return action->kind == ThreadResumeKind::single_step;
             });
-            // Keep the pending event owner stopped until every continuation is
-            // accepted, then issue its step last. This lets a failed step roll
-            // back peer continuations without consuming the owned event.
+            // Keep a non-owner step last and require the pending event owner
+            // to remain stopped. If the step request fails, peer continuations
+            // can be interrupted while the original event stays owned.
             if (step_action != runnable.end() &&
-                static_cast<pid_t>((*step_action)->thread) != owner)
-                return Error{ErrorCode::unsupported, "mixed Linux schedules may step only the pending event owner"};
+                static_cast<pid_t>((*step_action)->thread) != owner) {
+                const auto owner_action = std::find_if(actions.begin(), actions.end(), [&](const auto &action) {
+                    return static_cast<pid_t>(action.thread) == owner;
+                });
+                if (owner_action == actions.end() || owner_action->kind != ThreadResumeKind::stop)
+                    return Error{ErrorCode::unsupported,
+                        "a mixed non-owner step requires the pending event owner to remain stopped"};
+            }
             if (pending_breakpoint_)
                 return Error{ErrorCode::unsupported, "cannot schedule multiple threads while stepping over a pending software breakpoint"};
 
             // Release non-owner continuations first and the pending-event owner
-            // last. When the owner is stepping, its PTRACE_SINGLESTEP is always
-            // the final operation so no rollback has to undo a started step.
+            // last among continuations. A single step, whether it belongs to
+            // the owner or another stopped thread, is always the final request.
             std::vector<pid_t> order;
             order.reserve(runnable.size());
             for (const auto* action : runnable) {
@@ -911,7 +917,8 @@ public:
             });
             if (owner_continue != runnable.end())
                 order.push_back(owner);
-            if (step_action != runnable.end()) order.push_back(owner);
+            if (step_action != runnable.end())
+                order.push_back(static_cast<pid_t>((*step_action)->thread));
 
             std::vector<pid_t> resumed;
             resumed.reserve(order.size() - static_cast<std::size_t>(step_action != runnable.end()));

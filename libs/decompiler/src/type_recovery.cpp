@@ -749,11 +749,10 @@ std::vector<AbiArgumentSlot> aapcs64_prototype_slots(const types::TypePtr &proto
                 }
                 continue;
             }
-            // An HFA is allocated all-or-nothing. If its members do not fit
-            // in the remaining SIMD argument registers, the aggregate is
-            // stack-passed; the current register-slot IR cannot describe that
-            // composite stack value, so stop before assigning later slots.
-            if (classified->homogeneous_aggregate) break;
+            // An HFA is allocated all-or-nothing. If it does not fit, AAPCS64
+            // exhausts the remaining SIMD argument bank and places the whole
+            // aggregate on the stack; it is never split across SIMD and GPRs.
+            if (classified->homogeneous_aggregate) next_simd = 8;
         } else if (classified->value_class == AbiValueClass::vector) {
             if (next_simd < 8) {
                 slots.push_back({AbiValueClass::vector, arm64_simd(static_cast<unsigned>(next_simd++)), {},
@@ -763,14 +762,17 @@ std::vector<AbiArgumentSlot> aapcs64_prototype_slots(const types::TypePtr &proto
         }
 
         const auto type = unqualified_type(parameter.type);
-        if (!type || !type->size() || *type->size() == 0 || *type->size() > 16) break;
+        const auto maximum_stack_value_size = classified->homogeneous_aggregate ? 64u : 16u;
+        if (!type || !type->size() || *type->size() == 0 ||
+            *type->size() > maximum_stack_value_size) break;
         const auto alignment = std::min<std::uint64_t>(16, std::max<std::uint64_t>(8, type->alignment()));
         const auto remainder = static_cast<std::uint64_t>(stack_offset) % alignment;
         if (remainder) stack_offset += static_cast<std::int64_t>(alignment - remainder);
-        if (stack_offset < 0 || stack_offset > (1 << 20) - 16) break;
-        slots.push_back({classified->value_class, {}, stack_offset, parameter_number, {}});
         const auto allocation = std::max<std::uint64_t>(8, (*type->size() + 7) & ~std::uint64_t{7});
-        if (allocation > static_cast<std::uint64_t>((1 << 20) - stack_offset)) break;
+        constexpr std::uint64_t stack_budget = 1u << 20;
+        if (stack_offset < 0 || static_cast<std::uint64_t>(stack_offset) > stack_budget ||
+            allocation > stack_budget - static_cast<std::uint64_t>(stack_offset)) break;
+        slots.push_back({classified->value_class, {}, stack_offset, parameter_number, {}});
         stack_offset += static_cast<std::int64_t>(allocation);
     }
     return slots;
