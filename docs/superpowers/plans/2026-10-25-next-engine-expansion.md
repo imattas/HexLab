@@ -29,28 +29,28 @@
 
 **Files:** `libs/processors/src/x64_x87.cpp`, `libs/processors/include/hexlab/processors/`, `libs/decompiler/src/`, and x87 documentation as needed.
 
-- [ ] Inspect existing x87 register effects and stack-depth handling; define the smallest API-compatible TOP/tag state representation.
-- [ ] Implement supported push/pop and TOP-rotation transfer semantics with conservative handling for unknown restores and joins.
-- [ ] Document the modeled instruction subset and limits; compile affected processor and decompiler Debug targets.
+- [x] Inspect existing x87 register effects and stack-depth handling; define the smallest API-compatible TOP/tag state representation.
+- [x] Implement supported push/pop, TOP-rotation, FFREE/FFREEP, and known-tag transitions with conservative handling for unknown restores and joins.
+- [x] Document the modeled instruction subset and limits; compile affected processor and decompiler Debug targets.
 
 ### Task 2: ELF32 i386 runtime relocation application
 
 **Files:** `libs/loaders/src/elf_dynamic_relocations.cpp`, relevant public ELF runtime relocation headers, and focused ELF runtime relocation docs.
 
-- [ ] Confirm the existing ET_DYN overlay/transaction model and exact dynamic relocation table ownership.
-- [ ] Add bounded i386 REL support for `R_386_RELATIVE`, `R_386_GLOB_DAT`, and `R_386_JMP_SLOT` using checked 32-bit addresses and exact external bindings.
-- [ ] Keep unsupported rows explicit and preserve source-row provenance; compile `hexlab_loaders` and dependent CLI Debug targets.
+- [x] Confirm the existing ET_DYN overlay/transaction model and exact dynamic relocation table ownership.
+- [x] Add bounded i386 REL support for `R_386_RELATIVE`, `R_386_GLOB_DAT`, and `R_386_JMP_SLOT` using checked 32-bit addresses and exact external bindings.
+- [x] Keep unsupported rows explicit and preserve source-row provenance; compile `hexlab_loaders` and dependent CLI Debug targets.
 
 ### Task 3: PDB IPI resolution across type servers
 
 **Files:** `libs/types/src/pdb.cpp`, `libs/types/src/pdb_import.cpp`, public PDB type headers, and PDB type-import docs.
 
-- [ ] Confirm current IPI parsing/import coverage and type-server identity handling before editing.
-- [ ] Resolve only supported function/member-function IPI references in their owning PDB's TPI/IPI namespace, with exact GUID/age, cycle, ambiguity, and depth checks.
-- [ ] Preserve unresolved records and source provenance; compile `hexlab_types`, `hexlab_loaders`, and `hexlab_workspace` Debug targets.
+- [x] Confirm current IPI parsing/import coverage and type-server identity handling before editing.
+- [x] Resolve supported function/member-function IPI references in their owning PDB's TPI/IPI namespace, preserving exact GUID/age, namespace mapping, and cycle diagnostics.
+- [x] Preserve unresolved records and source provenance; compile the affected `hexlab_types` Debug target.
 
 ### Integration
 
-- [ ] Review independent changes for bounds, exact identity, semantic fidelity, and non-overlapping files.
-- [ ] Compile the integrated Debug targets serially; do not run tests or launch the desktop.
-- [ ] Update capability evidence from source and build output, then verify `out/` was untouched.
+- [x] Review independent changes for bounds, exact identity, semantic fidelity, and non-overlapping files.
+- [x] Compile the integrated Debug `hexlab_cli` and `hexlab` targets serially; do not run tests or launch the desktop.
+- [x] Update capability evidence from source and focused build output; keep `out/` untouched.
