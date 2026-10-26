@@ -21,3 +21,20 @@ instruction before safely resuming the owner. A multi-thread schedule also
 cannot contain a single-step action. These checks fail before any thread is
 resumed. This feature does not make multiple ptrace operations atomic; the
 backend uses stop-and-rollback to contain partial failure.
+
+Each scheduled action can choose a signal disposition. If the thread owns a
+signal-delivery stop, omitting the choice preserves and redelivers that signal;
+`not_handled` explicitly requests the same behavior and `handled` suppresses it.
+This works for both the event owner and a signal already queued for a stopped
+thread. A `stop` action keeps a pending signal with that thread for a later
+schedule. Suppression is retained even if the stop event is surfaced later.
+Process-wide continue also delivers queued signals for stopped peers. The
+backend does not reinject ptrace interrupt stops or debugger-owned software,
+hardware, and single-step traps. A SIGTRAP whose provenance cannot be read is
+conservatively suppressed.
+
+If a multi-thread resume fails after a peer has already restarted with a
+signal, stopping that peer cannot undo signal-handler execution. The consumed
+signal is removed from the queued state immediately after its successful
+`PTRACE_CONT`, preventing a retry from delivering it twice. The still-pending
+event owner remains available for retry.
