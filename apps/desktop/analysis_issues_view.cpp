@@ -82,6 +82,8 @@ AnalysisIssuesView::AnalysisIssuesView(wxWindow *parent) : wxPanel(parent) {
     filter_->Append("Candidates");
     filter_->Append("Overlaps");
     filter_->Append("Loader diagnostics");
+    filter_->Append("Type import diagnostics");
+    filter_->Append("Decompiler diagnostics");
     filter_->SetSelection(0);
     search_ = new wxTextCtrl(this, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
     search_->SetName("analysis-issues-search");
@@ -222,7 +224,7 @@ void AnalysisIssuesView::update(std::optional<DocumentId> document, std::shared_
             const auto found = preferences_.find(document_->value);
             if (found != preferences_.end()) preference = found->second;
         }
-        filter_->SetSelection(std::clamp(preference.filter, 0, 4));
+        filter_->SetSelection(std::clamp(preference.filter, 0, 6));
         search_->ChangeValue(preference.query);
         scope_entry_ = preference.function;
         selection_key_ = std::move(preference.selected);
@@ -240,7 +242,9 @@ void AnalysisIssuesView::update(std::optional<DocumentId> document, std::shared_
         scope_error_.clear();
         rebuild_scope();
         rebuild();
-    } else if (!same_project || changed_document) {
+    } else if (changed_document) {
+        rebuild();
+    } else if (!same_project) {
         render();
     } else {
         update_scope_context();
@@ -263,6 +267,28 @@ void AnalysisIssuesView::retain_documents(std::span<const DocumentInfo> document
             return document.id.value == item.first;
         });
     });
+    std::erase_if(type_diagnostics_, [&](const auto &item) {
+        return std::none_of(documents.begin(), documents.end(), [&](const auto &document) { return document.id.value == item.first; });
+    });
+    std::erase_if(decompiler_diagnostics_, [&](const auto &item) {
+        return std::none_of(documents.begin(), documents.end(), [&](const auto &document) { return document.id.value == item.first; });
+    });
+}
+
+void AnalysisIssuesView::set_type_diagnostics(std::optional<DocumentId> document,
+                                              std::vector<AnalysisIssueDiagnostic> diagnostics) {
+    if (!document) return;
+    if (diagnostics.empty()) type_diagnostics_.erase(document->value);
+    else type_diagnostics_.insert_or_assign(document->value, std::move(diagnostics));
+    if (document_ == document) rebuild();
+}
+
+void AnalysisIssuesView::set_decompiler_diagnostics(std::optional<DocumentId> document,
+                                                    std::vector<AnalysisIssueDiagnostic> diagnostics) {
+    if (!document) return;
+    if (diagnostics.empty()) decompiler_diagnostics_.erase(document->value);
+    else decompiler_diagnostics_.insert_or_assign(document->value, std::move(diagnostics));
+    if (document_ == document) rebuild();
 }
 
 void AnalysisIssuesView::remember_preference() {
@@ -401,6 +427,8 @@ wxString AnalysisIssuesView::kind_text(Kind kind) const {
     case Kind::overlap: return "Conflict";
     case Kind::incomplete_function: return "Incomplete function";
     case Kind::loader_diagnostic: return "Loader diagnostic";
+    case Kind::type_import_diagnostic: return "Type import diagnostic";
+    case Kind::decompiler_diagnostic: return "Decompiler diagnostic";
     }
     return "Finding";
 }
@@ -419,7 +447,16 @@ void AnalysisIssuesView::rebuild() {
         ? std::min(max_loader_rows, loaded->diagnostics.size()) +
               std::min(max_loader_rows, loaded->runtime_relocation_diagnostics.size())
         : 0;
-    const auto diagnostic_budget = std::min(max_loader_rows, diagnostic_count);
+    const auto active_type = document_ && type_diagnostics_.contains(document_->value) ? &type_diagnostics_.at(document_->value) : nullptr;
+    const auto active_decompiler = document_ && decompiler_diagnostics_.contains(document_->value) ? &decompiler_diagnostics_.at(document_->value) : nullptr;
+    const auto producer_count = std::min(max_loader_rows, active_type ? active_type->size() : 0) +
+                                std::min(max_loader_rows, active_decompiler ? active_decompiler->size() : 0);
+    const auto diagnostic_total = diagnostic_count + producer_count;
+    const bool diagnostic_source_truncated = loaded &&
+        (loaded->diagnostics.size() > max_loader_rows || loaded->runtime_relocation_diagnostics.size() > max_loader_rows);
+    const bool producer_source_truncated = (active_type && active_type->size() > max_loader_rows) ||
+                                           (active_decompiler && active_decompiler->size() > max_loader_rows);
+    const auto diagnostic_budget = std::min(max_loader_rows * 4, diagnostic_total);
     const auto function_row_limit = max_rows - diagnostic_budget;
     bool function_capped = false;
     auto add_function = [this, &function_capped, function_row_limit](Row row) {
@@ -479,7 +516,9 @@ void AnalysisIssuesView::rebuild() {
             wxString detail = text(source) + " " + severity_text(diagnostic.severity) + ": " +
                               preview_text(diagnostic.message, 4096);
             if (rows_.size() >= max_rows) break;
-            rows_.push_back({Kind::loader_diagnostic, diagnostic.location, {}, {}, std::move(detail)});
+            Row row{Kind::loader_diagnostic, diagnostic.location, {}, {}, std::move(detail)};
+            row.severity = diagnostic.severity;
+            rows_.push_back(std::move(row));
             ++diagnostic_rows;
         }
     };
@@ -487,7 +526,20 @@ void AnalysisIssuesView::rebuild() {
         add_diagnostics(loaded->diagnostics, "Loader");
         add_diagnostics(loaded->runtime_relocation_diagnostics, "Runtime relocation");
     }
-    capped_ = function_capped || diagnostic_rows < diagnostic_count;
+    const auto add_producer = [&](const std::vector<AnalysisIssueDiagnostic> *items, Kind kind) {
+        if (!items) return;
+        for (std::size_t i = 0; i < std::min(max_loader_rows, items->size()) && diagnostic_rows < diagnostic_budget; ++i) {
+            const auto &item = (*items)[i];
+            wxString detail = text(item.source) + " " + severity_text(item.severity) + ": " + preview_text(item.message, 4096);
+            Row row{kind, item.address, {}, item.function_entry, std::move(detail)};
+            row.severity = item.severity;
+            rows_.push_back(std::move(row));
+            ++diagnostic_rows;
+        }
+    };
+    add_producer(active_type, Kind::type_import_diagnostic);
+    add_producer(active_decompiler, Kind::decompiler_diagnostic);
+    capped_ = function_capped || diagnostic_rows < diagnostic_total || diagnostic_source_truncated || producer_source_truncated;
 
     std::stable_sort(rows_.begin(), rows_.end(), [](const Row &left, const Row &right) {
         if (left.address && right.address) {
@@ -587,6 +639,8 @@ void AnalysisIssuesView::render() {
             continue;
         if (selected_filter == 4 && kind != Kind::loader_diagnostic)
             continue;
+        if (selected_filter == 5 && kind != Kind::type_import_diagnostic) continue;
+        if (selected_filter == 6 && kind != Kind::decompiler_diagnostic) continue;
         if (!query.empty()) {
             wxString aggregate = kind_text(kind) + " " +
                                  (rows_[index].address ? location_text(*rows_[index].address)
@@ -623,7 +677,7 @@ void AnalysisIssuesView::render() {
             status += wxString::Format(" of %llu", static_cast<unsigned long long>(rows_.size()));
         if (scope_entry_) status += "; pinned function scope";
         if (capped_)
-            status += "; view bounded to 20,000 findings (at most 2,048 loader diagnostics) and 100,000 functions";
+            status += "; view bounded to 20,000 findings (at most 2,048 each from loader, runtime relocation, type import, and decompiler) and 100,000 functions";
         if (project_->functions && !project_->functions->complete)
             status += "; function analysis is incomplete";
         if (project_->status == DerivedStatus::incomplete)
@@ -633,9 +687,10 @@ void AnalysisIssuesView::render() {
         if (!project_->reason.empty())
             status += "; " + preview_text(project_->reason, 180);
         if (scope_entry_ && std::any_of(rows_.begin(), rows_.end(), [](const Row &row) {
-                return row.kind == Kind::loader_diagnostic && !row.address;
+                return (row.kind == Kind::loader_diagnostic || row.kind == Kind::type_import_diagnostic ||
+                        row.kind == Kind::decompiler_diagnostic) && !row.address;
             }))
-            status += "; unlocated loader diagnostics are hidden by function scope";
+            status += "; unlocated diagnostics are hidden by function scope";
         status_->SetLabel(status);
     }
     export_->Enable(!visible_rows_.empty());

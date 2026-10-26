@@ -3,6 +3,7 @@
 #include "hexlab/analysis/functions.hpp"
 #include "hexlab/analysis/stack.hpp"
 #include "hexlab/workspace/project.hpp"
+#include "analysis_issue_diagnostic.hpp"
 #include "hexlab/workspace/commands.hpp"
 #include "hexlab/workspace/document_manager.hpp"
 #include <wx/listctrl.h>
@@ -41,6 +42,7 @@ class PseudocodeView final : public wxPanel {
                          std::function<void(ProjectCommand)> submit = {});
     void retain_documents(std::span<const DocumentInfo>);
     std::function<void(Location)> navigate;
+    std::function<void(std::vector<AnalysisIssueDiagnostic>)> diagnostics_changed;
     std::function<void(const PseudocodeNavigationToken &, Location)> navigate_document;
     std::function<std::optional<wxString>(const wxString &, const wxString &, bool)> prompt;
 

@@ -1028,6 +1028,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     source_->ChangeValue({});
     update_variable_actions();
     if (!snapshot || !address) {
+        if (diagnostics_changed) diagnostics_changed({});
         status_->SetLabel("Select an address inside a recovered function");
         rename_function_->Enable(false); rename_local_->Enable(false); comment_local_->Enable(false); edit_comment_->Enable(false);
         rename_variable_->Enable(false); assign_type_->Enable(false);
@@ -1035,6 +1036,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
         return;
     }
     if (!match) {
+        if (diagnostics_changed) diagnostics_changed({});
         status_->SetLabel("No recovered function contains the selected address");
         rename_function_->Enable(false); rename_local_->Enable(false); comment_local_->Enable(false); edit_comment_->Enable(false);
         rename_variable_->Enable(false); assign_type_->Enable(false);
@@ -1042,6 +1044,10 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
         return;
     }
     function_ = match->function;
+    const auto report_decompiler_failure = [&](const std::string &message) {
+        if (diagnostics_changed)
+            diagnostics_changed({{"Decompiler", DiagnosticSeverity::error, message, {}, match->function->entry}});
+    };
     const bool editable = project_ && project_->state && project_->mode == database::ProjectMode::read_write && submit_;
     rename_function_->Enable(editable);
     const auto selected_stack_row = stack_slots_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
@@ -1060,6 +1066,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
                                     ? &*project_->loaded->metadata.wasm : nullptr;
     auto lifted = decompiler::lift_function(*match->function, *snapshot, jvm_metadata, wasm_metadata);
     if (!lifted) {
+        report_decompiler_failure(lifted.error().message);
         status_->SetLabel("Could not lift the selected function: " + text(lifted.error().message));
         updating_ = false;
         return;
@@ -1074,6 +1081,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     const auto abi = recovery_abi(*match->function, *snapshot, image, project_, prototype);
     auto call_effects = decompiler::prepare_call_effects(lifted.value(), abi);
     if (!call_effects) {
+        report_decompiler_failure(call_effects.error().message);
         status_->SetLabel("Could not prepare call effects: " + text(call_effects.error().message));
         updating_ = false;
         return;
@@ -1083,18 +1091,21 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     call_arguments.insert(call_arguments.end(), abi.vector_argument_registers.begin(), abi.vector_argument_registers.end());
     auto ssa = decompiler::to_ssa(call_effects.value(), call_arguments);
     if (!ssa) {
+        report_decompiler_failure(ssa.error().message);
         status_->SetLabel("Could not convert the selected function to SSA: " + text(ssa.error().message));
         updating_ = false;
         return;
     }
     auto constants_simplified = decompiler::simplify_constants(ssa.value());
     if (!constants_simplified) {
+        report_decompiler_failure(constants_simplified.error().message);
         status_->SetLabel("Could not simplify the selected function: " + text(constants_simplified.error().message));
         updating_ = false;
         return;
     }
     auto simplified = decompiler::simplify_identities(constants_simplified.value());
     if (!simplified) {
+        report_decompiler_failure(simplified.error().message);
         status_->SetLabel("Could not simplify identities in the selected function: " + text(simplified.error().message));
         updating_ = false;
         return;
@@ -1308,6 +1319,13 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
                       (match->function->complete ? "" : " (partial recovery)") +
                       (stack && !stack->complete ? " (partial stack offsets)" : ""));
     rendered_function_ = match->function->entry;
+    if (diagnostics_changed) {
+        std::vector<AnalysisIssueDiagnostic> diagnostics;
+        diagnostics.reserve(lifted.value().diagnostics.size());
+        for (const auto &message : lifted.value().diagnostics)
+            diagnostics.push_back({"Decompiler", DiagnosticSeverity::warning, message, {}, match->function->entry});
+        diagnostics_changed(std::move(diagnostics));
+    }
     rendered_snapshot_ = snapshot;
     rendered_project_ = project;
     rendered_image_ = image;
