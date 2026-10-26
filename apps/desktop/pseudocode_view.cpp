@@ -1159,14 +1159,14 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
         if (variable.access_sites.empty())
             ++variable_origin_counts[address_identity(variable.definition)];
         else
-            for (const auto address : variable.access_sites)
-                ++variable_origin_counts[address_identity(address)];
+            for (const auto site_address : variable.access_sites)
+                ++variable_origin_counts[address_identity(site_address)];
     }
     for (auto &variable : variables_) {
         const bool shared_origin = variable.access_sites.empty()
             ? variable_origin_counts[address_identity(variable.definition)] != 1
-            : std::any_of(variable.access_sites.begin(), variable.access_sites.end(), [&](Address address) {
-                  return variable_origin_counts[address_identity(address)] != 1;
+            : std::any_of(variable.access_sites.begin(), variable.access_sites.end(), [&](Address site_address) {
+                  return variable_origin_counts[address_identity(site_address)] != 1;
               });
         variable.function_entry_collision = variable.definition == match->function->entry;
         variable.editable = !shared_origin && !variable.function_entry_collision;
@@ -1268,7 +1268,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
                 return std::pair{left.space.value, left.offset} < std::pair{right.space.value, right.offset};
             });
             accesses.erase(std::unique(accesses.begin(), accesses.end()), accesses.end());
-            for (const auto address : accesses) ++stack_origin_counts[address_identity(address)];
+            for (const auto site_address : accesses) ++stack_origin_counts[address_identity(site_address)];
             normalized_accesses.push_back(std::move(accesses));
         }
         for (std::size_t slot_index = 0; slot_index < stack->slots.size(); ++slot_index) {
