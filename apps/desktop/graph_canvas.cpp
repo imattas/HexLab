@@ -667,8 +667,15 @@ GraphCanvas::InstructionRows GraphCanvas::instruction_rows(const GraphNode &node
     return rows;
 }
 void GraphCanvas::follow_focused_node() {
-    if (!graph_ || !hit_) return;
-    const auto *id = std::get_if<GraphNodeId>(&*hit_);
+    if (!graph_) return;
+    std::optional<GraphNodeId> id;
+    if (hit_) {
+        const auto *focused = std::get_if<GraphNodeId>(&*hit_);
+        if (!focused) return;
+        id = *focused;
+    } else {
+        id = focused_node();
+    }
     if (!id) return;
     const auto found = nodes_.find(*id);
     if (found == nodes_.end()) return;
