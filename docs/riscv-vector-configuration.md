@@ -133,3 +133,14 @@ actual memory accesses remain outside this bounded static model.
 The decoder supports the encoded RVV 1.0 forms listed here without claiming a
 complete RVV implementation; implementation-specific VLEN/ELEN and execution
 semantics remain outside this bounded static representation.
+
+The decoder and lane evaluator also support the non-widening integer
+multiply-accumulate/subtract forms `vmacc.vv/vx`, `vnmsac.vv/vx`,
+`vmadd.vv/vx`, and `vnmsub.vv/vx`. They use the destructive destination as an
+input. `vmacc`/`vnmsac` accumulate the low product into the old destination;
+`vmadd`/`vnmsub` multiply the old destination by the second multiplicand and
+add/subtract it from `vs2`. Masked encodings retain the v0 predicate dependency,
+while inactive and tail lanes retain the caller-supplied destination value.
+These operation equations, operand classes, and funct6 assignments follow
+[RVV 1.0 section 30.1.11.13](https://docs.riscv.org/reference/isa/v20240411/unpriv/v-st-ext.html#vector-single-width-integer-multiply-add-instructions).
+Widening multiply-accumulate and carry/borrow operations are not included.

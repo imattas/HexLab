@@ -11,7 +11,7 @@ F/D scalar instructions enter the shared pipeline with a distinct floating value
 Floating-result intrinsics carry an explicit 32- or 64-bit result type into type recovery. Only FPR destinations receive that floating fact; integer results and `fflags` remain separate effects.
 
 The decoded RVV integer elementwise families share one explicit opcode-to-effect
-route covering 69 forms:
+route covering 77 forms:
 
 | Family | Retained forms |
 | --- | --- |
@@ -20,6 +20,7 @@ route covering 69 forms:
 | Shifts | `vsll`, `vsrl`, `vsra` in `.vv/.vx/.vi` |
 | Min/max | `vminu`, `vmin`, `vmaxu`, `vmax` in `.vv/.vx` |
 | Multiply | `vmul`, `vmulh`, `vmulhu`, `vmulhsu` in `.vv/.vx` |
+| Multiply-accumulate | `vmacc`, `vnmsac`, `vmadd`, `vnmsub` in `.vv/.vx` |
 | Divide/remainder | `vdivu`, `vdiv`, `vremu`, `vrem` in `.vv/.vx` |
 | Comparisons | `vmseq/vmsne` in `.vv/.vx/.vi`; `vmsltu/vmslt` in `.vv/.vx`; `vmsleu/vmsle` in `.vv/.vx/.vi`; `vmsgtu/vmsgt` in `.vx/.vi` |
 
@@ -39,6 +40,13 @@ destination; repeated configuration-read records are collapsed. All inputs are
 pre-instruction SSA reads and all decoded outputs receive their own SSA versions.
 Vector result typing applies only to vector-register outputs, so `vstart` cannot
 accidentally acquire the data or predicate destination's vector type.
+
+The single-width multiply-accumulate/subtract forms retain the pre-instruction
+destination as an explicit vector input because their destination is destructive.
+The names distinguish accumulation into the old destination (`vmacc`,
+`vnmsac`) from multiplication using the old destination (`vmadd`, `vnmsub`).
+The lifter preserves their architectural input dependencies without lowering
+them to scalar arithmetic or assuming a runtime SEW.
 
 No lane evaluation is performed by the lifter. The mnemonic retains signedness,
 high-half multiply variants, reverse-subtract operand semantics, and unsigned
