@@ -631,9 +631,20 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
                 << unsigned(site.scale) << ",\"entry_encoding\":\""
                 << (site.entry_encoding == SwitchEntryEncoding::absolute_pointer ? "absolute_pointer"
                     : site.entry_encoding == SwitchEntryEncoding::signed_offset_from_table ? "signed_offset_from_table"
-                    : "thumb_scaled_pc_relative")
-                << "\",\"complete\":" << (site.complete ? "true" : "false")
-                << ",\"case_count\":";
+                    : site.entry_encoding == SwitchEntryEncoding::thumb_scaled_pc_relative ? "thumb_scaled_pc_relative"
+                    : "signed_offset_from_target_base")
+                << "\",\"target_base\":";
+            if (site.target_base)
+                out << '"' << location(*site.target_base) << '"';
+            else
+                out << "null";
+            out << ",\"complete\":" << (site.complete ? "true" : "false")
+                << ",\"incomplete_reason\":";
+            if (site.incomplete_reason)
+                out << '"' << *site.incomplete_reason << '"';
+            else
+                out << "null";
+            out << ",\"case_count\":";
             if (site.case_count)
                 out << *site.case_count;
             else

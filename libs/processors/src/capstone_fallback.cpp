@@ -95,29 +95,116 @@ std::optional<RegisterOperand> named_register(csh handle, unsigned reg, unsigned
         if(n=="zero") return RegisterOperand{RegisterBank::mips_gpr,0,static_cast<std::uint16_t>(width),false};
         constexpr std::string_view names[]={"zero","at","v0","v1","a0","a1","a2","a3","t0","t1","t2","t3","t4","t5","t6","t7","s0","s1","s2","s3","s4","s5","s6","s7","t8","t9","k0","k1","gp","sp","fp","ra"};
         for(unsigned i=0;i<32;i++) if(n==names[i]) return RegisterOperand{RegisterBank::mips_gpr,static_cast<std::uint8_t>(i),static_cast<std::uint16_t>(width),false};
+        if(n=="hi"||n=="lo") return RegisterOperand{RegisterBank::mips_hilo,static_cast<std::uint8_t>(n=="lo"),static_cast<std::uint16_t>(width),false};
+        if(n=="fcsr") return RegisterOperand{RegisterBank::mips_fcsr,0,32,false};
     }
-    if(arch==Architecture::powerpc){ if(auto i=number("r",32)) return RegisterOperand{RegisterBank::ppc_gpr,static_cast<std::uint8_t>(*i),static_cast<std::uint16_t>(width),false}; }
+    if(arch==Architecture::powerpc){
+        if(auto i=number("r",32)) return RegisterOperand{RegisterBank::ppc_gpr,static_cast<std::uint8_t>(*i),static_cast<std::uint16_t>(width),false};
+        if(auto i=number("cr",8)) return RegisterOperand{RegisterBank::ppc_cr,static_cast<std::uint8_t>(*i),4,false};
+        if(n=="lr"||n=="lr8") return RegisterOperand{RegisterBank::ppc_lr,0,static_cast<std::uint16_t>(width),false};
+        if(n=="ctr"||n=="ctr8") return RegisterOperand{RegisterBank::ppc_ctr,0,static_cast<std::uint16_t>(width),false};
+        if(n=="xer") return RegisterOperand{RegisterBank::ppc_xer,0,32,false};
+    }
     return {};
 }
 void add_unique(std::vector<RegisterOperand>& v, RegisterOperand r) {
     if (std::find(v.begin(),v.end(),r)==v.end()) v.push_back(r);
 }
+bool control_transfer(FlowKind flow) {
+    return flow==FlowKind::call || flow==FlowKind::jump || flow==FlowKind::conditional_branch;
+}
+std::optional<Address> absolute_target(const Instruction &instruction, std::int64_t value,
+                                       unsigned width, unsigned alignment) {
+    const auto offset=width==32?static_cast<std::uint64_t>(static_cast<std::uint32_t>(value))
+                                :static_cast<std::uint64_t>(value);
+    if(offset%alignment) return {};
+    return Address{instruction.address.space,offset};
+}
+std::optional<Address> relative_target(const Instruction &instruction, std::int64_t displacement,
+                                       unsigned width, unsigned alignment) {
+    const auto base=instruction.address.offset;
+    const auto magnitude=displacement<0?static_cast<std::uint64_t>(-(displacement+1))+1
+                                       :static_cast<std::uint64_t>(displacement);
+    if(width==32 && base>UINT32_MAX) return {};
+    if(displacement<0 ? magnitude>base : magnitude>(width==32?UINT32_MAX:UINT64_MAX)-base)
+        return {};
+    const auto offset=displacement<0?base-magnitude:base+magnitude;
+    if(offset%alignment) return {};
+    return Address{instruction.address.space,offset};
+}
+bool mips_classic_direct(unsigned id) {
+    switch(id) {
+    case MIPS_INS_J: case MIPS_INS_JAL: case MIPS_INS_BAL:
+    case MIPS_INS_BEQ: case MIPS_INS_BNE: case MIPS_INS_BGEZ: case MIPS_INS_BLTZ:
+    case MIPS_INS_BGTZ: case MIPS_INS_BLEZ:
+    case MIPS_INS_BC1T: case MIPS_INS_BC1F:
+        return true;
+    default:return false;
+    }
+}
+bool ppc_direct_branch(unsigned id) {
+    switch(id) {
+    case PPC_INS_B: case PPC_INS_BA: case PPC_INS_BL: case PPC_INS_BLA:
+    case PPC_INS_BC: case PPC_INS_BCA: case PPC_INS_BCL: case PPC_INS_BCLA:
+        return true;
+    default:return false;
+    }
+}
+bool riscv_relative_branch(unsigned id) {
+    switch(id) {
+    case RISCV_INS_BEQ:case RISCV_INS_BNE:case RISCV_INS_BLT:case RISCV_INS_BGE:
+    case RISCV_INS_BLTU:case RISCV_INS_BGEU:case RISCV_INS_C_BEQZ:case RISCV_INS_C_BNEZ:
+    case RISCV_INS_JAL:case RISCV_INS_C_J:case RISCV_INS_C_JAL:
+        return true;
+    default:return false;
+    }
+}
 void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Architecture architecture) {
     const auto *d=insn.detail;
     if (!d) return;
+    bool call=false,ret=false,trap=false,jump=false;
     for(unsigned i=0;i<d->groups_count;i++) {
         switch(d->groups[i]) {
-        case CS_GRP_CALL: out.flow=FlowKind::call; break;
-        case CS_GRP_RET: case CS_GRP_IRET: out.flow=FlowKind::ret; break;
-        case CS_GRP_INT: out.flow=FlowKind::trap; break;
-        case CS_GRP_JUMP:
-            // Capstone does not identify conditionality portably. On x86, a
-            // relative branch group or a conditional mnemonic is explicit.
-            if (insn.id == X86_INS_JMP || insn.id == X86_INS_LJMP) out.flow=FlowKind::jump;
-            else if (insn.id >= X86_INS_JAE && insn.id <= X86_INS_JS) out.flow=FlowKind::conditional_branch;
-            else out.flow=FlowKind::jump;
-            break;
+        case CS_GRP_CALL:call=true;break;
+        case CS_GRP_RET:case CS_GRP_IRET:ret=true;break;
+        case CS_GRP_INT:trap=true;break;
+        case CS_GRP_JUMP:jump=true;break;
         }
+    }
+    // Some backends attach both JUMP and CALL/RET groups. A later group must
+    // not overwrite the more specific control-transfer class.
+    out.flow=trap?FlowKind::trap:ret?FlowKind::ret:call?FlowKind::call:jump?FlowKind::jump:FlowKind::fallthrough;
+    if(architecture==Architecture::arm64 && out.flow==FlowKind::jump) {
+        const auto cc=d->arm64.cc;
+        if((insn.id==ARM64_INS_B || insn.id==ARM64_INS_BC) && cc>ARM64_CC_INVALID && cc<ARM64_CC_AL)
+            out.flow=FlowKind::conditional_branch;
+        if(insn.id==ARM64_INS_CBZ || insn.id==ARM64_INS_CBNZ ||
+           insn.id==ARM64_INS_TBZ || insn.id==ARM64_INS_TBNZ)
+            out.flow=FlowKind::conditional_branch;
+    } else if(architecture==Architecture::arm && out.flow==FlowKind::jump) {
+        const auto cc=d->arm.cc;
+        if((insn.id==ARM_INS_B && cc>ARM_CC_INVALID && cc<ARM_CC_AL) ||
+           insn.id==ARM_INS_CBZ || insn.id==ARM_INS_CBNZ)
+            out.flow=FlowKind::conditional_branch;
+    } else if((architecture==Architecture::riscv32 || architecture==Architecture::riscv64) &&
+              out.flow==FlowKind::jump) {
+        switch(insn.id) {
+        case RISCV_INS_BEQ: case RISCV_INS_BNE: case RISCV_INS_BLT: case RISCV_INS_BGE:
+        case RISCV_INS_BLTU: case RISCV_INS_BGEU: case RISCV_INS_C_BEQZ: case RISCV_INS_C_BNEZ:
+            out.flow=FlowKind::conditional_branch;break;
+        default:break;
+        }
+    } else if((architecture==Architecture::mips32 || architecture==Architecture::mips64) &&
+              out.flow==FlowKind::jump) {
+        switch(insn.id) {
+        case MIPS_INS_BEQ:case MIPS_INS_BNE:case MIPS_INS_BGEZ:case MIPS_INS_BLTZ:
+        case MIPS_INS_BGTZ:case MIPS_INS_BLEZ:case MIPS_INS_BC1T:case MIPS_INS_BC1F:
+            out.flow=FlowKind::conditional_branch;break;
+        default:break;
+        }
+    } else if(architecture==Architecture::powerpc && out.flow==FlowKind::jump) {
+        if(d->ppc.bc!=PPC_BC_INVALID || insn.id==PPC_INS_BDNZ || insn.id==PPC_INS_BDZ)
+            out.flow=FlowKind::conditional_branch;
     }
     const bool x86=architecture==Architecture::x86 || architecture==Architecture::x86_64;
     if (architecture==Architecture::arm64) {
@@ -126,14 +213,14 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
             if(op.access==0 && (op.type==ARM64_OP_REG||op.type==ARM64_OP_MEM)) continue;
             const auto ac=(op.access&CS_AC_WRITE)?((op.access&CS_AC_READ)?OperandAccess::read_write:OperandAccess::write):OperandAccess::read;
             if(op.type==ARM64_OP_REG){auto r=named_register(handle,op.reg,64,architecture); if(r){out.operands.emplace_back(*r);out.access.push_back(ac);}}
-            else if(op.type==ARM64_OP_IMM){out.operands.emplace_back(ImmediateOperand{static_cast<std::uint64_t>(op.imm),64,64,true,{}});out.access.push_back(OperandAccess::read);if(out.flow==FlowKind::call||out.flow==FlowKind::jump||out.flow==FlowKind::conditional_branch)out.direct_target=Address{out.address.space,static_cast<std::uint64_t>(op.imm)};}
+            else if(op.type==ARM64_OP_IMM){out.operands.emplace_back(ImmediateOperand{static_cast<std::uint64_t>(op.imm),64,64,true,{}});out.access.push_back(OperandAccess::read);}
             else if(op.type==ARM64_OP_MEM){MemoryOperand m;m.address_width=64;m.displacement=op.mem.disp;m.base=named_register(handle,op.mem.base,64,architecture);if(op.mem.index)m.index=named_register(handle,op.mem.index,64,architecture);out.operands.emplace_back(m);out.access.push_back(ac);out.memory_read|=ac!=OperandAccess::write;out.memory_write|=ac==OperandAccess::write||ac==OperandAccess::read_write;}
         }
     } else if (architecture==Architecture::arm) {
         const auto& a=d->arm;if(a.op_count>36)return;
         for(unsigned i=0;i<a.op_count;i++){const auto& op=a.operands[i];if(op.access==0&&(op.type==ARM_OP_REG||op.type==ARM_OP_MEM))continue;const auto ac=(op.access&CS_AC_WRITE)?((op.access&CS_AC_READ)?OperandAccess::read_write:OperandAccess::write):OperandAccess::read;
             if(op.type==ARM_OP_REG){auto r=named_register(handle,op.reg,32,architecture);if(r){out.operands.emplace_back(*r);out.access.push_back(ac);}}
-            else if(op.type==ARM_OP_IMM){out.operands.emplace_back(ImmediateOperand{static_cast<std::uint32_t>(op.imm),32,32,true,{}});out.access.push_back(OperandAccess::read);if(out.flow==FlowKind::call||out.flow==FlowKind::jump||out.flow==FlowKind::conditional_branch)out.direct_target=Address{out.address.space,static_cast<std::uint32_t>(op.imm)};}
+            else if(op.type==ARM_OP_IMM){out.operands.emplace_back(ImmediateOperand{static_cast<std::uint32_t>(op.imm),32,32,true,{}});out.access.push_back(OperandAccess::read);}
             else if(op.type==ARM_OP_MEM){MemoryOperand m;m.address_width=32;m.displacement=op.mem.disp;m.scale=op.mem.scale>0?static_cast<std::uint8_t>(op.mem.scale):1;m.base=named_register(handle,op.mem.base,32,architecture);if(op.mem.index)m.index=named_register(handle,op.mem.index,32,architecture);out.operands.emplace_back(m);out.access.push_back(ac);out.memory_read|=ac!=OperandAccess::write;out.memory_write|=ac==OperandAccess::write||ac==OperandAccess::read_write;}
         }
     } else if (architecture==Architecture::riscv32 || architecture==Architecture::riscv64) {
@@ -224,6 +311,56 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
         else if(m.am==MOS65XX_AM_ZP_REL&&m.op_count==2&&m.operands[1].type==MOS65XX_OP_MEM&&
                 out.flow==FlowKind::conditional_branch)
             out.direct_target=Address{out.address.space,m.operands[1].mem};
+    }
+    if(architecture==Architecture::arm64 && control_transfer(out.flow)) {
+        const auto &a=d->arm64;
+        const bool relative=insn.id==ARM64_INS_B || insn.id==ARM64_INS_BC || insn.id==ARM64_INS_BL ||
+                            insn.id==ARM64_INS_CBZ || insn.id==ARM64_INS_CBNZ ||
+                            insn.id==ARM64_INS_TBZ || insn.id==ARM64_INS_TBNZ;
+        if(relative && a.op_count && a.operands[a.op_count-1].type==ARM64_OP_IMM)
+            out.direct_target=absolute_target(out,a.operands[a.op_count-1].imm,64,4);
+    } else if(architecture==Architecture::arm && control_transfer(out.flow)) {
+        const auto &a=d->arm;
+        const bool relative=insn.id==ARM_INS_B || insn.id==ARM_INS_BL || insn.id==ARM_INS_BLX ||
+                            insn.id==ARM_INS_CBZ || insn.id==ARM_INS_CBNZ;
+        if(relative && a.op_count && a.operands[a.op_count-1].type==ARM_OP_IMM) {
+            // The bundled Capstone printer applies the ARM/Thumb PC bias
+            // (and Thumb BLX alignment) before storing the detail operand.
+            const auto target=static_cast<std::uint32_t>(a.operands[a.op_count-1].imm);
+            const unsigned alignment=insn.id==ARM_INS_BLX && out.context.mode==ExecutionMode::thumb?4:
+                                     out.context.mode==ExecutionMode::thumb || insn.id==ARM_INS_BLX?2:4;
+            if(target%alignment==0)
+                out.direct_target=Address{out.address.space,target};
+        }
+    } else if((architecture==Architecture::riscv32 || architecture==Architecture::riscv64) &&
+              control_transfer(out.flow)) {
+        const auto &rv=d->riscv;
+        if(insn.id==RISCV_INS_JAL && rv.op_count>1 && rv.operands[0].type==RISCV_OP_REG) {
+            if(const auto rd=named_register(handle,rv.operands[0].reg,
+                                           architecture==Architecture::riscv64?64:32,architecture);
+               rd && rd->bank==RegisterBank::riscv_gpr && rd->index==0)
+                out.flow=FlowKind::jump;
+        }
+        if(riscv_relative_branch(insn.id) && rv.op_count && rv.operands[rv.op_count-1].type==RISCV_OP_IMM)
+            out.direct_target=relative_target(out,rv.operands[rv.op_count-1].imm,
+                architecture==Architecture::riscv64?64:32,out.context.mode==ExecutionMode::rv64c?2:4);
+    } else if((architecture==Architecture::mips32 || architecture==Architecture::mips64) &&
+              control_transfer(out.flow) && mips_classic_direct(insn.id)) {
+        const auto &m=d->mips;
+        // These classic MIPS forms use a delay slot and Capstone places the
+        // decoded absolute branch address in their final immediate operand.
+        out.delay_slots=1;
+        if(m.op_count && m.operands[m.op_count-1].type==MIPS_OP_IMM)
+            out.direct_target=absolute_target(out,m.operands[m.op_count-1].imm,
+                architecture==Architecture::mips64?64:32,4);
+    } else if(architecture==Architecture::powerpc && control_transfer(out.flow) &&
+              ppc_direct_branch(insn.id)) {
+        const auto &p=d->ppc;
+        // The bundled Capstone printer has already added the PC for relative
+        // PPC branches and retained the absolute result in detail.
+        if(p.op_count && p.operands[p.op_count-1].type==PPC_OP_IMM)
+            out.direct_target=absolute_target(out,p.operands[p.op_count-1].imm,
+                out.context.mode==ExecutionMode::ppc64?64:32,4);
     }
     if (x86) {
       const std::string_view mnemonic(insn.mnemonic);

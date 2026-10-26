@@ -76,6 +76,26 @@ the 4096-entry limit, and an unbounded table reaching that limit is partial.
 As with the absolute form, ADRP/ADD relocation records are not applied when
 the decoder could not resolve the page or low immediate.
 
+A second AArch64 signed-offset form uses a distinct code base:
+`ADR Xtable, table` (or exact `ADRP`/unshifted `ADD` table setup),
+`LDRSW Xoffset, [Xtable, Wselector, UXTW #2]`, `ADR Xcode, code_base`,
+`ADD Xtarget, Xcode, Xoffset`, `BR Xtarget`. The five or six instructions
+must be contiguous in one recovered block, with one A64 context and the
+specified register relationships. The final `ADD` must be an unshifted
+64-bit register addition. Each signed 32-bit entry is added to the resolved
+`ADR` code base, which is reported separately from the table address as
+`target_base`. Table bytes and decoded targets must be file-backed; targets
+must decode as executable A64 instructions. Exact data-slot relocations can
+provide case targets, while unresolved, authenticated, or runtime-bound
+fixups end the verified prefix without using raw bytes. The exact local ELF
+`ADRP`/`ADD` relocation pair described above can supply this form's table
+base. Unknown setup relocations, other index extensions or shifts, an
+independent code base formed by another instruction sequence, and intervening
+instructions remain unsupported. A proven unsigned selector guard bounds
+the case count; otherwise scanning stops at the first unsupported entry or
+at 4096 entries. Partial sites report the scan failure through
+`incomplete_reason`.
+
 Thumb-2 `TBB [pc, Rm]` and `TBH [pc, Rm, LSL #1]` are decoded as indirect
 control transfers and recovered as byte/halfword tables based immediately
 after the 32-bit dispatch instruction. Each unsigned table entry scales by
@@ -92,8 +112,8 @@ entry scaling, and PC behavior follow the [Armv8-M Architecture Reference
 Manual, TBB/TBH](https://community.arm.com/cfs-file/__key/communityserver-discussions-components-files/471/DDI0553B_5F00_y_5F00_armv8m_5F00_arm.pdf).
 
 Each result preserves the dispatch address, table address, selector register,
-scale, entry encoding (`absolute_pointer`, `signed_offset_from_table`, or
-`thumb_scaled_pc_relative`), and
+scale, entry encoding (`absolute_pointer`, `signed_offset_from_table`,
+`signed_offset_from_target_base`, or `thumb_scaled_pc_relative`), and
 table-order case index. An unreadable or invalid entry ends the
 recovered prefix and marks it partial. Cancellation is checked during block,
 instruction, and table traversal. A contiguous `CMP selector, immediate` followed
