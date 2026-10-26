@@ -753,6 +753,9 @@ std::string operation_name(Opcode opcode) {
     case Opcode::vpsignb: return "vpsignb";
     case Opcode::vpsignw: return "vpsignw";
     case Opcode::vpsignd: return "vpsignd";
+    case Opcode::vpabsb: return "vpabsb";
+    case Opcode::vpabsw: return "vpabsw";
+    case Opcode::vpabsd: return "vpabsd";
     case Opcode::vpunpcklbw: return "vpunpcklbw";
     case Opcode::vpunpcklwd: return "vpunpcklwd";
     case Opcode::vpunpckldq: return "vpunpckldq";
@@ -3478,6 +3481,41 @@ a64_unhandled:
         }
     }
 
+    if (const auto lane = x86_avx_detail::absolute_lane_width(instruction.opcode);
+        x86 && instruction.context.mode == ExecutionMode::x86_64 && lane &&
+        instruction.operands.size() == 2 && !instruction.x86_evex && !instruction.x86_opmask &&
+        !instruction.x86_opmask_zeroing) {
+        const auto destination = as_register(instruction.operands[0]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        const auto width = destination ? destination->width : std::uint16_t{0};
+        const bool zero_upper = width == 128 && destination &&
+            std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [&](RegisterOperand reg) {
+                    return reg.bank == RegisterBank::ymm && reg.width == 256 && reg.index == destination->index;
+                });
+        if (destination && (width == 128 || width == 256) &&
+            x86_avx_detail::is_xmm_or_ymm(instruction.operands[0], width) &&
+            (x86_avx_detail::is_xmm_or_ymm(instruction.operands[1], width) ||
+             (memory && memory->data_width == width)) && (width != 128 || zero_upper) &&
+            (!instruction.vector_bits || instruction.vector_bits == width) &&
+            (!instruction.vector_element_bits || instruction.vector_element_bits == *lane)) {
+            const auto result_width = static_cast<std::uint16_t>(zero_upper ? 256 : width);
+            const auto source_type = vector_type(width, TypeKind::integer, *lane,
+                static_cast<std::uint8_t>(width / *lane), true);
+            const auto result_type = vector_type(result_width, TypeKind::integer, *lane,
+                static_cast<std::uint8_t>(result_width / *lane), false);
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_i" +
+                std::to_string(*lane) + "x" + std::to_string(width / *lane) + "_to_u" +
+                std::to_string(*lane) + "x" + std::to_string(result_width / *lane) +
+                (zero_upper ? "_zero_upper" : ""),
+                {retag_expr(operands[1], source_type)},
+                memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = result_type;
+            return effect;
+        }
+    }
+
     if (const auto shape = x86_avx_detail::immediate_shift_shape(instruction.opcode);
         x86 && instruction.context.mode == ExecutionMode::x86_64 && shape &&
         instruction.operands.size() == 3 && !instruction.x86_evex && !instruction.x86_opmask &&
@@ -4122,7 +4160,11 @@ std::optional<std::string> typed_member_access(const MemoryValue &memory) {
     while (object && object->kind() == types::Kind::qualified) object = object->element();
     if (!object || object->kind() != types::Kind::pointer) return {};
     object = object->element();
-    while (object && object->kind() == types::Kind::qualified) object = object->element();
+    const auto unqualify = [](types::TypePtr type) {
+        while (type && type->kind() == types::Kind::qualified) type = type->element();
+        return type;
+    };
+    object = unqualify(std::move(object));
     if (!object || object->kind() != types::Kind::structure || !object->size()) return {};
 
     const auto access_bytes = static_cast<std::uint64_t>(memory.type.bits / 8);
@@ -4150,7 +4192,75 @@ std::optional<std::string> typed_member_access(const MemoryValue &memory) {
         if (result) return {};
         result = std::move(candidate);
     }
-    return result;
+    if (result) return result;
+
+    // A flattened displacement may cross more than one aggregate member, for
+    // example base + offsetof(Outer, inner) + offsetof(Inner, field). Resolve
+    // that spelling only when every enclosing layout on the path is complete
+    // and non-overlapping; ambiguous/union-like layouts keep the raw memory
+    // expression below.
+    std::vector<std::string> nested_results;
+    std::size_t work = 0;
+    const auto valid_struct_layout = [&](const types::TypePtr &type) {
+        if (!type || type->kind() != types::Kind::structure || !type->size() ||
+            *type->size() == 0 || type->members().size() > 4096) return false;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        ranges.reserve(type->members().size());
+        for (const auto &field : type->members()) {
+            if (!field.has_fixed_offset() || field.bit_width || field.bit_offset || !field.type ||
+                !field.type->size() || *field.type->size() == 0 || field.offset > *type->size() ||
+                *field.type->size() > *type->size() - field.offset) return false;
+            ranges.emplace_back(field.offset, field.offset + *field.type->size());
+        }
+        std::sort(ranges.begin(), ranges.end());
+        for (std::size_t index = 1; index < ranges.size(); ++index)
+            if (ranges[index].first < ranges[index - 1].second) return false;
+        return true;
+    };
+    const auto descend = [&](const types::TypePtr &input, std::uint64_t offset,
+                             const std::string &path, unsigned depth, auto &&self) -> void {
+        if (++work > 4096 || depth > 8) return;
+        const auto type = unqualify(input);
+        if (!type || !type->size() || offset > *type->size() ||
+            access_bytes > *type->size() - offset) return;
+        if (type->kind() == types::Kind::array) {
+            const auto element = unqualify(type->element());
+            if (!element || !element->size() || *element->size() == 0 || type->count() == 0 ||
+                type->count() > (1u << 20) || type->count() > *type->size() / *element->size() ||
+                type->count() * *element->size() != *type->size()) return;
+            const auto index = offset / *element->size();
+            const auto within = offset % *element->size();
+            if (index >= type->count()) return;
+            const auto element_path = path + "[" + std::to_string(index) + "]";
+            if (within == 0 && access_bytes == *element->size()) {
+                nested_results.push_back(element_path);
+                return;
+            }
+            if (element->kind() == types::Kind::structure || element->kind() == types::Kind::array)
+                self(element, within, element_path, depth + 1, self);
+            return;
+        }
+        if (type->kind() != types::Kind::structure || !valid_struct_layout(type)) return;
+        for (const auto &field : type->members()) {
+            if (++work > 4096 || field.name.empty() || field.name.starts_with("$") ||
+                offset < field.offset) continue;
+            const auto field_type = unqualify(field.type);
+            if (!field_type || !field_type->size()) continue;
+            const auto relative = offset - field.offset;
+            if (relative > *field_type->size() || access_bytes > *field_type->size() - relative) continue;
+            const auto field_path = path + (path == register_name(*memory.base, memory.base_version)
+                ? "->" : ".") + field.name;
+            if (relative == 0 && access_bytes == *field_type->size()) {
+                nested_results.push_back(field_path);
+                continue;
+            }
+            if (field_type->kind() == types::Kind::structure || field_type->kind() == types::Kind::array)
+                self(field_type, relative, field_path, depth + 1, self);
+        }
+    };
+    descend(object, address_offset, register_name(*memory.base, memory.base_version), 0, descend);
+    if (nested_results.size() != 1) return {};
+    return nested_results.front();
 }
 std::string expression_text(const Expression &expression) {
     return std::visit([&](const auto &value) -> std::string {

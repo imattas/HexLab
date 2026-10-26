@@ -166,6 +166,17 @@ matches that exact member. Constant offsets into a recovered array member print
 as `base->field_N[index]` only for an exact element-width access. Unknown,
 ambiguous, partial-width, or overlapping accesses keep the ordinary memory
 expression.
+When an explicit or recovered structure contains nested structures or fixed
+arrays of structures, typed pseudocode can also follow a flattened constant
+displacement through the complete member path, such as
+`base->header.version` or `base->items[2].code`. Each enclosing structure must
+have a bounded, complete, non-overlapping fixed layout; array size must agree
+with its element size and count. The resolver is capped at eight nesting
+levels and 4096 visited type/member steps. Unions, bitfields, virtual bases,
+anonymous members, incomplete extents, ambiguous paths, dynamic indices, and
+partial-width accesses retain the ordinary memory expression. This follows
+Ghidra's type-directed member and subscript rendering in its native C printer
+([`printc.cc`](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc)); HexLab applies its own stricter bounded layout checks.
 When a pointer-width load into a pointer-classified value, or a pointer-valued
 store, uses a constant-offset slot, that member is recovered as `void*` rather
 than an integer. The pointer-field classification propagates through proven

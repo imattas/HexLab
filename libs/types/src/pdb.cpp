@@ -193,6 +193,24 @@ Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &database, std::stop_tok
             case 0x1503: { // LF_ARRAY
                 rec.kind=CodeViewTypeKind::array; rec.referenced_type=r32(); rec.underlying_type=r32(); rec.size=numeric(at,limit); rec.name=read_name(at,limit); break;
             }
+            case 0x151b: { // LF_VECTOR: scalar lane type, count, byte extent, and name.
+                rec.kind = CodeViewTypeKind::vector;
+                rec.referenced_type = r32();
+                rec.element_count = r32();
+                rec.size = numeric(at, limit, true);
+                rec.name = read_name(at, limit);
+                require(rec.element_count >= 2, "CodeView LF_VECTOR has fewer than two lanes");
+                require(rec.size != 0, "CodeView LF_VECTOR has zero byte extent");
+                {
+                    const auto padding = limit - at;
+                    require(padding <= 3, "CodeView LF_VECTOR has unexpected trailing bytes");
+                    for (std::size_t i = 0; i < padding; ++i)
+                        require(std::to_integer<unsigned>(bytes[at + i]) == 0xf0u + padding - i,
+                                "CodeView LF_VECTOR has invalid trailing padding");
+                    at = limit;
+                }
+                break;
+            }
             case 0x1504: case 0x1505: case 0x1519: { // class/structure/interface
                 const auto count=r16(); const auto properties=r16(); rec.field_list=r32(); rec.derivation_list=r32(); rec.vtable_shape=r32(); rec.size=numeric(at,limit); rec.name=read_name(at,limit);
                 if (properties & 0x0200) {
@@ -795,6 +813,8 @@ Result<PdbTypeGraph> resolve_pdb_type_graph(const PdbTypeStream &stream, std::st
             case CodeViewTypeKind::array:
                 add_reference(record.index, record.referenced_type, PdbTypeReferenceKind::array_element);
                 add_reference(record.index, record.underlying_type, PdbTypeReferenceKind::array_index); break;
+            case CodeViewTypeKind::vector:
+                add_reference(record.index, record.referenced_type, PdbTypeReferenceKind::vector_element); break;
             case CodeViewTypeKind::enumeration:
                 add_reference(record.index, record.underlying_type, PdbTypeReferenceKind::enum_underlying);
                 add_reference(record.index, record.field_list, PdbTypeReferenceKind::field_list); break;

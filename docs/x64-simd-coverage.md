@@ -20,6 +20,7 @@ families:
 | AVX2 immediate packed shifts | VEX.128/.256 `vpsllw/d/q`, `vpsrlw/d/q`, `vpsraw/d`, `vpslldq`, `vpsrldq` |
 | AVX2 packed word multiply | VEX.128/.256 `vpmullw`, `vpmulhw`, `vpmulhuw` |
 | AVX2 packed integer dataflow | VEX.128/.256 `vpandn`, `vpavgb/w`, `vpsignb/w/d`, `vpsadbw` |
+| AVX2 packed absolute value | VEX.128/.256 `vpabsb/w/d` |
 | AVX2 remaining min/max | VEX.128/.256 `vpminsb/sd/uw/ud`, `vpmaxsb/sd/uw/ud` |
 | AVX2 dword multiply and multiply-add | VEX.128/.256 `vpmulld`, `vpmuldq`, `vpmuludq`, `vpmaddwd`, `vpmaddubsw` |
 | AVX2 horizontal integer arithmetic | VEX.128/.256 `vphaddw/d/sw`, `vphsubw/d/sw` |
@@ -339,7 +340,7 @@ expanded subset; no tests were run.
 
 Other EVEX opcodes and exact floating-point execution remain unsupported. MMX, most AVX/VEX forms,
 packed floating-point execution, remaining packed integer forms
-(including absolute value, rounded high-word multiply, immediate shuffles/blends,
+(including rounded high-word multiply, immediate shuffles/blends,
 cross-128-bit permutations, and unsigned comparisons),
 other compare/test instructions, precise MXCSR flag/rounding behavior, and exact
 upper-lane merge behavior remain outside this slice. See the
@@ -372,3 +373,16 @@ sign-fill for arithmetic shifts; byte shifts at or above 16 clear each 128-bit
 lane. XMM destinations clear the upper YMM half. The pure lane evaluator and
 typed decompiler intrinsic retain the immediate count, lane width, memory read,
 and upper-half effect.
+
+The AVX `vpabsb/w/d` family decodes VEX.128/.256 `VPABSB`, `VPABSW`, and
+`VPABSD` with `VEX.pp=66`, map `0F38`, opcodes `1C/1D/1E`, and the reserved
+`vvvv` encoding. The ModRM register is a write-only destination; the register
+or full-width memory r/m operand is read. VEX.128 results clear the upper half
+of the YMM destination. The pure lane evaluator interprets each input lane as a
+signed byte/word/dword, emits its absolute value as an unsigned lane, and
+preserves the two's-complement bit pattern for the most-negative input, as the
+architectural width cannot represent its positive magnitude. The decompiler
+emits a typed unary intrinsic with signed input and unsigned result lane types.
+These forms follow Intel's [packed absolute-value instruction definition](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf)
+and Ghidra's [AVX](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/x86/data/languages/avx.sinc#L1397-L1417)
+and [AVX2 SLEIGH definitions](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/x86/data/languages/avx2.sinc#L17-L36).

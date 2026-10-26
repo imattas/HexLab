@@ -202,7 +202,8 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             x.calling_convention == y.calling_convention && x.function_options == y.function_options &&
             x.vftable_vfptr_offset == y.vftable_vfptr_offset && x.vftable_slot_kinds == y.vftable_slot_kinds &&
             x.vftable_names == y.vftable_names && x.this_adjustment == y.this_adjustment && x.parameter_count == y.parameter_count &&
-            x.fields.size() == y.fields.size() && x.field_list_continuations.size() == y.field_list_continuations.size();
+            x.element_count == y.element_count && x.fields.size() == y.fields.size() &&
+            x.field_list_continuations.size() == y.field_list_continuations.size();
         if (equal) equal = same_ref(a,x.referenced_type,b,y.referenced_type,depth) &&
             same_ref(a,x.field_list,b,y.field_list,depth) && same_ref(a,x.derivation_list,b,y.derivation_list,depth) &&
             same_ref(a,x.vtable_shape,b,y.vtable_shape,depth) && same_ref(a,x.underlying_type,b,y.underlying_type,depth) &&
@@ -418,6 +419,21 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             if (!record.size || !element.value()->size() || !*element.value()->size() || record.size % *element.value()->size())
                 return fail(Error{ErrorCode::unsupported, "PDB array has an incomplete element, zero length, or incompatible size"});
             made = Type::array(element.value(), record.size / *element.value()->size());
+            break;
+        }
+        case CodeViewTypeKind::vector: {
+            auto element = convert(target_namespace, record.referenced_type);
+            if (!element) return fail(element.error());
+            if (record.element_count < 2 || record.size < 2 || record.size > 64 ||
+                (record.size & (record.size - 1)) != 0 || !element.value()->size() ||
+                !*element.value()->size() || *element.value()->size() > UINT64_MAX / record.element_count ||
+                *element.value()->size() * record.element_count != record.size)
+                return fail(Error{ErrorCode::unsupported,
+                    "PDB vector has unsupported lane type, count, width, or alignment shape"});
+            // LF_VECTOR records the byte width and lanes but no separate ABI
+            // alignment. This bounded import accepts conventional power-of-two
+            // vector widths up to 512 bits, whose alignment equals that width.
+            made = Type::vector(element.value(), record.element_count, record.size);
             break;
         }
         case CodeViewTypeKind::structure:
