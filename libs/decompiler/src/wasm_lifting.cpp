@@ -1,4 +1,4 @@
-#include "hexlab/decompiler/wasm_lifting.hpp"
+﻿#include "hexlab/decompiler/wasm_lifting.hpp"
 
 #include <algorithm>
 #include <array>
@@ -90,6 +90,29 @@ std::optional<ConversionInfo> conversion(std::uint8_t op) {
     case 0xbf: return ConversionInfo{i64,f64,"wasm_f64_reinterpret_i64"};
     default: return {};
     }
+}
+ExpressionPtr integer_trap_condition(std::uint8_t op, const ExpressionPtr &left,
+                                     const ExpressionPtr &right, unsigned bits) {
+    const auto i32 = integer(32);
+    const auto zero = constant(0, integer(bits));
+    const auto divisor_zero = binary("eq", right, zero, i32);
+    if (op == 0x6d || op == 0x7f) {
+        const auto minimum = constant(std::uint64_t{1} << (bits - 1), integer(bits));
+        const auto minus_one_bits = bits == 64 ? std::numeric_limits<std::uint64_t>::max()
+                                                : (std::uint64_t{1} << bits) - 1;
+        const auto minus_one = constant(minus_one_bits, integer(bits));
+        const auto minimum_divided_by_minus_one = binary(
+            "and", binary("eq", left, minimum, i32), binary("eq", right, minus_one, i32), i32);
+        return binary("or", divisor_zero, minimum_divided_by_minus_one, i32);
+    }
+    return divisor_zero;
+}
+ExpressionPtr float_to_integer_trap_condition(std::uint8_t op, const ExpressionPtr &value) {
+    const auto info = conversion(op);
+    if (!info) return {};
+    // This named Boolean operator denotes the exact MVP trap condition:
+    // NaN or truncation toward zero would produce a value outside the target range.
+    return unary(std::string(info->operation) + "_condition", value, integer(32));
 }
 struct MemoryOpInfo {
     bool store = false;
@@ -511,12 +534,9 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         for(const auto &edge:successors[bi]){const auto target_addr=code[starts[edge.target]]->instruction.address;lifted.successors.push_back({code[last]->instruction.address,target_addr,BlockId{static_cast<std::uint64_t>(edge.target+1)},edge.kind});}
         for(std::size_t n=begin;n<finish;++n){
             const auto op=std::to_integer<std::uint8_t>(code[n]->instruction.bytes[0]);
-            const bool integer_division_or_remainder=(op>=0x6d&&op<=0x70)||(op>=0x7f&&op<=0x82);
             if(op==0x00)
                 lifted.trap_edges.push_back({code[n]->instruction.address,TrapEdgeKind::unconditional,"unreachable"});
             else if(op==0x11) lifted.trap_edges.push_back({code[n]->instruction.address,TrapEdgeKind::may_trap,"call_indirect table bounds or type mismatch"});
-            else if(integer_division_or_remainder)
-                lifted.trap_edges.push_back({code[n]->instruction.address,TrapEdgeKind::may_trap,code[n]->instruction.mnemonic_override});
             if(op==0x00)break;
         }
         for(std::size_t slot=0;slot<phi_versions[bi].size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};LiftedBlock::Phi phi{reg,phi_versions[bi][slot],{}};for(const auto pred:predecessors[bi]){if(slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor has no stack value for join"};phi.inputs.push_back({BlockId{static_cast<std::uint64_t>(pred+1)},output_versions[pred][slot]});}lifted.phis.push_back(std::move(phi));}
@@ -710,8 +730,34 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 continue;
             }
             if(op==0x3f||op==0x40)return unsupported("memory.size and memory.grow are not modeled");
-            auto info=numeric(op);if(info){if(info->pops==1){auto a=pop(info->input);if(!a)return a.error();stack.push_back(unary(std::string(info->op),a.value(),info->output));}else{auto b=pop(info->input);if(!b)return b.error();auto a=pop(info->input);if(!a)return a.error();stack.push_back(binary(std::string(info->op),a.value(),b.value(),info->output));}continue;}
-            if(auto cv=conversion(op)){auto v=pop(cv->input);if(!v)return v.error();stack.push_back(unary(std::string(cv->operation),v.value(),cv->output));continue;}
+            if (auto info = numeric(op)) {
+                if (info->pops == 1) {
+                    auto operand = pop(info->input);
+                    if (!operand) return operand.error();
+                    stack.push_back(unary(std::string(info->op), operand.value(), info->output));
+                } else {
+                    auto right = pop(info->input);
+                    if (!right) return right.error();
+                    auto left = pop(info->input);
+                    if (!left) return left.error();
+                    if ((op >= 0x6d && op <= 0x70) || (op >= 0x7f && op <= 0x82)) {
+                        const auto width = op <= 0x70 ? 32u : 64u;
+                        lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
+                            std::string(info->op), integer_trap_condition(op, left.value(), right.value(), width)});
+                    }
+                    stack.push_back(binary(std::string(info->op), left.value(), right.value(), info->output));
+                }
+                continue;
+            }
+            if (auto cv = conversion(op)) {
+                auto operand = pop(cv->input);
+                if (!operand) return operand.error();
+                if ((op >= 0xa8 && op <= 0xab) || (op >= 0xae && op <= 0xb1))
+                    lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
+                        std::string(cv->operation), float_to_integer_trap_condition(op, operand.value())});
+                stack.push_back(unary(std::string(cv->operation), operand.value(), cv->output));
+                continue;
+            }
             if(op>=0xa7&&op<=0xbf)return unsupported("numeric conversion or reinterpret opcode is not modeled");
             return unsupported("opcode/effect is not in the typed scalar subset: "+i.mnemonic_override);
         }
