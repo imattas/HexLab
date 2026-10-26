@@ -16,7 +16,12 @@ ordinary procedure locals, the table shows the local record offset. A partial
 inline-site identity is labeled as incomplete rather than inferred.
 
 PDB defranges are active only when the selected PC falls inside their address
-range and outside every encoded gap. No row is shown when no defrange is live.
+range and outside every encoded gap. A local inside `S_BLOCK32` must also be
+inside that nearest lexical block's validated half-open code range. Its Scope /
+origin includes the block's raw section, offset, and size. A block whose complete
+extent cannot be bound uniquely within the owning procedure retains an
+`unresolved` row without evaluating its value. Otherwise no row is shown when
+no defrange is live.
 If multiple defranges for one local overlap at the selected PC, the row stays
 visible with Location `ambiguous` and Value `<multiple overlapping PDB live
 ranges>`; the debugger does not choose one location arbitrarily. Separate
@@ -30,6 +35,6 @@ missing registers or bases, unavailable type sizes, and unreadable memory are
 reported in the row rather than guessed. Stack-frame source symbolization also
 uses the deepest explicit inline source range, labels it `(inline)`, and declines
 conflicting same-depth source locations. Source lookups examine at most 250,000
-inline ranges. Local visibility still follows defranges, even when inline source
-attribution is unavailable. This view does not decode PDB type names or
-reconstruct a complete source-level inline call tree.
+inline ranges. Local visibility follows defranges and any enclosing lexical
+block, even when inline source attribution is unavailable. This view does not
+decode PDB type names or reconstruct a complete source-level inline call tree.

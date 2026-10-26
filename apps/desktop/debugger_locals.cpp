@@ -326,15 +326,44 @@ std::optional<std::uint64_t> pdb_register_number(Architecture architecture, std:
     return std::nullopt;
 }
 
-std::optional<std::uint64_t> pdb_section_address(const ImageMetadata &metadata,
-                                                 std::uint16_t section_number,
-                                                 std::uint32_t offset) {
-    if (section_number == 0 || section_number > metadata.sections.size()) return std::nullopt;
+// Bind the whole extent, never just its first byte. Section ordinals belong
+// to the identity-matched PDB/PE pair; overlapping declarations cannot supply
+// an unambiguous code address even when the ordinal itself is valid.
+std::optional<std::uint64_t> pdb_section_range(const ImageMetadata &metadata,
+                                              const Image &image, std::uint64_t base,
+                                              std::uint16_t section_number,
+                                              std::uint32_t offset, std::uint32_t size) {
+    if (!metadata.pe || !size || section_number == 0 || section_number > metadata.sections.size())
+        return std::nullopt;
     const auto &section = metadata.sections[section_number - 1];
     const auto extent = std::max<std::uint64_t>(section.virtual_size, section.raw_size);
-    if (offset >= extent || std::uint64_t(section.rva.value) + offset > UINT64_MAX - metadata.preferred_base)
+    const auto rva = std::uint64_t{section.rva.value} + offset;
+    if (offset >= extent || size > extent - offset || rva >= metadata.image_size ||
+        size > metadata.image_size - rva || rva > UINT64_MAX - base)
         return std::nullopt;
-    return metadata.preferred_base + section.rva.value + offset;
+    const auto begin = base + rva;
+    // Require a representable exclusive end as well as the address-space width.
+    const auto width = image.layout().space.width_bits;
+    if (size > UINT64_MAX - begin || !width || width > 64 ||
+        (width < 64 && begin + size - 1 > ((UINT64_C(1) << width) - 1))) return std::nullopt;
+    for (std::size_t index = 0; index < metadata.sections.size(); ++index) {
+        if (index == static_cast<std::size_t>(section_number - 1)) continue;
+        const auto &other = metadata.sections[index];
+        const auto other_extent = std::max<std::uint64_t>(other.virtual_size, other.raw_size);
+        if (other_extent && rva < std::uint64_t{other.rva.value} + other_extent &&
+            other.rva.value < rva + size) return std::nullopt;
+    }
+    const Segment *mapped = nullptr;
+    for (const auto &segment : image.layout().segments) {
+        if (segment.begin.space != image.layout().space.id || !segment.size ||
+            segment.begin.offset > UINT64_MAX - segment.size) continue;
+        if (begin >= segment.begin.offset + segment.size || segment.begin.offset >= begin + size) continue;
+        if (mapped || !segment.executable || begin < segment.begin.offset ||
+            size > segment.size - (begin - segment.begin.offset)) return std::nullopt;
+        mapped = &segment;
+    }
+    if (!mapped) return std::nullopt;
+    return begin;
 }
 
 std::optional<std::size_t> pdb_type_size(const PeMetadata &metadata, std::uint32_t type_index,
@@ -975,11 +1004,12 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
     }
 
     // PDB locals live on the bound PE image rather than in workspace DWARF
-    // records. Only expose a row when one explicit CodeView defrange covers
-    // this PC and its location can be evaluated from the selected frame.
+    // records. Lexical scope limits visibility independently of storage live
+    // ranges; unresolved scope coordinates must never expose a guessed value.
     if (project.loaded && project.loaded->metadata.pe) {
         const auto &metadata = project.loaded->metadata;
         const auto &pe = *metadata.pe;
+        const auto pdb_base = project.loaded->load_base.value_or(metadata.preferred_base);
         const auto pdb_pc = pc;
         std::map<std::pair<std::uint16_t, std::uint32_t>, std::string> inline_sources;
         std::size_t inline_ranges_seen = 0;
@@ -1005,17 +1035,21 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
                 local.procedure_address->space != image.layout().space.id) continue;
             const auto procedure = local.procedure_address->offset;
             if (pdb_pc < procedure || pdb_pc - procedure >= local.procedure_size) continue;
-            std::vector<const PePdbLocalLiveRange *> active_ranges;
-            for (const auto &range : local.live_ranges) {
-                const auto begin = pdb_section_address(metadata, range.section, range.section_offset);
-                if (!begin || pdb_pc < *begin || pdb_pc - *begin >= range.size) continue;
-                const auto relative = static_cast<std::uint64_t>(pdb_pc - *begin);
-                bool in_gap = false;
-                for (const auto &gap : range.gaps)
-                    if (relative >= gap.offset && relative - gap.offset < gap.size) { in_gap = true; break; }
-                if (!in_gap) active_ranges.push_back(&range);
+            std::optional<std::uint64_t> lexical_begin;
+            if (local.has_lexical_scope) {
+                const auto bound_procedure = pdb_section_range(metadata, image, pdb_base,
+                    local.procedure_section, local.procedure_section_offset, local.procedure_size);
+                lexical_begin = pdb_section_range(metadata, image, pdb_base,
+                    local.lexical_scope_section, local.lexical_scope_offset, local.lexical_scope_size);
+                // A block must agree with the bound procedure and fit entirely
+                // inside it. Do not clip invalid extents to the procedure.
+                if (!bound_procedure || *bound_procedure != procedure || !lexical_begin ||
+                    *lexical_begin < procedure || *lexical_begin - procedure >= local.procedure_size ||
+                    local.lexical_scope_size > local.procedure_size - (*lexical_begin - procedure))
+                    lexical_begin.reset();
+                if (lexical_begin && (pdb_pc < *lexical_begin ||
+                    pdb_pc - *lexical_begin >= local.lexical_scope_size)) continue;
             }
-            if (active_ranges.empty()) continue;
             DebuggerLocalRow row;
             row.name = local.name;
             row.kind = local.parameter ? "parameter" : "local";
@@ -1029,6 +1063,28 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
                 const auto found = inline_sources.find({local.module_index, *local.inline_site_record_offset});
                 if (found != inline_sources.end()) row.scope += " / " + found->second;
             }
+            if (local.has_lexical_scope) {
+                row.scope += " / lexical block section " + std::to_string(local.lexical_scope_section) +
+                    " + " + hex_value(local.lexical_scope_offset) + " size " + hex_value(local.lexical_scope_size);
+                if (!lexical_begin) {
+                    row.location = "unresolved";
+                    row.value = "<PDB lexical scope cannot be bound unambiguously>";
+                    rows.push_back(std::move(row));
+                    continue;
+                }
+            }
+            std::vector<const PePdbLocalLiveRange *> active_ranges;
+            for (const auto &range : local.live_ranges) {
+                const auto begin = pdb_section_range(metadata, image, pdb_base,
+                    range.section, range.section_offset, range.size);
+                if (!begin || pdb_pc < *begin || pdb_pc - *begin >= range.size) continue;
+                const auto relative = static_cast<std::uint64_t>(pdb_pc - *begin);
+                bool in_gap = false;
+                for (const auto &gap : range.gaps)
+                    if (relative >= gap.offset && relative - gap.offset < gap.size) { in_gap = true; break; }
+                if (!in_gap) active_ranges.push_back(&range);
+            }
+            if (active_ranges.empty()) continue;
             if (active_ranges.size() > 1) {
                 row.location = "ambiguous";
                 row.value = "<multiple overlapping PDB live ranges>";

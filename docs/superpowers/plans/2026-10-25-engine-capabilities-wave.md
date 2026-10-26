@@ -67,8 +67,6 @@ Root reviews API compatibility and persistence, updates the capability ledger an
 
 Integration remains source compilation and review only. No tests, desktop launches, or `out/` changes.
 
-### Progress
-
 - **PDB type import:** standalone forward declarations now persist as opaque named references when no canonical definition is available. Full definitions are imported first; invalid or oversized names are skipped, and unresolved by-value layout is never guessed. Updated PDB/type-authoring docs and the capability ledger. MSVC Debug `hexlab_types` `ClCompile` passed; no tests run.
 - **Decompiler source recovery:** explicit or accepted inferred prototypes now render typed function headers for supported signed/unsigned scalar widths, pointers, and void pointers. Unsupported declarators retain the generic header; unknown/conflicting value-return types are not guessed as `void`. Updated `docs/decompiler-type-recovery.md`; source-only Debug `hexlab_decompiler` `ClCompile` passed; no tests run.
 - **Static library linking:** ELF common symbols allocate in merged BSS with strong/common/weak precedence; AMD64 COFF common externals coalesce by name and size with bounded natural alignment, selected strong definitions take precedence, and archive summaries recognize providers. Common/absolute collisions fail closed; exact eight-byte inline symbol names are accepted. Updated archive/link docs and capability ledger; loaders source build and independent modified-TU compile passed; no tests run.
@@ -259,3 +257,17 @@ All work stayed headless and left out/ untouched.
 - **AVX2 variable shifts:** VEX.128/.256 VPSLLV/VPSRLV dword/qword and VPSRAVD now decode and evaluate exact lanes; EVEX variable shifts evaluate result lanes with opmask behavior. Corrected source ordering/coverage documentation. Windows headless Debug processor/decompiler targets compiled; no tests run.
 - **PowerPC multiply/divide lifting:** added `mullw`/`mulld` and signed/unsigned word/doubleword division with PPC64 word-result extension and parallel Rc CR0 outputs. Division remains an explicit typed operation for exceptional cases. Windows headless Debug decompiler target compiled; no tests run.
 - **x87 FRNDINT semantics:** caller-driven binary80 evaluation now models RC rounding, signed zero/infinity, sticky PE/C1, unmasked precision retirement and the undefined condition-code mask; NaNs and unsupported encodings fail closed. Windows headless Debug processor target compiled; no tests run.
+
+## Next architecture and symbol wave
+
+Advance major remaining instruction and source-symbol gaps as independent workstreams. Keep each implementation within its owning architecture or PDB UI boundary. Root owns cross-subsystem integration, the capability ledger, and installed-doc lists. Do not add or run tests; compile changed targets only. Leave `out/` and untracked `.build/` data intact.
+
+- **MIPS64 reference propagation:** add bounded relocation-aware static references for supported MIPS64 address-building sequences, using initialized readable bytes and executable-target validation. Preserve address-space width and byte order; unsupported relocation or ambiguous register definitions remain unresolved. Own MIPS64-specific analysis helpers and `docs/mips64.md`.
+- **RISC-V vector floating point:** add decode and typed lifting for a substantial base RVV floating-point family after checking which forms are absent. Preserve masked/tail dependencies and FCSR/rounding effects symbolically where precise evaluation is unavailable. Own RISC-V processor/lifting sources and vector docs.
+- **PDB lexical-local presentation:** connect the already parsed nearest `S_BLOCK32` lexical extents to desktop PDB local rendering so block-scoped locals appear only within their owning code range, while procedure locals remain visible throughout. Use exact section/address binding and preserve uncertain rows as unresolved. Own the desktop PDB local rendering path and focused docs.
+
+### Progress
+
+- **MIPS64 reference propagation:** validated PC+8 link values for JAL/JALR and REGIMM link branches now flow through the delayed call sequence when the target is initialized executable code; relocation-covered immediates remain opaque and HI16/LO16 pairs are not resolved. Integrated Windows headless `hexlab_analysis` build passed; no tests run.
+- **RVV floating-point slice:** added base vector add/subtract/multiply/divide, sign injection, min/max, and compare VV/VF forms with correct FPR/vector operands, dynamic FRM and sticky FFLAGS dependencies, mask/tail inputs, and typed floating or boolean mask outputs. Numeric evaluation remains symbolic. Integrated Windows headless processor/decompiler builds passed; no tests run.
+- **PDB lexical locals:** parsed nearest block extents now flow through PE metadata; debugger locals filter valid half-open block ranges before evaluation and display unbindable extents as unresolved. Integrated Windows headless loader build and selected desktop translation-unit compile passed; no tests/UI run.

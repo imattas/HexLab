@@ -136,7 +136,7 @@ std::string register_name(const RegisterOperand &r) {
         return r.index < 32 && (r.width == 32 || r.width == 64) ? "x" + std::to_string(r.index) : "?riscv-register";
     if (r.bank == RegisterBank::riscv_fpr)
         return r.index < 32 && r.width == 64 ? "f" + std::to_string(r.index) : "?riscv-fpr";
-    if (r.bank == RegisterBank::riscv_fstatus) return "fflags";
+    if (r.bank == RegisterBank::riscv_fstatus) return r.index == 1 ? "frm" : "fflags";
     if (r.bank == RegisterBank::riscv_vpr)
         return r.index < 32 ? "v" + std::to_string(r.index) : "?riscv-vector-register";
     if (r.bank == RegisterBank::riscv_vcsr)
@@ -588,6 +588,14 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         static constexpr const char *names[]{"vwmulu.vv", "vwmulu.vx", "vwmulsu.vv", "vwmulsu.vx",
                                              "vwmul.vv", "vwmul.vx"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vwmulu_vv)];
+    }
+    if (op >= Opcode::rv_vfadd_vv && op <= Opcode::rv_vmfge_vf) {
+        static constexpr const char *names[]{"vfadd.vv","vfadd.vf","vfsub.vv","vfsub.vf","vfmul.vv","vfmul.vf",
+            "vfdiv.vv","vfdiv.vf","vfsgnj.vv","vfsgnj.vf","vfsgnjn.vv","vfsgnjn.vf",
+            "vfsgnjx.vv","vfsgnjx.vf","vfmin.vv","vfmin.vf","vfmax.vv","vfmax.vf",
+            "vmfeq.vv","vmfeq.vf","vmfne.vv","vmfne.vf","vmflt.vv","vmflt.vf",
+            "vmfle.vv","vmfle.vf","vmfgt.vf","vmfge.vf"};
+        return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vfadd_vv)];
     }
     if (op >= Opcode::rv_sh1add && op <= Opcode::rv_slli_uw) {
         static constexpr const char *names[]{"sh1add", "sh2add", "sh3add", "add.uw",
