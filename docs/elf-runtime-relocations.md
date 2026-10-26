@@ -14,6 +14,8 @@ ELF32 i386 `ET_DYN` REL records and little-endian ELF64 x86-64 or AArch64
 | Architecture | Relocation | Type | Formula |
 | --- | --- | ---: | --- |
 | i386 | `R_386_RELATIVE` | 8 | `B + A` |
+| i386 | `R_386_32` | 1 | `S + A` (low 32 bits) |
+| i386 | `R_386_PC32` | 2 | `S + A - P` (low 32 bits) |
 | i386 | `R_386_GLOB_DAT` | 6 | `S` |
 | i386 | `R_386_JMP_SLOT` | 7 | `S` |
 | x86-64 | `R_X86_64_RELATIVE` | 8 | `B + A` |
@@ -28,8 +30,12 @@ initialized load memory. ELF32 i386 targets must be complete four-byte fields
 in writable, initialized load memory. Its RELATIVE addend is the unsigned
 32-bit word sampled from the original target bytes, and `B + A` must fit in
 32 bits. ELF32 runtime addresses, symbol values, and rebased segment extents
-are checked against the 32-bit address space. i386 RELA runtime records are
-left skipped. RELATIVE requires symbol index zero. ELF64 RELA uses its
+are checked against the 32-bit address space. i386 `R_386_32` and `R_386_PC32`
+use the original four-byte REL field as the exact unsigned 32-bit implicit
+addend; their ABI `word32` results retain the low 32 bits. `R_386_PC32` uses
+the rebased runtime place `P`. The i386 psABI specifies REL records for its
+dynamic linker; i386 RELA rows remain skipped. RELATIVE requires symbol index
+zero. ELF64 RELA uses its
 explicit signed addend; ELF64 REL uses the signed 64-bit value sampled from
 the original target bytes. Symbol-slot relocations require a validated nonzero
 symbol index tied to the relocation table's symbol table. They apply only
@@ -78,7 +84,8 @@ IFUNC, copy, instruction, and retained non-dynamic section relocations remain
 unapplied; automatic dependency discovery and loading are not modeled. The
 i386 runtime profile is little-endian `ET_DYN` with dynamic-table-owned REL
 rows only. Other i386 relocation types, RELA rows, and big-endian i386 images
-remain explicit skips.
+remain explicit skips. TLS, copy, and `R_386_IRELATIVE` relocations are not
+applied; the latter would call a resolver and is deliberately never executed.
 
 `ElfLoadOptions::runtime_load_bias` requests this stage from `load_elf`.
 `LoadedImage::image` and its link-time metadata remain unchanged; optional

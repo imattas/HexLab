@@ -347,9 +347,13 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                                       relocation.kind == ElfRelocationKind::jump_slot);
             const bool symbol_with_addend = riscv64 && relocation.type == symbol_addend_type &&
                                             relocation.kind == ElfRelocationKind::absolute;
-            if (!relative && !symbol_slot && !symbol_with_addend) {
+            const bool i386_absolute = i386 && relocation.type == 1 &&
+                                       relocation.kind == ElfRelocationKind::absolute;
+            const bool i386_pc_relative = i386 && relocation.type == 2 &&
+                                          relocation.kind == ElfRelocationKind::pc_relative;
+            if (!relative && !symbol_slot && !symbol_with_addend && !i386_absolute && !i386_pc_relative) {
                 skip(index, i386
-                    ? "Supported dynamic types are R_386_RELATIVE, R_386_GLOB_DAT, and R_386_JMP_SLOT"
+                    ? "Supported dynamic types are R_386_32, R_386_PC32, R_386_RELATIVE, R_386_GLOB_DAT, and R_386_JMP_SLOT"
                     : x64
                     ? "Supported dynamic types are R_X86_64_RELATIVE, GLOB_DAT, and JUMP_SLOT"
                     : riscv64
@@ -442,7 +446,34 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     skip(index, "ELF32 symbol address exceeds the 32-bit address space");
                     continue;
                 }
-                if (symbol_with_addend) {
+                if (i386_absolute || i386_pc_relative) {
+                    if (!relocation.addend) {
+                        skip(index, "i386 symbol relocation's implicit addend is unavailable");
+                        continue;
+                    }
+                    const auto addend = static_cast<std::uint32_t>(*relocation.addend);
+                    std::uint64_t place = 0;
+                    if (i386_pc_relative) {
+                        if (!relocation.place) {
+                            skip(index, "R_386_PC32 relocation place is unavailable");
+                            continue;
+                        }
+                        try {
+                            place = shifted(relocation.place->offset, load_bias);
+                        } catch (const RuntimeRelocationFailure &) {
+                            skip(index, "R_386_PC32 runtime place overflows the address space");
+                            continue;
+                        }
+                        if (place > UINT32_MAX) {
+                            skip(index, "R_386_PC32 runtime place exceeds the 32-bit address space");
+                            continue;
+                        }
+                    }
+                    // The ABI defines these results as word32 fields. Preserve
+                    // the specified low 32 bits, including negative addends.
+                    value = static_cast<std::uint32_t>(
+                        static_cast<std::uint32_t>(value) + addend - static_cast<std::uint32_t>(place));
+                } else if (symbol_with_addend) {
                     if (!relocation.addend) {
                         skip(index, relocation.explicit_addend
                                         ? "R_RISCV_64 relocation addend is unavailable"
