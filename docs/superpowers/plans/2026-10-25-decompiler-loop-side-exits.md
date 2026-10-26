@@ -26,12 +26,14 @@
 
 **Files:** `libs/decompiler/src/decompiler.cpp`, `docs/decompiler-structuring.md`.
 
-- [ ] Inspect existing pre-tested and post-tested recognizers to select the smallest common unsupported side-exit shape.
-- [ ] Recognize only that explicit shape; validate exact CFG ownership, exit joins, and register/memory phis under current limits.
-- [ ] Emit parallel phi copies on original edges and preserve existing fallback for other shapes.
-- [ ] Compile the Debug decompiler target; do not run tests.
+- [x] Inspect existing pre-tested and post-tested recognizers to select the smallest common unsupported side-exit shape.
+- [x] Recognize only one nested conditional direct-break arm; validate exact CFG ownership, exit joins, and register/memory phis under current limits.
+- [x] Emit parallel phi copies on original edges and preserve existing fallback for other shapes.
+- [x] Compile the Debug decompiler source serially; do not run tests.
 
 ## Integration
 
-- [ ] Review the complete CFG coverage and side-effect ordering for the accepted shape.
-- [ ] Root updates `docs/capabilities.csv` with exact implementation and build evidence.
+- [x] Review the complete CFG coverage and side-effect ordering for the accepted shape.
+- [x] Root updates `docs/capabilities.csv` with exact implementation and build evidence.
+
+**Integration evidence:** Focused serial Windows Debug `ClCompile` of `hexlab_decompiler` passed after the final loop-diamond validation and budget changes. No tests were added or run; `out/` was untouched.
