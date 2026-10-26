@@ -515,6 +515,9 @@ Status DebugSession::resume_threads(std::uint64_t sequence, std::span<const Thre
         return invalid_state("thread resume schedule");
     if (actions.empty() || actions.size() > max_inspection_threads)
         return Error{ErrorCode::invalid_argument, "thread resume schedule must contain 1 to 4096 actions"};
+    if (!impl_->backend->supports_scheduled_signal_disposition() &&
+        std::any_of(actions.begin(), actions.end(), [](const auto& action) { return action.signal_disposition.has_value(); }))
+        return Error{ErrorCode::unsupported, "scheduled signal disposition is not supported by this backend"};
     std::set<ThreadId> threads;
     bool resumes_any_thread = false;
     for (const auto& action : actions) {
