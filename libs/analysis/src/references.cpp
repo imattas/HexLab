@@ -3806,8 +3806,10 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                     {}});
         }
         const bool metadata_complete =
-            !metadata.elf || (metadata.elf->relocations_complete && metadata.elf->dynamic_complete &&
-                              metadata.elf->rtti_complete);
+            (!metadata.elf || (metadata.elf->relocations_complete && metadata.elf->dynamic_complete &&
+                                metadata.elf->rtti_complete)) &&
+            (!metadata.macho || (metadata.macho->symbols_complete && metadata.macho->relocations_complete &&
+                                 metadata.macho->dyld_complete));
         return ReferenceIndex::create(std::move(references), functions.key, functions.complete && metadata_complete,
                                       stop);
     });

@@ -80,6 +80,31 @@ jobs:
         run: cmake --preset ${{ matrix.preset }}
       - name: Build complete desktop distribution
         run: cmake --build --preset ${{ matrix.preset }} --target package
+      - name: Verify universal macOS executables
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(find out/build/${{ matrix.preset }}/packages -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$archive"
+          extract_root="$RUNNER_TEMP/hexlab-universal-check"
+          mkdir -p "$extract_root"
+          tar -xzf "$archive" -C "$extract_root"
+          for tool in hexlab hexlab_cli hexlab_debug_server; do
+            binary="$(find "$extract_root" -type f -path "*/bin/$tool" -print -quit)"
+            test -n "$binary"
+            architectures="$(lipo -archs "$binary")"
+            [[ " $architectures " == *" arm64 "* ]]
+            [[ " $architectures " == *" x86_64 "* ]]
+          done
+          library_count=0
+          while IFS= read -r -d '' library; do
+            library_count=$((library_count + 1))
+            architectures="$(lipo -archs "$library")"
+            [[ " $architectures " == *" arm64 "* ]]
+            [[ " $architectures " == *" x86_64 "* ]]
+          done < <(find "$extract_root" -type f -name '*.dylib' -print0)
+          test "$library_count" -gt 0
       - name: Verify archive contains wxWidgets runtime libraries
         run: |
           archive="$(find out/build/${{ matrix.preset }}/packages -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"

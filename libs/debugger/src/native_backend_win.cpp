@@ -1376,13 +1376,33 @@ public:
                 reg.bytes.resize(sizeof(c.X[i]));
                 std::memcpy(reg.bytes.data(), &c.X[i], sizeof(c.X[i]));
                 out.push_back(std::move(reg));
+
+                RegisterValue wide_alias;
+                wide_alias.name = "w" + std::to_string(i);
+                wide_alias.byte_order = ByteOrder::little;
+                wide_alias.bytes.resize(sizeof(std::uint32_t));
+                const auto low = static_cast<std::uint32_t>(c.X[i]);
+                std::memcpy(wide_alias.bytes.data(), &low, sizeof(low));
+                out.push_back(std::move(wide_alias));
             }
             append_register(out, "sp", c.Sp);
+            append_register(out, "wsp", static_cast<std::uint32_t>(c.Sp));
             append_register(out, "pc", c.Pc);
             append_register(out, "cpsr", c.Cpsr);
+            // FP/LR are the conventional ABI aliases for x29/x30.
+            for (const auto& [name, index] : std::array<std::pair<const char*, std::uint32_t>, 2>{{{"fp", 29}, {"lr", 30}}}) {
+                RegisterValue alias;
+                alias.name = name;
+                alias.byte_order = ByteOrder::little;
+                alias.bytes.resize(sizeof(c.X[index]));
+                std::memcpy(alias.bytes.data(), &c.X[index], sizeof(c.X[index]));
+                out.push_back(std::move(alias));
+            }
             for (std::uint32_t i = 0; i < 32; ++i) {
                 RegisterValue reg;
                 reg.name = "v" + std::to_string(i);
+                reg.group = "vector";
+                reg.number = i;
                 reg.byte_order = ByteOrder::little;
                 reg.bytes.resize(sizeof(c.V[i]));
                 std::memcpy(reg.bytes.data(), &c.V[i], sizeof(c.V[i]));
@@ -1593,7 +1613,30 @@ public:
                 CloseHandle(thread);
                 return error;
             }
+            std::vector<std::string> written_aliases;
             for (const auto& reg : registers) {
+                if (reg.byte_order && *reg.byte_order != ByteOrder::little) {
+                    CloseHandle(thread);
+                    return Error{ErrorCode::invalid_argument, "Windows ARM64 register writes must be little-endian"};
+                }
+                std::string alias_key = reg.name;
+                const auto alias_index = [&](char prefix) -> std::optional<std::uint32_t> {
+                    if (reg.name.size() < 2 || reg.name[0] != prefix) return std::nullopt;
+                    std::uint32_t value = 0;
+                    const auto parsed = std::from_chars(reg.name.data() + 1, reg.name.data() + reg.name.size(), value);
+                    if (parsed.ec != std::errc{} || parsed.ptr != reg.name.data() + reg.name.size()) return std::nullopt;
+                    return value;
+                };
+                if (const auto index = alias_index('x'); index && *index <= 30) alias_key = "x" + std::to_string(*index);
+                else if (const auto index = alias_index('w'); index && *index <= 30) alias_key = "x" + std::to_string(*index);
+                else if (reg.name == "fp") alias_key = "x29";
+                else if (reg.name == "lr") alias_key = "x30";
+                else if (reg.name == "wsp") alias_key = "sp";
+                if (std::find(written_aliases.begin(), written_aliases.end(), alias_key) != written_aliases.end()) {
+                    CloseHandle(thread);
+                    return Error{ErrorCode::invalid_argument, "duplicate Windows ARM64 register or overlapping alias write"};
+                }
+                written_aliases.push_back(std::move(alias_key));
                 bool matched = false;
                 for (std::uint32_t i = 0; i <= 30; ++i) {
                     const auto name = "x" + std::to_string(i);
@@ -1605,9 +1648,28 @@ public:
                     matched = assign_register(reg, name.c_str(), c.X[i]);
                     break;
                 }
+                if (const auto index = alias_index('w'); index && *index <= 30) {
+                    if (*index == 18) {
+                        CloseHandle(thread);
+                        return Error{ErrorCode::unsupported, "writing ARM64 w18 is disabled because Windows reserves it as the thread environment pointer"};
+                    }
+                    std::uint32_t value = 0;
+                    matched = assign_register(reg, reg.name.c_str(), value);
+                    if (matched) c.X[*index] = value; // A W-register write clears the upper half of Xn.
+                }
+                if (reg.name == "fp") matched = assign_register(reg, "fp", c.X[29]);
+                if (reg.name == "lr") matched = assign_register(reg, "lr", c.X[30]);
                 if (reg.name == "sp") {
                     std::uint64_t value = 0;
                     matched = assign_register(reg, "sp", value);
+                    if (matched && (value & 0xfu) != 0) {
+                        CloseHandle(thread);
+                        return Error{ErrorCode::invalid_argument, "ARM64 stack pointer edits must preserve 16-byte alignment"};
+                    }
+                    if (matched) c.Sp = value;
+                } else if (reg.name == "wsp") {
+                    std::uint32_t value = 0;
+                    matched = assign_register(reg, "wsp", value);
                     if (matched && (value & 0xfu) != 0) {
                         CloseHandle(thread);
                         return Error{ErrorCode::invalid_argument, "ARM64 stack pointer edits must preserve 16-byte alignment"};
