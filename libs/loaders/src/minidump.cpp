@@ -84,6 +84,12 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
     try {
         if (!storage) return Error{ErrorCode::invalid_argument, "Minidump loading requires input storage"};
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump loading canceled"};
+        // Minidump mapping and metadata are derived from scattered stream and
+        // memory records. Track every source read so patch invalidation can
+        // prove whether a later project revision requires reparsing.
+        auto tracking = TrackingStorage::create(std::move(storage));
+        if (!tracking) return tracking.error();
+        storage = tracking.value();
         auto header = read(*storage, 0, 32);
         if (!header) return header.error();
         if (u(header.value().bytes, 0, 4) != 0x504d444d)
@@ -468,6 +474,7 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
         auto image = Image::create(storage, std::move(layout));
         if (!image) return image.error();
         loaded.image = std::move(image.value());
+        loaded.metadata_reads = tracking.value()->reads();
         if (minidump.streams.empty())
             return Error{ErrorCode::malformed, "Minidump has no stream directory entries"};
         if (!minidump.diagnostics.empty()) {

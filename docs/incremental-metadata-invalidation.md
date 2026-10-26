@@ -45,10 +45,27 @@ old scan was retained, refreshed by domain, or rescanned because its prior scan
 was incomplete. A changed source identity, recipe, mapping, or unverified byte
 diff does not qualify for this reuse.
 
-This contract assumes loaders set `metadata_complete` truthfully and include
-all metadata reads in their tracking set whenever they claim completeness.
-Loader-specific proof that every optional table and stream is covered remains
-part of the loader validation work.
+Loader reads are tracked at the `ByteStorage` boundary, so the range set is the
+merged set of exact file extents actually consumed while building a mapping or
+metadata. The minidump loader now uses this tracking boundary too; its scattered
+stream and captured-memory records therefore invalidate the mapping when an
+overlapping effective byte changes. Loaders that cannot claim complete
+interpretation must keep `metadata_complete` false, which forces reparsing and
+a full derived rebuild after any effective-byte edit. A tracking set proves
+which bytes were read, while `metadata_complete` certifies that the loader's
+supported dependency surface is complete; loader-specific validation is still
+needed to justify that flag.
+
+Workspace byte revisions are monotonic project revisions, not content hashes.
+For patch edits, the workspace compares the old and new effective bytes inside
+the union of old and new patch extents and supplies the resulting exact changed
+ranges with both range-verification flags set. These extents cover every byte
+that the patch set can alter. An empty result therefore certifies equivalent
+effective bytes for that transition, even if the logical byte revision advanced
+because the patch representation changed. Direct callers of the incremental
+API must provide equivalent proof themselves; without it, missing ranges on an
+advanced byte revision force a complete rebuild. Revisions may not move
+backwards, and a nonempty byte diff must advance the byte revision.
 
 The per-basis dependency index cache checks its immutable fact-owner identity
 under a short mutex, then builds a missing index outside the lock. Concurrent

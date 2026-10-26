@@ -962,10 +962,7 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
                 if (block_type < 0 || static_cast<std::uint64_t>(block_type) >= metadata.function_types.size())
                     return fail("block type index is out of range");
                 const auto &block_signature = metadata.function_types[static_cast<std::size_t>(block_type)];
-                if (!block_signature.parameter_types.empty()) {
-                    unsupported = true;
-                    return fail("block type parameters are outside the bounded multi-value subset");
-                }
+                parameters = block_signature.parameter_types;
                 results = block_signature.result_types;
             }
             if (results.size() > max_wasm_multi_values) {
@@ -973,12 +970,15 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
                 return fail("block result vector exceeds the 128-value multi-value limit");
             }
             if (op == 0x04 && !pop(0x7f)) return fail("if condition must be i32");
+            if (!pop_types(parameters)) return fail("block parameter type mismatch");
             if (controls.size() >= max_wasm_control_depth) {
                 limited = true;
                 return fail("control nesting limit exceeded");
             }
-            controls.push_back({op, std::move(parameters), std::move(results), stack.size(),
+            const auto height = stack.size();
+            controls.push_back({op, parameters, std::move(results), height,
                                 controls.back().unreachable});
+            for (auto parameter : parameters) if (!push(parameter)) return fail("operand stack limit exceeded");
         } else if (op == 0x05 || op == 0x0b) {
             if (controls.empty()) return fail("unmatched else or end");
             auto &frame = controls.back();
@@ -987,6 +987,7 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
             if (stack.size() != frame.height) return fail("block stack height mismatch");
             if (op == 0x05) {
                 frame.has_else = true;
+                stack.resize(frame.height);
                 frame.unreachable = controls.size() > 1 && controls[controls.size() - 2].unreachable;
                 for (auto type : frame.parameters) if (!push(type)) return fail("operand stack limit exceeded");
             } else {
