@@ -488,6 +488,8 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
         const auto *line_strings = debug_section(metadata, ".debug_line_str");
         const auto *location_lists = debug_section(metadata, ".debug_loclists");
         const auto *locations = debug_section(metadata, ".debug_loc");
+        const auto *range_lists = debug_section(metadata, ".debug_rnglists");
+        const auto *ranges = debug_section(metadata, ".debug_ranges");
         const auto *supplementary_strings = debug_section(metadata, ".debug_str_sup");
         const auto *supplementary = debug_section(metadata, ".debug_sup");
         require(abbrev && abbrev->size != 0, ".debug_info has no usable .debug_abbrev section");
@@ -495,7 +497,7 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
         auto abbrev_bytes = read_debug_bytes(storage, metadata, *abbrev, budget, stop);
         std::vector<std::uint8_t> string_bytes;
         if (strings && strings->size) string_bytes = read_debug_bytes(storage, metadata, *strings, budget, stop);
-        std::vector<std::uint8_t> string_offset_bytes, address_bytes, line_string_bytes, supplementary_string_bytes, location_list_bytes, location_bytes;
+        std::vector<std::uint8_t> string_offset_bytes, address_bytes, line_string_bytes, supplementary_string_bytes, location_list_bytes, location_bytes, range_list_bytes, range_bytes;
         if (string_offsets && string_offsets->size) string_offset_bytes = read_debug_bytes(storage, metadata, *string_offsets, budget, stop);
         if (addresses && addresses->size) address_bytes = read_debug_bytes(storage, metadata, *addresses, budget, stop);
         if (line_strings && line_strings->size) line_string_bytes = read_debug_bytes(storage, metadata, *line_strings, budget, stop);
@@ -504,6 +506,8 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
         if (supplementary && supplementary->size) supplementary_bytes = read_debug_bytes(storage, metadata, *supplementary, budget, stop);
         if (location_lists && location_lists->size) location_list_bytes = read_debug_bytes(storage, metadata, *location_lists, budget, stop);
         if (locations && locations->size) location_bytes = read_debug_bytes(storage, metadata, *locations, budget, stop);
+        if (range_lists && range_lists->size) range_list_bytes = read_debug_bytes(storage, metadata, *range_lists, budget, stop);
+        if (ranges && ranges->size) range_bytes = read_debug_bytes(storage, metadata, *ranges, budget, stop);
         std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> relocation_buffers;
         const auto add_reloc_buffer = [&](const ElfSection *section, std::vector<std::uint8_t> &bytes) {
             if (section && !bytes.empty()) {
@@ -515,6 +519,7 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
         add_reloc_buffer(strings, string_bytes); add_reloc_buffer(string_offsets, string_offset_bytes);
         add_reloc_buffer(addresses, address_bytes); add_reloc_buffer(line_strings, line_string_bytes);
         add_reloc_buffer(location_lists, location_list_bytes); add_reloc_buffer(locations, location_bytes);
+        add_reloc_buffer(range_lists, range_list_bytes); add_reloc_buffer(ranges, range_bytes);
         relocate_dwarf_data(metadata, relocation_buffers);
         canceled(stop);
         symbols::DwarfSections dwarf_sections;
@@ -529,6 +534,8 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
         dwarf_sections.supplementary_strings = supplementary_string_bytes;
         dwarf_sections.location_lists = location_list_bytes;
         dwarf_sections.locations = location_bytes;
+        dwarf_sections.range_lists = range_list_bytes;
+        dwarf_sections.ranges = range_bytes;
         dwarf_sections.split_unit_resolver = split_resolver;
         dwarf_sections.supplementary_resolution_max_bytes = supplementary_max_bytes;
         dwarf_sections.supplementary_resolution_max_requests = supplementary_max_requests;
@@ -704,7 +711,7 @@ Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
         auto info_bytes = read_debug_bytes(storage, metadata, *info, budget, stop);
         auto abbrev_bytes = read_debug_bytes(storage, metadata, *abbrev, budget, stop);
         std::vector<std::uint8_t> strings, string_offsets, addresses, line_strings,
-            location_lists, range_lists, line_bytes;
+            location_lists, range_lists, ranges, line_bytes;
         dwarf.info = info_bytes;
         dwarf.abbrev = abbrev_bytes;
         dwarf.stop = stop;
@@ -721,6 +728,7 @@ Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
         copy_optional(".debug_line_str.dwo", line_strings);
         copy_optional(".debug_loclists.dwo", location_lists);
         copy_optional(".debug_rnglists.dwo", range_lists);
+        copy_optional(".debug_ranges.dwo", ranges);
         copy_optional(".debug_line.dwo", line_bytes);
         dwarf.strings = strings;
         dwarf.string_offsets = string_offsets;
@@ -728,6 +736,7 @@ Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
         dwarf.line_strings = line_strings;
         dwarf.location_lists = location_lists;
         dwarf.range_lists = range_lists;
+        dwarf.ranges = ranges;
 
         auto imported = symbols::import_dwarf(dwarf);
         if (!imported) return imported.error();
