@@ -225,6 +225,7 @@ bool set_reg(const RegisterValue& source, const char* name, unsigned long long& 
 }
 
 class LinuxPtraceBackend final : public Backend {
+    bool supports_scheduled_signal_disposition() const noexcept override { return true; }
     using Clock = std::chrono::steady_clock;
     // A nested rollback/suspension shares its caller's deadline. EINTR and
     // additional TIDs never restart the timeout.
@@ -327,7 +328,7 @@ public:
             return fail_launch(Error{ErrorCode::io, "launched process failed before its ptrace exec stop"});
         const auto arch = proc_architecture(child);
         if (arch != Architecture::x86 && arch != Architecture::x86_64) return fail_launch(Error{ErrorCode::unsupported, "Linux ptrace register support is limited to x86 and x86-64 targets"});
-        startup_cleanup_ = false; startup_kill_ = false; launched_ = true; architecture_ = arch; last_signal_ = 0;
+        startup_cleanup_ = false; startup_kill_ = false; launched_ = true; architecture_ = arch; last_signal_ = 0; pending_signal_ = 0;
         pending_.reset(); seq_ = 0;
         initial_event_ = DebugEvent{0, EventKind::breakpoint, static_cast<ProcessId>(child), static_cast<ThreadId>(child), 0, "exec stop", SIGTRAP};
         return ProcessInfo{static_cast<ProcessId>(child), target.executable, arch};
@@ -367,7 +368,7 @@ public:
             if (WIFSTOPPED(status.value())) {
                 stopped_.insert(tid);
                 const auto event = static_cast<unsigned>(status.value()) >> 16;
-                if (!(event == PTRACE_EVENT_STOP && WSTOPSIG(status.value()) == SIGTRAP)) deferred_stops_[tid] = status.value();
+                if (!(event == PTRACE_EVENT_STOP && WSTOPSIG(status.value()) == SIGTRAP)) defer_stop(tid, status.value());
             } else forget_thread(tid);
             return std::monostate{};
         };
@@ -398,7 +399,7 @@ public:
             if (ptrace(PTRACE_SETOPTIONS, tid, nullptr, reinterpret_cast<void*>(PTRACE_O_TRACECLONE)) != 0)
                 return fail_attach(sys_error("PTRACE_SETOPTIONS after attach"));
         }
-        startup_cleanup_ = false; launched_ = false; architecture_ = target_architecture; last_signal_ = 0;
+        startup_cleanup_ = false; launched_ = false; architecture_ = target_architecture; last_signal_ = 0; pending_signal_ = 0;
         pending_.reset(); seq_ = 0;
         initial_event_ = DebugEvent{0, EventKind::exception, id, id, 0, "attach stop", SIGSTOP};
         return ProcessInfo{id, proc_name(pid), target_architecture};
@@ -421,7 +422,8 @@ public:
                 const auto deferred = deferred_stops_.find(tid);
                 if (deferred != deferred_stops_.end() && WIFSTOPPED(deferred->second) && (static_cast<unsigned>(deferred->second) >> 16) == 0)
                     signal = WSTOPSIG(deferred->second);
-                else if (pending_ && pending_->second == tid) signal = static_cast<int>(last_signal_);
+                else if (pending_ && pending_->second == tid) signal = pending_signal_;
+                if (const auto queued = deferred_signals_.find(tid); queued != deferred_signals_.end()) signal = queued->second;
                 if (signal == SIGTRAP) {
                     siginfo_t info{};
                     const bool have_info = ptrace(PTRACE_GETSIGINFO, tid, nullptr, &info) == 0;
@@ -505,7 +507,7 @@ public:
                         continue;
                     }
                     if (WIFSTOPPED(status)) {
-                        stopped_.insert(thread); deferred_stops_[thread] = status;
+                        stopped_.insert(thread); defer_stop(thread, status);
                         const auto ptrace_event = static_cast<unsigned>(status) >> 16;
                         if (ptrace_event == PTRACE_EVENT_CLONE) {
                             unsigned long child_tid = 0;
@@ -581,7 +583,7 @@ public:
             auto event = *initial_event_; initial_event_.reset(); event.sequence = ++seq_;
             pending_ = std::pair{event.sequence, static_cast<pid_t>(event.thread)};
             pending_breakpoint_.reset();
-            pending_debugger_trap_ = false;
+            pending_debugger_trap_ = false; pending_signal_ = 0;
             return event;
         }
         auto children = complete_pending_children(); if (!children) return children.error();
@@ -675,7 +677,10 @@ public:
                 }
                 DebugEvent event{}; event.sequence = ++seq_; event.process = static_cast<ProcessId>(pid_); event.thread = static_cast<ThreadId>(tid);
                 if (WIFEXITED(status) || WIFSIGNALED(status)) {
-                    stopped_.erase(tid); tracked_.erase(tid); seized_.erase(tid); interrupting_.erase(tid);
+                    pending_signal_ = 0;
+                    pending_debugger_trap_ = false;
+                    deferred_signals_.erase(tid);
+                    stopped_.erase(tid); tracked_.erase(tid); seized_.erase(tid); interrupting_.erase(tid); deferred_stops_.erase(tid);
                     event.kind = tid == pid_ ? EventKind::process_exited : EventKind::thread_exited;
                     event.code = WIFEXITED(status) ? static_cast<std::uint32_t>(WEXITSTATUS(status)) : static_cast<std::uint32_t>(WTERMSIG(status));
                     event.message = tid == pid_ ? "process exited" : "thread exited";
@@ -685,7 +690,7 @@ public:
                     const auto ptrace_event = static_cast<unsigned>(status) >> 16;
                     last_signal_ = ptrace_event == 0 ? static_cast<unsigned>(signal) : 0;
                     if (ptrace_event == PTRACE_EVENT_CLONE) {
-                        deferred_stops_[tid] = status;
+                        defer_stop(tid, status);
                         auto child = track_cloned_thread(tid);
                         if (!child) {
                             if (requested_user_step) step_threads_.insert(tid);
@@ -740,6 +745,10 @@ public:
                         }
                     }
                     }
+                    pending_debugger_trap_ = event.kind == EventKind::single_step || pending_breakpoint_.has_value() || !event.breakpoint_ids.empty();
+                    pending_signal_ = pending_debugger_trap_ ? 0 : signal_from_stop(tid, status);
+                    if (const auto queued = deferred_signals_.find(tid); queued != deferred_signals_.end())
+                        pending_signal_ = queued->second;
                 }
                 if (!resume_failure.empty()) {
                     event.message += "; " + resume_failure;
@@ -761,7 +770,6 @@ public:
                         event.message += "; peer suspension incomplete: " + stopped.error().message;
                     }
                 }
-                pending_debugger_trap_ = event.kind == EventKind::single_step || pending_breakpoint_.has_value() || !event.breakpoint_ids.empty();
                 pending_ = std::pair{event.sequence, tid}; return event;
             }
             auto progress = wait_progress(); if (!progress) return progress.error();
@@ -774,7 +782,7 @@ public:
         WaitScope scope(*this);
         if (!pending_ || pending_->first != sequence) return Error{ErrorCode::invalid_argument, "event sequence does not match pending event"};
         const auto tid = pending_->second;
-        const int signal = disposition == ContinueStatus::handled ? 0 : static_cast<int>(last_signal_);
+        const int signal = disposition == ContinueStatus::handled ? 0 : pending_signal_;
         if (exited_ && tid == pid_) { clear(); return std::monostate{}; }
         auto recovered = recover_suspension();
         if (!recovered) return recovered;
@@ -785,7 +793,8 @@ public:
         }
         auto resumed = resume_stopped_threads(tid, signal);
         if (!resumed) return resumed;
-        pending_breakpoint_.reset(); pending_.reset();
+        deferred_signals_.erase(tid);
+        pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0;
         return std::monostate{};
     }
     Status continue_thread_event(std::uint64_t sequence, ThreadId thread, ContinueStatus disposition) override {
@@ -799,7 +808,7 @@ public:
         if (!recovered) return recovered;
         if (!std::all_of(tracked_.begin(), tracked_.end(), [&](pid_t current) { return stopped_.contains(current); }))
             return Error{ErrorCode::busy, "thread-qualified continue requires all peers to remain stopped"};
-        const int signal = disposition == ContinueStatus::handled ? 0 : static_cast<int>(last_signal_);
+        const int signal = disposition == ContinueStatus::handled ? 0 : pending_signal_;
         if (disposition == ContinueStatus::handled) {
             auto displaced = needs_displaced_step(tid);
             if (!displaced) return displaced.error();
@@ -808,7 +817,8 @@ public:
         if (ptrace(PTRACE_CONT, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) != 0)
             return sys_error("PTRACE_CONT selected thread");
         stopped_.erase(tid);
-        pending_breakpoint_.reset(); pending_.reset();
+        deferred_signals_.erase(tid);
+        pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0;
         return std::monostate{};
     }
     Status resume_threads_event(std::uint64_t sequence, std::span<const ThreadResumeAction> actions) override {
@@ -824,6 +834,24 @@ public:
         if (!std::all_of(tracked_.begin(), tracked_.end(), [&](pid_t thread) { return stopped_.contains(thread); }))
             return Error{ErrorCode::busy, "thread resume schedule requires every traced thread to be stopped"};
         const auto owner = pending_->second;
+        if (owner <= 0 || !tracked_.contains(owner) || !stopped_.contains(owner))
+            return Error{ErrorCode::invalid_argument, "pending event owner is not a stopped thread owned by this session"};
+        const auto signal_for = [&](const ThreadResumeAction& action) {
+            const auto tid = static_cast<pid_t>(action.thread);
+            if (tid == owner && pending_signal_ != 0) return pending_signal_;
+            const auto queued = deferred_signals_.find(tid);
+            return queued == deferred_signals_.end() ? 0 : queued->second;
+        };
+        const auto apply_stopped_signal_dispositions = [&] {
+            for (const auto& action : actions) {
+                const auto tid = static_cast<pid_t>(action.thread);
+                if (action.kind != ThreadResumeKind::stop) continue;
+                const int signal = signal_for(action);
+                if (action.signal_disposition == ContinueStatus::handled) {
+                    if (signal != 0 || deferred_signals_.contains(tid)) deferred_signals_[tid] = 0;
+                } else if (signal != 0) deferred_signals_[tid] = signal;
+            }
+        };
         std::set<pid_t> selected;
         std::vector<const ThreadResumeAction*> runnable;
         for (const auto &action : actions) {
@@ -832,6 +860,9 @@ public:
             if (action.kind != ThreadResumeKind::continue_execution && action.kind != ThreadResumeKind::single_step &&
                 action.kind != ThreadResumeKind::stop)
                 return Error{ErrorCode::invalid_argument, "resume schedule contains an unknown action"};
+            if (action.signal_disposition && *action.signal_disposition != ContinueStatus::handled &&
+                *action.signal_disposition != ContinueStatus::not_handled)
+                return Error{ErrorCode::invalid_argument, "resume schedule contains an unknown signal disposition"};
             const auto tid = static_cast<pid_t>(action.thread);
             if (!selected.insert(tid).second)
                 return Error{ErrorCode::invalid_argument, "resume schedule contains a duplicate thread"};
@@ -871,7 +902,13 @@ public:
             std::vector<pid_t> resumed;
             resumed.reserve(order.size());
             for (const auto tid : order) {
-                if (ptrace(PTRACE_CONT, tid, nullptr, nullptr) != 0) {
+                const auto action = std::find_if(runnable.begin(), runnable.end(), [&](const auto* item) {
+                    return static_cast<pid_t>(item->thread) == tid;
+                });
+                const auto* selected_action = *action;
+                const int queued_signal = signal_for(*selected_action);
+                const int delivered = selected_action->signal_disposition == ContinueStatus::handled ? 0 : queued_signal;
+                if (ptrace(PTRACE_CONT, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(delivered))) != 0) {
                     const auto error = sys_error("PTRACE_CONT scheduled Linux thread");
                     auto rollback = stop_threads(resumed, true);
                     resume_blocked_ = !rollback;
@@ -880,33 +917,49 @@ public:
                     return error;
                 }
                 stopped_.erase(tid);
+                deferred_signals_.erase(tid);
+                if (tid == owner) pending_signal_ = 0;
                 resumed.push_back(tid);
             }
-            pending_.reset(); pending_breakpoint_.reset(); last_signal_ = 0;
+            apply_stopped_signal_dispositions();
+            pending_.reset(); pending_breakpoint_.reset(); pending_signal_ = 0; last_signal_ = 0;
             return std::monostate{};
         }
 
         const auto* selected_action = runnable.front();
         const auto tid = static_cast<pid_t>(selected_action->thread);
+        const int queued_signal = signal_for(*selected_action);
+        const int delivered = selected_action->signal_disposition == ContinueStatus::handled ? 0 : queued_signal;
         if (pending_breakpoint_ && tid != owner)
             return Error{ErrorCode::unsupported, "cannot preserve a pending software-breakpoint event while scheduling another thread"};
         if (selected_action->kind == ThreadResumeKind::single_step) {
-            if (tid == owner && pending_breakpoint_) {
+            if (tid == owner && pending_breakpoint_ && delivered == 0) {
                 auto displaced = needs_displaced_step(tid);
                 if (!displaced) return displaced.error();
-                if (displaced.value()) return begin_displaced_step(tid, false);
+                if (displaced.value()) {
+                    auto stepped = begin_displaced_step(tid, false);
+                    if (stepped) apply_stopped_signal_dispositions();
+                    return stepped;
+                }
             }
-            if (ptrace(PTRACE_SINGLESTEP, tid, nullptr, nullptr) != 0)
+            if (ptrace(PTRACE_SINGLESTEP, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(delivered))) != 0)
                 return sys_error("PTRACE_SINGLESTEP scheduled thread");
-            pending_.reset(); pending_breakpoint_.reset();
             stopped_.erase(tid); step_threads_.insert(tid);
+            deferred_signals_.erase(tid);
+            apply_stopped_signal_dispositions();
+            pending_signal_ = 0;
+            pending_.reset(); pending_breakpoint_.reset(); last_signal_ = 0;
             return std::monostate{};
         }
 
-        if (tid == owner && pending_breakpoint_) {
+        if (tid == owner && pending_breakpoint_ && delivered == 0) {
             auto displaced = needs_displaced_step(tid);
             if (!displaced) return displaced.error();
-            if (displaced.value()) return begin_displaced_step(tid, false, true);
+            if (displaced.value()) {
+                auto stepped = begin_displaced_step(tid, false, true);
+                if (stepped) apply_stopped_signal_dispositions();
+                return stepped;
+            }
         } else if (owner != tid && pending_breakpoint_) {
             if (std::find_if(actions.begin(), actions.end(), [&](const auto &action) {
                     return static_cast<pid_t>(action.thread) == owner && action.kind == ThreadResumeKind::stop;
@@ -916,9 +969,12 @@ public:
         // A schedule acknowledges the single pending stop, but resumes only the
         // selected thread. Other listed stop actions and omitted threads remain
         // ptrace-stopped until a later event schedule.
-        if (ptrace(PTRACE_CONT, tid, nullptr, nullptr) != 0)
+        if (ptrace(PTRACE_CONT, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(delivered))) != 0)
             return sys_error("PTRACE_CONT scheduled thread");
         stopped_.erase(tid);
+        deferred_signals_.erase(tid);
+        apply_stopped_signal_dispositions();
+        pending_signal_ = 0;
         pending_.reset(); pending_breakpoint_.reset(); last_signal_ = 0;
         return std::monostate{};
     }
@@ -933,9 +989,10 @@ public:
             if (!displaced) return displaced.error();
             if (displaced.value()) return begin_displaced_step(tid, false);
         }
-        const int signal = disposition == ContinueStatus::handled ? 0 : static_cast<int>(last_signal_);
+        const int signal = disposition == ContinueStatus::handled ? 0 : pending_signal_;
         if (ptrace(PTRACE_SINGLESTEP, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) != 0) return sys_error("PTRACE_SINGLESTEP");
-        pending_.reset(); pending_breakpoint_.reset();
+        deferred_signals_.erase(tid);
+        pending_.reset(); pending_breakpoint_.reset(); pending_signal_ = 0;
         stopped_.erase(tid); step_threads_.insert(tid); return std::monostate{};
     }
 
@@ -1371,7 +1428,37 @@ private:
     void forget_thread(pid_t tid) {
         tracked_.erase(tid); stopped_.erase(tid); seized_.erase(tid);
         interrupting_.erase(tid); deferred_stops_.erase(tid); initial_children_.erase(tid);
-        hardware_pending_children_.erase(tid); step_threads_.erase(tid);
+        deferred_signals_.erase(tid); hardware_pending_children_.erase(tid); step_threads_.erase(tid);
+    }
+    int signal_from_stop(pid_t tid, int status) const {
+        if (!WIFSTOPPED(status) || (static_cast<unsigned>(status) >> 16) != 0) return 0;
+        const int signal = WSTOPSIG(status);
+        if (signal == (SIGTRAP | 0x80)) return 0;
+        if (signal != SIGTRAP) return signal;
+        siginfo_t info{};
+        if (ptrace(PTRACE_GETSIGINFO, tid, nullptr, &info) != 0) return 0;
+        if (info.si_code == TRAP_TRACE) return 0;
+        if (info.si_code == TRAP_HWBKPT) {
+            auto dr6 = peek_debug_register(tid, 6);
+            if (dr6 && !detail::hardware_breakpoint_hits(hardware_slot_ids_, dr6.value()).empty()) return 0;
+        }
+        if (info.si_code == TRAP_BRKPT || info.si_code == SI_KERNEL) {
+            auto ip = instruction_pointer(tid);
+            if (ip && ip.value() > 0) {
+                const auto address = ip.value() - 1;
+                const bool owned = breakpoints_.contains(address) &&
+                    std::any_of(ids_.begin(), ids_.end(), [&](const auto& item) {
+                        return item.second == address && enabled_ids_.contains(item.first);
+                    });
+                if (owned) return 0;
+            }
+        }
+        return signal;
+    }
+    void defer_stop(pid_t tid, int status) {
+        deferred_stops_[tid] = status;
+        const int signal = signal_from_stop(tid, status);
+        if (signal != 0) deferred_signals_[tid] = signal;
     }
     // Failed attach owns only a partial census. Release exactly those TIDs,
     // preserving real signal stops, rather than requiring ownership of peers.
@@ -1395,7 +1482,7 @@ private:
                 if (WIFEXITED(status.value()) || WIFSIGNALED(status.value())) { forget_thread(tid); break; }
                 if (!WIFSTOPPED(status.value())) return Error{ErrorCode::io, "unexpected failed-startup tracee status"};
                 stopped_.insert(tid); interrupting_.erase(tid);
-                deferred_stops_[tid] = status.value();
+                defer_stop(tid, status.value());
                 if (!startup_kill_) break;
                 progress = wait_progress(false); if (!progress) return progress;
                 if (ptrace(PTRACE_CONT, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(SIGKILL))) != 0 && errno != ESRCH)
@@ -1425,7 +1512,7 @@ private:
         }
         if (!WIFSTOPPED(status.value())) return Error{ErrorCode::io, "cloned thread did not enter its initial ptrace stop"};
         stopped_.insert(child); interrupting_.erase(child); initial_children_.erase(child);
-        if ((static_cast<unsigned>(status.value()) >> 16) != PTRACE_EVENT_STOP) deferred_stops_[child] = status.value();
+        if ((static_cast<unsigned>(status.value()) >> 16) != PTRACE_EVENT_STOP) defer_stop(child, status.value());
         if (!hardware_breakpoints_.empty()) {
             hardware_pending_children_.insert(child);
             auto installed = install_hardware_on_thread(child, hardware_breakpoints_, true);
@@ -1485,7 +1572,7 @@ private:
                     if (waited == tid) {
                         if (WIFSTOPPED(status)) stopped_.insert(tid);
                         else forget_thread(tid);
-                        deferred_stops_[tid] = status;
+                        defer_stop(tid, status);
                         if (WIFSTOPPED(status) && (static_cast<unsigned>(status) >> 16) == PTRACE_EVENT_CLONE) {
                             auto child = track_cloned_thread(tid); if (!child) return child;
                         }
@@ -1507,7 +1594,7 @@ private:
                     else forget_thread(tid);
                     const bool internal = WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP &&
                         (static_cast<unsigned>(status) >> 16) == PTRACE_EVENT_STOP;
-                    if (!internal) deferred_stops_[tid] = status;
+                    if (!internal) defer_stop(tid, status);
                     if (WIFSTOPPED(status) && (static_cast<unsigned>(status) >> 16) == PTRACE_EVENT_CLONE) {
                         auto child = track_cloned_thread(tid); if (!child) return child;
                     }
@@ -1540,7 +1627,8 @@ private:
         if (stopped_.contains(event_thread) && !has_deferred_stop(event_thread)) candidates.push_back(event_thread);
         std::vector<pid_t> resumed;
         for (const auto tid : candidates) {
-            const auto delivered = tid == event_thread ? signal : 0;
+            const auto queued = deferred_signals_.find(tid);
+            const auto delivered = tid == event_thread ? signal : (queued == deferred_signals_.end() ? 0 : queued->second);
             if (ptrace(PTRACE_CONT, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(delivered))) != 0) {
                 const auto code = errno;
                 const auto error = sys_error("PTRACE_CONT process thread");
@@ -1548,7 +1636,7 @@ private:
                     int status{};
                     const auto waited = waitpid(tid, &status, __WALL | WNOHANG);
                     if (waited == tid) {
-                        deferred_stops_.emplace(tid, status);
+                        defer_stop(tid, status);
                         if (!WIFSTOPPED(status)) stopped_.erase(tid);
                         continue;
                     }
@@ -1559,6 +1647,7 @@ private:
                 return error;
             }
             stopped_.erase(tid);
+            deferred_signals_.erase(tid);
             resumed.push_back(tid);
         }
         return std::monostate{};
@@ -1634,7 +1723,7 @@ private:
         displaced_step_ = DisplacedStep{tid, address, continue_process, continue_thread};
         breakpoint_rollback_.reset();
         stopped_.erase(tid);
-        pending_breakpoint_.reset(); pending_.reset();
+        pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0;
         return std::monostate{};
     }
     Result<detail::I386UserRegisters> read_i386_registers(pid_t tid) const {
@@ -1861,10 +1950,11 @@ private:
     bool patch(std::uint64_t address, std::byte value) {
         return static_cast<bool>(write_memory_raw(address, std::span<const std::byte>(&value, 1)));
     }
-    void clear() { pending_debugger_trap_ = false; detach_signals_.clear(); initial_children_.clear(); hardware_pending_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; detach_preparing_ = false; terminating_ = false; pid_ = 0; architecture_ = Architecture::unknown; launched_ = false; exited_ = false; pending_.reset(); initial_event_.reset(); pending_breakpoint_.reset(); stopped_.clear(); tracked_.clear(); seized_.clear(); step_threads_.clear(); displaced_step_.reset(); breakpoint_rollback_.reset(); breakpoint_rearm_.reset(); deferred_stops_.clear(); interrupting_.clear(); resume_blocked_ = false; breakpoints_.clear(); ids_.clear(); enabled_ids_.clear(); hardware_breakpoints_.clear(); hardware_slots_.clear(); hardware_slot_ids_.clear(); }
+    void clear() { pending_debugger_trap_ = false; pending_signal_ = 0; detach_signals_.clear(); initial_children_.clear(); hardware_pending_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; detach_preparing_ = false; terminating_ = false; pid_ = 0; architecture_ = Architecture::unknown; launched_ = false; exited_ = false; pending_.reset(); initial_event_.reset(); pending_breakpoint_.reset(); stopped_.clear(); tracked_.clear(); seized_.clear(); step_threads_.clear(); displaced_step_.reset(); breakpoint_rollback_.reset(); breakpoint_rearm_.reset(); deferred_stops_.clear(); deferred_signals_.clear(); interrupting_.clear(); resume_blocked_ = false; breakpoints_.clear(); ids_.clear(); enabled_ids_.clear(); hardware_breakpoints_.clear(); hardware_slots_.clear(); hardware_slot_ids_.clear(); }
     pid_t pid_ = 0; bool launched_ = false; bool exited_ = false; std::uint64_t seq_ = 0; BreakpointId next_bp_ = 1;
     Architecture architecture_ = Architecture::unknown;
     unsigned last_signal_ = 0;
+    int pending_signal_ = 0;
     std::optional<std::pair<std::uint64_t, pid_t>> pending_;
     std::optional<DebugEvent> initial_event_;
     std::optional<std::uint64_t> pending_breakpoint_;
@@ -1879,6 +1969,7 @@ private:
     std::optional<BreakpointRollback> breakpoint_rollback_;
     std::optional<std::uint64_t> breakpoint_rearm_;
     std::map<pid_t, int> deferred_stops_;
+    std::map<pid_t, int> deferred_signals_;
     std::set<pid_t> interrupting_;
     bool resume_blocked_ = false, pending_debugger_trap_ = false;
     const std::chrono::milliseconds wait_timeout_ = configured_wait_timeout();
