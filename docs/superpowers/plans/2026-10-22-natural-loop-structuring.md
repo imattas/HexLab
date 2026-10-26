@@ -26,6 +26,17 @@
 - Loop-carried and internal join phis must lower to assignments on their actual incoming edges, including shuffled block storage.
 - Unclassified latches, irreducible cycles, missing edges, duplicate/foreign phi inputs, and side exits outside the recognized loop-control forms must preserve goto fallback with a reason. Explicit conditional continue edges may be multiple, but each must be identified and have a valid phi input/copy.
 
+### Scoped nested-child continuation implementation
+
+The current formatter recognizes one bounded subset of the continue requirement:
+in a canonical pre-tested child loop's traced straight-line body chain, a
+conditional branch may target the child header on one edge and advance to the
+next body block on the other. The child header's SSA phis are validated against
+the exact preheader, ordinary latch, and all such continue predecessors, with
+parallel copies placed on each source edge. This does not implement arbitrary
+natural-loop discovery or continues routed through side blocks/child diamonds;
+those remain for the broader plan and retain goto fallback.
+
 ---
 
 ### Task 1: Dedicated loop CFG fixtures and expected structured output

@@ -488,6 +488,23 @@ Result<ManagedCilDecompilation> decompile_managed_method(
         if (instruction.offset > UINT32_MAX - instruction.size)
             return failure(ErrorCode::malformed, "Managed IL instruction extent overflows");
         const auto mnemonic = std::string_view(instruction.mnemonic);
+        if (!method.body->exception_clauses.empty()) {
+            const auto covered = [&](const CilExceptionClause &clause) {
+                return in_region(instruction.offset, clause.try_offset, clause.try_length) ||
+                       in_region(instruction.offset, clause.handler_offset, clause.handler_length) ||
+                       (clause.kind == CilExceptionKind::filter &&
+                        in_region(instruction.offset, clause.filter_offset,
+                                  clause.handler_offset - clause.filter_offset));
+            };
+            if (std::any_of(method.body->exception_clauses.begin(), method.body->exception_clauses.end(), covered)) {
+                // Exceptional state is instruction-specific. Keep every covered
+                // IL instruction in its own source block so SSA cannot collapse
+                // several possible throws onto one normal-exit predecessor.
+                leaders.insert(instruction.offset);
+                const auto next = instruction.offset + instruction.size;
+                if (next < method.body->code_size) leaders.insert(next);
+            }
+        }
         const bool terminal = mnemonic == "ret" || mnemonic == "throw" || mnemonic == "rethrow" ||
                               mnemonic == "endfinally" || mnemonic == "endfilter";
         if (terminal && i + 1 < method.instructions.size()) leaders.insert(instruction.offset + instruction.size);
@@ -2182,6 +2199,38 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                 return edge.kind == BlockEdgeKind::exception && edge.target == std::optional<Address>{dispatch_address};
             }))
             edges.push_back({il_address(instruction.offset), dispatch_address, *dispatch_id, BlockEdgeKind::exception});
+        auto &source_block = result.lifted.blocks[block_index];
+        LiftedBlock::ExceptionMemoryTiming memory_timing =
+            LiftedBlock::ExceptionMemoryTiming::before_instruction;
+        bool found_source = false;
+        for (auto &lifted : source_block.instructions) {
+            if (lifted.origin.address != il_address(instruction.offset)) continue;
+            found_source = true;
+            if (auto *intrinsic = std::get_if<Intrinsic>(&lifted.statement)) {
+                if (intrinsic->memory_effect == IntrinsicMemoryEffect::write ||
+                    intrinsic->memory_effect == IntrinsicMemoryEffect::unknown) {
+                    // A managed store/call may partially complete before a
+                    // runtime fault. Preserve an explicit unknown memory
+                    // version for the exceptional path instead of claiming its
+                    // pre-instruction input is still current.
+                    intrinsic->memory_effect = IntrinsicMemoryEffect::unknown;
+                    memory_timing = LiftedBlock::ExceptionMemoryTiming::opaque_effect;
+                }
+            } else if (std::holds_alternative<Store>(lifted.statement) ||
+                       std::holds_alternative<Call>(lifted.statement)) {
+                return failure(ErrorCode::unsupported,
+                    "CIL exceptional memory state cannot be represented for this opaque statement");
+            }
+            break;
+        }
+        if (!found_source)
+            return failure(ErrorCode::malformed, "CIL exceptional edge has no lifted source instruction");
+        if (std::none_of(source_block.exception_memory_edges.begin(), source_block.exception_memory_edges.end(),
+                [&](const auto &edge) {
+                    return edge.source == il_address(instruction.offset) && edge.target == dispatch_address;
+                }))
+            source_block.exception_memory_edges.push_back(
+                {il_address(instruction.offset), dispatch_address, memory_timing});
     }
     result.lifted.blocks.insert(result.lifted.blocks.end(),
         std::make_move_iterator(synthetic_blocks.begin()), std::make_move_iterator(synthetic_blocks.end()));

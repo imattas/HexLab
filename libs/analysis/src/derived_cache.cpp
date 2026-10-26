@@ -659,8 +659,27 @@ Result<DerivedProposal> decode_derived(std::span<const std::byte> bytes, const I
         expected.source_key = key;
         take(bind_derived_source(expected, image, stop));
         expected.functions = recovery.run();
-        for (const auto &function : expected.functions->functions)
-            expected.stack_frames.push_back({function->id, take(analyze_stack_frame(*function, *expected.functions, stop))});
+        std::map<BlockId, std::shared_ptr<const BasicBlock>> validated_blocks;
+        for (const auto &block : expected.functions->blocks) {
+            canceled(stop);
+            validated_blocks.emplace(block->id, block);
+        }
+        for (const auto &function : expected.functions->functions) {
+            canceled(stop);
+            // The stack solver only needs blocks owned by this function. Keeping
+            // cache validation on the same narrow view avoids a functions ×
+            // image-blocks scan for large binaries.
+            FunctionSnapshot function_view;
+            function_view.blocks.reserve(function->blocks.size());
+            for (const auto block_id : function->blocks) {
+                canceled(stop);
+                const auto block = validated_blocks.find(block_id);
+                if (block != validated_blocks.end())
+                    function_view.blocks.push_back(block->second);
+            }
+            expected.stack_frames.push_back(
+                {function->id, take(analyze_stack_frame(*function, function_view, stop))});
+        }
         expected.references = take(derive_references(image, *expected.functions, metadata, decisions, stop));
         expected.strings = std::make_shared<const StringScan>(take(find_strings(image, options, stop)));
         expected.complete =

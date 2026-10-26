@@ -236,11 +236,14 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
             i.operands = {reg(rs), reg(rt)}; i.access = {OperandAccess::read, OperandAccess::read};
             i.register_reads = {reg(rs), reg(rt)}; i.register_writes = {hi, lo};
             break;
-        case 0x21: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
+        case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
+        case 0x2a: case 0x2b:
             if (shamt) return invalid("Reserved MIPS64 arithmetic encoding");
-            binary(funct == 0x21 ? Opcode::mips_addu : funct == 0x23 ? Opcode::mips_subu :
+            binary(funct == 0x20 ? Opcode::mips64_add : funct == 0x21 ? Opcode::mips64_addu :
+                   funct == 0x22 ? Opcode::mips64_sub : funct == 0x23 ? Opcode::mips64_subu :
                    funct == 0x24 ? Opcode::mips_and : funct == 0x25 ? Opcode::mips_or :
-                   funct == 0x26 ? Opcode::mips_xor : Opcode::mips_nor);
+                   funct == 0x26 ? Opcode::mips_xor : funct == 0x27 ? Opcode::mips_nor :
+                   funct == 0x2a ? Opcode::mips64_slt : Opcode::mips64_sltu);
             break;
         case 0x2c: case 0x2d: case 0x2e: case 0x2f:
             if (shamt) return invalid("Reserved MIPS64 doubleword arithmetic encoding");
@@ -252,9 +255,9 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
             if (rs) return invalid("Reserved MIPS64 fixed-shift encoding");
             unsigned amount = shamt;
             Opcode opcode;
-            if (funct == 0x00) opcode = Opcode::mips_sll;
-            else if (funct == 0x02) opcode = Opcode::mips_srl;
-            else if (funct == 0x03) opcode = Opcode::mips_sra;
+            if (funct == 0x00) opcode = Opcode::mips64_sll;
+            else if (funct == 0x02) opcode = Opcode::mips64_srl;
+            else if (funct == 0x03) opcode = Opcode::mips64_sra;
             else if (funct == 0x38) opcode = Opcode::mips64_dsll;
             else if (funct == 0x3a) opcode = Opcode::mips64_dsrl;
             else if (funct == 0x3b) opcode = Opcode::mips64_dsra;
@@ -277,6 +280,27 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
             i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
             i.register_reads = {reg(rt), reg(rs)};
             if (rd) i.register_writes = {reg(rd)};
+            break;
+        case 0x04: case 0x06: case 0x07:
+            if (shamt) return invalid("Reserved MIPS64 variable-shift encoding");
+            i.opcode = funct == 4 ? Opcode::mips64_sllv : funct == 6 ? Opcode::mips64_srlv : Opcode::mips64_srav;
+            i.operands = {reg(rd), reg(rt), reg(rs)};
+            i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
+            i.register_reads = {reg(rt), reg(rs)};
+            if (rd) i.register_writes = {reg(rd)};
+            break;
+        case 0x0a: case 0x0b:
+            if (shamt) return invalid("Reserved MIPS64 conditional-move encoding");
+            i.opcode = funct == 0x0a ? Opcode::mips64_movz : Opcode::mips64_movn;
+            i.operands = {reg(rd), reg(rs), reg(rt)};
+            i.access = {OperandAccess::read_write, OperandAccess::read, OperandAccess::read};
+            i.register_reads = {reg(rd), reg(rs), reg(rt)};
+            if (rd) i.register_writes = {reg(rd)};
+            break;
+        case 0x0f:
+            if (rs || rt || rd) return invalid("Reserved MIPS64 SYNC encoding");
+            i.opcode = Opcode::mips_sync;
+            if (shamt) i.operands = {ImmediateOperand{shamt, 5, 32, false, EncodedField{0, 2}}};
             break;
         default: return invalid("Reserved or unsupported MIPS64 SPECIAL function");
         }
@@ -365,13 +389,20 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         i.operands = {reg(rs)}; i.access = {OperandAccess::read}; i.register_reads = {reg(rs)};
         i.flow = FlowKind::conditional_branch; target(i, signed16(word)); i.access.push_back(OperandAccess::address); i.delay_slots = 1;
     } else if (op == 1) {
-        if (rt != 0 && rt != 1 && rt != 2 && rt != 3) return {DecodeStatus::unsupported, {}, "MIPS64 REGIMM link forms are unsupported"};
-        i.opcode = rt == 0 ? Opcode::mips_bltz : rt == 1 ? Opcode::mips_bgez : rt == 2 ? Opcode::mips_bltzl : Opcode::mips_bgezl;
+        if (rt > 3 && (rt < 16 || rt > 19)) return {DecodeStatus::unsupported, {}, "MIPS64 REGIMM suboperation is unsupported"};
+        const bool link = rt >= 16;
+        const bool ge_zero = (rt & 1) != 0;
+        const bool likely = (rt & 2) != 0;
+        i.opcode = link ? (ge_zero ? (likely ? Opcode::mips64_bgezall : Opcode::mips64_bgezal)
+                                    : (likely ? Opcode::mips64_bltzall : Opcode::mips64_bltzal)) :
+                   ge_zero ? (likely ? Opcode::mips_bgezl : Opcode::mips_bgez)
+                           : (likely ? Opcode::mips_bltzl : Opcode::mips_bltz);
         i.operands = {reg(rs)}; i.access = {OperandAccess::read}; i.register_reads = {reg(rs)};
+        if (link) i.register_writes = {reg(31)};
         i.flow = FlowKind::conditional_branch; target(i, signed16(word)); i.access.push_back(OperandAccess::address); i.delay_slots = 1;
     } else if (op == 0x08 || op == 0x09 || op == 0x0a || op == 0x0b || (op >= 0x0c && op <= 0x0e) || op == 0x18 || op == 0x19) {
-        i.opcode = op == 0x08 ? Opcode::mips_addi : op == 0x09 ? Opcode::mips_addiu : op == 0x0a ? Opcode::mips_slti :
-                   op == 0x0b ? Opcode::mips_sltiu : op == 0x0c ? Opcode::mips_andi : op == 0x0d ? Opcode::mips_ori :
+        i.opcode = op == 0x08 ? Opcode::mips64_addi : op == 0x09 ? Opcode::mips64_addiu : op == 0x0a ? Opcode::mips64_slti :
+                   op == 0x0b ? Opcode::mips64_sltiu : op == 0x0c ? Opcode::mips_andi : op == 0x0d ? Opcode::mips_ori :
                    op == 0x0e ? Opcode::mips_xori : op == 0x18 ? Opcode::mips64_daddi : Opcode::mips64_daddiu;
         const bool sign = op == 0x08 || op == 0x09 || op == 0x0a || op == 0x0b || op == 0x18 || op == 0x19;
         const auto raw = sign ? static_cast<std::uint64_t>(signed16(word)) : std::uint64_t{word & 0xffffu};
@@ -402,6 +433,8 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         case 0x1b: opcode=Opcode::mips64_ldr;width=64;load=true;unaligned_merge=true;break;
         case 0x2c: opcode=Opcode::mips64_sdl;width=64;unaligned_merge=true;break;
         case 0x2d: opcode=Opcode::mips64_sdr;width=64;unaligned_merge=true;break;
+        case 0x30: opcode=Opcode::mips64_ll;width=32;load=true;break;
+        case 0x38: opcode=Opcode::mips64_sc;width=32;break;
         case 0x34: opcode=Opcode::mips64_lld;width=64;load=true;break; case 0x37: opcode=Opcode::mips64_ld;width=64;load=true;break;
         case 0x3c: opcode=Opcode::mips64_scd;width=64;break;
         case 0x3f: opcode=Opcode::mips64_sd;width=64;break;
@@ -411,7 +444,7 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         i.opcode = opcode;
         MemoryOperand memory{static_cast<std::uint16_t>(width), 64, {}, reg(rs), {}, 1, signed16(word), false, {}, EncodedField{0, 2}};
         i.operands = {reg(rt), memory};
-        const bool conditional_store = opcode == Opcode::mips64_scd;
+        const bool conditional_store = opcode == Opcode::mips64_scd || opcode == Opcode::mips64_sc;
         i.access = {load ? (unaligned_merge ? OperandAccess::read_write : OperandAccess::write) :
                     (conditional_store ? OperandAccess::read_write : OperandAccess::read),
                     load ? OperandAccess::read : (unaligned_merge ? OperandAccess::read_write : OperandAccess::write)};
