@@ -40,6 +40,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <system_error>
 #include <cerrno>
@@ -321,15 +322,20 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
     } else {
         struct Edge {
             std::string name;
-            std::vector<std::size_t> providers;
+            const std::vector<std::size_t> *providers = nullptr;
         };
         std::vector<std::vector<Edge>> graph(modules.size());
         std::size_t edge_count = 0;
         std::size_t raw_dependency_rows = 0;
         std::size_t dependency_name_bytes = 0;
         std::map<std::string, std::vector<std::size_t>> providers_by_basename;
-        for (std::size_t candidate = 0; candidate < modules.size(); ++candidate)
-            providers_by_basename[leaf(path_text(modules[candidate].path))].push_back(candidate);
+        std::map<std::string, std::set<std::string>> provider_paths_by_basename;
+        for (std::size_t candidate = 0; candidate < modules.size(); ++candidate) {
+            const auto basename = leaf(path_text(modules[candidate].path));
+            const auto normalized_path = path_key(modules[candidate].path);
+            if (provider_paths_by_basename[basename].insert(normalized_path).second)
+                providers_by_basename[basename].push_back(candidate);
+        }
         for (std::size_t source = 0; source < modules.size(); ++source) {
             auto deps_result = dependencies_for(modules[source].document->metadata,
                 max_graph_edges - raw_dependency_rows, max_graph_name_bytes - dependency_name_bytes, false);
@@ -351,7 +357,7 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
             for (auto &dep : deps) {
                 Edge edge{std::move(dep), {}};
                 const auto providers = providers_by_basename.find(leaf(edge.name));
-                if (providers != providers_by_basename.end()) edge.providers = providers->second;
+                if (providers != providers_by_basename.end()) edge.providers = &providers->second;
                 graph[source].push_back(std::move(edge));
             }
         }
@@ -386,23 +392,23 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
                 out << std::string((depth + 1) * 2, ' ') << "(no dependency names in parsed metadata)\n";
             for (const auto &edge : graph[current]) {
                 out << std::string((depth + 1) * 2, ' ') << edge.name << " -> ";
-                if (edge.providers.empty()) {
+                if (!edge.providers || edge.providers->empty()) {
                     out << "unresolved (not supplied)\n";
                     continue;
                 }
-                if (edge.providers.size() != 1) {
+                if (edge.providers->size() != 1) {
                     out << "ambiguous:";
                     const auto remaining = max_reported_provider_ids - provider_ids_reported;
-                    const auto count = (std::min)(edge.providers.size(), remaining);
+                    const auto count = (std::min)(edge.providers->size(), remaining);
                     for (std::size_t index = 0; index < count; ++index)
-                        out << " [" << edge.providers[index] << "]";
+                        out << " [" << (*edge.providers)[index] << "]";
                     provider_ids_reported += count;
-                    if (count < edge.providers.size())
-                        out << " ... " << edge.providers.size() - count << " provider IDs omitted";
+                    if (count < edge.providers->size())
+                        out << " ... " << edge.providers->size() - count << " provider IDs omitted";
                     out << '\n';
                     continue;
                 }
-                const auto provider = edge.providers.front();
+                const auto provider = edge.providers->front();
                 out << "[" << provider << "] " << path_text(modules[provider].path);
                 if (color[provider] == 1) {
                     out << " (cycle)\n";
