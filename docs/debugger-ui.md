@@ -16,3 +16,13 @@ request, event polling resumes.
 The current remote RSP backend implements target termination. Native Windows,
 Linux, and macOS backends report it as unsupported; the UI does not treat
 unsupported as detach or pretend the target exited.
+
+Remote RSP connection and the first process enumeration run on the serialized
+inspection worker. The panel shows `Connecting...` and disables its controls
+while DNS lookup, TCP setup, protocol negotiation, and the initial listing are
+in progress. A connection failure is reported in the debugger output and leaves
+the panel available for another attempt. If connection succeeds but process
+enumeration is unsupported or fails, the remote session remains active and the
+process selector shows the listing error. Closing the debugger view before a
+pending connection completes disconnects a successful late connection instead
+of leaving an unowned remote session behind.

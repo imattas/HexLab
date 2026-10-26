@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <stop_token>
+#include <string>
 #include <vector>
 
 class wxListCtrl;
@@ -51,12 +52,15 @@ class DebuggerView final : public wxPanel {
     std::shared_ptr<InspectionState> inspection_state_;
     bool termination_pending_ = false;
     bool remote_session_active_ = false;
+    bool remote_connecting_ = false;
+    std::uint64_t remote_connect_request_ = 0;
     wxTimer poll_timer_;
     wxTextCtrl *executable_ = nullptr;
     wxTextCtrl *arguments_ = nullptr;
     wxTextCtrl *process_id_ = nullptr;
     wxChoice *processes_choice_ = nullptr;
     wxButton *detach_remote_process_button_ = nullptr;
+    wxButton *remote_connect_button_ = nullptr;
     wxTextCtrl *remote_host_ = nullptr;
     wxTextCtrl *remote_port_ = nullptr;
     wxTextCtrl *event_ = nullptr;
@@ -137,6 +141,9 @@ class DebuggerView final : public wxPanel {
     void detach_remote_process();
     void update_process_actions();
     void connect_remote();
+    void finish_remote_connect(std::uint64_t request, std::optional<debugger::ProcessInfo> process,
+                               std::vector<debugger::ProcessInfo> processes,
+                               std::string connect_error, std::string process_error);
     void detach();
     void terminate();
     void finish_terminate(debugger::Status);
