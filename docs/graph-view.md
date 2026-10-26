@@ -10,6 +10,15 @@ large graphs while preserving the current zoom and the rest of the viewport.
 
 Press **Enter** to follow a focused edge or selected node. Unmodified Up/Down still move through instructions. Left/Right still pan; Shift+Up/Down still pan vertically; Home fits the graph. Mouse drag, click, wheel zoom, and the Fit/zoom controls are unchanged.
 
+For a focused block, **Enter** follows the selected instruction's exact
+control-flow target. Double-click an instruction row to do the same. Follow
+resolves from the current graph and project references, even while the listing
+is refreshing. A node with no selected instruction navigates to its own
+location; an addressless node stays graph-local. Rejected or unresolved graph
+focus never follows the listing's previous instruction. Stale graph facts,
+ambiguous targets, and non-unique executable ownership cancel instruction
+follow and report the reason in Output.
+
 Edges without a destination location remain focusable and visible. Following them moves graph focus to the neighboring node when that node exists, but does not invent an image address. The ordering is stable for one graph model revision; identifiers may change after reanalysis.
 
 The graph toolbar has a case-insensitive **Find** field that searches node names,
