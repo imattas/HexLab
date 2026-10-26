@@ -706,7 +706,9 @@ struct MainFrame::Impl {
     VirtualTable *elf_programs, *elf_sections, *elf_dynamic, *elf_tables;
     VirtualTable *macho_metadata;
     VirtualTable *macho_objc = nullptr;
+    wxButton *macho_objc_import_types = nullptr;
     std::shared_ptr<const std::vector<MachOObjCViewRow>> macho_objc_rows;
+    std::shared_ptr<const MachOObjCScan> macho_objc_scan;
     std::shared_ptr<const DocumentSnapshot> macho_objc_source;
     PeView *pe_view = nullptr;
     MinidumpView *minidump_view = nullptr;
@@ -1880,11 +1882,13 @@ struct MainFrame::Impl {
         }
         if (macho_objc_source.get() != doc.get()) {
             std::vector<MachOObjCViewRow> rows;
+            macho_objc_scan.reset();
             if (doc->image && doc->metadata_view().macho) {
                 auto scanned = scan_macho_objc_classes(*doc->image, doc->metadata_view());
-                if (scanned)
+                if (scanned) {
+                    macho_objc_scan = std::make_shared<const MachOObjCScan>(scanned.value());
                     rows = macho_objc_view_rows(scanned.value());
-                else
+                } else
                     rows.push_back({"Scan", "", "Objective-C runtime metadata", "unavailable",
                                     "bounded scanner", scanned.error().message, {}});
             } else {
@@ -1894,6 +1898,8 @@ struct MainFrame::Impl {
             macho_objc_rows = std::make_shared<const std::vector<MachOObjCViewRow>>(std::move(rows));
             macho_objc_source = doc;
         }
+        if (macho_objc_import_types)
+            macho_objc_import_types->Enable(doc->project && doc->project->state && macho_objc_scan && !macho_objc_scan->classes.empty());
         display_macho_objc_rows(doc, macho_objc_rows);
     }
     void populate() {
@@ -1904,6 +1910,7 @@ struct MainFrame::Impl {
         if (bookmark_remove) bookmark_remove->Enable(false);
         if (!shown) {
             macho_objc_rows.reset();
+            macho_objc_scan.reset();
             macho_objc_source = nullptr;
             candidate_items.clear();
             visible_candidate_items.clear();
@@ -2910,6 +2917,40 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.macho_objc = new VirtualTable(metadata, "macho-objc",
                                      {"Kind", "Owner", "Name", "Address", "Status", "Provenance", "Details"});
     ui.macho_objc->SetToolTip("Objective-C runtime records from the bounded scan of the displayed Mach-O snapshot. Activate an addressable row to navigate.");
+    ui.macho_objc_import_types = new wxButton(metadata, wxID_ANY, "Import Objective-C types");
+    ui.macho_objc_import_types->SetName("macho-objc-import-types");
+    ui.macho_objc_import_types->Enable(false);
+    ui.macho_objc_import_types->SetToolTip("Persist class instance layouts and parsed method signatures from validated Objective-C runtime records.");
+    ui.macho_objc_import_types->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        const auto doc = impl_->shown;
+        if (!doc || !doc->project || !doc->project->state || !impl_->macho_objc_scan) return;
+        auto plan = macho_objc_type_import_plan(*impl_->macho_objc_scan, doc->project->state->user->types);
+        if (plan.definitions.empty()) {
+            wxString message = "No new Objective-C types are eligible for import.";
+            if (!plan.conflicts.empty()) message += "\nConflicts: " + wxString::FromUTF8(plan.conflicts.front().c_str());
+            if (!plan.skipped.empty()) message += "\nSkipped: " + wxString::FromUTF8(plan.skipped.front().c_str());
+            wxMessageBox(message, "Import Objective-C types", wxOK | wxICON_INFORMATION, this);
+            return;
+        }
+        const auto count = plan.definitions.size();
+        const auto skipped = plan.skipped.size(), conflicts = plan.conflicts.size();
+        auto submitted = impl_->frame.ApplyProjectCommand(ImportPortableTypes{std::move(plan.definitions), {}});
+        if (!submitted) {
+            wxMessageBox(wxString::FromUTF8(submitted.error().message.c_str()),
+                         "Import Objective-C types", wxOK | wxICON_ERROR, this);
+            return;
+        }
+        wxString message = wxString::Format("Imported %zu Objective-C type declarations.", count);
+        if (skipped || conflicts)
+            message += wxString::Format("\nSkipped %zu unsupported records and %zu name conflicts.", skipped, conflicts);
+        wxMessageBox(message, "Import Objective-C types", wxOK | wxICON_INFORMATION, this);
+    });
+    auto *macho_objc_layout = new wxBoxSizer(wxVERTICAL);
+    macho_objc_layout->Add(ui.macho_objc_import_types, 0, wxALL, FromDIP(3));
+    macho_objc_layout->Add(ui.macho_objc, 1, wxEXPAND);
+    auto *macho_objc_panel = new wxPanel(metadata);
+    macho_objc_panel->SetSizer(macho_objc_layout);
+    ui.macho_objc->Reparent(macho_objc_panel);
     ui.annotations = new VirtualTable(metadata, "annotations", {"Address / offset", "Name", "Comment", "State"});
     auto *bookmark_panel = new wxPanel(metadata);
     auto *bookmark_layout = new wxBoxSizer(wxVERTICAL);
@@ -2945,7 +2986,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     metadata->AddPage(ui.elf_dynamic, "ELF dynamic");
     metadata->AddPage(ui.elf_tables, "ELF tables");
     metadata->AddPage(macho_panel, "Mach-O");
-    metadata->AddPage(ui.macho_objc, "Objective-C");
+    metadata->AddPage(macho_objc_panel, "Objective-C");
     metadata->AddPage(ui.annotations, "Annotations");
     metadata->AddPage(bookmark_panel, "Bookmarks");
     ui.references = new ReferenceView(metadata);
