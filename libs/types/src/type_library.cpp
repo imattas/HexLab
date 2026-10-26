@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <set>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace hexlab::types {
 namespace {
@@ -56,5 +57,64 @@ Result<LibraryBundle> decode_library_bundle(std::span<const std::byte> bytes,std
   if(version!=2)return invalid("Unsupported type library version");auto flags=r.num(2);if(flags&~1u)return invalid("Invalid type library flags");auto count=r.num(4),assignments=r.num(4);if(count>max_entries||assignments>262144)return Error{ErrorCode::resource_limit,"Type library count limit exceeded"};if(flags&1){LibrarySourceIdentity id;id.input_size=r.num(8);auto a=r.take(32),b=r.take(32);std::copy(a.begin(),a.end(),id.input_sha256.begin());std::copy(b.begin(),b.end(),id.recipe_sha256.begin());out.source_identity=id;}if(assignments&&!out.source_identity)return invalid("Type assignments require a source identity");std::set<std::string> names;out.entries.reserve(count);for(std::uint64_t i=0;i<count;++i){auto e=read_entry(r);if(!names.insert(e.name).second)return invalid("Duplicate type library definition");out.entries.push_back(std::move(e));}
   std::set<std::string> locations;out.assignments.reserve(assignments);for(std::uint64_t i=0;i<assignments;++i){auto tag=r.num(1);if(tag!=0)return invalid("Invalid type assignment location tag");auto space=r.num(4),off=r.num(8);Address loc{AddressSpaceId{static_cast<std::uint32_t>(space)},off};auto name=r.str(max_name);if(name.empty())return invalid("Invalid symbolic type assignment");auto key="A:"+std::to_string(loc.space.value)+":"+std::to_string(loc.offset);if(!locations.insert(key).second)return invalid("Duplicate type assignment location");out.assignments.push_back({loc,std::move(name)});}check_end(r);return out;
  }catch(const std::bad_alloc&){return Error{ErrorCode::resource_limit,"Cannot decode type library"};}catch(const std::exception&e){return invalid(e.what());}
+}
+Result<std::size_t> validate_library_references(
+    const LibraryBundle &bundle, const std::set<std::string, std::less<>> &available_names,
+    std::size_t max_type_nodes) {
+    try {
+    if (bundle.entries.size() > max_entries)
+        return Error{ErrorCode::resource_limit, "Type library exceeds 4096 definitions"};
+    if (!max_type_nodes)
+        return Error{ErrorCode::resource_limit, "Type reference validation has no node budget"};
+
+    std::set<std::string, std::less<>> bundled_names;
+    for (const auto &entry : bundle.entries) {
+        if (!valid_entry(entry) || !bundled_names.insert(entry.name).second)
+            return invalid("Type library definitions must have valid unique names and types");
+    }
+
+    constexpr std::size_t max_type_edges = 4'000'000;
+    std::size_t edge_count = 0;
+    std::unordered_set<const Type *> visited;
+    std::vector<const Type *> pending;
+    const auto schedule = [&](const Type *type) {
+        if (!type) return;
+        if (edge_count == max_type_edges)
+            throw std::length_error("Type library reference graph exceeds edge budget");
+        ++edge_count;
+        pending.push_back(type);
+    };
+    for (const auto &entry : bundle.entries) schedule(entry.type.get());
+    while (!pending.empty()) {
+        const auto *type = pending.back();
+        pending.pop_back();
+        if (!type || !visited.insert(type).second) continue;
+        if (visited.size() > max_type_nodes)
+            return Error{ErrorCode::resource_limit, "Type library reference graph exceeds node budget"};
+        if (type->kind() == Kind::named_reference &&
+            !bundled_names.contains(type->name()) && !available_names.contains(type->name()))
+            return invalid("Type library refers to missing definition " + type->name());
+        if (type->element()) schedule(type->element().get());
+        if (type->result_type()) schedule(type->result_type().get());
+        for (const auto &member : type->members()) {
+            if (member.type) schedule(member.type.get());
+            if (member.virtual_base && member.virtual_base->vbptr_type)
+                schedule(member.virtual_base->vbptr_type.get());
+        }
+        for (const auto &parameter : type->parameters())
+            if (parameter.type) schedule(parameter.type.get());
+        for (const auto &method : type->methods()) {
+            if (method.signature) schedule(method.signature.get());
+            if (method.this_type) schedule(method.this_type.get());
+        }
+        for (const auto &member : type->static_data_members())
+            if (member.type) schedule(member.type.get());
+    }
+    return visited.size();
+    } catch (const std::length_error &error) {
+        return Error{ErrorCode::resource_limit, error.what()};
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot validate type library references"};
+}
 }
 }

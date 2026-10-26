@@ -8544,7 +8544,9 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
     // tree covers the whole function.
     auto try_return_tree = [&]() -> std::optional<StructuredPseudocode> {
         const auto count = function.blocks.size();
-        if (count < 3 || count > 1024) return {};
+        constexpr std::size_t max_return_tree_blocks = 4096;
+        constexpr std::size_t max_return_tree_depth = 1024;
+        if (count < 3 || count > max_return_tree_blocks) return {};
         using AddressKey = std::pair<std::uint64_t, std::uint64_t>;
         std::map<AddressKey, std::size_t> by_address;
         std::map<std::uint64_t, std::size_t> by_id;
@@ -8593,7 +8595,15 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         *unconditional.true_target != function.blocks[children[i][0]].begin) return {};
                 }
             } else if (children[i].size() == 2) {
-                if (contains_return(block) || !terminal_conditional(block)) return {};
+                const auto *condition = terminal_conditional(block);
+                if (contains_return(block) || !condition || !condition->true_target || !condition->false_target)
+                    return {};
+                const auto true_child = index_of(*condition->true_target);
+                const auto false_child = index_of(*condition->false_target);
+                if (!true_child || !false_child || *true_child == *false_child ||
+                    std::find(children[i].begin(), children[i].end(), *true_child) == children[i].end() ||
+                    std::find(children[i].begin(), children[i].end(), *false_child) == children[i].end())
+                    return {};
             }
         }
         if (predecessor_count[*root] != 0) return {};
@@ -8601,36 +8611,54 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             if (i != *root && predecessor_count[i] != 1) return {};
 
         std::vector<bool> visited(count, false);
-        std::function<bool(std::size_t)> check_tree = [&](std::size_t node) {
-            if (visited[node]) return false;
+        std::vector<std::pair<std::size_t, std::size_t>> pending{{*root, 1}};
+        while (!pending.empty()) {
+            const auto [node, depth] = pending.back();
+            pending.pop_back();
+            if (visited[node] || depth > max_return_tree_depth) return {};
             visited[node] = true;
-            for (const auto next : children[node]) if (!check_tree(next)) return false;
-            return true;
-        };
-        if (!check_tree(*root) || std::any_of(visited.begin(), visited.end(), [](bool value) { return !value; }))
-            return {};
+            for (const auto next : children[node]) pending.emplace_back(next, depth + 1);
+        }
+        if (std::any_of(visited.begin(), visited.end(), [](bool value) { return !value; })) return {};
 
         out << "function " << address_label(function.entry) << "() {\n";
-        std::function<void(std::size_t, unsigned)> emit_tree = [&](std::size_t node, unsigned indent) {
+        struct ReturnTreeFrame { std::size_t node = 0; unsigned indent = 0; std::uint8_t phase = 0; };
+        std::vector<ReturnTreeFrame> emit_stack{{*root, 4, 0}};
+        emit_stack.reserve(std::min(count, max_return_tree_depth));
+        while (!emit_stack.empty()) {
+            auto &frame = emit_stack.back();
+            const auto node = frame.node;
+            const auto indent = frame.indent;
             const auto &block = function.blocks[node];
             if (children[node].size() < 2) {
-                emit_block(block, indent, !children[node].empty());
-                if (!children[node].empty()) emit_tree(children[node][0], indent);
-                return;
+                if (frame.phase++ == 0) {
+                    emit_block(block, indent, !children[node].empty());
+                    if (!children[node].empty()) emit_stack.push_back({children[node][0], indent, 0});
+                } else {
+                    emit_stack.pop_back();
+                }
+                continue;
             }
             const auto *condition = terminal_conditional(block);
-            emit_block(block, indent, true);
-            const auto spaces = std::string(indent, ' ');
+            if (!condition || !condition->true_target || !condition->false_target) return {};
             const auto true_index = index_of(*condition->true_target);
             const auto false_index = index_of(*condition->false_target);
-            if (!true_index || !false_index) return;
-            out << spaces << "if (" << branch_condition_text(*condition) << ") {\n";
-            emit_tree(*true_index, indent + 4);
-            out << spaces << "} else {\n";
-            emit_tree(*false_index, indent + 4);
-            out << spaces << "}\n";
-        };
-        emit_tree(*root, 4);
+            if (!true_index || !false_index) return {};
+            const auto spaces = std::string(indent, ' ');
+            if (frame.phase == 0) {
+                emit_block(block, indent, true);
+                out << spaces << "if (" << branch_condition_text(*condition) << ") {\n";
+                frame.phase = 1;
+                emit_stack.push_back({*true_index, indent + 4, 0});
+            } else if (frame.phase == 1) {
+                out << spaces << "} else {\n";
+                frame.phase = 2;
+                emit_stack.push_back({*false_index, indent + 4, 0});
+            } else {
+                out << spaces << "}\n";
+                emit_stack.pop_back();
+            }
+        }
         out << "}\n";
         return StructuredPseudocode{out.str(), false, {}};
     };

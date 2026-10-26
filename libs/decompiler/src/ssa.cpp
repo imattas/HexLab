@@ -1,6 +1,7 @@
 #include "hexlab/decompiler/decompiler.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -113,19 +114,39 @@ std::optional<DynamicMemoryRange> dynamic_memory_range(const MemoryValue &memory
     if (std::get<2>(found->second.root.first) != memory.base->width) return {};
     auto displacement = memory.displacement;
     if (memory.index) {
-        if (!memory.index_version || memory.index->width != memory.base->width ||
-            !memory.index_extend.empty() ||
+        if (!memory.index_version ||
             (memory.index_shift != "" && memory.index_shift != "lsl")) return {};
         const auto index = constants.find({key(*memory.index), *memory.index_version});
-        if (index == constants.end() || index->second > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        if (index == constants.end()) return {};
+        std::optional<std::int64_t> index_value;
+        if (memory.index_extend.empty()) {
+            if (memory.index->width != memory.base->width ||
+                index->second > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return {};
+            index_value = static_cast<std::int64_t>(index->second);
+        } else if (memory.index_extend == "uxtw") {
+            if (memory.index->width != 32 || index->second > std::numeric_limits<std::uint32_t>::max()) return {};
+            index_value = static_cast<std::int64_t>(index->second);
+        } else if (memory.index_extend == "sxtw") {
+            if (memory.index->width != 32 || index->second > std::numeric_limits<std::uint32_t>::max()) return {};
+            index_value = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(index->second));
+        } else if (memory.index_extend == "sxtx") {
+            if (memory.index->width != 64) return {};
+            index_value = std::bit_cast<std::int64_t>(index->second);
+        } else {
             return {};
+        }
         const auto shift = static_cast<unsigned>(memory.index_shift_amount);
-        if (shift >= 63 || memory.scale == 0) return {};
-        const auto raw = index->second;
-        if (raw > (static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) >> shift) /
-                      static_cast<std::uint64_t>(memory.scale)) return {};
-        auto delta = static_cast<std::int64_t>(raw * static_cast<std::uint64_t>(memory.scale) << shift);
-        if (!memory.index_add) delta = -delta;
+        if (shift >= 63 || memory.scale == 0 ||
+            static_cast<std::uint64_t>(memory.scale) >
+                (static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) >> shift)) return {};
+        const auto factor = static_cast<std::int64_t>(static_cast<std::uint64_t>(memory.scale) << shift);
+        if (*index_value > std::numeric_limits<std::int64_t>::max() / factor ||
+            *index_value < std::numeric_limits<std::int64_t>::min() / factor) return {};
+        auto delta = *index_value * factor;
+        if (!memory.index_add) {
+            if (delta == std::numeric_limits<std::int64_t>::min()) return {};
+            delta = -delta;
+        }
         const auto adjusted = add_signed(displacement, delta);
         if (!adjusted) return {};
         displacement = *adjusted;

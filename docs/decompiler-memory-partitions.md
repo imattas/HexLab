@@ -21,12 +21,15 @@ The partitioner recognizes three bounded forms:
   expression levels before pointer origins are solved, so an address
   expression such as `base + offset_register` can produce an exact range when
   that register has one proven value.
-  The memory access may have no index register, or use a same-width index whose
-  exact nonnegative integer constant is proven through a literal, same-width
-  copy, unanimous phi, or a checked same-width `add`, `sub`, or `mul` tree with
-  no intermediate wrap and at most 32 expression levels. Indexed scale/shift
-  and displacement arithmetic must fit the checked signed offset bounds. The access also needs a bounded byte
-  width. Ranges sharing the same root register version and overlapping offsets
+  The memory access may have no index register, or use an index whose exact
+  constant is proven through a literal, same-width copy, unanimous phi, or a
+  checked same-width `add`, `sub`, or `mul` tree with no intermediate wrap and
+  at most 32 expression levels. Same-width unextended indices use nonnegative
+  values. AArch64 `uxtw`, `sxtw`, and `sxtx` indices use their architectural
+  zero- or sign-extension before checked scale/shift and displacement
+  arithmetic. The final byte range must fit the checked signed offset bounds.
+  The access also needs a bounded byte width. Ranges sharing the same root
+  register version and overlapping offsets
   are grouped together. Call results and call-clobbered register
   definitions are accepted as opaque roots, so accesses through a copied or
   constant-adjusted call output can use this partitioning too. These roots do
@@ -52,10 +55,10 @@ whole-memory SSA. If whole-function partition construction exceeds its budget,
 the function keeps only whole-memory SSA.
 
 This does not partition heap or global accesses whose address cannot be proven,
-aliases reached through unrelated roots, variable or signed-negative indices,
-index extensions other than the proven same-width form, or pointer arithmetic
-whose offset is not a proven nonnegative constant in a supported same-width
-integer expression. Signed-negative offset interpretation and wrapping
-arithmetic remain unsupported. The IR keeps these partitions
-supplementary: passes that ignore `memory_partition` continue to use the coarser
-`memory_version` chain.
+aliases reached through unrelated roots, variable indices, unsupported index
+extensions, or pointer arithmetic whose offset is not a proven nonnegative
+constant in a supported same-width integer expression. Signed index offsets
+are accepted only for the listed AArch64 forms and only when checked arithmetic
+does not overflow; wrapping address arithmetic remains unsupported. The IR
+keeps these partitions supplementary: passes that ignore `memory_partition`
+continue to use the coarser `memory_version` chain.
