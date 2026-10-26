@@ -202,6 +202,9 @@ DebugSession::DebugSession(DebugSession&&) noexcept = default;
 DebugSession& DebugSession::operator=(DebugSession&&) noexcept = default;
 SessionState DebugSession::state() const noexcept { return impl_->state; }
 const std::optional<ProcessInfo>& DebugSession::process() const noexcept { return impl_->process; }
+bool DebugSession::supports_scheduled_signal_disposition() const noexcept {
+    return impl_->backend && impl_->backend->supports_scheduled_signal_disposition();
+}
 const std::optional<std::string>& DebugSession::last_diagnostic() const noexcept { return impl_->last_diagnostic; }
 Result<std::vector<ProcessInfo>> DebugSession::processes() {
     if (!impl_->backend) return invalid_state("process enumeration");

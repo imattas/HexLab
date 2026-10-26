@@ -245,7 +245,7 @@ DecodeResult decode_scalar(std::span<const std::byte> input, Address address, De
         bool extended = opcode == 0x0f;
         if (extended)
             opcode = static_cast<std::uint8_t>(state.take(1));
-        const bool f3_bit_count = extended && (opcode == 0xbc || opcode == 0xbd);
+        const bool f3_bit_count = extended && (opcode == 0xbc || opcode == 0xbd || opcode == 0xb8);
         const bool string_form = !extended && opcode >= 0xa4 && opcode <= 0xaf && !(opcode >= 0xa8 && opcode <= 0xa9);
         const bool simd_form = simd(state, opcode, extended);
         if (!simd_form && ((state.group1 == 0xf2 && !string_form) ||

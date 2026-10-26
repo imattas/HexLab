@@ -131,6 +131,19 @@ signal action, resume returns unsupported and leaves the stop pending. A
 schedule cannot use `stop` for the pending signal's owner: that action cannot
 redeliver the signal, and acknowledging the stop would otherwise discard its
 disposition state. Rejecting it keeps the event available for retry.
+
+The local `hexlab-debug-server` advertises `C`/`S` signal actions only when its
+active backend supports scheduled signal disposition. It accepts legacy
+`Cxx`/`Sxx` and thread-qualified `vCont;Cxx:tid`/`vCont;Sxx:tid` actions. Signal
+zero suppresses the stopped signal; a nonzero signal is accepted only when it
+matches the signal number on the pending exception event, because the shared
+debugger API can redeliver that event's signal but cannot substitute a
+different one. An unqualified signal action is rejected for a multi-thread
+target to prevent broadcasting the event owner's signal. Ordinary `c`/`s`
+actions suppress the owner's pending signal, matching the RSP zero-signal
+behavior. A stopped owner with no matching explicit action keeps its pending
+signal queued when another thread is selected to run. Rejected actions leave
+the stop event available for retry.
 Multiprocess `W`/`X` exits retain their `process` field and only transition the
 session to exited when that field identifies its process. Missing or foreign
 exit identity reports unsupported rather than marking another process exited.

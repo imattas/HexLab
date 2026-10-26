@@ -364,11 +364,16 @@ struct ThreadSelection {
     ThreadSelectionKind kind = ThreadSelectionKind::any;
     ThreadId id = 0;
 };
-struct ResumeAction { bool step = false; ThreadSelection thread; };
+struct ResumeAction {
+    bool step = false;
+    ThreadSelection thread;
+    std::optional<unsigned> signal;
+};
 struct ResumeRequest {
     bool step = false;
     bool continue_thread = false;
     ThreadId selected_thread = 0;
+    std::optional<unsigned> signal;
     // vCont selectors are independent of the legacy Hc selection.
     bool vcont = false;
     ThreadSelection thread;
@@ -404,6 +409,12 @@ std::optional<ThreadSelection> parse_thread_selection(std::string_view id) {
 
 std::optional<ResumeRequest> parse_resume(std::string_view command, ThreadSelection legacy_thread) {
     ResumeRequest request;
+    const auto parse_signal = [](std::string_view value) -> std::optional<unsigned> {
+        if (value.size() != 2) return {};
+        std::uint64_t signal{};
+        if (!parse_u64(value, signal) || signal > 255) return {};
+        return static_cast<unsigned>(signal);
+    };
     if (command == "vCont" || command.starts_with("vCont;")) {
         request.vcont = true;
         if (!command.starts_with("vCont;") || command.size() < 7) return {};
@@ -412,26 +423,50 @@ std::optional<ResumeRequest> parse_resume(std::string_view command, ThreadSelect
             if (request.actions.size() == hexlab::debugger::max_inspection_threads) return {};
             const auto end = remaining.find(';');
             const auto action = remaining.substr(0, end);
-            if (action.empty() || (action[0] != 'c' && action[0] != 's')) return {};
-            ResumeAction parsed{action[0] == 's', {ThreadSelectionKind::all}};
-            if (action.size() > 1) {
-                if (action[1] != ':') return {};
-                auto thread = parse_thread_selection(action.substr(2));
+            if (action.empty()) return {};
+            ResumeAction parsed;
+            std::size_t selector_offset = 1;
+            if (action[0] == 'c' || action[0] == 's') {
+                parsed.step = action[0] == 's';
+            } else if (action[0] == 'C' || action[0] == 'S') {
+                const auto colon = action.find(':');
+                const auto signal_text = action.substr(1, colon == std::string_view::npos
+                    ? std::string_view::npos : colon - 1);
+                parsed.signal = parse_signal(signal_text);
+                if (!parsed.signal) return {};
+                parsed.step = action[0] == 'S';
+                selector_offset = colon == std::string_view::npos ? action.size() : colon;
+            } else return {};
+            if (selector_offset < action.size()) {
+                if (action[selector_offset] != ':') return {};
+                auto thread = parse_thread_selection(action.substr(selector_offset + 1));
                 if (!thread) return {};
                 parsed.thread = *thread;
-            }
+            } else parsed.thread = {ThreadSelectionKind::all};
             request.actions.push_back(parsed);
             if (end == std::string_view::npos) break;
             remaining.remove_prefix(end + 1);
             if (remaining.empty()) return {};
         }
     } else {
-        if (command.empty() || (command[0] != 'c' && command[0] != 's')) return {};
-        request.step = command[0] == 's';
+        if (command.empty()) return {};
+        std::size_t address_offset = 1;
+        if (command[0] == 'c' || command[0] == 's') {
+            request.step = command[0] == 's';
+        } else if (command[0] == 'C' || command[0] == 'S') {
+            if (command.size() < 3) return {};
+            request.signal = parse_signal(command.substr(1, 2));
+            if (!request.signal) return {};
+            request.step = command[0] == 'S';
+            if (command.size() > 3) {
+                if (command[3] != ';' || command.size() == 4) return {};
+                address_offset = 4;
+            } else address_offset = command.size();
+        } else return {};
         request.thread = legacy_thread;
-        if (command.size() > 1) {
+        if (command.size() > address_offset) {
             std::uint64_t address{};
-            if (command.size() > 17 || !parse_u64(command.substr(1), address)) return {};
+            if (command.size() - address_offset > 16 || !parse_u64(command.substr(address_offset), address)) return {};
             request.address = address;
         }
     }
@@ -660,6 +695,7 @@ bool only_event_thread(ServerState& state) {
 // combinations, never silently widen them to process-wide continuation.
 struct ResolvedResume {
     bool process_continue = false;
+    hexlab::debugger::ContinueStatus process_disposition = hexlab::debugger::ContinueStatus::handled;
     std::vector<hexlab::debugger::ThreadResumeAction> schedule;
 };
 std::optional<ResolvedResume> resolve_resume_actions(ServerState& state, const std::vector<ResumeAction>& actions) {
@@ -669,6 +705,8 @@ std::optional<ResolvedResume> resolve_resume_actions(ServerState& state, const s
     std::erase_if(threads, [](const auto& thread) { return thread.state == hexlab::debugger::ThreadState::exited; });
     if (threads.empty() || threads.size() > hexlab::debugger::max_inspection_threads) return {};
     for (const auto& action : actions) {
+        if (action.signal && action.thread.kind == ThreadSelectionKind::all && threads.size() != 1)
+            return {};
         const auto id = action.thread.kind == ThreadSelectionKind::any ? state.event->thread : action.thread.id;
         if (action.thread.kind != ThreadSelectionKind::all &&
             (id == 0 || std::none_of(threads.begin(), threads.end(),
@@ -682,9 +720,11 @@ std::optional<ResolvedResume> resolve_resume_actions(ServerState& state, const s
                 return known.thread == thread.id;
             })) return {};
         auto kind = hexlab::debugger::ThreadResumeKind::stop;
+        const ResumeAction* matched = nullptr;
         for (const auto& action : actions) {
             const auto id = action.thread.kind == ThreadSelectionKind::any ? state.event->thread : action.thread.id;
             if (action.thread.kind != ThreadSelectionKind::all && id != thread.id) continue;
+            matched = &action;
             if (action.step) {
                 ++stepped;
                 kind = hexlab::debugger::ThreadResumeKind::single_step;
@@ -696,9 +736,33 @@ std::optional<ResolvedResume> resolve_resume_actions(ServerState& state, const s
         }
         includes_owner = includes_owner || thread.id == state.event->thread;
         resolved.schedule.push_back({thread.id, kind});
+        auto& resolved_action = resolved.schedule.back();
+        if (thread.id == state.event->thread) {
+            if (matched && matched->signal) {
+                if (*matched->signal == 0) {
+                    if (state.session.supports_scheduled_signal_disposition())
+                        resolved_action.signal_disposition = hexlab::debugger::ContinueStatus::handled;
+                } else if (state.event->kind == EventKind::exception &&
+                           *matched->signal == state.event->code &&
+                           state.session.supports_scheduled_signal_disposition()) {
+                    resolved_action.signal_disposition = hexlab::debugger::ContinueStatus::not_handled;
+                } else return {};
+            } else if (kind != hexlab::debugger::ThreadResumeKind::stop &&
+                       state.session.supports_scheduled_signal_disposition()) {
+                // RSP c/s without an explicit signal suppresses the signal
+                // associated with this stop. Native schedules preserve it by
+                // default, so make the protocol's zero-signal choice explicit.
+                resolved_action.signal_disposition = hexlab::debugger::ContinueStatus::handled;
+            }
+        } else if (matched && matched->signal) {
+            return {};
+        }
     }
     if (continued == threads.size() && stepped == 0) {
         resolved.process_continue = true;
+        for (const auto& action : resolved.schedule)
+            if (action.thread == state.event->thread && action.signal_disposition)
+                resolved.process_disposition = *action.signal_disposition;
         resolved.schedule.clear();
         return resolved;
     }
@@ -764,7 +828,15 @@ std::string handle_command(ServerState& state, std::string_view command, bool& c
         return features;
     }
     if (command == "QStartNoAckMode") { toggle_no_ack = true; return "OK"; }
-    if (command == "vCont?") return single_step_supported(state) ? "vCont;c;s" : "vCont;c";
+    if (command == "vCont?") {
+        std::string actions = "vCont;c";
+        if (single_step_supported(state)) actions += ";s";
+        if (state.session.supports_scheduled_signal_disposition()) {
+            actions += ";C";
+            if (single_step_supported(state)) actions += ";S";
+        }
+        return actions;
+    }
     if (command == "qAttached") return state.attached_existing_process ? "1" : "0";
     if (command == "qC") return "QC" + hex_u64(state.event && state.event->thread ? state.event->thread : state.selected_thread);
     if (command == "qfThreadInfo") {
@@ -990,6 +1062,13 @@ std::optional<std::string> resume_and_wait(ServerState& state, std::string_view 
     if (!state.event) return std::string("E01");
     if (state.target_exited) return stop_reply(state, *state.event);
     if (state.session.state() != hexlab::debugger::SessionState::stopped) return std::string("E01");
+    auto disposition = hexlab::debugger::ContinueStatus::handled;
+    if (request->signal && *request->signal != 0) {
+        if (!state.session.supports_scheduled_signal_disposition() ||
+            state.event->kind != EventKind::exception || *request->signal != state.event->code)
+            return std::string("E01");
+        disposition = hexlab::debugger::ContinueStatus::not_handled;
+    }
     const auto& selection = request->thread;
     ResolvedResume resolved{};
     if (request->vcont) {
@@ -1022,10 +1101,10 @@ std::optional<std::string> resume_and_wait(ServerState& state, std::string_view 
     const auto sequence = state.event->sequence;
     auto resumed = request->vcont && !resolved.process_continue
         ? state.session.resume_threads(sequence, resolved.schedule) :
-        request->step ? state.session.single_step_execution(sequence) :
+        request->step ? state.session.single_step_execution(sequence, disposition) :
         request->continue_thread ? state.session.continue_thread_execution(sequence, request->selected_thread,
-            hexlab::debugger::ContinueStatus::handled) :
-        state.session.continue_execution(sequence, hexlab::debugger::ContinueStatus::handled);
+            disposition) :
+        state.session.continue_execution(sequence, disposition);
     // A one-thread schedule is equivalent to legacy stepping only after a
     // fresh listing proves that no peer could run. This retains the narrow
     // Darwin backend without making unsupported multi-thread plans global.
@@ -1033,13 +1112,13 @@ std::optional<std::string> resume_and_wait(ServerState& state, std::string_view 
         resumed.error().code == hexlab::ErrorCode::unsupported && resolved.schedule.size() == 1 &&
         resolved.schedule.front().thread == state.event->thread &&
         resolved.schedule.front().kind == hexlab::debugger::ThreadResumeKind::single_step && only_event_thread(state))
-        resumed = state.session.single_step_execution(sequence);
+        resumed = state.session.single_step_execution(sequence, disposition);
     // A process-wide continue is exactly equivalent when the selected event
     // thread is the target's only live thread, preserving older backends that
     // do not need a distinct thread-qualified operation in that case.
     if (!resumed && request->continue_thread && resumed.error().code == hexlab::ErrorCode::unsupported &&
         only_event_thread(state))
-        resumed = state.session.continue_execution(sequence, hexlab::debugger::ContinueStatus::handled);
+        resumed = state.session.continue_execution(sequence, disposition);
     if (!resumed) return "E01";
     state.memory_map_snapshot.reset();
     state.event.reset();
@@ -1074,7 +1153,9 @@ int serve(Socket socket, DebugSession& session, DebugEvent initial, bool attache
         }
         bool close_connection = false, toggle_no_ack = false;
         std::string response;
-        if (packet->starts_with("c") || packet->starts_with("s") || *packet == "vCont" || packet->starts_with("vCont;")) {
+        if (packet->starts_with("c") || packet->starts_with("s") ||
+            packet->starts_with("C") || packet->starts_with("S") ||
+            *packet == "vCont" || packet->starts_with("vCont;")) {
             auto stop = resume_and_wait(state, *packet);
             if (!stop) continue;
             response = std::move(*stop);

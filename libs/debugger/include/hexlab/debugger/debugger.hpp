@@ -212,6 +212,9 @@ public:
 
     SessionState state() const noexcept;
     const std::optional<ProcessInfo>& process() const noexcept;
+    // Reports whether the current backend can preserve or suppress a pending
+    // signal as part of a scheduled thread resume.
+    bool supports_scheduled_signal_disposition() const noexcept;
     const std::optional<std::string>& last_diagnostic() const noexcept;
     Result<std::vector<ProcessInfo>> processes();
     Result<ProcessInfo> launch(const Target& target);

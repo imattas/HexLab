@@ -418,8 +418,10 @@ Status Client::send_resume(std::string_view command, std::stop_token stop) {
     };
     const bool legacy_continue_or_step = (command == "c" || command == "s") ||
         ((command.starts_with('c') || command.starts_with('s')) && command.size() <= 17 && hex_digits(command.substr(1)));
-    const bool legacy_signal_resume = command.size() == 3 &&
-        (command.front() == 'C' || command.front() == 'S') && hex_digits(command.substr(1));
+    const bool legacy_signal_prefix = command.size() >= 3 &&
+        (command.front() == 'C' || command.front() == 'S') && hex_digits(command.substr(1, 2));
+    const bool legacy_signal_resume = legacy_signal_prefix && (command.size() == 3 ||
+        (command[3] == ';' && command.size() > 4 && command.size() - 4 <= 16 && hex_digits(command.substr(4))));
     if (command.empty() || command.size() > max_packet_ ||
         !(legacy_continue_or_step || legacy_signal_resume || command.starts_with("vCont;")))
         return Error{ErrorCode::invalid_argument, "invalid RSP resume command"};

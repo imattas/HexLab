@@ -52,3 +52,12 @@ existing format-specific provenance.
 The derived-analysis fingerprint advances again for this non-x86 graph
 generation, so cached reference results without these graphs are recomputed.
 The reference payload format and reference identity remain unchanged.
+
+MIPS64 address propagation recognizes the dedicated N64 ADDI/ADDIU word
+opcodes, including their 32-bit result sign extension, and register ADD/ADDU,
+SUB/SUBU, DADDU, and DSUBU when both source values are proven. Trapping ADD
+and SUB produce a value only when their signed 32-bit operation cannot
+overflow. Resolved branch and memory references can therefore retain these
+definitions as their producer chain; arithmetic that wraps ambiguously across
+the address domain remains unresolved. The function-analysis fingerprint is
+advanced so cached reference results are recomputed with this propagation.
