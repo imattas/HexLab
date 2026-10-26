@@ -82,6 +82,8 @@ std::uint16_t arm_condition_mask(std::uint8_t condition) {
     return result;
 }
 std::uint16_t predicate_guard(const Instruction &instruction) {
+    if (instruction.context.architecture == Architecture::arm64 && instruction.opcode == Opcode::a64_b_cond)
+        return arm_condition_mask(instruction.condition);
     if (!instruction.arm || instruction.arm->predicate != ArmPredicate::condition) return all_nzcv;
     return arm_condition_mask(instruction.condition);
 }
@@ -1031,8 +1033,12 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
     };
     const auto executes_with = predicate_guard(instruction);
     const auto skips_with = skipped_predicate_guard(instruction);
-    const bool writes_nzcv = instruction.arm &&
-                             (instruction.arm->flags_written != 0 || !instruction.arm->flags_known);
+    const bool writes_nzcv = (instruction.arm &&
+                             (instruction.arm->flags_written != 0 || !instruction.arm->flags_known)) ||
+                            (instruction.context.architecture == Architecture::arm64 &&
+                             (instruction.opcode == Opcode::opaque ||
+                              std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                                          [](const auto &reg) { return reg.bank == RegisterBank::arm_flags; })));
     const auto unresolved = [&]() {
         if (!instruction.operands.empty()) {
             const auto resolution = take(relocations.operand(instruction, 0, stop));
@@ -1130,8 +1136,10 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
             value.stop = FunctionStop{address, unresolved(), "Conditional target remains unresolved"};
             value.stop_guard = executes_with;
         }
-        const auto branch_not_taken = instruction.context.architecture == Architecture::arm && instruction.arm &&
-                                              instruction.arm->predicate == ArmPredicate::condition
+        const auto branch_not_taken = ((instruction.context.architecture == Architecture::arm && instruction.arm &&
+                                              instruction.arm->predicate == ArmPredicate::condition) ||
+                                       (instruction.context.architecture == Architecture::arm64 &&
+                                        instruction.opcode == Opcode::a64_b_cond))
                                           ? static_cast<std::uint16_t>(all_nzcv & ~executes_with)
                                           : all_nzcv;
         continuation(BlockEdgeKind::conditional_false, branch_not_taken);
@@ -1383,9 +1391,8 @@ void Recovery::discover() {
                 pending_functions.push_back(*current.call_target);
             for (const auto &edge : current.edges)
                 if (edge.target) {
-                    auto next_flags = static_cast<std::uint16_t>(fresh_flags & edge.flags_guard);
+                    auto next_flags = edge_flags(current, edge, fresh_flags);
                     if (!next_flags) continue;
-                    if (edge.flags_unknown_after) next_flags = all_nzcv;
                     pending.push_back({*edge.target, edge.target_it, next_flags});
                 }
         }
@@ -1504,9 +1511,8 @@ void Recovery::trusted_seeds() {
             }
             for (const auto &edge : current.edges)
                 if (edge.target) {
-                    auto next_flags = static_cast<std::uint16_t>(fresh_flags & edge.flags_guard);
+                    auto next_flags = edge_flags(current, edge, fresh_flags);
                     if (!next_flags) continue;
-                    if (edge.flags_unknown_after) next_flags = all_nzcv;
                     pending.push_back({*edge.target, edge.target_it, next_flags});
                 }
         }
@@ -1602,9 +1608,8 @@ void Recovery::assign_owners() {
             for (const auto &edge : current.edges) {
                 if (!edge.target)
                     continue;
-                auto next_flags = static_cast<std::uint16_t>(fresh_flags & edge.flags_guard);
+                auto next_flags = edge_flags(current, edge, fresh_flags);
                 if (!next_flags) continue;
-                if (edge.flags_unknown_after) next_flags = all_nzcv;
                 const bool call_continuation_entry = call_reachable && edge.kind == BlockEdgeKind::call_continuation &&
                                                      current.call_target == edge.target && !permission(*edge.target) &&
                                                      !suppressed.contains(*edge.target);
@@ -1701,6 +1706,7 @@ std::shared_ptr<const FunctionSnapshot> Recovery::run() {
     validate_decisions();
     seed_roots();
     discover();
+    refine_a64_flow();
     find_conflicts();
     trusted_seeds();
     assign_owners();
@@ -1720,7 +1726,7 @@ namespace hexlab {
 Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     Sha256 hash;
     constexpr std::string_view version =
-        "hexlab-functions-v55/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v1/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v3/guard-multiblock-v1/unicode-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
+        "hexlab-functions-v56/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v1/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v3/guard-multiblock-v1/unicode-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
         "elf-reference-provenance-v1/elf-arithmetic-v2/macho-symbol-roots-v1/macho-relocation-flow-v1/"
         "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1";
     (void)hash.update(std::as_bytes(std::span(version)));

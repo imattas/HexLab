@@ -14,6 +14,7 @@
 #include <wx/stattext.h>
 #include <wx/sizer.h>
 #include <wx/button.h>
+#include <wx/numdlg.h>
 #include <algorithm>
 #include <fstream>
 namespace hexlab::desktop {
@@ -24,7 +25,8 @@ constexpr int actions[] = {wxID_SAVE,  wxID_SAVEAS,  wxID_UNDO,        wxID_REDO
                            chunks_id,  suppress_id,  reset_function_id, reference_id, patch_id, export_id,
                            wxID_FIND,  find_next_id, find_previous_id, reanalyze_id,
                            exchange_export_id, exchange_import_id, patch_manager_id,
-                           backup_project_id, restore_backup_id};
+                           backup_project_id, restore_backup_id, rotate_backups_id, list_backups_id,
+                           prune_backups_id};
 ProjectActionKind kind(int id) {
     switch (id) {
     case reanalyze_id:
@@ -194,6 +196,9 @@ void ProjectActions::add_menus(wxMenu &file, wxMenu &edit) {
     file.Insert(position++, wxID_SAVE, "&Save Project\tCtrl+S");
     file.Insert(position++, wxID_SAVEAS, "Save Project &As...\tCtrl+Shift+S");
     file.Insert(position++, backup_project_id, "Create Project &Backup...");
+    file.Insert(position++, rotate_backups_id, "Create &Rotated Backup...");
+    file.Insert(position++, list_backups_id, "List Rotated Backups");
+    file.Insert(position++, prune_backups_id, "Prune Rotated Backups...");
     file.Insert(position++, restore_backup_id, "Restore Backup as New Project...");
     file.Insert(position, export_id, "Export Patched &Binary...");
     file.InsertSeparator(position++);
@@ -232,6 +237,16 @@ void ProjectActions::update(wxUpdateUIEvent &event) {
                 if (document.id == *id)
                     saved = document.path.has_value();
         event.Enable(id && saved && bool(controller_.documents().actor(*id)));
+        return;
+    }
+    if (event.GetId() == rotate_backups_id || event.GetId() == list_backups_id ||
+        event.GetId() == prune_backups_id) {
+        bool saved = false;
+        if (id)
+            for (const auto &document : controller_.documents().documents())
+                if (document.id == *id)
+                    saved = document.path.has_value();
+        event.Enable(id && saved && project && bool(controller_.documents().actor(*id)));
         return;
     }
     if (event.GetId() == patch_manager_id) {
@@ -331,6 +346,43 @@ void ProjectActions::command(wxCommandEvent &event) {
             controller_.documents().report_error(*id, submitted.error());
         else if (controller_.message)
             controller_.message(*id, "Creating a consistent project backup...");
+        return;
+    }
+    if (event.GetId() == rotate_backups_id) {
+        wxNumberEntryDialog dialog(&frame_, "Create a timestamped backup and keep this many generations.",
+                                  "Generations to retain:", "Create Rotated Project Backup", 5, 1, 32);
+        if (dialog.ShowModal() != wxID_OK)
+            return;
+        auto started = controller_.rotate_backups(*id, static_cast<std::size_t>(dialog.GetValue()));
+        if (!started)
+            controller_.documents().report_error(*id, started.error());
+        else if (controller_.message)
+            controller_.message(*id, "Creating and rotating project backups...");
+        return;
+    }
+    if (event.GetId() == list_backups_id) {
+        auto started = controller_.list_backups(*id);
+        if (!started)
+            controller_.documents().report_error(*id, started.error());
+        else if (controller_.message)
+            controller_.message(*id, "Listing rotated project backups...");
+        return;
+    }
+    if (event.GetId() == prune_backups_id) {
+        wxNumberEntryDialog dialog(&frame_, "Keep this many newest validated generations.",
+                                  "Generations to retain:", "Prune Rotated Project Backups", 5, 1, 32);
+        if (dialog.ShowModal() != wxID_OK)
+            return;
+        const auto retain = static_cast<std::size_t>(dialog.GetValue());
+        if (wxMessageBox(wxString::Format("Delete older validated backups and keep at most %zu generations?",
+                                          retain),
+                         "Confirm Backup Pruning", wxYES_NO | wxICON_WARNING, &frame_) != wxYES)
+            return;
+        auto started = controller_.prune_backups(*id, retain);
+        if (!started)
+            controller_.documents().report_error(*id, started.error());
+        else if (controller_.message)
+            controller_.message(*id, "Pruning rotated project backups...");
         return;
     }
     if (event.GetId() == patch_manager_id) {

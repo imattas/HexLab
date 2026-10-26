@@ -363,6 +363,9 @@ struct PeCxxFuncInfo4 {
     bool is_catch_funclet = false;
     bool has_ehs_flag = false;
     bool is_noexcept = false;
+    std::optional<PeRecordSource> catch_funclet_flag_source;
+    std::optional<PeRecordSource> ehs_flag_source;
+    std::optional<PeRecordSource> noexcept_flag_source;
     std::uint8_t unknown_header_flags = 0;
     std::optional<std::uint32_t> bbt_flags;
     std::optional<std::uint32_t> unwind_map_rva, try_block_map_rva;

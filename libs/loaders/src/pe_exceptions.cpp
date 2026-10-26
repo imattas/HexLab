@@ -575,6 +575,10 @@ Result<std::size_t> read_exception_directory(const Image &image, const Directory
                         fh4.is_catch_funclet = (fh4.header & 0x01u) != 0;
                         fh4.has_ehs_flag = (fh4.header & 0x20u) != 0;
                         fh4.is_noexcept = (fh4.header & 0x40u) != 0;
+                        const auto header_flag_source = flags_source(cursor - 1, 1, 0);
+                        fh4.catch_funclet_flag_source = header_flag_source;
+                        fh4.ehs_flag_source = header_flag_source;
+                        fh4.noexcept_flag_source = header_flag_source;
                         fh4.unknown_header_flags = static_cast<std::uint8_t>(fh4.header & 0x80u);
                         constexpr std::uint8_t separated_flag = 0x02;
                         constexpr std::uint8_t bbt_flag = 0x04;

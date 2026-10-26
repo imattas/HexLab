@@ -21,3 +21,18 @@ run at a time.
 An unsaved, untitled document must be saved before it can be backed up. The
 restore command does not rotate or retain older backup generations, and it
 does not restore in place.
+
+## Rotating backups in the desktop
+
+The File menu also provides **Create Rotated Backup...**, **List Rotated Backups**,
+and **Prune Rotated Backups...** for any saved project. These commands use a
+sibling base name ending in `-backups` (for example,
+`sample-backups.hxproj`); timestamped generations are stored beside the project
+and the base file itself is not overwritten. Rotation and pruning ask for a
+retention count from 1 through 32, and pruning confirms before it removes older
+validated generations.
+
+Backup scanning, validation, copying, and pruning run on a worker thread. The
+result is reported in the project message log; listing shows each validated
+filename and marks an incomplete bounded scan. The existing restore command
+can open any listed generation as a new project.
