@@ -8,7 +8,7 @@ remain attached to the source image. A copy-on-write overlay holds changes, so
 neither the input file nor the original loaded image is modified.
 
 For ordinary dynamic REL/RELA records, the supported profile is little-endian
-ELF32 i386 `ET_DYN` REL records and little-endian ELF64 x86-64 or AArch64
+ELF32 i386 and ARM `ET_DYN` dynamic records and little-endian ELF64 x86-64 or AArch64
 `ET_DYN` records, with these types:
 
 | Architecture | Relocation | Type | Formula |
@@ -18,6 +18,11 @@ ELF32 i386 `ET_DYN` REL records and little-endian ELF64 x86-64 or AArch64
 | i386 | `R_386_PC32` | 2 | `S + A - P` (low 32 bits) |
 | i386 | `R_386_GLOB_DAT` | 6 | `S` |
 | i386 | `R_386_JMP_SLOT` | 7 | `S` |
+| ARM | `R_ARM_ABS32` | 2 | `(S + A) | T` (low 32 bits) |
+| ARM | `R_ARM_REL32` | 3 | `((S + A) | T) - P` (low 32 bits) |
+| ARM | `R_ARM_GLOB_DAT` | 21 | `(S + A) | T` (low 32 bits) |
+| ARM | `R_ARM_JUMP_SLOT` | 22 | `S` for REL; `S + A` for RELA |
+| ARM | `R_ARM_RELATIVE` | 23 | `B + A` |
 | x86-64 | `R_X86_64_64` | 1 | `S + A` (64-bit field) |
 | x86-64 | `R_X86_64_PC32` | 2 | `S + A - P` (signed 32-bit field) |
 | x86-64 | `R_X86_64_32` | 10 | `S + A` (unsigned 32-bit field) |
@@ -32,6 +37,17 @@ ELF32 i386 `ET_DYN` REL records and little-endian ELF64 x86-64 or AArch64
 | PPC64 | `R_PPC64_ADDR64` | 38 | `S + A` (low 64 bits) |
 | PPC64 | `R_PPC64_GLOB_DAT` | 20 | `S + A` (low 64 bits) |
 | PPC64 | `R_PPC64_RELATIVE` | 22 | `B + A` |
+
+The ARM profile is little-endian ELF32 `ET_DYN` and supports dynamic REL and
+RELA records for `R_ARM_ABS32`, `R_ARM_REL32`, `R_ARM_GLOB_DAT`,
+`R_ARM_JUMP_SLOT`, and `R_ARM_RELATIVE`. REL addends are sampled from the
+original four-byte target, except REL `JUMP_SLOT`, whose ABI addend is zero.
+For symbol relocations, `T` is the Thumb bit from the resolved symbol address;
+it is preserved after `S + A`. REL32 uses runtime place `P`. All ARM targets
+must be complete four-byte fields in writable initialized load memory and
+four-byte aligned. ELF32 addresses and rebased extents must fit in 32 bits.
+Big-endian ARM, TLS, IFUNC, COPY, instruction relocations, and other ARM types
+remain unapplied.
 
 The AArch64 profile also supports the dynamic `R_AARCH64_ABS64` relocation. It
 applies `S + A` and writes the low 64 bits without an overflow check, as

@@ -1671,6 +1671,235 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
+std::optional<SwitchSite> mips64_register_absolute_switch(
+    const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
+    const std::vector<std::shared_ptr<const InstructionFact>> &facts,
+    std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
+    std::stop_token stop) {
+    // MIPS64 N64 absolute table form, bounded to one straight-line block:
+    //   LUI/ORI tableBase; DSLL index, selector, 3; DADDU address, tableBase, index;
+    //   LD target, 0(address); JR target.
+    // The same register facts also accept DADDIU adjustments around the base.
+    if (dispatch_index < 4 || dispatch_index >= facts.size() || stop.stop_requested() ||
+        !facts[dispatch_index])
+        return {};
+    const auto &dispatch = facts[dispatch_index]->instruction;
+    if (dispatch.context.architecture != Architecture::mips64 ||
+        dispatch.context.mode != ExecutionMode::mips64 || dispatch.opcode != Opcode::mips_jr ||
+        dispatch.flow != FlowKind::jump || dispatch.operands.size() != 1)
+        return {};
+    const auto *target_register = register_operand(dispatch, 0);
+    if (!target_register || target_register->bank != RegisterBank::mips_gpr || target_register->width != 64 ||
+        target_register->index == 0 || !facts[dispatch_index - 1])
+        return {};
+    const auto &terminal_load = facts[dispatch_index - 1]->instruction;
+    const auto load_end = analysis_detail::continuation_address(terminal_load);
+    const auto *loaded_register = terminal_load.operands.empty() ? nullptr : register_operand(terminal_load, 0);
+    if (!load_end || load_end.value() != dispatch.address || terminal_load.context != dispatch.context ||
+        terminal_load.opcode != Opcode::mips64_ld || terminal_load.flow != FlowKind::fallthrough ||
+        !loaded_register || !same_register(loaded_register, target_register))
+        return {};
+
+    struct Value {
+        std::optional<Address> constant;
+        std::optional<Address> table_base;
+        std::optional<RegisterOperand> selector;
+        std::uint64_t scale = 1;
+        Address scale_instruction{};
+        bool has_scale_instruction = false;
+    };
+    std::map<std::uint32_t, Value> registers;
+    const auto remember = [&](std::uint32_t index, Value value) { registers[index] = std::move(value); };
+    for (std::size_t index = 0; index < dispatch_index; ++index) {
+        if (stop.stop_requested() || !facts[index])
+            return {};
+        const auto &instruction = facts[index]->instruction;
+        if (instruction.context != dispatch.context || instruction.flow != FlowKind::fallthrough ||
+            instruction.delay_slots)
+            return {};
+
+        const auto *destination = instruction.operands.empty() ? nullptr : register_operand(instruction, 0);
+        const auto erase_written = [&] {
+            for (const auto &written : instruction.register_writes)
+                if (written.bank == RegisterBank::mips_gpr && written.index != 0)
+                    registers.erase(written.index);
+        };
+        if (instruction.opcode == Opcode::mips_lui && instruction.operands.size() == 2 && destination &&
+            destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0) {
+            const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[1]);
+            if (!immediate || immediate->effective_width != 16 || immediate->value > 0xffff) {
+                erase_written();
+                continue;
+            }
+            const auto word = static_cast<std::uint32_t>(immediate->value << 16);
+            const auto signed_word = std::bit_cast<std::int32_t>(word);
+            const auto value = static_cast<std::uint64_t>(static_cast<std::int64_t>(signed_word));
+            erase_written();
+            remember(destination->index, Value{Address{dispatch.address.space, value}});
+            continue;
+        }
+        if (instruction.opcode == Opcode::mips_ori && instruction.operands.size() == 3 && destination) {
+            const auto *source = register_operand(instruction, 1);
+            const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+            std::optional<Value> value;
+            if (destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0 &&
+                source && source->bank == RegisterBank::mips_gpr && source->width == 64 && immediate &&
+                immediate->encoded_width == 16 && immediate->effective_width == 64 && !immediate->is_signed &&
+                immediate->value <= 0xffff) {
+                std::optional<Value> base;
+                if (source->index == 0) base = Value{Address{dispatch.address.space, 0}};
+                else if (const auto found = registers.find(source->index); found != registers.end())
+                    base = found->second;
+                if (base && base->constant && base->constant->space == dispatch.address.space)
+                    value = Value{Address{dispatch.address.space, base->constant->offset | immediate->value}};
+            }
+            erase_written();
+            if (value) remember(destination->index, std::move(*value));
+            continue;
+        }
+        if (instruction.opcode == Opcode::mips64_daddiu && instruction.operands.size() == 3 && destination) {
+            const auto *source = register_operand(instruction, 1);
+            const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+            std::optional<Value> value;
+            if (destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0 &&
+                source && source->bank == RegisterBank::mips_gpr && source->width == 64 && immediate &&
+                immediate->effective_width == 64 && immediate->is_signed) {
+                std::optional<Value> base;
+                if (source->index == 0) base = Value{Address{dispatch.address.space, 0}};
+                else if (const auto found = registers.find(source->index); found != registers.end())
+                    base = found->second;
+                if (base && base->constant && base->constant->space == dispatch.address.space) {
+                    const auto signed_immediate = std::bit_cast<std::int64_t>(immediate->value);
+                    if (const auto adjusted = add_signed_offset(*base->constant, signed_immediate, image))
+                        value = Value{*adjusted};
+                } else if (base && base->table_base && base->selector && base->table_base->space == dispatch.address.space) {
+                    const auto signed_immediate = std::bit_cast<std::int64_t>(immediate->value);
+                    if (const auto adjusted = add_signed_offset(*base->table_base, signed_immediate, image)) {
+                        auto combined = *base;
+                        combined.table_base = *adjusted;
+                        value = std::move(combined);
+                    }
+                }
+            }
+            erase_written();
+            if (value) remember(destination->index, std::move(*value));
+            continue;
+        }
+        if (instruction.opcode == Opcode::mips64_dsll && instruction.operands.size() == 3 && destination) {
+            const auto *source = register_operand(instruction, 1);
+            const auto *amount = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+            std::optional<Value> value;
+            if (destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0 &&
+                source && source->bank == RegisterBank::mips_gpr && source->width == 64 && source->index != 0 &&
+                amount && amount->effective_width == 64 && amount->value < 64) {
+                const auto factor = UINT64_C(1) << amount->value;
+                value = Value{{}, {}, *source, factor, instruction.address, true};
+            }
+            erase_written();
+            if (value) remember(destination->index, std::move(*value));
+            continue;
+        }
+        if (instruction.opcode == Opcode::mips64_daddu && instruction.operands.size() == 3 && destination) {
+            const auto *left = register_operand(instruction, 1);
+            const auto *right = register_operand(instruction, 2);
+            std::optional<Value> value;
+            if (destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0 &&
+                left && right && left->bank == RegisterBank::mips_gpr && right->bank == RegisterBank::mips_gpr &&
+                left->width == 64 && right->width == 64) {
+                const auto value_of = [&](const RegisterOperand &reg) -> std::optional<Value> {
+                    if (reg.index == 0) return Value{Address{dispatch.address.space, 0}};
+                    const auto found = registers.find(reg.index);
+                    return found == registers.end() ? std::nullopt : std::optional<Value>{found->second};
+                };
+                const auto lhs = value_of(*left), rhs = value_of(*right);
+                if (lhs && rhs && lhs->constant && rhs->constant && lhs->constant->space == dispatch.address.space &&
+                    rhs->constant->space == dispatch.address.space) {
+                    if (const auto sum = add_offset(*lhs->constant, rhs->constant->offset, image)) value = Value{*sum};
+                } else {
+                    const Value *scaled = lhs && lhs->selector && !lhs->constant ? &*lhs :
+                                          rhs && rhs->selector && !rhs->constant ? &*rhs : nullptr;
+                    const Value *base = lhs && lhs->constant ? &*lhs : rhs && rhs->constant ? &*rhs : nullptr;
+                    if (scaled && base && base->constant && base->constant->space == dispatch.address.space &&
+                        scaled->selector->index != 0 && scaled->scale &&
+                        !same_register(&*scaled->selector, &*left) && !same_register(&*scaled->selector, &*right)) {
+                        auto combined = *scaled;
+                        combined.table_base = *base->constant;
+                        combined.constant.reset();
+                        value = std::move(combined);
+                    } else if (lhs && lhs->table_base && lhs->selector && rhs && rhs->constant) {
+                        if (const auto adjusted = add_offset(*lhs->table_base, rhs->constant->offset, image)) {
+                            auto combined = *lhs;
+                            combined.table_base = *adjusted;
+                            value = std::move(combined);
+                        }
+                    } else if (rhs && rhs->table_base && rhs->selector && lhs && lhs->constant) {
+                        if (const auto adjusted = add_offset(*rhs->table_base, lhs->constant->offset, image)) {
+                            auto combined = *rhs;
+                            combined.table_base = *adjusted;
+                            value = std::move(combined);
+                        }
+                    }
+                }
+            }
+            erase_written();
+            if (value) remember(destination->index, std::move(*value));
+            continue;
+        }
+        if (instruction.opcode == Opcode::mips64_ld && instruction.operands.size() == 2 && destination) {
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+            std::optional<Value> value;
+            if (destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0 &&
+                memory && memory->data_width == 64 && memory->address_width == 64 && memory->base &&
+                memory->base->bank == RegisterBank::mips_gpr && memory->base->width == 64 &&
+                memory->base->index != 0) {
+                const auto address = registers.find(memory->base->index);
+                if (address != registers.end() && address->second.table_base && address->second.selector) {
+                    if (const auto table = add_signed_offset(*address->second.table_base, memory->displacement, image)) {
+                        auto loaded = address->second;
+                        loaded.table_base = *table;
+                        value = std::move(loaded);
+                    }
+                }
+            }
+            erase_written();
+            if (value) remember(destination->index, std::move(*value));
+            continue;
+        }
+        erase_written();
+    }
+
+    const auto found = registers.find(target_register->index);
+    if (found == registers.end() || !found->second.table_base || !found->second.selector ||
+        found->second.scale != 8 || !found->second.has_scale_instruction ||
+        !file_backed_range(image, *found->second.table_base, 8, false))
+        return {};
+    SwitchSite site;
+    site.dispatch = dispatch.address;
+    site.table = *found->second.table_base;
+    site.selector = *found->second.selector;
+    site.scale = 8;
+    if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
+                                               found->second.scale_instruction, dispatch.address,
+                                               dispatch.context, guards, stop)) {
+        site.case_count = bound->case_count;
+        site.default_target = bound->default_target;
+    }
+    const auto scan_limit = site.case_count ? *site.case_count : max_entries;
+    for (std::size_t index = 0; index < scan_limit; ++index) {
+        if (stop.stop_requested()) return {};
+        const auto target = table_target(image, site.table, index, 8, false, relocations, stop);
+        if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
+            site.complete = false;
+            break;
+        }
+        site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
+                              target->relocation_rows, target->dyld_classic_rows, target->dyld_chained_rows});
+    }
+    if (!site.case_count && site.cases.size() == max_entries) site.complete = false;
+    return site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1)
+        ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
+}
+
 std::optional<SwitchSite> riscv_indexed_relative_switch(
     const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
@@ -1914,6 +2143,20 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
             if (!fact)
                 continue;
             const auto &instruction = fact->instruction;
+            if (instruction.context.architecture == Architecture::mips64 &&
+                instruction.context.mode == ExecutionMode::mips64 && instruction.opcode == Opcode::mips_jr &&
+                instruction.flow == FlowKind::jump) {
+                auto mips_switch = mips64_register_absolute_switch(image, function, snapshot,
+                                                                     found->second->instructions, fact_index,
+                                                                     guards, relocations, stop);
+                if (stop.stop_requested())
+                    return Error{ErrorCode::canceled, "Switch analysis canceled"};
+                if (mips_switch) {
+                    result.complete = result.complete && mips_switch->complete;
+                    result.sites.push_back(std::move(*mips_switch));
+                }
+                continue;
+            }
             if (instruction.context.architecture == Architecture::riscv64 &&
                 instruction.context.mode == ExecutionMode::rv64 && instruction.opcode == Opcode::rv_jalr &&
                 instruction.flow == FlowKind::jump) {

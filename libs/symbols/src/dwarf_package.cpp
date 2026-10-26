@@ -809,7 +809,12 @@ DwarfCrossContributionDieResolver make_dwarf_package_cross_contribution_die_reso
             if (result.type) return malformed("DWP target offset resolves to conflicting DIE kinds");
             result.kind = DwarfReferencedDieKind::subprogram; result.name = symbol.name; result.type = symbol.type;
         }
-        if (!result.type) return hexlab::Error{hexlab::ErrorCode::unsupported, "DWP reference target offset does not identify a supported type or subprogram DIE"};
+        for (const auto &variable : imported.value().variables) {
+            if (variable.is_parameter || variable.origin.record_offset != absolute_offset) continue;
+            if (result.type) return malformed("DWP target offset resolves to conflicting DIE kinds");
+            result.kind = DwarfReferencedDieKind::variable; result.name = variable.name; result.type = variable.type;
+        }
+        if (!result.type) return hexlab::Error{hexlab::ErrorCode::unsupported, "DWP reference target offset does not identify a supported type, subprogram, or variable DIE"};
         return result;
     };
 }

@@ -111,7 +111,7 @@ struct DwarfPackageContribution {
 // and imports referenced type units on demand. The shared index and all section
 // and string spans must remain alive until the returned resolver is discarded.
 using DwarfTypeSignatureResolver = std::function<hexlab::Result<types::TypePtr>(std::uint64_t)>;
-enum class DwarfReferencedDieKind : std::uint8_t { type, subprogram };
+enum class DwarfReferencedDieKind : std::uint8_t { type, subprogram, variable };
 // Identity-preserving summary of one DIE outside the currently imported
 // .debug_info contribution. A caller-owned resolver must select the row from
 // the already-chosen package index and set identity_verified only after

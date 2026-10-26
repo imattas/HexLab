@@ -174,6 +174,17 @@ persistence, and broader 16/32-bit fixtures remain follow-up work. Direct
 `LDRSW` recognition remains unavailable until the processor decoder exposes
 that instruction with typed semantics.
 
+MIPS64 N64 switch recovery recognizes a same-basic-block register sequence
+that constructs an absolute table base with `LUI`/`ORI` (or bounded
+`DADDIU` adjustments), scales the selector by eight with `DSLL`, combines the
+index and base with `DADDU`, loads an eight-byte target with `LD`, and dispatches
+through `JR`. Each table word must resolve to an executable, decodable target;
+relocation metadata is preserved where available. The scan is capped at 4096
+entries. No MIPS branch-delay-slot guard proof is implemented, so case counts
+and defaults remain unknown and such scans are partial. Other widths, signed
+offset tables, cross-block register propagation, and delay-slot control-flow
+proofs remain unsupported.
+
 For project users, `hexlab_cli project switches <project> --at va:<entry>`
 prints deterministic JSON containing the dispatch/table addresses, selector,
 scale, entry encoding, case indices and targets, optional `case_count` and `default_target`

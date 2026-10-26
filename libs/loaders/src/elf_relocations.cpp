@@ -176,6 +176,17 @@ Field field(const ElfHeader &header, std::uint32_t type) {
         default: break;
         }
     }
+    if (header.machine == 40 && !header.is_64) {
+        switch (type) {
+        case 2: return {K::absolute, 4}; // R_ARM_ABS32
+        case 3: return {K::pc_relative, 4}; // R_ARM_REL32
+        case 20: return {K::copy, {}}; // R_ARM_COPY
+        case 21: return {K::global_data, 4}; // R_ARM_GLOB_DAT
+        case 22: return {K::jump_slot, 4}; // R_ARM_JUMP_SLOT
+        case 23: return {K::base_relative, 4}; // R_ARM_RELATIVE
+        default: break;
+        }
+    }
     if (header.machine == 21 && header.is_64) {
         switch (type) {
         case 20: return {K::global_data, 8}; // R_PPC64_GLOB_DAT
@@ -226,11 +237,14 @@ bool uses_addend(ElfRelocationKind kind) {
     return kind == K::absolute || kind == K::pc_relative || kind == K::plt_relative || kind == K::plt_absolute ||
            kind == K::base_relative || kind == K::got || kind == K::symbol_size || kind == K::ifunc;
 }
-void map_place(ElfRelocation &row, const ElfSection *target, const Image &image, const Reader &reader, bool implicit) {
+void map_place(ElfRelocation &row, const ElfSection *target, const Image &image, const Reader &reader, bool implicit,
+               bool implicit_global_addend = false) {
     if (row.kind == ElfRelocationKind::none)
         return;
     const auto extent = row.field_size.value_or(1);
-    const auto sample_addend = implicit && uses_addend(row.kind) && row.field_size && extent && extent <= 8;
+    const auto sample_addend = implicit && (uses_addend(row.kind) ||
+        (implicit_global_addend && row.kind == ElfRelocationKind::global_data)) &&
+        row.field_size && extent && extent <= 8;
     if (target) {
         require(row.offset <= target->size && extent <= target->size - row.offset,
                 "ELF relocation field exceeds target section");
@@ -384,7 +398,8 @@ std::uint64_t read_relocation_table(const Reader &reader, const Image &image, El
         const bool packed_rel = metadata.header.machine == 183 && (row.type == 282 || row.type == 283) && !input.rela;
         if (packed_rel)
             metadata.relocations_complete = false;
-        map_place(row, target, image, reader, !input.rela && !retained && !packed_rel);
+        map_place(row, target, image, reader, !input.rela && !retained && !packed_rel,
+                  metadata.header.machine == 40);
         const RelocationRegistry::RowKey key{record_file, minimum, source_key(unused ? std::nullopt : row.symbol_table),
                                              metadata.header.object_type == 1 ? input.target : std::nullopt};
         if (const auto found = registry.rows.find(key); found != registry.rows.end()) {

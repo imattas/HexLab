@@ -23,6 +23,12 @@ dependent units. Declarations
 whose signature cannot be represented remain unsupported. Cycles and references
 to non-subprogram DIEs are malformed.
 
+Global variable DIEs with missing names or types can inherit those fields from
+an exact `DW_FORM_ref_addr` `DW_AT_specification` or `DW_AT_abstract_origin`
+target in a selected DWP compile-unit contribution. The package index row,
+contribution bounds, and DIE offset are verified before the summary is used.
+Parameter inheritance and automatic DWO/DWP discovery remain unsupported.
+
 The symbols API `evaluate_imported_variable_location(variable, pc, context)` selects a matching half-open location range and evaluates its already-decoded operations. For an un-ranged variable it evaluates the direct expression, then falls back to a direct absolute address when present. For a ranged variable, an explicit matching range is selected first, then its default entry if present; otherwise it never falls back to its address or another range when the requested PC is uncovered. The result is a register location, memory address, or scalar value as classified by the expression. Register values, frame/CFA values, and memory reads come only from the caller callbacks; this API performs no process access. Missing locations, unmatched PCs, and unavailable runtime inputs return explicit errors.
 
 The scalar evaluator supports literals/constants, direct and base-register locations, frame-base/CFA-relative addresses, bounded dereferences, `DW_OP_nop`, stack manipulation (`dup`, `drop`, `over`, `pick`, `swap`, `rot`), and fixed-width integer arithmetic, bitwise operations, and shifts. Signed division/remainder use the target address width; arithmetic wraps to that width, while division by zero, out-of-width shifts, stack underflow, and arithmetic on an unmaterialized register location return explicit errors. Branching expressions, pieces in the scalar entry point, implicit values, TLS, and entry-value operations remain unsupported. Composite pieces use `evaluate_location_expression_sequence`, which shares the 65,536 executed-operation and 4,096 memory-read budgets across every piece in a composite expression. This prevents many individually small pieces from multiplying the evaluator's work limits. This is a bounded subset of the DWARF expression language; the caller owns process state, target endianness in the memory callback, and fault handling.
