@@ -469,9 +469,27 @@ Result<PeFh3ExceptionPlan> plan_pe_fh3_exception(const PeMetadata &metadata, std
         instruction_pointer - module_base > std::numeric_limits<std::uint32_t>::max())
         return failure(ErrorCode::out_of_bounds, "instruction pointer is outside the PE RVA range");
     const auto rva = static_cast<std::uint32_t>(instruction_pointer - module_base);
+    constexpr std::size_t max_fh3_states = 4096;
+    constexpr std::size_t max_fh3_ip_rows = 65536;
+    constexpr std::size_t max_fh3_try_blocks = 4096;
+    constexpr std::size_t max_fh3_handlers = 65536;
+    if (metadata.exception_functions.size() > 65536)
+        return failure(ErrorCode::resource_limit, "PE runtime-function count exceeds the FH3 planner budget");
     const PeRuntimeFunction *runtime = nullptr;
+    bool multiple_owners = false;
     for (const auto &row : metadata.exception_functions) {
-        if (row.begin_rva <= rva && rva < row.end_rva) { runtime = &row; break; }
+        if (row.begin_rva <= rva && rva < row.end_rva) {
+            if (runtime) multiple_owners = true;
+            else runtime = &row;
+        }
+    }
+    if (multiple_owners) {
+        PeFh3ExceptionPlan ambiguous;
+        ambiguous.function_begin_rva = runtime->begin_rva;
+        ambiguous.establisher_frame = establisher_frame;
+        ambiguous.dispatch = PeFh3DispatchDisposition::ambiguous;
+        ambiguous.dispatch_diagnostic = "multiple caller-supplied runtime functions own the live IP";
+        return ambiguous;
     }
     if (!runtime || !runtime->unwind_info || !runtime->unwind_info->handler_payload ||
         !runtime->unwind_info->handler_payload->cxx_func_info)
@@ -480,13 +498,61 @@ Result<PeFh3ExceptionPlan> plan_pe_fh3_exception(const PeMetadata &metadata, std
     const auto &fh3 = *runtime->unwind_info->handler_payload->cxx_func_info;
     if (fh3.magic != 0x19930522u)
         return failure(ErrorCode::unsupported, "FH3 FuncInfo version is unsupported");
-    if (fh3.max_state < 0 || static_cast<std::size_t>(fh3.max_state) != fh3.unwind_map.size() ||
-        fh3.ip_to_state.size() > 1'000'000 || fh3.try_blocks.size() > 1'000'000)
+    if (fh3.unwind_map.size() > max_fh3_states || fh3.ip_to_state.size() > max_fh3_ip_rows ||
+        fh3.try_blocks.size() > max_fh3_try_blocks)
+        return failure(ErrorCode::resource_limit, "FH3 table exceeds the planner budget");
+    if (fh3.max_state < 0 || static_cast<std::size_t>(fh3.max_state) != fh3.unwind_map.size())
         return failure(ErrorCode::malformed, "FH3 state or table extents are inconsistent");
+
+    std::size_t total_handlers = 0;
+    bool conflicting_duplicate_ip_state = false;
+    for (std::size_t i = 0; i < fh3.ip_to_state.size(); ++i) {
+        const auto &entry = fh3.ip_to_state[i];
+        if (entry.ip_rva < runtime->begin_rva || entry.ip_rva >= runtime->end_rva ||
+            entry.state < -1 || entry.state >= fh3.max_state)
+            return failure(ErrorCode::malformed, "FH3 IP-state row is outside its function or has an invalid state");
+        if (i && fh3.ip_to_state[i - 1].ip_rva > entry.ip_rva)
+            return failure(ErrorCode::malformed, "FH3 IP-state rows are unsorted");
+        if (i && fh3.ip_to_state[i - 1].ip_rva == entry.ip_rva &&
+            fh3.ip_to_state[i - 1].state != entry.state)
+            conflicting_duplicate_ip_state = true;
+    }
+    for (std::size_t i = 0; i < fh3.unwind_map.size(); ++i) {
+        const auto predecessor = fh3.unwind_map[i].to_state;
+        if (predecessor < -1 || predecessor >= static_cast<std::int32_t>(i))
+            return failure(ErrorCode::malformed, "FH3 unwind map has an invalid predecessor state");
+    }
+    for (const auto &try_block : fh3.try_blocks) {
+        if (try_block.try_low < 0 || try_block.try_low > try_block.try_high ||
+            try_block.try_high >= fh3.max_state || try_block.catch_high < try_block.try_high ||
+            try_block.catch_high >= fh3.max_state)
+            return failure(ErrorCode::malformed, "FH3 try-block state range is invalid");
+        if (try_block.handlers.size() > max_fh3_handlers - total_handlers)
+            return failure(ErrorCode::resource_limit, "FH3 handler count exceeds the planner budget");
+        total_handlers += try_block.handlers.size();
+        for (const auto &handler : try_block.handlers) {
+            if (handler.handler_rva == 0 || ((!handler.type_descriptor_rva || *handler.type_descriptor_rva == 0) && handler.decorated_type_name))
+                return failure(ErrorCode::malformed, "FH3 handler or type-descriptor reference is invalid");
+            if (handler.handler_rva > std::numeric_limits<std::uint64_t>::max() - module_base)
+                return failure(ErrorCode::overflow, "FH3 handler address overflows");
+            if (handler.type_descriptor_rva && *handler.type_descriptor_rva &&
+                *handler.type_descriptor_rva > std::numeric_limits<std::uint64_t>::max() - module_base)
+                return failure(ErrorCode::overflow, "FH3 type-descriptor address overflows");
+        }
+    }
+    for (const auto &row : fh3.unwind_map)
+        if (row.action_rva && row.action_rva > std::numeric_limits<std::uint64_t>::max() - module_base)
+            return failure(ErrorCode::overflow, "FH3 cleanup action address overflows");
 
     PeFh3ExceptionPlan plan;
     plan.function_begin_rva = runtime->begin_rva;
     plan.establisher_frame = establisher_frame;
+    if (conflicting_duplicate_ip_state) {
+        plan.dispatch = PeFh3DispatchDisposition::ambiguous;
+        plan.dispatch_source = fh3.source;
+        plan.dispatch_diagnostic = "duplicate FH3 IP transitions assign conflicting states";
+        return plan;
+    }
     const auto ip_entry = std::upper_bound(fh3.ip_to_state.begin(), fh3.ip_to_state.end(), rva,
         [](std::uint32_t address, const PeCxxIpToStateEntry &row) { return address < row.ip_rva; });
     if (ip_entry != fh3.ip_to_state.begin()) plan.state = std::prev(ip_entry)->state;
@@ -566,6 +632,7 @@ Result<PeFh3ExceptionPlan> plan_pe_fh3_exception(const PeMetadata &metadata, std
     }
 
     bool uncertain_match = false;
+    std::size_t provable_match_count = 0;
     for (const auto &candidate : plan.handlers) {
         switch (candidate.disposition) {
         case PeFh3CatchDisposition::different_type:
@@ -576,19 +643,34 @@ Result<PeFh3ExceptionPlan> plan_pe_fh3_exception(const PeMetadata &metadata, std
             break;
         case PeFh3CatchDisposition::catch_all:
         case PeFh3CatchDisposition::exact_type:
+            ++provable_match_count;
             if (uncertain_match) {
                 plan.dispatch = PeFh3DispatchDisposition::ambiguous;
                 plan.dispatch_source = candidate.source;
                 plan.dispatch_diagnostic = "an earlier FH3 catch with unmodeled matching semantics prevents handler selection";
                 return plan;
             }
-            plan.dispatch = PeFh3DispatchDisposition::handler_candidate;
-            plan.selected_try_index = candidate.try_index;
-            plan.selected_handler_index = candidate.handler_index;
-            plan.dispatch_source = candidate.source;
-            plan.dispatch_diagnostic = "first provable matching FH3 handler candidate in metadata order";
-            return plan;
+            break;
         }
+    }
+    if (provable_match_count == 1 && !uncertain_match) {
+        for (const auto &candidate : plan.handlers) {
+            if (candidate.disposition == PeFh3CatchDisposition::catch_all ||
+                candidate.disposition == PeFh3CatchDisposition::exact_type) {
+                plan.dispatch = PeFh3DispatchDisposition::handler_candidate;
+                plan.selected_try_index = candidate.try_index;
+                plan.selected_handler_index = candidate.handler_index;
+                plan.dispatch_source = candidate.source;
+                plan.dispatch_diagnostic = "only provable matching FH3 handler candidate";
+                return plan;
+            }
+        }
+    }
+    if (provable_match_count > 1) {
+        plan.dispatch = PeFh3DispatchDisposition::ambiguous;
+        plan.dispatch_source = fh3.source;
+        plan.dispatch_diagnostic = "multiple provable FH3 catches cannot be ordered from caller-supplied try-block rows";
+        return plan;
     }
     if (uncertain_match) {
         plan.dispatch = PeFh3DispatchDisposition::ambiguous;
