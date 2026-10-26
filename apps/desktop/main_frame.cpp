@@ -1859,12 +1859,20 @@ struct MainFrame::Impl {
             history_view->update(id, std::move(actor), std::move(project));
         }
         if (type_symbols) {
-            type_symbols->navigate = [this](Location location) { frame.Navigate(location); };
+            type_symbols->navigate = [this](DocumentId source_id, std::shared_ptr<const ProjectSnapshot> source,
+                                            Location location) {
+                const auto source_document = shown;
+                if (!source_document || source_document->id != source_id || source_document->project != source) {
+                    log("Symbol navigation canceled because its source snapshot changed.");
+                    return;
+                }
+                navigate_from_document(source_document, location);
+            };
             type_symbols->diagnostics_changed = [this, id](std::vector<AnalysisIssueDiagnostic> diagnostics) {
                 if (analysis_issues) analysis_issues->set_type_diagnostics(id, std::move(diagnostics));
             };
             auto project = id ? controller->documents().project(*id) : nullptr;
-            type_symbols->update(project, state().selection(), [this, id](ProjectCommand command) {
+            type_symbols->update(id, project, state().selection(), [this, id](ProjectCommand command) {
                 if (!id) return;
                 auto result = controller->execute(*id, std::move(command));
                 if (!result) controller->documents().report_error(*id, result.error());
@@ -1906,6 +1914,22 @@ struct MainFrame::Impl {
         });
         macho_objc->activate = {};
     }
+    bool navigate_from_document(const std::shared_ptr<const DocumentSnapshot> &source, Location destination) {
+        const auto current = controller->state().current();
+        const auto current_project = source ? controller->documents().project(source->id) : nullptr;
+        if (!source || closer->closing_window() ||
+            controller->documents().active_document() != source->id ||
+            !current || current->id != source->id || current->revision != source->revision ||
+            shown != source || current_project != source->project) {
+            log("Navigation canceled because its source document changed.");
+            return false;
+        }
+        frame.Navigate(destination);
+        if (state().selection() != std::optional<Location>{destination})
+            return false;
+        pages->SetSelection(std::holds_alternative<Address>(destination) ? 0 : 1);
+        return true;
+    }
     void display_macho_objc_rows(const std::shared_ptr<const DocumentSnapshot> &doc,
                                  const std::shared_ptr<const std::vector<MachOObjCViewRow>> &rows) {
         if (!macho_objc || !doc || !rows) return;
@@ -1913,9 +1937,9 @@ struct MainFrame::Impl {
             if (row >= rows->size()) return wxString{};
             return macho_objc_view_cell((*rows)[row], column, doc->image.get());
         });
-        macho_objc->activate = [this, rows](std::size_t row) {
+        macho_objc->activate = [this, doc, rows](std::size_t row) {
             if (row < rows->size() && (*rows)[row].address)
-                frame.Navigate(*(*rows)[row].address);
+                navigate_from_document(doc, *(*rows)[row].address);
         };
     }
     void populate_macho_objc() {
@@ -1974,9 +1998,9 @@ struct MainFrame::Impl {
         if (pe_view) pe_view->set_document(doc);
         if (minidump_view) minidump_view->set_document(doc);
         populate_candidate_model(doc);
-        candidates->activate = [this](std::size_t row) {
+        candidates->activate = [this, doc](std::size_t row) {
             if (row < visible_candidate_items.size())
-                frame.Navigate(visible_candidate_items[row].entry);
+                navigate_from_document(doc, visible_candidate_items[row].entry);
         };
         segments->populate(doc->image->layout().segments.size(), [doc](std::size_t row, int column) {
             const auto &item = doc->image->layout().segments[row];
@@ -1992,7 +2016,10 @@ struct MainFrame::Impl {
                        (item.executable ? "X" : "-");
             }
         });
-        segments->activate = [this, doc](std::size_t row) { frame.Navigate(doc->image->layout().segments[row].begin); };
+        segments->activate = [this, doc](std::size_t row) {
+            if (row < doc->image->layout().segments.size())
+                navigate_from_document(doc, doc->image->layout().segments[row].begin);
+        };
         strings->set_document(doc);
         imports->populate(doc->metadata_view().imports.size(), [doc](std::size_t row, int column) {
             const auto &item = doc->metadata_view().imports[row];
@@ -2005,7 +2032,10 @@ struct MainFrame::Impl {
                      })()
                                  : wxString::Format("ordinal %u", *item.ordinal);
         });
-        imports->activate = [this, doc](std::size_t row) { frame.Navigate(doc->metadata_view().imports[row].iat); };
+        imports->activate = [this, doc](std::size_t row) {
+            if (row < doc->metadata_view().imports.size())
+                navigate_from_document(doc, Location{doc->metadata_view().imports[row].iat});
+        };
         auto export_cell = [doc](std::size_t row, int column) {
             const auto &item = doc->metadata_view().exports[row];
             return column == 0 ? (item.address ? location_text(*item.address, doc->image.get()) : wxString("forwarded"))
@@ -2015,9 +2045,10 @@ struct MainFrame::Impl {
         exports->populate(doc->metadata_view().exports.size(), export_cell);
         symbols->populate(doc->metadata_view().exports.size(), export_cell);
         auto export_jump = [this, doc](std::size_t row) {
+            if (row >= doc->metadata_view().exports.size()) return;
             const auto &item = doc->metadata_view().exports[row];
             if (item.address)
-                frame.Navigate(*item.address);
+                navigate_from_document(doc, Location{*item.address});
             else if (item.forwarder)
                 log("Forwarder: " + text(*item.forwarder));
         };
@@ -2042,13 +2073,14 @@ struct MainFrame::Impl {
                        wxString::Format("; #%u", item.index);
             });
             symbols->activate = [this, doc](std::size_t row) {
+                if (row >= doc->metadata_view().elf->symbols.size()) return;
                 const auto &item = doc->metadata_view().elf->symbols[row];
                 if (item.address)
-                    frame.Navigate(*item.address);
+                    navigate_from_document(doc, Location{*item.address});
                 else if (doc->project) {
                     const auto file = elf_symbol_record_at(*doc->project, row);
                     if (file)
-                        frame.Navigate(*file);
+                        navigate_from_document(doc, Location{*file});
                 }
             };
         }
@@ -2064,8 +2096,10 @@ struct MainFrame::Impl {
                        location_text(FileOffset{item.record_file_offset});
             });
             symbols->activate = [this, doc](std::size_t row) {
+                if (row >= doc->metadata_view().macho->symbols.size()) return;
                 const auto &item = doc->metadata_view().macho->symbols[row];
-                frame.Navigate(item.address ? Location{*item.address} : Location{FileOffset{item.record_file_offset}});
+                navigate_from_document(doc, item.address ? Location{*item.address}
+                                                         : Location{FileOffset{item.record_file_offset}});
             };
         }
         macho_metadata->populate(doc->project ? static_cast<std::size_t>(macho_metadata_row_count(*doc->project)) : 0,
@@ -2084,7 +2118,7 @@ struct MainFrame::Impl {
                     macho_metadata_cell(*doc, *item, 0) + " | " + macho_metadata_cell(*doc, *item, 1) + "\n" +
                     macho_metadata_cell(*doc, *item, 2) + "\n" + macho_metadata_cell(*doc, *item, 3));
             if (item)
-                frame.Navigate(item->source);
+                navigate_from_document(doc, item->source);
         };
         if (metadata_pages && metadata_pages->GetCurrentPage() == macho_objc)
             populate_macho_objc();
@@ -2320,13 +2354,36 @@ struct MainFrame::Impl {
     void jump() {
         if (!shown)
             return;
+        // The address dialog and ambiguity chooser are modal. The user can
+        // activate another tab, close this document, or receive a newer
+        // analysis snapshot while either dialog is open, so bind every result
+        // to the exact document view that produced its candidates.
+        const auto source_document = shown;
+        const auto source_project = source_document->project;
+        const auto navigate_from_source = [&](Location destination) {
+            const auto current = controller->state().current();
+            const auto current_project = controller->documents().project(source_document->id);
+            if (closer->closing_window() ||
+                controller->documents().active_document() != source_document->id ||
+                !current || current->id != source_document->id ||
+                current->revision != source_document->revision ||
+                current_project != source_project || shown != source_document) {
+                log("Jump canceled because the source document changed while choosing a destination.");
+                return false;
+            }
+            frame.Navigate(destination);
+            if (state().selection() != std::optional<Location>{destination})
+                return false;
+            pages->SetSelection(0); // show the destination in disassembly
+            return true;
+        };
         AddressDialog dialog(&frame);
         if (dialog.ShowModal() != wxID_OK)
             return;
         if (dialog.mode->GetSelection() == 2) {
             auto address = parse_segment_address(*shown->image, dialog.value->GetValue().ToStdWstring());
             if (address)
-                frame.Navigate(address.value());
+                navigate_from_source(address.value());
             else
                 log(text(address.error().message));
             return;
@@ -2361,7 +2418,7 @@ struct MainFrame::Impl {
             }
             const auto match = resolve_named_location_expression(entries, bounded_entries, requested);
             if (match.location) {
-                frame.Navigate(*match.location);
+                navigate_from_source(*match.location);
                 return;
             }
             if (match.ambiguous) {
@@ -2374,7 +2431,7 @@ struct MainFrame::Impl {
                     "Ambiguous name: " + requested, labels);
                 if (chooser.ShowModal() == wxID_OK && chooser.GetSelection() >= 0 &&
                     static_cast<std::size_t>(chooser.GetSelection()) < match.candidates.size())
-                    frame.Navigate(match.candidates[static_cast<std::size_t>(chooser.GetSelection())].location);
+                    navigate_from_source(match.candidates[static_cast<std::size_t>(chooser.GetSelection())].location);
                 return;
             }
             const bool address_expression = parse_named_location_expression(requested).has_value() ||
@@ -2392,7 +2449,7 @@ struct MainFrame::Impl {
                 wxSingleChoiceDialog chooser(&frame, prompt, "Jump name suggestions: " + requested, labels);
                 if (chooser.ShowModal() == wxID_OK && chooser.GetSelection() >= 0 &&
                     static_cast<std::size_t>(chooser.GetSelection()) < suggestions.candidates.size())
-                    frame.Navigate(suggestions.candidates[static_cast<std::size_t>(chooser.GetSelection())].location);
+                    navigate_from_source(suggestions.candidates[static_cast<std::size_t>(chooser.GetSelection())].location);
                 return;
             }
             if (const auto expression = parse_named_location_expression(requested)) {
@@ -2400,7 +2457,7 @@ struct MainFrame::Impl {
                 if (base) {
                     Location destination{Address{space, base.value()}};
                     if (apply_location_displacement(destination, expression->add, expression->displacement)) {
-                        frame.Navigate(destination);
+                        navigate_from_source(destination);
                     } else {
                         log("Address expression overflows or underflows the address space.");
                     }
@@ -2427,8 +2484,8 @@ struct MainFrame::Impl {
             log(text(number.error().message));
             return;
         }
-        frame.Navigate(dialog.mode->GetSelection() == 0 ? Location{Address{space, number.value()}}
-                                                        : Location{FileOffset{number.value()}});
+        navigate_from_source(dialog.mode->GetSelection() == 0 ? Location{Address{space, number.value()}}
+                                                              : Location{FileOffset{number.value()}});
     }
     const ListingRow *selected_row() {
         if (auto selection = action_location())
@@ -2910,7 +2967,9 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.pe_view = new PeView(metadata);
     ui.minidump_view = new MinidumpView(metadata);
     ui.minidump_view->navigate = [this](Location location) { Navigate(location); };
-    ui.pe_view->navigate = [this](Location location) { Navigate(location); };
+    ui.pe_view->navigate = [this](std::shared_ptr<const DocumentSnapshot> source, Location location) {
+        impl_->navigate_from_document(source, location);
+    };
     ui.pe_view->open_runtime_view = [this](PeRuntimeArchitecture target) {
         const auto doc = impl_->shown;
         if (!doc || !doc->project || !doc->project->state ||
@@ -3348,9 +3407,14 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.plugins->extensions_operation_finished = [this](bool) {
         impl_->refresh_plugin_analysis();
     };
-    ui.references->navigate = [this](DocumentId id, Location location) {
-        if (projects().active_document() == id)
-            Navigate(location);
+    ui.references->navigate = [this](DocumentId id, std::shared_ptr<const ProjectSnapshot> source_project,
+                                     Location location) {
+        const auto source_document = impl_->shown;
+        if (!source_document || source_document->id != id || source_document->project != source_project) {
+            impl_->log("Reference navigation canceled because its source snapshot changed.");
+            return;
+        }
+        impl_->navigate_from_document(source_document, location);
     };
     docking_.AddPane(metadata, wxAuiPaneInfo()
                                    .Name("metadata")

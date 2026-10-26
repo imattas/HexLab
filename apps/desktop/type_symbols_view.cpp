@@ -477,33 +477,34 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
     portable_library_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { portable_type_library(); });
     symbol_filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { refresh_symbols(); });
     pdb_data_symbols_->activate = [this](std::size_t row) {
-        if (row < pdb_data_symbol_rows_.size() && pdb_data_symbol_rows_[row].address && navigate)
-            navigate(Location{*pdb_data_symbol_rows_[row].address});
+        if (document_ && row < pdb_data_symbol_rows_.size() && pdb_data_symbol_rows_[row].address && navigate)
+            navigate(*document_, project_, Location{*pdb_data_symbol_rows_[row].address});
     };
     pdb_data_symbols_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &) { refresh_pdb_data_symbol_details(); });
     pdb_data_symbols_->Bind(wxEVT_LIST_ITEM_DESELECTED, [this](wxListEvent &) { refresh_pdb_data_symbol_details(); });
     variables_->Bind(wxEVT_LIST_ITEM_SELECTED,[this](wxListEvent &){refresh_variable_details();});
     variables_->Bind(wxEVT_LIST_ITEM_DESELECTED,[this](wxListEvent &){refresh_variable_details();});
     go_to_variable_function_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
-        if (!project_ || !project_->state || !navigate)
+        if (!document_ || !project_ || !project_->state || !navigate)
             return;
         const auto selected = variables_->selected_row();
         if (!selected || *selected >= project_->state->user->debug_variables.size())
             return;
-        navigate(Location{project_->state->user->debug_variables[*selected].function_entry});
+        navigate(*document_, project_, Location{project_->state->user->debug_variables[*selected].function_entry});
     });
     assignments_->activate = [this](std::size_t row) {
-        if (!project_ || !project_->state || row >= visible_assignment_indices_.size() || !navigate)
+        if (!document_ || !project_ || !project_->state || row >= visible_assignment_indices_.size() || !navigate)
             return;
         const auto index = visible_assignment_indices_[row];
         if (index < project_->state->user->type_assignments.size())
-            navigate(project_->state->user->type_assignments[index].location);
+            navigate(*document_, project_, project_->state->user->type_assignments[index].location);
     };
     refresh();
 }
-void TypeSymbolsView::update(std::shared_ptr<const ProjectSnapshot> project, std::optional<Location> selection,
+void TypeSymbolsView::update(std::optional<DocumentId> document, std::shared_ptr<const ProjectSnapshot> project,
+                             std::optional<Location> selection,
                              std::function<void(ProjectCommand)> submit) {
-    const bool project_changed = !project || !project->state || !project_ || !project_->state ||
+    const bool project_changed = document != document_ || !project || !project->state || !project_ || !project_->state ||
         project->state->uuid != project_->state->uuid;
     if (project_changed) {
         selected_type_id_.reset();
@@ -518,6 +519,7 @@ void TypeSymbolsView::update(std::shared_ptr<const ProjectSnapshot> project, std
         pdb_id_diagnostic_.clear();
         pdb_data_symbol_diagnostic_.clear();
     }
+    document_ = document;
     project_ = std::move(project);
     submit_ = std::move(submit);
     selected_address_.reset();
@@ -725,8 +727,8 @@ void TypeSymbolsView::refresh_symbols() {
     });
     symbols_->fit_columns({0, 1});
     symbols_->activate = [this](std::size_t row) {
-        if (row < visible_symbol_candidate_indices_.size() && navigate)
-            navigate(Location{symbol_candidates_[visible_symbol_candidate_indices_[row]].address});
+        if (document_ && row < visible_symbol_candidate_indices_.size() && navigate)
+            navigate(*document_, project_, Location{symbol_candidates_[visible_symbol_candidate_indices_[row]].address});
     };
 }
 void TypeSymbolsView::refresh_layout() {

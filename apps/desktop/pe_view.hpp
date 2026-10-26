@@ -11,7 +11,7 @@ class PeView final : public wxPanel {
   public:
     explicit PeView(wxWindow *parent);
     void set_document(std::shared_ptr<const DocumentSnapshot> document);
-    std::function<void(Location)> navigate;
+    std::function<void(std::shared_ptr<const DocumentSnapshot>, Location)> navigate;
     std::function<void(PeRuntimeArchitecture)> open_runtime_view;
 
   private:

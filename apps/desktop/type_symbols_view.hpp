@@ -39,9 +39,10 @@ struct PdbDataSymbolRow {
 class TypeSymbolsView final : public wxPanel {
   public:
     explicit TypeSymbolsView(wxWindow *parent);
-    void update(std::shared_ptr<const ProjectSnapshot> project, std::optional<Location> selection,
+    void update(std::optional<DocumentId> document, std::shared_ptr<const ProjectSnapshot> project,
+                std::optional<Location> selection,
                 std::function<void(ProjectCommand)> submit);
-    std::function<void(Location)> navigate;
+    std::function<void(DocumentId, std::shared_ptr<const ProjectSnapshot>, Location)> navigate;
     std::function<void(std::vector<AnalysisIssueDiagnostic>)> diagnostics_changed;
 
   private:
@@ -68,6 +69,7 @@ class TypeSymbolsView final : public wxPanel {
              *import_ = nullptr, *import_header_ = nullptr, *import_pdb_types_ = nullptr,
              *import_dwarf_ = nullptr, *portable_library_ = nullptr, *go_to_variable_function_ = nullptr;
     std::shared_ptr<const ProjectSnapshot> project_;
+    std::optional<DocumentId> document_;
     std::optional<Address> selected_address_;
     std::optional<std::uint64_t> selected_type_id_;
     bool refreshing_types_ = false;

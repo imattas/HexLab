@@ -14,7 +14,7 @@ class ReferenceView final : public wxPanel {
     void update(std::optional<DocumentId>, std::shared_ptr<const ProjectSnapshot>, std::optional<Location>);
     void retain_documents(std::span<const DocumentInfo>);
     void inspect(Location, bool incoming);
-    std::function<void(DocumentId, Location)> navigate;
+    std::function<void(DocumentId, std::shared_ptr<const ProjectSnapshot>, Location)> navigate;
 
   private:
     VirtualTable *table_;
