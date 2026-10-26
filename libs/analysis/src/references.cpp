@@ -2097,6 +2097,7 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                 const auto *src = src_operand && src_operand->bank == RegisterBank::arm64_gpr &&
                     (src_operand->width == 32 || src_operand->width == 64) ? src_operand : nullptr;
                 const auto immediate = immediate_value(instruction, 2);
+                const auto *register_offset = std::get_if<RegisterOperand>(&instruction.operands[2]);
                 std::optional<Address> target;
                 if (dst && dst->index != 31 && src && src->index != 31 && dst->width == src->width && immediate) {
                     const auto base = registers.find(src->index);
@@ -2114,6 +2115,36 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                                 target = Address{base->second.space, value + *immediate};
                         } else if (value >= *immediate) {
                             target = Address{base->second.space, value - *immediate};
+                        }
+                    }
+                } else if (instruction.operands.size() == 3 && dst && dst->index != 31 &&
+                           src && src->index != 31 && register_offset &&
+                           register_offset->bank == RegisterBank::arm64_gpr && register_offset->index != 31 &&
+                           register_offset->width == dst->width && dst->width == src->width) {
+                    // Register ADD/SUB is useful for address construction when
+                    // both inputs are already proven constants/addresses. Keep
+                    // this to the unshifted three-operand form; shifted operands
+                    // and SP/XZR forms require additional semantics.
+                    const auto base = registers.find(src->index);
+                    const auto offset = registers.find(register_offset->index);
+                    if (base != registers.end() && offset != registers.end() &&
+                        base->second.space == instruction.address.space &&
+                        offset->second.space == instruction.address.space &&
+                        base->second.space == offset->second.space) {
+                        const auto lhs = base->second.offset;
+                        const auto rhs = offset->second.offset;
+                        if (dst->width == 32) {
+                            const auto left = static_cast<std::uint32_t>(lhs);
+                            const auto right = static_cast<std::uint32_t>(rhs);
+                            target = Address{base->second.space,
+                                instruction.opcode == Opcode::a64_add
+                                    ? static_cast<std::uint32_t>(left + right)
+                                    : static_cast<std::uint32_t>(left - right)};
+                        } else if (instruction.opcode == Opcode::a64_add) {
+                            if (lhs <= UINT64_MAX - rhs)
+                                target = Address{base->second.space, lhs + rhs};
+                        } else if (lhs >= rhs) {
+                            target = Address{base->second.space, lhs - rhs};
                         }
                     }
                 }
