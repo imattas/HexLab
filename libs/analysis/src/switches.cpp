@@ -80,6 +80,7 @@ std::optional<Address> add_signed_offset(Address base, std::int64_t delta, const
 struct A64RelocatedTableAddress {
     bool relocation_present = false;
     std::optional<Address> address;
+    std::vector<std::uint64_t> rows;
 };
 
 A64RelocatedTableAddress a64_adrp_add_relocated_address(const Image &image, const ImageMetadata *metadata,
@@ -109,7 +110,9 @@ A64RelocatedTableAddress a64_adrp_add_relocated_address(const Image &image, cons
     const auto target_section_matches = [](const ElfRelocation &relocation, Address place) {
         return relocation.target_section && *relocation.target_section == place.space.value;
     };
-    if (page_relocation.type != 275 || add_relocation.type != 277 ||
+    // ADR_PREL_PG_HI21 and its NC form compute the same symbol page;
+    // NC omits the linker's overflow diagnostic, not the address equation.
+    if ((page_relocation.type != 275 && page_relocation.type != 276) || add_relocation.type != 277 ||
         page_relocation.kind != ElfRelocationKind::unknown || add_relocation.kind != ElfRelocationKind::unknown ||
         !page_relocation.explicit_addend || !add_relocation.explicit_addend ||
         !page_relocation.addend || !add_relocation.addend || page_relocation.addend != add_relocation.addend ||
@@ -141,6 +144,7 @@ A64RelocatedTableAddress a64_adrp_add_relocated_address(const Image &image, cons
     if (!table)
         return result;
     result.address = table;
+    result.rows = {page_rows.front(), add_rows.front()};
     return result;
 }
 
@@ -1167,7 +1171,7 @@ std::optional<SwitchSite> a64_indexed_absolute_switch(
     const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
     std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
-    std::stop_token stop) {
+    const ImageMetadata *metadata, std::stop_token stop) {
     if (dispatch_index < 3 || stop.stop_requested() || !facts[dispatch_index] ||
         !facts[dispatch_index - 1] || !facts[dispatch_index - 2] || !facts[dispatch_index - 3])
         return {};
@@ -1192,7 +1196,10 @@ std::optional<SwitchSite> a64_indexed_absolute_switch(
 
     const auto *page_reg = register_operand(page, 0);
     const auto *page_address = std::get_if<MemoryOperand>(&page.operands[1]);
-    const auto resolved_page = page_address
+    const auto pair = a64_adrp_add_relocated_address(image, metadata, relocations, page, add, stop);
+    if (pair.relocation_present && !pair.address)
+        return {}; // An unproven pair must never fall back to placeholder bytes.
+    const auto resolved_page = page_address && !pair.address
                                    ? relocated_operand_address(page, 1, page_address->resolved_address,
                                                                relocations, stop)
                                    : std::optional<Address>{};
@@ -1203,19 +1210,35 @@ std::optional<SwitchSite> a64_indexed_absolute_switch(
     const auto *entries = std::get_if<MemoryOperand>(&load.operands[1]);
     const auto *branch_reg = register_operand(dispatch, 0);
     if (!page_reg || page_reg->bank != RegisterBank::arm64_gpr || page_reg->width != 64 ||
-        !page_address || !resolved_page || page_address->base ||
+        page_reg->index == 31 || !page_address || (!resolved_page && !pair.address) ||
+        !page_address->ip_relative || page_address->address_width != 64 || page_address->base ||
         page_address->index || page_address->segment || !add_dest || !add_src || !same_register(page_reg, add_dest) ||
-        !same_register(page_reg, add_src) || !low || !loaded_reg || !entries || !branch_reg ||
+        !same_register(page_reg, add_src) || add_dest->width != 64 || add_src->width != 64 ||
+        !low || low->value > 4095 || low->encoded_width != 12 || low->effective_width != 64 || low->is_signed ||
+        !loaded_reg || !entries || !branch_reg ||
         loaded_reg->bank != RegisterBank::arm64_gpr || loaded_reg->width != 64 ||
+        loaded_reg->index == 31 || branch_reg->width != 64 ||
         !same_register(loaded_reg, branch_reg) || !same_register(entries->base ? &*entries->base : nullptr, page_reg) ||
+        !entries->base || entries->base->width != 64 ||
         !entries->index || entries->index->bank != RegisterBank::arm64_gpr || entries->index->width != 64 ||
+        entries->index->index == 31 ||
         entries->data_width != 64 || entries->address_width != 64 || entries->displacement != 0 ||
         entries->segment || entries->index_extend != "" || entries->index_shift_amount != 3 ||
         same_register(page_reg, loaded_reg) || same_register(page_reg, &*entries->index) ||
         same_register(loaded_reg, &*entries->index))
         return {};
-    const auto relocated_table = relocated_operand_address(add, 2, {}, relocations, stop);
-    const auto table = relocated_table ? relocated_table : add_offset(*resolved_page, low->value, image);
+    if (page.length != 4 || add.length != 4 || load.length != 4 || dispatch.length != 4 ||
+        (std::to_integer<unsigned>(add.bytes[dispatch.context.order == ByteOrder::little ? 2 : 1]) & 0x40u))
+        return {}; // ADD must use the unshifted low-12 immediate.
+    const auto relocated_table = pair.address ? std::optional<Address>{}
+        : relocated_operand_address(add, 2, {}, relocations, stop);
+    if (relocations && !pair.address) {
+        const auto low_resolution = relocations->operand(add, 2, stop);
+        if (!low_resolution || (low_resolution.value().relocated() && !low_resolution.value().address))
+            return {};
+    }
+    const auto table = pair.address ? pair.address
+        : relocated_table ? relocated_table : add_offset(*resolved_page, low->value, image);
     if (!table)
         return {};
 
@@ -1224,6 +1247,10 @@ std::optional<SwitchSite> a64_indexed_absolute_switch(
     site.table = *table;
     site.selector = *entries->index;
     site.scale = 8;
+    if (pair.address) {
+        site.table_base_source = SwitchSite::TableBaseSource::elf_relocation_pair;
+        site.table_base_relocation_rows = pair.rows;
+    }
     const auto *space = image.space(table->space);
     if (!space || space->width_bits != 64)
         return {};
@@ -1464,6 +1491,10 @@ std::optional<SwitchSite> a64_signed_offset_switch(
     site.selector = *entries->index;
     site.scale = 4;
     site.entry_encoding = SwitchEntryEncoding::signed_offset_from_table;
+    if (relocated_pair.address) {
+        site.table_base_source = SwitchSite::TableBaseSource::elf_relocation_pair;
+        site.table_base_relocation_rows = relocated_pair.rows;
+    }
     if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector, page.address,
                                                dispatch.address, dispatch.context, guards, stop)) {
         site.case_count = bound->case_count;
@@ -1539,6 +1570,7 @@ std::optional<SwitchSite> a64_separate_base_signed_offset_switch(
         table_operand->segment)
         return {};
     std::optional<Address> table;
+    std::vector<std::uint64_t> table_relocation_rows;
     if (page_form) {
         const auto *page_reg = register_operand(table_address, 0);
         const auto *add_source = register_operand(table_add, 1);
@@ -1556,6 +1588,7 @@ std::optional<SwitchSite> a64_separate_base_signed_offset_switch(
             return {}; // This pattern uses an unshifted low-12 ADD.
         const auto pair = a64_adrp_add_relocated_address(image, metadata, relocations,
                                                            table_address, table_add, stop);
+        table_relocation_rows = pair.rows;
         if (pair.relocation_present && !pair.address)
             return {};
         const auto decoded_page = relocated_operand_address(table_address, 1,
@@ -1621,6 +1654,10 @@ std::optional<SwitchSite> a64_separate_base_signed_offset_switch(
     site.scale = 4;
     site.entry_encoding = SwitchEntryEncoding::signed_offset_from_target_base;
     site.target_base = *code_base;
+    if (!table_relocation_rows.empty()) {
+        site.table_base_source = SwitchSite::TableBaseSource::elf_relocation_pair;
+        site.table_base_relocation_rows = std::move(table_relocation_rows);
+    }
     if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
                                                table_address.address, dispatch.address, dispatch.context,
                                                guards, stop)) {
@@ -2406,7 +2443,7 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
                 instruction.opcode == Opcode::a64_br && instruction.flow == FlowKind::jump) {
                 auto a64_switch = a64_indexed_absolute_switch(image, function, snapshot,
                                                                found->second->instructions, fact_index, guards,
-                                                               relocations, stop);
+                                                               relocations, metadata, stop);
                 if (!a64_switch && !stop.stop_requested())
                     a64_switch = a64_adr_indexed_absolute_switch(image, function, snapshot,
                                                                   found->second->instructions, fact_index, guards,

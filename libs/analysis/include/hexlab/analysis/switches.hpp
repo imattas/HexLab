@@ -45,6 +45,12 @@ struct SwitchSite {
     // reached its hard entry limit; the recovered prefix remains usable.
     bool complete = true;
     std::optional<std::string> incomplete_reason;
+    // Setup provenance is distinct from per-case pointer-slot relocations.
+    enum class TableBaseSource { encoded_bytes, elf_relocation_pair } table_base_source =
+        TableBaseSource::encoded_bytes;
+    // ELF metadata row indices in ADRP/ADD instruction order. Present only
+    // when the exact matched pair established the table address.
+    std::vector<std::uint64_t> table_base_relocation_rows;
     bool operator==(const SwitchSite &) const = default;
 };
 
@@ -79,7 +85,7 @@ struct SwitchAnalysis {
 // at most 4096 entries. Targets must decode as instructions in executable,
 // file-backed image bytes. Recovery is limited to recognized instruction
 // patterns; it does not propagate arbitrary register values. For ELF
-// relocatable objects, the signed-offset AArch64 form may resolve an otherwise
+// relocatable objects, the absolute-pointer and signed-offset AArch64 forms may resolve an otherwise
 // unknown ADRP/ADD table base only from a matched explicit-addend relocation
 // pair to a defined local symbol.
 HEXLAB_ANALYSIS_EXPORT Result<SwitchAnalysis>

@@ -3356,6 +3356,45 @@ a64_unhandled:
             return effect;
         }
     }
+    if (x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
+        (instruction.opcode == Opcode::vcmpps || instruction.opcode == Opcode::vcmppd) &&
+        (instruction.vector_bits == 128 || instruction.vector_bits == 256 || instruction.vector_bits == 512) &&
+        instruction.operands.size() == 4 && !instruction.x86_opmask_zeroing &&
+        (!instruction.x86_opmask || (*instruction.x86_opmask > 0 && *instruction.x86_opmask < 8))) {
+        const auto width = static_cast<unsigned>(instruction.vector_bits);
+        const auto lane_bits = static_cast<std::uint16_t>(instruction.opcode == Opcode::vcmpps ? 32 : 64);
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
+        const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+        const bool source2_valid = x86_avx_detail::is_evex_vector(instruction.operands[2], width) ||
+            (memory && memory->data_width == (instruction.x86_evex_broadcast ? lane_bits : width));
+        if (destination && destination->bank == RegisterBank::opmask && destination->index < 8 &&
+            destination->width == 64 && !destination->high_byte &&
+            x86_avx_detail::is_evex_vector(instruction.operands[1], width) && source2_valid && predicate &&
+            predicate->encoded_width == 8 && predicate->effective_width == 8 && !predicate->is_signed &&
+            predicate->value < 32 && (!instruction.vector_element_bits || instruction.vector_element_bits == lane_bits)) {
+            const auto vector_value_type = vector_type(width, TypeKind::floating, lane_bits,
+                static_cast<std::uint8_t>(width / lane_bits));
+            std::vector<ExpressionPtr> inputs{
+                retag_expr(operands[1], vector_value_type),
+                instruction.x86_evex_broadcast
+                    ? retag_expr(operands[2], floating_type(lane_bits))
+                    : retag_expr(operands[2], vector_value_type),
+                retag_expr(operands[3], integer_type(8))};
+            if (instruction.x86_opmask)
+                inputs.push_back(reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false}));
+            inputs.push_back(reg_expr({RegisterBank::mxcsr, 0, 32, false}));
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_f" + std::to_string(lane_bits) +
+                "x" + std::to_string(width / lane_bits) + "_predicate" + std::to_string(predicate->value) +
+                "_to_k" + std::to_string(destination->index) +
+                (instruction.x86_evex_broadcast ? "_broadcast" : "") +
+                (instruction.x86_opmask ? "_masked_zero" : "_unmasked") + "_mxcsr_control_status",
+                std::move(inputs), memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = integer_type(64);
+            return effect;
+        }
+    }
     if (const auto shape = x86_avx_detail::evex_compare_shape(instruction.opcode);
         x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
         (instruction.vector_bits == 128 || instruction.vector_bits == 256 || instruction.vector_bits == 512) &&

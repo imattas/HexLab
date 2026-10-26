@@ -54,7 +54,8 @@ The table must be readable and file-backed, and each table-relative target
 must decode in executable AArch64 bytes. Invalid entries preserve the verified
 prefix and mark it partial. For ELF relocatable objects,
 the form can recover an otherwise unresolved table base from an exact
-`R_AARCH64_ADR_PREL_PG_HI21` / `R_AARCH64_ADD_ABS_LO12_NC` pair. Both
+`R_AARCH64_ADR_PREL_PG_HI21` (or its `_NC` variant) /
+`R_AARCH64_ADD_ABS_LO12_NC` pair. Both
 explicit-addend records must refer to the same validated symbol-table namespace,
 symbol index, and addend; the symbol must be a defined local symbol in a mapped
 section. Missing, duplicate, overlapping, mismatched, or non-local relocation
@@ -277,3 +278,52 @@ The Debug analysis target was source-built after this change. No tests were
 added or run for the new cross-block proof, and runtime recognition remains
 unverified. The function-engine fingerprint changed to invalidate older
 derived analyses affected by the broader guard recognition.
+
+
+## AArch64 ELF relocatable absolute-pointer tables
+
+The contiguous absolute-pointer form now also resolves an unlinked ELF64
+little-endian AArch64 table:
+
+```text
+ADRP Xbase, table
+ADD  Xbase, Xbase, :lo12:table
+LDR  Xtarget, [Xbase, Xselector, LSL #3]
+BR   Xtarget
+```
+
+The setup must carry exactly one `R_AARCH64_ADR_PREL_PG_HI21` (275) or
+`R_AARCH64_ADR_PREL_PG_HI21_NC` (276) relocation at `ADRP`, and exactly one
+`R_AARCH64_ADD_ABS_LO12_NC` (277) relocation at `ADD`. Both must be explicit
+RELA records with the same validated symbol-table namespace, symbol index and
+addend. Only a defined local table symbol (NOTYPE, OBJECT or SECTION) with a
+mapped section address is accepted. The exact table address is the symbol's
+section-relative image address plus the checked signed addend; placeholder
+instruction immediates never establish that address. The table can occupy a
+separate section/address space from the dispatch, as usual for ET_REL rodata.
+
+The four instructions must be adjacent, have one A64 context, use 64-bit
+registers, and preserve distinct table-base, selector and loaded-target
+registers. SP/ZR aliases, shifted low-12 ADD, index extensions, nonzero load
+displacements and other pointer widths are rejected. Unknown or malformed
+setup relocation evidence suppresses the form rather than falling back to
+encoded placeholder bytes. The existing signed-offset forms also accept the
+275/276 page variants under the same pair checks.
+
+`SwitchSite::table_base_source` reports `elf_relocation_pair` when this pair
+establishes the table. `table_base_relocation_rows` retains the two ELF row
+indices in ADRP/ADD instruction order. The existing signed-offset recognizers
+now retain the same setup provenance. These fields are separate from each
+`SwitchCase`'s pointer-slot relocation source and rows: a relocated table base
+does not claim that a raw table word was itself relocated. Table words still
+use exact data-slot relocation resolution where present, and every resulting
+case must decode in executable, file-backed A64 bytes. No guessed target is
+emitted for an unresolved slot. Existing proven count/default handling and the
+4096-entry scan cap apply unchanged.
+
+This extends source recognition only. No tests were added or run, and no build
+was run for this change; runtime recognition remains unverified. The setup
+provenance is exposed by the analysis API; CLI serialization and durable
+provenance persistence are not extended here. REL implicit addends,
+preemptible/global symbols, GOT indirection, arbitrary address propagation and
+other instruction relocation families remain unsupported.

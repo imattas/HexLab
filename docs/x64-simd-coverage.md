@@ -160,6 +160,16 @@ input as broadcast across result lanes. EVEX.b with a register source selects
 embedded rounding and remains unsupported, as do broadcast tuples for other
 instruction families, reserved encodings, and unsupported EVEX maps. This follows the EVEX `Load+Op` broadcast and tuple-scale rules in Intel SDM Vol. 2, sections 2.6.5 and 2.6.6 ([manual](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developers-manual.pdf)).
 
+EVEX packed floating compare-to-mask now decodes `VCMPPS` and `VCMPPD` at
+128/256/512-bit widths with all 32 immediate predicates, K0-K7 destinations,
+optional execution masks, vector or memory sources, and 32/64-bit memory
+broadcast. The decoder records MXCSR status effects and the typed decompiler
+retains the predicate, source shapes, mask, broadcast marker, and K result.
+Predicate evaluation and exception-flag calculation remain symbolic. Register
+source EVEX.b (SAE), destination zeroing, and invalid encodings are rejected.
+The opcode forms and predicate width follow Intel SDM Vol. 2's `VCMPPS` and
+`VCMPPD` entries (same [manual](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developers-manual.pdf)).
+
 EVEX.512 packed integer wrapping add/sub now covers `VPADDB/W/D/Q` and
 `VPSUBB/W/D/Q` with ZMM register and 512-bit memory operands. K1-K7 masking is
 decoded as a mask-register read; merge forms also read the destination, while

@@ -632,8 +632,12 @@ bool parse_section_stream(std::span<const std::byte> bytes, std::uint64_t source
                 sections[row_index].disposition = UefiSectionDisposition::processing_required;
                 sections[row_index].diagnostic = "GUID-defined payload requires an unavailable processor and is retained opaque";
             } else {
-                sections[row_index].disposition = UefiSectionDisposition::opaque_guid_defined;
-                sections[row_index].diagnostic = "GUID-defined payload remains opaque because its format is not registered";
+                // PI permits consumers to use the bytes at DataOffset directly
+                // when no extraction processor is required. In that case they
+                // are an ordinary nested section stream, irrespective of GUID.
+                sections[row_index].disposition = UefiSectionDisposition::nested_sections;
+                contains_sections = true;
+                nested_offset = data_offset;
             }
         } else if (type == section_disposable) {
             sections[row_index].disposition = UefiSectionDisposition::nested_sections;

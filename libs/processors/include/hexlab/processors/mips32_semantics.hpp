@@ -21,4 +21,23 @@ struct Mips32HiLoResult {
 HEXLAB_PROCESSORS_EXPORT std::optional<Mips32HiLoResult>
 evaluate_mips32_hilo(Mips32HiLoOperation operation, std::uint32_t lhs, std::uint32_t rhs) noexcept;
 
+// Exact bounded single-precision DIV.S result for gradual-underflow mode
+// (FCSR.FS=0). exception_bits uses canonical IEEE order I/U/O/Z/V in bits
+// 0..4. fcsr_after applies the MIPS Cause replacement and sticky Flag rules;
+// an enabled exception suppresses both flag accrual and the destination write.
+struct Mips32DivSResult {
+    std::uint32_t value_bits = 0;
+    std::uint32_t fcsr_after = 0;
+    std::uint8_t exception_bits = 0;
+    bool exception_taken = false;
+    bool writes_destination = true;
+    bool operator==(const Mips32DivSResult &) const = default;
+};
+
+// Operands are IEEE binary32 bit patterns. FCSR RM, enable, cause, and flag
+// fields are interpreted architecturally. Returns no value when FCSR.FS is
+// set, because flush-subnormal behavior is not modeled by this evaluator.
+HEXLAB_PROCESSORS_EXPORT std::optional<Mips32DivSResult>
+evaluate_mips32_div_s(std::uint32_t lhs_bits, std::uint32_t rhs_bits, std::uint32_t fcsr) noexcept;
+
 } // namespace hexlab

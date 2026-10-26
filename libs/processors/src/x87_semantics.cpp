@@ -14,7 +14,10 @@ constexpr std::uint16_t fsw_c3 = 1u << 14, fsw_busy = 1u << 15;
 constexpr std::uint16_t fcw_invalid_mask = 1u << 0;
 constexpr std::uint16_t fcw_denormal_mask = 1u << 1;
 constexpr std::uint16_t fsw_precision = 1u << 5;
+constexpr std::uint16_t fsw_overflow = 1u << 3;
 constexpr std::uint16_t fsw_denormal = 1u << 1;
+constexpr std::uint16_t fsw_underflow = 1u << 4;
+constexpr std::uint16_t fcw_underflow_mask = 1u << 4;
 constexpr std::uint16_t fcw_precision_mask = 1u << 5;
 constexpr std::uint16_t fcw_overflow_mask = 1u << 3;
 constexpr std::uint16_t fcw_rounding_mask = 3u << 10;
@@ -163,6 +166,136 @@ std::uint16_t signal_exception(std::uint16_t status, std::uint16_t exception) no
 
 X87Binary80 x87_indefinite() noexcept {
     return {integer_bit | quiet_bit, static_cast<std::uint16_t>(exponent_mask | sign_mask)};
+}
+
+struct BinaryFormat {
+    unsigned total_bits, fraction_bits, exponent_bits;
+    int bias;
+};
+
+constexpr BinaryFormat binary32_format{32, 23, 8, 127};
+constexpr BinaryFormat binary64_format{64, 52, 11, 1023};
+
+std::uint64_t width_mask(unsigned width) noexcept {
+    return width == 64 ? UINT64_MAX : (std::uint64_t{1} << width) - 1;
+}
+
+std::uint64_t sign_field(bool negative, const BinaryFormat &format) noexcept {
+    return negative ? std::uint64_t{1} << (format.total_bits - 1) : 0;
+}
+
+std::uint64_t infinity_bits(bool negative, const BinaryFormat &format) noexcept {
+    const auto exponent = (std::uint64_t{1} << format.exponent_bits) - 1;
+    return sign_field(negative, format) | (exponent << format.fraction_bits);
+}
+
+std::uint64_t indefinite_bits(const BinaryFormat &format) noexcept {
+    const auto quiet = std::uint64_t{1} << (format.fraction_bits - 1);
+    return infinity_bits(true, format) | quiet;
+}
+
+struct RoundedFormatValue {
+    std::uint64_t bits = 0;
+    bool inexact = false;
+    bool incremented = false;
+    bool overflow = false;
+    bool underflow = false;
+};
+
+bool should_increment(std::uint64_t quotient, std::uint64_t remainder, unsigned shift,
+                      bool negative, std::uint8_t rounding) noexcept {
+    if (!remainder) return false;
+    switch (rounding & 3) {
+    case 0:
+        if (shift > 64) return false;
+        if (shift == 64) {
+            const auto halfway = std::uint64_t{1} << 63;
+            return remainder > halfway || (remainder == halfway && (quotient & 1));
+        }
+        if (shift == 0) return false;
+        {
+            const auto halfway = std::uint64_t{1} << (shift - 1);
+            return remainder > halfway || (remainder == halfway && (quotient & 1));
+        }
+    case 1: return negative; // round toward -infinity
+    case 2: return !negative; // round toward +infinity
+    default: return false; // chop
+    }
+}
+
+RoundedFormatValue round_binary80_to_format(const Decoded &decoded, const BinaryFormat &format,
+                                             std::uint8_t rounding) noexcept {
+    const auto exponent_all_ones = (std::uint64_t{1} << format.exponent_bits) - 1;
+    const auto fraction_mask = width_mask(format.fraction_bits);
+    const auto exponent_min = 1 - format.bias;
+    const auto exponent_max = static_cast<int>(exponent_all_ones - 1) - format.bias;
+    const auto precision = format.fraction_bits + 1;
+    const auto sign = sign_field(decoded.negative, format);
+    if (decoded.kind == Class::zero) return {sign, false, false};
+    if (decoded.kind == Class::infinity) return {infinity_bits(decoded.negative, format), false, false};
+    if (decoded.kind == Class::quiet_nan || decoded.kind == Class::signaling_nan) {
+        const auto payload = (decoded.significand & (integer_bit - 1)) >> (63 - format.fraction_bits);
+        const auto quiet = decoded.kind == Class::signaling_nan
+            ? std::uint64_t{1} << (format.fraction_bits - 1) : 0;
+        return {sign | (exponent_all_ones << format.fraction_bits) | (payload & fraction_mask) | quiet,
+                false, false};
+    }
+
+    const auto highest = 63u - static_cast<unsigned>(std::countl_zero(decoded.significand));
+    const auto normalized = decoded.significand << (63u - highest);
+    const auto exponent = (decoded.exponent == 0 ? 1 - 16383 : static_cast<int>(decoded.exponent) - 16383) +
+                          static_cast<int>(highest) - 63;
+    const auto shift = 63u - precision;
+    const auto quotient = normalized >> shift;
+    const auto remainder = normalized & ((std::uint64_t{1} << shift) - 1);
+    auto rounded = quotient;
+    const bool increment = should_increment(quotient, remainder, shift, decoded.negative, rounding);
+    if (increment) ++rounded;
+    auto rounded_exponent = exponent;
+    if (rounded == (std::uint64_t{1} << precision)) {
+        rounded >>= 1;
+        ++rounded_exponent;
+    }
+    if (rounded_exponent > exponent_max) {
+        bool to_infinity = false;
+        switch (rounding & 3) {
+        case 0: to_infinity = true; break;
+        case 1: to_infinity = decoded.negative; break;
+        case 2: to_infinity = !decoded.negative; break;
+        default: break;
+        }
+        const auto bits = to_infinity ? infinity_bits(decoded.negative, format) :
+            sign | (static_cast<std::uint64_t>(exponent_all_ones - 1) << format.fraction_bits) | fraction_mask;
+        return {bits, true, increment, true, false};
+    }
+    if (rounded_exponent >= exponent_min) {
+        const auto encoded_exponent = static_cast<std::uint64_t>(rounded_exponent + format.bias);
+        return {sign | (encoded_exponent << format.fraction_bits) | (rounded & fraction_mask),
+                remainder != 0, increment, false, false};
+    }
+
+    const auto subnormal_shift = static_cast<unsigned>(63 + exponent_min -
+        static_cast<int>(format.fraction_bits) - exponent);
+    std::uint64_t subnormal = 0;
+    bool inexact = normalized != 0;
+    bool subnormal_increment = false;
+    if (subnormal_shift < 64) {
+        subnormal = normalized >> subnormal_shift;
+        const auto sub_remainder = normalized & ((std::uint64_t{1} << subnormal_shift) - 1);
+        inexact = sub_remainder != 0;
+        subnormal_increment = should_increment(subnormal, sub_remainder, subnormal_shift, decoded.negative, rounding);
+        if (subnormal_increment)
+            ++subnormal;
+    } else {
+        subnormal_increment = should_increment(0, normalized, subnormal_shift, decoded.negative, rounding);
+        if (subnormal_increment) subnormal = 1;
+    }
+    if (subnormal >= (std::uint64_t{1} << format.fraction_bits)) {
+        // Rounding the largest subnormal upward produces the minimum normal.
+        return {sign | (std::uint64_t{1} << format.fraction_bits), inexact, subnormal_increment,
+                false, inexact};
+    }
+    return {sign | subnormal, inexact, subnormal_increment, false, inexact};
 }
 
 X87Binary80 quiet_nan(X87Binary80 value) noexcept {
@@ -830,6 +963,149 @@ X87UnaryResult evaluate_x87_unary(X87Binary80 value, std::uint16_t status_word,
     else
         value.sign_exponent &= static_cast<std::uint16_t>(~sign_mask);
     return {value, status_word};
+}
+
+std::optional<X87RealLoadResult>
+evaluate_x87_load_real(const X87RealLoadRequest &request) noexcept {
+    const BinaryFormat *format = request.source_width == 32 ? &binary32_format :
+                                 request.source_width == 64 ? &binary64_format : nullptr;
+    if (!format || (request.source_width == 32 && (request.source_bits >> 32) != 0)) return {};
+    const auto exponent_mask_value = (std::uint64_t{1} << format->exponent_bits) - 1;
+    const auto fraction_mask = width_mask(format->fraction_bits);
+    const auto bits = request.source_bits & width_mask(format->total_bits);
+    const bool negative = ((bits >> (format->total_bits - 1)) & 1) != 0;
+    const auto exponent = static_cast<unsigned>((bits >> format->fraction_bits) & exponent_mask_value);
+    const auto fraction = bits & fraction_mask;
+
+    X87Binary80 value{};
+    value.sign_exponent = static_cast<std::uint16_t>(negative ? sign_mask : 0);
+    X87RealLoadResult result;
+    result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
+    if (exponent == exponent_mask_value) {
+        value.sign_exponent |= exponent_mask;
+        value.significand = integer_bit | (fraction << (63 - format->fraction_bits));
+        if (fraction == 0) {
+            value.significand = integer_bit;
+        } else {
+            const bool signaling = (fraction & (std::uint64_t{1} << (format->fraction_bits - 1))) == 0;
+            result.invalid_operation = signaling;
+            if (signaling) {
+                result.status_word |= fsw_invalid;
+                if ((request.control_word & fcw_invalid_mask) == 0) {
+                    result.status_word = signal_exception(result.status_word, fsw_invalid);
+                    result.completed = false;
+                    return result;
+                }
+                value.significand |= quiet_bit;
+            }
+        }
+        result.value = value;
+        return result;
+    }
+
+    if (exponent == 0 && fraction == 0) {
+        result.value = value;
+        return result;
+    }
+    if (exponent == 0) {
+        result.denormal_operand = true;
+        result.status_word |= fsw_denormal;
+        if ((request.control_word & fcw_denormal_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_denormal);
+            result.completed = false;
+            return result;
+        }
+        const auto highest = 63u - static_cast<unsigned>(std::countl_zero(fraction));
+        const auto unbiased = static_cast<int>(highest) + 1 - format->bias -
+                              static_cast<int>(format->fraction_bits);
+        value.significand = fraction << (63u - highest);
+        value.sign_exponent |= static_cast<std::uint16_t>(unbiased + 16383);
+        result.value = value;
+        return result;
+    }
+
+    const auto unbiased = static_cast<int>(exponent) - format->bias;
+    const auto extended_exponent = unbiased + 16383;
+    if (extended_exponent <= 0 || extended_exponent >= exponent_mask) return {};
+    value.significand = (std::uint64_t{1} << format->fraction_bits | fraction) <<
+                        (63 - format->fraction_bits);
+    value.sign_exponent |= static_cast<std::uint16_t>(extended_exponent);
+    result.value = value;
+    return result;
+}
+
+std::optional<X87RealStoreResult>
+evaluate_x87_store_real(const X87RealStoreRequest &request) noexcept {
+    const BinaryFormat *format = request.destination_width == 32 ? &binary32_format :
+                                 request.destination_width == 64 ? &binary64_format : nullptr;
+    if (!format) return {};
+    const auto decoded = decode(request.value);
+    X87RealStoreResult result;
+    result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
+    const auto signal_invalid = [&]() noexcept {
+        result.invalid_operation = true;
+        result.status_word |= fsw_invalid;
+        if ((request.control_word & fcw_invalid_mask) != 0) {
+            result.destination_bits = indefinite_bits(*format);
+            return true;
+        }
+        result.status_word = signal_exception(result.status_word, fsw_invalid);
+        result.completed = false;
+        return false;
+    };
+
+    if (decoded.kind == Class::unsupported) {
+        (void)signal_invalid();
+        return result;
+    }
+    if (decoded.kind == Class::signaling_nan) {
+        if (!signal_invalid()) return result;
+        // A masked signaling NaN is converted to the target's quiet NaN.
+        X87Binary80 quieted = request.value;
+        quieted.significand |= quiet_bit;
+        const auto quiet_decoded = decode(quieted);
+        const auto rounded = round_binary80_to_format(quiet_decoded, *format,
+            static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10));
+        result.destination_bits = rounded.bits;
+        return result;
+    }
+    if (decoded.kind == Class::finite && decoded.exponent == 0 &&
+        (decoded.significand & integer_bit) == 0) {
+        result.denormal_operand = true;
+        result.status_word |= fsw_denormal;
+        if ((request.control_word & fcw_denormal_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_denormal);
+            result.completed = false;
+            return result;
+        }
+    }
+
+    const auto rounded = round_binary80_to_format(decoded, *format,
+        static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10));
+    result.destination_bits = rounded.bits;
+    result.overflow = rounded.overflow;
+    result.underflow = rounded.underflow;
+    result.precision = rounded.inexact;
+    if (rounded.inexact && decoded.negative != rounded.incremented)
+        result.status_word |= fsw_c1;
+    if (rounded.overflow) result.status_word |= fsw_overflow;
+    if (rounded.underflow) result.status_word |= fsw_underflow;
+    if (rounded.inexact) result.status_word |= fsw_precision;
+
+    if (rounded.overflow && (request.control_word & fcw_overflow_mask) == 0) {
+        result.status_word = signal_exception(result.status_word, fsw_overflow);
+        result.destination_bits.reset();
+        result.completed = false;
+    } else if (rounded.underflow && (request.control_word & fcw_underflow_mask) == 0) {
+        result.status_word = signal_exception(result.status_word, fsw_underflow);
+        result.destination_bits.reset();
+        result.completed = false;
+    } else if (rounded.inexact && (request.control_word & fcw_precision_mask) == 0) {
+        result.status_word = signal_exception(result.status_word, fsw_precision);
+        result.destination_bits.reset();
+        result.completed = false;
+    }
+    return result;
 }
 
 } // namespace hexlab

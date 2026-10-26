@@ -159,4 +159,49 @@ HEXLAB_PROCESSORS_EXPORT X87UnaryResult
 evaluate_x87_unary(X87Binary80 value, std::uint16_t status_word,
                    X87UnaryArithmetic operation) noexcept;
 
+struct X87RealLoadRequest {
+    std::uint64_t source_bits = 0;
+    std::uint8_t source_width = 32; // FLD m32real or m64real.
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+};
+struct X87RealLoadResult {
+    std::optional<X87Binary80> value;
+    std::uint16_t status_word = 0;
+    bool completed = true;
+    bool denormal_operand = false;
+    bool invalid_operation = false;
+    bool operator==(const X87RealLoadResult &) const = default;
+};
+// Expand an IEEE binary32/binary64 memory value into exact x87 binary80,
+// including signed zero and NaN payload mapping, while applying FLD's DE/IE
+// sticky and unmasked-exception retirement rules. Stack push/tag handling is
+// the caller's responsibility.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87RealLoadResult>
+evaluate_x87_load_real(const X87RealLoadRequest &request) noexcept;
+
+struct X87RealStoreRequest {
+    X87Binary80 value;
+    std::uint8_t destination_width = 32; // FST/FSTP m32real or m64real.
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+};
+struct X87RealStoreResult {
+    std::optional<std::uint64_t> destination_bits;
+    std::uint16_t status_word = 0;
+    bool completed = true;
+    bool denormal_operand = false;
+    bool invalid_operation = false;
+    bool overflow = false;
+    bool underflow = false;
+    bool precision = false;
+    bool operator==(const X87RealStoreResult &) const = default;
+};
+// Round an x87 binary80 value to IEEE binary32/binary64 using FCW.RC and
+// produce sticky exception/status effects. An absent result means an unmasked
+// exception suppressed the memory store. Memory access and FSTP's stack pop
+// are the caller's responsibility.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87RealStoreResult>
+evaluate_x87_store_real(const X87RealStoreRequest &request) noexcept;
+
 } // namespace hexlab

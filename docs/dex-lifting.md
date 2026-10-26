@@ -63,6 +63,19 @@ opcodes still return `ErrorCode::unsupported` with the method-relative
 instruction address. It does not produce a partial function when an instruction
 has unknown effects.
 
+DEX 038+ `invoke-polymorphic` (including `/range`) and `invoke-custom` (including
+`/range`) are decoded as calls. Polymorphic instructions retain both the method
+and prototype indexes; custom instructions retain the call-site index. Their
+encoded argument words are lifted as unknown 32-bit register reads, and the
+call-like intrinsic invalidates memory. DEX 039+ `const-method-handle` and
+`const-method-type` decode and lift as unknown reference constants while
+preserving the method-handle or prototype index. The bytecode decoder does not
+currently validate that the file version permits these opcodes, and the
+analysis layer does not resolve call-site arrays, method handles, prototypes,
+or descriptors. Register arguments therefore do not have recovered types or a
+linked return value; `move-result` remains an independent unknown value. These
+opcode encodings follow the [Android Dalvik bytecode reference](https://source.android.google.cn/docs/core/runtime/dalvik-bytecode?hl=en).
+
 Function and block boundaries come from the existing analysis snapshot. This
 first slice does not independently verify Dalvik register typing, reconstruct
 exception edges, prove verifier invariants, or structure arbitrary cyclic CFGs.

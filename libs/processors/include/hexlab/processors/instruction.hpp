@@ -438,7 +438,9 @@ enum class Opcode {
     // MIPS64 conditional trap comparisons; append to preserve persisted IDs.
     mips64_tge, mips64_tgeu, mips64_tlt, mips64_tltu, mips64_teq, mips64_tne,
     // RVV unary square-root and IEEE class mask; appended for ID stability.
-    rv_vfsqrt_v, rv_vfclass_v
+    rv_vfsqrt_v, rv_vfclass_v,
+    // EVEX packed floating compare-to-opmask forms; append to preserve IDs.
+    vcmpps, vcmppd
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

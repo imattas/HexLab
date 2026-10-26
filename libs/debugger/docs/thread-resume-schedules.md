@@ -26,6 +26,19 @@ non-stop or range-step packets. Signal actions `C`/`S` are advertised only when
 the backend supports scheduled signal disposition.
 These selector rules follow the [GDB packet specification](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Packets.html).
 
+## Remote thread lifecycle events
+
+During RSP connection setup, HexLab requests `QThreadEvents:1` when the stub
+advertises `QThreadEvents+`. A successful negotiation lets the backend receive
+thread-created and thread-exited stop replies as they occur, instead of
+discovering changes only when the user refreshes the thread list. The normal
+owned-event sequence still applies: the event is surfaced to the desktop and
+must be explicitly continued or scheduled. Stubs that do not advertise or
+accept this optional feature continue to use thread-list refreshes and do not
+fail connection setup. Malformed or transport-level negotiation failures do
+fail setup so a broken RSP exchange is not silently treated as a capability
+decline.
+
 The outbound RSP backend uses exact `t:TID` or `t:pPID.TID` wire actions in
 mixed schedules only when the peer advertises `t`. Process-qualified IDs retain
 both components and must belong to the selected inferior. A stop action cannot

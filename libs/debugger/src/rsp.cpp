@@ -322,7 +322,7 @@ Result<std::string> Client::transact_until(std::string_view command, Deadline de
 Result<std::string> Client::request(std::string_view command, std::stop_token stop) { return transact(command, stop); }
 
 Result<Capabilities> Client::negotiate(std::stop_token stop) {
-    auto supported = transact("qSupported:multiprocess+;swbreak+;hwbreak+;vContSupported+", stop);
+    auto supported = transact("qSupported:multiprocess+;swbreak+;hwbreak+;vContSupported+;QThreadEvents+", stop);
     if (!supported) return supported.error();
     Capabilities result;
     std::string_view rest = supported.value();
@@ -339,6 +339,9 @@ Result<Capabilities> Client::negotiate(std::stop_token stop) {
     }
     if (const auto feature = result.features.find("QNonStop"); feature != result.features.end())
         result.non_stop_supported = feature->second == "+";
+    if (const auto feature = result.features.find("QThreadEvents"); feature != result.features.end())
+        result.thread_events_supported = feature->second == "+";
+    thread_events_supported_ = result.thread_events_supported;
     non_stop_supported_ = result.non_stop_supported;
     peer_packet_size_ = std::min<std::size_t>(max_packet_, 4096);
     if (const auto feature = result.features.find("PacketSize"); feature != result.features.end()) {
@@ -366,6 +369,19 @@ Status Client::set_non_stop_mode(bool enabled, std::stop_token stop) {
             : Status{Error{ErrorCode::io, "remote rejected non-stop mode change: " + response.value()}};
     non_stop_mode_ = enabled;
     stop_reply_sequence_active_ = false;
+    return std::monostate{};
+}
+Status Client::set_thread_events(bool enabled, std::stop_token stop) {
+    if (enabled && !thread_events_supported_)
+        return Error{ErrorCode::unsupported, "remote did not advertise QThreadEvents support"};
+    if (enabled == thread_events_enabled_) return std::monostate{};
+    auto response = transact(enabled ? "QThreadEvents:1" : "QThreadEvents:0", stop);
+    if (!response) return response.error();
+    if (response.value() != "OK")
+        return response.value().empty()
+            ? Status{Error{ErrorCode::unsupported, "remote rejected thread-event notifications"}}
+            : Status{Error{ErrorCode::io, "remote rejected thread-event mode change: " + response.value()}};
+    thread_events_enabled_ = enabled;
     return std::monostate{};
 }
 Result<StopReply> Client::read_stop_reply(std::stop_token stop) {
