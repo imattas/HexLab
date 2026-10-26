@@ -51,6 +51,16 @@ std::optional<RegisterOperand> x86_register(csh handle, unsigned reg, unsigned w
 }
 std::optional<RegisterOperand> named_register(csh handle, unsigned reg, unsigned width, Architecture arch) {
     if (arch==Architecture::x86 || arch==Architecture::x86_64) return x86_register(handle,reg,width);
+    if (arch==Architecture::mos6502) {
+        switch (reg) {
+        case MOS65XX_REG_ACC: return RegisterOperand{RegisterBank::mos6502,0,8,false};
+        case MOS65XX_REG_X: return RegisterOperand{RegisterBank::mos6502,1,8,false};
+        case MOS65XX_REG_Y: return RegisterOperand{RegisterBank::mos6502,2,8,false};
+        case MOS65XX_REG_P: return RegisterOperand{RegisterBank::mos6502,3,8,false};
+        case MOS65XX_REG_SP: return RegisterOperand{RegisterBank::mos6502,4,8,false};
+        default: return {};
+        }
+    }
     const char *raw=cs_reg_name(handle,reg); if(!raw) return {};
     const std::string_view n(raw);
     auto number=[&](std::string_view prefix,unsigned limit)->std::optional<unsigned>{
@@ -87,10 +97,6 @@ std::optional<RegisterOperand> named_register(csh handle, unsigned reg, unsigned
         for(unsigned i=0;i<32;i++) if(n==names[i]) return RegisterOperand{RegisterBank::mips_gpr,static_cast<std::uint8_t>(i),static_cast<std::uint16_t>(width),false};
     }
     if(arch==Architecture::powerpc){ if(auto i=number("r",32)) return RegisterOperand{RegisterBank::ppc_gpr,static_cast<std::uint8_t>(*i),static_cast<std::uint16_t>(width),false}; }
-    if(arch==Architecture::mos6502){
-        constexpr std::string_view names[]={"a","x","y","p","sp"};
-        for(unsigned i=0;i<5;i++) if(n==names[i]) return RegisterOperand{RegisterBank::mos6502,static_cast<std::uint8_t>(i),static_cast<std::uint16_t>(width),false};
-    }
     return {};
 }
 void add_unique(std::vector<RegisterOperand>& v, RegisterOperand r) {
@@ -168,6 +174,56 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
             else if(op.type==PPC_OP_REG&&known){auto r=named_register(handle,op.reg,out.context.mode==ExecutionMode::ppc64?64:32,architecture);if(!r)continue;bool rd=false,wr=false;for(unsigned j=0;j<nr;j++)rd|=reads[j]==op.reg;for(unsigned j=0;j<nw;j++)wr|=writes[j]==op.reg;if(rd||wr){out.operands.emplace_back(*r);out.access.push_back(rd&&wr?OperandAccess::read_write:wr?OperandAccess::write:OperandAccess::read);}}
             else if(op.type==PPC_OP_MEM){MemoryOperand mem;mem.address_width=out.context.mode==ExecutionMode::ppc64?64:32;mem.displacement=op.mem.disp;mem.base=named_register(handle,op.mem.base,mem.address_width,architecture);out.operands.emplace_back(mem);out.access.push_back(OperandAccess::address);}
         }
+    } else if (architecture==Architecture::mos6502) {
+        const auto &m=d->mos65xx;
+        if(m.op_count>3)return;
+        std::array<uint16_t,64> reads{},writes{};uint8_t nr=0,nw=0;
+        const bool known=cs_regs_access(handle,&insn,reads.data(),&nr,writes.data(),&nw)==CS_ERR_OK;
+        const auto has_register=[&](const auto &set,uint8_t count,unsigned reg){
+            return std::find(set.begin(),set.begin()+count,reg)!=set.begin()+count;
+        };
+        for(unsigned i=0;i<m.op_count;i++){
+            const auto &op=m.operands[i];
+            if(op.type==MOS65XX_OP_REG&&known){
+                auto r=named_register(handle,op.reg,8,architecture);if(!r)continue;
+                const bool rd=has_register(reads,nr,op.reg),wr=has_register(writes,nw,op.reg);
+                if(rd||wr){out.operands.emplace_back(*r);out.access.push_back(rd&&wr?OperandAccess::read_write:wr?OperandAccess::write:OperandAccess::read);}
+            }else if(op.type==MOS65XX_OP_IMM){
+                out.operands.emplace_back(ImmediateOperand{op.imm,8,8,false,{}});
+                out.access.push_back(OperandAccess::read);
+            }else if(op.type==MOS65XX_OP_MEM){
+                MemoryOperand mem;mem.address_width=16;mem.data_width=8;
+                mem.displacement=static_cast<std::int64_t>(op.mem);
+                switch(m.am){
+                case MOS65XX_AM_ZP_X:case MOS65XX_AM_ABS_X:case MOS65XX_AM_ZP_X_IND:case MOS65XX_AM_ABS_X_IND:
+                    mem.index=RegisterOperand{RegisterBank::mos6502,1,8,false};break;
+                case MOS65XX_AM_ZP_Y:case MOS65XX_AM_ABS_Y:case MOS65XX_AM_ZP_IND_Y:case MOS65XX_AM_ZP_IND_LONG_Y:
+                    mem.index=RegisterOperand{RegisterBank::mos6502,2,8,false};break;
+                default:break;
+                }
+                if((m.am==MOS65XX_AM_ZP||m.am==MOS65XX_AM_ABS||m.am==MOS65XX_AM_ZP_REL||
+                    m.am==MOS65XX_AM_REL)&&op.mem<=UINT16_MAX)
+                    mem.resolved_address=Address{out.address.space,op.mem};
+                out.operands.emplace_back(mem);out.access.push_back(OperandAccess::address);
+                if((insn.id==MOS65XX_INS_JMP||insn.id==MOS65XX_INS_JSR)&&m.am==MOS65XX_AM_ABS&&op.mem<=UINT16_MAX)
+                    out.direct_target=Address{out.address.space,op.mem};
+            }
+        }
+        switch(insn.id){
+        case MOS65XX_INS_BCC:case MOS65XX_INS_BCS:case MOS65XX_INS_BEQ:case MOS65XX_INS_BMI:
+        case MOS65XX_INS_BNE:case MOS65XX_INS_BPL:case MOS65XX_INS_BVC:case MOS65XX_INS_BVS:
+        case MOS65XX_INS_BBR:case MOS65XX_INS_BBS:
+            out.flow=FlowKind::conditional_branch;break;
+        case MOS65XX_INS_BRA:case MOS65XX_INS_BRL:
+            out.flow=FlowKind::jump;break;
+        default:break;
+        }
+        if(m.am==MOS65XX_AM_REL&&m.op_count==1&&m.operands[0].type==MOS65XX_OP_MEM&&
+           (out.flow==FlowKind::conditional_branch||out.flow==FlowKind::jump))
+            out.direct_target=Address{out.address.space,m.operands[0].mem};
+        else if(m.am==MOS65XX_AM_ZP_REL&&m.op_count==2&&m.operands[1].type==MOS65XX_OP_MEM&&
+                out.flow==FlowKind::conditional_branch)
+            out.direct_target=Address{out.address.space,m.operands[1].mem};
     }
     if (x86) {
       const std::string_view mnemonic(insn.mnemonic);

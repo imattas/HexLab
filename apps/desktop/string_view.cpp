@@ -1,9 +1,18 @@
 #include "string_view.hpp"
 
 #include "hexlab/analysis/references.hpp"
+#include "hexlab/image/file_publication.hpp"
+#include "hexlab/image/file_storage.hpp"
 #include "hexlab/image/image.hpp"
 #include "hexlab/workspace/project.hpp"
 #include <algorithm>
+#include <filesystem>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <wx/filedlg.h>
+#include <wx/msgdlg.h>
 #include <wx/sizer.h>
 
 namespace hexlab::desktop {
@@ -41,14 +50,50 @@ wxString reference_kind_text(ReferenceKind kind) {
     }
     return "unknown";
 }
+std::string utf8(const wxString &value) {
+    const auto encoded = value.ToUTF8();
+    return encoded ? std::string(encoded.data(), encoded.length()) : std::string{};
+}
+std::string csv_field(std::string_view value) {
+    std::string result = "\"";
+    for (const char c : value) {
+        if (c == '"') result += "\"\"";
+        else result += c;
+    }
+    result += '"';
+    return result;
+}
+std::string csv_row(const std::vector<std::string> &fields) {
+    std::string result;
+    bool first = true;
+    for (const auto &field : fields) {
+        if (!first) result += ',';
+        first = false;
+        result += csv_field(field);
+    }
+    result += "\r\n";
+    return result;
+}
+std::string decimal(std::uint64_t value) {
+    return std::to_string(value);
+}
+std::string hex(std::uint64_t value) {
+    return utf8(wxString::Format("0x%llX", static_cast<unsigned long long>(value)));
+}
 }
 
 StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter_timer_(this) {
     auto *layout = new wxBoxSizer(wxVERTICAL);
+    auto *filter_row = new wxBoxSizer(wxHORIZONTAL);
     filter_ = new wxTextCtrl(this, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
     filter_->SetName("strings-filter");
     filter_->SetHint("Filter strings by text, address, or encoding");
-    layout->Add(filter_, 0, wxEXPAND | wxALL, FromDIP(4));
+    filter_row->Add(filter_, 1, wxEXPAND | wxRIGHT, FromDIP(4));
+    export_ = new wxButton(this, wxID_ANY, "Export filtered CSV...");
+    export_->SetName("strings-export");
+    export_->Enable(false);
+    filter_row->Add(export_, 0, wxEXPAND);
+    layout->Add(filter_row, 0, wxEXPAND | wxALL, FromDIP(4));
 
     auto *splitter = new wxSplitterWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                            wxSP_LIVE_UPDATE | wxSP_3D);
@@ -83,6 +128,7 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
     SetSizer(layout);
 
     filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { filter_timer_.StartOnce(120); });
+    export_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_filtered_strings(); });
     filter_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent &) {
         filter_timer_.Stop();
         refresh_strings();
@@ -172,6 +218,7 @@ void StringBrowserView::refresh_strings() {
         default: return wxString::Format("%llu", static_cast<unsigned long long>(record.byte_length));
         }
     });
+    export_->Enable(document_ && !visible_strings_.empty());
     if (previous) {
         const auto visible = std::find(visible_strings_.begin(), visible_strings_.end(), *previous);
         if (visible != visible_strings_.end()) {
@@ -183,6 +230,117 @@ void StringBrowserView::refresh_strings() {
         reference_offset_ = 0;
         refresh_references();
     }
+}
+
+void StringBrowserView::export_filtered_strings() {
+    if (!document_)
+        return;
+    filter_timer_.Stop();
+    refresh_strings();
+    const auto document = document_;
+    const auto visible = visible_strings_;
+    if (visible.empty())
+        return;
+
+    std::vector<std::filesystem::path> protected_paths = document->project
+        ? document->project->protected_paths : std::vector<std::filesystem::path>{};
+    if (const auto file = std::dynamic_pointer_cast<const FileStorage>(document->input_storage))
+        protected_paths.push_back(file->backing_path());
+    wxFileDialog dialog(this, "Export filtered strings and incoming references", {}, "strings.csv",
+                        "CSV files (*.csv)|*.csv|All files (*.*)|*.*", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    if (dialog.ShowModal() != wxID_OK)
+        return;
+    auto publication = FilePublication::create(std::filesystem::path(dialog.GetPath().ToStdWstring()),
+                                               ExistingFilePolicy::replace, protected_paths, {});
+    if (!publication) {
+        wxMessageBox(text(publication.error().message), "Export strings", wxOK | wxICON_ERROR, this);
+        return;
+    }
+    const auto append = [&](std::string_view bytes) -> bool {
+        const auto written = publication.value()->append(std::as_bytes(std::span(bytes.data(), bytes.size())));
+        if (!written) {
+            wxMessageBox(text(written.error().message), "Export strings", wxOK | wxICON_ERROR, this);
+            return false;
+        }
+        return true;
+    };
+    if (!append(csv_row({"string_address", "file_offset", "encoding", "byte_length", "characters",
+                         "terminated", "preview", "incoming_source", "reference_kind", "operand_index",
+                         "reference_status"})))
+        return;
+
+    const auto *index = document->project ? document->project->references.get() : nullptr;
+    const auto status = document->project ? document->project->status : DerivedStatus::fresh;
+    const bool references_available = index &&
+        (status == DerivedStatus::fresh || status == DerivedStatus::incomplete);
+    const bool partial_references = references_available &&
+        (status == DerivedStatus::incomplete || !document->strings().complete || !index->complete());
+    const std::string available_status = partial_references ? "partial analysis" : "available";
+    const std::string unavailable = !document->project ? "unavailable: standalone document" :
+        !index ? "unavailable: no reference index" :
+        status == DerivedStatus::stale ? "unavailable: stale analysis" :
+        status == DerivedStatus::pending ? "unavailable: analysis pending" :
+        status == DerivedStatus::file_only ? "unavailable: file-only document" :
+        "unavailable: reference index is not current";
+    constexpr std::size_t export_page_size = 128;
+    for (const auto record_index : visible) {
+        if (record_index >= document->strings().records.size())
+            continue;
+        const auto &record = document->strings().records[record_index];
+        const auto address = record.address ? location_text(Location{*record.address}, document->image.get()) :
+            location_text(Location{record.file_offset}, document->image.get());
+        const std::vector<std::string> prefix = {utf8(address), hex(record.file_offset.value),
+            utf8(encoding_text(record.encoding)), decimal(record.byte_length), decimal(record.characters),
+            record.terminated ? "true" : "false", utf8(text(record.preview))};
+        if (!references_available) {
+            auto fields = prefix;
+            fields.insert(fields.end(), {"", "", "", unavailable});
+            if (!append(csv_row(fields)))
+                return;
+            continue;
+        }
+
+        std::uint64_t offset = 0;
+        bool wrote_reference = false;
+        while (true) {
+            auto page = record.address
+                ? index->incoming_mapped_file_range(*document->image, record.file_offset, record.byte_length,
+                                                    {offset, export_page_size})
+                : index->incoming_file_range(record.file_offset, record.byte_length, {offset, export_page_size});
+            if (!page) {
+                wxMessageBox(text(page.error().message), "Export strings", wxOK | wxICON_ERROR, this);
+                return;
+            }
+            for (const auto &reference : page.value().rows) {
+                wrote_reference = true;
+                auto fields = prefix;
+                fields.push_back(utf8(location_text(reference.source, document->image.get())));
+                fields.push_back(utf8(reference_kind_text(reference.kind)));
+                fields.push_back(reference.operand_index ? std::to_string(*reference.operand_index) : std::string{});
+                fields.push_back(available_status);
+                if (!append(csv_row(fields)))
+                    return;
+            }
+            if (!page.value().next_offset)
+                break;
+            if (page.value().rows.empty() || *page.value().next_offset <= offset) {
+                wxMessageBox("The reference index returned an invalid page sequence.", "Export strings",
+                             wxOK | wxICON_ERROR, this);
+                return;
+            }
+            offset = *page.value().next_offset;
+        }
+        if (!wrote_reference) {
+            auto fields = prefix;
+            fields.insert(fields.end(), {"", "", "", partial_references
+                ? "partial analysis: no indexed incoming references" : "available: no incoming references"});
+            if (!append(csv_row(fields)))
+                return;
+        }
+    }
+    const auto published = publication.value()->publish();
+    if (!published)
+        wxMessageBox(text(published.error().message), "Export strings", wxOK | wxICON_ERROR, this);
 }
 
 void StringBrowserView::choose_string(std::size_t record_index, bool navigate_to_string) {
