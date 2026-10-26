@@ -421,7 +421,11 @@ GPR/XMM values, cover the aggregate exactly without gaps or overlap, and the
 existing aggregate projection logic can derive each piece type. This supports
 bounded INTEGER, SSE, and mixed INTEGER/SSE two-eightbyte returns. Hidden-result
 pointers, x87 classes, unsupported layouts, and results with any other number
-or arrangement of locations remain unresolved. Windows x64 and AAPCS64 retain
-their bounded single-register cases; AAPCS64 models a one-member HFA in v0.
-This path is prototype-driven and never guesses aggregate returns from
-observed register widths.
+or arrangement of locations remain unresolved. Windows x64 retains its bounded
+single-register cases. AAPCS64 supports one-member HFAs through v0 and
+two-to-four member HFAs through v0-v3 when the classifier's floating-register
+locations match each homogeneous element's exact size and contiguous object
+offset. The lifter's call writes must include every result register before
+those component types are propagated. This path is prototype-driven and never
+guesses aggregate returns from observed register widths. AAPCS64 X8
+hidden-result buffers remain unmodeled.
