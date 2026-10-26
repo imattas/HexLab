@@ -3,6 +3,7 @@
 #include "hexlab/core/sha256.hpp"
 #include "hexlab/types/types.hpp"
 #include <optional>
+#include <set>
 
 namespace hexlab::types {
 // Portable type metadata deliberately uses symbolic names and source offsets,
@@ -43,4 +44,10 @@ HEXLAB_TYPES_EXPORT Result<std::vector<std::byte>> encode_library_bundle(
     const LibraryBundle &, std::size_t max_bytes = 16u * 1024u * 1024u);
 HEXLAB_TYPES_EXPORT Result<LibraryBundle> decode_library_bundle(
     std::span<const std::byte>, std::size_t max_bytes = 16u * 1024u * 1024u);
+// Validates every symbolic reference in a bundle against the combined set of
+// bundled and destination definitions. Traversal is graph-aware and bounded;
+// names compare exactly, matching the project type namespace.
+HEXLAB_TYPES_EXPORT Result<std::size_t> validate_library_references(
+    const LibraryBundle &, const std::set<std::string, std::less<>> &available_names,
+    std::size_t max_type_nodes = 1'000'000);
 }

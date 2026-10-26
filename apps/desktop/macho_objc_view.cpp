@@ -58,7 +58,8 @@ std::string objc_type_component(std::string_view name) {
 void add_method(std::vector<MachOObjCViewRow> &rows, const MachOObjCMethod &method,
                 const std::string &owner, std::string kind) {
     std::string status = "selector=" + method.selector_status + "; types=" + method.type_status +
-                         "; signature=" + method.signature_status + "; implementation=" + method.implementation_status;
+                         "; signature=" + method.signature_status + "; implementation=" + method.implementation_status +
+                         "; encoding=" + (method.relative_encoding ? "small-relative" : "absolute-pointer");
     std::string details = "entry=" + number(method.entry.offset) + "; selector=" + value(method.selector) +
                           "; encoding=" + value(method.type_encoding) + "; implementation=" +
                           (method.implementation ? number(method.implementation->offset) : "unavailable") +

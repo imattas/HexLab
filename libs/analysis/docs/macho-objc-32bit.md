@@ -19,14 +19,16 @@ Realized, future or bundle runtime-data flags stop class-ro interpretation;
 
 Legacy absolute `method_list_t` records have an eight-byte
 `entsizeAndFlags,count` header and at least twelve bytes per entry: selector,
-type-encoding and IMP pointers. The low two fixup markers are separated from
-entry size. Entry strides must meet the record minimum, pointer alignment and
-4096-byte ceiling; count, initialized segment extent and aggregate read budgets
-are checked before payload decoding. Unknown encoding flags, direct-selector
-flags without relative encoding, and 32-bit small/relative lists remain partial
-with explicit statuses. Rejected lists retain available count/stride evidence
-but are never decoded as absolute entries. Existing supported 64-bit relative
-lists retain their separate format.
+type-encoding and IMP pointers. Small/relative lists use the same header, a
+minimum twelve-byte entry, and signed 32-bit offsets based at each individual
+selector, type-encoding, and IMP field. Relative selectors either name a string
+directly or resolve through a selector-reference slot according to the direct
+selector flag. The low two fixup markers are separated from entry size. Entry
+strides must meet the record minimum, four-byte relative-field or pointer
+alignment, and 4096-byte ceiling; count, initialized segment extent and
+aggregate read budgets are checked before payload decoding. Unknown encoding
+flags and direct-selector flags without relative encoding remain partial with
+explicit statuses.
 
 Pointer reads require width-matched address domains and aligned complete slots.
 Relocation/dyld-owned fields preserve the existing resolved, runtime-bound,
@@ -53,7 +55,7 @@ selected pointer width, so `long`, object and block pointers use 32-bit sizes.
 Links and deduplication use the complete address-space ID plus offset.
 
 ObjC1 module/class/category/protocol records in `__OBJC`, big-endian images,
-arm64_32, small/relative 32-bit method lists, tagged relative-list-list unions,
+arm64_32, tagged relative-list-list unions,
 runtime caches and realized/future runtime objects are intentionally unsupported.
 Optional category class-property tails, protocol extended method-type arrays,
 demangled-name/class-property tails, Swift initializer tails and private runtime

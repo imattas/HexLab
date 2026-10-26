@@ -524,27 +524,7 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
             std::set<std::string, std::less<>> available;
             for (const auto &row : current.snapshot->state->user->types) available.insert(row.name);
             for (const auto &entry : bundle.entries) available.insert(entry.name);
-            for (const auto &entry : bundle.entries) {
-                std::unordered_set<const types::Type *> visited;
-                std::function<void(const types::Type &)> validate_refs = [&](const types::Type &type) {
-                    if (!visited.insert(&type).second) return;
-                    if (type.kind() == types::Kind::named_reference)
-                        require(available.contains(type.name()), "Type library refers to missing definition " + type.name());
-                    if (type.element()) validate_refs(*type.element());
-                    if (type.result_type()) validate_refs(*type.result_type());
-                    for (const auto &member : type.members()) {
-                        if (member.type) validate_refs(*member.type);
-                        if (member.virtual_base && member.virtual_base->vbptr_type) validate_refs(*member.virtual_base->vbptr_type);
-                    }
-                    for (const auto &parameter : type.parameters()) if (parameter.type) validate_refs(*parameter.type);
-                    for (const auto &method : type.methods()) {
-                        if (method.signature) validate_refs(*method.signature);
-                        if (method.this_type) validate_refs(*method.this_type);
-                    }
-                    for (const auto &member : type.static_data_members()) if (member.type) validate_refs(*member.type);
-                };
-                validate_refs(*entry.type);
-            }
+            take(types::validate_library_references(bundle, available));
             ImportPortableTypes command;
             for (auto &entry : bundle.entries) {
                 auto found = std::find_if(current.snapshot->state->user->types.begin(), current.snapshot->state->user->types.end(),

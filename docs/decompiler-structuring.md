@@ -14,7 +14,10 @@ edge, and the leaves are terminal returns. This covers two-return conditionals
 and nested return-only branches without requiring a common post-dominator.
 Shared return blocks, SSA phis, unresolved edges, and mixed return/non-return
 leaves remain on the label/goto path unless another existing recognizer handles
-them.
+them. Return-only trees use iterative validation and emission, so nesting depth
+does not consume recursive C++ stack frames. This recognizer accepts at most
+4,096 blocks and 1,024 nodes on any root-to-leaf path; larger or deeper trees
+retain the fallback.
 
 Whenever a structured edge carries more than one register-phi value, the
 formatter captures every incoming source in a temporary before assigning any

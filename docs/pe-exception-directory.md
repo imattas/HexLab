@@ -126,6 +126,7 @@ diagnostic. Unknown header bits remain explicitly unsupported.
 The FH4 field and compressed-integer layout follows the public implementation
 in [Wine's `handler4.c`](https://github.com/wine-mirror/wine/blob/master/dlls/msvcrt/handler4.c)
 and Microsoft's [C++ Team description of FH4](https://devblogs.microsoft.com/cppblog/making-cpp-exception-handling-smaller-x64/).
+Because callers may construct `PeMetadata` directly, the FH4 planner independently caps runtime-function, state, handler, continuation, and aggregate decorated-name records before it builds a plan. It rejects overlapping runtime-function ownership, empty function extents, unordered/out-of-function IP transitions, invalid backward unwind links, try-state ranges outside the unwind map, and function-relative continuation addresses outside their owning function. Address additions remain checked. These checks protect the public planning API even when the model did not come from the bounded PE loader.
 Other handlers carry an explicit unresolved or unsupported status
 plus at most a 256-byte source-tracked opaque preview, which does not claim to
 cover the complete payload. ARM64 language payloads remain uninterpreted. The loader does not execute

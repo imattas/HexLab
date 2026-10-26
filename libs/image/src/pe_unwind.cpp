@@ -9,6 +9,8 @@ namespace hexlab {
 namespace {
 constexpr std::size_t max_unwind_operations = 512;
 constexpr std::size_t max_unwind_depth = 32;
+constexpr std::size_t max_fh4_metadata_records = 1'000'000;
+constexpr std::size_t max_fh4_name_bytes = 1024 * 1024;
 
 Error failure(ErrorCode code, std::string message) { return {code, std::move(message)}; }
 
@@ -512,7 +514,7 @@ Result<PeFh3ExceptionPlan> plan_pe_fh3_exception(const PeMetadata &metadata, std
     bool conflicting_duplicate_ip_state = false;
     for (std::size_t i = 0; i < fh3.ip_to_state.size(); ++i) {
         const auto &entry = fh3.ip_to_state[i];
-        if (entry.ip_rva < runtime->begin_rva || entry.ip_rva >= runtime->end_rva ||
+        if (entry.ip_rva < runtime->begin_rva || entry.ip_rva > runtime->end_rva ||
             entry.state < -1 || entry.state >= fh3.max_state)
             return failure(ErrorCode::malformed, "FH3 IP-state row is outside its function or has an invalid state");
         if (i && fh3.ip_to_state[i - 1].ip_rva > entry.ip_rva)
@@ -746,13 +748,21 @@ Result<PeFh4ExceptionPlan> plan_pe_fh4_exception(const PeMetadata &metadata, std
         std::uint64_t instruction_pointer, std::uint64_t establisher_frame,
         std::optional<std::string_view> exception_decorated_type, const PeMemoryReader &memory,
         PeFh4ExceptionKind exception_kind) {
+    if (metadata.exception_functions.size() > max_fh4_metadata_records)
+        return failure(ErrorCode::resource_limit, "FH4 runtime-function table exceeds one million rows");
     if (instruction_pointer < module_base ||
         instruction_pointer - module_base > std::numeric_limits<std::uint32_t>::max())
         return failure(ErrorCode::out_of_bounds, "instruction pointer is outside the PE RVA range");
     const auto rva=static_cast<std::uint32_t>(instruction_pointer-module_base);
     const PeRuntimeFunction *runtime=nullptr;
-    for(const auto& row:metadata.exception_functions)
-        if(row.begin_rva<=rva&&rva<row.end_rva){runtime=&row;break;}
+    for(const auto& row:metadata.exception_functions) {
+        if (row.begin_rva >= row.end_rva)
+            return failure(ErrorCode::malformed, "PE runtime-function extent is empty");
+        if(row.begin_rva<=rva&&rva<row.end_rva) {
+            if (runtime) return failure(ErrorCode::invalid_argument, "overlapping PE runtime-function rows make FH4 ownership ambiguous");
+            runtime=&row;
+        }
+    }
     if(!runtime||!runtime->unwind_info||!runtime->unwind_info->handler_payload||
        !runtime->unwind_info->handler_payload->cxx_func_info4)
         return failure(ErrorCode::unsupported,"no FH4 metadata is associated with the live runtime function");
@@ -761,6 +771,69 @@ Result<PeFh4ExceptionPlan> plan_pe_fh4_exception(const PeMetadata &metadata, std
         return failure(ErrorCode::malformed,"FH4 metadata is malformed: "+fh4.diagnostic);
     if(fh4.status!=PeCxxFuncInfo4Status::decoded_subset)
         return failure(ErrorCode::unsupported,"FH4 metadata is unsupported: "+fh4.diagnostic);
+
+    // PeMetadata is a public value model and callers can construct it without
+    // passing through the loader's parser budgets. Reapply those limits before
+    // traversing or copying any FH4 vectors into the returned plan.
+    if (fh4.unwind_map.size() > max_fh4_metadata_records ||
+        fh4.ip_to_state.size() > max_fh4_metadata_records ||
+        fh4.try_blocks.size() > max_fh4_metadata_records)
+        return failure(ErrorCode::resource_limit, "FH4 state tables exceed one million rows");
+    if (exception_decorated_type && exception_decorated_type->size() > max_fh4_name_bytes)
+        return failure(ErrorCode::resource_limit, "FH4 exception type name exceeds the one MiB comparison budget");
+    std::size_t aggregate_records = fh4.unwind_map.size() + fh4.ip_to_state.size() + fh4.try_blocks.size();
+    if (aggregate_records > max_fh4_metadata_records)
+        return failure(ErrorCode::resource_limit, "FH4 aggregate state tables exceed one million rows");
+    std::size_t aggregate_name_bytes = exception_decorated_type ? exception_decorated_type->size() : 0;
+    for (std::size_t i = 0; i < fh4.unwind_map.size(); ++i) {
+        const auto &entry = fh4.unwind_map[i];
+        if (entry.previous_entry_index && *entry.previous_entry_index >= i)
+            return failure(ErrorCode::malformed, "FH4 unwind link is not a backward link");
+        if (entry.type != PeCxxUnwindEntry4Type::no_action && !entry.action_rva)
+            return failure(ErrorCode::malformed, "FH4 cleanup entry has no action RVA");
+        if ((entry.type == PeCxxUnwindEntry4Type::destructor_object ||
+             entry.type == PeCxxUnwindEntry4Type::destructor_pointer) && !entry.object_offset)
+            return failure(ErrorCode::malformed, "FH4 destructor entry has no object offset");
+        if (static_cast<unsigned>(entry.type) > static_cast<unsigned>(PeCxxUnwindEntry4Type::action_rva))
+            return failure(ErrorCode::malformed, "FH4 unwind entry type is reserved");
+    }
+    std::uint32_t previous_ip = 0;
+    bool first_ip = true;
+    for (const auto &entry : fh4.ip_to_state) {
+        if (entry.ip_rva < runtime->begin_rva || entry.ip_rva >= runtime->end_rva ||
+            (!first_ip && entry.ip_rva < previous_ip))
+            return failure(ErrorCode::malformed, "FH4 IP-to-state rows are unordered or outside their function");
+        if (entry.state < -1 || (entry.state >= 0 && static_cast<std::size_t>(entry.state) >= fh4.unwind_map.size()))
+            return failure(ErrorCode::malformed, "FH4 IP-to-state row exceeds the unwind map");
+        previous_ip = entry.ip_rva;
+        first_ip = false;
+    }
+    for (const auto &try_block : fh4.try_blocks) {
+        if (try_block.try_low < -1 || try_block.try_high < -1 || try_block.catch_high < -1 ||
+            try_block.try_low > try_block.try_high || try_block.catch_high < try_block.try_high ||
+            (try_block.try_low >= 0 && static_cast<std::size_t>(try_block.try_low) >= fh4.unwind_map.size()) ||
+            (try_block.try_high >= 0 && static_cast<std::size_t>(try_block.try_high) >= fh4.unwind_map.size()) ||
+            (try_block.catch_high >= 0 && static_cast<std::size_t>(try_block.catch_high) >= fh4.unwind_map.size()))
+            return failure(ErrorCode::malformed, "FH4 try-state range exceeds the unwind map");
+        if (try_block.handlers.size() > max_fh4_metadata_records - aggregate_records)
+            return failure(ErrorCode::resource_limit, "FH4 handler records exceed one million rows");
+        aggregate_records += try_block.handlers.size();
+        for (const auto &handler : try_block.handlers) {
+            if (handler.continuation_addresses.size() > max_fh4_metadata_records - aggregate_records)
+                return failure(ErrorCode::resource_limit, "FH4 continuation records exceed one million rows");
+            aggregate_records += handler.continuation_addresses.size();
+            if (handler.decorated_type_name) {
+                if (handler.decorated_type_name->size() > max_fh4_name_bytes - aggregate_name_bytes)
+                    return failure(ErrorCode::resource_limit, "FH4 catch type names exceed the one MiB comparison budget");
+                aggregate_name_bytes += handler.decorated_type_name->size();
+            }
+            for (const auto continuation : handler.continuation_addresses) {
+                if (!handler.continuation_addresses_are_rvas &&
+                    continuation >= runtime->end_rva - runtime->begin_rva)
+                    return failure(ErrorCode::malformed, "FH4 continuation address exceeds its encoded extent");
+            }
+        }
+    }
 
     PeFh4ExceptionPlan plan;
     plan.function_begin_rva=runtime->begin_rva;

@@ -25,9 +25,9 @@ inside initialized readable bytes. Their entries are decoded within the same
 metadata byte and entry-count budgets:
 
 - Big and relative method lists report selector, type encoding, and IMP fields.
-  The 32-bit subset accepts legacy absolute entries; small/relative lists are
-  explicitly unsupported there. Relative selector references in supported
-  64-bit lists are followed through their selector-reference
+  Both 32-bit and 64-bit ObjC2 images accept the bounded 12-byte small-method
+  entry format with signed 32-bit offsets based at each name, type, and IMP
+  field. Relative selector references are followed through their selector-reference
   slots unless the direct-selector flag is set. IMPs are retained only when
   they map to file-backed executable image bytes outside code exclusions.
   ARM32 IMPs preserve the encoded Thumb tag and mode separately from the
@@ -75,7 +75,7 @@ pointer slot, and scalar read. Protocol definitions use the same validated direc
 Default work limits are 100,000 classes, categories, and protocols, 64 MiB of metadata reads and validated list extents, 4,096 bytes per name, and 1,000,000 entries per list. A limit or unresolved class field
 marks the scan partial while preserving the rows already decoded. Cancellation
 is honored during scanning. Big-endian images, arm64_32, ObjC1 `__OBJC`
-records, runtime class data and 32-bit relative method lists remain unsupported.
+records and runtime class data remain unsupported.
 See the [32-bit layout and validation contract](../libs/analysis/docs/macho-objc-32bit.md)
 for exact supported offsets, pointer checks and remaining runtime forms.
 This hardening slice has source-review evidence only; no builds or tests were run.

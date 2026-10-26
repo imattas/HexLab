@@ -154,9 +154,9 @@ struct MachOObjCScan {
 };
 
 // Parses 32-bit and 64-bit little-endian Objective-C class-list, class_ro_t,
-// protocol, and category ObjC2 metadata from mapped Mach-O images. The 32-bit
-// subset accepts legacy absolute method entries, not small/relative methods or
-// ObjC1 __OBJC records. Pointer slots use
+// protocol, and category ObjC2 metadata from mapped Mach-O images. Both widths
+// accept validated absolute and 32-bit field-relative method entries; ObjC1
+// __OBJC records remain unsupported. Pointer slots use
 // exact relocation/dyld resolution where available; only unassociated
 // initialized bytes are treated as raw pointers.
 HEXLAB_ANALYSIS_EXPORT Result<MachOObjCScan>

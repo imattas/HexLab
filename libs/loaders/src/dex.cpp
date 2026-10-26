@@ -1,6 +1,7 @@
 #include "hexlab/loaders/dex.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -70,6 +71,74 @@ struct Code { std::uint32_t method = 0; std::uint64_t file_offset = 0; std::uint
 bool extent(std::uint64_t off, std::uint64_t count, std::uint64_t stride, std::uint64_t size) {
     return off <= size && (!count || (stride && count <= (size - off) / stride));
 }
+std::uint32_t adler32(std::span<const std::byte> bytes, std::stop_token stop) {
+    constexpr std::uint32_t modulus = 65521;
+    std::uint32_t a = 1, b = 0;
+    for (std::size_t begin = 0; begin < bytes.size();) {
+        if (stop.stop_requested()) return 0;
+        const auto count = std::min<std::size_t>(5552, bytes.size() - begin);
+        for (std::size_t i = 0; i < count; ++i) {
+            a += std::to_integer<std::uint8_t>(bytes[begin + i]);
+            b += a;
+        }
+        a %= modulus;
+        b %= modulus;
+        begin += count;
+    }
+    return (b << 16) | a;
+}
+
+std::array<std::byte, 20> sha1(std::span<const std::byte> bytes, std::stop_token stop, bool &canceled) {
+    std::uint32_t h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe,
+                  h3 = 0x10325476, h4 = 0xc3d2e1f0;
+    const auto process = [&](const std::byte *block) {
+        std::array<std::uint32_t, 80> words{};
+        for (unsigned i = 0; i < 16; ++i) {
+            const auto at = i * 4;
+            words[i] = (std::uint32_t(std::to_integer<std::uint8_t>(block[at])) << 24) |
+                       (std::uint32_t(std::to_integer<std::uint8_t>(block[at + 1])) << 16) |
+                       (std::uint32_t(std::to_integer<std::uint8_t>(block[at + 2])) << 8) |
+                       std::to_integer<std::uint8_t>(block[at + 3]);
+        }
+        for (unsigned i = 16; i < words.size(); ++i)
+            words[i] = std::rotl(words[i - 3] ^ words[i - 8] ^ words[i - 14] ^ words[i - 16], 1);
+        auto a = h0, b = h1, c = h2, d = h3, e = h4;
+        for (unsigned i = 0; i < words.size(); ++i) {
+            std::uint32_t f = 0, k = 0;
+            if (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }
+            else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
+            else { f = b ^ c ^ d; k = 0xca62c1d6; }
+            const auto temp = std::rotl(a, 5) + f + e + k + words[i];
+            e = d; d = c; c = std::rotl(b, 30); b = a; a = temp;
+        }
+        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
+    };
+    std::size_t offset = 0;
+    while (bytes.size() - offset >= 64) {
+        if ((offset & ((1u << 20) - 1)) == 0 && stop.stop_requested()) { canceled = true; return {}; }
+        process(bytes.data() + offset);
+        offset += 64;
+    }
+    std::array<std::byte, 128> tail{};
+    const auto remaining = bytes.size() - offset;
+    std::copy(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end(), tail.begin());
+    tail[remaining] = std::byte{0x80};
+    const std::size_t padded = remaining < 56 ? 64 : 128;
+    const auto bit_length = static_cast<std::uint64_t>(bytes.size()) * 8;
+    for (unsigned i = 0; i < 8; ++i)
+        tail[padded - 1 - i] = static_cast<std::byte>((bit_length >> (i * 8)) & 0xff);
+    process(tail.data());
+    if (padded == 128) process(tail.data() + 64);
+    std::array<std::byte, 20> digest{};
+    const std::array<std::uint32_t, 5> state{h0, h1, h2, h3, h4};
+    for (std::size_t i = 0; i < state.size(); ++i)
+        for (unsigned j = 0; j < 4; ++j)
+            digest[i * 4 + j] = static_cast<std::byte>((state[i] >> (24 - j * 8)) & 0xff);
+    canceled = stop.stop_requested();
+    return digest;
+}
+
 std::string utf8(std::uint32_t cp) {
     std::string out;
     if (cp <= 0x7f) out.push_back(static_cast<char>(cp));
@@ -168,6 +237,19 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         return Error{ErrorCode::malformed, "Truncated DEX header fields"};
     if (stored_file_size != file_size || header_size != header_bytes || endian != 0x12345678)
         return Error{ErrorCode::malformed, "DEX header size, file size, or endian tag is unsupported"};
+    bool hash_canceled = false;
+    const auto signature = sha1(bytes.subspan(32), stop, hash_canceled);
+    if (hash_canceled) return Error{ErrorCode::canceled, "DEX signature validation canceled"};
+    if (!std::equal(signature.begin(), signature.end(), bytes.begin() + 12))
+        return Error{ErrorCode::malformed, "DEX SHA-1 signature mismatch at file offset 0x0c"};
+    const auto stored_checksum = std::uint32_t(std::to_integer<std::uint8_t>(bytes[8])) |
+                                 (std::uint32_t(std::to_integer<std::uint8_t>(bytes[9])) << 8) |
+                                 (std::uint32_t(std::to_integer<std::uint8_t>(bytes[10])) << 16) |
+                                 (std::uint32_t(std::to_integer<std::uint8_t>(bytes[11])) << 24);
+    const auto computed_checksum = adler32(bytes.subspan(12), stop);
+    if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX checksum validation canceled"};
+    if (computed_checksum != stored_checksum)
+        return Error{ErrorCode::malformed, "DEX Adler-32 checksum mismatch at file offset 0x08"};
     if (string_count > max_items || type_count > max_items || proto_count > max_items || method_count > max_items || class_count > max_items || field_count > max_items)
         return Error{ErrorCode::resource_limit, "DEX identifier table exceeds one million items"};
     if ((string_count && (string_off & 3)) || (type_count && (type_off & 3)) ||

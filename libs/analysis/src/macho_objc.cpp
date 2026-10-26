@@ -232,11 +232,6 @@ MachOObjCList parse_list(const Image &image, const RelocationResolver &resolver,
             mark_incomplete(scan, owner_complete, "Objective-C method encoding flags are unsupported");
             return output;
         }
-        if (budget.pointer_bytes == 4 && relative) {
-            output.status = "unsupported-relative-methods-32";
-            mark_incomplete(scan, owner_complete, "32-bit Objective-C small/relative method lists are outside the supported legacy subset");
-            return output;
-        }
         const std::uint64_t minimum = (output.encoded_flags & 0x80000000u)
                                           ? 12
                                           : 3 * static_cast<std::uint64_t>(budget.pointer_bytes);
