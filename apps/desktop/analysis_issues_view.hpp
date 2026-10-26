@@ -1,6 +1,7 @@
 #pragma once
 
 #include "data_views.hpp"
+#include "analysis_issue_diagnostic.hpp"
 #include "hexlab/workspace/project.hpp"
 #include "hexlab/workspace/document_manager.hpp"
 
@@ -20,16 +21,19 @@ class AnalysisIssuesView final : public wxPanel {
     void update(std::shared_ptr<const ProjectSnapshot> project);
     void update(std::optional<DocumentId>, std::shared_ptr<const ProjectSnapshot>, std::optional<Location>);
     void retain_documents(std::span<const DocumentInfo>);
+    void set_type_diagnostics(std::optional<DocumentId>, std::vector<AnalysisIssueDiagnostic>);
+    void set_decompiler_diagnostics(std::optional<DocumentId>, std::vector<AnalysisIssueDiagnostic>);
     std::function<void(Location)> navigate;
 
   private:
-    enum class Kind { function_stop, candidate, overlap, incomplete_function, loader_diagnostic };
+    enum class Kind { function_stop, candidate, overlap, incomplete_function, loader_diagnostic, type_import_diagnostic, decompiler_diagnostic };
     struct Row {
         Kind kind;
         std::optional<Address> address;
         std::optional<Address> related;
         std::optional<Address> function_entry;
         wxString detail;
+        DiagnosticSeverity severity = DiagnosticSeverity::warning;
         bool operator==(const Row &) const = default;
     };
     struct Preference {
@@ -63,6 +67,7 @@ class AnalysisIssuesView final : public wxPanel {
     std::shared_ptr<const ProjectSnapshot> project_;
     const FunctionSnapshot *source_ = nullptr;
     const LoadedImage *loader_source_ = nullptr;
+    std::map<std::uint64_t, std::vector<AnalysisIssueDiagnostic>> type_diagnostics_, decompiler_diagnostics_;
     std::vector<Row> rows_;
     std::vector<std::size_t> visible_rows_;
     bool capped_ = false;

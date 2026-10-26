@@ -945,8 +945,16 @@ void TypeSymbolsView::import_header() {
     else if (target.GetSelection() == 2) { options.pointer_bytes = 4; options.long_bytes = 4; }
     auto parsed = types::import_c_header(source, options);
     if (!parsed) {
+        if (diagnostics_changed) diagnostics_changed({{"Header import", DiagnosticSeverity::error, parsed.error().message, {}, {}}});
         wxMessageBox(text(parsed.error().message), "Header import failed", wxOK | wxICON_ERROR, this);
         return;
+    }
+    if (diagnostics_changed) {
+        std::vector<AnalysisIssueDiagnostic> diagnostics;
+        const auto source_name = path.filename().string();
+        for (const auto &message : parsed.value().diagnostics)
+            diagnostics.push_back({"Header import (" + source_name + ")", DiagnosticSeverity::warning, message, {}, {}});
+        diagnostics_changed(std::move(diagnostics));
     }
     std::set<std::string, std::less<>> existing;
     for (const auto &definition : project_->state->user->types) existing.insert(definition.name);
@@ -1178,6 +1186,7 @@ void TypeSymbolsView::import_pdb_types() {
     const auto root_pdb_path = std::filesystem::path(picker.GetPath().ToStdWstring());
     auto database = types::parse_pdb(bytes);
     if (!database) {
+        if (diagnostics_changed) diagnostics_changed({{"PDB type import", DiagnosticSeverity::error, database.error().message, {}, {}}});
         wxMessageBox(text(database.error().message), "PDB type import failed", wxOK | wxICON_ERROR, this);
         pdb_id_diagnostic_ = "PDB parse failed: " + database.error().message;
         refresh_pdb_function_ids();
@@ -1218,6 +1227,7 @@ void TypeSymbolsView::import_pdb_types() {
     std::vector<std::pair<std::uint8_t, std::uint8_t>> root_namespace_map;
     auto stream = types::parse_pdb_types(database.value());
     if (!stream) {
+        if (diagnostics_changed) diagnostics_changed({{"PDB type import", DiagnosticSeverity::error, stream.error().message, {}, {}}});
         wxMessageBox(text(stream.error().message), "PDB type import failed", wxOK | wxICON_ERROR, this);
         pdb_id_diagnostic_ = "TPI parse failed; IPI records remain unjoined: " + stream.error().message;
         refresh_pdb_function_ids();
@@ -1225,6 +1235,7 @@ void TypeSymbolsView::import_pdb_types() {
     }
     auto graph = types::resolve_pdb_type_graph(stream.value());
     if (!graph) {
+        if (diagnostics_changed) diagnostics_changed({{"PDB type import", DiagnosticSeverity::error, graph.error().message, {}, {}}});
         wxMessageBox(text(graph.error().message), "PDB type import failed", wxOK | wxICON_ERROR, this);
         pdb_id_diagnostic_ = "TPI graph resolution failed; IPI records remain unjoined: " + graph.error().message;
         refresh_pdb_function_ids();
@@ -1739,6 +1750,23 @@ void TypeSymbolsView::import_pdb_types() {
     if (skipped) message += wxString::Format(" %llu unsupported, unnamed, duplicate, ambiguous, or existing names were skipped.",
                                              static_cast<unsigned long long>(skipped));
     if (!server_warning.empty()) message += " Type-server loading was partial: " + text(server_warning);
+    if (diagnostics_changed) {
+        std::vector<AnalysisIssueDiagnostic> diagnostics;
+        const auto source_name = "PDB type import (" + root_pdb_path.filename().string() + ")";
+        if (!pdb_id_diagnostic_.empty()) diagnostics.push_back({source_name, DiagnosticSeverity::warning, pdb_id_diagnostic_, {}, {}});
+        if (!server_warning.empty()) diagnostics.push_back({source_name, DiagnosticSeverity::warning, "Type-server loading was partial: " + server_warning, {}, {}});
+        if (unresolved_id_count || unsupported_id_count)
+            diagnostics.push_back({source_name, DiagnosticSeverity::warning,
+                "IPI function records: " + std::to_string(unresolved_id_count) + " unresolved and " +
+                std::to_string(unsupported_id_count) + " unsupported.", {}, {}});
+        for (const auto &row : pdb_data_symbol_rows_) {
+            if (row.resolved || row.status.empty()) continue;
+            diagnostics.push_back({source_name, DiagnosticSeverity::warning,
+                "Data symbol " + row.name + ": " + row.status, row.address, {}});
+            if (diagnostics.size() >= 2048) break;
+        }
+        diagnostics_changed(std::move(diagnostics));
+    }
     wxMessageBox(message, "PDB type import", wxOK | (added ? wxICON_INFORMATION : wxICON_WARNING), this);
 }
 }

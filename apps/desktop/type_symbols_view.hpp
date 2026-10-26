@@ -1,5 +1,6 @@
 #pragma once
 #include "hexlab/workspace/project.hpp"
+#include "analysis_issue_diagnostic.hpp"
 #include "data_views.hpp"
 #include <wx/notebook.h>
 #include <wx/panel.h>
@@ -41,6 +42,7 @@ class TypeSymbolsView final : public wxPanel {
     void update(std::shared_ptr<const ProjectSnapshot> project, std::optional<Location> selection,
                 std::function<void(ProjectCommand)> submit);
     std::function<void(Location)> navigate;
+    std::function<void(std::vector<AnalysisIssueDiagnostic>)> diagnostics_changed;
 
   private:
     wxNotebook *pages_ = nullptr;

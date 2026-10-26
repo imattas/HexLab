@@ -1822,6 +1822,9 @@ struct MainFrame::Impl {
         }
         if (type_symbols) {
             type_symbols->navigate = [this](Location location) { frame.Navigate(location); };
+            type_symbols->diagnostics_changed = [this, id](std::vector<AnalysisIssueDiagnostic> diagnostics) {
+                if (analysis_issues) analysis_issues->set_type_diagnostics(id, std::move(diagnostics));
+            };
             auto project = id ? controller->documents().project(*id) : nullptr;
             type_symbols->update(project, state().selection(), [this, id](ProjectCommand command) {
                 if (!id) return;
@@ -1832,6 +1835,9 @@ struct MainFrame::Impl {
         references->update(id, shown ? shown->project : nullptr, state().selection());
         if (analysis_issues)
             analysis_issues->update(id, shown ? shown->project : nullptr, state().selection());
+        pseudocode->diagnostics_changed = [this, id](std::vector<AnalysisIssueDiagnostic> diagnostics) {
+            if (analysis_issues) analysis_issues->set_decompiler_diagnostics(id, std::move(diagnostics));
+        };
         pseudocode->update_document(id, shown ? shown->project : nullptr, shown ? shown->revision : 0,
                            state().selection(),
                            [this, id](ProjectCommand command) {
