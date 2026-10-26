@@ -240,3 +240,8 @@ All work stayed headless and left `out/` untouched.
 - **WebAssembly MVP validation:** complete scalar function bodies are validated against signatures, locals/globals, calls, branch labels, memory immediates, numeric types, and structured-control results before mapping. Control/operand bounds and periodic cancellation are explicit; Debug loader build passed; the decompiler subset remains narrower; no tests run.
 - **Windows ARM32 debugging:** native stopped-thread GPR/NEON access, guarded edits, ARM/Thumb software breakpoints, and temporary-trap stepping for verified sequential instructions are implemented. Thumb IT blocks are rejected; ARMv7 syntax and Windows x64 debugger builds passed; native ARM32 runtime validation and hardware breakpoints remain open; no tests run.
 All work stayed headless and left out/ untouched.
+
+## 2026-10-26 continuation
+
+- **PowerPC64 ELFv2 ABI:** added an explicit little-endian classifier for integer/pointer and binary float/double scalars plus bounded integer-only C-like aggregates, with parameter-home slots, register exhaustion, and direct/hidden returns. `hexlab_analysis` Debug target compiled; no tests run. Other aggregate classes, ELFv1, big-endian selection, and variadic calls remain unsupported.
+- **PowerPC VMX integer slice:** added exact VX decoding and formatting for modular byte/halfword/word add/subtract and common bitwise operations, plus v0-v31 effects and typed 128-bit/lane IR intrinsics. Processor and decompiler Debug targets compiled; lane execution and broader VMX remain unsupported; no tests run.
