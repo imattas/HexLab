@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <iterator>
 #include <map>
+#include <mutex>
+#include <set>
 #include <unordered_set>
 
 namespace hexlab::elf_detail {
@@ -591,7 +593,8 @@ namespace hexlab {
 Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
                                               const symbols::DwarfSplitUnitRequest &request,
                                               std::stop_token stop,
-                                              std::uint64_t max_metadata_bytes) {
+                                              std::uint64_t max_metadata_bytes,
+                                              symbols::DwarfTypeSignatureResolver type_signature_resolver) {
     using namespace elf_detail;
     try {
         require(max_metadata_bytes != 0, "ELF DWO metadata budget must be nonzero", ErrorCode::invalid_argument);
@@ -618,6 +621,7 @@ Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
         dwarf.stop = stop;
         dwarf.expected_split_dwo_id = request.dwo_id;
         if (request.address_size) dwarf.expected_split_address_size = request.address_size;
+        dwarf.type_signature_resolver = std::move(type_signature_resolver);
         const auto copy_optional = [&](std::string_view name, std::vector<std::uint8_t> &target) {
             if (const auto *section = debug_section(metadata, name); section && section->size)
                 target = read_debug_bytes(storage, metadata, *section, budget, stop);
@@ -674,6 +678,10 @@ Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
             charge(sizeof(type) + type.source_name.size());
             charge_type(type.type);
         }
+        for (const auto &signature : imported.value().type_signatures) {
+            charge(sizeof(signature));
+            charge_type(signature.type);
+        }
         for (const auto &variable : imported.value().variables) {
             charge(sizeof(variable) + variable.name.size() + variable.location_expression.size() +
                    variable.location_operations.size() * sizeof(symbols::LocationOperation));
@@ -702,8 +710,10 @@ Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
 
 symbols::DwarfSplitUnitResolver make_elf_dwo_resolver(ElfDwoStorageResolver resolver,
                                                        std::stop_token stop,
-                                                       std::uint64_t max_metadata_bytes) {
-    return [resolver = std::move(resolver), stop, max_metadata_bytes]
+                                                       std::uint64_t max_metadata_bytes,
+                                                       symbols::DwarfTypeSignatureResolver type_signature_resolver) {
+    return [resolver = std::move(resolver), stop, max_metadata_bytes,
+            type_signature_resolver = std::move(type_signature_resolver)]
            (const symbols::DwarfSplitUnitRequest &request)
                -> Result<std::shared_ptr<symbols::ImportResult>> {
         if (!resolver)
@@ -712,9 +722,171 @@ symbols::DwarfSplitUnitResolver make_elf_dwo_resolver(ElfDwoStorageResolver reso
         auto storage = resolver(request);
         if (!storage) return storage.error();
         if (!storage.value()) return Error{ErrorCode::invalid_argument, "ELF DWO resolver returned null storage"};
-        auto imported = import_elf_dwo(*storage.value(), request, stop, max_metadata_bytes);
+        auto imported = import_elf_dwo(*storage.value(), request, stop, max_metadata_bytes,
+                                       type_signature_resolver);
         if (!imported) return imported.error();
         return std::make_shared<symbols::ImportResult>(std::move(imported.value()));
     };
+}
+
+symbols::DwarfTypeSignatureResolver make_elf_dwo_type_signature_resolver(
+    std::vector<ElfDwoTypeSource> sources, std::stop_token stop, ElfDwoTypeResolverLimits limits) {
+    struct State {
+        std::vector<ElfDwoTypeSource> sources;
+        std::vector<std::shared_ptr<symbols::ImportResult>> cache;
+        std::set<std::uint64_t> active;
+        std::set<std::uint64_t> active_dwo_ids;
+        std::uint64_t bytes = 0;
+        std::uint32_t requests = 0;
+        std::mutex mutex;
+        std::recursive_mutex invocation_mutex;
+        ElfDwoTypeResolverLimits limits;
+        std::stop_token stop;
+        std::optional<Error> catalog_error;
+    };
+    auto state = std::make_shared<State>();
+    state->sources = std::move(sources);
+    state->cache.resize(state->sources.size());
+    state->limits = limits;
+    state->stop = stop;
+    if (state->sources.size() > limits.max_sources)
+        state->catalog_error = Error{ErrorCode::resource_limit, "Cross-DWO source count exceeds configured limit"};
+    std::set<std::uint64_t> source_ids;
+    for (const auto &source : state->sources) {
+        if (state->catalog_error) break;
+        if (!source.storage || !source.identity.dwo_id ||
+            (source.identity.address_size != 4 && source.identity.address_size != 8)) {
+            state->catalog_error = Error{ErrorCode::invalid_argument,
+                "Cross-DWO source requires storage, exact DWO ID, and 4- or 8-byte address size"};
+            break;
+        }
+        if (!source_ids.insert(source.identity.dwo_id).second) {
+            state->catalog_error = Error{ErrorCode::malformed, "Ambiguous duplicate DWO identity in cross-DWO catalog"};
+            break;
+        }
+    }
+    auto self = std::make_shared<symbols::DwarfTypeSignatureResolver>();
+    const std::weak_ptr<symbols::DwarfTypeSignatureResolver> weak_self = self;
+    *self = [state, weak_self](std::uint64_t signature) -> Result<types::TypePtr> {
+        std::lock_guard invocation_lock(state->invocation_mutex);
+        if (state->catalog_error) return *state->catalog_error;
+        if (state->stop.stop_requested()) return Error{ErrorCode::canceled, "Cross-DWO type resolution canceled"};
+        {
+            std::lock_guard lock(state->mutex);
+            if (state->active.contains(signature))
+                return Error{ErrorCode::malformed, "Cycle in cross-DWO type-signature dependencies"};
+            if (state->requests >= state->limits.max_requests)
+                return Error{ErrorCode::resource_limit, "Cross-DWO type request limit exceeded"};
+            ++state->requests;
+            state->active.insert(signature);
+        }
+        struct ActiveGuard { std::shared_ptr<State> state; std::uint64_t signature;
+            ~ActiveGuard() { std::lock_guard lock(state->mutex); state->active.erase(signature); }
+        } guard{state, signature};
+        std::vector<symbols::ImportedTypeSignature> matches;
+        bool skipped_active_dwo = false;
+        for (std::size_t i = 0; i < state->sources.size(); ++i) {
+            if (state->stop.stop_requested()) return Error{ErrorCode::canceled, "Cross-DWO type resolution canceled"};
+            const auto &source = state->sources[i];
+            std::shared_ptr<symbols::ImportResult> imported;
+            {
+                std::lock_guard lock(state->mutex);
+                imported = state->cache[i];
+            }
+            if (!imported) {
+                {
+                    std::lock_guard lock(state->mutex);
+                    if (!state->active_dwo_ids.insert(source.identity.dwo_id).second) {
+                        skipped_active_dwo = true;
+                        continue;
+                    }
+                }
+                struct DwoGuard { std::shared_ptr<State> state; std::uint64_t id;
+                    ~DwoGuard() { std::lock_guard lock(state->mutex); state->active_dwo_ids.erase(id); }
+                } dwo_guard{state, source.identity.dwo_id};
+                const auto size = source.storage->size();
+                {
+                    std::lock_guard lock(state->mutex);
+                    if (size > state->limits.max_bytes - state->bytes)
+                        return Error{ErrorCode::resource_limit, "Cross-DWO aggregate byte limit exceeded"};
+                    state->bytes += size;
+                }
+                auto resolver = weak_self.lock();
+                if (!resolver) return Error{ErrorCode::canceled, "Cross-DWO resolver expired during import"};
+                auto parsed = import_elf_dwo(*source.storage, source.identity, state->stop,
+                                             state->limits.max_bytes_per_dwo, *resolver);
+                if (!parsed) return parsed.error();
+                imported = std::make_shared<symbols::ImportResult>(std::move(parsed.value()));
+                if (!imported->split_unit || imported->split_dwo_id != source.identity.dwo_id)
+                    return Error{ErrorCode::malformed, "Cross-DWO import did not preserve the selected skeleton identity"};
+                std::uint64_t result_cost = 0;
+                const auto add_cost = [&](std::uint64_t amount) {
+                    if (amount > UINT64_MAX - result_cost) return false;
+                    result_cost += amount;
+                    return true;
+                };
+                std::unordered_set<const types::Type *> charged_types;
+                const auto charge_type = [&](const types::TypePtr &type) {
+                    if (!type || !charged_types.insert(type.get()).second) return true;
+                    auto encoded = types::encode(*type);
+                    return encoded && add_cost(encoded.value().size());
+                };
+                bool cost_valid = true;
+                for (const auto &row : imported->symbols)
+                    cost_valid = cost_valid && add_cost(sizeof(row) + row.name.size() + row.ranges.size() * sizeof(symbols::ImportedSymbol::Range)) && charge_type(row.type);
+                for (const auto &row : imported->types)
+                    cost_valid = cost_valid && add_cost(sizeof(row) + row.source_name.size()) && charge_type(row.type);
+                for (const auto &row : imported->variables) {
+                    cost_valid = cost_valid && add_cost(sizeof(row) + row.name.size() + row.location_expression.size() +
+                        row.location_operations.size() * sizeof(symbols::LocationOperation)) && charge_type(row.type);
+                    for (const auto &range : row.location_ranges)
+                        cost_valid = cost_valid && add_cost(sizeof(range) + range.expression.size() +
+                            range.operations.size() * sizeof(symbols::LocationOperation));
+                }
+                for (const auto &row : imported->enumerators)
+                    cost_valid = cost_valid && add_cost(sizeof(row) + row.name.size() + row.enum_type_name.size());
+                for (const auto &row : imported->type_signatures)
+                    cost_valid = cost_valid && add_cost(sizeof(row)) && charge_type(row.type);
+                for (const auto &unit : imported->line_units) {
+                    cost_valid = cost_valid && add_cost(sizeof(unit) + unit.rows.size() * sizeof(symbols::DwarfLineRow));
+                    for (const auto &directory : unit.directories) cost_valid = cost_valid && add_cost(sizeof(directory) + directory.size());
+                    for (const auto &file : unit.files) cost_valid = cost_valid && add_cost(sizeof(file) + file.name.size());
+                }
+                if (!cost_valid) return Error{ErrorCode::resource_limit, "Cross-DWO result size overflowed accounting"};
+                {
+                    std::lock_guard lock(state->mutex);
+                    if (result_cost > state->limits.max_bytes - state->bytes)
+                        return Error{ErrorCode::resource_limit, "Cross-DWO aggregate byte limit exceeded"};
+                    state->bytes += result_cost;
+                }
+                std::lock_guard lock(state->mutex);
+                if (!state->cache[i]) state->cache[i] = imported;
+                else imported = state->cache[i];
+            }
+            for (const auto &entry : imported->type_signatures) {
+                if (entry.signature != signature) continue;
+                if (!entry.type || entry.origin.source_id != "ELF .debug_info.dwo" ||
+                    entry.origin.section != ".debug_info" || entry.origin.record_size == 0)
+                    return Error{ErrorCode::malformed, "Cross-DWO type signature lacks type or source provenance"};
+                if (std::find(matches.begin(), matches.end(), entry) == matches.end()) matches.push_back(entry);
+            }
+        }
+        if (matches.empty()) {
+            if (skipped_active_dwo)
+                return Error{ErrorCode::malformed, "Cross-DWO signature could not be resolved without reimporting an active object"};
+            return Error{ErrorCode::unsupported, "Cross-DWO type signature was not found"};
+        }
+        if (matches.size() != 1) return Error{ErrorCode::malformed, "Ambiguous type signature across selected DWO objects"};
+        auto encoded = types::encode(*matches.front().type);
+        if (!encoded) return encoded.error();
+        {
+            std::lock_guard lock(state->mutex);
+            if (encoded.value().size() > state->limits.max_bytes - state->bytes)
+                return Error{ErrorCode::resource_limit, "Cross-DWO aggregate byte limit exceeded"};
+            state->bytes += encoded.value().size();
+        }
+        return matches.front().type;
+    };
+    return *self;
 }
 } // namespace hexlab

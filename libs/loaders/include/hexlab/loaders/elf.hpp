@@ -37,16 +37,35 @@ struct ElfLoadOptions {
     // parsing metadata. LoadedImage::image remains the unrebased ELF view.
     std::optional<std::uint64_t> runtime_load_bias;
 };
+struct ElfDwoTypeSource {
+    // Exact caller-selected skeleton/DWO pairing. The storage is never
+    // discovered from DW_AT_dwo_name or DW_AT_comp_dir.
+    symbols::DwarfSplitUnitRequest identity;
+    std::shared_ptr<const ByteStorage> storage;
+};
+struct ElfDwoTypeResolverLimits {
+    std::uint32_t max_sources = 4096;
+    std::uint32_t max_requests = 4096;
+    std::uint64_t max_bytes = 64u * 1024u * 1024u;
+    std::uint64_t max_bytes_per_dwo = 64u * 1024u * 1024u;
+};
 // Imports a split-compile unit from an ELF DWO object, checking its DWO ID and
 // address size against the requesting skeleton. The caller owns DWO discovery.
 HEXLAB_LOADERS_EXPORT Result<symbols::ImportResult> import_elf_dwo(
     const ByteStorage &, const symbols::DwarfSplitUnitRequest &,
-    std::stop_token = {}, std::uint64_t max_metadata_bytes = 64u * 1024u * 1024u);
+    std::stop_token = {}, std::uint64_t max_metadata_bytes = 64u * 1024u * 1024u,
+    symbols::DwarfTypeSignatureResolver = {});
 // Builds a safe split-unit callback from caller-controlled storage selection.
 // No path in DW_AT_dwo_name or DW_AT_comp_dir is opened by this helper.
 HEXLAB_LOADERS_EXPORT symbols::DwarfSplitUnitResolver make_elf_dwo_resolver(
     ElfDwoStorageResolver, std::stop_token = {},
-    std::uint64_t max_metadata_bytes = 64u * 1024u * 1024u);
+    std::uint64_t max_metadata_bytes = 64u * 1024u * 1024u,
+    symbols::DwarfTypeSignatureResolver = {});
+// Resolves DW_FORM_ref_sig8 over a caller-selected set of paired DWO objects.
+// Duplicate DWO IDs or signatures are treated as ambiguous; imports are lazy,
+// cached, cycle-checked, and bounded by the supplied aggregate limits.
+HEXLAB_LOADERS_EXPORT symbols::DwarfTypeSignatureResolver make_elf_dwo_type_signature_resolver(
+    std::vector<ElfDwoTypeSource>, std::stop_token = {}, ElfDwoTypeResolverLimits = {});
 // Container validation only; does not claim architecture/relocation support.
 // Reads the fixed header and, for extended counts, the first section record.
 // Table extents are checked without materializing the tables or whole input.

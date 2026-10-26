@@ -323,6 +323,14 @@ struct ImportedType {
     bool operator==(const ImportedType &) const = default;
 };
 
+// Type-unit signature exported with the owning DIE's checked source location.
+struct ImportedTypeSignature {
+    std::uint64_t signature = 0;
+    types::TypePtr type;
+    SourceOrigin origin;
+    bool operator==(const ImportedTypeSignature &) const = default;
+};
+
 // A validated DWARF v2-v5 location-expression instruction. The
 // decoder accepts address, literal/register/base-register, fbreg/CFA, constant,
 // dereference, integer stack manipulation/arithmetic and signed comparisons,
@@ -419,6 +427,7 @@ struct ImportedEnumerator {
 struct ImportResult {
     std::vector<ImportedSymbol> symbols;
     std::vector<ImportedType> types;
+    std::vector<ImportedTypeSignature> type_signatures;
     std::vector<ImportedVariable> variables;
     std::vector<ImportedEnumerator> enumerators;
     std::vector<DwarfLineUnit> line_units;
