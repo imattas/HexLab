@@ -18,6 +18,10 @@ ELF32 i386 `ET_DYN` REL records and little-endian ELF64 x86-64 or AArch64
 | i386 | `R_386_PC32` | 2 | `S + A - P` (low 32 bits) |
 | i386 | `R_386_GLOB_DAT` | 6 | `S` |
 | i386 | `R_386_JMP_SLOT` | 7 | `S` |
+| x86-64 | `R_X86_64_64` | 1 | `S + A` (64-bit field) |
+| x86-64 | `R_X86_64_PC32` | 2 | `S + A - P` (signed 32-bit field) |
+| x86-64 | `R_X86_64_32` | 10 | `S + A` (unsigned 32-bit field) |
+| x86-64 | `R_X86_64_32S` | 11 | `S + A` (signed 32-bit field) |
 | x86-64 | `R_X86_64_RELATIVE` | 8 | `B + A` |
 | x86-64 | `R_X86_64_GLOB_DAT` | 6 | `S` |
 | x86-64 | `R_X86_64_JUMP_SLOT` | 7 | `S` |
@@ -25,8 +29,16 @@ ELF32 i386 `ET_DYN` REL records and little-endian ELF64 x86-64 or AArch64
 | AArch64 | `R_AARCH64_GLOB_DAT` | 1025 | `S` |
 | AArch64 | `R_AARCH64_JUMP_SLOT` | 1026 | `S` |
 
-ELF64 patch targets must be complete eight-byte fields in writable,
-initialized load memory. ELF32 i386 targets must be complete four-byte fields
+ELF64 pointer relocations and `R_X86_64_64` targets must be complete
+eight-byte fields in writable, initialized load memory. The x86-64 `PC32`,
+`32`, and `32S` records patch complete four-byte fields under the same target
+checks. Their explicit RELA addends are preserved as signed 64-bit values;
+runtime `P` for `PC32` is the relocation place plus load bias. `R_X86_64_64`
+stores the low 64 bits of `S + A`; `R_X86_64_32` applies only when the
+mathematical result is in `[0, UINT32_MAX]`; `R_X86_64_32S` and
+`R_X86_64_PC32` apply only when their mathematical results fit signed 32 bits.
+Out-of-range values and unavailable addends or places are skipped with a row
+diagnostic. ELF32 i386 targets must be complete four-byte fields
 in writable, initialized load memory. Its RELATIVE addend is the unsigned
 32-bit word sampled from the original target bytes, and `B + A` must fit in
 32 bits. ELF32 runtime addresses, symbol values, and rebased segment extents
