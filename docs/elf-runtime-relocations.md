@@ -25,9 +25,18 @@ ELF32 i386 `ET_DYN` REL records and little-endian ELF64 x86-64 or AArch64
 | x86-64 | `R_X86_64_RELATIVE` | 8 | `B + A` |
 | x86-64 | `R_X86_64_GLOB_DAT` | 6 | `S` |
 | x86-64 | `R_X86_64_JUMP_SLOT` | 7 | `S` |
+| AArch64 | `R_AARCH64_ABS64` | 257 | `S + A` (low 64 bits) |
 | AArch64 | `R_AARCH64_RELATIVE` | 1027 | `B + A` |
 | AArch64 | `R_AARCH64_GLOB_DAT` | 1025 | `S` |
 | AArch64 | `R_AARCH64_JUMP_SLOT` | 1026 | `S` |
+
+The AArch64 profile also supports the dynamic `R_AARCH64_ABS64` relocation. It
+applies `S + A` and writes the low 64 bits without an overflow check, as
+specified by AAELF64. All supported ordinary AArch64 ELF64 dynamic
+relocations require an eight-byte aligned 64-bit target field. The ELF64
+`ABS32`, `ABS16`, and `PREL*` data relocations remain static-only and are not
+applied by this runtime overlay; the separate AArch64 P32/ELF32 profile is not
+implemented.
 
 ELF64 pointer relocations and `R_X86_64_64` targets must be complete
 eight-byte fields in writable, initialized load memory. The x86-64 `PC32`,
