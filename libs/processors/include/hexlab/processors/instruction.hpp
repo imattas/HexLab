@@ -422,7 +422,9 @@ enum class Opcode {
     rv_vmfeq_vv, rv_vmfeq_vf, rv_vmfne_vv, rv_vmfne_vf, rv_vmflt_vv, rv_vmflt_vf,
     rv_vmfle_vv, rv_vmfle_vf, rv_vmfgt_vf, rv_vmfge_vf,
     // Appended AVX packed floating division forms; preserve stored opcode IDs.
-    vdivps, vdivpd
+    vdivps, vdivpd,
+    // AArch64 preserving bitfield move; append to preserve persisted IDs.
+    a64_bfm
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

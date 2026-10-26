@@ -2975,16 +2975,53 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         Navigate(location);
         if (impl_->graph && impl_->graph->canvas) impl_->graph->canvas->reveal_selection();
     };
-    ui.graph->canvas->navigate = [this](Location location) {
+    const auto synchronize_graph_source = [this](std::shared_ptr<const ProjectGraph> source_graph, Location location) {
         const auto id = impl_->controller->documents().active_document();
+        const auto document = impl_->state().current();
         const auto project = id ? impl_->controller->documents().project(*id) : nullptr;
         const auto current_graph = impl_->graph->canvas->graph();
-        if (!project || !current_graph || !project_graph_current(*project, *current_graph)) {
+        if (!id || !document || document->id != *id || !impl_->shown ||
+            impl_->shown->id != *id || impl_->shown->revision != document->revision ||
+            !project || !project->loaded || !project->loaded->image ||
+            document->image != project->loaded->image ||
+            !source_graph || source_graph != current_graph ||
+            source_graph != impl_->controller->graph_result(*id) ||
+            !project_graph_current(*project, *source_graph) || impl_->closer->closing_window()) {
             impl_->log("Graph changed; stale navigation was canceled.");
+            return false;
+        }
+        // Location equality retains the address-space ID. Equal offsets in
+        // another image domain must never become a graph source by accident.
+        bool graph_location = false;
+        for (const auto &node : source_graph->model->nodes) {
+            if (node.selection == std::optional<Location>{location}) { graph_location = true; break; }
+            if (node.block)
+                for (const auto &fact : node.block->instructions)
+                    if (fact && Location{fact->instruction.address} == location) { graph_location = true; break; }
+            if (graph_location) break;
+        }
+        if (!graph_location)
+            for (const auto &edge : source_graph->model->edges)
+                if (edge.selection == std::optional<Location>{location} ||
+                    edge.target_location == std::optional<Location>{location}) { graph_location = true; break; }
+        if (!graph_location) {
+            impl_->log("Selected source is absent from the current graph.");
             return false;
         }
         Navigate(location);
         return impl_->state().selection() == std::optional<Location>{location};
+    };
+    ui.graph->canvas->synchronize_selection = synchronize_graph_source;
+    ui.graph->show_source = [this, synchronize_graph_source](std::shared_ptr<const ProjectGraph> graph,
+                                                            Location location, bool pseudocode) {
+        if (!synchronize_graph_source(std::move(graph), location)) return;
+        auto *view = pseudocode ? static_cast<wxWindow *>(impl_->pseudocode)
+                                : static_cast<wxWindow *>(impl_->listing);
+        const auto page = impl_->pages->FindPage(view);
+        if (page != wxNOT_FOUND) {
+            impl_->pages->SetSelection(static_cast<std::size_t>(page));
+            view->SetFocus();
+        }
     };
     ui.graph->canvas->context_action = [this](Location location, GraphContextAction action) {
         const auto id = impl_->controller->documents().active_document();

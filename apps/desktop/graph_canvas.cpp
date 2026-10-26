@@ -362,8 +362,8 @@ bool GraphCanvas::focus_node(GraphNodeId id, bool navigate_to_location) {
         Refresh();
     }
     if (focus_changed) focus_changed();
-    if (navigate_to_location && found->second->selection && navigate &&
-        !navigate(*found->second->selection))
+    if (navigate_to_location && found->second->selection &&
+        !navigate_location(*found->second->selection))
         return false;
     return true;
 }
@@ -601,7 +601,11 @@ void GraphCanvas::select(std::optional<Location> location) {
                 if (instruction_index(*node)) { matching_node = node->id; break; }
         }
     }
-    if (matching_node) {
+    // A graph-originated navigation can select a boundary node whose source
+    // address is also a real block's address. Keep that graph-local focus on
+    // synchronous and later refreshes of the same global selection.
+    const bool keep_focus = !changed && hit_.has_value();
+    if (matching_node && !keep_focus) {
         if (selected_nodes_.empty()) selected_nodes_.insert(*matching_node);
         selection_anchor_ = *matching_node;
         hit_ = GraphHit{*matching_node};
@@ -612,13 +616,48 @@ void GraphCanvas::select(std::optional<Location> location) {
         edge_focus_incoming_ = false;
         if (focus_changed) focus_changed();
     }
-    if (hit_ && std::holds_alternative<GraphEdgeId>(*hit_) &&
+    if (!keep_focus && hit_ && std::holds_alternative<GraphEdgeId>(*hit_) &&
         edges_.at(std::get<GraphEdgeId>(*hit_))->selection != selection_) {
         hit_.reset();
         edge_focus_incoming_ = false;
     }
     if (changed) reveal_selection();
     Refresh();
+}
+std::optional<Location> GraphCanvas::source_location() const {
+    if (!graph_) return {};
+    if (hit_) {
+        if (const auto *edge_id = std::get_if<GraphEdgeId>(&*hit_)) {
+            const auto edge = edges_.find(*edge_id);
+            return edge == edges_.end() ? std::nullopt : edge->second->selection;
+        }
+    }
+    const auto id = focused_node();
+    if (!id) return {};
+    const auto found = nodes_.find(*id);
+    if (found == nodes_.end()) return {};
+    const auto &node = *found->second;
+    if (const auto index = instruction_index(node))
+        return node.block->instructions[*index]->instruction.address;
+    return node.selection;
+}
+bool GraphCanvas::navigate_location(Location location) {
+    const auto source_graph = graph_;
+    const auto focus = hit_;
+    const auto incoming = edge_focus_incoming_;
+    const auto anchor = selection_anchor_;
+    const bool accepted = synchronize_selection ? synchronize_selection(source_graph, location)
+                                              : navigate && navigate(location);
+    // MainFrame synchronizes all views synchronously. Preserve the exact node
+    // or edge the user chose when multiple graph objects share one address.
+    if (source_graph == graph_ && focus) {
+        hit_ = focus;
+        edge_focus_incoming_ = incoming;
+        selection_anchor_ = anchor;
+        Refresh();
+        if (focus_changed) focus_changed();
+    }
+    return accepted;
 }
 void GraphCanvas::reveal_selection() {
     if (!selection_) { reveal_pending_ = false; return; }
@@ -683,12 +722,12 @@ void GraphCanvas::follow_focused_node() {
     if (const auto index = instruction_index(node)) {
         if (follow_instruction)
             follow_instruction(graph_, node.block->instructions[*index]->instruction.address);
-    } else if (node.selection && navigate) {
-        (void)navigate(*node.selection);
+    } else if (node.selection) {
+        (void)navigate_location(*node.selection);
     }
 }
 void GraphCanvas::move_instruction(bool next) {
-    if (!graph_ || navigation_nodes_.empty() || !navigate) return;
+    if (!graph_ || navigation_nodes_.empty() || (!navigate && !synchronize_selection)) return;
     hit_.reset();
     edge_focus_incoming_ = false;
     if (focus_changed) focus_changed();
@@ -702,12 +741,12 @@ void GraphCanvas::move_instruction(bool next) {
         const auto selected = instruction_index(node);
         if (!selected && node.selection != selection_) continue;
         if (selected && ((next && *selected + 1 < node.block->instructions.size()) || (!next && *selected > 0)))
-            (void)navigate(node.block->instructions[next ? *selected + 1 : *selected - 1]->instruction.address);
-        else if (next && n + 1 < navigation_nodes_.size()) (void)navigate(destination(*navigation_nodes_[n + 1], false));
-        else if (!next && n > 0) (void)navigate(destination(*navigation_nodes_[n - 1], true));
+            (void)navigate_location(node.block->instructions[next ? *selected + 1 : *selected - 1]->instruction.address);
+        else if (next && n + 1 < navigation_nodes_.size()) (void)navigate_location(destination(*navigation_nodes_[n + 1], false));
+        else if (!next && n > 0) (void)navigate_location(destination(*navigation_nodes_[n - 1], true));
         return;
     }
-    (void)navigate(destination(*(next ? navigation_nodes_.front() : navigation_nodes_.back()), !next));
+    (void)navigate_location(destination(*(next ? navigation_nodes_.front() : navigation_nodes_.back()), !next));
 }
 std::optional<GraphNodeId> GraphCanvas::focused_node() const {
     if (!graph_) return {};
@@ -781,7 +820,7 @@ void GraphCanvas::follow_edge(GraphEdgeId edge_id, bool forward) {
     reveal_node(destination_id);
     Refresh();
     if (focus_changed) focus_changed();
-    if (location && navigate && !navigate(*location)) return;
+    if (location && !navigate_location(*location)) return;
 }
 void GraphCanvas::reveal_node(GraphNodeId id) {
     const auto position = position_by_node_.find(id);
@@ -858,7 +897,7 @@ void GraphCanvas::activate(wxPoint point, bool follow) {
         if (focus_changed) focus_changed();
         return;
     }
-    if (location && navigate && !navigate(*location)) {
+    if (location && !navigate_location(*location)) {
         if (focus_changed) focus_changed();
         return;
     }
@@ -952,7 +991,7 @@ void GraphCanvas::show_context_menu(wxPoint point) {
             wxTheClipboard->Close();
         }
     } else if (command == follow_id && is_node) {
-        if (location && navigate) (void)navigate(*location);
+        if (location) (void)navigate_location(*location);
     } else if (command == follow_edge_id && !is_node) {
         follow_edge(std::get<GraphEdgeId>(*selected), true);
     } else if (location && context_action) {

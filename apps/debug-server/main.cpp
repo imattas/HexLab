@@ -365,7 +365,7 @@ struct ThreadSelection {
     ThreadId id = 0;
 };
 struct ResumeAction {
-    bool step = false;
+    hexlab::debugger::ThreadResumeKind kind = hexlab::debugger::ThreadResumeKind::continue_execution;
     ThreadSelection thread;
     std::optional<unsigned> signal;
 };
@@ -426,15 +426,18 @@ std::optional<ResumeRequest> parse_resume(std::string_view command, ThreadSelect
             if (action.empty()) return {};
             ResumeAction parsed;
             std::size_t selector_offset = 1;
-            if (action[0] == 'c' || action[0] == 's') {
-                parsed.step = action[0] == 's';
+            if (action[0] == 'c' || action[0] == 's' || action[0] == 't') {
+                parsed.kind = action[0] == 't' ? hexlab::debugger::ThreadResumeKind::stop :
+                    action[0] == 's' ? hexlab::debugger::ThreadResumeKind::single_step :
+                    hexlab::debugger::ThreadResumeKind::continue_execution;
             } else if (action[0] == 'C' || action[0] == 'S') {
                 const auto colon = action.find(':');
                 const auto signal_text = action.substr(1, colon == std::string_view::npos
                     ? std::string_view::npos : colon - 1);
                 parsed.signal = parse_signal(signal_text);
                 if (!parsed.signal) return {};
-                parsed.step = action[0] == 'S';
+                parsed.kind = action[0] == 'S' ? hexlab::debugger::ThreadResumeKind::single_step :
+                    hexlab::debugger::ThreadResumeKind::continue_execution;
                 selector_offset = colon == std::string_view::npos ? action.size() : colon;
             } else return {};
             if (selector_offset < action.size()) {
@@ -725,12 +728,11 @@ std::optional<ResolvedResume> resolve_resume_actions(ServerState& state, const s
             const auto id = action.thread.kind == ThreadSelectionKind::any ? state.event->thread : action.thread.id;
             if (action.thread.kind != ThreadSelectionKind::all && id != thread.id) continue;
             matched = &action;
-            if (action.step) {
+            kind = action.kind;
+            if (kind == hexlab::debugger::ThreadResumeKind::single_step) {
                 ++stepped;
-                kind = hexlab::debugger::ThreadResumeKind::single_step;
-            } else {
+            } else if (kind == hexlab::debugger::ThreadResumeKind::continue_execution) {
                 ++continued;
-                kind = hexlab::debugger::ThreadResumeKind::continue_execution;
             }
             break;
         }
@@ -829,7 +831,7 @@ std::string handle_command(ServerState& state, std::string_view command, bool& c
     }
     if (command == "QStartNoAckMode") { toggle_no_ack = true; return "OK"; }
     if (command == "vCont?") {
-        std::string actions = "vCont;c";
+        std::string actions = "vCont;c;t";
         if (single_step_supported(state)) actions += ";s";
         if (state.session.supports_scheduled_signal_disposition()) {
             actions += ";C";

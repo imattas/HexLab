@@ -2,6 +2,7 @@
 #include "control_target.hpp"
 #include "mips64_reference_helpers.hpp"
 #include "hexlab/analysis/relocations.hpp"
+#include "hexlab/processors/arm32_semantics.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -2883,6 +2884,7 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
         return result;
     using RegisterKey = std::pair<ExecutionMode, std::uint32_t>;
     using RegisterState = std::map<RegisterKey, Address>;
+    constexpr std::uint32_t carry_fact_register = 16;
     const auto process_block = [&](const BasicBlock &block, RegisterState registers) {
         for (const auto &fact : block.instructions) {
             reference_detail::canceled(stop);
@@ -2903,6 +2905,14 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                 else
                     ++value;
             }
+            const RegisterKey carry_key{mode, carry_fact_register};
+            const auto current_carry = [&]() -> std::optional<bool> {
+                const auto found = registers.find(carry_key);
+                if (found == registers.end() || found->second.space != instruction.address.space ||
+                    found->second.offset > 1)
+                    return {};
+                return found->second.offset != 0;
+            };
             if ((instruction.flow == FlowKind::call || instruction.flow == FlowKind::jump) &&
                 (instruction.opcode == Opcode::a32_bx || instruction.opcode == Opcode::a32_blx ||
                  instruction.opcode == Opcode::t32_bx || instruction.opcode == Opcode::t32_blx)) {
@@ -2983,6 +2993,8 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     return rotate ? std::rotr(*value, static_cast<int>(rotate)) : *value;
                 }
                 case ArmShift::rrx:
+                    if (const auto carry = current_carry())
+                        return (static_cast<std::uint32_t>(*carry) << 31) | (*value >> 1);
                     return {};
                 }
                 return {};
@@ -3026,13 +3038,33 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                        (instruction.opcode == Opcode::a32_add || instruction.opcode == Opcode::a32_sub ||
                         instruction.opcode == Opcode::a32_rsb || instruction.opcode == Opcode::a32_and ||
                         instruction.opcode == Opcode::a32_eor || instruction.opcode == Opcode::a32_orr ||
-                        instruction.opcode == Opcode::a32_bic)) {
+                        instruction.opcode == Opcode::a32_bic || instruction.opcode == Opcode::a32_adc ||
+                        instruction.opcode == Opcode::a32_sbc || instruction.opcode == Opcode::a32_rsc)) {
                 const auto *destination = architecture_register(instruction, 0, RegisterBank::arm32_gpr, 32);
                 const auto *source = architecture_register(instruction, 1, RegisterBank::arm32_gpr, 32);
                 const auto operand2 = arm_operand2_value(instruction.operands[2]);
-                if (arm_instruction_unconditional && destination && destination->index != 15 && source && operand2) {
+                const auto carry = current_carry();
+                const bool carry_arithmetic = instruction.opcode == Opcode::a32_adc ||
+                                               instruction.opcode == Opcode::a32_sbc ||
+                                               instruction.opcode == Opcode::a32_rsc;
+                if (arm_instruction_unconditional && destination && destination->index != 15 && source &&
+                    operand2 && (!carry_arithmetic || carry)) {
                     std::optional<Address> target;
-                    if (source->index == 15 &&
+                    if (carry_arithmetic && source->index != 15 && carry) {
+                        const auto base = tracked(source->index);
+                        if (base) {
+                            const auto lhs = static_cast<std::uint32_t>(base->offset);
+                            const std::uint32_t rhs = *operand2;
+                            std::uint32_t value = 0;
+                            switch (instruction.opcode) {
+                            case Opcode::a32_adc: value = lhs + rhs + static_cast<std::uint32_t>(*carry); break;
+                            case Opcode::a32_sbc: value = lhs - rhs - static_cast<std::uint32_t>(!*carry); break;
+                            case Opcode::a32_rsc: value = rhs - lhs - static_cast<std::uint32_t>(!*carry); break;
+                            default: continue;
+                            }
+                            target = Address{base->space, value};
+                        }
+                    } else if (source->index == 15 &&
                         (instruction.opcode == Opcode::a32_add || instruction.opcode == Opcode::a32_sub)) {
                         const auto pc_bias = instruction.context.mode == ExecutionMode::a32
                                                  ? UINT64_C(8)
@@ -3042,7 +3074,7 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                                                ? static_cast<std::uint32_t>(pc + *operand2)
                                                : static_cast<std::uint32_t>(pc - *operand2);
                         target = Address{instruction.address.space, value};
-                    } else if (source->index != 15) {
+                    } else if (source->index != 15 && operand2) {
                         const auto base = tracked(source->index);
                         if (base) {
                             const auto lhs = static_cast<std::uint32_t>(base->offset);
@@ -3101,7 +3133,7 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                 } else if (const auto *shifted = std::get_if<ArmShiftedRegisterOperand>(&memory->offset)) {
                     const auto source = registers.find({mode, shifted->source.index});
                     if (shifted->source.bank != RegisterBank::arm32_gpr || shifted->source.width != 32 ||
-                        shifted->shift == ArmShift::rrx || source == registers.end())
+                        source == registers.end())
                         continue;
                     auto value = static_cast<std::uint32_t>(source->second.offset);
                     std::uint32_t amount = shifted->amount;
@@ -3134,7 +3166,11 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                         }
                         break;
                     case ArmShift::rrx:
-                        continue;
+                        if (const auto carry = current_carry())
+                            value = (static_cast<std::uint32_t>(*carry) << 31) | (value >> 1);
+                        else
+                            continue;
+                        break;
                     }
                     displacement = value;
                 }
@@ -3163,11 +3199,38 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     writeback_definition = {{memory->base.index,
                                              Address{base->second.space, effective}}};
             }
+            const bool carry_may_change = instruction.flow != FlowKind::call && instruction.arm &&
+                (!instruction.arm->flags_known || (instruction.arm->flags_written & 2));
+            std::optional<bool> updated_carry;
+            if (carry_may_change && instruction.arm->flags_known &&
+                (instruction.arm->flags_written & 2) &&
+                instruction.arm->predicate == ArmPredicate::always && !instruction.arm->writes_pc) {
+                const auto read_register = [&](const RegisterOperand &reg) { return arm_register_value(reg); };
+                const auto known_carry = current_carry();
+                const std::array<bool, 2> candidates{known_carry.value_or(false), known_carry.value_or(true)};
+                const auto candidate_count = known_carry ? std::size_t{1} : std::size_t{2};
+                std::optional<bool> common;
+                bool valid = true;
+                for (std::size_t candidate = 0; candidate < candidate_count; ++candidate) {
+                    Arm32Nzcv incoming{};
+                    incoming.c = candidates[candidate];
+                    const auto evaluated = evaluate_arm32_nzcv_instruction(instruction, incoming, read_register);
+                    if (!evaluated || !(evaluated->flags_written & 2)) { valid = false; break; }
+                    if (!common) common = evaluated->flags.c;
+                    else if (*common != evaluated->flags.c) { valid = false; break; }
+                }
+                if (valid) updated_carry = common;
+            }
             for (const auto &written : instruction.register_writes)
                 if (written.bank == RegisterBank::arm32_gpr && written.index != 15)
                     registers.erase({mode, written.index});
             if (instruction.flow == FlowKind::call)
                 registers.clear();
+            if (carry_may_change) {
+                registers.erase(carry_key);
+                if (updated_carry)
+                    registers[carry_key] = Address{instruction.address.space, *updated_carry ? 1u : 0u};
+            }
             if (definition) {
                 registers[{mode, definition->first}] = definition->second;
                 result.address_definitions.insert(fact->id);

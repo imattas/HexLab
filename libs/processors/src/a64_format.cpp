@@ -35,6 +35,7 @@ std::string mnemonic(Opcode opcode, std::uint8_t condition) {
     if (opcode == Opcode::a64_stp) return "stp";
     if (opcode == Opcode::a64_sbfm) return "sbfm";
     if (opcode == Opcode::a64_ubfm) return "ubfm";
+    if (opcode == Opcode::a64_bfm) return "bfm";
     static constexpr const char *names[]{"b",    "bl",  "b.cond", "cbz",  "cbnz", "tbz",  "tbnz", "br",   "blr",
                                          "ret",  "brk", "nop",    "movn", "movz", "movk", "add",  "adds", "sub",
                                          "subs", "and", "orr", "eor", "ands", "adr", "adrp", "ldr", "str", "ldrb", "strb", "ldrh", "strh", "sbfm", "ubfm"};
@@ -105,6 +106,22 @@ std::string format(const Instruction &i) {
                 result += register_name(*reg) + "." + std::to_string(lanes) + suffix;
             }
             return result;
+        }
+    }
+    if (i.opcode == Opcode::a64_bfm && i.operands.size() == 4) {
+        const auto *dst = std::get_if<RegisterOperand>(&i.operands[0]);
+        const auto *src = std::get_if<RegisterOperand>(&i.operands[1]);
+        const auto *r = std::get_if<ImmediateOperand>(&i.operands[2]);
+        const auto *s = std::get_if<ImmediateOperand>(&i.operands[3]);
+        if (dst && src && r && s && (dst->width == 32 || dst->width == 64) &&
+            src->width == dst->width && r->value < dst->width && s->value < dst->width) {
+            if (s->value >= r->value)
+                return "bfxil " + register_name(*dst) + ", " + register_name(*src) + ", #" +
+                    hex(r->value) + ", #" + hex(s->value - r->value + 1);
+            const auto field = ", #" + hex(dst->width - r->value) + ", #" + hex(s->value + 1);
+            if (src->bank == RegisterBank::arm64_zero)
+                return "bfc " + register_name(*dst) + field;
+            return "bfi " + register_name(*dst) + ", " + register_name(*src) + field;
         }
     }
     if ((i.opcode == Opcode::a64_ubfm || i.opcode == Opcode::a64_sbfm) && i.operands.size() == 4) {

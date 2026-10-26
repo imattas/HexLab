@@ -117,14 +117,16 @@ bool integer(Instruction &i, std::uint32_t word) {
         const unsigned opc = (word >> 29) & 3;
         const unsigned immr = (word >> 16) & 0x3f;
         const unsigned imms = (word >> 10) & 0x3f;
-        if ((opc != 0 && opc != 2) || immr >= width || imms >= width ||
+        if (opc == 3 || (word & 0x00200000u) || immr >= width || imms >= width ||
             ((word >> 22) & 1) != (width == 64 ? 1u : 0u))
-            return false; // BFM and reserved width encodings retain no fabricated semantics.
-        i.opcode = opc == 0 ? Opcode::a64_sbfm : Opcode::a64_ubfm;
-        operand(i, reg(word & 31, width), OperandAccess::write);
+            return false; // Reserved opc, fixed-bit and width encodings have no native semantics.
+        i.opcode = opc == 0 ? Opcode::a64_sbfm : opc == 1 ? Opcode::a64_bfm : Opcode::a64_ubfm;
+        operand(i, reg(word & 31, width), opc == 1 ? OperandAccess::read_write : OperandAccess::write);
         operand(i, reg((word >> 5) & 31, width), OperandAccess::read);
         immediate(i, immr, 6, width);
         immediate(i, imms, 6, width);
+        if (opc == 1 && width == 32 && (word & 31) != 31)
+            i.register_writes.push_back(reg(word & 31, 64));
         return true;
     }
     const auto shift = (word >> 22) & 3;

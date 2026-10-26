@@ -1,6 +1,7 @@
 #pragma once
 #include "graph_canvas.hpp"
 #include <wx/choice.h>
+#include <wx/button.h>
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
 #include <vector>
@@ -11,12 +12,14 @@ class GraphView final : public wxPanel {
     void update(const ProjectSnapshot *, std::optional<Location>, GraphKind, std::size_t call_depth,
                 std::shared_ptr<const ProjectGraph>, bool, const wxString &);
     std::function<void(GraphKind, std::size_t)> kind_changed;
+    std::function<void(std::shared_ptr<const ProjectGraph>, Location, bool pseudocode)> show_source;
     GraphCanvas *canvas;
 
   private:
     wxChoice *kind_;
     wxChoice *call_depth_;
     wxStaticText *status_;
+    wxButton *show_listing_, *show_pseudocode_;
     wxStaticText *search_status_;
     wxTextCtrl *search_;
     std::optional<Sha256Digest> search_graph_key_;

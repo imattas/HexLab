@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hexlab/processors/instruction.hpp"
+#include "hexlab/processors/processors_export.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -29,7 +30,7 @@ struct Arm32AluResult {
 // Evaluate an ALU operation after the caller has resolved and shifted operand2.
 // `shifter_carry` is required only when a logical operation writes C. `incoming.c`
 // supplies the carry-in for ADC/SBC/RSC. Arithmetic is modulo 2^32.
-std::optional<Arm32AluResult> evaluate_arm32_alu(Arm32AluOperation operation,
+HEXLAB_PROCESSORS_EXPORT std::optional<Arm32AluResult> evaluate_arm32_alu(Arm32AluOperation operation,
                                                 std::uint32_t lhs,
                                                 std::uint32_t operand2,
                                                 Arm32Nzcv incoming,
@@ -41,7 +42,7 @@ using Arm32RegisterReader = std::function<std::optional<std::uint32_t>(const Reg
 // The callback supplies runtime GPR values; immediate and register-shifted
 // operand2 forms, including RRX and register-specified shifts, are evaluated here.
 // PC-writing, multiply, memory, unknown-flag, and unsupported operand forms fail closed.
-std::optional<Arm32AluResult> evaluate_arm32_nzcv_instruction(const Instruction &instruction,
+HEXLAB_PROCESSORS_EXPORT std::optional<Arm32AluResult> evaluate_arm32_nzcv_instruction(const Instruction &instruction,
                                                              Arm32Nzcv incoming,
                                                              const Arm32RegisterReader &read_register);
 

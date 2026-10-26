@@ -135,6 +135,14 @@ the pending event remains available for retry. The API tracks expected step
 completions by thread, so an intervening stop from another thread does not
 consume the step expectation. Session state remains a coarse running/stopped
 summary; use `thread_run_states()` for the backend's known per-thread state.
+Stop actions are sent explicitly as `t:TID` or `t:pPID.TID`; they are never
+implemented by dropping that thread from the packet. The full process-qualified
+identity is checked against the selected inferior before transmission. At least
+one action must continue or step a thread. HexLab's own all-stop server also
+accepts explicit `t` in mixed schedules, such as `vCont;t:TID;c` or
+`vCont;c:TID;t`, and advertises `t` through `vCont?`. Its selectors are plain
+hexadecimal thread IDs, `0` for the event owner, and `-1` or an omitted selector
+for all live threads; it does not negotiate multiprocess or non-stop mode.
 Native backends implement bounded exact schedules described in
 [Native thread schedules](../libs/debugger/docs/thread-resume-schedules.md).
 A schedule is validated as one operation; it does not promise processor-atomic

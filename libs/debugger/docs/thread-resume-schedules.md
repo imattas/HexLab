@@ -11,12 +11,27 @@ stopped state and continue draining queued events.
 
 The [RSP server](../../../docs/debug-server.md) resolves `vCont` left to right
 against a bounded live-thread census. Every unmatched live thread receives a
-stop action. Selector `0` chooses the event thread; omitted selectors and `-1`
-match all live threads. An all-continue result retains the existing process-wide
-continue path. Other schedules reach the shared API intact. The server still
-accepts only `c`/`s` actions, uses all-stop replies, and does not negotiate
-multiprocess, non-stop, signal-delivery, range-step or explicit `t` packets.
+stop action. Explicit `t` actions also reach the shared API as stop actions,
+and prevent later matching actions from resuming that thread. Selector `0`
+chooses the event thread; omitted selectors and `-1` match all live threads.
+For example, `vCont;t:TID;c` holds that thread and continues its peers, while
+`vCont;c:TID;t` continues only that thread. An all-continue result retains the
+existing process-wide continue path. Other schedules reach the shared API
+intact, including an explicit stop for the pending event owner when selected.
+The all-stop server accepts `c`/`s`/`t` and advertises `t` in `vCont?`; a
+stop-only result returns `E01` without consuming the event because the shared
+API requires at least one runnable thread. No new stop notification is needed
+for a thread already stopped. The server does not negotiate multiprocess,
+non-stop or range-step packets. Signal actions `C`/`S` are advertised only when
+the backend supports scheduled signal disposition.
 These selector rules follow the [GDB packet specification](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Packets.html).
+
+The outbound RSP backend uses exact `t:TID` or `t:pPID.TID` wire actions in
+mixed schedules only when the peer advertises `t`. Process-qualified IDs retain
+both components and must belong to the selected inferior. A stop action cannot
+preserve or disposition a pending nonzero remote stop signal; that schedule
+fails before transmission. Syntax, identity, and unsupported-action errors
+retain the owned event, with no retry as an unfiltered continuation.
 
 ## Supported native subsets
 
@@ -57,8 +72,8 @@ place for a later encounter after signal handling. Queued signals are removed
 only after a successful resume or explicit suppression. This follows Linux
 ptrace signal-delivery semantics: the signal is injected by the next restart
 operation, and a zero signal suppresses it ([ptrace(2)](https://man7.org/linux/man-pages/man2/ptrace.2.html)).
-The RSP server still does not negotiate signal-delivery packets, so this
-disposition is currently available through the native scheduling API.
+The RSP server advertises `C`/`S` when this scheduled disposition is supported;
+it accepts suppression or redelivery of the pending event owner's signal.
 
 ## Windows suspension ownership
 
@@ -96,6 +111,6 @@ retry while the debug event remains owned. Neither can undo instructions already
 executed. This is one validated scheduling operation, not processor-atomic
 execution. No rejected filtered schedule is retried as a global continuation.
 
-This increment was reviewed from source only. No builds, tests or live debugging
-were run. Follow up with serial debugger/server compilation on Windows x64 and
-the architecture-specific native builds, then live multithread validation.
+The explicit RSP stop-action integration was checked with a Windows x64 Debug
+debugger/server build. No tests or live debugging were run. Architecture-specific
+native builds and live multithread validation remain follow-up work.
