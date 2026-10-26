@@ -2,6 +2,7 @@
 
 #include "project_view.hpp"
 #include "hexlab/analysis/macho_objc_types.hpp"
+#include "hexlab/database/codec.hpp"
 #include <algorithm>
 #include <string_view>
 #include <unordered_map>
@@ -208,30 +209,53 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
             ++class_name_counts[*row.name];
     }
     std::unordered_set<std::string> reported_duplicate_names;
+    bool project_type_limit_reported = false;
     const auto add_definition = [&](std::string name, types::TypePtr type,
                                     std::string section, std::uint64_t slot_index,
                                     std::uint64_t record_offset, std::uint64_t record_size) {
         if (!type) return;
+        // ImportPortableTypes validates every definition before applying any of them.
+        // Reject a record that the project format cannot name or encode here so it
+        // does not invalidate otherwise importable classes in the same scan.
+        if (name.empty() || name.size() > 512) {
+            plan.skipped.push_back("Objective-C type name exceeds the project import limit");
+            return;
+        }
+        auto encoding = types::encode(*type);
+        if (!encoding) {
+            plan.skipped.push_back(name + " cannot be encoded for project import: " + encoding.error().message);
+            return;
+        }
         database::DwarfSourceOrigin origin{"Mach-O ObjC2", std::move(section), slot_index,
                                            record_offset, std::max<std::uint64_t>(record_size, 1)};
         auto prior = std::find_if(existing.begin(), existing.end(), [&](const auto &item) { return item.name == name; });
         if (prior != existing.end()) {
             auto old_encoding = types::encode(*prior->type);
-            auto new_encoding = types::encode(*type);
-            if (old_encoding && new_encoding && old_encoding.value() == new_encoding.value() && prior->origin == origin)
+            if (old_encoding && old_encoding.value() == encoding.value() && prior->origin == origin)
                 return;
             plan.conflicts.push_back(name + " already exists with different content or provenance");
+            return;
+        }
+        if (existing.size() + plan.definitions.size() >= database::project_record_limit) {
+            if (!project_type_limit_reported) {
+                plan.skipped.push_back("Objective-C type import reaches the project type-record limit");
+                project_type_limit_reported = true;
+            }
             return;
         }
         plan.definitions.push_back({std::move(name), std::move(type), {}, std::move(origin),
                                     database::DeclarationKind::type, {}});
     };
-    const auto make_methods = [](const MachOObjCList &list, bool is_static) {
+    const auto make_methods = [](const MachOObjCList &list, bool is_static)
+        -> std::optional<std::vector<types::Method>> {
         std::vector<types::Method> methods;
         for (const auto &method : list.methods) {
-            if (method.selector && method.signature && method.signature_status == "parsed")
+            if (method.selector && method.signature && method.signature_status == "parsed") {
+                // The persistent type codec accepts at most 100,000 methods.
+                if (methods.size() == 100000) return std::nullopt;
                 methods.push_back({*method.selector, method.signature, types::MemberAccess::unknown,
                                    types::MemberDispatch::unknown, 0, is_static});
+            }
         }
         return methods;
     };
@@ -249,8 +273,9 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
         }
         const auto class_type_name = "ObjC2.Class." + objc_type_component(*row.name);
         const auto meta_type_name = "ObjC2.Meta." + objc_type_component(*row.name);
+        const auto instance_methods = make_methods(row.methods, false);
         const auto import_instance_methods_without_layout = [&] {
-            auto methods = make_methods(row.methods, false);
+            auto methods = *instance_methods;
             if (methods.empty()) return;
             auto incomplete = types::Type::incomplete_aggregate(types::Kind::structure, class_type_name);
             if (!incomplete) return;
@@ -260,15 +285,24 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
                                row.classlist_index, row.class_address->offset, 1);
         };
         if (row.metaclass_address) {
-            auto meta = types::Type::incomplete_aggregate(types::Kind::structure, meta_type_name);
-            if (meta) {
-                auto meta_methods = types::Type::with_methods(meta.value(), make_methods(row.class_methods, true));
-                if (meta_methods)
-                    add_definition(meta_type_name, meta_methods.value(), "__objc_metaclass",
-                                   row.classlist_index, row.metaclass_address->offset, 1);
+            auto class_methods = make_methods(row.class_methods, true);
+            if (!class_methods) {
+                plan.skipped.push_back("Class " + *row.name + " has too many parsed class methods for project storage");
+            } else {
+                auto meta = types::Type::incomplete_aggregate(types::Kind::structure, meta_type_name);
+                if (meta) {
+                    auto meta_methods = types::Type::with_methods(meta.value(), std::move(*class_methods));
+                    if (meta_methods)
+                        add_definition(meta_type_name, meta_methods.value(), "__objc_metaclass",
+                                       row.classlist_index, row.metaclass_address->offset, 1);
+                }
             }
         } else if (!row.class_methods.methods.empty()) {
             plan.skipped.push_back("Class " + *row.name + " has class methods but no validated metaclass address");
+        }
+        if (!instance_methods) {
+            plan.skipped.push_back("Class " + *row.name + " has too many parsed instance methods for project storage");
+            continue;
         }
         if (!row.instance_size || *row.instance_size == 0) {
             plan.skipped.push_back("Class " + *row.name + " has no proven instance extent");
@@ -285,11 +319,18 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
         std::vector<types::Member> members;
         std::uint64_t cursor = 0;
         bool valid = true;
+        bool member_limit_exceeded = false;
         for (const auto &ivar : row.ivars.ivars) {
             if (!ivar.name || ivar.name_status != "resolved" || !ivar.type_encoding ||
                 ivar.type_status != "resolved" || !ivar.offset || !ivar.size || *ivar.offset < cursor ||
                 *ivar.offset > *row.instance_size || *ivar.size > *row.instance_size - *ivar.offset) {
                 valid = false; break;
+            }
+            const std::size_t needed_members = 1 + (*ivar.offset > cursor ? 1 : 0);
+            if (members.size() + needed_members > 100000) {
+                member_limit_exceeded = true;
+                valid = false;
+                break;
             }
             auto parsed = parse_macho_objc_property_encoding(*ivar.type_encoding,
                 MachOObjCEncodingLimits{4096, 32, 256, scan.pointer_bytes});
@@ -308,11 +349,18 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
             cursor = static_cast<std::uint64_t>(*ivar.offset) + *ivar.size;
         }
         if (!valid) {
-            plan.skipped.push_back("Class " + *row.name + " has an ivar without a proven type, size, or non-overlapping offset");
+            plan.skipped.push_back(member_limit_exceeded
+                ? "Class " + *row.name + " exceeds the persistent aggregate-member limit"
+                : "Class " + *row.name + " has an ivar without a proven type, size, or non-overlapping offset");
             import_instance_methods_without_layout();
             continue;
         }
         if (cursor < *row.instance_size) {
+            if (members.size() == 100000) {
+                plan.skipped.push_back("Class " + *row.name + " exceeds the persistent aggregate-member limit");
+                import_instance_methods_without_layout();
+                continue;
+            }
             auto byte = types::Type::integer("objc_byte", 1, 1, false);
             auto padding = byte ? types::Type::array(byte.value(), *row.instance_size - cursor) : hexlab::Result<types::TypePtr>(byte.error());
             if (!padding) { plan.skipped.push_back("Class " + *row.name + " has an unrepresentable instance extent"); continue; }
@@ -326,7 +374,7 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
         auto structure = types::Type::structure(class_type_name, std::move(members),
                                                 *row.instance_size, 1);
         if (!structure) { plan.skipped.push_back("Class " + *row.name + ": " + structure.error().message); import_instance_methods_without_layout(); continue; }
-        auto class_type = types::Type::with_methods(structure.value(), make_methods(row.methods, false));
+        auto class_type = types::Type::with_methods(structure.value(), *instance_methods);
         if (!class_type) { plan.skipped.push_back("Class " + *row.name + " has invalid method declarations"); continue; }
         add_definition(class_type_name, class_type.value(), "__objc_classlist",
                        row.classlist_index, row.class_address->offset, *row.instance_size);
