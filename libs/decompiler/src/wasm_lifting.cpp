@@ -445,8 +445,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     return unsupported("call_indirect type metadata is unavailable");
                 const auto &callee = metadata->function_types[*type_index];
                 if (callee.parameter_count != callee.parameter_types.size() || callee.result_count != callee.result_types.size() ||
-                    callee.parameter_types.size() > 1 || callee.result_types.size() > 1)
-                    return unsupported("call_indirect supports at most one numeric parameter and result");
+                    callee.parameter_types.size() > 127 || callee.result_types.size() > 1)
+                    return unsupported("call_indirect supports at most 127 numeric parameters and one result");
                 auto table_slot = shape_pop(stack, integer(32));
                 if (!table_slot) return table_slot.error();
                 for (auto it = callee.parameter_types.rbegin(); it != callee.parameter_types.rend(); ++it) {
@@ -633,8 +633,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 const auto *callee = &metadata->function_types[static_cast<std::size_t>(*type_index)];
                 if (callee->parameter_count != callee->parameter_types.size() ||
                     callee->result_count != callee->result_types.size() ||
-                    callee->parameter_types.size() > 1 || callee->result_types.size() > 1)
-                    return unsupported("call_indirect supports at most one numeric parameter and result");
+                    callee->parameter_types.size() > 127 || callee->result_types.size() > 1)
+                    return unsupported("call_indirect supports at most 127 numeric parameters and one result");
                 if (stack.empty() || stack.back()->type != integer(32))
                     return unsupported("call_indirect table index is unavailable or not i32");
                 auto table_index_value = stack.back();
