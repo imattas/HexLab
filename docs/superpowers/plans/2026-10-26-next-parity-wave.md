@@ -36,7 +36,7 @@ First audit the existing Windows native backend and public API. If x86/x64 suppo
 
 ### Task 3: WebAssembly MVP globals and indirect calls
 
-Own Wasm metadata/loader and `libs/decompiler/src/wasm_lifting.cpp`, plus focused docs. Preserve imported/defined global and table/function-type index spaces, mutability, and bounded MVP element/function mappings. Lift `global.get`, `global.set`, and `call_indirect` only when the target table slot and signature are statically and uniquely proven; dynamic/ambiguous targets remain explicit unsupported operations. Calls are limited to existing supported numeric stack types and zero/one result.
+Own Wasm metadata/loader and `libs/decompiler/src/wasm_lifting.cpp`, plus focused docs. Preserve imported/defined global and table/function-type index spaces, mutability, and bounded MVP element/function mappings. Lift `global.get` and mutable `global.set` with conservative state effects. Lift `call_indirect` with its runtime i32 table index and exact type-index signature when there is exactly one table; carry bounds/type-mismatch as a may-trap edge. Calls are limited to existing supported numeric stack types and zero/one result. Static element mappings may provide target evidence but are not required for dynamic calls.
 
 ## Integration
 
@@ -46,5 +46,5 @@ Root reviews workstream scope, failure behavior, and source/API compatibility be
 
 - [x] Task 1 implementation and source review; matching uses componentwise dominance and fixed template names use normal name resolution plus primary signature validation. `cmake --build $env:TEMP/hexlab-cpp-partial-specializations-debug --config Debug --target hexlab_types --parallel 3` passed (MSVC 19.44; no tests run).
 - [x] Task 2 audit: x86/x64 four-slot execution and write/access watchpoints were already implemented; platform docs and ledger now describe lifecycle behavior and read-only watchpoint limits. Debug `hexlab_debugger` and desktop-components builds passed; no tests/runtime validation.
-- [ ] Task 3 implementation, review, and loader/decompiler/CLI Debug builds.
+- [x] Task 3 implementation and source review; imported-then-defined globals preserve type/mutability, accesses have unknown state effects, and dynamic typed `call_indirect` retains the runtime i32 index and a bounds/type-mismatch may-trap edge. Debug `hexlab_loaders`, `hexlab_decompiler`, and `hexlab_cli` builds passed; no tests run.
 - [ ] Integrated source review, capability-ledger update, final builds, and push.
