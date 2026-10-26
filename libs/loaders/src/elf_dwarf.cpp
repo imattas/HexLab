@@ -405,17 +405,26 @@ DwarfPackageResolvers read_dwp_supplementary_resolver(
     const auto package_identity = read_supplementary_identity(sup_bytes);
     require(package_identity.supplementary && package_identity.checksum == application_identity.checksum,
             "DWP package identity/checksum does not match the application .debug_sup descriptor");
-    const auto *index_section = debug_section(metadata, ".debug_tu_index");
-    require(index_section && index_section->size, "DWP supplementary package has no .debug_tu_index", ErrorCode::unsupported);
     auto package = std::make_shared<DwarfPackage>();
-    package->index = read_package_index(*tracking, metadata, *index_section,
-        symbols::DwarfPackageIndexKind::type_units, budget, stop);
+    if (const auto *index = debug_section(metadata, ".debug_tu_index"); index && index->size)
+        package->type_index = read_package_index(*tracking, metadata, *index,
+            symbols::DwarfPackageIndexKind::type_units, budget, stop);
+    if (const auto *index = debug_section(metadata, ".debug_cu_index"); index && index->size)
+        package->index = read_package_index(*tracking, metadata, *index,
+            symbols::DwarfPackageIndexKind::compile_units, budget, stop);
+    require(package->index || package->type_index,
+            "DWP supplementary package has no CU or TU index", ErrorCode::unsupported);
+    require((!package->index || package->index->version == 5) &&
+                (!package->type_index || package->type_index->version == 5),
+            "DWP supplementary references require version-5 package indexes", ErrorCode::unsupported);
     constexpr std::pair<std::uint32_t, std::string_view> names[] = {
         {1, ".debug_info.dwo"}, {3, ".debug_abbrev.dwo"}, {4, ".debug_line.dwo"},
-        {6, ".debug_str_offsets.dwo"},
+        {5, ".debug_loclists.dwo"}, {6, ".debug_str_offsets.dwo"}, {7, ".debug_macro.dwo"},
+        {8, ".debug_rnglists.dwo"}, {9, ".debug_addr.dwo"},
     };
     for (const auto &[id, name] : names) {
         canceled(stop);
+        if (!package->index && id != 1 && id != 3 && id != 4 && id != 6) continue;
         const auto *section = debug_section(metadata, name);
         if (section && section->size)
             package->sections.emplace(id, read_debug_bytes(*tracking, metadata, *section, budget, stop));
@@ -431,39 +440,72 @@ DwarfPackageResolvers read_dwp_supplementary_resolver(
     std::vector<symbols::DwarfPackageSectionData> package_sections;
     package_sections.reserve(package->sections.size());
     for (const auto &[id, bytes] : package->sections) package_sections.push_back({id, bytes});
-    auto type_signature = symbols::make_dwarf_package_type_signature_resolver(
-        package->index, std::move(package_sections), package->strings, package->line_strings, stop,
-        {budget.used < max_bytes ? max_bytes - budget.used : 0,
-         std::min<std::uint32_t>(max_requests, 4096)});
+    const symbols::DwarfPackageTypeResolutionLimits limits{
+        budget.used < max_bytes ? max_bytes - budget.used : 0,
+        std::min<std::uint32_t>(max_requests, 4096)};
+    symbols::DwarfCrossContributionDieResolver compile_die;
+    if (package->index)
+        compile_die = symbols::make_dwarf_package_cross_contribution_die_resolver(
+            package->index, package_sections, package->strings, package->line_strings, stop,
+            limits, metadata.header.order == ByteOrder::little);
+    symbols::DwarfTypeSignatureResolver type_signature;
+    if (package->type_index)
+        type_signature = symbols::make_dwarf_package_type_signature_resolver(
+            package->type_index, std::move(package_sections), package->strings, package->line_strings,
+            stop, limits);
     auto retained_package = package;
     auto catalog_package = package;
-    symbols::DwarfTypeSignatureResolver retained_type_signature =
+    symbols::DwarfTypeSignatureResolver retained_type_signature;
+    if (type_signature) retained_type_signature =
         [type_signature = std::move(type_signature), retained_package = std::move(retained_package)](std::uint64_t signature) {
             return type_signature(signature);
         };
     auto supplementary = [package = std::move(package), type_signature = retained_type_signature,
+                          compile_die = std::move(compile_die),
                           application_identity, stop, examined]
         (const symbols::DwarfSupplementaryIdentity &requested_identity, std::uint64_t die_offset)
         -> Result<symbols::DwarfSupplementaryType> {
         try {
         require(requested_identity == application_identity,
                 "supplementary request identity differs from selected DWP package");
-        const auto info_column = std::find(package->index->section_ids.begin(), package->index->section_ids.end(), 1u);
-        require(info_column != package->index->section_ids.end(), "DWP type index has no INFO column");
-        const auto column = static_cast<std::size_t>(info_column - package->index->section_ids.begin());
+        // A section offset has meaning only within this checksum-verified
+        // supplementary object. Require one owner across both indexes before
+        // invoking either bounded resolver; never fall back by error category.
+        const symbols::DwarfPackageIndex *owner = nullptr;
         const symbols::DwarfPackageIndexRow *match = nullptr;
-        for (const auto &row : package->index->rows) {
-            canceled(stop);
-            if (column >= row.sections.size()) throw Failure{{ErrorCode::malformed, "invalid DWP type-index row"}};
-            const auto &range = row.sections[column];
-            if (die_offset < range.offset || die_offset - range.offset >= range.size) continue;
-            if (match) throw Failure{{ErrorCode::malformed, "supplementary DIE offset belongs to ambiguous DWP contributions"}};
-            match = &row;
+        std::size_t column = 0;
+        for (const auto &index : {package->index, package->type_index}) {
+            if (!index) continue;
+            const auto info_column = std::find(index->section_ids.begin(), index->section_ids.end(), 1u);
+            require(info_column != index->section_ids.end(), "DWP supplementary index has no INFO column");
+            const auto candidate_column = static_cast<std::size_t>(info_column - index->section_ids.begin());
+            for (const auto &row : index->rows) {
+                canceled(stop);
+                if (candidate_column >= row.sections.size()) throw Failure{{ErrorCode::malformed, "invalid DWP supplementary-index row"}};
+                const auto &range = row.sections[candidate_column];
+                if (die_offset < range.offset || die_offset - range.offset >= range.size) continue;
+                if (match) throw Failure{{ErrorCode::malformed, "supplementary DIE offset belongs to ambiguous DWP contributions"}};
+                match = &row; owner = index.get(); column = candidate_column;
+            }
         }
-        require(match != nullptr, "supplementary DIE offset is absent from DWP type contributions", ErrorCode::unsupported);
+        require(match != nullptr, "supplementary DIE offset is absent from DWP indexed contributions", ErrorCode::unsupported);
+        if (owner->kind == symbols::DwarfPackageIndexKind::compile_units) {
+            auto resolved = compile_die(die_offset);
+            if (!resolved) throw Failure{resolved.error()};
+            const auto &die = resolved.value();
+            const auto &range = match->sections[column];
+            require(die.identity_verified && die.index_kind == symbols::DwarfPackageIndexKind::compile_units &&
+                        die.contribution_signature == match->signature && die.info_section_offset == range.offset &&
+                        die.contribution_size == range.size && die.die_offset == die_offset - range.offset,
+                    "supplementary CU resolver returned a different contribution or DIE offset");
+            require(die.kind == symbols::DwarfReferencedDieKind::type && bool(die.type),
+                    "supplementary DIE offset does not identify an imported type", ErrorCode::unsupported);
+            return symbols::DwarfSupplementaryType{
+                requested_identity, die.type, die_offset, examined, true};
+        }
         std::vector<symbols::DwarfPackageSectionData> section_data;
         for (const auto &[id, bytes] : package->sections) section_data.push_back({id, bytes});
-        auto contribution = symbols::find_dwarf_package_contribution(*package->index, match->signature, section_data, stop);
+        auto contribution = symbols::find_dwarf_package_contribution(*owner, match->signature, section_data, stop);
         if (!contribution) throw Failure{contribution.error()};
         symbols::DwarfSections dwarf;
         dwarf.source_id = "DWARF v5 DWP supplementary type contribution";

@@ -120,6 +120,9 @@ inline std::optional<IntegerDataflowShape> evex_integer_shape(Opcode opcode) noe
     case Opcode::vpmaxsb: case Opcode::vpmaxsd: case Opcode::vpmaxuw: case Opcode::vpmaxud:
     case Opcode::vpmulld: case Opcode::vpmuldq: case Opcode::vpmuludq:
     case Opcode::vpmaddwd: case Opcode::vpmaddubsw:
+    // Packing narrows signed inputs, independently within 128-bit groups;
+    // writemask elements follow the narrowed result rather than input lanes.
+    case Opcode::vpacksswb: case Opcode::vpackssdw: case Opcode::vpackuswb: case Opcode::vpackusdw:
         return integer_dataflow_shape(opcode);
     default: return std::nullopt;
     }

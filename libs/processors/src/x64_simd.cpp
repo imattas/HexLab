@@ -593,6 +593,9 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
     case 0xe9: integer_operation=Opcode::vpsubsw; break;
     case 0xd8: integer_operation=Opcode::vpsubusb; break;
     case 0xd9: integer_operation=Opcode::vpsubusw; break;
+    case 0x63: integer_operation=Opcode::vpacksswb; break;
+    case 0x67: integer_operation=Opcode::vpackuswb; break;
+    case 0x6b: integer_operation=Opcode::vpackssdw; required_w=false; break;
     case 0xda: integer_operation=Opcode::vpminub; break;
     case 0xea: integer_operation=Opcode::vpminsw; break;
     case 0xde: integer_operation=Opcode::vpmaxub; break;
@@ -618,6 +621,7 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
     case 0x47: integer_operation=w ? Opcode::vpsllvq : Opcode::vpsllvd; required_w=w; break;
     case 0x04: integer_operation=Opcode::vpmaddubsw; break;
     case 0x28: integer_operation=Opcode::vpmuldq; required_w=true; break;
+    case 0x2b: integer_operation=Opcode::vpackusdw; required_w=false; break;
     case 0x38: integer_operation=Opcode::vpminsb; break;
     case 0x39: integer_operation=Opcode::vpminsd; required_w=false; break;
     case 0x3a: integer_operation=Opcode::vpminuw; break;

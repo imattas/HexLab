@@ -20,6 +20,13 @@ class GraphCanvas final : public wxPanel {
     // The focused graph source, never a previously selected listing row.
     std::optional<Location> source_location() const;
     bool focus_node(GraphNodeId, bool navigate_to_location = true);
+    // Native graph-items controls share graph-local focus without taking
+    // keyboard focus from their own accessible control.
+    std::optional<GraphHit> focused_item() const;
+    const std::set<GraphNodeId> &selected_node_ids() const { return selected_nodes_; }
+    wxString item_description(GraphHit) const;
+    bool focus_item(GraphHit);
+    void activate_focused_item();
     // Cycles the graph-local node focus and navigates linked views when the
     // focused node has a location. A rejected address leaves graph focus intact.
     bool move_node(bool next);
@@ -42,6 +49,7 @@ class GraphCanvas final : public wxPanel {
     // rendered listing row. The receiver validates the captured graph source.
     std::function<void(std::shared_ptr<const ProjectGraph>, Address)> follow_instruction;
     std::function<void()> focus_changed;
+    std::function<void()> focus_items;
 
   private:
     struct IndexedBounds { GraphRect bounds; std::size_t index = 0; };
