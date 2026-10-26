@@ -185,11 +185,16 @@ using Statement = std::variant<Assign, Store, Call, Branch, Return, Intrinsic>;
 
 struct InstructionOrigin { Address address; std::uint64_t instruction_id = 0; };
 struct LiftedInstruction { InstructionOrigin origin; Statement statement; };
+enum class TrapEdgeKind { unconditional, may_trap };
+struct TrapEdge { Address source; TrapEdgeKind kind; std::string operation; };
 struct LiftedBlock {
     BlockId id;
     Address begin;
     std::vector<LiftedInstruction> instructions;
     std::vector<BlockSuccessor> successors;
+    // Possible terminal traps are kept separate from normal successors so
+    // control-flow structuring does not mistake them for ordinary exits.
+    std::vector<TrapEdge> trap_edges;
     struct ExceptionHandlerDispatch {
         Address target{{0}, 0};
         std::optional<std::string> catch_type;
