@@ -6,7 +6,11 @@ namespace {
 const ElfSection *find_debug_section(const ElfMetadata &metadata, std::string_view name) {
     const ElfSection *found = nullptr;
     for (const auto &section : metadata.sections) {
-        if (section.name != name) continue;
+        const bool canonical = section.name == name;
+        const bool gnu_alias = name.starts_with(".debug_") &&
+            section.name.size() == name.size() + 1 && section.name.starts_with(".zdebug_") &&
+            section.name.substr(2) == name.substr(1);
+        if (!canonical && !gnu_alias) continue;
         if (found) throw Failure{{ErrorCode::malformed,
             "ELF contains duplicate " + std::string(name) + " sections"}};
         found = &section;
@@ -16,19 +20,7 @@ const ElfSection *find_debug_section(const ElfMetadata &metadata, std::string_vi
 
 std::vector<std::uint8_t> read_line_section(const ByteStorage &storage,
     const ElfMetadata &metadata, const ElfSection &section, Budget &budget, std::stop_token stop) {
-    if (section.type == 8) throw Failure{{ErrorCode::unsupported,
-        section.name + " is SHT_NOBITS and has no file contents"}};
-    if (section.flags & 0x800) throw Failure{{ErrorCode::unsupported,
-        "Compressed " + section.name + " is not interpreted"}};
-    if (section.size > metadata_limit) throw Failure{{ErrorCode::resource_limit,
-        section.name + " exceeds ELF metadata budget"}};
-    budget.include(section.size);
-    Reader reader(storage, metadata.header.order, stop);
-    const auto view = reader.bytes(section.offset, static_cast<std::size_t>(section.size));
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(view.bytes.size());
-    for (auto byte : view.bytes) { canceled(stop); bytes.push_back(std::to_integer<std::uint8_t>(byte)); }
-    return bytes;
+    return read_debug_section_bytes(storage, metadata, section, budget, stop);
 }
 }
 Result<bool> read_source_lines(const ByteStorage &storage, ElfMetadata &metadata, Budget &budget, std::stop_token stop) {

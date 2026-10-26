@@ -38,7 +38,11 @@ symbols::DwarfSupplementaryIdentity read_supplementary_identity(std::span<const 
 const ElfSection *debug_section(const ElfMetadata &metadata, std::string_view name) {
     const ElfSection *found = nullptr;
     for (const auto &section : metadata.sections) {
-        if (section.name != name) continue;
+        const bool canonical = section.name == name;
+        const bool gnu_alias = name.starts_with(".debug_") &&
+            section.name.size() == name.size() + 1 && section.name.starts_with(".zdebug_") &&
+            section.name.substr(2) == name.substr(1);
+        if (!canonical && !gnu_alias) continue;
         require(found == nullptr, "ELF contains duplicate DWARF section declarations");
         found = &section;
     }
@@ -53,19 +57,7 @@ const ElfSection *optional_debug_section(const ElfMetadata &metadata, std::strin
 }
 std::vector<std::uint8_t> read_debug_bytes(const ByteStorage &storage, const ElfMetadata &metadata,
                                           const ElfSection &section, Budget &budget, std::stop_token stop) {
-    require(section.type != 8, "DWARF section is SHT_NOBITS and has no file contents", ErrorCode::unsupported);
-    require((section.flags & 0x800) == 0, "Compressed DWARF sections are not interpreted", ErrorCode::unsupported);
-    require(section.size <= metadata_limit, "DWARF section exceeds ELF metadata budget", ErrorCode::resource_limit);
-    budget.include(section.size);
-    Reader reader(storage, metadata.header.order, stop);
-    const auto view = reader.bytes(section.offset, static_cast<std::size_t>(section.size));
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(view.bytes.size());
-    for (auto byte : view.bytes) {
-        canceled(stop);
-        bytes.push_back(std::to_integer<std::uint8_t>(byte));
-    }
-    return bytes;
+    return read_debug_section_bytes(storage, metadata, section, budget, stop);
 }
 
 struct DwarfPackage {
