@@ -49,6 +49,13 @@ void pop(State &s) {
     --s.i.x87_stack_delta;
 }
 void compare_status(State &s) { status_read_write(s); }
+void arithmetic_environment(State &s) {
+    // x87 arithmetic reads PC/RC from the control word and updates sticky
+    // exception/status bits, including C1. Keep those dependencies visible
+    // to data-flow analysis even when the rounded value is not modeled.
+    add_register(s.i.register_reads, control());
+    status_read_write(s);
+}
 void free_tag(State &s) {
     add_register(s.i.register_reads, tag());
     add_register(s.i.register_writes, tag());
@@ -58,6 +65,7 @@ void binary(State &s, const char *name, unsigned destination, unsigned source, b
     const auto d = st(destination), r = st(source);
     s.operand(d, OperandAccess::read_write);
     s.operand(r, OperandAccess::read);
+    arithmetic_environment(s);
     if (pop_result)
         pop(s);
 }
@@ -154,8 +162,10 @@ bool memory_form(State &s, std::uint8_t opcode, unsigned group, Operand &rm) {
     if (arithmetic || stores_st0)
         s.i.register_reads.push_back(st(0));
     if (arithmetic && (group == 2 || group == 3)) compare_status(s);
-    if (arithmetic && group != 2 && group != 3)
+    if (arithmetic && group != 2 && group != 3) {
+        arithmetic_environment(s);
         s.i.register_writes.push_back(st(0));
+    }
     if (opcode == 0xd9 && group == 5) s.i.register_writes.push_back(control());
     if (opcode == 0xd9 && group == 7) s.i.register_reads.push_back(control());
     if (opcode == 0xdd && group == 7) s.i.register_reads.push_back(status());

@@ -26,6 +26,17 @@ resolution reports authenticated pointers as unresolved because PAC is not
 applied. Apple defines these field semantics; Ghidra's current implementation
 was used as a secondary format/stride cross-check.
 
+For standard ARM64e authenticated words (formats 1, 7, 9, 10, and 12), the
+parser preserves the 32-bit authenticated rebase runtime offset or bind import
+ordinal separately from the 16-bit diversity, address-diversity bit, and
+two-bit key. The key values are retained as encoded: 0/1/2/3 correspond to
+IA/IB/DA/DB. Format 12 bind ordinals are 24 bits; other standard ARM64e bind
+ordinals are 16 bits. The reserved bits after each ordinal are checked, and
+authenticated binds do not acquire an addend from the unauthenticated addend
+field. An authenticated rebase remains a raw image-relative offset; the
+runtime resolver deliberately does not turn it into a usable pointer because
+it cannot produce or validate a PAC.
+
 ARM64e segmented format 14 stores an 8-byte field with a 4-byte chain stride.
 The parser retains the lower 32-bit target payload (4-bit segment index plus
 28-bit segment offset), the 12-bit next field, and authenticated diversity,

@@ -1,11 +1,13 @@
 # x87 lifting and compare branches
 
 The common non-popping real arithmetic forms `FADD`, `FMUL`, `FSUB`,
-`FSUBR`, `FDIV`, and `FDIVR` lift to 80-bit typed SSA expressions for the
-register and supported memory-source encodings. `FCHS` and `FABS` lift as
-unary updates to `ST(0)`. These expressions describe the numerical operation;
-the current IR does not model x87 precision-control rounding or arithmetic
-exception flags. Other transcendental, rounding, integer-conversion, and
+`FSUBR`, `FDIV`, and `FDIVR` lift to 80-bit typed SSA result expressions for
+the register and supported memory-source encodings. Their intrinsic also
+retains the FCW input and FSW output dependency, so the numeric expression
+does not erase those architectural effects. The output expression currently
+does not apply PC/RC rounding or calculate the resulting exception flags;
+those values remain explicitly unknown. `FCHS` and `FABS` lift as unary
+updates to `ST(0)`. Other transcendental, rounding, integer-conversion, and
 stack-changing forms remain named intrinsics with their decoded register,
 memory, status, and tag effects. The lifted intrinsic also preserves the
 decoder's logical x87 stack depth delta. Pseudocode marks pushes and pops

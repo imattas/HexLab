@@ -12,7 +12,9 @@ constexpr std::uint16_t fsw_invalid = 1u << 0, fsw_error_summary = 1u << 7;
 constexpr std::uint16_t fsw_c0 = 1u << 8, fsw_c1 = 1u << 9, fsw_c2 = 1u << 10;
 constexpr std::uint16_t fsw_c3 = 1u << 14, fsw_busy = 1u << 15;
 constexpr std::uint16_t fcw_invalid_mask = 1u << 0;
+constexpr std::uint16_t fcw_denormal_mask = 1u << 1;
 constexpr std::uint16_t fsw_precision = 1u << 5;
+constexpr std::uint16_t fsw_denormal = 1u << 1;
 constexpr std::uint16_t fcw_precision_mask = 1u << 5;
 constexpr std::uint16_t fcw_overflow_mask = 1u << 3;
 constexpr std::uint16_t fcw_rounding_mask = 3u << 10;
@@ -160,6 +162,40 @@ std::uint16_t signal_exception(std::uint16_t status, std::uint16_t exception) no
 }
 
 struct Product128 { std::uint64_t hi, lo; };
+Product128 shift_right_jam(Product128 value, unsigned amount) noexcept {
+    if (!amount) return value;
+    if (amount < 64) {
+        const auto lost_mask = (std::uint64_t{1} << amount) - 1;
+        const bool lost = (value.lo & lost_mask) != 0;
+        return {value.hi >> amount,
+                (value.lo >> amount) | (value.hi << (64 - amount)) | static_cast<std::uint64_t>(lost)};
+    }
+    if (amount == 64)
+        return {0, value.hi | static_cast<std::uint64_t>(value.lo != 0)};
+    if (amount < 128) {
+        const auto shift = amount - 64;
+        const auto lost_mask = (std::uint64_t{1} << shift) - 1;
+        const bool lost = value.lo != 0 || (value.hi & lost_mask) != 0;
+        return {0, (value.hi >> shift) | static_cast<std::uint64_t>(lost)};
+    }
+    return {0, static_cast<std::uint64_t>(value.hi != 0 || value.lo != 0)};
+}
+
+Product128 add_wide(Product128 left, Product128 right) noexcept {
+    const auto lo = left.lo + right.lo;
+    return {left.hi + right.hi + static_cast<std::uint64_t>(lo < left.lo), lo};
+}
+
+Product128 subtract_wide(Product128 left, Product128 right) noexcept {
+    const auto lo = left.lo - right.lo;
+    return {left.hi - right.hi - static_cast<std::uint64_t>(left.lo < right.lo), lo};
+}
+
+bool wide_bit(Product128 value, unsigned bit) noexcept {
+    return bit < 64 ? ((value.lo >> bit) & 1) != 0
+                    : bit < 128 && ((value.hi >> (bit - 64)) & 1) != 0;
+}
+
 Product128 multiply_u64(std::uint64_t a, std::uint64_t b) noexcept {
     const std::uint64_t a0 = static_cast<std::uint32_t>(a), a1 = a >> 32;
     const std::uint64_t b0 = static_cast<std::uint32_t>(b), b1 = b >> 32;
@@ -178,6 +214,98 @@ bool round_up(bool negative, std::uint8_t rc, std::uint64_t retained,
     case 2: return !negative;
     default: return false;
     }
+}
+
+struct NormalizedBinary80 {
+    std::uint64_t significand = 0;
+    int exponent = 0;
+};
+
+NormalizedBinary80 normalize_finite(const Decoded &decoded) noexcept {
+    auto significand = decoded.significand;
+    auto exponent = static_cast<int>(decoded.exponent == 0 ? 1 : decoded.exponent);
+    if ((significand & integer_bit) == 0) {
+        const auto shift = std::countl_zero(significand);
+        significand <<= shift;
+        exponent -= static_cast<int>(shift);
+    }
+    return {significand, exponent};
+}
+
+Product128 extended_significand(std::uint64_t significand) noexcept {
+    // Three low bits carry guard, round, and sticky information through
+    // exponent alignment and cancellation.
+    return {significand >> 61, significand << 3};
+}
+
+std::uint64_t extended_to_significand(Product128 value) noexcept {
+    return (value.hi << 61) | (value.lo >> 3);
+}
+
+std::optional<X87ArithmeticResult> round_add_sub_result(
+    Product128 extended, int exponent, bool negative,
+    const X87AddSubtractRequest &request) noexcept {
+    const auto pc = static_cast<std::uint8_t>((request.control_word >> 8) & 3);
+    const unsigned precision = pc == 0 ? 24 : pc == 2 ? 53 : 64;
+    const unsigned discard = 64 - precision;
+    const auto significand = extended_to_significand(extended);
+    std::uint64_t retained = significand >> discard;
+    bool guard = false;
+    bool sticky = false;
+    if (discard) {
+        guard = ((significand >> (discard - 1)) & 1) != 0;
+        const auto discarded_mask = (std::uint64_t{1} << (discard - 1)) - 1;
+        sticky = (significand & discarded_mask) != 0 || (extended.lo & 7) != 0;
+    } else {
+        guard = (extended.lo & 4) != 0;
+        sticky = (extended.lo & 3) != 0;
+    }
+    const bool inexact = guard || sticky;
+    const bool increment = round_up(negative,
+        static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10), retained, guard, sticky);
+    const auto precision_max = precision == 64 ? UINT64_MAX : ((std::uint64_t{1} << precision) - 1);
+    const bool carry = increment && retained == precision_max;
+    if (increment) ++retained;
+    if (carry) {
+        retained = std::uint64_t{1} << (precision - 1);
+        ++exponent;
+    }
+    const auto rounded_significand = retained << discard;
+
+    X87ArithmeticResult result;
+    result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
+    if (inexact && increment) result.status_word |= fsw_c1;
+    const bool overflow = exponent >= 0x7fff;
+    if (overflow) {
+        result.overflow = true;
+        result.precision = true;
+        result.status_word |= static_cast<std::uint16_t>((1u << 3) | fsw_precision);
+        if ((request.control_word & fcw_overflow_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, 1u << 3);
+            result.completed = false;
+            return result;
+        }
+        const auto rc = static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10);
+        const bool infinity = rc == 0 || (rc == 1 && negative) || (rc == 2 && !negative);
+        result.value = infinity ? X87Binary80{integer_bit, static_cast<std::uint16_t>(0x7fff | (negative ? sign_mask : 0))}
+                                : X87Binary80{UINT64_MAX, static_cast<std::uint16_t>(0x7ffe | (negative ? sign_mask : 0))};
+        if ((request.control_word & fcw_precision_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_precision);
+            result.completed = false;
+        }
+        return result;
+    }
+    if (exponent <= 0) return {}; // gradual-underflow rounding is deliberately unsupported for now
+    if (inexact) result.status_word |= fsw_precision;
+    result.precision = inexact;
+    result.value = X87Binary80{rounded_significand,
+        static_cast<std::uint16_t>(exponent | (negative ? sign_mask : 0))};
+    if (inexact && (request.control_word & fcw_precision_mask) == 0) {
+        result.status_word = signal_exception(result.status_word, fsw_precision);
+        result.completed = false;
+        return result;
+    }
+    return result;
 }
 } // namespace
 
@@ -482,21 +610,121 @@ std::optional<X87ArithmeticResult> evaluate_x87_multiply(const X87MultiplyReques
         if ((request.control_word & fcw_precision_mask) == 0) {
             result.status_word = signal_exception(result.status_word, fsw_precision);
             result.completed = false;
-            result.value.reset();
         }
         return result;
     }
     if (exponent <= 0) return {}; // gradual-underflow rounding is deliberately unsupported for now
     if (inexact) result.status_word |= fsw_precision;
+    result.precision = inexact;
+    result.value = X87Binary80{significand, static_cast<std::uint16_t>(exponent | (negative ? sign_mask : 0))};
     if (inexact && (request.control_word & fcw_precision_mask) == 0) {
-        result.precision = true;
         result.status_word = signal_exception(result.status_word, fsw_precision);
         result.completed = false;
         return result;
     }
-    result.precision = inexact;
-    result.value = X87Binary80{significand, static_cast<std::uint16_t>(exponent | (negative ? sign_mask : 0))};
     return result;
+}
+
+std::optional<X87ArithmeticResult>
+evaluate_x87_add_subtract(const X87AddSubtractRequest &request) noexcept {
+    if (((request.control_word >> 8) & 3) == 1 ||
+        (request.operation != X87BinaryArithmetic::add &&
+         request.operation != X87BinaryArithmetic::subtract))
+        return {};
+    const auto a = decode(request.left), b = decode(request.right);
+    const bool a_numeric = a.kind == Class::finite || a.kind == Class::zero;
+    const bool b_numeric = b.kind == Class::finite || b.kind == Class::zero;
+    if (!a_numeric || !b_numeric) return {};
+
+    const auto is_subnormal = [](const Decoded &operand) noexcept {
+        return operand.kind == Class::finite && operand.exponent == 0 &&
+               (operand.significand & integer_bit) == 0;
+    };
+    const bool denormal = is_subnormal(a) || is_subnormal(b);
+    if (denormal && (request.control_word & fcw_denormal_mask) == 0) {
+        X87ArithmeticResult result;
+        result.status_word = signal_exception(
+            static_cast<std::uint16_t>(request.status_word & ~fsw_c1), fsw_denormal);
+        result.completed = false;
+        return result;
+    }
+    const auto add_denormal_status = [denormal](X87ArithmeticResult result) noexcept {
+        if (denormal) result.status_word |= fsw_denormal;
+        return result;
+    };
+
+    const bool right_negative = b.negative ^ (request.operation == X87BinaryArithmetic::subtract);
+    const auto rc = static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10);
+    if (a.kind == Class::zero && b.kind == Class::zero) {
+        const bool negative = a.negative == right_negative ? a.negative : rc == 1;
+        X87ArithmeticResult result;
+        result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
+        result.value = X87Binary80{0, static_cast<std::uint16_t>(negative ? sign_mask : 0)};
+        return add_denormal_status(std::move(result));
+    }
+    if (a.kind == Class::zero || b.kind == Class::zero) {
+        const auto &nonzero = a.kind == Class::zero ? b : a;
+        const bool negative = a.kind == Class::zero ? right_negative : a.negative;
+        const auto normalized = normalize_finite(nonzero);
+        auto rounded = round_add_sub_result(
+            extended_significand(normalized.significand), normalized.exponent, negative, request);
+        if (!rounded) return {};
+        return add_denormal_status(std::move(*rounded));
+    }
+
+    const auto normalized_a = normalize_finite(a);
+    const auto normalized_b = normalize_finite(b);
+    const bool b_sign = right_negative;
+    const auto compare_magnitude = [](const NormalizedBinary80 &left,
+                                      const NormalizedBinary80 &right) noexcept {
+        if (left.exponent != right.exponent)
+            return left.exponent < right.exponent ? -1 : 1;
+        return left.significand < right.significand ? -1 :
+               left.significand > right.significand ? 1 : 0;
+    };
+
+    const bool same_sign = a.negative == b_sign;
+    const NormalizedBinary80 *large = &normalized_a;
+    const NormalizedBinary80 *small = &normalized_b;
+    bool negative = a.negative;
+    const auto magnitude_order = compare_magnitude(normalized_a, normalized_b);
+    if (!same_sign && magnitude_order == 0) {
+        X87ArithmeticResult result;
+        result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
+        const bool zero_negative = rc == 1;
+        result.value = X87Binary80{0, static_cast<std::uint16_t>(zero_negative ? sign_mask : 0)};
+        return add_denormal_status(std::move(result));
+    }
+    if (magnitude_order < 0) {
+        large = &normalized_b;
+        small = &normalized_a;
+        if (!same_sign) negative = b_sign;
+    }
+
+    const auto exponent_difference = static_cast<unsigned>(large->exponent - small->exponent);
+    const auto large_extended = extended_significand(large->significand);
+    const auto small_extended = shift_right_jam(extended_significand(small->significand),
+                                                exponent_difference);
+    Product128 combined{};
+    int exponent = large->exponent;
+    if (same_sign) {
+        combined = add_wide(large_extended, small_extended);
+        if (wide_bit(combined, 67)) {
+            combined = shift_right_jam(combined, 1);
+            ++exponent;
+        }
+    } else {
+        combined = subtract_wide(large_extended, small_extended);
+        if (!combined.hi && !combined.lo) return {};
+        while (!wide_bit(combined, 66)) {
+            combined = {static_cast<std::uint64_t>((combined.hi << 1) | (combined.lo >> 63)),
+                        combined.lo << 1};
+            --exponent;
+        }
+    }
+    auto result = round_add_sub_result(combined, exponent, negative, request);
+    if (!result) return {};
+    return add_denormal_status(std::move(*result));
 }
 
 X87UnaryResult evaluate_x87_unary(X87Binary80 value, std::uint16_t status_word,
