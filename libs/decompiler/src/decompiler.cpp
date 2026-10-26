@@ -3912,6 +3912,23 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
                left->registers == right->registers && same_expression(left->left, right->left) &&
                same_expression(left->right, right->right);
     };
+    const auto x86_condition_expression = [](const Instruction &instruction, X86Condition condition,
+                                             const PendingX86Compare &pending) -> ExpressionPtr {
+        const auto flags = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        if (pending.x87_sahf)
+            return flags == instruction.register_reads.end() ? ExpressionPtr{} :
+                x87_sahf_predicate(condition, reg_expr(*flags));
+        if (pending.x87_flags)
+            return flags == instruction.register_reads.end() ? ExpressionPtr{} :
+                x87_flags_predicate(condition, reg_expr(*flags));
+        if (pending.raw_x86_flags)
+            return flags == instruction.register_reads.end() ? ExpressionPtr{} :
+                x86_flags_predicate(condition, reg_expr(*flags), pending.defined_flags);
+        if (pending.test || pending.operation == "cmp")
+            return x86_predicate(condition, pending.test, pending.left, pending.right);
+        return x86_arithmetic_predicate(condition, pending.operation, pending.left, pending.right);
+    };
     auto update_x86_flag_state = [&](std::optional<PendingX86Compare> state,
                                      const Instruction &instruction, std::uint64_t instruction_id) {
         if (is_x87_flag_compare(instruction)) {
@@ -4229,6 +4246,7 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             const auto &decoded = fact->instruction;
             const bool a64_context = decoded.context.architecture == Architecture::arm64 &&
                                      decoded.context.mode == ExecutionMode::a64;
+            const auto x86_compare_before_instruction = pending_x86_compare;
             pending_x86_compare = update_x86_flag_state(std::move(pending_x86_compare), decoded, fact->id);
             pending_a64_compare = update_a64_flag_state(std::move(pending_a64_compare), decoded);
             std::vector<Statement> ppc_before;
@@ -4242,6 +4260,57 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             }
             auto statement = extension_ir ? Statement{std::move(*extension_ir)} :
                 ppc_statement ? std::move(*ppc_statement) : lift_instruction(decoded, result.diagnostics);
+            if ((decoded.opcode == Opcode::cmovcc || decoded.opcode == Opcode::setcc) &&
+                decoded.x86_condition && is_x86_context(decoded)) {
+                const PendingX86Compare *condition_state = pending_x86_compare ? &*pending_x86_compare : nullptr;
+                const bool writes_flags = std::any_of(decoded.register_writes.begin(), decoded.register_writes.end(),
+                    [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+                // A conditional move can overwrite one of the compare inputs.
+                // Its condition still observes the pre-instruction state, even
+                // though that write ends the compare fact for later instructions.
+                if (!condition_state && x86_compare_before_instruction && !writes_flags && decoded.flow != FlowKind::call)
+                    condition_state = &*x86_compare_before_instruction;
+                if (condition_state) {
+                    auto predicate = x86_condition_expression(decoded, *decoded.x86_condition, *condition_state);
+                    if (predicate && decoded.opcode == Opcode::cmovcc && decoded.operands.size() == 2) {
+                        const auto *destination = std::get_if<RegisterOperand>(&decoded.operands[0]);
+                        if (destination && destination->bank == RegisterBank::gpr &&
+                            (std::holds_alternative<RegisterOperand>(decoded.operands[1]) ||
+                             std::holds_alternative<MemoryOperand>(decoded.operands[1]))) {
+                            const auto source = operand_expr(decoded.operands[1]);
+                            const auto prior = reg_expr(*destination);
+                            if (source->type.bits == destination->width && prior->type.bits == destination->width) {
+                                auto selected = std::make_shared<Expression>(Expression{
+                                    integer_type(destination->width),
+                                    BinaryValue{"select_if", predicate,
+                                        std::make_shared<Expression>(Expression{
+                                            integer_type(destination->width),
+                                            BinaryValue{"pair", source, prior}})}});
+                                if (std::holds_alternative<MemoryOperand>(decoded.operands[1])) {
+                                    Intrinsic effect{"x86_cmovcc", {predicate, source, prior},
+                                        IntrinsicMemoryEffect::read};
+                                    effect.register_writes.push_back(*destination);
+                                    effect.register_output_values.push_back(std::move(selected));
+                                    effect.result_type = integer_type(destination->width);
+                                    statement = std::move(effect);
+                                } else {
+                                    statement = Assign{*destination, std::move(selected)};
+                                }
+                            }
+                        }
+                    } else if (predicate && decoded.opcode == Opcode::setcc && decoded.operands.size() == 1) {
+                        auto value = std::make_shared<Expression>(Expression{
+                            integer_type(8), UnaryValue{"zext", std::move(predicate)}});
+                        if (const auto *destination = std::get_if<RegisterOperand>(&decoded.operands[0]);
+                            destination && destination->bank == RegisterBank::gpr && destination->width == 8) {
+                            statement = Assign{*destination, std::move(value)};
+                        } else if (const auto *destination = std::get_if<MemoryOperand>(&decoded.operands[0]);
+                                   destination && destination->data_width == 8) {
+                            statement = Store{operand_expr(decoded.operands[0]), std::move(value)};
+                        }
+                    }
+                }
+            }
             const bool x87_instruction = (decoded.context.architecture == Architecture::x86 ||
                 decoded.context.architecture == Architecture::x86_64) && decoded.opcode == Opcode::x87;
             if (auto *intrinsic = std::get_if<Intrinsic>(&statement); intrinsic && x87_instruction)
