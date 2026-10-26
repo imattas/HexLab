@@ -8,6 +8,40 @@ RV32M and RV64M arithmetic is preserved as explicit pseudocode operations such a
 
 F/D scalar instructions enter the shared pipeline with a distinct floating value type. FLW/FLD produce typed memory reads and FSW/FSD produce typed stores. Arithmetic, FMA, comparisons, classification, moves, and conversions retain named typed intrinsics; their decoded FPR/GPR outputs and `fflags` effects participate in SSA. Rounding mode remains available on the generic instruction for analysis and assembly formatting.
 
+Scalar FCVT conversions additionally carry explicit parallel output formulas.
+W/WU and L/LU inputs retain signedness and 32/64-bit width; an RV64 W/WU
+integer source is truncated to its low word. Float-to-W/WU results are explicitly
+sign-extended to XLEN, including the unsigned WU variants. FCLASS.S/D produce
+a ten-bit class mask zero-extended to XLEN and do not touch FCSR. Integer output
+types are recovered independently of the floating result and status outputs.
+
+Each rounding-sensitive FCVT formula consumes either its encoded static
+rounding mode or the pre-instruction three-bit `frm` value for `rm=111`.
+FCVT.D.S and exact FCVT.D.W/WU still validate and retain the encoded `rm`
+field, but have no semantic `frm` dependency or rounding operand. Reserved
+static modes 101/110 and RV32 L/LU forms remain invalid. The dynamic mode is
+not evaluated or assumed to contain a legal value.
+
+Conversions that may raise exceptions read the old five-bit `fflags` and write
+`old_fflags | raised_flags` in parallel with their value result. Raised flags
+remain symbolic and are bounded to NV/NX for float-to-integer, NX for rounded
+integer-to-float, NV/OF/UF/NX for FCVT.S.D, and NV for FCVT.D.S. FCVT.D.W/WU
+are exact and preserve `fflags` without a status write. A destination of x0
+discards only the integer result; possible status effects remain. The intrinsic
+retains architectural clipping and NaN semantics without evaluating host C++
+casts or inventing a floating exception trap.
+
+Encodings and effects follow the official
+[F extension](https://docs.riscv.org/reference/isa/v20260120/unpriv/f-st-ext.html),
+[D extension](https://docs.riscv.org/reference/isa/v20260120/unpriv/d-st-ext.html),
+and [RV32/64G listings](https://docs.riscv.org/reference/isa/v20260120/unpriv/rv-32-64g.html).
+All forms use OP-FP `0x53`. FCVT integer destinations use funct7 `0x60/0x61`
+(S/D source), integer sources use `0x68/0x69` (S/D destination), and rs2
+`0/1/2/3` selects W/WU/L/LU. FCVT.S.D uses funct7 `0x20`, rs2=1;
+FCVT.D.S uses `0x21`, rs2=0. FCLASS.S/D use funct7 `0x70/0x71`, rs2=0,
+funct3=1. W/WU and S/D precision conversions work at either XLEN; L/LU
+forms require RV64.
+
 Floating-result intrinsics carry an explicit 32- or 64-bit result type into type recovery. Only FPR destinations receive that floating fact; integer results and `fflags` remain separate effects.
 
 The decoded RVV integer elementwise families share one explicit opcode-to-effect

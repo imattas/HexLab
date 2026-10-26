@@ -15,9 +15,15 @@ The partitioner recognizes three bounded forms:
   partition only when its exact byte range was observed and mapped.
 - **Pointer-relative ranges:** a base register must have a proven SSA pointer
   origin through supported copies, constant offsets, constant-proven SSA
-  register offsets, and unanimous phi inputs. Integer offsets are propagated
-  from literals, same-width copies, unanimous phis, and checked same-width
-  `add`, `sub`, or `mul` trees with no intermediate wrap and at most 32
+  register offsets, and unanimous phi inputs. For flat A32, AArch64, RISC-V,
+  MIPS, and PowerPC register banks, a proven 32- or 64-bit constant register
+  value is rooted at that numeric address. Equal constants in different
+  registers therefore share one address origin, and differing constants
+  become checked offsets from it. Values above the signed offset bound retain
+  opaque roots. The generic x86 GPR bank is excluded because a segment override
+  can change the effective address without changing the GPR value. Integer
+  offsets are propagated from literals, same-width copies, unanimous phis, and
+  checked same-width `add`, `sub`, or `mul` trees with no intermediate wrap and at most 32
   expression levels before pointer origins are solved, so an address
   expression such as `base + offset_register` can produce an exact range when
   that register has one proven value.
@@ -38,11 +44,14 @@ The partitioner recognizes three bounded forms:
   partitions.
 
 The alias rule is byte-range based. A store advances its exact stack or
-absolute-range partition. A pointer-relative store advances every partition
-that might alias it; it preserves another range only when the partition has
-the same proven pointer root and its byte range is disjoint. Different pointer
-roots are not assumed to be disjoint. Calls invalidate all absolute and
-pointer-relative partitions while preserving proven nonescaping stack slots.
+absolute-range partition. An absolute-address store also invalidates stack and
+pointer-relative partitions, plus any absolute partition not proven disjoint
+by address space or byte range. A pointer-relative store advances every
+partition that might alias it; it preserves another range only when the
+partition has the same proven pointer root and its byte range is disjoint.
+Different pointer roots are not assumed to be disjoint. Calls invalidate all
+absolute and pointer-relative partitions while preserving proven nonescaping
+stack slots.
 Intrinsics with write or unknown memory effects and unclassified stores
 invalidate every partition. These effects also advance the whole-memory chain.
 Read-only and no-memory intrinsics do not invalidate partitions.

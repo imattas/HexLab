@@ -598,6 +598,28 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
         i.register_reads = {left, right, fpscr()};
         i.register_writes = {field, fpscr()};
+    } else if (op == 63 && (((w >> 1) & 0x3ff) == 14 || ((w >> 1) & 0x3ff) == 15 ||
+                            ((w >> 1) & 0x3ff) == 814 || ((w >> 1) & 0x3ff) == 815 ||
+                            ((w >> 1) & 0x3ff) == 846)) {
+        // Power ISA Book I 4.6.7.2: exact ten-bit X-form XO, not the
+        // five-bit A-form arithmetic selector. Integer payloads remain in FPRs.
+        const auto xo = (w >> 1) & 0x3ff;
+        if (ra != 0)
+            return fail(DecodeStatus::invalid, "PowerPC FP conversion has nonzero reserved fields");
+        if (xo >= 814 && !ppc64)
+            return fail(DecodeStatus::unsupported, "PowerPC doubleword FP conversion requires PPC64 mode");
+        i.opcode = xo == 14 ? Opcode::ppc_fctiw : xo == 15 ? Opcode::ppc_fctiwz :
+                   xo == 814 ? Opcode::ppc_fctid : xo == 815 ? Opcode::ppc_fctidz : Opcode::ppc_fcfid;
+        const auto destination = fpr(rt, 64), source = fpr(rb, 64);
+        const bool from_integer = xo == 846;
+        i.operands = {destination, source};
+        // An enabled invalid conversion suppresses the FRT update. FCFID has
+        // no invalid-operation case and always produces a rounded FP result.
+        i.access = {from_integer ? OperandAccess::write : OperandAccess::read_write, OperandAccess::read};
+        i.register_reads = {source, fpscr()};
+        if (!from_integer) i.register_reads.push_back(destination);
+        i.register_writes = {destination, fpscr()};
+        if (rc) i.register_writes.push_back(cr1());
     } else if (op == 63 && (((w >> 1) & 0x3ff) == 12 || ((w >> 1) & 0x3ff) == 40 ||
                             ((w >> 1) & 0x3ff) == 72 || ((w >> 1) & 0x3ff) == 264)) {
         const auto xo10 = (w >> 1) & 0x3ff;

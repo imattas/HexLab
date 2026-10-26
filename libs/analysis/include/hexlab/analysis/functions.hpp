@@ -5,7 +5,7 @@
 namespace hexlab {
 struct FunctionId {std::uint64_t value;auto operator<=>(const FunctionId&)const=default;};
 struct BlockId {std::uint64_t value;auto operator<=>(const BlockId&)const=default;};
-enum class FunctionSeedKind {entry,export_symbol,direct_call,user_function,user_code,symbol,unwind,arm_context_root,tls_callback,initializer,guard_cf};
+enum class FunctionSeedKind {entry,export_symbol,direct_call,user_function,user_code,symbol,unwind,arm_context_root,tls_callback,initializer,guard_cf,dex_method};
 struct FunctionSeedUnwindEvidence {std::uint32_t section=0;std::uint64_t file_offset=0,record_size=0;bool operator==(const FunctionSeedUnwindEvidence&)const=default;};
 enum class FunctionInitializerSource : std::uint8_t { elf_init, elf_fini, elf_preinit_array, elf_init_array, elf_fini_array, macho_mod_init_func, macho_routines };
 struct FunctionSeedInitializerEvidence {

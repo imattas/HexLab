@@ -25,6 +25,7 @@ const char *seed_kind_name(FunctionSeedKind kind) {
     case FunctionSeedKind::tls_callback: return "TLS callback";
     case FunctionSeedKind::initializer: return "initializer metadata";
     case FunctionSeedKind::guard_cf: return "Guard CF metadata";
+    case FunctionSeedKind::dex_method: return "DEX defined method";
     }
     return "unknown function evidence";
 }
@@ -91,6 +92,29 @@ std::uint16_t skipped_predicate_guard(const Instruction &instruction) {
     if (!instruction.arm || instruction.arm->predicate == ArmPredicate::always) return 0;
     if (instruction.arm->predicate == ArmPredicate::unknown_it) return all_nzcv;
     return static_cast<std::uint16_t>(all_nzcv & ~arm_condition_mask(instruction.condition));
+}
+std::optional<Address> dex_direct_call_target(const Instruction &instruction, const Image &image,
+                                               const ImageMetadata &metadata) {
+    if (instruction.context.architecture != Architecture::dex || instruction.flow != FlowKind::call ||
+        !metadata.dex) return {};
+    const auto bytes = instruction.encoded_bytes();
+    if (bytes.size() < 4) return {};
+    const auto opcode = std::to_integer<std::uint8_t>(bytes[0]);
+    // Virtual/interface dispatch depends on the receiver, and invoke-super
+    // requires superclass lookup. Only direct/static method IDs are exact.
+    if (opcode != 0x70 && opcode != 0x71 && opcode != 0x76 && opcode != 0x77) return {};
+    const auto method_index = static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(bytes[2])) |
+                              (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(bytes[3])) << 8);
+    const auto &code = metadata.dex->code;
+    const auto method = std::lower_bound(code.begin(), code.end(), method_index,
+        [](const DexMethodCode &candidate, std::uint32_t index) { return candidate.method_index < index; });
+    if (method == code.end() || method->method_index != method_index || method_index == UINT32_MAX) return {};
+    const Address target{AddressSpaceId{method_index + 1}, 0};
+    const auto *segment = image.segment_at(target);
+    const auto context = image.context_at(target);
+    if (!segment || !segment->executable || !context || context.value().architecture != Architecture::dex ||
+        context.value().mode != ExecutionMode::dex) return {};
+    return target;
 }
 } // namespace
 uint64_t Ids::make(FactKind kind, Address address, std::span<const std::byte> extra) {
@@ -288,6 +312,13 @@ void Recovery::seed_roots() {
         for (const auto &profile_root : image.layout().arm_profile->roots) {
             canceled();
             root({FunctionSeedKind::arm_context_root, profile_root.at, {}, {}}, true);
+        }
+    if (metadata.dex)
+        for (const auto &method : metadata.dex->code) {
+            canceled();
+            if (method.method_index == UINT32_MAX) continue;
+            root({FunctionSeedKind::dex_method,
+                  Address{AddressSpaceId{method.method_index + 1}, 0}, {}, {}}, false);
         }
     for (const auto &symbol : metadata.exports) {
         canceled();
@@ -1004,7 +1035,8 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
             FunctionStop{address, FunctionStopReason::macho_dyld, "Runtime fixup affects instruction opcode bytes"};
         return finish();
     }
-    const auto target = take(relocations.control_target(image, instruction, stop));
+    auto flow_target = take(relocations.control_target(image, instruction, stop));
+    if (!flow_target) flow_target = dex_direct_call_target(instruction, image, metadata);
     if (analysis_detail::has_delay_slot(instruction)) {
         const auto slot = take(analysis_detail::delay_slot_address(instruction));
         delayed_slots.insert(slot);
@@ -1054,11 +1086,11 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
                    : FunctionStopReason::indirect;
     };
     const auto arm_target_matches = [&]() {
-        if (instruction.context.architecture != Architecture::arm || !target)
+        if (instruction.context.architecture != Architecture::arm || !flow_target)
             return true;
         if (!instruction.arm)
             return false;
-        const auto target_context = image.context_at(*target);
+        const auto target_context = image.context_at(*flow_target);
         if (!instruction.arm->target_mode)
             return analysis_detail::is_arm_literal_pc_load(instruction) && target_context &&
                    (target_context.value().mode == ExecutionMode::a32 || target_context.value().mode == ExecutionMode::thumb);
@@ -1069,8 +1101,8 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
             return instruction.arm->it_after;
         if (instruction.arm && instruction.arm->target_mode == ExecutionMode::thumb)
             return ThumbITState{true, 0};
-        if (target && analysis_detail::is_arm_literal_pc_load(instruction)) {
-            const auto context = image.context_at(*target);
+        if (flow_target && analysis_detail::is_arm_literal_pc_load(instruction)) {
+            const auto context = image.context_at(*flow_target);
             if (context && context.value().mode == ExecutionMode::thumb)
                 return ThumbITState{true, 0};
         }
@@ -1103,15 +1135,15 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
     case FlowKind::call:
         value.call = true;
         value.call_guard = executes_with;
-        value.call_target = arm_target_matches() ? target : std::nullopt;
+        value.call_target = arm_target_matches() ? flow_target : std::nullopt;
         if (value.call_target && target_it().known)
             thumb_states.emplace(*value.call_target, target_it());
         if (!value.call_target)
             value.call_issue = FunctionStop{
                 address,
-                instruction.context.architecture == Architecture::arm && target ? FunctionStopReason::unsupported
+                instruction.context.architecture == Architecture::arm && flow_target ? FunctionStopReason::unsupported
                                                                                  : unresolved(),
-                instruction.context.architecture == Architecture::arm && target
+                instruction.context.architecture == Architecture::arm && flow_target
                     ? "ARM call target conflicts with source-backed execution-state metadata"
                     : "Call target remains unresolved"};
         else if (auto denied = permission(*value.call_target))
@@ -1130,9 +1162,9 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
                 break;
             }
         }
-        value.edges.push_back({target, target ? BlockEdgeKind::conditional_true : BlockEdgeKind::unresolved,
+        value.edges.push_back({flow_target, flow_target ? BlockEdgeKind::conditional_true : BlockEdgeKind::unresolved,
                                target_it(), executes_with, writes_nzcv});
-        if (!target) {
+        if (!flow_target) {
             value.stop = FunctionStop{address, unresolved(), "Conditional target remains unresolved"};
             value.stop_guard = executes_with;
         }
@@ -1159,9 +1191,9 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
                 break;
             }
         }
-        value.edges.push_back({target, target ? BlockEdgeKind::jump : BlockEdgeKind::unresolved, target_it(),
+        value.edges.push_back({flow_target, flow_target ? BlockEdgeKind::jump : BlockEdgeKind::unresolved, target_it(),
                                executes_with, writes_nzcv});
-        if (!target) {
+        if (!flow_target) {
             value.stop = FunctionStop{address, unresolved(), "Jump target remains unresolved"};
             value.stop_guard = executes_with;
         }
@@ -1726,7 +1758,7 @@ namespace hexlab {
 Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     Sha256 hash;
     constexpr std::string_view version =
-        "hexlab-functions-v56/a64-preserving-bitfield-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v1/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v3/guard-multiblock-v1/unicode-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
+        "hexlab-functions-v57/dex-method-roots-call-edges-v2/dex-relative-control-operands-v1/a64-preserving-bitfield-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v1/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v3/guard-multiblock-v1/unicode-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
         "elf-reference-provenance-v1/elf-arithmetic-v2/macho-symbol-roots-v1/macho-relocation-flow-v1/"
         "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1";
     (void)hash.update(std::as_bytes(std::span(version)));

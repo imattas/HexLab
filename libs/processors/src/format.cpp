@@ -378,6 +378,11 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::ppc_fneg: return "fneg";
     case Opcode::ppc_fabs: return "fabs";
     case Opcode::ppc_frsp: return "frsp";
+    case Opcode::ppc_fctiw: return "fctiw";
+    case Opcode::ppc_fctiwz: return "fctiwz";
+    case Opcode::ppc_fctid: return "fctid";
+    case Opcode::ppc_fctidz: return "fctidz";
+    case Opcode::ppc_fcfid: return "fcfid";
     case Opcode::ppc_vaddubm: return "vaddubm";
     case Opcode::ppc_vadduhm: return "vadduhm";
     case Opcode::ppc_vadduwm: return "vadduwm";
@@ -768,6 +773,12 @@ std::string format_instruction(const Instruction &i) {
     }
     if (i.context.architecture == Architecture::powerpc) {
         std::string out = opcode_name(i.opcode, i.condition);
+        if ((i.opcode == Opcode::ppc_fctiw || i.opcode == Opcode::ppc_fctiwz ||
+             i.opcode == Opcode::ppc_fctid || i.opcode == Opcode::ppc_fctidz ||
+             i.opcode == Opcode::ppc_fcfid) &&
+            std::find(i.register_writes.begin(), i.register_writes.end(),
+                      RegisterOperand{RegisterBank::ppc_cr, 1, 4, false}) != i.register_writes.end())
+            out += ".";
         for (std::size_t n = 0; n < i.operands.size(); ++n) {
             out += n ? ", " : " ";
             const auto &operand = i.operands[n];

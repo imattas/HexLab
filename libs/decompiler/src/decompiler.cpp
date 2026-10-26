@@ -7,6 +7,7 @@
 #include "hexlab/processors/x86_avx_semantics.hpp"
 #include "mips64_lifting.hpp"
 #include "ppc_lifting.hpp"
+#include "riscv_fp_lifting.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -2543,6 +2544,7 @@ a64_unhandled:
             return effect;
         }
         if (op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) {
+            if (auto converted = lift_riscv_fp_conversion(instruction, operands)) return *converted;
             if ((op == Opcode::rv_flw || op == Opcode::rv_fld) && dst && operands.size() >= 2) {
                 auto loaded = *operands[1];
                 if (auto *memory = std::get_if<MemoryValue>(&loaded.value)) {
@@ -2588,6 +2590,10 @@ a64_unhandled:
                 }
                 inputs.push_back(std::move(input));
             }
+            if (instruction.rounding_mode)
+                inputs.push_back(constant_expr(*instruction.rounding_mode, 3));
+            for (const auto &reg : instruction.register_reads)
+                if (reg.bank == RegisterBank::riscv_fstatus) inputs.push_back(reg_expr(reg));
             Intrinsic effect{riscv_fp_name(op), std::move(inputs), IntrinsicMemoryEffect::none};
             effect.register_writes = instruction.register_writes;
             if (dst && dst->bank == RegisterBank::riscv_fpr) {
@@ -4117,7 +4123,8 @@ std::string expression_text(const Expression &expression) {
             return value.operation + "(" + operand + ")";
         } else if constexpr (std::is_same_v<T, BinaryValue>) {
             if (value.operation == "a64_udiv" || value.operation == "a64_sdiv" ||
-                value.operation.rfind("wasm_", 0) == 0 || value.operation.rfind("ppc_fcmp_", 0) == 0)
+                value.operation.rfind("wasm_", 0) == 0 || value.operation.rfind("ppc_fcmp_", 0) == 0 ||
+                value.operation.starts_with("fcvt."))
                 return value.operation + "(" + expression_text(*value.left) + ", " +
                        expression_text(*value.right) + ")";
             if (value.operation == "frem" || value.operation == "fcgt_un" || value.operation == "fclt_un" ||

@@ -66,6 +66,17 @@ file offsets of its key and target words (packed keys derive from the shared
 `first_key` word). These offsets are reconstructed from the source image when
 an instruction is loaded from the derived cache.
 
+Function recovery treats every defined `code_item` as a method entry.
+`invoke-direct` and `invoke-static` (including `/range`) references resolve to
+that entry only when the referenced method ID has a validated code item,
+producing cross-method call graph edges and call references. Virtual,
+interface, and super invokes remain unresolved because their exact callee
+requires dispatch evidence. Abstract, native, and otherwise code-less methods
+also remain unresolved rather than being assigned invented code addresses.
+Conditional branch references identify the relative target operand after the
+source registers. Targets outside the method address space retain an unresolved
+relative expression rather than treating a source register as a target.
+
 The loader exposes parsed debug metadata to `inspect` and project inspection; it
 does not import DEX classes, methods, or strings into the shared symbol/type
 model. Source rows use byte offsets in the method address space; local scopes
@@ -92,6 +103,25 @@ recovered method remain incomplete. No Dalvik verifier-wide type model is
 claimed. `inspect` and `disassemble` accept automatic detection or `--format
 dex`; CLI decompilation supports the bounded method lifting subset described in
 `dex-lifting.md`.
+
+Every supported instruction exposes typed operands in Dalvik syntax order,
+with one access entry per operand and explicit virtual-register read/write
+sets. Wide values use 64-bit register operands; their effects name both 32-bit
+virtual-register slots so high-half accesses retain dependencies. Long shifts
+read a single-word shift count, conversions preserve distinct source and result
+widths, and `/2addr` destinations are read/write. `check-cast` reads its reference
+without defining a new register value. Array and field stores read their value
+and address registers; loads write their destination. Invoke argument lists
+retain encoded argument words as 32-bit reads, followed by the 16-bit method
+index. No implicit result register is invented: `move-result*` defines the
+explicit destination. Constants and table indices remain typed immediates;
+branches and switches retain byte-relative target/payload operands.
+
+Registers above 255, wide pairs ending above 255, and register ranges that
+exceed the 16-bit encoding are rejected before narrowing. Range instructions
+with more than 15 register words are unsupported because their trailing table
+index would exceed the shared 16-operand instruction/cache budget. Method
+register-count and invoke prototype validation remain verifier responsibilities.
 
 Filled-array instructions decode their 35c register list (up to five entries)
 or 3rc contiguous range, retain each source register and the 16-bit type index

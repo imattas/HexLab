@@ -410,7 +410,7 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
         auto seeds = in.count(16);
         for (size_t j = 0; j < seeds; ++j) {
             auto kind = in.number(1);
-            require(kind <= static_cast<unsigned>(FunctionSeedKind::guard_cf), "Unknown cached function seed kind");
+            require(kind <= static_cast<unsigned>(FunctionSeedKind::dex_method), "Unknown cached function seed kind");
             FunctionSeed seed{static_cast<FunctionSeedKind>(kind), in.address(), in.optional_address(), {}};
             if (in.flag())
                 seed.decision = in.number();

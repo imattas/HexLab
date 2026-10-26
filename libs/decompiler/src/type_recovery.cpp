@@ -1535,6 +1535,28 @@ static Result<TypeRecoveryResult> recover_types_impl(
             }
             else if constexpr(std::is_same_v<T,Intrinsic>) {
                 for(const auto &e:s.operands) register_expr(e,register_expr);
+                // Scalar RISC-V conversion outputs are typed individually:
+                // integer/FPR results and accrued FCSR flags must never share
+                // a result type. The formulas also preserve source reads when
+                // an integer destination is x0 and only flags are written.
+                if ((s.name.starts_with("fcvt.") || s.name.starts_with("fclass.")) &&
+                    s.register_output_values.size() == s.register_writes.size()) {
+                    for (std::size_t n = 0; n < s.register_writes.size(); ++n) {
+                        const auto bank = s.register_writes[n].bank;
+                        if (bank != RegisterBank::riscv_gpr && bank != RegisterBank::riscv_fpr &&
+                            bank != RegisterBank::riscv_fstatus) continue;
+                        const auto &output = s.register_output_values[n];
+                        if (!output) continue;
+                        register_expr(output, register_expr);
+                        const auto version = n < s.register_output_versions.size()
+                            ? std::optional<std::uint32_t>{s.register_output_versions[n]} : std::nullopt;
+                        auto &destination = ensure(s.register_writes[n], version);
+                        destination.bits = output->type.bits;
+                        destination.floating = output->type.kind == TypeKind::floating;
+                        if (output->type.kind == TypeKind::integer)
+                            destination.sign = output->type.is_signed;
+                    }
+                }
                 if (s.result_type && s.result_type->kind == TypeKind::floating) {
                     for (std::size_t n = 0; n < s.register_writes.size(); ++n) {
                         const auto bank = s.register_writes[n].bank;

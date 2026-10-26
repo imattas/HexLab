@@ -351,6 +351,76 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         if (intrinsic && (single_round || writes_record)) intrinsic->operands.push_back(reg(status));
         return statement;
     }
+    if (i.opcode == Opcode::ppc_fctiw || i.opcode == Opcode::ppc_fctiwz ||
+        i.opcode == Opcode::ppc_fctid || i.opcode == Opcode::ppc_fctidz || i.opcode == Opcode::ppc_fcfid) {
+        const auto *source = ops.size() == 2 ? std::get_if<R>(&ops[1]) : nullptr;
+        const R status{RegisterBank::ppc_fpscr, 0, 32, false};
+        const R record{RegisterBank::ppc_cr, 1, 4, false};
+        const bool from_integer = i.opcode == Opcode::ppc_fcfid;
+        const bool word = i.opcode == Opcode::ppc_fctiw || i.opcode == Opcode::ppc_fctiwz;
+        const bool truncate = i.opcode == Opcode::ppc_fctiwz || i.opcode == Opcode::ppc_fctidz;
+        const auto valid_fpr = [](const R *r) {
+            return r && r->bank == RegisterBank::ppc_fpr && r->width == 64 && r->index < 32 && !r->high_byte;
+        };
+        if (!valid_fpr(dst) || !valid_fpr(source) || (!word && width != 64) || i.memory_read || i.memory_write)
+            return effect(i, "ppc_malformed_fp_conversion");
+        const bool writes_record = std::find(i.register_writes.begin(), i.register_writes.end(), record) !=
+                                   i.register_writes.end();
+        std::vector<R> expected_reads{*source, status};
+        if (!from_integer) expected_reads.push_back(*dst);
+        std::vector<R> expected_writes{*dst, status};
+        if (writes_record) expected_writes.push_back(record);
+        if (i.access != std::vector<OperandAccess>{from_integer ? OperandAccess::write : OperandAccess::read_write,
+                                                 OperandAccess::read} ||
+            i.register_reads != expected_reads || i.register_writes != expected_writes)
+            return effect(i, "ppc_malformed_fp_conversion_effects");
+        const char *name = from_integer ? "ppc_fcfid" : word ? (truncate ? "ppc_fctiwz" : "ppc_fctiw") :
+                                                          (truncate ? "ppc_fctidz" : "ppc_fctid");
+        const ValueType signed_payload{TypeKind::integer, static_cast<std::uint16_t>(word ? 32 : 64), true};
+        auto input = from_integer
+            ? std::make_shared<Expression>(Expression{signed_payload, RegisterValue{*source, {}}}) : reg(*source);
+        ExpressionPtr result;
+        if (from_integer) {
+            // This is a signed integer payload in FRB, not an FP bit pattern
+            // to numerically reinterpret. RN controls rounding to binary64.
+            result = std::make_shared<Expression>(Expression{floating(64),
+                BinaryValue{"ppc_i64_to_f64_rn", input, reg(status)}});
+        } else {
+            // Named operations define NaN -> signed minimum and saturate
+            // out-of-range values after rounding, unlike an ordinary cast.
+            const auto operation = std::string("ppc_f64_to_i") + (word ? "32_" : "64_") +
+                                   (truncate ? "rtz_saturate" : "rn_saturate");
+            result = std::make_shared<Expression>(Expression{signed_payload,
+                BinaryValue{operation, input, reg(status)}});
+            if (word) {
+                auto undefined_high = std::make_shared<Expression>(Expression{integer(32),
+                    UnknownValue{"ppc_fctiw_undefined_high32"}});
+                result = binary("or", unary("zext", result, 64),
+                    binary("shl", unary("zext", undefined_high, 64), constant(32, 64), 64), 64);
+            }
+            // VE suppresses FRT writes for NaN/out-of-range conversions.
+            // Keep the old raw FPR bits and the source/FPSCR predicate in the
+            // expression, including when FRT aliases FRB.
+            auto invalid = predicate(word ? (truncate ? "ppc_fctiwz_invalid_enabled" : "ppc_fctiw_invalid_enabled") :
+                                            (truncate ? "ppc_fctidz_invalid_enabled" : "ppc_fctid_invalid_enabled"),
+                                     input, reg(status));
+            auto preserve_mask = unary("sext", invalid, 64);
+            auto previous = std::make_shared<Expression>(Expression{integer(64), RegisterValue{*dst, {}}});
+            result = binary("or", binary("and", result, unary("bitnot", preserve_mask, 64), 64),
+                                  binary("and", previous, preserve_mask, 64), 64);
+        }
+        auto next_status = std::make_shared<Expression>(Expression{integer(32),
+            UnknownValue{std::string(name) + "_fpscr_after_conversion"}});
+        std::vector<ExpressionPtr> outputs{result, next_status};
+        if (writes_record) outputs.push_back(ppc_fpscr_record_cr1(next_status));
+        Intrinsic converted{name, {input, reg(status)}, IntrinsicMemoryEffect::none};
+        if (!from_integer)
+            converted.operands.push_back(std::make_shared<Expression>(Expression{integer(64), RegisterValue{*dst, {}}}));
+        converted.register_writes = i.register_writes;
+        converted.register_output_values = std::move(outputs);
+        converted.result_type = result->type;
+        return converted;
+    }
     if (ops.size() == 3 && dst && dst->bank == RegisterBank::ppc_fpr &&
         (i.opcode == Opcode::ppc_fadds || i.opcode == Opcode::ppc_fsubs ||
          i.opcode == Opcode::ppc_fmuls || i.opcode == Opcode::ppc_fdivs ||
