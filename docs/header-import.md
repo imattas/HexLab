@@ -37,7 +37,17 @@ lookup from `api` or its nested namespaces. A qualified lookup that finds
 different declarations through the enclosing and inline namespace is ambiguous
 and fails instead of choosing one. An inline namespace cannot alias a namespace
 that was previously declared without `inline`; it can be reopened normally.
-Anonymous namespaces and namespace members other than types remain unsupported.
+Anonymous namespace definitions are supported with stable synthetic components
+for declarations in the same lexical namespace scope. Their supported type names
+are made visible through the enclosing namespace's implicit using-directive; the
+synthetic component remains in the stored qualified name. Namespace members
+other than supported types and declarations remain unsupported.
+
+`extern "C"` and `extern "C++"` linkage specifications are accepted in either
+single-declaration or braced form when their contents use supported declaration
+syntax. The importer preserves the declared type and symbol, but does not model
+language-linkage mangling or ABI differences between the two forms. Other
+linkage string literals are rejected explicitly.
 
 An integer constant-expression evaluator supports decimal, octal, and
 hexadecimal literals; previously bound integral template parameters;

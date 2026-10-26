@@ -164,15 +164,17 @@ does not yet provide p-code semantics, so this implementation uses the ISA
 specification for operation effects rather than treating SLEIGH as an
 authoritative semantic source.
 
-The unary `vfsqrt.v` and `vfclass.v` encodings are also decoded. Square root
-retains dynamic `frm` and sticky `fflags` dependencies. Classification is
-rounding-independent and reports its ten IEEE-754 classes as a SEW-wide bit
-field; the lane evaluator handles SEW 32/64 exactly while preserving masked,
-prestart, and tail lanes. Square-root lane evaluation remains unavailable
-because the current floating evaluator has no rounding-mode input.
+The unary `vfsqrt.v`, `vfrsqrt7.v`, `vfrec7.v`, and `vfclass.v` encodings are
+also decoded. Square root retains dynamic `frm` and sticky `fflags`
+dependencies. Reciprocal-square-root estimate is independent of `frm`, while
+reciprocal estimate retains it for its rounding-dependent overflow result;
+both read and update sticky `fflags`. Classification is rounding-independent
+and reports its ten IEEE-754 classes as a SEW-wide bit field; the lane
+evaluator handles SEW 32/64 exactly while preserving masked, prestart, and tail
+lanes. Square-root and estimate lane evaluation remain unavailable.
 
-These unary operation codes and classification bit definitions follow the
-[RISC-V V specification, §30.1.13](https://docs.riscv.org/reference/isa/unpriv/v-st-ext.html#vector-floating-point-instructions).
+These unary operation codes, estimate result rules, and classification bit
+definitions follow the [RISC-V V specification, §30.1.13](https://docs.riscv.org/reference/isa/unpriv/v-st-ext.html#vector-floating-point-instructions).
 
 The decompiler keeps the operations as named floating-vector or boolean-mask
 intrinsics. Every operation retains implicit `vl`, `vtype`, and `vstart` reads,

@@ -33,6 +33,9 @@ struct AnalysisBasis {
     bool loader_metadata_complete=true;
     std::vector<FunctionStackRecord> stack_frames;
     std::shared_ptr<DependencyIndexCache> dependency_index_cache;
+    // Input byte dependencies used to construct loader metadata are fully
+    // tracked. False forces reparsing/full invalidation on any byte edit.
+    bool metadata_reads_complete = false;
 };
 struct InvalidationPlan {
     AnalysisKey before_key,source_key;ReadSet byte_ranges,string_ranges;

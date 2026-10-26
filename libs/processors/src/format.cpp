@@ -630,6 +630,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     }
     if (op == Opcode::rv_vfsqrt_v) return "vfsqrt.v";
     if (op == Opcode::rv_vfclass_v) return "vfclass.v";
+    if (op == Opcode::rv_vfrsqrt7_v) return "vfrsqrt7.v";
+    if (op == Opcode::rv_vfrec7_v) return "vfrec7.v";
     if (op >= Opcode::rv_sh1add && op <= Opcode::rv_slli_uw) {
         static constexpr const char *names[]{"sh1add", "sh2add", "sh3add", "add.uw",
             "sh1add.uw", "sh2add.uw", "sh3add.uw", "slli.uw"};

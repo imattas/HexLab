@@ -9,6 +9,10 @@ struct LoadedImage {
     std::vector<Diagnostic> diagnostics;
     bool metadata_complete = false;
     ReadSet metadata_reads;
+    // True only when the loader has certified that metadata_reads covers every
+    // byte dependency in the primary input. An empty set is valid for formats
+    // whose mapping comes entirely from the explicit load recipe.
+    bool metadata_reads_complete = false;
     // PE runtime base when explicitly selected; otherwise absent for loaders
     // without a distinct runtime/preferred mapping choice.
     std::optional<std::uint64_t> load_base;

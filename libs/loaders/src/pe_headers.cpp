@@ -289,6 +289,7 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
             loaded.image = std::move(moved.value());
         }
         loaded.metadata_reads=tracking.value()->reads();
+        loaded.metadata_reads_complete=true;
         auto published_storage = requested_base == loaded.metadata.preferred_base
             ? original : loaded.image->storage();
         auto published=Image::create(std::move(published_storage),loaded.image->layout());
@@ -297,6 +298,11 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
         loaded.pe_native_image = loaded.image;
         if (loaded.metadata.pe && loaded.metadata.pe->load_configuration &&
             loaded.metadata.pe->load_configuration->dynamic_value_relocations) {
+            // ARM64X effective-view construction reads additional target bytes
+            // after the parsed image has been rebound to its source storage.
+            // Until those reads are routed through TrackingStorage, do not
+            // certify the earlier read snapshot as exhaustive.
+            loaded.metadata_reads_complete = false;
             auto &dynamic = *loaded.metadata.pe->load_configuration->dynamic_value_relocations;
             auto arm64x = build_arm64x_view(*loaded.image, loaded.metadata, dynamic, requested_base, stop);
             if (arm64x) {

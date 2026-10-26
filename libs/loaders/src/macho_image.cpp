@@ -201,6 +201,7 @@ Result<LoadedImage> macho_detail::load_macho_bound(std::shared_ptr<const ByteSto
         }
         loaded.metadata.macho = std::move(metadata);
         loaded.metadata_reads = tracking->reads();
+        loaded.metadata_reads_complete = true;
         canceled(stop);
         return loaded;
     } catch (const Failure &failure) {

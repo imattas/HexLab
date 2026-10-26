@@ -576,6 +576,7 @@ Result<LoadedImage> load_durable_image(std::shared_ptr<const ByteStorage> storag
         if (!loaded) return loaded.error();
         auto dependency = loaded.value().metadata_reads.include({0}, storage->size());
         if (!dependency) return dependency.error();
+        loaded.value().metadata_reads_complete = true;
         return loaded;
     }
     if (recipe.format == Format::pe) {
@@ -622,6 +623,7 @@ Result<LoadedImage> load_durable_image(std::shared_ptr<const ByteStorage> storag
     loaded.image = std::move(image.value());
     loaded.metadata.format = "raw";
     loaded.metadata_complete = true;
+    loaded.metadata_reads_complete = true;
     loaded.metadata.preferred_base =
         recipe.raw->x86_profile ? recipe.raw->x86_profile->input_load_address : recipe.raw->base.offset;
     loaded.metadata.image_size = storage->size();

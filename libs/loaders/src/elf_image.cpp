@@ -442,7 +442,6 @@ Result<LoadedImage> load_elf(std::shared_ptr<const ByteStorage> storage, const E
             return Error{ErrorCode::unsupported, "Runtime relocation is unavailable for ELF core images"};
         }
         loaded.metadata.elf = std::move(elf);
-        loaded.metadata_reads = tracking->reads();
         if (options.runtime_load_bias) {
             auto runtime = take(apply_elf_runtime_relocations(loaded, *options.runtime_load_bias, stop));
             loaded.runtime_image = std::move(runtime.image);
@@ -458,6 +457,8 @@ Result<LoadedImage> load_elf(std::shared_ptr<const ByteStorage> storage, const E
                          " skipped: " + skip.reason,
                      {}});
         }
+        loaded.metadata_reads = tracking->reads();
+        loaded.metadata_reads_complete = true;
         canceled(stop);
         return loaded;
     } catch (const Failure &failure) {

@@ -3037,6 +3037,7 @@ Result<LoadedImage> PluginManager::load_plugin_image(std::shared_ptr<const ByteS
         // plugin may have declined to make after a conditional parse branch.
         auto dependency = loaded.metadata_reads.include({0}, storage->size());
         if (!dependency) return dependency.error();
+        loaded.metadata_reads_complete = true;
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "Plugin image loading canceled"};
         loaded.diagnostics.push_back({DiagnosticSeverity::info,
             "Plugin image provider supplies mappings only; format metadata is incomplete", {}});

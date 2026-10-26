@@ -102,6 +102,23 @@ std::vector<Token> lex(std::string_view text, const HeaderImportOptions &o) {
         }
         if(c=='/' && i+1<text.size() && text[i+1]=='/') { i+=2;while(i<text.size()&&text[i]!='\n')++i;continue; }
         if(c=='/' && i+1<text.size() && text[i+1]=='*') { i+=2;bool closed=false;while(i+1<text.size()){if(text[i]=='\n')++line;if(text[i]=='*'&&text[i+1]=='/'){i+=2;closed=true;break;}++i;}if(!closed)fail(ErrorCode::malformed,"unterminated block comment");continue; }
+        if(c=='"') {
+            const auto begin=i++;
+            bool closed=false;
+            while(i<text.size()) {
+                if(text[i]=='\n') fail(ErrorCode::malformed,"newline in string literal at line "+std::to_string(line));
+                if(text[i]=='\\') {
+                    if(i+1>=text.size()||text[i+1]=='\n')
+                        fail(ErrorCode::malformed,"unterminated escape in string literal at line "+std::to_string(line));
+                    i+=2;
+                    continue;
+                }
+                if(text[i++]=='"') { closed=true; break; }
+            }
+            if(!closed) fail(ErrorCode::malformed,"unterminated string literal at line "+std::to_string(line));
+            push(std::string(text.substr(begin,i-begin)));
+            continue;
+        }
         if(ident_start(c)){std::size_t b=i++;while(i<text.size()&&ident_continue(text[i]))++i;push(std::string(text.substr(b,i-b)));continue;}
         if(c>='0'&&c<='9'){std::size_t b=i++;while(i<text.size()&&((text[i]>='0'&&text[i]<='9')||(text[i]>='a'&&text[i]<='z')||(text[i]>='A'&&text[i]<='Z')||text[i]=='x'||text[i]=='X'))++i;push(std::string(text.substr(b,i-b)));continue;}
         if(c==':'&&i+1<text.size()&&text[i+1]==':'){push("::");i+=2;continue;}
@@ -2247,6 +2264,21 @@ private:
     }
     void parse_external(){
         if(take(";"))return;
+        if(at("extern") && peek(1).text.size() >= 2 && peek(1).text.front() == '"') {
+            ++pos_;
+            const auto linkage = next().text;
+            if (linkage != "\"C\"" && linkage != "\"C++\"")
+                fail(ErrorCode::unsupported, "only C and C++ linkage specifications are supported");
+            if (take("{")) {
+                while (!take("}")) {
+                    if (at("<eof>")) syntax("unterminated linkage specification");
+                    parse_external();
+                }
+                return;
+            }
+            parse_external();
+            return;
+        }
         if(at("inline")&&peek(1).text=="namespace"){
             ++pos_;
             parse_namespace(true);

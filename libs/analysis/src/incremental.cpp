@@ -212,6 +212,8 @@ Result<InvalidationPlan> plan_invalidation(const AnalysisBasis &old, std::span<c
             plan.full_reason = "Analysis engine or options changed";
         else if (plan.metadata_invalid)
             plan.full_reason = "Changed loader metadata requires a freshly parsed mapping";
+        else if (!old.metadata_reads_complete && !plan.byte_ranges.ranges().empty())
+            plan.full_reason = "Loader metadata read dependencies are uncertified; byte edits require a fresh parse";
         else if (!old.loader_metadata_complete && !plan.byte_ranges.ranges().empty())
             plan.full_reason = "Incomplete loader metadata requires a full rebuild after byte changes";
         else if (key.byte_revision != old.key.byte_revision && plan.byte_ranges.ranges().empty() &&
@@ -306,6 +308,7 @@ Result<DerivedProposal> reanalyze(const AnalysisBasis &old, std::shared_ptr<cons
         const bool untracked_loader_change = (!same_layout || !same_metadata) &&
                                              !plan.metadata_invalid && plan.full_reason.empty();
         const bool loader_change_requires_full_facts = plan.metadata_invalid || untracked_loader_change ||
+            (!old.metadata_reads_complete && !plan.byte_ranges.ranges().empty()) ||
             (!old.loader_metadata_complete && !plan.byte_ranges.ranges().empty());
         DerivedProposal output;
         output.source_key = key;

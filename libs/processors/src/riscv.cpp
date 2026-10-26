@@ -211,13 +211,21 @@ bool decode_vector_floating(std::uint32_t w, RiscvInstruction &i) {
     const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
     const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
     const unsigned funct3 = (w >> 12) & 7, vd = (w >> 7) & 31;
-    // VFUNARY0 uses the OPFVV major class and encodes its sub-op in vs1.
-    if (funct3 == 1 && funct6 == 0x13 && (vs1 == 0 || vs1 == 16)) {
-        i.opcode = vs1 == 0 ? RiscvOpcode::vfsqrt_v : RiscvOpcode::vfclass_v;
-        const bool rounded = vs1 == 0;
-        i.reads_frm = rounded;
-        i.reads_fflags = rounded;
-        i.writes_fflags = rounded;
+    // VFUNARY1 uses OPFVV and encodes its sub-op in vs1.
+    if (funct3 == 1 && funct6 == 0x13 &&
+        (vs1 == 0 || vs1 == 4 || vs1 == 5 || vs1 == 16)) {
+        switch (vs1) {
+        case 0: i.opcode = RiscvOpcode::vfsqrt_v; break;
+        case 4: i.opcode = RiscvOpcode::vfrsqrt7_v; break;
+        case 5: i.opcode = RiscvOpcode::vfrec7_v; break;
+        case 16: i.opcode = RiscvOpcode::vfclass_v; break;
+        }
+        // vfrec7's overflow result depends on frm; reciprocal-square-root
+        // estimates are independent of frm. All three arithmetic operations
+        // can accrue IEEE exceptions, unlike classification.
+        i.reads_frm = vs1 == 0 || vs1 == 5;
+        i.reads_fflags = vs1 != 16;
+        i.writes_fflags = vs1 != 16;
         operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
         read_vector_destination(i, vd);
         operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
@@ -1007,7 +1015,7 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
             const bool floating_implemented = funct6 == 0 || funct6 == 2 || funct6 == 4 || funct6 == 6 ||
                 funct6 == 8 || funct6 == 9 || funct6 == 10 || funct6 == 0x18 || funct6 == 0x19 ||
                 funct6 == 0x1b || funct6 == 0x1c || funct6 == 0x1d || funct6 == 0x1f ||
-                funct6 == 0x20 || funct6 == 0x24;
+                funct6 == 0x20 || funct6 == 0x24 || funct6 == 0x13;
             if ((implemented && (funct3 == 0 || funct3 == 3 || funct3 == 4)) || floating_implemented)
                 return false; // Reserved operand class of an explicitly implemented integer/FP operation.
             unsupported = "RVV operand class or operation is outside the enabled vector subset";

@@ -128,6 +128,7 @@ std::shared_ptr<const ProjectSnapshot> adopt_project_analysis(const ProjectSnaps
         basis->metadata = std::shared_ptr<const ImageMetadata>(latest.loaded, &latest.loaded->metadata);
         basis->metadata_reads = latest.loaded->metadata_reads;
         basis->loader_metadata_complete = latest.loaded->metadata_complete;
+        basis->metadata_reads_complete = latest.loaded->metadata_reads_complete;
         basis->decisions = latest.state->user->decisions;
         basis->options = options;
         basis->key = key;
