@@ -327,7 +327,12 @@ Result<FunctionBlockCorrespondence> correspond_function_blocks(
         FunctionInstructionDiffOptions diff_options;
         diff_options.max_dynamic_cells = cells;
         diff_options.stop_token = options.stop_token;
-        auto diff = diff_function_instructions(old_sequence, new_sequence, diff_options);
+        auto diff = old_blocks[*row.old_block].instruction_semantics.size() == old_sequence.size() &&
+                    new_blocks[*row.new_block].instruction_semantics.size() == new_sequence.size()
+            ? diff_function_instructions_detailed(old_sequence, new_sequence,
+                old_blocks[*row.old_block].instruction_semantics,
+                new_blocks[*row.new_block].instruction_semantics, diff_options)
+            : diff_function_instructions(old_sequence, new_sequence, diff_options);
         if (!diff) {
             if (diff.error().code == ErrorCode::canceled) return diff.error();
             row.instruction_diff_budget_exhausted = true;

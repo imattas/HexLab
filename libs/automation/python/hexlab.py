@@ -1480,6 +1480,85 @@ class Project:
         """Write an independent copy without rebinding this object's project."""
         return self._call("save_as", os.fspath(path))
 
+    def backup_to(self, path, *, replace=False, cancel=None):
+        """Create a consistent restore point without changing this project's path.
+
+        Returns a dictionary with the backup path and preserved project UUID.
+        Existing destinations are refused unless replace=True.
+        """
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            return self._call("backup_to", os.fspath(path), bool(replace),
+                              None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("project backup canceled") from None
+            raise
+
+    def backup_to_rotating(self, base, *, retain=5, cancel=None):
+        """Write a timestamped restore point and prune old generations."""
+        _unsigned(retain, "retain")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            return self._call("backup_to_rotating", os.fspath(base), retain,
+                              None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("rotating project backup canceled") from None
+            raise
+
+    def list_rotated_backups(self, base, *, cancel=None):
+        """List timestamped backups; `complete` reports whether scanning finished."""
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            return self._call("list_rotated_backups", os.fspath(base),
+                              None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("backup listing canceled") from None
+            raise
+
+    def prune_rotated_backups(self, base, *, retain, cancel=None):
+        """Keep at most `retain` rotated generations and report pruning status."""
+        _unsigned(retain, "retain")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            return self._call("prune_rotated_backups", os.fspath(base), retain,
+                              None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("backup pruning canceled") from None
+            raise
+
+    @staticmethod
+    def restore_backup_in_place(backup, target, *, api_version=API_VERSION, cancel=None):
+        """Restore a backup after closing all project owners for target.
+
+        Reopen target afterward to refresh its workspace snapshot.
+        """
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            return _hexlab.restore_backup_in_place(
+                os.fspath(backup), os.fspath(target), api_version,
+                None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("project restore canceled") from None
+            raise
+
     def export_binary(self, path):
         """Export canonical effective bytes; refuse to replace existing paths."""
         return self._call("export", os.fspath(path))

@@ -360,4 +360,41 @@ Result<FunctionInstructionDiff> diff_function_instructions(
         return Error{ErrorCode::canceled, "instruction diff canceled"};
     return result;
 }
+
+Result<FunctionInstructionDiff> diff_function_instructions_detailed(
+    std::span<const std::uint64_t> old_fingerprints, std::span<const std::uint64_t> new_fingerprints,
+    std::span<const InstructionSemanticFeature> old_features,
+    std::span<const InstructionSemanticFeature> new_features,
+    const FunctionInstructionDiffOptions &options) {
+    if (old_features.size() != old_fingerprints.size() || new_features.size() != new_fingerprints.size())
+        return Error{ErrorCode::invalid_argument, "instruction semantic features must cover both fingerprint sequences"};
+    for (std::size_t i=0;i<old_features.size();++i) if (old_features[i].fingerprint != old_fingerprints[i])
+        return Error{ErrorCode::invalid_argument, "old instruction semantic fingerprint mismatch"};
+    for (std::size_t i=0;i<new_features.size();++i) if (new_features[i].fingerprint != new_fingerprints[i])
+        return Error{ErrorCode::invalid_argument, "new instruction semantic fingerprint mismatch"};
+    auto result = diff_function_instructions(old_fingerprints, new_fingerprints, options);
+    if (!result) return result.error();
+    auto &diff = result.value();
+    diff.semantic.available = true;
+    for (auto &run : diff.runs) {
+        if (run.kind != InstructionDiffKind::changed) continue;
+        run.semantic.available = true;
+        const auto paired = std::min(run.old_count, run.new_count);
+        for (std::uint64_t n=0;n<paired;++n) {
+            const auto &a=old_features[static_cast<std::size_t>(run.old_start+n)];
+            const auto &b=new_features[static_cast<std::size_t>(run.new_start+n)];
+            if (a.opcode != b.opcode) ++run.semantic.opcode_changes;
+            if (a.flow != b.flow) ++run.semantic.flow_changes;
+            if (a.operand_signature != b.operand_signature) ++run.semantic.operand_changes;
+            if (a.effect_signature != b.effect_signature) ++run.semantic.effect_changes;
+            if (a.opcode == b.opcode && a.flow == b.flow && a.operand_signature == b.operand_signature &&
+                a.effect_signature == b.effect_signature) ++run.semantic.unclassified_changes;
+        }
+        auto &sum=diff.semantic;
+        sum.opcode_changes+=run.semantic.opcode_changes; sum.flow_changes+=run.semantic.flow_changes;
+        sum.operand_changes+=run.semantic.operand_changes; sum.effect_changes+=run.semantic.effect_changes;
+        sum.unclassified_changes+=run.semantic.unclassified_changes;
+    }
+    return result;
+}
 } // namespace hexlab::compare

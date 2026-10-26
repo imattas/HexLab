@@ -707,3 +707,23 @@ patches, code/data definitions, function/chunk decisions, user references,
 type assignments/type updates, and saved breakpoints in one revision-pinned
 operation. Its operation tuples, resource limits, and cancellation behavior are
 documented in [python-automation-batches.md](python-automation-batches.md).
+
+## Project backups
+
+`Project.backup_to(path, replace=False, cancel=None)` creates a consistent
+project restore point without rebinding the open owner. It refuses to replace
+an existing destination unless `replace=True`; the returned dictionary has
+`path` and the preserved project `uuid`. `backup_to_rotating(base, retain=5)`
+creates a timestamped generation and prunes older generations. Its result
+contains the new `backup`, `removed_generations`, and `retention_satisfied`.
+`list_rotated_backups(base)` returns `backups` (each with `backup` and
+`created_unix_ms`) and a `complete` flag. `prune_rotated_backups(base,
+retain=...)` returns `remaining`, `removed`, and `retention_satisfied`.
+
+Backup, listing, and pruning methods accept an optional `CancellationToken`;
+the console's active token is used when omitted. A canceled operation raises
+`AnalysisCancelled`. To replace a project's database from a backup, close every
+owner for the target first, call
+`Project.restore_backup_in_place(backup, target, api_version=API_VERSION)`, then
+reopen the target so its workspace snapshot reflects the restored database.
+Restore preserves the backup project UUID and history.

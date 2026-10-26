@@ -23,6 +23,7 @@
 #include "pe_view.hpp"
 #include "minidump_view.hpp"
 #include "compare_view.hpp"
+#include "../compare_instruction_features.hpp"
 #include "compare_adapter.hpp"
 #include "archive_view.hpp"
 #include "history_view.hpp"
@@ -542,12 +543,14 @@ std::vector<compare::FunctionFeature> compare_function_features(const FunctionSn
                         break;
                     }
                     block_feature.instruction_fingerprints.push_back(*fingerprint);
+                    block_feature.instruction_semantics.push_back(::hexlab::app::compare_semantic_feature(fact->instruction, *fingerprint));
                 }
                 if (block_fingerprints_complete) {
                     block_feature.instruction_fingerprints_available = true;
                     cfg_instruction_fingerprint_budget -= block_feature.instruction_fingerprints.size();
                 } else {
                     block_feature.instruction_fingerprints.clear();
+                    block_feature.instruction_semantics.clear();
                 }
                 for (const auto &[kind, target] : node.outgoing)
                     if (target < cfg.size()) block_feature.successors.push_back({static_cast<std::uint32_t>(target), kind});
@@ -572,17 +575,21 @@ std::vector<compare::FunctionFeature> compare_function_features(const FunctionSn
                 if (opcode < feature.opcode_histogram.size()) ++feature.opcode_histogram[opcode];
                 if (fingerprints_complete) {
                     const auto fingerprint = compare_instruction_fingerprint(fact->instruction);
-                    if (fingerprint) feature.instruction_fingerprints.push_back(*fingerprint);
+                    if (fingerprint) {
+                        feature.instruction_fingerprints.push_back(*fingerprint);
+                        feature.instruction_semantics.push_back(::hexlab::app::compare_semantic_feature(fact->instruction, *fingerprint));
+                    }
                     else {
                         fingerprints_complete = false;
                         feature.instruction_fingerprints.clear();
+                        feature.instruction_semantics.clear();
                     }
                 }
             }
         }
         feature.call_count = static_cast<std::uint64_t>(std::count_if(snapshot.calls.begin(), snapshot.calls.end(),
             [&](const auto &call) { return call.owner == function->id; }));
-        if (!fingerprints_complete) feature.instruction_fingerprints.clear();
+        if (!fingerprints_complete) { feature.instruction_fingerprints.clear(); feature.instruction_semantics.clear(); }
         result.push_back(std::move(feature));
     }
     populate_direct_call_neighborhoods(snapshot, result);
@@ -622,7 +629,8 @@ std::vector<compare::FunctionBodyDiff> compare_function_bodies(
                         compare::FunctionInstructionDiffOptions options;
                         options.max_dynamic_cells = std::min(per_function_cell_budget, remaining_cells);
                         options.stop_token = stop;
-                        auto diff = compare::diff_function_instructions(before, after, options);
+                        auto diff = compare::diff_function_instructions_detailed(before, after,
+                            old_found->second->instruction_semantics, new_found->second->instruction_semantics, options);
                         if (!diff && diff.error().code == compare::ErrorCode::canceled) return {};
                         if (diff) { instruction_diff = std::move(diff.value()); remaining_cells -= cells; }
                     }

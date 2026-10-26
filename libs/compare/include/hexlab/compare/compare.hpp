@@ -19,6 +19,7 @@ public:
     Result(Error error) : error_(std::move(error)) {}
     bool has_value() const noexcept { return value_.has_value(); }
     explicit operator bool() const noexcept { return value_.has_value(); }
+    T &value() { return value_.value(); }
     const T &value() const { return value_.value(); }
     const Error &error() const { return error_.value(); }
 private:
@@ -65,6 +66,18 @@ struct CfgEdgeFeature {
     // conditional-false, fallthrough, switch, or indirect.
     std::uint32_t kind = 0;
 };
+// Compact instruction facts retained by comparison frontends. Signatures are
+// normalized and address independent; they classify a changed fingerprint.
+struct InstructionSemanticFeature {
+    std::uint64_t fingerprint = 0;
+    std::uint32_t opcode = 0, flow = 0;
+    std::uint64_t operand_signature = 0, effect_signature = 0;
+};
+struct InstructionChangeEvidence {
+    bool available = false;
+    std::uint64_t opcode_changes = 0, flow_changes = 0;
+    std::uint64_t operand_changes = 0, effect_changes = 0, unclassified_changes = 0;
+};
 struct CfgBlockFeature {
     // Address-independent summary of the block's normalized instructions.
     std::uint64_t fingerprint = 0;
@@ -73,6 +86,7 @@ struct CfgBlockFeature {
     // Empty or unavailable sequences never get treated as evidence of equality.
     std::vector<std::uint64_t> instruction_fingerprints;
     bool instruction_fingerprints_available = false;
+    std::vector<InstructionSemanticFeature> instruction_semantics;
 };
 // Architecture-neutral function shape used for relocation-tolerant matching.
 struct FunctionFeature {
@@ -85,6 +99,7 @@ struct FunctionFeature {
     // Stable, address-independent instruction IDs. The analysis frontend should
     // normalize operands (registers, immediates, and branch targets) before hashing.
     std::vector<std::uint64_t> instruction_fingerprints;
+    std::vector<InstructionSemanticFeature> instruction_semantics;
     // Optional known direct-call destinations in this image. Unknown targets
     // are ignored, and duplicate call sites to one function count once.
     std::vector<FunctionAddress> direct_calls;
@@ -167,11 +182,13 @@ struct InstructionDiffRun {
     InstructionDiffKind kind = InstructionDiffKind::equal;
     std::uint64_t old_start = 0, new_start = 0;
     std::uint64_t old_count = 0, new_count = 0;
+    InstructionChangeEvidence semantic;
 };
 struct FunctionInstructionDiff {
     std::vector<InstructionDiffRun> runs;
     std::uint64_t equal_instructions = 0, changed_instructions = 0;
     std::uint64_t removed_instructions = 0, added_instructions = 0;
+    InstructionChangeEvidence semantic;
 };
 struct FunctionInstructionDiffOptions {
     // Total LCS matrix cells across exact-alignment gaps are bounded before
@@ -250,6 +267,11 @@ struct FunctionBodyDiff {
 HEXLAB_COMPARE_EXPORT Result<FunctionInstructionDiff> diff_function_instructions(
     std::span<const std::uint64_t> old_fingerprints,
     std::span<const std::uint64_t> new_fingerprints,
+    const FunctionInstructionDiffOptions &options = {});
+HEXLAB_COMPARE_EXPORT Result<FunctionInstructionDiff> diff_function_instructions_detailed(
+    std::span<const std::uint64_t> old_fingerprints, std::span<const std::uint64_t> new_fingerprints,
+    std::span<const InstructionSemanticFeature> old_features,
+    std::span<const InstructionSemanticFeature> new_features,
     const FunctionInstructionDiffOptions &options = {});
 struct CompareOptions {
     std::stop_token stop_token;

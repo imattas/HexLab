@@ -1,5 +1,6 @@
 #include "commands.hpp"
 #include "argument_text.hpp"
+#include "../compare_instruction_features.hpp"
 
 #include "hexlab/compare/compare.hpp"
 #include "hexlab/analysis/functions.hpp"
@@ -158,6 +159,7 @@ std::vector<compare::FunctionFeature> function_features(const FunctionSnapshot &
                         block_fingerprints_complete = false;
                     } else if (block_fingerprints_complete) {
                         block_feature.instruction_fingerprints.push_back(*fingerprint);
+                        block_feature.instruction_semantics.push_back(::hexlab::app::compare_semantic_feature(fact->instruction, *fingerprint));
                     }
                 }
                 if (block_fingerprints_complete) {
@@ -165,6 +167,7 @@ std::vector<compare::FunctionFeature> function_features(const FunctionSnapshot &
                     cfg_instruction_fingerprint_budget -= block_feature.instruction_fingerprints.size();
                 } else {
                     block_feature.instruction_fingerprints.clear();
+                    block_feature.instruction_semantics.clear();
                 }
                 std::sort(opcodes.begin(), opcodes.end());
                 auto hash = mix(offset_basis, opcodes.size());
@@ -197,9 +200,10 @@ std::vector<compare::FunctionFeature> function_features(const FunctionSnapshot &
                 const auto opcode = static_cast<std::size_t>(fact->instruction.opcode);
                 if (opcode < feature.opcode_histogram.size()) ++feature.opcode_histogram[opcode];
                 if (fingerprint_complete) {
-                    if (const auto fingerprint = instruction_fingerprint(fact->instruction))
+                    if (const auto fingerprint = instruction_fingerprint(fact->instruction)) {
                         feature.instruction_fingerprints.push_back(*fingerprint);
-                    else { fingerprint_complete = false; feature.instruction_fingerprints.clear(); }
+                        feature.instruction_semantics.push_back(::hexlab::app::compare_semantic_feature(fact->instruction, *fingerprint));
+                    } else { fingerprint_complete = false; feature.instruction_fingerprints.clear(); feature.instruction_semantics.clear(); }
                 }
             }
         }
@@ -450,19 +454,27 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
                         out << " equal=" << block.instruction_diff.equal_instructions
                             << " changed=" << block.instruction_diff.changed_instructions
                             << " removed=" << block.instruction_diff.removed_instructions
-                            << " added=" << block.instruction_diff.added_instructions << '\n';
+                            << " added=" << block.instruction_diff.added_instructions;
+                        const auto &semantic = block.instruction_diff.semantic;
+                        if (semantic.available) out << " semantic(opcode=" << semantic.opcode_changes
+                            << ",flow=" << semantic.flow_changes << ",operand=" << semantic.operand_changes
+                            << ",effect=" << semantic.effect_changes << ",unclassified=" << semantic.unclassified_changes << ')';
+                        out << '\n';
                     }
                     if (omitted_block_summaries)
                         out << "  ... " << omitted_block_summaries
                             << " changed block summaries omitted (global display limit)\n";
                 }
                 if (old_feature->instruction_fingerprints.empty() || new_feature->instruction_fingerprints.empty()) continue;
-                auto body = compare::diff_function_instructions(old_feature->instruction_fingerprints,
-                    new_feature->instruction_fingerprints);
+                auto body = compare::diff_function_instructions_detailed(old_feature->instruction_fingerprints,
+                    new_feature->instruction_fingerprints, old_feature->instruction_semantics,
+                    new_feature->instruction_semantics);
                 if (!body) continue;
                 out << "  instructions equal=" << body.value().equal_instructions << " changed="
                     << body.value().changed_instructions << " removed=" << body.value().removed_instructions
-                    << " added=" << body.value().added_instructions << '\n';
+                    << " added=" << body.value().added_instructions << " semantic(opcode=" << body.value().semantic.opcode_changes
+                    << ",flow=" << body.value().semantic.flow_changes << ",operand=" << body.value().semantic.operand_changes
+                    << ",effect=" << body.value().semantic.effect_changes << ",unclassified=" << body.value().semantic.unclassified_changes << ")\n";
                 std::uint64_t omitted_instruction_runs = 0;
                 for (const auto &run : body.value().runs) {
                     if (run.kind == compare::InstructionDiffKind::equal) continue;
