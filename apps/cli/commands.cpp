@@ -36,6 +36,7 @@
 #include <iomanip>
 #include <sstream>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -195,7 +196,7 @@ void usage(std::ostream &out) {
            "       hexlab_cli disassemble <path> [options]\n\n"
            "       hexlab_cli decompile <path> [options]\n\n"
            "       hexlab_cli compare <old-image> <new-image> [--window <bytes>] [--anchor <bytes>] [--limit <runs>] [--functions]\n\n"
-           "       hexlab_cli modules <binary>...  (dependency inventory and supplied-file resolution)\n\n"
+           "       hexlab_cli modules [--graph] <binary>...  (graph mode traverses dependencies from the first file)\n\n"
            "       hexlab_cli project --help  (persistent projects and editing)\n\n"
            "       hexlab_cli plugins scan <directory> [--json]  (data-only native plugin discovery)\n\n"
            "       hexlab_cli archive list <archive>\n"
@@ -223,15 +224,26 @@ void usage(std::ostream &out) {
 }
 
 int modules_command(std::span<const std::wstring_view> arguments, std::ostream &out, std::ostream &err) {
-    if (arguments.size() < 2) {
-        err << "Usage: hexlab_cli modules <binary>...\n";
+    const bool graph_mode = !arguments.empty() && arguments.front() == L"--graph";
+    const auto inputs = graph_mode ? arguments.subspan(1) : arguments;
+    if ((graph_mode && inputs.empty()) || (!graph_mode && inputs.size() < 2)) {
+        err << "Usage: hexlab_cli modules [--graph] <binary>...\n"
+               "       In graph mode the first binary is the root; later files are supplied candidates.\n";
+        return 2;
+    }
+    constexpr std::size_t max_graph_modules = 4096;
+    constexpr std::size_t max_graph_edges = 100000;
+    constexpr std::size_t max_graph_depth = 64;
+    constexpr std::size_t max_graph_name_bytes = 16 * 1024 * 1024;
+    if (graph_mode && inputs.size() > max_graph_modules) {
+        err << "Dependency graph accepts at most " << max_graph_modules << " supplied files.\n";
         return 2;
     }
     struct Module { std::filesystem::path path; std::shared_ptr<const DocumentSnapshot> document; };
     std::vector<Module> modules;
-    for (std::size_t i = 0; i < arguments.size(); ++i) {
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
         OpenRequest request;
-        request.path = std::filesystem::path(arguments[i]);
+        request.path = std::filesystem::path(inputs[i]);
         request.run_analysis = false;
         auto loaded = load_document(request, {{i}, 1}, {});
         if (!loaded) { err << path_text(request.path) << ": " << loaded.error().message << '\n'; return 1; }
@@ -243,26 +255,180 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
         std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return value;
     };
-    for (const auto &module : modules) {
-        const auto &m = module.document->metadata;
+    auto path_key = [](const std::filesystem::path &path) {
+        auto value = path.lexically_normal().generic_string();
+#ifdef _WIN32
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+#endif
+        return value;
+    };
+    auto dependencies_for = [](const ImageMetadata &metadata, std::size_t row_limit, std::size_t byte_limit,
+                               bool include_macho_id)
+        -> std::optional<std::vector<std::string>> {
         std::vector<std::string> deps;
-        for (const auto &imp : m.imports) if (!imp.library.empty()) deps.push_back(imp.library);
-        if (m.elf) for (const auto &table : m.elf->dynamic_tables) for (const auto &entry : table.entries)
-            if (entry.tag == 1 && entry.string_value) deps.push_back(*entry.string_value);
-        if (m.macho) for (const auto &library : m.macho->libraries) if (!library.name.empty()) deps.push_back(library.name);
-        std::sort(deps.begin(), deps.end(), [&leaf](const auto &a, const auto &b) { return leaf(a) < leaf(b); });
+        std::size_t bytes = 0;
+        bool exceeded = false;
+        auto add = [&](const std::string &name) {
+            if (name.empty()) return;
+            if (deps.size() >= row_limit || name.size() > byte_limit - bytes) {
+                exceeded = true;
+                return;
+            }
+            bytes += name.size();
+            deps.push_back(name);
+        };
+        for (const auto &imp : metadata.imports)
+            add(imp.library);
+        if (metadata.elf)
+            for (const auto &table : metadata.elf->dynamic_tables)
+                for (const auto &entry : table.entries)
+                    if (entry.tag == 1 && entry.string_value) add(*entry.string_value);
+        if (metadata.macho)
+            for (const auto &library : metadata.macho->libraries)
+                if (include_macho_id || library.ordinal) add(library.name);
+        if (exceeded) return std::nullopt;
+        return deps;
+    };
+    auto sort_dependencies = [&leaf](std::vector<std::string> &deps) {
+        std::sort(deps.begin(), deps.end(), [&leaf](const auto &a, const auto &b) {
+            const auto left = leaf(a), right = leaf(b);
+            return left == right ? a < b : left < right;
+        });
         deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
-        out << path_text(module.path) << "\n";
-        if (deps.empty()) { out << "  (no dependency names in parsed metadata)\n"; continue; }
-        for (const auto &dep : deps) {
-            std::vector<std::string> providers;
-            for (const auto &candidate : modules) if (&candidate != &module && leaf(path_text(candidate.path)) == leaf(dep))
-                providers.push_back(path_text(candidate.path));
-            out << "  " << dep << " -> ";
-            if (providers.empty()) out << "unresolved (not supplied)";
-            else if (providers.size() == 1) out << "resolved: " << providers.front();
-            else { out << "ambiguous:"; for (const auto &p : providers) out << " " << p; }
+    };
+    if (!graph_mode) {
+        for (const auto &module : modules) {
+            auto deps_result = dependencies_for(module.document->metadata,
+                (std::numeric_limits<std::size_t>::max)(),
+                (std::numeric_limits<std::size_t>::max)(), true);
+            auto deps = std::move(*deps_result);
+            sort_dependencies(deps);
+            out << path_text(module.path) << "\n";
+            if (deps.empty()) { out << "  (no dependency names in parsed metadata)\n"; continue; }
+            for (const auto &dep : deps) {
+                std::vector<std::string> providers;
+                for (const auto &candidate : modules)
+                    if (&candidate != &module && leaf(path_text(candidate.path)) == leaf(dep))
+                        providers.push_back(path_text(candidate.path));
+                out << "  " << dep << " -> ";
+                if (providers.empty()) out << "unresolved (not supplied)";
+                else if (providers.size() == 1) out << "resolved: " << providers.front();
+                else { out << "ambiguous:"; for (const auto &p : providers) out << " " << p; }
+                out << '\n';
+            }
+        }
+    } else {
+        struct Edge {
+            std::string name;
+            std::vector<std::size_t> providers;
+        };
+        std::vector<std::vector<Edge>> graph(modules.size());
+        std::size_t edge_count = 0;
+        std::size_t raw_dependency_rows = 0;
+        std::size_t dependency_name_bytes = 0;
+        std::map<std::string, std::vector<std::size_t>> providers_by_basename;
+        for (std::size_t candidate = 0; candidate < modules.size(); ++candidate)
+            providers_by_basename[leaf(path_text(modules[candidate].path))].push_back(candidate);
+        for (std::size_t source = 0; source < modules.size(); ++source) {
+            auto deps_result = dependencies_for(modules[source].document->metadata,
+                max_graph_edges - raw_dependency_rows, max_graph_name_bytes - dependency_name_bytes, false);
+            if (!deps_result) {
+                err << "Dependency graph exceeds " << max_graph_edges << " dependency rows or "
+                    << max_graph_name_bytes << " dependency-name bytes.\n";
+                return 2;
+            }
+            auto deps = std::move(*deps_result);
+            raw_dependency_rows += deps.size();
+            for (const auto &dep : deps) dependency_name_bytes += dep.size();
+            sort_dependencies(deps);
+            if (deps.size() > max_graph_edges - edge_count) {
+                err << "Dependency graph exceeds " << max_graph_edges << " unique dependency rows.\n";
+                return 2;
+            }
+            edge_count += deps.size();
+            graph[source].reserve(deps.size());
+            for (auto &dep : deps) {
+                Edge edge{std::move(dep), {}};
+                const auto providers = providers_by_basename.find(leaf(edge.name));
+                if (providers != providers_by_basename.end()) edge.providers = providers->second;
+                graph[source].push_back(std::move(edge));
+            }
+        }
+
+        out << "Recursive dependency graph (only supplied files; maximum depth " << max_graph_depth << ")\n";
+        out << "Supplied node identities (input order):\n";
+        std::map<std::string, std::size_t> first_path;
+        std::map<std::string, std::size_t> first_basename;
+        for (std::size_t index = 0; index < modules.size(); ++index) {
+            const auto key = path_key(modules[index].path);
+            const auto basename = leaf(path_text(modules[index].path));
+            out << "  [" << index << "] " << path_text(modules[index].path);
+            if (const auto same_path = first_path.find(key); same_path != first_path.end())
+                out << " (duplicate supplied path of [" << same_path->second << "])";
+            else if (const auto same_basename = first_basename.find(basename);
+                     same_basename != first_basename.end())
+                out << " (duplicate basename of [" << same_basename->second << "])";
             out << '\n';
+            first_path.try_emplace(key, index);
+            first_basename.try_emplace(basename, index);
+        }
+        out << "Root: [0] " << path_text(modules.front().path) << "\n";
+        std::vector<std::uint8_t> color(modules.size(), 0);
+        std::size_t expanded = 0;
+        std::size_t provider_ids_reported = 0;
+        constexpr std::size_t max_reported_provider_ids = 100000;
+        bool depth_limited = false;
+        std::function<void(std::size_t, std::size_t)> visit = [&](std::size_t current, std::size_t depth) {
+            color[current] = 1;
+            ++expanded;
+            if (graph[current].empty())
+                out << std::string((depth + 1) * 2, ' ') << "(no dependency names in parsed metadata)\n";
+            for (const auto &edge : graph[current]) {
+                out << std::string((depth + 1) * 2, ' ') << edge.name << " -> ";
+                if (edge.providers.empty()) {
+                    out << "unresolved (not supplied)\n";
+                    continue;
+                }
+                if (edge.providers.size() != 1) {
+                    out << "ambiguous:";
+                    const auto remaining = max_reported_provider_ids - provider_ids_reported;
+                    const auto count = (std::min)(edge.providers.size(), remaining);
+                    for (std::size_t index = 0; index < count; ++index)
+                        out << " [" << edge.providers[index] << "]";
+                    provider_ids_reported += count;
+                    if (count < edge.providers.size())
+                        out << " ... " << edge.providers.size() - count << " provider IDs omitted";
+                    out << '\n';
+                    continue;
+                }
+                const auto provider = edge.providers.front();
+                out << "[" << provider << "] " << path_text(modules[provider].path);
+                if (color[provider] == 1) {
+                    out << " (cycle)\n";
+                    continue;
+                }
+                if (color[provider] == 2) {
+                    out << " (already expanded)\n";
+                    continue;
+                }
+                if (depth + 1 >= max_graph_depth) {
+                    out << " (depth limit reached)\n";
+                    depth_limited = true;
+                    continue;
+                }
+                out << '\n';
+                visit(provider, depth + 1);
+            }
+            color[current] = 2;
+        };
+        visit(0, 0);
+        out << "Expanded " << expanded << " of " << modules.size() << " supplied modules; "
+            << edge_count << " dependency rows.\n";
+        if (expanded < modules.size()) {
+            out << "Some supplied modules were not expanded because they are unreachable from the root";
+            if (depth_limited) out << " or beyond the depth limit";
+            out << ".\n";
         }
     }
     std::vector<SuppliedModule> supplied;
