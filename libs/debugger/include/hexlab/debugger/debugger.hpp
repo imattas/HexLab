@@ -163,6 +163,9 @@ public:
     virtual Status resume_threads_event(std::uint64_t, std::span<const ThreadResumeAction>) {
         return Error{ErrorCode::unsupported, "per-thread resume schedules are not supported by this backend"};
     }
+    // Signal disposition on scheduled actions is opt-in because most backends
+    // cannot safely preserve or suppress a pending signal per thread.
+    virtual bool supports_scheduled_signal_disposition() const noexcept { return false; }
     // Backends without instruction stepping may keep this default behavior.
     virtual Status single_step_event(std::uint64_t, ContinueStatus) {
         return Error{ErrorCode::unsupported, "single-step execution is not supported by this backend"};

@@ -317,6 +317,7 @@ Status set_sve_state(pid_t tid, const Aarch64SveState& state) {
 }
 
 class LinuxAarch64Backend final : public Backend {
+    bool supports_scheduled_signal_disposition() const noexcept override { return true; }
     using Clock = std::chrono::steady_clock;
     // A nested rollback/suspension shares its caller's deadline. EINTR and
     // additional TIDs never restart the timeout.
