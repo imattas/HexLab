@@ -535,6 +535,9 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
     case 0xd5: integer_operation=Opcode::vpmullw; break;
     case 0xe5: integer_operation=Opcode::vpmulhw; break;
     case 0xe4: integer_operation=Opcode::vpmulhuw; break;
+    case 0xdb: integer_operation=w ? Opcode::vpandq : Opcode::vpandd; break;
+    case 0xeb: integer_operation=w ? Opcode::vporq : Opcode::vpord; break;
+    case 0xef: integer_operation=w ? Opcode::vpxorq : Opcode::vpxord; break;
     case 0xf4: integer_operation=Opcode::vpmuludq; required_w=true; break;
     case 0xf5: integer_operation=Opcode::vpmaddwd; break;
     default: break;

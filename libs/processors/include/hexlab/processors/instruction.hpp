@@ -374,7 +374,9 @@ enum class Opcode {
     vpunpckhbw, vpunpckhwd, vpunpckhdq, vpunpckhqdq,
     vpacksswb, vpackssdw, vpackuswb, vpackusdw, vpshufb, vpsadbw,
     // Appended scalar PowerPC floating-point compare and unary operations.
-    ppc_fcmpu, ppc_fcmpo, ppc_fmr, ppc_fneg, ppc_fabs, ppc_frsp
+    ppc_fcmpu, ppc_fcmpo, ppc_fmr, ppc_fneg, ppc_fabs, ppc_frsp,
+    // EVEX dword/qword bitwise forms; append to preserve persisted opcode IDs.
+    vpandd, vpandq, vpord, vporq, vpxord, vpxorq
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

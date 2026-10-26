@@ -89,6 +89,10 @@ inline std::optional<IntegerDataflowShape> evex_integer_shape(Opcode opcode) noe
         return IntegerDataflowShape{32,32,32,false,false,false};
     case Opcode::vpaddq: case Opcode::vpsubq:
         return IntegerDataflowShape{64,64,64,false,false,false};
+    case Opcode::vpandd: case Opcode::vpord: case Opcode::vpxord:
+        return IntegerDataflowShape{32,32,32,false,false,false};
+    case Opcode::vpandq: case Opcode::vporq: case Opcode::vpxorq:
+        return IntegerDataflowShape{64,64,64,false,false,false};
     case Opcode::vpavgb: case Opcode::vpavgw:
     case Opcode::vpminsb: case Opcode::vpminsd: case Opcode::vpminuw: case Opcode::vpminud:
     case Opcode::vpmaxsb: case Opcode::vpmaxsd: case Opcode::vpmaxuw: case Opcode::vpmaxud:
@@ -472,6 +476,17 @@ inline std::optional<X86EvexIntegerResult> evaluate_x86_evex_integer(
     const auto active_bytes = vector_bits / 8;
     if(const auto dataflow=integer_dataflow_shape(instruction.opcode))
         evaluate_integer_dataflow(instruction.opcode,*dataflow,source1,source2,result.bytes,active_bytes);
+    else if (instruction.opcode == Opcode::vpandd || instruction.opcode == Opcode::vpandq ||
+             instruction.opcode == Opcode::vpord || instruction.opcode == Opcode::vporq ||
+             instruction.opcode == Opcode::vpxord || instruction.opcode == Opcode::vpxorq) {
+        for (unsigned byte = 0; byte < active_bytes; ++byte) {
+            const auto left = std::to_integer<unsigned>(source1[byte]);
+            const auto right = std::to_integer<unsigned>(source2[byte]);
+            const auto value = (instruction.opcode == Opcode::vpandd || instruction.opcode == Opcode::vpandq) ? left & right :
+                (instruction.opcode == Opcode::vpord || instruction.opcode == Opcode::vporq) ? left | right : left ^ right;
+            result.bytes[byte] = static_cast<std::byte>(value);
+        }
+    }
     else if(!evaluate_integer_lanes(instruction.opcode,shape->result_bits,source1,source2,result.bytes,active_bytes))return std::nullopt;
     // Writemask bits index destination elements, not source elements. This
     // distinction matters for even-dword products and adjacent multiply-adds.

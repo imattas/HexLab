@@ -604,6 +604,12 @@ std::string operation_name(Opcode opcode) {
     case Opcode::vpand: return "vpand";
     case Opcode::vpor: return "vpor";
     case Opcode::vpxor: return "vpxor";
+    case Opcode::vpandd: return "vpandd";
+    case Opcode::vpandq: return "vpandq";
+    case Opcode::vpord: return "vpord";
+    case Opcode::vporq: return "vporq";
+    case Opcode::vpxord: return "vpxord";
+    case Opcode::vpxorq: return "vpxorq";
     case Opcode::vpsubb: return "vpsubb";
     case Opcode::vpsubw: return "vpsubw";
     case Opcode::vpsubsb: return "vpsubsb";
@@ -2742,7 +2748,10 @@ a64_unhandled:
         : instruction.opcode == Opcode::vpaddq || instruction.opcode == Opcode::vpsubq ? 64u
         : avx_integer_multiply ? 16u : 0u;
     const bool avx_integer_bitwise = instruction.opcode == Opcode::vpand || instruction.opcode == Opcode::vpor ||
-        instruction.opcode == Opcode::vpxor;
+        instruction.opcode == Opcode::vpxor || instruction.opcode == Opcode::vpandd ||
+        instruction.opcode == Opcode::vpandq || instruction.opcode == Opcode::vpord ||
+        instruction.opcode == Opcode::vporq || instruction.opcode == Opcode::vpxord ||
+        instruction.opcode == Opcode::vpxorq;
     if (x86 && (avx_move || avx_float_arithmetic || avx_bitwise || avx_integer_lanes || avx_integer_bitwise)) {
         const auto destination = instruction.operands.empty() ? std::optional<RegisterOperand>{} : as_register(instruction.operands[0]);
         const auto move_source = avx_move && instruction.operands.size() == 2 ? as_register(instruction.operands[1]) : std::optional<RegisterOperand>{};
@@ -2761,12 +2770,16 @@ a64_unhandled:
         const auto vector_type_for = [&](bool floating, std::uint16_t width) {
             const auto lane_bits = avx_integer_lanes
                 ? static_cast<std::uint16_t>(avx_integer_lane_bits)
+                : (instruction.opcode == Opcode::vpandq || instruction.opcode == Opcode::vporq ||
+                   instruction.opcode == Opcode::vpxorq) ? std::uint16_t{64}
+                : (instruction.opcode == Opcode::vpandd || instruction.opcode == Opcode::vpord ||
+                   instruction.opcode == Opcode::vpxord) ? std::uint16_t{32}
                 : (instruction.opcode == Opcode::vaddpd || instruction.opcode == Opcode::vsubpd ||
                 instruction.opcode == Opcode::vmulpd || instruction.opcode == Opcode::vxorpd || instruction.opcode == Opcode::vandpd)
                 ? std::uint16_t{64} : std::uint16_t{32};
             return vector_type(width, floating ? TypeKind::floating : TypeKind::integer,
-                               (floating || avx_integer_lanes) ? lane_bits : width,
-                               (floating || avx_integer_lanes) ? static_cast<std::uint8_t>(width / lane_bits) : std::uint8_t{1});
+                               (floating || avx_integer_lanes || avx_integer_bitwise) ? lane_bits : width,
+                               (floating || avx_integer_lanes || avx_integer_bitwise) ? static_cast<std::uint8_t>(width / lane_bits) : std::uint8_t{1});
         };
         const auto valid_vector_operand = [&](const Operand &operand, bool allow_memory) {
             if (const auto *reg = std::get_if<RegisterOperand>(&operand))
