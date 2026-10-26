@@ -49,6 +49,12 @@ struct WasmExport {
     std::uint32_t index = 0;
     // Resolved from the function index space when kind == function.
     std::optional<std::uint32_t> function_type_index;
+    // Resolved from the corresponding kind-specific index space. Table and
+    // memory exports retain their limits; global exports retain their value
+    // type and mutability.
+    std::optional<WasmLimits> limits;
+    std::optional<std::uint8_t> global_value_type;
+    bool global_mutable = false;
     std::uint32_t entry_index = 0;
     FileOffset section_file_offset{};
     FileOffset entry_file_offset{};
