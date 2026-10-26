@@ -23,10 +23,18 @@ state, `mxcsr`, `st0`-`st7`, and `xmm0`-`xmm7`. Register writes validate names,
 byte widths, and little-endian encoding before applying the complete thread
 context. AVX/YMM state for WOW64 and 32-bit debugger builds is not exposed.
 
+Windows ARM32 builds expose `r0`-`r12`, `sp`, `lr`, `pc`, `cpsr`, `q0`-`q15`,
+and `fpscr` during a pending debug stop. All scalar fields are four bytes;
+each Q register is 16 bytes. Writes require unique little-endian names and
+exact widths. SP remains eight-byte aligned. PC must be two-byte aligned in
+Thumb state and four-byte aligned in ARM state; changing CPSR.T requires an
+explicit PC edit and clear IT state. CPSR's other editable bits are NZCV.
+These paths require a native ARM32 debugger build and have only cross-target
+syntax validation so far.
+
 Windows ARM64 builds expose `x0`-`x30`, `sp`, `pc`, `cpsr`, `v0`-`v31`,
 `fpcr`, and `fpsr`; `x18` remains read-only because Windows reserves it as the
 thread environment pointer. The ARM64-specific branch remains conditional on
-an ARM64 build and still needs target-host validation. ARM32 thread-context
-mapping remains unsupported and returns an explicit error. The backend does
-not claim a complete Windows XSAVE view: AVX-512/ZMM/opmask, WOW64 AVX, and
-ARM32 context state remain unavailable.
+an ARM64 build and still needs target-host validation. The backend does not
+claim a complete Windows XSAVE view: AVX-512/ZMM/opmask and WOW64 AVX remain
+unavailable.
