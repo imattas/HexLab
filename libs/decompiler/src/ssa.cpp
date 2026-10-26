@@ -5,6 +5,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <tuple>
 
@@ -414,6 +415,37 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
         }
         if (target) { successors[i].insert(*target); predecessors[*target].insert(i); }
     }
+    using ExceptionMemoryEdge = LiftedBlock::ExceptionMemoryEdge;
+    std::map<std::pair<std::size_t, std::size_t>, ExceptionMemoryEdge> exception_memory_edges;
+    for (std::size_t source = 0; source < count; ++source)
+        for (const auto &edge : result.blocks[source].exception_memory_edges) {
+            const auto target = addresses.find({edge.target.space.value, edge.target.offset});
+            if (target == addresses.end() || !successors[source].contains(target->second) ||
+                std::none_of(result.blocks[source].successors.begin(), result.blocks[source].successors.end(),
+                    [&](const auto &successor) {
+                        return successor.kind == BlockEdgeKind::exception && successor.source == edge.source &&
+                               successor.target == edge.target;
+                    }))
+                return Error{ErrorCode::invalid_argument, "SSA exception memory edge disagrees with CFG"};
+            if (std::any_of(result.blocks[source].successors.begin(), result.blocks[source].successors.end(),
+                    [&](const auto &successor) {
+                        return successor.kind != BlockEdgeKind::exception &&
+                               ((successor.target && *successor.target == edge.target) ||
+                                (successor.block && successor.block->value == result.blocks[target->second].id.value));
+                    }))
+                return Error{ErrorCode::invalid_argument,
+                    "SSA cannot merge ordinary and exceptional memory on parallel edges"};
+            if (!exception_memory_edges.emplace(std::pair{source, target->second}, edge).second)
+                return Error{ErrorCode::invalid_argument, "SSA has multiple memory states for one exception edge"};
+            if (edge.timing == LiftedBlock::ExceptionMemoryTiming::opaque_effect &&
+                std::none_of(result.blocks[source].instructions.begin(), result.blocks[source].instructions.end(),
+                    [&](const auto &instruction) {
+                        const auto *intrinsic = std::get_if<Intrinsic>(&instruction.statement);
+                        return instruction.origin.address == edge.source && intrinsic &&
+                               intrinsic->memory_effect == IntrinsicMemoryEffect::unknown;
+                    }))
+                return Error{ErrorCode::invalid_argument, "opaque exception edge has no unknown memory effect"};
+        }
 
     std::set<std::size_t> reachable{entry};
     std::vector<std::size_t> pending{entry};
@@ -562,6 +594,13 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
             }
         }
     }
+    // A single exceptional predecessor still needs its own input: the normal
+    // dominator stack contains the throwing instruction's success state.
+    for (const auto &[edge, timing] : exception_memory_edges) {
+        (void)timing;
+        if (reachable.contains(edge.first) && reachable.contains(edge.second))
+            result.blocks[edge.second].memory_phi = LiftedBlock::MemoryPhi{};
+    }
 
     std::vector<std::map<Key, std::size_t>> phi_positions(count);
     for (const auto &variable : variables) {
@@ -595,7 +634,9 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
     std::map<SnapshotPoint, VersionSnapshot> instruction_input_versions;
     std::map<std::uint64_t, VersionSnapshot> block_exit_versions;
     std::map<SnapshotPoint, std::uint32_t> instruction_input_memory_versions;
+    std::map<SnapshotPoint, std::uint32_t> instruction_unknown_memory_versions;
     std::map<std::uint64_t, std::uint32_t> block_exit_memory_versions;
+    bool unresolved_exception_memory = false;
     const auto capture_versions = [&]() {
         VersionSnapshot snapshot;
         for (const auto &[variable, versions] : stacks)
@@ -736,6 +777,12 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                 }
             }
             }, instruction.statement);
+            if (const auto *intrinsic = std::get_if<Intrinsic>(&instruction.statement);
+                intrinsic && intrinsic->memory_effect == IntrinsicMemoryEffect::unknown &&
+                intrinsic->memory_output_version)
+                instruction_unknown_memory_versions.try_emplace(
+                    SnapshotPoint{block.id.value, instruction.origin.instruction_id},
+                    *intrinsic->memory_output_version);
         }
         block_exit_versions[block.id.value] = capture_versions();
         block_exit_memory_versions[block.id.value] = memory_stack.back();
@@ -746,8 +793,25 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
             auto &target = result.blocks[successor];
             for (auto &[variable, position] : phi_positions[successor])
                 target.phis[position].inputs.push_back({block.id, stacks.at(variable).back()});
-            if (target.memory_phi)
-                target.memory_phi->inputs.push_back({block.id, memory_stack.back()});
+            if (target.memory_phi) {
+                auto version = memory_stack.back();
+                if (const auto edge = exception_memory_edges.find({block_index, successor});
+                    edge != exception_memory_edges.end()) {
+                    const auto site = std::find_if(block.instructions.begin(), block.instructions.end(),
+                        [&](const auto &instruction) { return instruction.origin.address == edge->second.source; });
+                    if (site != block.instructions.end()) {
+                        const SnapshotPoint point{block.id.value, site->origin.instruction_id};
+                        const auto &versions = edge->second.timing ==
+                            LiftedBlock::ExceptionMemoryTiming::before_instruction
+                            ? instruction_input_memory_versions : instruction_unknown_memory_versions;
+                        const auto found = versions.find(point);
+                        if (found == versions.end()) unresolved_exception_memory = true;
+                        else version = found->second;
+                    } else if (edge->second.timing != LiftedBlock::ExceptionMemoryTiming::before_instruction)
+                        unresolved_exception_memory = true;
+                }
+                target.memory_phi->inputs.push_back({block.id, version});
+            }
         }
         for (auto child : dom_children[block_index]) rename(child);
         for (const auto &[variable, amount] : pushed)
@@ -756,6 +820,8 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
         if (has_memory_phi) memory_stack.pop_back();
     };
     rename(entry);
+    if (unresolved_exception_memory)
+        return Error{ErrorCode::invalid_argument, "SSA could not resolve throwing instruction memory state"};
     for (auto block : reachable) for (auto &phi : result.blocks[block].phis) {
         std::sort(phi.inputs.begin(), phi.inputs.end(), [&](const auto &a, const auto &b) {
             return ids.at(a.predecessor.value) < ids.at(b.predecessor.value);
@@ -778,9 +844,13 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
     // Add independent version chains for stack slots already proven by the
     // existing recovery pass. The original whole-memory chain is retained for
     // every access and every unclassified effect.
-    auto recovered_slots = recover_stack_variables(result);
-    if (recovered_slots) {
-        auto partitioned = std::move(recovered_slots.value());
+    // The partition renamer currently has only block-exit edge snapshots.
+    // Keep the correct whole-memory chain until partitions gain the same
+    // instruction-specific exceptional input selection.
+    std::optional<Result<LiftedFunction>> recovered_slots;
+    if (exception_memory_edges.empty()) recovered_slots.emplace(recover_stack_variables(result));
+    if (recovered_slots && *recovered_slots) {
+        auto partitioned = std::move(recovered_slots->value());
         // Track pointer identity only through SSA copies, constant add/sub, and
         // unanimous phis. Every other value gets an opaque root; distinct roots
         // remain may-alias, so this never licenses cross-root disjointness.

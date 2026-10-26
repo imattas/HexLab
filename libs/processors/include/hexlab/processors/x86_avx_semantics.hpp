@@ -28,6 +28,13 @@ struct X86EvexIntegerResult {
     bool operator==(const X86EvexIntegerResult &) const = default;
 };
 
+struct X86EvexMaskCompareResult {
+    std::uint64_t mask = 0;
+    std::uint16_t vector_bits = 0;
+    std::uint8_t active_bits = 0;
+    bool operator==(const X86EvexMaskCompareResult &) const = default;
+};
+
 namespace x86_avx_detail {
 // Input and result lane shapes are separate for narrowing, widening and
 // mixed-signedness operations. Every shape here uses full-width vector inputs;
@@ -99,6 +106,23 @@ inline std::optional<IntegerDataflowShape> evex_integer_shape(Opcode opcode) noe
     case Opcode::vpmulld: case Opcode::vpmuldq: case Opcode::vpmuludq:
     case Opcode::vpmaddwd: case Opcode::vpmaddubsw:
         return integer_dataflow_shape(opcode);
+    default: return std::nullopt;
+    }
+}
+struct EvexCompareShape {
+    std::uint16_t lane_bits;
+    bool is_signed;
+};
+inline std::optional<EvexCompareShape> evex_compare_shape(Opcode opcode) noexcept {
+    switch (opcode) {
+    case Opcode::vpcmpb: return EvexCompareShape{8, true};
+    case Opcode::vpcmpw: return EvexCompareShape{16, true};
+    case Opcode::vpcmpd: return EvexCompareShape{32, true};
+    case Opcode::vpcmpq: return EvexCompareShape{64, true};
+    case Opcode::vpcmpub: return EvexCompareShape{8, false};
+    case Opcode::vpcmpuw: return EvexCompareShape{16, false};
+    case Opcode::vpcmpud: return EvexCompareShape{32, false};
+    case Opcode::vpcmpuq: return EvexCompareShape{64, false};
     default: return std::nullopt;
     }
 }
@@ -496,6 +520,58 @@ inline std::optional<X86EvexIntegerResult> evaluate_x86_evex_integer(
         const auto begin=lane*lane_bytes;
         for(unsigned byte=0;byte<lane_bytes;++byte)
             result.bytes[begin+byte]=instruction.x86_opmask_zeroing?std::byte{}:(*old_destination)[begin+byte];
+    }
+    return result;
+}
+
+// VPCMP writes a K register. Masked-off comparisons and bits above the active
+// element count become zero; there is no old-destination merge operand.
+inline std::optional<X86EvexMaskCompareResult> evaluate_x86_evex_mask_compare(
+    const Instruction &instruction, const std::array<std::byte, 64> &source1,
+    const std::array<std::byte, 64> &source2, std::uint64_t opmask_value = UINT64_MAX) noexcept {
+    using namespace x86_avx_detail;
+    const auto shape = evex_compare_shape(instruction.opcode);
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || !instruction.x86_evex ||
+        !shape || instruction.operands.size() != 4 || instruction.x86_opmask_zeroing ||
+        (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512) ||
+        (instruction.vector_element_bits && instruction.vector_element_bits != shape->lane_bits))
+        return std::nullopt;
+    const auto width = static_cast<unsigned>(instruction.vector_bits);
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
+    const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+    if (!destination || destination->bank != RegisterBank::opmask || destination->index >= 8 ||
+        destination->width != 64 || destination->high_byte ||
+        !is_evex_vector(instruction.operands[1], width) ||
+        (!is_evex_vector(instruction.operands[2], width) && (!memory || memory->data_width != width)) ||
+        !predicate || predicate->encoded_width != 8 || predicate->effective_width != 8 || predicate->is_signed ||
+        predicate->value > 7 ||
+        (instruction.x86_opmask && (*instruction.x86_opmask == 0 || *instruction.x86_opmask >= 8)))
+        return std::nullopt;
+    X86EvexMaskCompareResult result{};
+    result.vector_bits = static_cast<std::uint16_t>(width);
+    result.active_bits = static_cast<std::uint8_t>(width / shape->lane_bits);
+    for (unsigned lane = 0; lane < result.active_bits; ++lane) {
+        if (instruction.x86_opmask && !(opmask_value & (UINT64_C(1) << lane))) continue;
+        const unsigned offset = lane * shape->lane_bits / 8;
+        const auto first = load_lane(source1, offset, shape->lane_bits);
+        const auto second = load_lane(source2, offset, shape->lane_bits);
+        const bool equal = first == second;
+        const bool less = shape->is_signed ? signed_lane(first, shape->lane_bits) < signed_lane(second, shape->lane_bits)
+                                           : first < second;
+        bool match = false;
+        switch (predicate->value) {
+        case 0: match = equal; break;
+        case 1: match = less; break;
+        case 2: match = less || equal; break;
+        case 3: match = false; break;
+        case 4: match = !equal; break;
+        case 5: match = !less; break;
+        case 6: match = !less && !equal; break;
+        case 7: match = true; break;
+        }
+        if (match) result.mask |= UINT64_C(1) << lane;
     }
     return result;
 }

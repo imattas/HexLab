@@ -440,6 +440,14 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::vpcmpgtw: return "vpcmpgtw";
     case Opcode::vpcmpgtd: return "vpcmpgtd";
     case Opcode::vpcmpgtq: return "vpcmpgtq";
+    case Opcode::vpcmpb: return "vpcmpb";
+    case Opcode::vpcmpw: return "vpcmpw";
+    case Opcode::vpcmpd: return "vpcmpd";
+    case Opcode::vpcmpq: return "vpcmpq";
+    case Opcode::vpcmpub: return "vpcmpub";
+    case Opcode::vpcmpuw: return "vpcmpuw";
+    case Opcode::vpcmpud: return "vpcmpud";
+    case Opcode::vpcmpuq: return "vpcmpuq";
     default: break;
     }
     if (op >= Opcode::pcmpeqb && op <= Opcode::pcmpgtd) {

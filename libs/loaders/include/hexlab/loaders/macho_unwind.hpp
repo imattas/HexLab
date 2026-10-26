@@ -37,9 +37,10 @@ struct MachOUnwindResult {
 };
 
 // Evaluates a bounded eh_frame FDE containing PC, or falls back to a compact-
-// unwind entry when no FDE covers it. Unsupported recipes are reported
-// explicitly; the callback is asked for 8-byte stack words, 1..8-byte DWARF
-// dereferences, or a bounded 7-byte x86_64 indirect-stack prologue read.
+// unwind entry when no FDE covers it. Arm64 DWARF-mode compact entries bind
+// their exact FDE offset before the generic range lookup. Unsupported recipes
+// are reported explicitly; the callback is asked for 8-byte stack words,
+// 1..8-byte DWARF dereferences, or a bounded 7-byte x86_64 indirect-stack read.
 HEXLAB_LOADERS_EXPORT Result<MachOUnwindResult> evaluate_macho_unwind(
     const MachOMetadata &, Address pc, const MachOUnwindContext &, const MachOUnwindMemoryReader &);
 
