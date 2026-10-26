@@ -3532,6 +3532,14 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         }
         return match;
     };
+    const auto indirect_target_abi_compatible = [&](const EntryKey &entry,
+            const AbiDescription &caller_abi) {
+        if (const auto recovered = entries.find(entry); recovered != entries.end())
+            return same_abi(caller_abi, abis[recovered->second]);
+        const auto external = external_entries.find(entry);
+        return external != external_entries.end() && !external->second.ambiguous &&
+            same_abi(caller_abi, external->second.abi);
+    };
 
     std::vector<LiftedFunction> raw(functions.begin(), functions.end());
 
@@ -3671,10 +3679,12 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                 const bool was_indirect = !call->direct_target;
                 if (!call->direct_target && ssa_call && ssa_call->indirect_target) {
                     const auto direct = constant_call_target(ssa_call->indirect_target, abis[caller]);
-                    if (direct) call->direct_target = Address{AddressSpaceId{direct->first}, direct->second};
+                    if (direct && indirect_target_abi_compatible(*direct, abis[caller]))
+                        call->direct_target = Address{AddressSpaceId{direct->first}, direct->second};
                     else if (const auto *source = std::get_if<RegisterValue>(&ssa_call->indirect_target->value)) {
                         const auto resolved = resolve_target_value(key(source->reg, source->version), source->reg, 0);
-                        if (resolved) call->direct_target = Address{AddressSpaceId{resolved->first}, resolved->second};
+                        if (resolved && indirect_target_abi_compatible(*resolved, abis[caller]))
+                            call->direct_target = Address{AddressSpaceId{resolved->first}, resolved->second};
                     }
                 }
                 if (!call->direct_target) continue;
