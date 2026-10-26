@@ -152,8 +152,13 @@ ZMM0-ZMM31 and K0-K7, preserves full 512-bit register and memory widths, and
 records mask-register reads. K0 is unmasked; K1-K7 support merge masking and
 destination zeroing for loads/arithmetic, and merge masking for stores. EVEX
 compressed disp8 on these full-width non-broadcast forms scales by 64 bytes.
-Broadcast, embedded rounding, reserved encodings, and unsupported EVEX maps
-remain rejected rather than decoded as VEX/legacy instructions.
+Packed floating arithmetic also accepts memory broadcast (`EVEX.b=1`) for
+`VADDPS/PD`, `VSUBPS/PD`, `VMULPS/PD`, and `VDIVPS/PD` at 128/256/512-bit
+vector widths. The memory operand is one 32- or 64-bit lane, compressed disp8
+scales by that element width, and typed decompiler effects mark the scalar
+input as broadcast across result lanes. EVEX.b with a register source selects
+embedded rounding and remains unsupported, as do broadcast tuples for other
+instruction families, reserved encodings, and unsupported EVEX maps. This follows the EVEX `Load+Op` broadcast and tuple-scale rules in Intel SDM Vol. 2, sections 2.6.5 and 2.6.6 ([manual](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developers-manual.pdf)).
 
 EVEX.512 packed integer wrapping add/sub now covers `VPADDB/W/D/Q` and
 `VPSUBB/W/D/Q` with ZMM register and 512-bit memory operands. K1-K7 masking is

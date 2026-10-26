@@ -1338,4 +1338,108 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
     }
     return rows;
 }
+
+std::vector<DebuggerLocalRow> debugger_pe_exception_rows(
+    const PeMetadata &metadata, std::uint64_t module_base, std::uint64_t runtime_pc,
+    std::uint64_t establisher_frame,
+    const std::function<Result<std::vector<std::byte>>(std::uint64_t, std::size_t)> &read_memory) {
+    std::vector<DebuggerLocalRow> rows;
+    const auto address_text = [](std::uint64_t address) {
+        char buffer[32]{};
+        std::snprintf(buffer, sizeof(buffer), "0x%llX", static_cast<unsigned long long>(address));
+        return std::string(buffer);
+    };
+    const auto append_dispatch = [&](std::string_view abi, std::string_view disposition,
+                                     std::string_view diagnostic) {
+        if (diagnostic.empty()) return;
+        rows.push_back({"Exception dispatch", std::string(abi) + " metadata", "Current frame",
+                        std::string(disposition), std::string(diagnostic)});
+    };
+    const auto fh3_dispatch_name = [](PeFh3DispatchDisposition disposition) -> std::string_view {
+        switch (disposition) {
+        case PeFh3DispatchDisposition::unresolved: return "unresolved";
+        case PeFh3DispatchDisposition::handler_candidate: return "handler candidate";
+        case PeFh3DispatchDisposition::continue_search: return "continue search";
+        case PeFh3DispatchDisposition::unexpected_exception_spec: return "unexpected exception specification";
+        case PeFh3DispatchDisposition::terminate_noexcept: return "terminate noexcept";
+        case PeFh3DispatchDisposition::ambiguous: return "ambiguous";
+        }
+        return "unknown";
+    };
+    const auto fh4_dispatch_name = [](PeFh4DispatchDisposition disposition) -> std::string_view {
+        switch (disposition) {
+        case PeFh4DispatchDisposition::unresolved: return "unresolved";
+        case PeFh4DispatchDisposition::handler_candidate: return "handler candidate";
+        case PeFh4DispatchDisposition::continue_search: return "continue search";
+        case PeFh4DispatchDisposition::terminate_noexcept: return "terminate noexcept";
+        case PeFh4DispatchDisposition::ambiguous: return "ambiguous";
+        }
+        return "unknown";
+    };
+
+    auto fh3 = plan_pe_fh3_exception(metadata, module_base, runtime_pc, establisher_frame);
+    if (fh3) {
+        const auto &plan = fh3.value();
+        append_dispatch("FH3", fh3_dispatch_name(plan.dispatch), plan.dispatch_diagnostic);
+        for (const auto &action : plan.cleanup_actions) {
+            rows.push_back({"Cleanup state " + std::to_string(action.state), "FH3 cleanup candidate",
+                            "Active at selected PC", address_text(action.action_address),
+                            "metadata candidate; target code was not executed"});
+        }
+        const auto disposition_name = [](PeFh3CatchDisposition disposition) -> std::string_view {
+            switch (disposition) {
+            case PeFh3CatchDisposition::catch_all: return "catch-all";
+            case PeFh3CatchDisposition::exact_type: return "exact type";
+            case PeFh3CatchDisposition::different_type: return "different type";
+            case PeFh3CatchDisposition::type_unknown: return "type unknown";
+            case PeFh3CatchDisposition::unsupported_adjectives: return "unsupported adjectives";
+            }
+            return "unknown";
+        };
+        for (const auto &handler : plan.handlers) {
+            const auto name = handler.decorated_type_name.value_or("<catch-all or unresolved type>");
+            rows.push_back({name, "FH3 catch candidate: " + std::string(disposition_name(handler.disposition)),
+                            "Try block " + std::to_string(handler.try_index) +
+                                ", handler " + std::to_string(handler.handler_index),
+                            address_text(handler.handler_address),
+                            handler.catch_object_address
+                                ? "catch object " + address_text(*handler.catch_object_address)
+                                : "catch-object location unavailable; exception type not supplied"});
+        }
+    }
+
+    auto fh4 = plan_pe_fh4_exception(metadata, module_base, runtime_pc, establisher_frame,
+                                     {}, read_memory, PeFh4ExceptionKind::unknown);
+    if (fh4) {
+        const auto &plan = fh4.value();
+        append_dispatch("FH4", fh4_dispatch_name(plan.dispatch), plan.dispatch_diagnostic);
+        for (const auto &action : plan.cleanup_actions) {
+            std::string detail = "metadata candidate; target code was not executed";
+            if (action.object_address) detail += "; object " + address_text(*action.object_address);
+            rows.push_back({"Cleanup state " + std::to_string(action.state), "FH4 cleanup candidate",
+                            "Active at selected PC", address_text(action.action_address), std::move(detail)});
+        }
+        const auto disposition_name = [](PeFh4CatchDisposition disposition) -> std::string_view {
+            switch (disposition) {
+            case PeFh4CatchDisposition::catch_all: return "catch-all";
+            case PeFh4CatchDisposition::exact_type: return "exact type";
+            case PeFh4CatchDisposition::different_type: return "different type";
+            case PeFh4CatchDisposition::type_unknown: return "type unknown";
+            case PeFh4CatchDisposition::unsupported_adjectives: return "unsupported adjectives";
+            }
+            return "unknown";
+        };
+        for (const auto &handler : plan.handlers) {
+            const auto name = handler.decorated_type_name.value_or("<catch-all or unresolved type>");
+            std::string detail = "metadata candidate; exception type and runtime dispatch are unresolved";
+            if (handler.catch_object_address)
+                detail += "; catch object " + address_text(*handler.catch_object_address);
+            rows.push_back({name, "FH4 catch candidate: " + std::string(disposition_name(handler.disposition)),
+                            "Try block " + std::to_string(handler.try_index) +
+                                ", handler " + std::to_string(handler.handler_index),
+                            address_text(handler.handler_address), std::move(detail)});
+        }
+    }
+    return rows;
+}
 } // namespace hexlab::desktop

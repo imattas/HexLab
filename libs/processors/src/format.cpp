@@ -218,6 +218,12 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips64_bgezal: return "bgezal";
     case Opcode::mips64_bltzall: return "bltzall";
     case Opcode::mips64_bgezall: return "bgezall";
+    case Opcode::mips64_tge: return "tge";
+    case Opcode::mips64_tgeu: return "tgeu";
+    case Opcode::mips64_tlt: return "tlt";
+    case Opcode::mips64_tltu: return "tltu";
+    case Opcode::mips64_teq: return "teq";
+    case Opcode::mips64_tne: return "tne";
     case Opcode::mips64_ll: return "ll";
     case Opcode::mips64_sc: return "sc";
     case Opcode::mips64_add: return "add";
@@ -620,6 +626,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
             "vfmsub.vv","vfmsub.vf","vfnmsub.vv","vfnmsub.vf"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vfadd_vv)];
     }
+    if (op == Opcode::rv_vfsqrt_v) return "vfsqrt.v";
+    if (op == Opcode::rv_vfclass_v) return "vfclass.v";
     if (op >= Opcode::rv_sh1add && op <= Opcode::rv_slli_uw) {
         static constexpr const char *names[]{"sh1add", "sh2add", "sh3add", "add.uw",
             "sh1add.uw", "sh2add.uw", "sh3add.uw", "slli.uw"};
@@ -946,8 +954,11 @@ std::string format_instruction(const Instruction &i) {
                        : hex(immediate->value);
         else if (const auto *rel = std::get_if<RelativeOperand>(&operand))
             out += i.direct_target ? hex(i.direct_target->offset) : "rel " + signed_hex(rel->displacement);
-        else if (const auto *m = std::get_if<MemoryOperand>(&operand))
+        else if (const auto *m = std::get_if<MemoryOperand>(&operand)) {
             out += memory_text(*m, i.opcode == Opcode::lea);
+            if (i.x86_evex_broadcast && i.vector_element_bits != 0)
+                out += "{1to" + std::to_string(i.vector_bits / i.vector_element_bits) + "}";
+        }
         else if (const auto *far_pointer = std::get_if<FarPointerOperand>(&operand))
             out += hex(far_pointer->selector) + ":" + hex(far_pointer->offset);
         else if (const auto *far_memory = std::get_if<FarMemoryOperand>(&operand))

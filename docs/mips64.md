@@ -87,3 +87,5 @@ address-space width; it uses 32-bit pointers and 64-bit argument registers and
 slots. The type system also accepts an explicit `mips_n32` function
 convention. N32-specific relocation, unwind, and core-register integration
 remain incomplete. Variadic N32 classification remains unsupported.
+
+Register-register conditional traps TGE/TGEU/TLT/TLTU/TEQ/TNE are decoded with both 64-bit GPR inputs and the encoded 10-bit software trap code. They lift as named conditional-trap effects. The shared IR does not model the resulting exception edge or evaluate the comparison into a CFG branch.

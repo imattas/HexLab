@@ -772,6 +772,29 @@ std::vector<AbiArgumentSlot> aapcs64_prototype_slots(const types::TypePtr &proto
         constexpr std::uint64_t stack_budget = 1u << 20;
         if (stack_offset < 0 || static_cast<std::uint64_t>(stack_offset) > stack_budget ||
             allocation > stack_budget - static_cast<std::uint64_t>(stack_offset)) break;
+        if (classified->homogeneous_aggregate) {
+            auto component_offset = stack_offset;
+            bool representable = true;
+            for (std::size_t component = 0; component < classified->floating_components.size(); ++component) {
+                const auto &component_type = classified->floating_components[component];
+                if (!component_type || !component_type->size() ||
+                    *component_type->size() > static_cast<std::uint64_t>(stack_offset) + allocation -
+                        static_cast<std::uint64_t>(component_offset) || component > UINT8_MAX) {
+                    representable = false;
+                    break;
+                }
+                slots.push_back({AbiValueClass::floating, {}, component_offset, parameter_number,
+                    static_cast<std::uint8_t>(component)});
+                component_offset += static_cast<std::int64_t>(*component_type->size());
+            }
+            if (!representable) {
+                while (!slots.empty() && slots.back().parameter_index == parameter_number)
+                    slots.pop_back();
+                break;
+            }
+            stack_offset += static_cast<std::int64_t>(allocation);
+            continue;
+        }
         slots.push_back({classified->value_class, {}, stack_offset, parameter_number, {}});
         stack_offset += static_cast<std::int64_t>(allocation);
     }
@@ -1756,7 +1779,13 @@ static Result<TypeRecoveryResult> recover_types_impl(
                     constrain_register(*slot.reg, component_type);
                     mapped[parameter_index] = true;
                 } else if (slot.stack_offset) {
-                    constrain_stack_slot(*slot.stack_offset, parameter_type);
+                    auto component_type = parameter_type;
+                    if (slot.component_index) {
+                        const auto elements = hfa_float_elements(parameter_type);
+                        if (!elements || *slot.component_index >= elements->size()) continue;
+                        component_type = (*elements)[*slot.component_index];
+                    }
+                    constrain_stack_slot(*slot.stack_offset, component_type);
                     mapped[parameter_index] = true;
                 }
             }
@@ -4702,7 +4731,12 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                         // share stack evidence when the target slot is exact
                         // and the caller's direct store proof below matches it.
                         if (!signature || !argument_slot.stack_offset) continue;
-                        const auto &parameter_type = signature->parameters()[parameter_index].type;
+                        auto parameter_type = signature->parameters()[parameter_index].type;
+                        if (argument_slot.component_index) {
+                            const auto components = hfa_float_elements(parameter_type);
+                            if (!components || *argument_slot.component_index >= components->size()) continue;
+                            parameter_type = (*components)[*argument_slot.component_index];
+                        }
                         if (!matches_slot_class(argument_slot.value_class, unqualified_type(parameter_type))) continue;
                         const auto parameter_bits = type_bits(parameter_type);
                         if (!parameter_bits) continue;

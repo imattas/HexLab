@@ -1006,7 +1006,7 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
         } else if (op == 0x0e) {
             std::uint32_t count = 0;
             std::vector<std::uint8_t> first;
-            if (!code.uleb(count) || count > 8) { unsupported = true; return fail("branch table exceeds decoder limit"); }
+            if (!code.uleb(count) || count > 12) { unsupported = true; return fail("branch table exceeds the maximum case count for a 15-byte instruction"); }
             for (std::uint32_t n = 0; n <= count; ++n) {
                 if (!code.uleb(index) || index >= controls.size()) return fail("invalid branch table depth");
                 const auto &types = label(index);

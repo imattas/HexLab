@@ -80,6 +80,18 @@ ambiguous overlapping source rows. It does not load separate debug files on
 demand or query symbol servers. Line lookup is capped at 250,000 rows per
 request; larger tables still retain function/symbol labels without a source
 location.
+
+For selected AMD64 PE frames whose register snapshot contains an exact-width
+`RSP`, the Locals table also shows source-backed FH3/FH4 C++ EH facts for the
+current instruction: active cleanup actions, try-block catch candidates,
+handler addresses, and the planner's dispatch classification. These rows describe metadata candidates;
+the debugger does not call destructors or handlers. The live exception object
+and its decorated type are not available from an ordinary stop, so typed catch
+matching is shown as unknown/ambiguous. Frames without a readable `RSP`, and
+other PE architectures, do not receive these rows. The planner uses the
+selected frame's current `RSP` as its frame base; the caller CFA shown for that
+frame is not substituted.
+
 `DebugSession` exposes memory regions from
 the Windows, Linux, and RSP backends when the target supports enumeration.
 

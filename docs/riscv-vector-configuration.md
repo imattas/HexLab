@@ -164,6 +164,16 @@ does not yet provide p-code semantics, so this implementation uses the ISA
 specification for operation effects rather than treating SLEIGH as an
 authoritative semantic source.
 
+The unary `vfsqrt.v` and `vfclass.v` encodings are also decoded. Square root
+retains dynamic `frm` and sticky `fflags` dependencies. Classification is
+rounding-independent and reports its ten IEEE-754 classes as a SEW-wide bit
+field; the lane evaluator handles SEW 32/64 exactly while preserving masked,
+prestart, and tail lanes. Square-root lane evaluation remains unavailable
+because the current floating evaluator has no rounding-mode input.
+
+These unary operation codes and classification bit definitions follow the
+[RISC-V V specification, §30.1.13](https://docs.riscv.org/reference/isa/unpriv/v-st-ext.html#vector-floating-point-instructions).
+
 The decompiler keeps the operations as named floating-vector or boolean-mask
 intrinsics. Every operation retains implicit `vl`, `vtype`, and `vstart` reads,
 the normal-completion `vstart` write, masked `v0`, and the old destination
@@ -192,8 +202,8 @@ injection is bitwise and does not raise flags. Floating arithmetic, dynamic
 rounding, inexact/underflow/overflow/divide-by-zero flags, and wider or
 half-precision lanes remain outside the evaluator.
 
-Reductions, conversions, classification, reciprocal and
-square-root operations, widening floating-point arithmetic, half-precision
+Reductions, conversions, reciprocal and reciprocal-square-root estimates,
+widening floating-point arithmetic, half-precision
 vector operations, and all other vector floating-point encodings remain
 unsupported. A recognized FP funct6 with a reserved operand class is invalid;
 FP funct6 values outside this slice remain unsupported.

@@ -211,6 +211,20 @@ bool decode_vector_floating(std::uint32_t w, RiscvInstruction &i) {
     const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
     const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
     const unsigned funct3 = (w >> 12) & 7, vd = (w >> 7) & 31;
+    // VFUNARY0 uses the OPFVV major class and encodes its sub-op in vs1.
+    if (funct3 == 1 && funct6 == 0x13 && (vs1 == 0 || vs1 == 16)) {
+        i.opcode = vs1 == 0 ? RiscvOpcode::vfsqrt_v : RiscvOpcode::vfclass_v;
+        const bool rounded = vs1 == 0;
+        i.reads_frm = rounded;
+        i.reads_fflags = rounded;
+        i.writes_fflags = rounded;
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
+        read_vector_destination(i, vd);
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
+        if (!vm) i.register_reads.push_back(RiscvRegister{0, false, true});
+        i.vector_masked = !vm;
+        return true;
+    }
     if (funct3 != 1 && funct3 != 5) return false; // OPFVV and OPFVF only.
     const bool scalar = funct3 == 5;
     RiscvOpcode op;

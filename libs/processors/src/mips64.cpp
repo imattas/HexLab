@@ -236,6 +236,21 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
             i.operands = {reg(rs), reg(rt)}; i.access = {OperandAccess::read, OperandAccess::read};
             i.register_reads = {reg(rs), reg(rt)}; i.register_writes = {hi, lo};
             break;
+        case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x36: {
+            // Trap comparisons use the otherwise-unused rd/shamt bits as a
+            // 10-bit software trap code; they are not reserved zeros.
+            static constexpr Opcode operations[]{Opcode::mips64_tge, Opcode::mips64_tgeu,
+                Opcode::mips64_tlt, Opcode::mips64_tltu, Opcode::mips64_teq, Opcode::mips64_tne};
+            const unsigned index = funct == 0x30 ? 0 : funct == 0x31 ? 1 : funct == 0x32 ? 2 :
+                                   funct == 0x33 ? 3 : funct == 0x34 ? 4 : 5;
+            i.opcode = operations[index];
+            i.operands = {reg(rs), reg(rt), ImmediateOperand{(word >> 6) & 0x3ffu, 10, 32, false,
+                                                              EncodedField{0, 2}}};
+            i.access = {OperandAccess::read, OperandAccess::read, OperandAccess::read};
+            if (rs) i.register_reads.push_back(reg(rs));
+            if (rt) i.register_reads.push_back(reg(rt));
+            break;
+        }
         case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
         case 0x2a: case 0x2b:
             if (shamt) return invalid("Reserved MIPS64 arithmetic encoding");

@@ -80,4 +80,12 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
     const std::function<Result<std::vector<std::byte>>(std::uint64_t, std::size_t)> &read_memory,
     std::optional<std::uint64_t> call_frame_cfa = {});
 
+// Summarizes the source-backed active AMD64 C++ EH state for a selected PE
+// frame. It reports cleanup and catch candidates; it does not dispatch an
+// exception or execute target code.
+std::vector<DebuggerLocalRow> debugger_pe_exception_rows(
+    const PeMetadata &, std::uint64_t module_base, std::uint64_t runtime_pc,
+    std::uint64_t establisher_frame,
+    const std::function<Result<std::vector<std::byte>>(std::uint64_t, std::size_t)> &read_memory);
+
 } // namespace hexlab::desktop
