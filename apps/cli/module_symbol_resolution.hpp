@@ -29,11 +29,33 @@ inline bool is_pe_module(const ImageMetadata &metadata) {
     return metadata.format == "PE32" || metadata.format == "PE32+";
 }
 
+inline bool elf_abi_compatible(const ElfHeader &importer, const ElfHeader &provider) {
+    // ELF's generic loader model is not enough to prove that an address from
+    // one object is meaningful in another architecture's process image.
+    return importer.is_64 == provider.is_64 && importer.order == provider.order &&
+           importer.machine == provider.machine;
+}
+
+inline std::vector<std::size_t> elf_dynamic_symbol_table_indices(const ElfMetadata &elf) {
+    std::vector<std::size_t> indices;
+    for (std::size_t table_index = 0; table_index < elf.symbol_tables.size(); ++table_index) {
+        const auto &source = elf.symbol_tables[table_index].source;
+        if (std::any_of(elf.dynamic_tables.begin(), elf.dynamic_tables.end(), [&](const auto &table) {
+                return table.symbol_table && *table.symbol_table == source;
+            })) indices.push_back(table_index);
+    }
+    return indices;
+}
+
 // Resolve undefined ELF dynamic symbols against explicitly supplied objects.
 // We intentionally require a unique DT_NEEDED basename when available; no
 // ambient loader search path or filesystem probing is performed.
 inline void print_elf_import_resolutions(const std::vector<SuppliedModule> &modules, std::ostream &out) {
     constexpr std::size_t row_cap = 100000;
+    std::vector<std::vector<std::size_t>> dynamic_tables_by_module(modules.size());
+    for (std::size_t module_index = 0; module_index < modules.size(); ++module_index)
+        if (modules[module_index].metadata && modules[module_index].metadata->elf)
+            dynamic_tables_by_module[module_index] = elf_dynamic_symbol_table_indices(*modules[module_index].metadata->elf);
     auto needed_names = [](const ImageMetadata &m) {
         std::vector<std::string> names;
         if (!m.elf) return names;
@@ -43,20 +65,16 @@ inline void print_elf_import_resolutions(const std::vector<SuppliedModule> &modu
         return names;
     };
     out << "ELF imported-symbol resolution (only supplied files are considered):\n";
-    for (const auto &importer : modules) {
+    for (std::size_t importer_index = 0; importer_index < modules.size(); ++importer_index) {
+        const auto &importer = modules[importer_index];
         if (!importer.metadata || !importer.metadata->elf) continue;
         const auto &elf = *importer.metadata->elf;
-        std::vector<std::size_t> dynamic_tables;
-        for (std::size_t ti = 0; ti < elf.symbol_tables.size(); ++ti) {
-            const auto &source = elf.symbol_tables[ti].source;
-            if (std::any_of(elf.dynamic_tables.begin(), elf.dynamic_tables.end(), [&](const auto &dt) {
-                    return dt.symbol_table && *dt.symbol_table == source;
-                })) dynamic_tables.push_back(ti);
-        }
         std::vector<const ElfSymbol *> imports;
         for (const auto &symbol : elf.symbols) {
             if (symbol.state == ElfSymbolState::undefined && symbol.binding != 0 &&
-                symbol.table && std::find(dynamic_tables.begin(), dynamic_tables.end(), *symbol.table) != dynamic_tables.end())
+                symbol.table && std::find(dynamic_tables_by_module[importer_index].begin(),
+                                          dynamic_tables_by_module[importer_index].end(), *symbol.table) !=
+                                    dynamic_tables_by_module[importer_index].end())
                 imports.push_back(&symbol);
         }
         out << "  " << importer.path << "\n";
@@ -69,25 +87,51 @@ inline void print_elf_import_resolutions(const std::vector<SuppliedModule> &modu
             out << " -> ";
             if (wanted.name.empty()) { out << "unsupported (empty symbol name)\n"; continue; }
             if (wanted.type == 6 || wanted.type == 10) { out << "unsupported (TLS/IFUNC import semantics)\n"; continue; }
-            std::vector<const SuppliedModule *> providers;
-            for (const auto &candidate : modules) {
-                if (&candidate == &importer || !candidate.metadata || !candidate.metadata->elf) continue;
+            std::vector<std::size_t> providers;
+            for (std::size_t candidate_index = 0; candidate_index < modules.size(); ++candidate_index) {
+                const auto &candidate = modules[candidate_index];
+                if (candidate_index == importer_index || !candidate.metadata || !candidate.metadata->elf) continue;
                 if (names.empty() || std::any_of(names.begin(), names.end(), [&](const auto &n) {
                     return module_leaf(n) == module_leaf(candidate.path);
-                })) providers.push_back(&candidate);
+                })) providers.push_back(candidate_index);
             }
             if (providers.empty()) { out << "unresolved (no supplied DT_NEEDED provider)\n"; continue; }
             std::vector<std::pair<const SuppliedModule *, const ElfSymbol *>> matches;
-            for (const auto *provider : providers) {
+            bool has_abi_compatible_provider = false;
+            bool has_unsupported_provider_symbol = false;
+            for (const auto provider_index : providers) {
+                const auto *provider = &modules[provider_index];
                 const auto &pe = *provider->metadata->elf;
+                if (!elf_abi_compatible(elf.header, pe.header)) continue;
+                has_abi_compatible_provider = true;
+                if (wanted.version_file && module_leaf(*wanted.version_file) != module_leaf(provider->path))
+                    continue;
                 for (const auto &candidate : pe.symbols) {
-                    if (candidate.name != wanted.name || candidate.state != ElfSymbolState::defined ||
-                        candidate.binding == 0 || candidate.visibility == 1 || candidate.visibility == 2 || candidate.visibility == 3) continue;
+                    if (!candidate.table ||
+                        std::find(dynamic_tables_by_module[provider_index].begin(),
+                                  dynamic_tables_by_module[provider_index].end(), *candidate.table) ==
+                            dynamic_tables_by_module[provider_index].end() ||
+                        candidate.name != wanted.name ||
+                        (candidate.state != ElfSymbolState::defined && candidate.state != ElfSymbolState::absolute) ||
+                        (candidate.binding != 1 && candidate.binding != 2 && candidate.binding != 10) ||
+                        candidate.visibility == 1 || candidate.visibility == 2) continue;
                     if (wanted.version_name) {
                         if (candidate.version_name != wanted.version_name) continue;
                     } else if (candidate.version_name && candidate.version_hidden) continue;
+                    if (candidate.type == 6 || candidate.type == 10) {
+                        has_unsupported_provider_symbol = true;
+                        continue;
+                    }
                     matches.emplace_back(provider, &candidate);
                 }
+            }
+            if (!has_abi_compatible_provider) {
+                out << "unsupported (supplied DT_NEEDED providers have incompatible ELF class, byte order, or machine)\n";
+                continue;
+            }
+            if (has_unsupported_provider_symbol) {
+                out << "unsupported (matching provider export requires TLS/IFUNC semantics)\n";
+                continue;
             }
             if (matches.empty()) { out << "unresolved (no exact eligible export)\n"; continue; }
             if (matches.size() != 1) { out << "ambiguous (" << matches.size() << " matching exports)\n"; continue; }
