@@ -45,8 +45,11 @@ ARM32 has no CPSR single-step bit exposed by this API. The bounded step path
 accepts verified sequential instructions: common 16-bit Thumb scalar and
 load/store forms, 32-bit Thumb MOVW/MOVT, and ARM data-processing immediates
 that do not write PC. It rejects branches, calls, returns, interworking,
-unknown encodings, and a successor overlapping a user breakpoint. For an
-accepted step, the backend restores an owned breakpoint instruction if needed,
+unknown encodings, and a successor overlapping a user breakpoint. A Thumb
+context with nonzero CPSR ITSTATE, including the final instruction of an IT
+block, is rejected before releasing peer suspensions, changing PC, or patching
+code. For an accepted step, the backend restores an owned breakpoint
+instruction if needed,
 patches a temporary trap at the decoded successor, suspends peer threads, and
 continues the event owner. At the next stop it rewinds a post-trap PC, restores
 the successor bytes, and rearms the owned breakpoint. Restoration failure

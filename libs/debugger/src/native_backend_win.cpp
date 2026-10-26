@@ -1143,13 +1143,14 @@ public:
             if (!ok) return error;
             std::vector<RegisterValue> out;
             out.reserve(13 + 4 + 16 + 1);
-            const DWORD* general = &c.R0;
+            const std::array<DWORD, 13> general{c.R0, c.R1, c.R2, c.R3, c.R4, c.R5, c.R6,
+                                                 c.R7, c.R8, c.R9, c.R10, c.R11, c.R12};
             for (unsigned i = 0; i < 13; ++i) {
                 RegisterValue reg;
                 reg.name = "r" + std::to_string(i);
                 reg.byte_order = ByteOrder::little;
                 reg.bytes.resize(sizeof(DWORD));
-                std::memcpy(reg.bytes.data(), general + i, sizeof(DWORD));
+                std::memcpy(reg.bytes.data(), &general[i], sizeof(DWORD));
                 out.push_back(std::move(reg));
             }
             append_register(out, "sp", c.Sp);
@@ -1330,6 +1331,8 @@ public:
                 return error;
             }
             CONTEXT original = c;
+            std::array<DWORD, 13> general{c.R0, c.R1, c.R2, c.R3, c.R4, c.R5, c.R6,
+                                          c.R7, c.R8, c.R9, c.R10, c.R11, c.R12};
             std::vector<std::string> seen;
             for (const auto& reg : registers) {
                 if ((reg.byte_order && *reg.byte_order != ByteOrder::little) ||
@@ -1344,7 +1347,7 @@ public:
                     const auto parsed = std::from_chars(reg.name.data() + 1, reg.name.data() + reg.name.size(), index);
                     if (parsed.ec == std::errc{} && parsed.ptr == reg.name.data() + reg.name.size() &&
                         index < 13 && reg.name == "r" + std::to_string(index))
-                        matched = assign_register(reg, reg.name.c_str(), (&c.R0)[index]);
+                        matched = assign_register(reg, reg.name.c_str(), general[index]);
                 } else if (reg.name == "sp") matched = assign_register(reg, "sp", c.Sp);
                 else if (reg.name == "lr") matched = assign_register(reg, "lr", c.Lr);
                 else if (reg.name == "pc") matched = assign_register(reg, "pc", c.Pc);
@@ -1364,6 +1367,9 @@ public:
                     return Error{ErrorCode::invalid_argument, "unknown or incorrectly sized Windows ARM32 register"};
                 }
             }
+            c.R0 = general[0]; c.R1 = general[1]; c.R2 = general[2]; c.R3 = general[3];
+            c.R4 = general[4]; c.R5 = general[5]; c.R6 = general[6]; c.R7 = general[7];
+            c.R8 = general[8]; c.R9 = general[9]; c.R10 = general[10]; c.R11 = general[11]; c.R12 = general[12];
             constexpr DWORD thumb = 1u << 5;
             constexpr DWORD editable_cpsr = 0xf0000000u | thumb; // NZCV and execution state only.
             constexpr DWORD it_state = (3u << 25) | (0x3fu << 10);
@@ -1846,8 +1852,6 @@ private:
             pending_->dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT)
             return Error{ErrorCode::invalid_argument, "cannot step an exit event"};
         if (arm32_step_) return Error{ErrorCode::busy, "previous ARM32 step restoration is pending"};
-        auto resumed = resume_step_suspensions();
-        if (!resumed) return resumed;
         const DWORD thread_id = pending_->dwThreadId;
         HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, thread_id);
         if (!thread) return win_error("OpenThread for ARM32 step");
@@ -1864,6 +1868,11 @@ private:
         }
         CONTEXT original_context = context;
         const bool thumb = (context.Cpsr & (1u << 5)) != 0;
+        constexpr DWORD it_state = (3u << 25) | (0x3fu << 10);
+        if (thumb && (context.Cpsr & it_state) != 0) {
+            CloseHandle(thread);
+            return Error{ErrorCode::unsupported, "ARM32 temporary-trap stepping is unavailable inside a Thumb IT block"};
+        }
         std::uintptr_t pc = context.Pc;
         if ((pc & (thumb ? 1u : 3u)) != 0) {
             CloseHandle(thread);
@@ -1928,6 +1937,8 @@ private:
             CloseHandle(thread);
             return error;
         }
+        auto resumed = resume_step_suspensions();
+        if (!resumed) { CloseHandle(thread); return resumed; }
         arm32_step_ = std::move(state);
         if (displaced) {
             auto removed = patch_bytes(*displaced, breakpoints_.at(*displaced).original);
