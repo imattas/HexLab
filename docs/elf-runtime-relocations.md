@@ -34,6 +34,11 @@ ELF64 x86-64, AArch64, PPC64, and RISC-V `ET_DYN` records, with these types:
 | x86-64 | `R_X86_64_GLOB_DAT` | 6 | `S` |
 | x86-64 | `R_X86_64_JUMP_SLOT` | 7 | `S` |
 | AArch64 | `R_AARCH64_ABS64` | 257 | `S + A` (low 64 bits) |
+| AArch64 | `R_AARCH64_ABS32` | 258 | `S + A` (check `[-2^31, 2^32-1]`) |
+| AArch64 | `R_AARCH64_ABS16` | 259 | `S + A` (check `[-2^15, 2^16-1]`) |
+| AArch64 | `R_AARCH64_PREL64` | 260 | `S + A - P` (low 64 bits) |
+| AArch64 | `R_AARCH64_PREL32` | 261 | `S + A - P` (signed 32-bit field) |
+| AArch64 | `R_AARCH64_PREL16` | 262 | `S + A - P` (signed 16-bit field) |
 | AArch64 | `R_AARCH64_RELATIVE` | 1027 | `B + A` |
 | AArch64 | `R_AARCH64_GLOB_DAT` | 1025 | `S` |
 | AArch64 | `R_AARCH64_JUMP_SLOT` | 1026 | `S` |
@@ -68,13 +73,16 @@ four-byte aligned. ELF32 addresses and rebased extents must fit in 32 bits.
 Big-endian ARM, TLS, IFUNC, COPY, instruction relocations, and other ARM types
 remain unapplied.
 
-The AArch64 profile also supports the dynamic `R_AARCH64_ABS64` relocation. It
-applies `S + A` and writes the low 64 bits without an overflow check, as
-specified by AAELF64. All supported ordinary AArch64 ELF64 dynamic
-relocations require an eight-byte aligned 64-bit target field. The ELF64
-`ABS32`, `ABS16`, and `PREL*` data relocations remain static-only and are not
-applied by this runtime overlay; the separate AArch64 P32/ELF32 profile is not
-implemented.
+The AArch64 profile supports dynamic `ABS64`, `ABS32`, `ABS16`, `PREL64`,
+`PREL32`, and `PREL16` data relocations. `ABS64` and `PREL64` write low 64-bit
+results without overflow checks; `ABS32` and `ABS16` accept the AAELF64 ranges
+`[-2^31, 2^32-1]` and `[-2^15, 2^16-1]`; `PREL32` and `PREL16` require signed
+32-bit and 16-bit results. AAELF64 defines these data fields as byte-aligned,
+so the runtime view validates their exact field extent and backing without
+imposing pointer alignment. Instruction-field relocations, including CALL26
+and JUMP26, remain unapplied, as do other AArch64 dynamic relocation types and
+the separate AArch64 P32/ELF32 profile. These formulas and overflow ranges
+follow the [AAELF64 data relocation table](https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst#static-data-relocations).
 
 The little-endian PPC64 ELF64 profile applies `R_PPC64_RELATIVE`,
 `R_PPC64_ADDR64`, `R_PPC64_GLOB_DAT`, and `R_PPC64_JMP_SLOT` from dynamic RELA tables. Relative

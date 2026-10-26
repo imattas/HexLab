@@ -164,22 +164,78 @@ bool pc32_result(std::uint64_t symbol, std::int64_t addend, std::uint64_t place,
     const auto addend_magnitude = addend_negative
         ? static_cast<std::uint64_t>(-(addend + 1)) + 1
         : static_cast<std::uint64_t>(addend);
-    if (!addend_magnitude) {
-        // Keep the sign of zero immaterial.
-    } else if (negative == addend_negative) {
-        const auto limit = negative ? UINT64_C(2147483648) : static_cast<std::uint64_t>(INT32_MAX);
-        if (magnitude > limit || addend_magnitude > limit - magnitude) return false;
-        magnitude += addend_magnitude;
-    } else if (magnitude >= addend_magnitude) {
-        magnitude -= addend_magnitude;
-        if (!magnitude) negative = false;
-    } else {
-        magnitude = addend_magnitude - magnitude;
-        negative = addend_negative;
+    if (addend_magnitude) {
+        if (negative == addend_negative) {
+            const auto limit = negative ? UINT64_C(2147483648) : static_cast<std::uint64_t>(INT32_MAX);
+            if (magnitude > limit || addend_magnitude > limit - magnitude) return false;
+            magnitude += addend_magnitude;
+        } else if (magnitude >= addend_magnitude) {
+            magnitude -= addend_magnitude;
+            if (!magnitude) negative = false;
+        } else {
+            magnitude = addend_magnitude - magnitude;
+            negative = addend_negative;
+        }
     }
     if (negative ? magnitude > UINT64_C(2147483648) : magnitude > static_cast<std::uint64_t>(INT32_MAX))
         return false;
     encoded = static_cast<std::uint32_t>(negative ? std::uint64_t{0} - magnitude : magnitude);
+    return true;
+}
+bool aarch64_absolute_result(std::uint64_t symbol, std::int64_t addend, unsigned bits,
+                             std::uint64_t &encoded) {
+    if (bits == 64) {
+        encoded = symbol + static_cast<std::uint64_t>(addend);
+        return true;
+    }
+    const auto upper = (UINT64_C(1) << bits) - 1;
+    if (addend >= 0) {
+        const auto amount = static_cast<std::uint64_t>(addend);
+        if (symbol > UINT64_MAX - amount) return false;
+        encoded = symbol + amount;
+        return encoded <= upper;
+    }
+    const auto amount = static_cast<std::uint64_t>(-(addend + 1)) + 1;
+    if (symbol >= amount) {
+        encoded = symbol - amount;
+        return encoded <= upper;
+    }
+    const auto magnitude = amount - symbol;
+    if (magnitude > (UINT64_C(1) << (bits - 1))) return false;
+    encoded = std::uint64_t{0} - magnitude;
+    encoded &= upper;
+    return true;
+}
+bool aarch64_prel_result(std::uint64_t symbol, std::int64_t addend, std::uint64_t place,
+                         unsigned bits, std::uint64_t &encoded) {
+    if (bits == 64) {
+        encoded = symbol + static_cast<std::uint64_t>(addend) - place;
+        return true;
+    }
+    const auto negative_limit = UINT64_C(1) << (bits - 1);
+    const auto positive_limit = negative_limit - 1;
+    bool negative = symbol < place;
+    auto magnitude = negative ? place - symbol : symbol - place;
+    const bool addend_negative = addend < 0;
+    const auto addend_magnitude = addend_negative
+        ? static_cast<std::uint64_t>(-(addend + 1)) + 1
+        : static_cast<std::uint64_t>(addend);
+    if (addend_magnitude) {
+        if (negative == addend_negative) {
+            const auto limit = negative ? negative_limit : positive_limit;
+            if (magnitude > limit || addend_magnitude > limit - magnitude) return false;
+            magnitude += addend_magnitude;
+        } else if (magnitude >= addend_magnitude) {
+            magnitude -= addend_magnitude;
+            if (!magnitude) negative = false;
+        } else {
+            magnitude = addend_magnitude - magnitude;
+            negative = addend_negative;
+        }
+    }
+    if (negative ? magnitude > negative_limit : magnitude > positive_limit) return false;
+    encoded = negative ? std::uint64_t{0} - magnitude : magnitude;
+    encoded &= (UINT64_C(1) << bits) - 1;
     return true;
 }
 void shift_address(Address &address, std::uint64_t bias, bool elf32) {
@@ -401,6 +457,16 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             const bool symbol_with_addend = riscv_32 || riscv_64;
             const bool aarch64_abs64 = metadata.header.machine == 183 && relocation.type == 257 &&
                                        relocation.kind == ElfRelocationKind::absolute;
+            const bool aarch64_abs32 = metadata.header.machine == 183 && relocation.type == 258 &&
+                                       relocation.kind == ElfRelocationKind::absolute;
+            const bool aarch64_abs16 = metadata.header.machine == 183 && relocation.type == 259 &&
+                                       relocation.kind == ElfRelocationKind::absolute;
+            const bool aarch64_prel64 = metadata.header.machine == 183 && relocation.type == 260 &&
+                                        relocation.kind == ElfRelocationKind::pc_relative;
+            const bool aarch64_prel32 = metadata.header.machine == 183 && relocation.type == 261 &&
+                                        relocation.kind == ElfRelocationKind::pc_relative;
+            const bool aarch64_prel16 = metadata.header.machine == 183 && relocation.type == 262 &&
+                                        relocation.kind == ElfRelocationKind::pc_relative;
             const bool i386_absolute = i386 && relocation.type == 1 &&
                                        relocation.kind == ElfRelocationKind::absolute;
             const bool i386_pc_relative = i386 && relocation.type == 2 &&
@@ -419,7 +485,9 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             const bool x64_32s = x64 && relocation.type == 11 && relocation.kind == ElfRelocationKind::absolute;
             if (!relative && !symbol_slot && !symbol_with_addend && !i386_absolute && !i386_pc_relative &&
                 !arm32_absolute && !arm32_pc_relative && !arm32_glob_dat && !arm32_jump_slot &&
-                !x64_64 && !x64_pc32 && !x64_32 && !x64_32s && !aarch64_abs64 &&
+                !x64_64 && !x64_pc32 && !x64_32 && !x64_32s &&
+                !aarch64_abs64 && !aarch64_abs32 && !aarch64_abs16 &&
+                !aarch64_prel64 && !aarch64_prel32 && !aarch64_prel16 &&
                 !ppc64_glob_dat && !ppc64_abs64) {
                 skip(index, i386
                     ? "Supported dynamic types are R_386_32, R_386_PC32, R_386_RELATIVE, R_386_GLOB_DAT, and R_386_JMP_SLOT"
@@ -432,7 +500,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     ? "Supported dynamic types are R_X86_64_64, PC32, 32, 32S, RELATIVE, GLOB_DAT, and JUMP_SLOT"
                     : ppc64
                     ? "Supported dynamic types are R_PPC64_RELATIVE, GLOB_DAT, JMP_SLOT, and ADDR64"
-                    : "Supported dynamic types are R_AARCH64_ABS64, RELATIVE, GLOB_DAT, and JUMP_SLOT");
+                    : "Supported dynamic types are R_AARCH64_ABS64/32/16, PREL64/32/16, RELATIVE, GLOB_DAT, and JUMP_SLOT");
                 continue;
             }
             if (i386 && relocation.explicit_addend) {
@@ -586,9 +654,13 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     } else {
                         value = tagged_symbol;
                     }
-                } else if (symbol_with_addend || aarch64_abs64 || ppc64_glob_dat || ppc64_abs64) {
+                } else if (symbol_with_addend || aarch64_abs64 || aarch64_abs32 || aarch64_abs16 ||
+                           aarch64_prel64 || aarch64_prel32 || aarch64_prel16 || ppc64_glob_dat || ppc64_abs64) {
                     if (!relocation.addend) {
                         const auto relocation_name = aarch64_abs64 ? "R_AARCH64_ABS64" :
+                            aarch64_abs32 ? "R_AARCH64_ABS32" : aarch64_abs16 ? "R_AARCH64_ABS16" :
+                            aarch64_prel64 ? "R_AARCH64_PREL64" : aarch64_prel32 ? "R_AARCH64_PREL32" :
+                            aarch64_prel16 ? "R_AARCH64_PREL16" :
                             ppc64_glob_dat ? "R_PPC64_GLOB_DAT" : ppc64_abs64 ? "R_PPC64_ADDR64" :
                             riscv_32 ? "R_RISCV_32" : "R_RISCV_64";
                         skip(index, std::string(relocation_name) +
@@ -596,7 +668,29 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                                                                     : " implicit addend is unavailable"));
                         continue;
                     }
-                    if (riscv_32) {
+                    if (aarch64_abs64 || aarch64_abs32 || aarch64_abs16) {
+                        const auto bits = aarch64_abs64 ? 64u : aarch64_abs32 ? 32u : 16u;
+                        if (!aarch64_absolute_result(value, *relocation.addend, bits, value)) {
+                            skip(index, "AArch64 ABS relocation result does not fit its ABI range");
+                            continue;
+                        }
+                    } else if (aarch64_prel64 || aarch64_prel32 || aarch64_prel16) {
+                        if (!relocation.place) {
+                            skip(index, "AArch64 PREL relocation place is unavailable");
+                            continue;
+                        }
+                        std::uint64_t place = 0;
+                        try { place = shifted(relocation.place->offset, load_bias); }
+                        catch (const RuntimeRelocationFailure &) {
+                            skip(index, "AArch64 PREL runtime place overflows the address space");
+                            continue;
+                        }
+                        const auto bits = aarch64_prel64 ? 64u : aarch64_prel32 ? 32u : 16u;
+                        if (!aarch64_prel_result(value, *relocation.addend, place, bits, value)) {
+                            skip(index, "AArch64 PREL result does not fit its signed ABI range");
+                            continue;
+                        }
+                    } else if (riscv_32) {
                         std::uint64_t sum = 0;
                         if (!add_signed_to_unsigned(value, *relocation.addend, sum) || sum > UINT32_MAX) {
                             skip(index, "R_RISCV_32 result does not fit unsigned 32 bits");
@@ -639,7 +733,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                             continue;
                         }
                         value = sum;
-                    } else {
+                    } else if (x64_32s) {
                         bool fits = false;
                         std::uint32_t low = 0;
                         if (addend >= 0) {
@@ -667,15 +761,15 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             }
             const auto word = metadata.header.is_64 ? UINT64_C(8) : UINT64_C(4);
             const auto expected_width = packed_relative || i386 || arm32 || riscv32 ? word :
-                (riscv_32 || x64_pc32 || x64_32 || x64_32s) ? UINT64_C(4) : UINT64_C(8);
+                (riscv_32 || x64_pc32 || x64_32 || x64_32s || aarch64_abs32 || aarch64_prel32)
+                    ? UINT64_C(4)
+                    : (aarch64_abs16 || aarch64_prel16) ? UINT64_C(2) : UINT64_C(8);
             if (!relocation.place || !relocation.file_place || relocation.field_size != expected_width) {
                 skip(index, "Relocation target is not a complete file-backed field of the supported width");
                 continue;
             }
-            if (!packed_relative && (metadata.header.machine == 183 || ppc64) &&
-                (relocation.place->offset & 7) != 0) {
-                skip(index, ppc64 ? "PPC64 dynamic relocation target is not 8-byte aligned"
-                                  : "AArch64 dynamic relocation target is not 8-byte aligned");
+            if (!packed_relative && ppc64 && (relocation.place->offset & 7) != 0) {
+                skip(index, "PPC64 dynamic relocation target is not 8-byte aligned");
                 continue;
             }
             if (arm32 && (relocation.place->offset & 3) != 0) {

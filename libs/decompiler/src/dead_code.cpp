@@ -18,7 +18,8 @@ bool pure(const ExpressionPtr &expression) {
     if (!expression) return true;
     return std::visit([](const auto &value) {
         using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T, RegisterValue> || std::is_same_v<T, ConstantValue>) return true;
+        if constexpr (std::is_same_v<T, RegisterValue> || std::is_same_v<T, ConstantValue> ||
+                      std::is_same_v<T, X87Binary80Value>) return true;
         else if constexpr (std::is_same_v<T, UnaryValue>) return pure(value.operand);
         else if constexpr (std::is_same_v<T, BinaryValue>) return pure(value.left) && pure(value.right);
         else return false;

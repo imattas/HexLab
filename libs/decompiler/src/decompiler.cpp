@@ -95,6 +95,22 @@ void refine_x87_stack_writes(Statement &statement, const Instruction &instructio
             intrinsic->register_writes.end())
             intrinsic->register_writes.push_back(new_top);
     }
+    if (instruction.mnemonic_override == "fld1" || instruction.mnemonic_override == "fldz") {
+        const X87Binary80 literal = instruction.mnemonic_override == "fld1"
+            ? X87Binary80{UINT64_C(0x8000000000000000), 0x3fff}
+            : X87Binary80{};
+        intrinsic->register_output_values.clear();
+        for (const auto reg : intrinsic->register_writes) {
+            if (reg.bank == RegisterBank::x87 && reg.index == 0) {
+                intrinsic->register_output_values.push_back(std::make_shared<Expression>(Expression{
+                    ValueType{TypeKind::floating, 80, false}, X87Binary80Value{literal}}));
+            } else {
+                intrinsic->register_output_values.push_back(std::make_shared<Expression>(Expression{
+                    ValueType{TypeKind::integer, reg.width, false},
+                    UnknownValue{"x87 environment output after " + instruction.mnemonic_override}}));
+            }
+        }
+    }
 }
 } // namespace
 
@@ -1247,7 +1263,7 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             instruction.register_writes.front().index == 0) {
             auto input = retag_expr(typed_operands.front(), floating_type(80));
             auto value = std::make_shared<Expression>(Expression{
-                floating_type(80), UnaryValue{name == "fchs" ? "-" : "fabs", std::move(input)}});
+                floating_type(80), UnaryValue{name == "fchs" ? "x87_fchs" : "x87_fabs", std::move(input)}});
             return Assign{instruction.register_writes.front(), std::move(value)};
         }
         if (name == "sahf") {
@@ -3938,6 +3954,11 @@ std::string expression_text(const Expression &expression) {
             return register_name(value.reg, value.version);
         } else if constexpr (std::is_same_v<T, ConstantValue>) {
             std::ostringstream out; out << "0x" << std::hex << value.value; return out.str();
+        } else if constexpr (std::is_same_v<T, X87Binary80Value>) {
+            std::ostringstream out;
+            out << "x87_binary80(0x" << std::hex << value.value.sign_exponent << ", 0x"
+                << value.value.significand << ')';
+            return out.str();
         } else if constexpr (std::is_same_v<T, MemoryValue>) {
             if (value.stack_variable) return *value.stack_variable;
             const auto access_bytes = static_cast<std::uint16_t>((value.type.bits + 7u) / 8u);
@@ -3950,6 +3971,8 @@ std::string expression_text(const Expression &expression) {
             return "*[(" + address_text(value) + ")]";
         } else if constexpr (std::is_same_v<T, UnaryValue>) {
             const auto operand = expression_text(*value.operand);
+            if (value.operation == "x87_fchs") return "x87_fchs_exact(" + operand + ")";
+            if (value.operation == "x87_fabs") return "x87_fabs_exact(" + operand + ")";
             if (value.operation == "carry_flag") return "carry_flag(" + operand + ")";
             if (value.operation.rfind("arm_condition_", 0) == 0) {
                 unsigned condition = 255;
@@ -4854,8 +4877,10 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             if (auto *intrinsic = std::get_if<Intrinsic>(&statement); intrinsic && x87_instruction)
                 intrinsic->x87_stack_state = x87_stack_state;
             const auto x87_post_state = transfer_x87_stack_state(x87_stack_state, decoded);
-            if (x87_instruction && x87_stack_state.top) {
+            if (x87_instruction && (x87_stack_state.top || decoded.mnemonic_override == "fld1" ||
+                                    decoded.mnemonic_override == "fldz"))
                 detail::refine_x87_stack_writes(statement, decoded);
+            if (x87_instruction && x87_stack_state.top) {
                 const auto write_top = decoded.x87_stack_delta > 0 && x87_post_state.top
                     ? *x87_post_state.top : *x87_stack_state.top;
                 detail::remap_x87_statement(statement, *x87_stack_state.top, write_top);
@@ -5701,6 +5726,10 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         stream << register_name(statement.register_writes[i], version) << " = "
                                << expression_text(*statement.register_output_values[i]);
                     }
+                    if (statement.x87_stack_delta > 0)
+                        stream << " /* x87 push " << static_cast<unsigned>(statement.x87_stack_delta) << " */";
+                    else if (statement.x87_stack_delta < 0)
+                        stream << " /* x87 pop " << static_cast<unsigned>(-statement.x87_stack_delta) << " */";
                     stream << ';';
                     return;
                 }
