@@ -72,8 +72,8 @@ mask/tail undisturbed behavior only; when vma/vta request agnostic results it
 chooses the old destination as a conservative representative. Fractional LMUL
 is supported when VLMAX is integral. Unsupported SEW, reserved LMUL, `vill`,
 implementation-specific limits, whole-register operations, reductions,
-permutation/slide operations, saturating/averaging operations, and widening or
-narrowing forms remain outside this slice.
+permutation/slide operations, saturating/averaging operations, widening
+arithmetic beyond MAC, and narrowing forms remain outside this slice.
 
 Unit-stride integer `vle8.v`, `vle16.v`, `vle32.v`, `vle64.v` and corresponding
 `vse*.v` forms are recognized for RV32 and RV64. The decoder accepts only
@@ -143,4 +143,14 @@ add/subtract it from `vs2`. Masked encodings retain the v0 predicate dependency,
 while inactive and tail lanes retain the caller-supplied destination value.
 These operation equations, operand classes, and funct6 assignments follow
 [RVV 1.0 section 30.1.11.13](https://docs.riscv.org/reference/isa/v20240411/unpriv/v-st-ext.html#vector-single-width-integer-multiply-add-instructions).
-Widening multiply-accumulate and carry/borrow operations are not included.
+The decoder also recognizes seven widening integer multiply-accumulate forms:
+`vwmaccu.vv/vx`, `vwmacc.vv/vx`, `vwmaccsu.vv/vx`, and `vwmaccus.vx`.
+These overwrite a 2*SEW-bit accumulator with the full signed/unsigned product
+plus its old value. The lane evaluator reports the result element width and
+handles SEW 8/16/32 and effective destination LMUL at most 8, including
+masked/prestart/tail preservation. SEW 64 would require 128-bit lanes and
+therefore remains symbolic only. The lane API does not receive physical vector
+register group identities, so it cannot validate group alignment or overlap.
+The seven encodings and operand signedness follow the official RVV 1.0
+[widening multiply-add specification](https://docs.riscv.org/reference/isa/unpriv/v-st-ext).
+Carry/borrow and other widening operations are not included.

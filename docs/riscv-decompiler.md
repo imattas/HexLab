@@ -11,7 +11,7 @@ F/D scalar instructions enter the shared pipeline with a distinct floating value
 Floating-result intrinsics carry an explicit 32- or 64-bit result type into type recovery. Only FPR destinations receive that floating fact; integer results and `fflags` remain separate effects.
 
 The decoded RVV integer elementwise families share one explicit opcode-to-effect
-route covering 77 forms:
+route covering 84 forms:
 
 | Family | Retained forms |
 | --- | --- |
@@ -21,6 +21,7 @@ route covering 77 forms:
 | Min/max | `vminu`, `vmin`, `vmaxu`, `vmax` in `.vv/.vx` |
 | Multiply | `vmul`, `vmulh`, `vmulhu`, `vmulhsu` in `.vv/.vx` |
 | Multiply-accumulate | `vmacc`, `vnmsac`, `vmadd`, `vnmsub` in `.vv/.vx` |
+| Widening multiply-accumulate | `vwmaccu`, `vwmacc`, `vwmaccsu` in `.vv/.vx`; `vwmaccus.vx` |
 | Divide/remainder | `vdivu`, `vdiv`, `vremu`, `vrem` in `.vv/.vx` |
 | Comparisons | `vmseq/vmsne` in `.vv/.vx/.vi`; `vmsltu/vmslt` in `.vv/.vx`; `vmsleu/vmsle` in `.vv/.vx/.vi`; `vmsgtu/vmsgt` in `.vx/.vi` |
 
@@ -43,6 +44,10 @@ accidentally acquire the data or predicate destination's vector type.
 
 The single-width multiply-accumulate/subtract forms retain the pre-instruction
 destination as an explicit vector input because their destination is destructive.
+The widening multiply-accumulate forms retain the same dependency and carry
+distinct opcode names. Their result remains an opaque vector here: the generic
+instruction does not carry the active SEW or LMUL needed to prove a concrete
+2*SEW lane shape or a legal destination register group.
 The names distinguish accumulation into the old destination (`vmacc`,
 `vnmsac`) from multiplication using the old destination (`vmadd`, `vnmsub`).
 The lifter preserves their architectural input dependencies without lowering
@@ -53,7 +58,8 @@ high-half multiply variants, reverse-subtract operand semantics, and unsigned
 shift-immediate forms without converting them into scalar arithmetic. Runtime
 SEW, LMUL, VLEN, active length, register grouping, policy choices and vector
 divide edge cases remain opaque here. Unsupported/reserved operand forms are
-not added, and no processor opcode IDs or serialization formats change.
+not added. Existing processor opcode IDs remain stable; the widening forms
+append IDs without changing project serialization formats.
 
 This is effect-preserving lifting rather than an IEEE-754 evaluator: it does not calculate floating results, choose dynamic `frm`, or derive precise exception flags. The physical FPR bank is 64 bits wide, with S values typed at 32 bits; RV64F NaN-boxing is not modeled. Atomic and privileged instruction decompilation remain outside this slice. Compressed integer instructions use the same lifter only when the decoder normalizes them to one of the listed scalar opcodes.
 

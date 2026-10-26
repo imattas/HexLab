@@ -383,7 +383,10 @@ enum class Opcode {
     ppc_vand, ppc_vandc, ppc_vor, ppc_vxor, ppc_vnor,
     // RVV non-widening integer multiply-accumulate forms; preserve prior IDs.
     rv_vmacc_vv, rv_vmacc_vx, rv_vnmsac_vv, rv_vnmsac_vx,
-    rv_vmadd_vv, rv_vmadd_vx, rv_vnmsub_vv, rv_vnmsub_vx
+    rv_vmadd_vv, rv_vmadd_vx, rv_vnmsub_vv, rv_vnmsub_vx,
+    // RVV widening integer MAC forms; append to retain serialized opcode IDs.
+    rv_vwmaccu_vv, rv_vwmaccu_vx, rv_vwmacc_vv, rv_vwmacc_vx,
+    rv_vwmaccsu_vv, rv_vwmaccsu_vx, rv_vwmaccus_vx
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

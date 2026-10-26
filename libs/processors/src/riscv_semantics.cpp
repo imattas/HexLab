@@ -284,6 +284,7 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
         const auto element_mask = width_mask(sew);
         RiscvVectorIntegerResult result;
         result.vlmax = vlmax;
+        result.element_bits = static_cast<std::uint8_t>(sew);
         result.lanes.assign(operands.old_destination.begin(), operands.old_destination.end());
         for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
             if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0)
@@ -306,6 +307,53 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
                     value = operands.vs2[static_cast<std::size_t>(lane + encoded_index)] & element_mask;
             }
             result.lanes[static_cast<std::size_t>(lane)] = value;
+        }
+        return result;
+    }
+
+    // Widening MAC destinations have EMUL = 2*LMUL and 2*SEW-bit elements.
+    // The public lane representation is uint64_t, so SEW=64 (a 128-bit
+    // destination) is deliberately left to symbolic lifting.
+    bool widening_mac = false, vector_multiplier = false;
+    bool first_signed = false, second_signed = false;
+    switch (opcode) {
+    case RiscvOpcode::vwmaccu_vv: widening_mac = true; vector_multiplier = true; break;
+    case RiscvOpcode::vwmaccu_vx: widening_mac = true; break;
+    case RiscvOpcode::vwmacc_vv: widening_mac = true; vector_multiplier = true;
+        first_signed = second_signed = true; break;
+    case RiscvOpcode::vwmacc_vx: widening_mac = true;
+        first_signed = second_signed = true; break;
+    case RiscvOpcode::vwmaccsu_vv: widening_mac = true; vector_multiplier = true;
+        first_signed = true; break;
+    case RiscvOpcode::vwmaccsu_vx: widening_mac = true;
+        first_signed = true; break;
+    case RiscvOpcode::vwmaccus_vx: widening_mac = true;
+        second_signed = true; break;
+    default: break;
+    }
+    if (widening_mac) {
+        if (sew > 32 || config.lmul_log2 > 2 ||
+            (vector_multiplier && operands.vs1.size() != vlmax))
+            return {};
+        const auto source_mask = width_mask(sew);
+        const auto destination_mask = width_mask(2 * sew);
+        const auto extend = [source_mask, sew](std::uint64_t value, bool is_signed) {
+            value &= source_mask;
+            if (is_signed && negative(value, sew)) value |= ~source_mask;
+            return value;
+        };
+        RiscvVectorIntegerResult result;
+        result.vlmax = vlmax;
+        result.element_bits = static_cast<std::uint8_t>(2 * sew);
+        result.lanes.assign(operands.old_destination.begin(), operands.old_destination.end());
+        for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
+            if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0)
+                continue;
+            const auto first = vector_multiplier ? operands.vs1[static_cast<std::size_t>(lane)] : operands.scalar;
+            const auto second = operands.vs2[static_cast<std::size_t>(lane)];
+            const auto product = extend(first, first_signed) * extend(second, second_signed);
+            result.lanes[static_cast<std::size_t>(lane)] =
+                (operands.old_destination[static_cast<std::size_t>(lane)] + product) & destination_mask;
         }
         return result;
     }
@@ -386,6 +434,7 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
     RiscvVectorIntegerResult result;
     result.vlmax = vlmax;
     result.mask_result = mask_result;
+    result.element_bits = mask_result ? 1 : static_cast<std::uint8_t>(sew);
     result.lanes.assign(operands.old_destination.begin(), operands.old_destination.end());
     for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
         if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0) continue;
