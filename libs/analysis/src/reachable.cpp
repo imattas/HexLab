@@ -110,7 +110,7 @@ Result<DecodeResult> decode_analysis_instruction(DecodeContext context, std::spa
         instruction.length == 0 || instruction.length > bytes.size() || instruction.length != instruction.encoded_bytes().size() ||
         instruction.operands.size() > 16 || instruction.operands.size() != instruction.access.size() ||
         instruction.register_reads.size() > 64 || instruction.register_writes.size() > 64 ||
-        static_cast<unsigned>(instruction.flow) > static_cast<unsigned>(FlowKind::switch_dispatch) ||
+        static_cast<unsigned>(instruction.flow) > static_cast<unsigned>(FlowKind::data) ||
         !std::equal(instruction.encoded_bytes().begin(), instruction.encoded_bytes().end(), bytes.begin()))
         return Error{ErrorCode::integrity, "Semantic decoder returned an invalid instruction record"};
     for (const auto access : instruction.access)
@@ -458,6 +458,10 @@ Result<AnalysisSnapshot> analyze(const Image &image, const ImageMetadata &metada
                 terminate(address, StopReason::trap, "Trap", false);
                 if (arm_mode && arm_predicate_can_skip(instruction))
                     fallthrough();
+                continue;
+            }
+            if (instruction.flow == FlowKind::data) {
+                terminate(address, StopReason::invalid, "Instruction stream reached non-executable data", false);
                 continue;
             }
             if (instruction.flow == FlowKind::fallthrough) {
