@@ -55,7 +55,22 @@ selects a handler only for an exact decorated-name match or catch-all after all
 earlier candidates are provably different. Unknown types, unsupported handler
 adjectives, conversions, and rethrow behavior remain ambiguous; it never calls
 cleanup or catch code. This is a metadata plan, not a runtime dispatcher.
-Dynamic handler behavior remains uninterpreted. For
+Because `PeMetadata` is publicly constructible, the FH3 planner repeats the
+critical bounds checks at its API boundary. It caps the runtime-function scan
+at 65,536 rows, unwind states and try blocks at 4,096 each, IP transitions at
+65,536, and total handlers at 65,536. IP transitions must be nondecreasing
+and lie in the selected runtime-function extent; duplicate
+transitions with one shared state are accepted, while conflicting duplicate
+states produce an ambiguous plan. Every IP state,
+try/catch range, and unwind predecessor is checked before selection. Cleanup
+and handler address additions are checked for overflow. Caller-supplied
+overlapping runtime-function extents return an ambiguous plan with a
+diagnostic instead of choosing whichever row appears first. Malformed or
+oversized tables return an error before candidate traversal/allocation. These
+limits apply to the planner independently of parser budgets. When multiple
+provable catches remain active and only caller vector order distinguishes
+them, dispatch is reported as ambiguous. Dynamic handler
+behavior remains uninterpreted. For
 `__CxxFrameHandler4`, the loader preserves the one-byte FuncInfo header and
 unknown flag bit, decodes the optional BBT value, optional unwind/try map RVAs,
 mandatory IP map RVA, and optional catch-frame value. It decodes the compressed
