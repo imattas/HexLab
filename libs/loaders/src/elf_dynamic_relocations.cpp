@@ -361,27 +361,36 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             const bool i386 = !metadata.header.is_64 && metadata.header.machine == 3 &&
                               metadata.header.order == ByteOrder::little;
             const bool x64 = metadata.header.machine == 62;
+            const bool ppc64 = metadata.header.machine == 21;
             const bool riscv64 = metadata.header.machine == 243;
-            const auto relative_type = i386 || x64 ? 8u : riscv64 ? 3u : 1027u;
+            const auto relative_type = i386 || x64 ? 8u : ppc64 ? 22u : riscv64 ? 3u : 1027u;
             const auto jump_slot_type = i386 || x64 ? 7u : riscv64 ? 5u : 1026u;
             const auto symbol_addend_type = riscv64 ? 2u : 0u;
             const bool ordinary_subset = metadata.header.order == ByteOrder::little &&
                                          ((metadata.header.is_64 &&
-                                           (metadata.header.machine == 62 || metadata.header.machine == 183 || riscv64)) ||
+                                           (metadata.header.machine == 62 || metadata.header.machine == 183 || ppc64 || riscv64)) ||
                                           i386);
             if (!packed_relative && !ordinary_subset) {
                 skip(index, "Ordinary REL/RELA runtime relocations are unsupported for this ELF class, byte order, or architecture");
                 continue;
             }
+            if (!packed_relative && ppc64 && !relocation.explicit_addend) {
+                skip(index, "PPC64 runtime relocation support requires RELA explicit addends");
+                continue;
+            }
             const bool relative = relocation.kind == ElfRelocationKind::base_relative &&
                                   (packed_relative || relocation.type == relative_type);
-            const bool symbol_slot = (!riscv64 &&
+            const bool symbol_slot = (!riscv64 && !ppc64 &&
                                       ((relocation.type == (i386 || x64 ? 6u : 1025u) &&
                                         relocation.kind == ElfRelocationKind::global_data) ||
                                        (relocation.type == jump_slot_type &&
                                         relocation.kind == ElfRelocationKind::jump_slot))) ||
                                      (riscv64 && relocation.type == jump_slot_type &&
                                       relocation.kind == ElfRelocationKind::jump_slot);
+            const bool ppc64_glob_dat = ppc64 && relocation.type == 20 &&
+                                        relocation.kind == ElfRelocationKind::global_data;
+            const bool ppc64_abs64 = ppc64 && relocation.type == 38 &&
+                                     relocation.kind == ElfRelocationKind::absolute;
             const bool symbol_with_addend = riscv64 && relocation.type == symbol_addend_type &&
                                             relocation.kind == ElfRelocationKind::absolute;
             const bool aarch64_abs64 = metadata.header.machine == 183 && relocation.type == 257 &&
@@ -395,12 +404,15 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             const bool x64_32 = x64 && relocation.type == 10 && relocation.kind == ElfRelocationKind::absolute;
             const bool x64_32s = x64 && relocation.type == 11 && relocation.kind == ElfRelocationKind::absolute;
             if (!relative && !symbol_slot && !symbol_with_addend && !i386_absolute && !i386_pc_relative &&
-                !x64_64 && !x64_pc32 && !x64_32 && !x64_32s && !aarch64_abs64) {
+                !x64_64 && !x64_pc32 && !x64_32 && !x64_32s && !aarch64_abs64 &&
+                !ppc64_glob_dat && !ppc64_abs64) {
                 skip(index, i386
                     ? "Supported dynamic types are R_386_32, R_386_PC32, R_386_RELATIVE, R_386_GLOB_DAT, and R_386_JMP_SLOT"
                     : x64
                     ? "Supported dynamic types are R_X86_64_64, PC32, 32, 32S, RELATIVE, GLOB_DAT, and JUMP_SLOT"
-                    : riscv64
+                    : ppc64
+                        ? "Supported dynamic types are R_PPC64_RELATIVE, GLOB_DAT, and ADDR64"
+                        : riscv64
                         ? "Supported dynamic types are R_RISCV_RELATIVE, R_RISCV_64, and R_RISCV_JUMP_SLOT"
                         : "Supported dynamic types are R_AARCH64_ABS64, RELATIVE, GLOB_DAT, and JUMP_SLOT");
                 continue;
@@ -517,9 +529,10 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     // the specified low 32 bits, including negative addends.
                     value = static_cast<std::uint32_t>(
                         static_cast<std::uint32_t>(value) + addend - static_cast<std::uint32_t>(place));
-                } else if (symbol_with_addend || aarch64_abs64) {
+                } else if (symbol_with_addend || aarch64_abs64 || ppc64_glob_dat || ppc64_abs64) {
                     if (!relocation.addend) {
-                        const auto relocation_name = aarch64_abs64 ? "R_AARCH64_ABS64" : "R_RISCV_64";
+                        const auto relocation_name = aarch64_abs64 ? "R_AARCH64_ABS64" :
+                            ppc64_glob_dat ? "R_PPC64_GLOB_DAT" : ppc64_abs64 ? "R_PPC64_ADDR64" : "R_RISCV_64";
                         skip(index, std::string(relocation_name) +
                                         (relocation.explicit_addend ? " relocation addend is unavailable"
                                                                     : " implicit addend is unavailable"));
@@ -592,8 +605,10 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 skip(index, "Relocation target is not a complete file-backed field of the supported width");
                 continue;
             }
-            if (!packed_relative && metadata.header.machine == 183 && (relocation.place->offset & 7) != 0) {
-                skip(index, "AArch64 dynamic relocation target is not 8-byte aligned");
+            if (!packed_relative && (metadata.header.machine == 183 || ppc64) &&
+                (relocation.place->offset & 7) != 0) {
+                skip(index, ppc64 ? "PPC64 dynamic relocation target is not 8-byte aligned"
+                                  : "AArch64 dynamic relocation target is not 8-byte aligned");
                 continue;
             }
             const auto *segment = source.image->segment_at(*relocation.place);
