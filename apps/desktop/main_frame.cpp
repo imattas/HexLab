@@ -67,6 +67,7 @@
 #include <wx/statusbr.h>
 #include <wx/textctrl.h>
 #include <wx/dialog.h>
+#include <wx/listctrl.h>
 #include <wx/valnum.h>
 #include <wx/window.h>
 #include <algorithm>
@@ -847,6 +848,7 @@ struct MainFrame::Impl {
             flirt_work->thread = std::jthread(
                 [work, project_id, snapshot, actor, catalog_path, provenance](std::stop_token stop) {
                     std::string message;
+                    std::vector<FunctionFlirtMatch> match_rows;
                     try {
                         std::error_code ec;
                         const auto size = std::filesystem::file_size(catalog_path, ec);
@@ -863,10 +865,12 @@ struct MainFrame::Impl {
 
                         const auto &image = *snapshot->loaded->image;
                         Result<FlirtCatalog> catalog = Error{ErrorCode::unsupported, "Unsupported FLAIR catalog format."};
-                        const auto extension = catalog_path.extension().string();
-                        if (extension == ".sig") {
+                        const bool binary_sig = bytes.size() >= 6 && std::memcmp(bytes.data(), "IDASGN", 6) == 0;
+                        const bool gzip_text = bytes.size() >= 2 && bytes[0] == std::byte{0x1f} &&
+                                               bytes[1] == std::byte{0x8b};
+                        if (binary_sig) {
                             catalog = parse_flirt_sig(bytes, provenance, catalog_limits, stop);
-                        } else if (extension == ".gz") {
+                        } else if (gzip_text) {
                             catalog = parse_flirt_pat_gz(bytes, image.layout().architecture, image.layout().mode,
                                                          provenance, catalog_limits, stop);
                         } else {
@@ -897,7 +901,7 @@ struct MainFrame::Impl {
                         if (!persisted) throw std::runtime_error(persisted.error().message);
                         std::ostringstream report;
                         report << "Catalog: " << provenance << "\nFormat: "
-                               << (extension == ".sig" ? "binary IDASGN" : extension == ".gz" ? "gzip FLAIR text" : "FLAIR text")
+                               << (binary_sig ? "binary IDASGN" : gzip_text ? "gzip FLAIR text" : "FLAIR text")
                                << "\nPatterns: " << catalog.value().patterns.size()
                                << "\nTarget: " << static_cast<unsigned>(catalog.value().target_architecture)
                                << " / mode " << static_cast<unsigned>(catalog.value().target_mode)
@@ -910,7 +914,8 @@ struct MainFrame::Impl {
                         const auto display_count = std::min<std::size_t>(2000, recognition.value().functions.size());
                         for (std::size_t i = 0; i < display_count; ++i) {
                             const auto &function = recognition.value().functions[i];
-                            report << "va:" << std::hex << function.entry.offset << std::dec
+                            report << "space " << function.entry.space.value << ":0x" << std::hex
+                                   << function.entry.offset << std::dec
                                    << (function.ambiguous ? " [AMBIGUOUS] " : " ");
                             for (std::size_t n = 0; n < function.candidates.size(); ++n) {
                                 if (n) report << " | ";
@@ -923,7 +928,9 @@ struct MainFrame::Impl {
                         if (recognition.value().functions.size() > display_count)
                             report << "\nDisplay limit reached; " << (recognition.value().functions.size() - display_count)
                                    << " additional matches remain in persisted project evidence.\n";
-                        message = "Stored FLAIR evidence for " + std::to_string(recognition.value().functions.size()) +
+                        const auto match_count = recognition.value().functions.size();
+                        match_rows = std::move(recognition.value().functions);
+                        message = "Stored FLAIR evidence for " + std::to_string(match_count) +
                             " functions" + (recognition.value().complete ? "." : " (partial; work budget reached).") +
                             "\n" + report.str();
                     } catch (const std::exception &error) {
@@ -935,7 +942,9 @@ struct MainFrame::Impl {
                         std::lock_guard lock(work->mutex);
                         work->running = false;
                     }
-                    if (wxTheApp) wxTheApp->CallAfter([work, project_id, message = std::move(message)] {
+                    auto matches = std::make_shared<const std::vector<FunctionFlirtMatch>>(std::move(match_rows));
+                    const auto image = snapshot->loaded->image;
+                    if (wxTheApp) wxTheApp->CallAfter([work, project_id, message = std::move(message), matches, image] {
                         MainFrame *target = nullptr;
                         {
                             std::lock_guard lock(work->mutex);
@@ -943,18 +952,68 @@ struct MainFrame::Impl {
                         }
                         if (target && target->projects().active_document() == project_id) {
                             target->impl_->log_to(project_id, text(message));
-                            wxDialog dialog(target, wxID_ANY, "FLAIR catalog scan results", wxDefaultPosition, wxSize(820, 620),
+                            wxDialog dialog(target, wxID_ANY, "FLAIR catalog scan results", wxDefaultPosition, wxSize(920, 680),
                                             wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
                             auto *layout = new wxBoxSizer(wxVERTICAL);
-                            auto *details = new wxTextCtrl(&dialog, wxID_ANY, text(message), wxDefaultPosition, wxDefaultSize,
-                                                           wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2);
-                            layout->Add(details, 1, wxEXPAND | wxALL, 8);
-                            auto *close = new wxButton(&dialog, wxID_OK, "Close");
-                            layout->Add(close, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+                            auto summary_text = message;
+                            if (const auto end = summary_text.find("\n\nMatches and candidate names"); end != std::string::npos)
+                                summary_text.resize(end);
+                            auto *summary = new wxTextCtrl(&dialog, wxID_ANY, text(summary_text), wxDefaultPosition,
+                                                           wxSize(-1, 150), wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2);
+                            layout->Add(summary, 0, wxEXPAND | wxALL, 8);
+                            auto *results = new wxListCtrl(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                                           wxLC_REPORT | wxLC_SINGLE_SEL | wxLC_HRULES | wxLC_VRULES);
+                            results->InsertColumn(0, "Function entry", wxLIST_FORMAT_LEFT, 180);
+                            results->InsertColumn(1, "Candidate names and provenance", wxLIST_FORMAT_LEFT, 620);
+                            results->InsertColumn(2, "Status", wxLIST_FORMAT_LEFT, 90);
+                            const auto row_count = std::min<std::size_t>(2000, matches->size());
+                            for (std::size_t i = 0; i < row_count; ++i) {
+                                const auto &match = (*matches)[i];
+                                const auto row = results->InsertItem(static_cast<long>(i),
+                                    text(format_location(Location{match.entry}, image.get())));
+                                std::string names;
+                                for (const auto &candidate : match.candidates) {
+                                    if (!names.empty()) names += " | ";
+                                    names += candidate.name + " {" + candidate.provenance + "}";
+                                    if (candidate.kind == FlirtSymbolKind::local_name) names += " [local]";
+                                    if (names.size() >= 2048) {
+                                        names.resize(2048);
+                                        names += "...";
+                                        break;
+                                    }
+                                }
+                                results->SetItem(row, 1, text(names));
+                                results->SetItem(row, 2, match.ambiguous ? "Ambiguous" : "Unambiguous");
+                            }
+                            results->SetMinSize(wxSize(-1, 300));
+                            layout->Add(results, 1, wxEXPAND | wxLEFT | wxRIGHT, 8);
+                            if (matches->size() > row_count)
+                                layout->Add(new wxStaticText(&dialog, wxID_ANY,
+                                    text(std::to_string(matches->size() - row_count) +
+                                         " additional matches remain in the stored project evidence.")),
+                                    0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+                            auto *buttons = new wxBoxSizer(wxHORIZONTAL);
+                            auto *go = new wxButton(&dialog, wxID_OK, "Go to Selected Function");
+                            auto *close = new wxButton(&dialog, wxID_CANCEL, "Close");
+                            buttons->Add(go, 0, wxRIGHT, 8);
+                            buttons->Add(close, 0);
+                            layout->Add(buttons, 0, wxALIGN_RIGHT | wxALL, 8);
                             dialog.SetSizerAndFit(layout);
-                            dialog.SetSize(820, 620);
+                            dialog.SetSize(920, 680);
                             dialog.CentreOnParent();
-                            dialog.ShowModal();
+                            std::optional<Address> selected_entry;
+                            auto navigate_selected = [&] {
+                                const auto row = results->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+                                if (row < 0 || static_cast<std::size_t>(row) >= row_count) return;
+                                selected_entry = (*matches)[static_cast<std::size_t>(row)].entry;
+                                dialog.EndModal(wxID_OK);
+                            };
+                            go->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) { navigate_selected(); });
+                            results->Bind(wxEVT_LIST_ITEM_ACTIVATED, [&](wxListEvent &) { navigate_selected(); });
+                            results->Bind(wxEVT_LIST_ITEM_SELECTED, [go](wxListEvent &) { go->Enable(true); });
+                            go->Enable(false);
+                            if (dialog.ShowModal() == wxID_OK && selected_entry)
+                                target->Navigate(*selected_entry);
                         }
                     });
                 });

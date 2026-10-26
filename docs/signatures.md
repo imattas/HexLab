@@ -146,15 +146,17 @@ automatic library naming remain future work.
 
 ## FLAIR text patterns
 
-The desktop **Analysis → Scan FLAIR Catalog and Browse Results** workflow
+The desktop **Analysis > Scan FLAIR Catalog and Browse Results...** workflow
 imports `.pat`, gzip-wrapped `.pat.gz`, and binary `.sig` catalogs (versions
-5–10), then scans the active writable project’s recovered functions. The
-results window reports catalog provenance, parsed pattern count, target, scan
-completeness, comparison counts, and candidate names with provenance. Ambiguous
-entries are marked explicitly. Recognition evidence is stored in the project’s
-analysis cache and the scan can be repeated after changing catalogs or project
-analysis. This workflow does not rename functions. It displays up to 2,000
-entries per scan report; the project evidence retains the full bounded result.
+5-10), then scans the active writable project's recovered functions. Format dispatch uses IDASGN and gzip magic bytes; otherwise input is parsed as FLAIR text. Its
+results dialog reports catalog provenance, parsed pattern count, target, scan
+completeness, and work counters, then lists up to 2,000 matching function
+entries with candidate names, provenance, and ambiguity status. Select a row
+and choose **Go to Selected Function**, or activate the row, to navigate to that
+entry. Additional matches remain in the stored evidence and are reported in
+the dialog. Recognition evidence is stored in the project's analysis cache;
+the scan can be repeated after changing catalogs or project analysis. The
+desktop workflow does not rename functions.
 
 The analysis API also imports the human-readable FLAIR `.pat` format with
 `parse_flirt_pat`. The caller supplies the architecture, execution mode, and
@@ -247,12 +249,12 @@ at 1,000,000 each, candidate and reference work at 67,108,864 each, and byte
 comparisons at 268,435,456. Lower per-invocation limits can be selected with
 the corresponding budget options.
 
-The desktop Analysis menu has **Apply FLAIR Catalog Evidence...** for a saved,
-writable project. It parses and recognizes on a cancellable worker, stores the
-source-bound evidence without renaming functions or editing comments, and
-reports up to 32 matched entries in the output pane. **Cancel Background Work**
-requests cancellation; closing the desktop also requests cancellation and waits
-for the worker to stop.
+The desktop Analysis menu scan is available for a saved, writable project with
+current recovered functions. It parses and recognizes on a cancellable worker,
+stores source-bound evidence without renaming functions or editing comments,
+and opens the browsable results dialog when the scanned project is still
+active. **Cancel Background Work** requests cancellation; closing the desktop
+also requests cancellation and waits for the worker to stop.
 
 ## Instruction-normalized function fingerprints
 
