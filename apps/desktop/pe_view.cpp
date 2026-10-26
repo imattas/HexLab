@@ -121,7 +121,8 @@ PeView::PeView(wxWindow *parent) : wxPanel(parent) {
 
 void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
     document_ = std::move(document);
-    const auto *metadata = document_ ? &document_->metadata_view() : nullptr;
+    const auto source_document = document_;
+    const auto *metadata = source_document ? &source_document->metadata_view() : nullptr;
     const bool pe = metadata && metadata->pe.has_value();
     if (!pe) {
         directories_->populate(0, {});
@@ -149,7 +150,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
     }
 
     const auto directory_count = std::min<std::size_t>(metadata->directories.size(), 16);
-    directories_->populate(directory_count, [this, metadata](std::size_t row, int column) {
+    directories_->populate(directory_count, [source_document, metadata](std::size_t row, int column) {
+        (void)source_document;
         const auto &item = metadata->directories[row];
         switch (column) {
         case 0: return wxString::Format("%u", item.index);
@@ -158,17 +160,17 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         default: return wxString::Format("0x%X", item.size);
         }
     });
-    directories_->activate = [this, metadata](std::size_t row) {
-        if (!document_ || row >= metadata->directories.size()) return;
+    directories_->activate = [this, source_document, metadata](std::size_t row) {
+        if (!source_document || row >= metadata->directories.size()) return;
         const auto &entry = metadata->directories[row];
         if (entry.file_offset) {
-            if (entry.location <= document_->image->storage()->size() && navigate)
-                navigate(document_, FileOffset{entry.location});
+            if (source_document->image && entry.location <= source_document->image->storage()->size() && navigate)
+                navigate(source_document, FileOffset{entry.location});
             return;
         }
         const auto base = metadata->preferred_base;
         if (entry.location <= UINT64_MAX - base)
-            if (navigate) navigate(document_, Address{{0}, base + entry.location});
+            if (navigate) navigate(source_document, Address{{0}, base + entry.location});
     };
 
     constexpr std::size_t resource_display_limit = 4096;
@@ -183,7 +185,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         "Resources: %llu records%s; select a row to navigate to its file-backed payload",
         static_cast<unsigned long long>(resource_records.size()),
         resource_records.size() > resource_rows.size() ? " (display limited to 4096 rows)" : ""));
-    resources_->populate(resource_rows.size(), [resource_rows](std::size_t row, int column) {
+    resources_->populate(resource_rows.size(), [source_document, resource_rows](std::size_t row, int column) {
+        (void)source_document;
         if (row >= resource_rows.size() || !resource_rows[row].resource) return wxString{};
         const auto &item = *resource_rows[row].resource;
         switch (column) {
@@ -222,11 +225,11 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         default: return wxString::Format("%u", item.data_entry.index);
         }
     });
-    resources_->activate = [this, resource_rows](std::size_t row) {
+    resources_->activate = [this, source_document, resource_rows](std::size_t row) {
         if (row >= resource_rows.size() || !resource_rows[row].resource || !navigate) return;
         const auto &item = *resource_rows[row].resource;
         if (item.size != 0 && !item.payload.empty())
-            navigate(document_, Location{item.payload.front().offset});
+            navigate(source_document, Location{item.payload.front().offset});
     };
 
     std::vector<BoundRow> rows;
@@ -239,7 +242,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
             rows.push_back({&item, &forwarder, source_offset(forwarder.descriptor)});
         }
     }
-    bound_imports_->populate(rows.size(), [rows](std::size_t row, int column) {
+    bound_imports_->populate(rows.size(), [source_document, rows](std::size_t row, int column) {
+        (void)source_document;
         const auto &item = rows[row];
         const auto library = item.forwarder ? item.forwarder->library : item.module->library;
         const auto timestamp = item.forwarder ? item.forwarder->timestamp : item.module->timestamp;
@@ -250,9 +254,9 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         default: return item.forwarder ? wxString("forwarder") : wxString("module");
         }
     });
-    bound_imports_->activate = [this, rows](std::size_t row) {
+    bound_imports_->activate = [this, source_document, rows](std::size_t row) {
         if (row < rows.size() && rows[row].source && navigate)
-            navigate(document_, *rows[row].source);
+            navigate(source_document, *rows[row].source);
     };
     const auto &certificate_table = metadata->pe->certificate_table;
     if (!certificate_table) {
@@ -268,7 +272,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
             static_cast<unsigned>(records.size()),
             static_cast<unsigned long long>(certificate_table->file_offset.value),
             certificate_table->size, shown < records.size() ? " (display limited to 4096 rows)" : ""));
-        certificates_->populate(shown, [records, shown](std::size_t row, int column) {
+        certificates_->populate(shown, [source_document, records, shown](std::size_t row, int column) {
+            (void)source_document;
             (void)shown;
             const auto &record = records[row];
             const auto offset = record.source.spans.empty() ? 0 : record.source.spans.front().offset.value;
@@ -282,11 +287,11 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
             default: return wxString::Format("%u", record.source.index);
             }
         });
-        certificates_->activate = [this, records, shown](std::size_t row) {
+        certificates_->activate = [this, source_document, records, shown](std::size_t row) {
             if (row >= shown || !navigate) return;
             const auto &record = records[row];
-            if (!record.payload.empty()) navigate(document_, record.payload.front().offset);
-            else if (!record.source.spans.empty()) navigate(document_, record.source.spans.front().offset);
+            if (!record.payload.empty()) navigate(source_document, record.payload.front().offset);
+            else if (!record.source.spans.empty()) navigate(source_document, record.source.spans.front().offset);
         };
     }
     const auto &load_config = metadata->pe->load_configuration;
@@ -324,7 +329,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
             static_cast<unsigned long long>(load_config->safe_seh_handlers.size()),
             static_cast<unsigned long long>(*load_config->safe_seh_table_rva)));
         const auto handlers = load_config->safe_seh_handlers;
-        safe_seh_->populate(handlers.size(), [handlers](std::size_t row, int column) {
+        safe_seh_->populate(handlers.size(), [source_document, handlers](std::size_t row, int column) {
+            (void)source_document;
             const auto &handler = handlers[row];
             switch (column) {
             case 0: return wxString::Format("0x%08X", handler.rva);
@@ -332,11 +338,11 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
             default: return wxString::Format("%u", handler.source.index);
             }
         });
-        safe_seh_->activate = [this, metadata, handlers](std::size_t row) {
+        safe_seh_->activate = [this, source_document, metadata, handlers](std::size_t row) {
             if (row >= handlers.size() || !navigate) return;
             const auto base = metadata->preferred_base;
             if (handlers[row].rva <= UINT64_MAX - base)
-                navigate(document_, Address{{0}, base + handlers[row].rva});
+                navigate(source_document, Address{{0}, base + handlers[row].rva});
         };
     }
     std::vector<ExceptionRow> exception_rows;
@@ -408,7 +414,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
             add_exception_row(rva_address(*function.xdata->handler_rva), "ARM64 exception handler",
                 "language payload is retained as metadata", function.xdata->handler_source.value_or(function.xdata->source));
     }
-    exceptions_->populate(exception_rows.size(), [exception_rows](std::size_t row, int column) {
+    exceptions_->populate(exception_rows.size(), [source_document, exception_rows](std::size_t row, int column) {
+        (void)source_document;
         const auto &item = exception_rows[row];
         switch (column) {
         case 0: return item.address ? location_text(Location{*item.address}) : wxString("—");
@@ -417,11 +424,11 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         default: return item.source ? location_text(*item.source) : wxString("unavailable");
         }
     });
-    exceptions_->activate = [this, exception_rows](std::size_t row) {
+    exceptions_->activate = [this, source_document, exception_rows](std::size_t row) {
         if (row < exception_rows.size() && exception_rows[row].source && navigate)
-            navigate(document_, *exception_rows[row].source);
+            navigate(source_document, *exception_rows[row].source);
         else if (row < exception_rows.size() && exception_rows[row].address && navigate)
-            navigate(document_, *exception_rows[row].address);
+            navigate(source_document, *exception_rows[row].address);
     };
     const auto &pdb = *metadata->pe;
     const auto *pdb_ptr = &pdb;
@@ -434,7 +441,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
             static_cast<unsigned long long>(pdb.pdb_symbols.size()),
             static_cast<unsigned long long>(pdb.pdb_types.size()), static_cast<unsigned long long>(pdb.source_lines.size()),
             static_cast<unsigned long long>(pdb.pdb_inline_sites.size())));
-    pdb_symbols_->populate(std::min<std::size_t>(4096, pdb.pdb_symbols.size()), [this, pdb_ptr](std::size_t row, int column) {
+    pdb_symbols_->populate(std::min<std::size_t>(4096, pdb.pdb_symbols.size()), [source_document, pdb_ptr](std::size_t row, int column) {
+        (void)source_document;
         const auto &item = pdb_ptr->pdb_symbols[row];
         switch (column) {
         case 0: return item.address ? location_text(Location{*item.address}) : wxString::Format("section %u+0x%X", item.section, item.section_offset);
@@ -445,10 +453,11 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
                                                wxString::Format(" 0x%X", item.type_index) : wxString("unavailable");
         }
     });
-    pdb_symbols_->activate = [this, pdb_ptr](std::size_t row) {
-        if (row < pdb_ptr->pdb_symbols.size() && pdb_ptr->pdb_symbols[row].address && navigate) navigate(document_, *pdb_ptr->pdb_symbols[row].address);
+    pdb_symbols_->activate = [this, source_document, pdb_ptr](std::size_t row) {
+        if (row < pdb_ptr->pdb_symbols.size() && pdb_ptr->pdb_symbols[row].address && navigate) navigate(source_document, *pdb_ptr->pdb_symbols[row].address);
     };
-    pdb_types_->populate(std::min<std::size_t>(4096, pdb.pdb_types.size()), [pdb_ptr](std::size_t row, int column) {
+    pdb_types_->populate(std::min<std::size_t>(4096, pdb.pdb_types.size()), [source_document, pdb_ptr](std::size_t row, int column) {
+        (void)source_document;
         const auto &item = pdb_ptr->pdb_types[row];
         switch (column) {
         case 0: return wxString::Format("0x%X", item.index);
@@ -457,7 +466,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         default: return wxString::Format("%llu", static_cast<unsigned long long>(item.size));
         }
     });
-    pdb_lines_->populate(std::min<std::size_t>(4096, pdb.source_lines.size()), [pdb_ptr](std::size_t row, int column) {
+    pdb_lines_->populate(std::min<std::size_t>(4096, pdb.source_lines.size()), [source_document, pdb_ptr](std::size_t row, int column) {
+        (void)source_document;
         const auto &item = pdb_ptr->source_lines[row];
         switch (column) {
         case 0: return item.address ? location_text(Location{*item.address}) : wxString("unmapped");
@@ -466,8 +476,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         default: return text(item.module_name);
         }
     });
-    pdb_lines_->activate = [this, pdb_ptr](std::size_t row) {
-        if (row < pdb_ptr->source_lines.size() && pdb_ptr->source_lines[row].address && navigate) navigate(document_, *pdb_ptr->source_lines[row].address);
+    pdb_lines_->activate = [this, source_document, pdb_ptr](std::size_t row) {
+        if (row < pdb_ptr->source_lines.size() && pdb_ptr->source_lines[row].address && navigate) navigate(source_document, *pdb_ptr->source_lines[row].address);
     };
     std::vector<std::pair<std::size_t, std::optional<std::size_t>>> inline_rows;
     for (std::size_t i = 0; i < pdb.pdb_inline_sites.size() && inline_rows.size() < 4096; ++i) {
@@ -476,7 +486,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         for (std::size_t r = 0; r < site.ranges.size() && inline_rows.size() < 4096; ++r)
             inline_rows.emplace_back(i, r);
     }
-    pdb_inline_->populate(inline_rows.size(), [pdb_ptr, inline_rows](std::size_t row, int column) {
+    pdb_inline_->populate(inline_rows.size(), [source_document, pdb_ptr, inline_rows](std::size_t row, int column) {
+        (void)source_document;
         const auto &[site_index, range_index] = inline_rows[row];
         const auto &site = pdb_ptr->pdb_inline_sites[site_index];
         const auto *range = range_index ? &site.ranges[*range_index] : nullptr;
@@ -492,11 +503,11 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         default: return text(site.status);
         }
     });
-    pdb_inline_->activate = [this, pdb_ptr, inline_rows](std::size_t row) {
+    pdb_inline_->activate = [this, source_document, pdb_ptr, inline_rows](std::size_t row) {
         if (row >= inline_rows.size()) return;
         const auto &[site, range] = inline_rows[row];
         if (range && pdb_ptr->pdb_inline_sites[site].ranges[*range].address && navigate)
-            navigate(document_, *pdb_ptr->pdb_inline_sites[site].ranges[*range].address);
+            navigate(source_document, *pdb_ptr->pdb_inline_sites[site].ranges[*range].address);
     };
     pdb_inline_->fit_columns({0, 1, 2, 3, 4, 5});
     directories_->fit_columns({0, 1, 2, 3});
