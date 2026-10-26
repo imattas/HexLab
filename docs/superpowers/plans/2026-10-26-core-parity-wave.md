@@ -32,28 +32,28 @@
 
 **Ownership:** `libs/decompiler/src/decompiler.cpp`, focused decompiler documentation, and no other subsystem.
 
-- [ ] Read `docs/capabilities.csv` and the structuring implementation; identify one high-impact native CFG/SSA shape currently falling back.
-- [ ] Implement bounded recognition and exact edge/phi validation for that shape; preserve the existing fallback for ambiguous forms.
-- [ ] Document the new accepted shape and remaining limits; compile `hexlab_decompiler` Debug or the changed object plus integrated CLI if dependencies prevent the standalone target.
+- [x] Read `docs/capabilities.csv` and the structuring implementation; identified explicit-preheader post-tested loops with loop-carried SSA phis.
+- [x] Implemented bounded recognition, exact edge/phi validation, and conservative fallback for ambiguous forms.
+- [x] Documented limits; isolated Windows Debug `hexlab_decompiler` build passed.
 
 ### Task 2: PDB type import
 
 **Ownership:** `libs/types/src/pdb.cpp`, `libs/types/src/pdb_import.cpp`, their public PDB/type headers, and focused PDB/type documentation.
 
-- [ ] Read the PDB/type capability entries and identify one common unsupported CodeView record path with a user-visible type-library outcome.
-- [ ] Carry it from bounded parse/graph validation through type import, preserving type-server namespace and provenance.
-- [ ] Document unsupported and malformed cases; compile `hexlab_types` Debug.
+- [x] Read the PDB/type capability entries; selected `LF_BINTERFACE` interface base subobjects.
+- [x] Carried the leaf through bounded parse, type graph references, type-server remapping, and type import with source provenance.
+- [x] Documented malformed/unsupported cases; isolated Windows Debug `hexlab_types` build passed.
 
 ### Task 3: Graph cross-view workflow
 
 **Ownership:** `apps/desktop/graph_canvas.*`, `apps/desktop/graph_view.*`, tightly coupled main-frame wiring only when needed, and focused graph documentation.
 
-- [ ] Inspect graph focus/selection callbacks and linked listing/pseudocode navigation; identify one high-impact synchronization gap.
-- [ ] Implement the workflow with stale graph and location validation and without mutating immutable graph facts.
-- [ ] Document keyboard/mouse behavior and compile the affected desktop components Debug; do not launch the GUI.
+- [x] Inspected graph callbacks; graph follow previously used the asynchronously rendered listing row instead of the focused graph instruction.
+- [x] Graph follow now carries the exact instruction and graph snapshot and checks active document/image/revision plus reference and endpoint ownership.
+- [x] Documented Enter/double-click behavior; MSVC Debug compiled graph canvas, graph view, and main frame translation units. No GUI launched.
 
 ### Integration
 
-- [ ] Review all diffs for bounds, exact provenance, stale-state handling, and fallback behavior.
-- [ ] Compile integrated Windows Debug CLI and desktop component targets serially where wxWidgets is available.
-- [ ] Update capability evidence, commit the integration record, and push `feat/foundation`.
+- [x] Reviewed all three diffs; independent task reviews approved all three tasks.
+- [ ] Compile integrated Windows Debug CLI and desktop component targets serially where wxWidgets is available; graph translation units were compiled independently because configured wx source resides under prohibited `out/`.
+- [x] Update capability evidence, commit the integration record, and push `feat/foundation`.
