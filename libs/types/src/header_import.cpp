@@ -1102,6 +1102,34 @@ private:
         specificity += 8;
         return value == argument;
     }
+    bool template_template_parameter_pattern(const std::vector<Token> &pattern,
+                                            const std::vector<TemplateParameter> &parameters,
+                                            std::map<std::string, std::string, std::less<>> &bindings,
+                                            const std::string &argument, unsigned &specificity) {
+        if (pattern.size() != 1 || !identifier(pattern.front().text))
+            fail(ErrorCode::unsupported, "template-template specialization patterns must be one template name or parameter name");
+        const auto &name = pattern.front().text;
+        const auto parameter = std::find_if(parameters.begin(), parameters.end(), [&](const auto &item) {
+            return item.name == name;
+        });
+        if (parameter != parameters.end()) {
+            if (!parameter->template_parameter || parameter->pack)
+                fail(ErrorCode::unsupported, "template-template specialization patterns can bind only template parameters");
+            validate_template_template_argument(*parameter, argument);
+            if (auto found = bindings.find(name); found != bindings.end()) return found->second == argument;
+            bindings.emplace(name, argument);
+            return true;
+        }
+        const auto fixed_name = qualify_name(name);
+        const auto found = result_.templates.find(fixed_name);
+        if (found == result_.templates.end())
+            fail(ErrorCode::unsupported, "fixed template-template specialization pattern names an unsupported template");
+        // Validate the template's signature against the primary's template-template parameter
+        // before comparing the bound identity.
+        if (found->first != argument) return false;
+        specificity += 8;
+        return true;
+    }
     TypePtr instantiate_template_aggregate(const std::string &name, const std::vector<TemplateArgument> &arguments) {
         if (template_depth_ >= o_.max_nesting)
             fail(ErrorCode::resource_limit, "template aggregate expansion exceeds configured nesting limit");
@@ -1114,9 +1142,9 @@ private:
         std::vector<TemplateArgument> complete_arguments;
         const bool supported_specialization_parameters = std::all_of(
             definition->second.parameters.begin(), definition->second.parameters.end(),
-            [](const auto &parameter) { return !parameter.template_parameter && !parameter.pack; });
+            [](const auto &parameter) { return !parameter.pack; });
         if (!definition->second.specializations.empty() && !supported_specialization_parameters)
-            fail(ErrorCode::unsupported, "specializations with template-template or pack parameters are unsupported");
+            fail(ErrorCode::unsupported, "specializations with primary template parameter packs are unsupported");
         if (!definition->second.specializations.empty()) {
             complete_arguments.reserve(definition->second.parameters.size());
             for (const auto &parameter : definition->second.parameters) {
@@ -1150,9 +1178,12 @@ private:
                     matched = template_parameter_pattern(pattern, specialization.parameters,
                                                          candidate_bindings.types,
                                                          complete_arguments[i].type, specificity);
+                } else if (primary_parameter.template_parameter && !complete_arguments[i].template_name.empty()) {
+                    matched = template_template_parameter_pattern(pattern, specialization.parameters,
+                                                                 candidate_bindings.templates,
+                                                                 complete_arguments[i].template_name, specificity);
                 } else {
-                    fail(ErrorCode::unsupported,
-                         "specialization matching for template-template arguments is unsupported");
+                    fail(ErrorCode::unsupported, "specialization argument kind is unsupported");
                 }
                 if (!matched) {
                     matches = false;
@@ -1162,6 +1193,7 @@ private:
             if (!matches) continue;
             for (const auto &parameter : specialization.parameters)
                 if ((parameter.value_parameter && !candidate_bindings.values.contains(parameter.name)) ||
+                    (parameter.template_parameter && !candidate_bindings.templates.contains(parameter.name)) ||
                     (!parameter.value_parameter && !parameter.template_parameter &&
                      !candidate_bindings.types.contains(parameter.name)))
                     fail(ErrorCode::unsupported,
@@ -1297,11 +1329,11 @@ private:
             return;
         }
         if (std::any_of(parameters.begin(), parameters.end(), [](const auto &parameter) {
-                return parameter.template_parameter || parameter.pack || !parameter.default_value_expression.empty() ||
+                return parameter.pack || !parameter.default_value_expression.empty() ||
                        !parameter.default_type.empty() || !parameter.default_template.empty();
             }))
             fail(ErrorCode::unsupported,
-                 "class-template specializations support integral and type parameters without defaults or packs");
+                 "class-template specializations support type, integral, and template-template parameters without defaults or packs");
         auto primary = aggregate_templates_.find(base_name);
         if (primary == aggregate_templates_.end())
             fail(ErrorCode::unsupported, "template specializations require a previously declared primary template");

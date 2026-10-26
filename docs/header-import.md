@@ -63,8 +63,9 @@ resulting concrete layout is stored under a name such as `Box<int>`. An explicit
 specialization such as `template<> struct Box<int> { ... };` overrides the
 primary template for that exact argument identity. Partial specializations
 support direct type parameters (`Box<T>`), pointer parameters (`Box<T*>`),
-`const T*` patterns, and integral non-type arguments that are direct parameter
-names or integer literals. See
+`const T*` patterns, integral non-type arguments that are direct parameter
+names or integer literals, and template-template arguments that are direct
+template parameter names or fixed template names. See
 [integral non-type class-template specializations](header-non-type-specializations.md)
 for examples. Specializations must follow a previously declared primary
 template. Default arguments are applied from left to right. A direct `Pack...`
@@ -79,8 +80,9 @@ instantiate as structure layouts; `class` bodies default methods to private,
 while `struct` bodies default methods to public. Data-member visibility is not
 retained in the shared type model, but does not affect imported offsets or size.
 
-Template-template parameters and parameter packs cannot be used in class-template
-specializations; compound pack patterns, member/parameter pack expansions,
+Template-template parameters are supported in class-template specializations
+when they are matched as a direct template name or parameter. Parameter packs
+cannot be used in specializations; compound pack patterns, member/parameter pack expansions,
 arithmetic non-type specialization patterns, function-template
 specializations, explicit alias-template specializations, forward-declared
 templates, and nested class-template definitions are unsupported. Type
