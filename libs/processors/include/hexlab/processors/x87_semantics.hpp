@@ -120,15 +120,30 @@ struct X87MultiplyRequest {
 struct X87ArithmeticResult {
     std::optional<X87Binary80> value;
     std::uint16_t status_word = 0;
+    // False means an unmasked exception requires delivery. For unmasked PE,
+    // x87 register arithmetic still commits the rounded value before delivery.
     bool completed = true;
     bool overflow = false;
     bool precision = false;
     bool operator==(const X87ArithmeticResult &) const = default;
 };
-// Evaluate finite binary80 FMUL operands with x87 precision control and RC.
-// Special operands/encodings not yet covered fail closed.
+// Evaluate finite and signed-zero binary80 FMUL operands with x87 precision
+// control and RC. NaN/infinity and unsupported encodings fail closed.
 HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
 evaluate_x87_multiply(const X87MultiplyRequest &request) noexcept;
+
+enum class X87BinaryArithmetic : std::uint8_t { add, subtract };
+struct X87AddSubtractRequest {
+    X87Binary80 left, right;
+    X87BinaryArithmetic operation = X87BinaryArithmetic::add;
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+};
+// Evaluate finite and signed-zero binary80 FADD/FSUB operands with x87
+// precision control and RC. NaNs, infinities, reserved PC, and gradual-
+// underflow results fail closed.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
+evaluate_x87_add_subtract(const X87AddSubtractRequest &request) noexcept;
 
 enum class X87UnaryArithmetic : std::uint8_t { change_sign, absolute };
 struct X87UnaryResult {

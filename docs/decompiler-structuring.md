@@ -384,8 +384,12 @@ Canonical pre-tested loops also accept a conditional break edge that reaches the
 loop's validated exit through a straight-line chain of at most 64 phi-free,
 side-effect-preserving blocks. Each path block must have exactly the preceding
 branch or path block as its predecessor, one unconditional jump or fallthrough,
-and no return, nested branch, switch, or memory phi. The formatter emits those
-path statements inside the break condition, then resumes after the loop so the
-shared exit block executes once. Shared path blocks, exit phis, extra
-predecessors on a path block, and other ambiguous shapes retain the existing
-fallback.
+and no return, nested branch, switch, or memory phi. The shared exit may contain
+register phis when its predecessor set is exactly the loop-header condition
+failure edge plus one distinct final edge for every recognized break path, and
+every phi has exactly one input for each of those predecessors. The formatter
+emits each path's statements and simultaneous phi copies inside its break
+condition; copies for the loop-header failure edge execute after the loop
+condition fails. It then emits the shared exit block once. Shared path blocks,
+exit memory phis, extra predecessors on a path block, incomplete or duplicate
+phi inputs, and other ambiguous shapes retain the existing fallback.

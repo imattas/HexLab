@@ -1230,16 +1230,22 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             name == "fcom" || name == "fcomp" || name.starts_with("fadd") ||
             name.starts_with("fmul") || name.starts_with("fsub") || name.starts_with("fdiv");
         std::vector<ExpressionPtr> typed_operands;
+        std::vector<ExpressionPtr> numeric_operands;
         typed_operands.reserve(operands.size() + instruction.register_reads.size());
         for (std::size_t index = 0; index < operands.size(); ++index) {
             const auto &decoded_operand = instruction.operands[index];
             if (const auto *reg = std::get_if<RegisterOperand>(&decoded_operand);
                 reg && reg->bank == RegisterBank::x87) {
                 typed_operands.push_back(retag_expr(operands[index], floating_type(80)));
+                numeric_operands.push_back(retag_expr(operands[index], floating_type(80)));
             } else if (const auto *memory = std::get_if<MemoryOperand>(&decoded_operand)) {
                 const auto type = real_memory && !integer_memory ? floating_type(memory->data_width)
                                                                   : integer_type(memory->data_width);
                 typed_operands.push_back(retag_expr(operands[index], type));
+                if (real_memory && !integer_memory &&
+                    (name.starts_with("fadd") || name.starts_with("fmul") ||
+                     name.starts_with("fsub") || name.starts_with("fdiv")))
+                    numeric_operands.push_back(retag_expr(operands[index], type));
             } else {
                 typed_operands.push_back(operands[index]);
             }
@@ -1255,9 +1261,12 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                     const auto *explicit_reg = std::get_if<RegisterOperand>(&operand);
                     return explicit_reg && *explicit_reg == reg;
                 });
-            if (!explicit_read)
+            if (!explicit_read) {
                 typed_operands.push_back(reg.bank == RegisterBank::x87
                     ? retag_expr(reg_expr(reg), floating_type(80)) : reg_expr(reg));
+                if (reg.bank == RegisterBank::x87)
+                    numeric_operands.push_back(retag_expr(reg_expr(reg), floating_type(80)));
+            }
         }
         // ST(i) indexes are relative to TOP. A push or pop changes that
         // mapping, so make the whole logical stack an input/output boundary.
@@ -1275,20 +1284,17 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                     typed_operands.push_back(retag_expr(reg_expr(reg), floating_type(80)));
             }
         }
-        // The common non-popping real arithmetic forms have a single explicit
-        // destination and do not change TOP. Represent their numeric result in
-        // the same SSA assignment model used by scalar floating instructions.
-        // Keep integer-converting FI* forms, comparisons, and pop variants as
-        // intrinsics until the IR can represent their conversion/status/stack
-        // effects without losing them.
+        // Keep the rounded-result expression and the status-word side effect
+        // in one intrinsic. This lets SSA retain both architectural outputs.
         const bool real_binary = name == "fadd" || name == "fmul" || name == "fsub" ||
                                  name == "fsubr" || name == "fdiv" || name == "fdivr";
-        if (real_binary && typed_operands.size() == 2 && instruction.register_writes.size() == 1 &&
-            instruction.register_writes.front().bank == RegisterBank::x87) {
+        if (real_binary && numeric_operands.size() == 2 &&
+            std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::x87; })) {
             const bool memory_source = !instruction.operands.empty() &&
                 std::holds_alternative<MemoryOperand>(instruction.operands.front());
-            auto left = typed_operands[0];
-            auto right = typed_operands[1];
+            auto left = numeric_operands[0];
+            auto right = numeric_operands[1];
             if (memory_source) std::swap(left, right); // implicit ST(0), explicit memory source
             if (name == "fsubr" || name == "fdivr") std::swap(left, right);
             const std::string operation = name == "fadd" ? "+" : name == "fmul" ? "*" :
@@ -1297,7 +1303,16 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             right = retag_expr(std::move(right), floating_type(80));
             auto value = std::make_shared<Expression>(Expression{
                 floating_type(80), BinaryValue{operation, std::move(left), std::move(right)}});
-            return Assign{instruction.register_writes.front(), std::move(value)};
+            Intrinsic effect{"x87_" + name, std::move(typed_operands),
+                instruction.memory_read && instruction.memory_write ? IntrinsicMemoryEffect::unknown :
+                instruction.memory_read ? IntrinsicMemoryEffect::read :
+                instruction.memory_write ? IntrinsicMemoryEffect::write : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.register_output_values.reserve(effect.register_writes.size());
+            for (const auto reg : effect.register_writes)
+                effect.register_output_values.push_back(reg.bank == RegisterBank::x87
+                    ? value : unknown_expr("x87-status-after-" + name, reg.width));
+            return effect;
         }
         if ((name == "fchs" || name == "fabs") && typed_operands.size() == 1 &&
             instruction.register_writes.size() == 1 &&
@@ -6853,6 +6868,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             const LiftedBlock *branch = nullptr;
             bool break_on_true = true;
             std::vector<const LiftedBlock *> path;
+            std::vector<std::pair<std::string, std::string>> exit_phi_copies;
         };
         std::vector<LoopBreakPath> loop_breaks;
         std::set<std::uint64_t> loop_break_path_ids;
@@ -7440,7 +7456,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 predecessor = candidate->id.value;
                 candidate = find_block(*candidate->successors.front().target);
             }
-            if (candidate != exit_block || !exit_block->phis.empty() || exit_block->memory_phi ||
+            if (candidate != exit_block || exit_block->memory_phi ||
                 !exit_block->memory_partition_phis.empty() ||
                 !diamond_predecessors[exit_block->id.value].contains(predecessor))
                 return std::nullopt;
@@ -7902,6 +7918,56 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             if (next_address == header->begin) break;
             body = find_block(next_address);
         }
+        std::vector<std::pair<std::string, std::string>> loop_condition_exit_phi_copies;
+        if (exit_block && !exit_block->phis.empty()) {
+            std::set<std::uint64_t> expected_exit_predecessors{header->id.value};
+            std::map<std::uint64_t, LoopBreakPath *> break_by_predecessor;
+            for (auto &loop_break : loop_breaks) {
+                const auto *tail = loop_break.path.empty() ? loop_break.branch : loop_break.path.back();
+                if (!tail || !break_by_predecessor.emplace(tail->id.value, &loop_break).second ||
+                    !expected_exit_predecessors.insert(tail->id.value).second) {
+                    loop_body_edges_valid = false;
+                    break;
+                }
+            }
+            if (loop_body_edges_valid && diamond_predecessors[exit_block->id.value] != expected_exit_predecessors)
+                loop_body_edges_valid = false;
+            if (loop_body_edges_valid &&
+                (exit_block->phis.size() > 4096 || !valid_diamond_memory_phi(*exit_block)))
+                loop_body_edges_valid = false;
+            for (const auto &phi : exit_block->phis) {
+                if (!loop_body_edges_valid) break;
+                if (phi.inputs.size() != expected_exit_predecessors.size()) {
+                    loop_body_edges_valid = false;
+                    break;
+                }
+                std::set<std::uint64_t> seen_predecessors;
+                const auto destination = register_name(phi.destination, phi.version);
+                for (const auto &input : phi.inputs) {
+                    const auto predecessor = input.predecessor.value;
+                    if (!expected_exit_predecessors.contains(predecessor) ||
+                        !seen_predecessors.insert(predecessor).second) {
+                        loop_body_edges_valid = false;
+                        break;
+                    }
+                    auto copy = std::make_pair(destination, register_name(phi.destination, input.version));
+                    if (predecessor == header->id.value) {
+                        loop_condition_exit_phi_copies.push_back(std::move(copy));
+                    } else {
+                        const auto found = break_by_predecessor.find(predecessor);
+                        if (found == break_by_predecessor.end()) {
+                            loop_body_edges_valid = false;
+                            break;
+                        }
+                        found->second->exit_phi_copies.push_back(std::move(copy));
+                    }
+                }
+                if (!loop_body_edges_valid || seen_predecessors != expected_exit_predecessors) {
+                    loop_body_edges_valid = false;
+                    break;
+                }
+            }
+        }
         const auto *latch = loop_body.empty() ? nullptr : loop_body.back();
         const bool recognized_return_latch = latch && std::any_of(loop_returns.begin(), loop_returns.end(),
             [&](const auto &side_exit) { return side_exit.branch == latch; });
@@ -7916,7 +7982,9 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
              recognized_conditional_latch);
         auto *continuation = exit_block;
         while (continuation && exit_path.size() < function.blocks.size() &&
-               exit_path_ids.insert(continuation->id.value).second && continuation->phis.empty() &&
+               exit_path_ids.insert(continuation->id.value).second &&
+               (continuation == exit_block || (continuation->phis.empty() && !continuation->memory_phi &&
+                                                continuation->memory_partition_phis.empty())) &&
                !contains_branch(*continuation) && has_only_simple_statements(*continuation)) {
             exit_path.push_back(continuation);
             if (has_only_terminal_return(*continuation)) break;
@@ -7932,6 +8000,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         }
         if (exit_path.empty() || !has_only_terminal_return(*exit_path.back()) ||
             (continuation && exit_path_ids.contains(continuation->id.value) && continuation != exit_path.back()))
+            exit_path_valid = false;
+        if (exit_block && (exit_block->memory_phi || !exit_block->memory_partition_phis.empty()))
             exit_path_valid = false;
         if (header && condition && body_start && exit_block && latch && closes_to_header && loop_body_edges_valid &&
             header != entry && body_start != entry && exit_block != entry && body_start != header &&
@@ -8195,6 +8265,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         "!(" + branch_condition_text(*body_condition) + ")") << ") {\n";
                     for (const auto *path_block : conditional_break->path)
                         emit_block(*path_block, 12, true);
+                    emit_parallel_copies(out, conditional_break->exit_phi_copies, 12);
                     out << "            break;\n        }\n";
                 }
                 const auto conditional_continue = std::find_if(loop_continues.begin(), loop_continues.end(),
@@ -8212,6 +8283,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             }
             emit_parallel_copies(out, recurrent_loop_phi_copies[latch->id.value], 8);
             out << "    }\n";
+            emit_parallel_copies(out, loop_condition_exit_phi_copies, 4);
             for (const auto *block : exit_path) emit_block(*block, 4, block != exit_path.back());
             out << "}\n";
             return {out.str(), false, {}};
