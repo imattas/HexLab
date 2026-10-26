@@ -124,12 +124,14 @@ struct X87ArithmeticResult {
     // x87 register arithmetic still commits the rounded value before delivery.
     bool completed = true;
     bool overflow = false;
+    // True when the operation raises UE under the current mask/tininess rules.
+    bool underflow = false;
     bool precision = false;
     bool invalid_operation = false;
     bool operator==(const X87ArithmeticResult &) const = default;
 };
 // Evaluate binary80 FMUL finite, signed-zero, infinity, and NaN operands with
-// x87 precision control and exception masks. Gradual-underflow results fail closed.
+// x87 precision control, gradual underflow, and exception masks.
 HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
 evaluate_x87_multiply(const X87MultiplyRequest &request) noexcept;
 

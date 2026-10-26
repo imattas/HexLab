@@ -11,6 +11,14 @@ constexpr std::size_t max_unwind_operations = 512;
 constexpr std::size_t max_unwind_depth = 32;
 constexpr std::size_t max_fh4_metadata_records = 1'000'000;
 constexpr std::size_t max_fh4_name_bytes = 1024 * 1024;
+constexpr std::uint32_t eh_adjective_const = 0x01;
+constexpr std::uint32_t eh_adjective_volatile = 0x02;
+constexpr std::uint32_t eh_adjective_unaligned = 0x04;
+constexpr std::uint32_t eh_adjective_reference = 0x08;
+constexpr std::uint32_t eh_adjective_type_qualifiers = 0x0f;
+constexpr std::uint32_t eh_adjective_std_dotdot = 0x40;
+constexpr std::uint32_t eh_adjective_badalloc_compat = 0x80;
+constexpr std::uint32_t eh_adjective_complus = 0x80000000u;
 
 Error failure(ErrorCode code, std::string message) { return {code, std::move(message)}; }
 
@@ -608,6 +616,13 @@ Result<PeFh3ExceptionPlan> plan_pe_fh3_exception(const PeMetadata &metadata, std
                 candidate.decorated_type_name = handler.decorated_type_name;
                 candidate.source = handler.source;
                 candidate.type_descriptor_source = handler.type_descriptor_source;
+                candidate.catch_const = (handler.adjectives & eh_adjective_const) != 0;
+                candidate.catch_volatile = (handler.adjectives & eh_adjective_volatile) != 0;
+                candidate.catch_unaligned = (handler.adjectives & eh_adjective_unaligned) != 0;
+                candidate.catch_by_reference = (handler.adjectives & eh_adjective_reference) != 0;
+                candidate.std_dotdot = (handler.adjectives & eh_adjective_std_dotdot) != 0;
+                candidate.badalloc_compatibility = (handler.adjectives & eh_adjective_badalloc_compat) != 0;
+                candidate.complus_catch = (handler.adjectives & eh_adjective_complus) != 0;
                 auto handler_address = add(module_base, handler.handler_rva);
                 if (!handler_address) return handler_address.error();
                 candidate.handler_address = handler_address.value();
@@ -623,9 +638,13 @@ Result<PeFh3ExceptionPlan> plan_pe_fh3_exception(const PeMetadata &metadata, std
                     candidate.catch_object_address = establisher_frame - magnitude;
                 }
 
-                if (handler.adjectives != 0)
+                const bool catch_all = !handler.type_descriptor_rva || *handler.type_descriptor_rva == 0;
+                const auto special_adjectives = handler.adjectives & ~eh_adjective_type_qualifiers;
+                // FH3 plans do not carry the exception kind or runtime compatibility
+                // mode, so special catch-all/bad_alloc/COM+ matching stays unresolved.
+                if (special_adjectives != 0 || (catch_all && handler.adjectives != 0))
                     candidate.disposition = PeFh3CatchDisposition::unsupported_adjectives;
-                else if (!handler.type_descriptor_rva || *handler.type_descriptor_rva == 0)
+                else if (catch_all)
                     candidate.disposition = PeFh3CatchDisposition::catch_all;
                 else if (!exception_decorated_type)
                     candidate.disposition = PeFh3CatchDisposition::type_unknown;
@@ -895,6 +914,14 @@ Result<PeFh4ExceptionPlan> plan_pe_fh4_exception(const PeMetadata &metadata, std
                 candidate.handler_index=static_cast<std::uint32_t>(handler_index);
                 candidate.decorated_type_name=handler.decorated_type_name;
                 candidate.source=handler.source;
+                const auto adjectives=handler.adjectives.value_or(0);
+                candidate.catch_const = (adjectives & eh_adjective_const) != 0;
+                candidate.catch_volatile = (adjectives & eh_adjective_volatile) != 0;
+                candidate.catch_unaligned = (adjectives & eh_adjective_unaligned) != 0;
+                candidate.catch_by_reference = (adjectives & eh_adjective_reference) != 0;
+                candidate.std_dotdot = (adjectives & eh_adjective_std_dotdot) != 0;
+                candidate.badalloc_compatibility = (adjectives & eh_adjective_badalloc_compat) != 0;
+                candidate.complus_catch = (adjectives & eh_adjective_complus) != 0;
                 auto target=add(module_base,handler.handler_rva);if(!target)return target.error();
                 candidate.handler_address=target.value();
                 if(handler.catch_object_offset){
@@ -909,10 +936,22 @@ Result<PeFh4ExceptionPlan> plan_pe_fh4_exception(const PeMetadata &metadata, std
                     candidate.continuation_addresses.push_back(address.value());
                 }
                 const bool catch_all=!handler.type_descriptor_rva||*handler.type_descriptor_rva==0;
-                const auto adjectives=handler.adjectives.value_or(0);
-                if(catch_all)candidate.disposition=adjectives==0
-                    ? PeFh4CatchDisposition::catch_all:PeFh4CatchDisposition::unsupported_adjectives;
-                else if(adjectives!=0)candidate.disposition=PeFh4CatchDisposition::unsupported_adjectives;
+                const auto special_adjectives=adjectives & ~eh_adjective_type_qualifiers;
+                if (special_adjectives & (eh_adjective_badalloc_compat | eh_adjective_complus))
+                    candidate.disposition=PeFh4CatchDisposition::unsupported_adjectives;
+                else if (special_adjectives & ~eh_adjective_std_dotdot)
+                    candidate.disposition=PeFh4CatchDisposition::unsupported_adjectives;
+                else if (catch_all && candidate.std_dotdot && effective_kind == PeFh4ExceptionKind::cxx)
+                    candidate.disposition=PeFh4CatchDisposition::catch_all;
+                else if (catch_all && candidate.std_dotdot && effective_kind == PeFh4ExceptionKind::non_cxx)
+                    candidate.disposition=PeFh4CatchDisposition::different_type;
+                else if (catch_all && candidate.std_dotdot)
+                    candidate.disposition=PeFh4CatchDisposition::type_unknown;
+                else if (catch_all && adjectives == 0)
+                    candidate.disposition=PeFh4CatchDisposition::catch_all;
+                else if (catch_all)
+                    candidate.disposition=PeFh4CatchDisposition::unsupported_adjectives;
+                else if(candidate.std_dotdot)candidate.disposition=PeFh4CatchDisposition::unsupported_adjectives;
                 else if(!exception_decorated_type)candidate.disposition=PeFh4CatchDisposition::type_unknown;
                 else if(handler.decorated_type_name&&*handler.decorated_type_name==*exception_decorated_type)
                     candidate.disposition=PeFh4CatchDisposition::exact_type;
