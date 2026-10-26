@@ -23,6 +23,7 @@ families:
 | AVX2 dword multiply and multiply-add | VEX.128/.256 `vpmulld`, `vpmuldq`, `vpmuludq`, `vpmaddwd`, `vpmaddubsw` |
 | AVX2 horizontal integer arithmetic | VEX.128/.256 `vphaddw/d/sw`, `vphsubw/d/sw` |
 | AVX2 lane routing and narrowing | VEX.128/.256 `vpunpcklbw/lwd/ldq/lqdq`, `vpunpckhbw/hwd/hdq/hqdq`, `vpacksswb/ssdw/uswb/usdw`, `vpshufb` |
+| AVX-512 packed compare to mask | EVEX.128/.256/.512 `vpcmpb/w/d/q` and `vpcmpub/uw/ud/uq`, with immediate predicates 0-7 |
 
 The intended typed model uses 128-bit XMM register operands, 128-bit packed
 memory operands, and 32-/64-bit scalar memory operands. Read/write access on
@@ -231,6 +232,28 @@ EVEX integer operations. Their typed intrinsic shapes preserve 32- or 64-bit
 unsigned lanes, and the pure evaluator applies the bitwise operation over the
 active vector bytes. Reserved pp values and unsupported maps remain rejected;
 the existing VEX `vpand`, `vpor`, and `vpxor` opcode identities are unchanged.
+
+EVEX map `0F3A`, `pp=66` packed integer compare forms decode to a K0-K7
+destination and full-width XMM/YMM/ZMM or memory sources. Opcodes `3F/3E`
+select signed/unsigned byte lanes with W=0 and word lanes with W=1;
+`1F/1E` select signed/unsigned dword lanes with W=0 and qword lanes with W=1.
+The 8-bit immediate selects EQ, LT, LE, FALSE, NE, NLT, NLE, or TRUE using
+values 0-7. Its upper five bits are reserved. Source lanes use signed or
+unsigned ordering according to the mnemonic. A memory source has the full
+16/32/64-byte vector width, including compressed disp8 scaling. Register
+sources retain the EVEX extension bits; the K destination rejects ModRM.reg
+extension because only K0-K7 exist.
+
+EVEX.aaa=0 compares all active lanes and does not read K0. A nonzero aaa
+reads its K register and clears output bits for masked-off lanes. K0 is valid
+as the destination, including when another K register supplies the mask.
+Every output bit beyond the active lane count is zero. The decoder rejects
+EVEX.z for this family; it does not add an old-K destination dependency.
+`evaluate_x86_evex_mask_compare` returns the exact 64-bit output mask and
+active bit count from caller-supplied source bytes and runtime opmask. The
+decompiler records a typed lane comparison, optional mask AND, and active-bit
+AND as the explicit K output formula. Broadcast and embedded-rounding EVEX.b
+forms remain outside this subset.
 
 The decompiler has a separate EVEX integer route rather than extending VEX
 comparison or shuffle rules to unrelated encodings. Each intrinsic retains the

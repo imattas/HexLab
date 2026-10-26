@@ -680,6 +680,14 @@ std::string operation_name(Opcode opcode) {
     case Opcode::vpackusdw: return "vpackusdw";
     case Opcode::vpshufb: return "vpshufb";
     case Opcode::vpsadbw: return "vpsadbw";
+    case Opcode::vpcmpb: return "vpcmpb";
+    case Opcode::vpcmpw: return "vpcmpw";
+    case Opcode::vpcmpd: return "vpcmpd";
+    case Opcode::vpcmpq: return "vpcmpq";
+    case Opcode::vpcmpub: return "vpcmpub";
+    case Opcode::vpcmpuw: return "vpcmpuw";
+    case Opcode::vpcmpud: return "vpcmpud";
+    case Opcode::vpcmpuq: return "vpcmpuq";
     case Opcode::movdqa: return "movdqa";
     case Opcode::movdqu: return "movdqu";
     case Opcode::movss: return "movss";
@@ -2903,6 +2911,60 @@ a64_unhandled:
                 std::move(inputs), memory ? IntrinsicMemoryEffect::unknown : IntrinsicMemoryEffect::none};
             effect.register_writes = instruction.register_writes;
             if (destination) effect.result_type = integer_type(width);
+            return effect;
+        }
+    }
+    if (const auto shape = x86_avx_detail::evex_compare_shape(instruction.opcode);
+        x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
+        (instruction.vector_bits == 128 || instruction.vector_bits == 256 || instruction.vector_bits == 512) &&
+        shape && instruction.operands.size() == 4 && !instruction.x86_opmask_zeroing &&
+        (!instruction.vector_element_bits || instruction.vector_element_bits == shape->lane_bits) &&
+        (!instruction.x86_opmask || (*instruction.x86_opmask > 0 && *instruction.x86_opmask < 8))) {
+        const auto width = static_cast<unsigned>(instruction.vector_bits);
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
+        const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+        if (destination && destination->bank == RegisterBank::opmask && destination->index < 8 &&
+            destination->width == 64 && !destination->high_byte &&
+            x86_avx_detail::is_evex_vector(instruction.operands[1], width) &&
+            (x86_avx_detail::is_evex_vector(instruction.operands[2], width) ||
+             (memory && memory->data_width == width)) && predicate &&
+            predicate->encoded_width == 8 && predicate->effective_width == 8 && !predicate->is_signed &&
+            predicate->value < 8) {
+            const auto lane_type = vector_type(width, TypeKind::integer, shape->lane_bits,
+                                               static_cast<std::uint8_t>(width / shape->lane_bits), shape->is_signed);
+            std::vector<ExpressionPtr> inputs{
+                retag_expr(operands[1], lane_type), retag_expr(operands[2], lane_type),
+                retag_expr(operands[3], integer_type(8))};
+            if (instruction.x86_opmask)
+                inputs.push_back(reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false}));
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_" +
+                (shape->is_signed ? "i" : "u") + std::to_string(shape->lane_bits) + "x" +
+                std::to_string(width / shape->lane_bits) + "_predicate" +
+                std::to_string(predicate->value) + "_to_k" +
+                std::to_string(destination->index) + (instruction.x86_opmask ? "_masked_zero" : "_unmasked"),
+                std::move(inputs), memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = integer_type(64);
+            // The predicate operation produces one low K bit per input lane.
+            // EVEX.aaa clears disabled bits, and the architectural K result
+            // clears every bit above the active element count.
+            const auto lanes = width / shape->lane_bits;
+            const auto active_mask = lanes == 64 ? UINT64_MAX : (UINT64_C(1) << lanes) - 1;
+            ExpressionPtr output;
+            if (predicate->value == 3) output = constant_expr(0, 64);
+            else if (predicate->value == 7) output = constant_expr(active_mask, 64);
+            else output = std::make_shared<Expression>(Expression{integer_type(64), BinaryValue{
+                "vpcmp_" + std::string(shape->is_signed ? "signed_" : "unsigned_") +
+                std::to_string(shape->lane_bits) + "_predicate" + std::to_string(predicate->value),
+                retag_expr(operands[1], lane_type), retag_expr(operands[2], lane_type)}});
+            if (instruction.x86_opmask)
+                output = std::make_shared<Expression>(Expression{integer_type(64), BinaryValue{
+                    "and", std::move(output), reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false})}});
+            if (lanes < 64)
+                output = std::make_shared<Expression>(Expression{integer_type(64), BinaryValue{
+                    "and", std::move(output), constant_expr(active_mask, 64)}});
+            effect.register_output_values = {std::move(output)};
             return effect;
         }
     }

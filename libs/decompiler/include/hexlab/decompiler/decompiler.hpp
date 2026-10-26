@@ -213,6 +213,15 @@ struct LiftedBlock {
         std::vector<Address> protected_throw_sites;
     };
     std::vector<ExceptionHandlerDispatch> exception_handlers;
+    enum class ExceptionMemoryTiming { before_instruction, opaque_effect };
+    struct ExceptionMemoryEdge {
+        Address source;
+        Address target;
+        ExceptionMemoryTiming timing;
+    };
+    // The handler's memory input is selected at the throwing bytecode, not
+    // from the block's normal exit. Opaque effects must define unknown memory.
+    std::vector<ExceptionMemoryEdge> exception_memory_edges;
     struct PhiInput { BlockId predecessor; std::uint32_t version = 0; };
     struct Phi { RegisterOperand destination; std::uint32_t version = 0; std::vector<PhiInput> inputs; };
     std::vector<Phi> phis;

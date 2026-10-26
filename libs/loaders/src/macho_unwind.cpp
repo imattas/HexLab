@@ -803,7 +803,7 @@ Result<MachOUnwindResult> evaluate_arm64(const MachOCompactUnwindFunction &fn,
     const auto encoding = fn.encoding;
     const auto mode = encoding & mode_mask;
     if (mode == 0x03000000u)
-        return failure(ErrorCode::unsupported, "Mach-O arm64 DWARF FDE evaluation is not implemented");
+        return failure(ErrorCode::unsupported, "Mach-O arm64 DWARF mode requires its linked eh_frame FDE");
     const bool pauth_frame = mode == 0x05000000u;
     if (mode != 0x02000000u && mode != 0x04000000u && !pauth_frame)
         return failure(ErrorCode::unsupported, "Mach-O arm64 compact-unwind mode is unsupported");
@@ -908,6 +908,77 @@ Result<MachOUnwindResult> evaluate_arm64(const MachOCompactUnwindFunction &fn,
     }
     return result;
 }
+
+Result<const MachOEhFrameFunction *> arm64_compact_dwarf_fde(
+    const MachOMetadata &metadata, const MachOCompactUnwindFunction &compact, Address pc,
+    std::optional<std::uint64_t> compact_end) {
+    // The low 24 bits are an offset from the start of __TEXT,__eh_frame to
+    // the FDE record, not an offset into __unwind_info or a function address.
+    if (metadata.eh_frame_functions.empty())
+        return failure(ErrorCode::unsupported, "Mach-O arm64 DWARF FDE is not decoded at the compact offset");
+    const MachOSection *compact_section = nullptr, *eh_section = nullptr;
+    for (const auto &section : metadata.sections) {
+        if (section.ordinal == compact.section) {
+            if (compact_section)
+                return failure(ErrorCode::malformed, "Mach-O DWARF compact section identity is ambiguous");
+            compact_section = &section;
+        }
+        if (section.name == "__eh_frame" && section.segment_name == "__TEXT") {
+            if (eh_section)
+                return failure(ErrorCode::malformed, "Mach-O DWARF compact entry has multiple eh_frame sections");
+            eh_section = &section;
+        }
+    }
+    const auto &slice = metadata.container.slices[metadata.selected_slice];
+    if (slice.size > UINT64_MAX - slice.offset)
+        return failure(ErrorCode::overflow, "Mach-O selected slice file extent overflows");
+    const auto source_contains = [&](const MachOSection &section, std::uint64_t at, std::uint64_t size) {
+        if (!section.file_offset || section.file_offset->value < slice.offset)
+            return false;
+        const auto slice_offset = section.file_offset->value - slice.offset;
+        if (slice_offset > slice.size || section.size > slice.size - slice_offset ||
+            at < section.file_offset->value)
+            return false;
+        const auto section_offset = at - section.file_offset->value;
+        return section_offset <= section.size && size <= section.size - section_offset;
+    };
+    if (!compact_section || compact_section->name != "__unwind_info" ||
+        compact_section->segment_name != "__TEXT" ||
+        !source_contains(*compact_section, compact.record_file_offset, 4))
+        return failure(ErrorCode::malformed, "Mach-O DWARF compact entry has invalid file provenance");
+    if (!eh_section || !eh_section->file_offset)
+        return failure(ErrorCode::unsupported, "Mach-O DWARF compact entry has no initialized eh_frame section");
+    const auto encoded_offset = std::uint64_t(compact.encoding & 0x00ffffffu);
+    std::uint64_t record_file_offset = 0;
+    if (!add(eh_section->file_offset->value, encoded_offset, record_file_offset) ||
+        !source_contains(*eh_section, record_file_offset, 8))
+        return failure(ErrorCode::malformed, "Mach-O DWARF compact FDE offset exceeds its eh_frame section");
+    const MachOEhFrameFunction *linked = nullptr;
+    for (const auto &fde : metadata.eh_frame_functions) {
+        if (fde.section != eh_section->ordinal || fde.record_file_offset != record_file_offset) continue;
+        if (linked)
+            return failure(ErrorCode::malformed, "Mach-O DWARF compact entry names multiple FDE records");
+        linked = &fde;
+    }
+    if (!linked)
+        return failure(ErrorCode::unsupported, "Mach-O DWARF compact entry has no decoded FDE at its encoded offset");
+    // Compact unwind can describe several ranges within one function. The
+    // linked FDE may start earlier, but it must contain this range's start.
+    if (!compact.address || !linked->address || compact.address->space != linked->address->space ||
+        compact.address->offset < linked->address->offset ||
+        compact.address->offset - linked->address->offset >= linked->size)
+        return failure(ErrorCode::malformed, "Mach-O DWARF compact range starts outside its FDE");
+    std::uint64_t fde_end = 0;
+    if (!add(linked->address->offset, linked->size, fde_end))
+        return failure(ErrorCode::overflow, "Mach-O DWARF compact entry's FDE range overflows");
+    // The next compact record bounds this range even if the FDE covers more
+    // of the function. For a terminal entry, the exact FDE's declared size is
+    // the available bound; no synthetic compact-index sentinel is inferred.
+    const auto range_end = compact_end ? std::min(*compact_end, fde_end) : fde_end;
+    if (pc.space != linked->address->space || pc.offset < compact.address->offset || pc.offset >= range_end)
+        return failure(ErrorCode::out_of_bounds, "PC is outside the Mach-O DWARF compact range");
+    return linked;
+}
 } // namespace
 
 Result<MachOUnwindResult> evaluate_macho_unwind(const MachOMetadata &metadata, Address pc,
@@ -916,6 +987,42 @@ Result<MachOUnwindResult> evaluate_macho_unwind(const MachOMetadata &metadata, A
     if (metadata.selected_slice >= metadata.container.slices.size())
         return failure(ErrorCode::malformed, "Mach-O selected slice is invalid");
     const auto cpu = metadata.container.slices[metadata.selected_slice].header.cpu_type;
+    const MachOCompactUnwindFunction *found = nullptr;
+    bool duplicate_compact_entry = false;
+    for (const auto &fn : metadata.compact_unwind_functions) {
+        if (!fn.address || fn.address->space != pc.space) continue;
+        if (fn.address->offset <= pc.offset && (!found || fn.address->offset > found->address->offset)) {
+            found = &fn;
+            duplicate_compact_entry = false;
+        } else if (found && fn.address->offset == found->address->offset)
+            duplicate_compact_entry = true;
+    }
+    const bool arm64_dwarf = found && cpu == arm64_cpu &&
+        (found->encoding & mode_mask) == 0x03000000u;
+    const MachOCompactUnwindFunction *next = nullptr;
+    bool duplicate_compact_boundary = false;
+    if (found) for (const auto &fn : metadata.compact_unwind_functions) {
+        if (!fn.address || fn.section != found->section || fn.address->space != pc.space ||
+            fn.address->offset <= found->address->offset) continue;
+        if (!next || fn.address->offset < next->address->offset) {
+            next = &fn;
+            duplicate_compact_boundary = false;
+        } else if (fn.address->offset == next->address->offset)
+            duplicate_compact_boundary = true;
+    }
+    if (arm64_dwarf) {
+        if (duplicate_compact_entry)
+            return failure(ErrorCode::malformed, "Mach-O compact-unwind metadata has duplicate function entries");
+        if (duplicate_compact_boundary)
+            return failure(ErrorCode::malformed, "Mach-O compact-unwind metadata has duplicate function boundaries");
+        const auto compact_end = next ? std::optional<std::uint64_t>{next->address->offset} : std::nullopt;
+        auto linked = arm64_compact_dwarf_fde(metadata, *found, pc, compact_end);
+        if (!linked) return linked.error();
+        auto recovered = evaluate_eh_frame(*linked.value(), cpu, pc, context, read);
+        if (!recovered) return recovered.error();
+        recovered.value().encoding = found->encoding;
+        return recovered;
+    }
     const MachOEhFrameFunction *fde_match = nullptr;
     for (const auto &fde : metadata.eh_frame_functions) {
         if (!fde.address || fde.address->space != pc.space || pc.offset < fde.address->offset ||
@@ -924,23 +1031,11 @@ Result<MachOUnwindResult> evaluate_macho_unwind(const MachOMetadata &metadata, A
         fde_match = &fde;
     }
     if (fde_match) return evaluate_eh_frame(*fde_match, cpu, pc, context, read);
-    const MachOCompactUnwindFunction *found = nullptr;
-    for (const auto &fn : metadata.compact_unwind_functions) {
-        if (!fn.address || fn.address->space != pc.space) continue;
-        if (fn.address->offset <= pc.offset && (!found || fn.address->offset > found->address->offset))
-            found = &fn;
-        else if (found && fn.section == found->section && fn.address->offset == found->address->offset)
-            return failure(ErrorCode::malformed, "Mach-O compact-unwind metadata has duplicate function entries");
-    }
     if (!found) return failure(ErrorCode::out_of_bounds, "No Mach-O compact-unwind entry precedes PC");
-    const MachOCompactUnwindFunction *next = nullptr;
-    for (const auto &fn : metadata.compact_unwind_functions) {
-        if (!fn.address || fn.section != found->section || fn.address->space != pc.space ||
-            fn.address->offset <= found->address->offset) continue;
-        if (!next || fn.address->offset < next->address->offset) next = &fn;
-        else if (fn.address->offset == next->address->offset)
-            return failure(ErrorCode::malformed, "Mach-O compact-unwind metadata has duplicate function boundaries");
-    }
+    if (duplicate_compact_entry)
+        return failure(ErrorCode::malformed, "Mach-O compact-unwind metadata has duplicate function entries");
+    if (duplicate_compact_boundary)
+        return failure(ErrorCode::malformed, "Mach-O compact-unwind metadata has duplicate function boundaries");
     if (!next || pc.offset >= next->address->offset)
         return failure(ErrorCode::out_of_bounds, "Mach-O compact-unwind function interval is not proven");
     if (cpu == x86_64_cpu)

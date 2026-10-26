@@ -493,7 +493,7 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
 
 bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsigned vvvv, bool w,
                unsigned vector_bits, unsigned mask, bool zeroing, bool reg_high, bool rm_high, bool broadcast) {
-    if (map != 1 && map != 2)
+    if (map != 1 && map != 2 && map != 3)
         unsupported("EVEX opcode map is outside the enabled AVX-512 subset");
     if (vector_bits != 128 && vector_bits != 256 && vector_bits != 512)
         unsupported("EVEX vector length is outside the modeled 128/256/512-bit forms");
@@ -501,6 +501,55 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
         unsupported("EVEX broadcast and embedded-rounding forms are not covered");
     if (zeroing && mask == 0)
         invalid("EVEX zeroing requires a nonzero opmask register");
+
+    if (map == 3) {
+        if (opcode != 0x1e && opcode != 0x1f && opcode != 0x3e && opcode != 0x3f)
+            return false;
+        if (pp != 1)
+            invalid("EVEX VPCMP requires pp=66");
+        if (zeroing)
+            unsupported("EVEX VPCMP does not model the EVEX.z encoding");
+        auto decoded = modrm(state, static_cast<std::uint16_t>(vector_bits), 64);
+        // ModRM.reg addresses K0-K7; neither R nor R' extends this field.
+        if (reg_high || decoded.reg.index >= 8)
+            invalid("EVEX VPCMP destination must encode K0-K7 without register extension");
+        const auto vector_bank = vector_bits == 128 ? RegisterBank::xmm :
+                                 vector_bits == 256 ? RegisterBank::ymm : RegisterBank::zmm;
+        Operand rm = std::move(decoded.rm);
+        if (auto *reg = std::get_if<RegisterOperand>(&rm)) {
+            reg->bank = vector_bank;
+            reg->width = static_cast<std::uint16_t>(vector_bits);
+            reg->high_byte = false;
+            if (rm_high)
+                reg->index = static_cast<std::uint8_t>(reg->index + 16);
+        } else if (auto *memory = std::get_if<MemoryOperand>(&rm)) {
+            memory->data_width = static_cast<std::uint16_t>(vector_bits);
+            if (memory->displacement_encoding && memory->displacement_encoding->size == 1)
+                memory->displacement *= static_cast<std::int64_t>(vector_bits / 8);
+        }
+        const auto predicate = state.immediate(8, 8, false);
+        if (predicate.value > 7)
+            invalid("EVEX VPCMP immediate has reserved upper predicate bits");
+        const bool words = (opcode & 0x20) != 0;
+        const bool is_unsigned = (opcode & 1) == 0;
+        state.i.opcode = words ? (w ? (is_unsigned ? Opcode::vpcmpuw : Opcode::vpcmpw)
+                                    : (is_unsigned ? Opcode::vpcmpub : Opcode::vpcmpb))
+                               : (w ? (is_unsigned ? Opcode::vpcmpuq : Opcode::vpcmpq)
+                                    : (is_unsigned ? Opcode::vpcmpud : Opcode::vpcmpd));
+        state.i.x86_evex = true;
+        state.i.vector_bits = static_cast<std::uint16_t>(vector_bits);
+        state.i.vector_element_bits = words ? (w ? 16 : 8) : (w ? 64 : 32);
+        if (mask) {
+            state.i.x86_opmask = static_cast<std::uint8_t>(mask);
+            state.i.register_reads.push_back({RegisterBank::opmask, static_cast<std::uint8_t>(mask), 64, false});
+        }
+        state.operand(RegisterOperand{RegisterBank::opmask, decoded.reg.index, 64, false}, OperandAccess::write);
+        state.operand(RegisterOperand{vector_bank, static_cast<std::uint8_t>(vvvv),
+                                      static_cast<std::uint16_t>(vector_bits), false}, OperandAccess::read);
+        state.operand(std::move(rm), OperandAccess::read);
+        state.operand(predicate, OperandAccess::read);
+        return true;
+    }
 
     const bool move_load = map == 1 && opcode == 0x10;
     const bool move_store = map == 1 && opcode == 0x11;

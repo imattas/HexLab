@@ -2,8 +2,10 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -266,13 +268,23 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         return !code || physical_slots <= code->max_stack;
     };
     std::array<std::uint32_t, 256> versions{};
-    struct Transfer { LiftedBlock block; std::vector<ExpressionPtr> stack; };
+    struct ExceptionalReference {
+        std::size_t target;
+        std::shared_ptr<std::array<Reference, 256>> locals;
+    };
+    struct Transfer {
+        LiftedBlock block;
+        std::vector<ExpressionPtr> stack;
+        std::vector<ExceptionalReference> exceptional_references;
+    };
     // Shape inference and final emission deliberately share the same opcode
     // transfer, so stack manipulation and descriptor effects cannot diverge.
     const auto transfer = [&](std::size_t block_index, std::vector<ExpressionPtr> stack, bool shapes_only,
                               ReferenceState *references = nullptr) -> Result<Transfer> {
         const auto &src = *sources[block_index];
         LiftedBlock dst{src.id, src.begin, {}, src.successors};
+        std::vector<ExceptionalReference> exceptional_references;
+        std::shared_ptr<std::array<Reference, 256>> exceptional_locals;
         // Owning keys prevent allocator address reuse from attributing a popped
         // value's identity to an unrelated expression created later.
         std::map<ExpressionPtr, Reference, std::owner_less<ExpressionPtr>> identities;
@@ -298,10 +310,11 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                     const auto start = code->begin.offset + handler.start_pc;
                     const auto end = code->begin.offset + handler.end_pc;
                     const auto target_address = Address{source.space, code->begin.offset + handler.handler_pc};
-                    if (source.offset < start || source.offset >= end ||
-                        std::none_of(src.successors.begin(), src.successors.end(), [&](const auto &edge) {
-                            return edge.kind == BlockEdgeKind::exception && edge.target == target_address;
-                        })) continue;
+                    if (source.offset < start || source.offset >= end) continue;
+                    if (std::none_of(src.successors.begin(), src.successors.end(), [&](const auto &edge) {
+                            return edge.kind == BlockEdgeKind::exception && edge.source == source &&
+                                   edge.target == target_address;
+                        })) return no("protected throwing instruction is missing a handler edge");
                     std::optional<std::string> catch_type;
                     if (handler.catch_type) {
                         if (handler.catch_type >= metadata->constant_pool.size() ||
@@ -330,10 +343,52 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 }
             }
         }
+        for (const auto &edge : src.successors) if (edge.kind == BlockEdgeKind::exception) {
+            if (!code || !edge.target) return no("exception edge has no method Code or target");
+            const auto site = std::find_if(src.instructions.begin(), src.instructions.end(), [&](const auto &fact) {
+                return fact->instruction.address == edge.source;
+            });
+            if (site == src.instructions.end() || (*site)->instruction.bytes.empty())
+                return no("exception edge has no throwing instruction");
+            const auto opcode = std::to_integer<std::uint8_t>((*site)->instruction.bytes.front());
+            if (!jvm_may_throw(opcode) || std::next(site) != src.instructions.end())
+                return no("exception edge does not end at a modeled throwing instruction");
+            if (std::none_of(code->exception_table.begin(), code->exception_table.end(), [&](const auto &handler) {
+                return edge.source.offset >= code->begin.offset + handler.start_pc &&
+                       edge.source.offset < code->begin.offset + handler.end_pc &&
+                       *edge.target == Address{code->begin.space, code->begin.offset + handler.handler_pc};
+            })) return no("exception edge is absent from method exception table");
+            auto timing = LiftedBlock::ExceptionMemoryTiming::opaque_effect;
+            if ((opcode >= 0x2e && opcode <= 0x35) || (opcode >= 0x4f && opcode <= 0x56) ||
+                opcode == 0xbe || opcode == 0xbf)
+                timing = LiftedBlock::ExceptionMemoryTiming::before_instruction;
+            if (opcode >= 0x12 && opcode <= 0x14) {
+                const auto index = imm((*site)->instruction);
+                if (!index || !metadata || *index >= metadata->constant_pool.size())
+                    return no("throwing ldc has no valid constant-pool entry");
+                const auto tag = metadata->constant_pool[*index].tag;
+                if (tag == 3 || tag == 4 || tag == 5 || tag == 6)
+                    timing = LiftedBlock::ExceptionMemoryTiming::before_instruction;
+            }
+            if (std::none_of(dst.exception_memory_edges.begin(), dst.exception_memory_edges.end(),
+                    [&](const auto &candidate) { return candidate.target == *edge.target; }))
+                dst.exception_memory_edges.push_back({edge.source, *edge.target, timing});
+        }
         auto pop=[&](ValueType want)->Result<ExpressionPtr>{if(stack.empty())return no("operand stack underflow");auto v=stack.back();stack.pop_back();if(v->type!=want)return no("operand stack type mismatch");return v;};
         auto pop_any=[&]()->Result<ExpressionPtr>{if(stack.empty())return no("operand stack underflow in stack manipulation");auto v=stack.back();stack.pop_back();return v;};
         auto emit=[&](const InstructionFact &f,Statement s){dst.instructions.push_back({{f.instruction.address,f.id},std::move(s)});};
         for(std::size_t ix=0;ix<src.instructions.size();++ix){if(!valid_stack(stack))return no("operand stack exceeds max_stack or the 256 logical-slot IR limit");const auto &fact=src.instructions[ix];if(!fact)return Error{ErrorCode::invalid_argument,"JVM basic block contains a null instruction"};const auto &i=fact->instruction;if(i.context.architecture!=Architecture::jvm||i.bytes.empty())return no("non-JVM instruction in function");const auto op=std::to_integer<std::uint8_t>(i.bytes[0]);
+            if (references) for (const auto &edge : src.successors)
+                if (edge.kind == BlockEdgeKind::exception && edge.source == i.address && edge.target) {
+                    const auto target = address_positions.find({edge.target->space.value, edge.target->offset});
+                    if (target == address_positions.end()) return no("exception reference target is unresolved");
+                    if (std::none_of(exceptional_references.begin(), exceptional_references.end(),
+                            [&](const auto &snapshot) { return snapshot.target == target->second; })) {
+                        if (!exceptional_locals)
+                            exceptional_locals = std::make_shared<std::array<Reference, 256>>(references->locals);
+                        exceptional_references.push_back({target->second, exceptional_locals});
+                    }
+                }
             if ((target(i) || (op >= 0xac && op <= 0xb1) || op == 0xbf) && ix+1 != src.instructions.size())
                 return no("control transfer is not at basic-block end");
             if (target(i) && i.direct_target && std::none_of(src.successors.begin(), src.successors.end(), [&](const auto &edge) {
@@ -521,14 +576,16 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             if(op==0xa7||op==0xc8){if(!i.direct_target)return no("goto target unavailable");emit(*fact,Branch{"true",i.direct_target,{}});continue;}
             if(op>=0xac&&op<=0xb0){const auto type=op==0xac?int32():op==0xad?int64():op==0xae?fp32():op==0xaf?fp64():ref32();auto v=pop(type);if(!v)return v.error();if(!stack.empty())return no("return leaves extra operand-stack values");emit(*fact,Return{v.value()});continue;}
             if(op==0xb1){if(!stack.empty())return no("void return leaves operand-stack values");emit(*fact,Return{});continue;}
-            if(op==0xbf){auto exception=pop(ref32());if(!exception)return exception.error();if(!stack.empty())return no("athrow leaves extra operand-stack values");Intrinsic effect;effect.name="jvm_athrow";effect.operands.push_back(exception.value());effect.memory_effect=IntrinsicMemoryEffect::unknown;emit(*fact,std::move(effect));continue;}
+            if(op==0xbf){auto exception=pop(ref32());if(!exception)return exception.error();if(!stack.empty())return no("athrow leaves extra operand-stack values");Intrinsic effect;effect.name="jvm_athrow";effect.operands.push_back(exception.value());effect.memory_effect=IntrinsicMemoryEffect::none;emit(*fact,std::move(effect));continue;}
             if(op>=0xb2&&op<=0xb5){
                 if(!metadata)return no("field access requires JVM constant-pool metadata");
                 auto index=imm(i);if(!index)return no("field constant-pool index unavailable");
                 auto member=cp_member(*metadata,*index,false);if(!member)return member.error();
                 std::size_t position=0;auto type=descriptor_type(member.value().descriptor,position);
                 if(!type||position!=member.value().descriptor.size())return no("field descriptor is malformed");
-                Intrinsic effect;effect.memory_effect=(op==0xb3||op==0xb5)?IntrinsicMemoryEffect::write:IntrinsicMemoryEffect::read;
+                // Resolution and static initialization can execute opaque code
+                // before a field instruction throws. Preserve that uncertainty.
+                Intrinsic effect;effect.memory_effect=IntrinsicMemoryEffect::unknown;
                 const auto symbol=member.value().owner+"."+member.value().name;
                 if(op==0xb2){effect.name="jvm_getstatic "+symbol;effect.result_type=type.value();const auto result_name=effect.name;emit(*fact,std::move(effect));stack.push_back(evidence(unknown(result_name,type.value()),reference_descriptor(member.value().descriptor)));continue;}
                 if(op==0xb3){auto value=pop(type.value());if(!value)return value.error();effect.name="jvm_putstatic "+symbol;effect.operands.push_back(value.value());emit(*fact,std::move(effect));continue;}
@@ -560,6 +617,11 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                         (member.value().owner == metadata->class_name ||
                          (!metadata->super_name.empty() && member.value().owner == metadata->super_name));
                     const auto initialized_this = constructor_chain ? reference_class(metadata->class_name) : Reference{};
+                    if (receiver && (receiver->kind == JvmVerificationKind::uninitialized ||
+                                     receiver->kind == JvmVerificationKind::uninitialized_this))
+                        if (exceptional_locals)
+                            for (auto &value : *exceptional_locals)
+                                if (value == receiver) value.reset();
                     const auto initialize_alias = [&](Reference &value) {
                         if (!value || (value->kind != JvmVerificationKind::uninitialized &&
                                        value->kind != JvmVerificationKind::uninitialized_this)) return;
@@ -648,7 +710,7 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             references->stack.clear();
             for (const auto &value : stack) references->stack.push_back(identity(value));
         }
-        return Transfer{std::move(dst), std::move(stack)};
+        return Transfer{std::move(dst), std::move(stack), std::move(exceptional_references)};
     };
     using Shape = std::vector<ValueType>;
     std::vector<std::optional<Shape>> entries(count), exits(count);
@@ -826,19 +888,35 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
     }
     reference_entries[*entry] = initial;
     work.push_back(*entry);
+    std::vector<Reference> handler_stack_references(count);
     for (std::size_t bi = 0; bi < count; ++bi) if (handler_entries[bi]) {
         // The handler stack value has the catch type only when every ordered
         // table clause reaching this target agrees exactly. A mixed-type
         // handler needs hierarchy-aware common-supertype computation.
-        ReferenceState handler;
         const auto evidence = handler_catch_evidence.find({sources[bi]->begin.space.value,
                                                            sources[bi]->begin.offset});
         if (evidence != handler_catch_evidence.end() && evidence->second.consistent)
-            handler.stack.push_back(evidence->second.type);
-        else handler.stack.emplace_back();
-        reference_entries[bi] = std::move(handler);
-        work.push_back(bi);
+            handler_stack_references[bi] = evidence->second.type;
     }
+    const auto merge_reference_entry = [&](std::size_t target, const ReferenceState &incoming) -> Result<bool> {
+        if (!reference_entries[target]) {
+            reference_entries[target] = incoming;
+            work.push_back(target);
+            return true;
+        }
+        auto merged = *reference_entries[target];
+        if (merged.stack.size() != incoming.stack.size())
+            return no("reference evidence disagrees with stack shape");
+        for (std::size_t slot = 0; slot < merged.locals.size(); ++slot)
+            if (merged.locals[slot] != incoming.locals[slot]) merged.locals[slot].reset();
+        for (std::size_t slot = 0; slot < merged.stack.size(); ++slot)
+            if (merged.stack[slot] != incoming.stack[slot]) merged.stack[slot].reset();
+        if (merged == *reference_entries[target]) return false;
+        reference_entries[target] = std::move(merged);
+        work.push_back(target);
+        return true;
+    };
+    while (true) {
     while (!work.empty()) {
         const auto bi = work.front(); work.pop_front();
         auto state = *reference_entries[bi];
@@ -864,25 +942,30 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         for (const auto type : *entries[bi]) input.push_back(unknown("reference_shape", type));
         const auto lifted = transfer(bi, std::move(input), true, &state);
         if (!lifted) return lifted.error();
+        for (const auto &snapshot : lifted.value().exceptional_references) {
+            if (!handler_entries[snapshot.target]) return no("exception evidence targets a non-handler block");
+            ReferenceState incoming;
+            incoming.locals = *snapshot.locals;
+            incoming.stack.push_back(handler_stack_references[snapshot.target]);
+            auto merged = merge_reference_entry(snapshot.target, incoming);
+            if (!merged) return merged.error();
+        }
         if (reference_exits[bi] && *reference_exits[bi] == state) continue;
         reference_exits[bi] = state;
         for (const auto target : successors[bi]) {
-            if (!reference_entries[target]) {
-                reference_entries[target] = state;
-                work.push_back(target);
-                continue;
-            }
-            auto merged = *reference_entries[target];
-            if (merged.stack.size() != state.stack.size()) return no("reference evidence disagrees with stack shape");
-            for (std::size_t slot = 0; slot < merged.locals.size(); ++slot)
-                if (merged.locals[slot] != state.locals[slot]) merged.locals[slot].reset();
-            for (std::size_t slot = 0; slot < merged.stack.size(); ++slot)
-                if (merged.stack[slot] != state.stack[slot]) merged.stack[slot].reset();
-            if (merged != *reference_entries[target]) {
-                reference_entries[target] = std::move(merged);
-                work.push_back(target);
-            }
+            auto merged = merge_reference_entry(target, state);
+            if (!merged) return merged.error();
         }
+    }
+    // Shape inference visits even handlers in disconnected components. Keep
+    // those analyzable with unknown locals, without diluting reachable sites.
+    std::size_t bi = 0;
+    while (bi < count && (!handler_entries[bi] || reference_entries[bi])) ++bi;
+    if (bi == count) break;
+    ReferenceState unknown_handler;
+    unknown_handler.stack.push_back(handler_stack_references[bi]);
+    reference_entries[bi] = std::move(unknown_handler);
+    work.push_back(bi);
     }
     std::vector<bool> needs_frame(count, false);
     for (std::size_t bi = 0; bi < count; ++bi) needs_frame[bi] = predecessors[bi].size() > 1;

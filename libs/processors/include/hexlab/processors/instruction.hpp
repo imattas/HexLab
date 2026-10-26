@@ -388,7 +388,10 @@ enum class Opcode {
     rv_vwmaccu_vv, rv_vwmaccu_vx, rv_vwmacc_vv, rv_vwmacc_vx,
     rv_vwmaccsu_vv, rv_vwmaccsu_vx, rv_vwmaccus_vx,
     // AArch64 conditional compares; append to preserve serialized opcode IDs.
-    a64_ccmp, a64_ccmn
+    a64_ccmp, a64_ccmn,
+    // EVEX packed integer compare to opmask; append to retain serialized IDs.
+    vpcmpb, vpcmpw, vpcmpd, vpcmpq,
+    vpcmpub, vpcmpuw, vpcmpud, vpcmpuq
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
