@@ -160,8 +160,24 @@ then proves the in-range upper-guard edge reaches the normalization and
 dispatch without selector writes, alternate entries, bypasses, or cycles.
 Negative bounds, different branch conditions/defaults, non-in-place or
 different-constant normalization, alias/cross-width forms other than this
-32-to-64 zero-extension, and non-x86 signed ranges remain unproven. Failed
-proofs retain the existing verified-prefix scan.
+32-to-64 zero-extension, and other non-x86 signed ranges remain unproven.
+Failed proofs retain the existing verified-prefix scan.
+
+AArch64 also accepts the exact signed immediate form
+`SUBS XZR, Xn, #low; B.LT default; SUBS XZR, Xn, #high; B.GT default; ...`.
+Both guards must compare the same 32- or 64-bit register, use the same decoded
+default target, and prove `0 <= low <= high` in the signed domain. A zero lower
+bound uses the original selector directly. A nonzero lower bound requires an
+adjacent in-place `SUB Xn, Xn, #low`, and the indexed dispatch must consume that
+same register. Shifted and negative immediates, other branch conditions,
+cross-width aliases, and non-adjacent normalization remain unsupported. The
+existing complete-CFG predecessor and selector-preservation proof is applied
+to the in-range edge through normalization and dispatch; incomplete evidence
+continues to produce only the verified table prefix. This follows the same
+range-driven approach as Ghidra's native jump-table recovery, which models
+bounded value ranges and checks value equivalence while tracing guard inputs,
+but HexLab intentionally accepts only these explicit typed instruction forms
+([Ghidra `jumptable.cc`](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/jumptable.cc)).
 
 `case_count` and `default_target` are optional evidence. For AArch64, the same
 guard proof applies to both recognized table forms. A proven count limits

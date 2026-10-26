@@ -600,17 +600,19 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
             } else if (context.architecture == Architecture::arm64 && context.mode == ExecutionMode::a64 &&
                        compare.opcode == Opcode::a64_subs && compare.operands.size() == 3 &&
                        branch.opcode == Opcode::a64_b_cond &&
-                       (branch.condition == 2 || branch.condition == 8)) {
+                       (branch.condition == 2 || branch.condition == 8 || branch.condition == 12)) {
                 // CMP is SUBS to WZR/XZR. B.HS (CS) proves selector < imm;
-                // B.HI proves selector <= imm. Only the unshifted immediate
-                // representation is accepted below.
+                // B.HI proves selector <= imm; B.GT is the signed upper guard
+                // paired with B.LT below. Immediate representation and width
+                // are checked below.
                 const auto *destination = register_operand(compare, 0);
                 compared_register = register_operand(compare, 1);
                 immediate = std::get_if<ImmediateOperand>(&compare.operands[2]);
                 if (!destination || destination->bank != RegisterBank::arm64_gpr || destination->index != 31 ||
-                    !immediate || immediate->encoded_width != 12)
+                    !immediate || immediate->encoded_width != 12 || immediate->is_signed)
                     continue;
                 exclusive_upper_bound = branch.condition == 8;
+                signed_upper_bound = branch.condition == 12;
             } else if (context.architecture == Architecture::arm && context.mode == ExecutionMode::thumb &&
                        compare.opcode == Opcode::a32_cmp && compare.operands.size() == 2 &&
                        branch.opcode == Opcode::t32_b && (branch.condition == 2 || branch.condition == 8)) {
@@ -722,17 +724,33 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                     continue;
                 const auto &lower_compare = lower_compare_fact->instruction;
                 const auto &lower_branch = lower_branch_fact->instruction;
-                const auto *lower_register = lower_compare.opcode == Opcode::cmp && lower_compare.operands.size() == 2
+                const bool a64_signed_pair = context.architecture == Architecture::arm64 &&
+                    context.mode == ExecutionMode::a64 && lower_compare.opcode == Opcode::a64_subs &&
+                    lower_compare.operands.size() == 3 && lower_branch.opcode == Opcode::a64_b_cond &&
+                    lower_branch.condition == 11;
+                const bool x86_signed_pair = x86_mode(context) && lower_compare.opcode == Opcode::cmp &&
+                    lower_compare.operands.size() == 2 && lower_branch.opcode == Opcode::jcc &&
+                    lower_branch.x86_condition && *lower_branch.x86_condition == X86Condition::less;
+                const auto *lower_register = x86_signed_pair
+                    ? register_operand(lower_compare, 0)
+                    : a64_signed_pair && register_operand(lower_compare, 0) &&
+                          register_operand(lower_compare, 0)->index == 31
+                        ? register_operand(lower_compare, 1) : nullptr;
+                const auto *lower_immediate = x86_signed_pair
+                    ? (lower_compare.operands.size() > 1
+                        ? std::get_if<ImmediateOperand>(&lower_compare.operands[1]) : nullptr)
+                    : a64_signed_pair && lower_compare.operands.size() > 2
+                        ? std::get_if<ImmediateOperand>(&lower_compare.operands[2]) : nullptr;
+                const auto *lower_destination = a64_signed_pair
                     ? register_operand(lower_compare, 0) : nullptr;
-                const auto *lower_immediate = lower_compare.opcode == Opcode::cmp && lower_compare.operands.size() == 2
-                    ? std::get_if<ImmediateOperand>(&lower_compare.operands[1]) : nullptr;
                 const auto lower_compare_end = analysis_detail::continuation_address(lower_compare);
                 const auto lower_branch_end = analysis_detail::continuation_address(lower_branch);
                 if (lower_compare.context != context || lower_branch.context != context ||
                     lower_compare.flow != FlowKind::fallthrough || lower_branch.flow != FlowKind::conditional_branch ||
-                    lower_branch.opcode != Opcode::jcc || !lower_branch.x86_condition ||
-                    *lower_branch.x86_condition != X86Condition::less || !lower_branch.direct_target ||
+                    !(x86_signed_pair || a64_signed_pair) || !lower_branch.direct_target ||
                     *lower_branch.direct_target != *branch.direct_target || !lower_register ||
+                    (a64_signed_pair && (!lower_destination || lower_destination->bank != RegisterBank::arm64_gpr ||
+                                         lower_destination->index != 31 || !lower_immediate || lower_immediate->is_signed)) ||
                     *lower_register != *compared_register ||
                     !lower_immediate || lower_immediate->effective_width != compared_register->width ||
                     lower_immediate->encoded_width == 0 ||
@@ -761,20 +779,34 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                         continue;
                     const auto &normalization = instructions[branch_index + 1]->instruction;
                     const auto normalization_end = analysis_detail::continuation_address(normalization);
+                    const bool a64_normalization = context.architecture == Architecture::arm64 &&
+                        context.mode == ExecutionMode::a64 && normalization.opcode == Opcode::a64_sub &&
+                        normalization.operands.size() == 3;
                     const auto *normalized_register = normalization.opcode == Opcode::sub &&
                         normalization.operands.size() == 2 ? register_operand(normalization, 0) : nullptr;
                     const auto *normalization_immediate = normalization.opcode == Opcode::sub &&
                         normalization.operands.size() == 2
-                            ? std::get_if<ImmediateOperand>(&normalization.operands[1]) : nullptr;
-                    const bool same_index = normalized_register && selector.bank == normalized_register->bank &&
-                        selector.index == normalized_register->index && !selector.high_byte &&
-                        !normalized_register->high_byte &&
-                        (selector.width == normalized_register->width ||
-                         (context.architecture == Architecture::x86_64 && context.mode == ExecutionMode::x86_64 &&
-                          selector.width == 64 && normalized_register->width == 32));
+                            ? std::get_if<ImmediateOperand>(&normalization.operands[1])
+                            : a64_normalization ? std::get_if<ImmediateOperand>(&normalization.operands[2]) : nullptr;
+                    const auto *normalization_source = a64_normalization
+                        ? register_operand(normalization, 1) : normalized_register;
+                    const auto *a64_destination = a64_normalization
+                        ? register_operand(normalization, 0) : nullptr;
+                    const bool destination_is_same = a64_normalization
+                        ? a64_destination && normalization_source && *a64_destination == *normalization_source &&
+                              *normalization_source == *compared_register
+                        : normalized_register && (selector.bank == normalized_register->bank &&
+                              selector.index == normalized_register->index && !selector.high_byte &&
+                              !normalized_register->high_byte &&
+                              (selector.width == normalized_register->width ||
+                               (context.architecture == Architecture::x86_64 &&
+                                context.mode == ExecutionMode::x86_64 && selector.width == 64 &&
+                                normalized_register->width == 32)));
                     if (normalization.address != branch_end.value() || normalization.flow != FlowKind::fallthrough ||
-                        normalization.context != context || !same_index || !normalization_immediate ||
-                        normalization_immediate->effective_width != normalized_register->width ||
+                        normalization.context != context || !destination_is_same || !normalization_immediate ||
+                        (a64_normalization && (normalization_immediate->encoded_width != 12 ||
+                                               normalization_immediate->is_signed)) ||
+                        normalization_immediate->effective_width != normalization_source->width ||
                         normalization_immediate->value != *signed_range_min || !normalization_end)
                         continue;
                     normalized_sequence = normalization.address;

@@ -1115,6 +1115,33 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
                 }
                 return hex_value(value);
             };
+            const auto unique_parent_member = [&](std::uint64_t offset) -> const PePdbTypeField * {
+                const auto parent = std::find_if(pe.pdb_types.begin(), pe.pdb_types.end(),
+                    [&](const auto &candidate) { return candidate.index == local.type_index; });
+                if (parent == pe.pdb_types.end() || !parent->field_layout_complete ||
+                    parent->leaf == 0x1506 || !parent->size || parent->size > 256 ||
+                    !size || parent->size != *size || parent->fields.size() > 4096) return nullptr;
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> extents;
+                const PePdbTypeField *match = nullptr;
+                for (const auto &field : parent->fields) {
+                    if (field.leaf == 0x1400 || field.leaf == 0x1401 || field.leaf == 0x1402)
+                        return nullptr;
+                    if (field.leaf != 0x150d) continue;
+                    const auto field_size = pdb_type_size(pe, field.type, architecture);
+                    if (!field_size || *field_size == 0 || *field_size > 256 ||
+                        field.offset > parent->size || *field_size > parent->size - field.offset)
+                        return nullptr;
+                    const auto end = field.offset + *field_size;
+                    for (const auto &[begin, previous_end] : extents)
+                        if (field.offset < previous_end && begin < end) return nullptr;
+                    extents.emplace_back(field.offset, end);
+                    if (field.offset == offset) {
+                        if (match) return nullptr;
+                        match = &field;
+                    }
+                }
+                return match;
+            };
             if (kind == PePdbLocalLocationKind::frame_relative ||
                 (kind == PePdbLocalLocationKind::register_relative && !active->indirect &&
                  !active->spilled_udt_member && active->offset_in_parent == 0 && active->offset_in_udt == 0)) {
@@ -1146,12 +1173,36 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
             } else if (kind == PePdbLocalLocationKind::register_relative &&
                        (active->indirect || active->spilled_udt_member)) {
                 row.location = "unavailable";
-                if (!size) row.value = "<unknown type size>";
-                else if (active->spilled_udt_member) row.value = "<spilled parent member extent unavailable>";
-                else if (active->offset_in_parent != 0 || active->offset_in_udt != 0)
-                    row.value = "<member fragment size unavailable>";
+                std::size_t fragment_size = size.value_or(0);
+                const bool has_member_offset = active->offset_in_parent != 0 || active->offset_in_udt != 0;
+                if (active->spilled_udt_member) {
+                    const auto *member = active->offset_in_udt < 0
+                        ? nullptr : unique_parent_member(active->offset_in_parent);
+                    if (active->offset_in_udt < 0)
+                        row.value = "<negative spilled-member UDT offset>";
+                    else if (!active->indirect && active->offset_in_udt != 0)
+                        row.value = "<non-indirect spilled-member has an unexpected UDT offset>";
+                    else if (!member) row.value = "<spilled parent member layout unavailable or ambiguous>";
+                    else if (active->indirect && active->offset_in_udt != active->offset_in_parent)
+                        row.value = "<indirect member offsets disagree>";
+                    else if (const auto field_size = pdb_type_size(pe, member->type, architecture)) {
+                        fragment_size = *field_size;
+                    } else row.value = "<spilled member type size unavailable>";
+                } else if (active->indirect && has_member_offset) {
+                    if (active->offset_in_parent == 0 || active->offset_in_udt < 0 ||
+                        static_cast<std::uint64_t>(active->offset_in_udt) != active->offset_in_parent)
+                        row.value = "<indirect member offsets disagree or are invalid>";
+                    else if (const auto *member = unique_parent_member(
+                                 static_cast<std::uint64_t>(active->offset_in_udt))) {
+                        if (const auto field_size = pdb_type_size(pe, member->type, architecture)) {
+                            fragment_size = *field_size;
+                        } else row.value = "<indirect member type size unavailable>";
+                    } else row.value = "<indirect parent member layout unavailable or ambiguous>";
+                } else if (!size) row.value = "<unknown type size>";
                 else if (*size > 256) row.value = "<type extent exceeds preview limit>";
-                else {
+                if (fragment_size == 0 && row.value.empty()) row.value = "<empty member fragment>";
+                else if (fragment_size > 256 && row.value.empty()) row.value = "<type extent exceeds preview limit>";
+                if (row.value.empty()) {
                     const auto number = pdb_register_number(architecture, active->register_id);
                     const auto base = number ? dwarf_reg_value(architecture, *number, registers) : std::nullopt;
                     std::optional<std::uint64_t> slot;
@@ -1176,19 +1227,23 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
                                 const auto index = big ? i : pointer_width - 1 - i;
                                 pointee = (pointee << 8) | std::to_integer<std::uint8_t>((*pointer)[index]);
                             }
-                            if (pointee > UINT64_MAX - *size) row.value = "<address overflow>";
+                            const auto member_displacement = active->offset_in_udt > 0
+                                ? static_cast<std::uint64_t>(active->offset_in_udt) : 0;
+                            if (pointee > UINT64_MAX - member_displacement ||
+                                pointee + member_displacement > UINT64_MAX - fragment_size)
+                                row.value = "<address overflow>";
                             else {
-                                address = pointee;
+                                address = pointee + member_displacement;
                                 row.location = "memory " + hex_value(*address);
-                                row.value = show_memory_value(*address, *size);
+                                row.value = show_memory_value(*address, fragment_size);
                             }
                         }
                     } else {
-                        if (*size > UINT64_MAX - *slot) row.value = "<address overflow>";
+                        if (fragment_size > UINT64_MAX - *slot) row.value = "<address overflow>";
                         else {
                             address = *slot;
                             row.location = "memory " + hex_value(*address);
-                            row.value = show_memory_value(*address, *size);
+                            row.value = show_memory_value(*address, fragment_size);
                         }
                     }
                 }
