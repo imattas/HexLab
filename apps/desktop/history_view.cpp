@@ -13,7 +13,10 @@
 #include <chrono>
 #include <charconv>
 #include <future>
+#include <map>
 #include <span>
+#include <type_traits>
+#include <utility>
 #include <thread>
 
 namespace hexlab::desktop {
@@ -653,9 +656,9 @@ void HistoryView::render_preview() {
         preview_rows_.push_back(std::move(row));
     };
     preview_rows_.clear();
-    preview_rows_.reserve(state.annotations.size() + state.bookmarks.size() + state.types.size() +
+    preview_rows_.reserve(state.annotations.size() + state.bookmarks.size() + state.breakpoints.size() + state.types.size() +
         state.type_assignments.size() + state.decisions.functions.size() + state.decisions.regions.size() +
-        state.decisions.references.size() + state.debug_variables.size() + state.patches.size());
+        state.decisions.references.size() + state.debug_variables.size() + state.patches.size() + 10);
     for (const auto& row : state.annotations)
         add("Annotation", row.location, text(row.name), preview_text(row.comment, 256));
     for (const auto& row : state.bookmarks)
@@ -694,7 +697,7 @@ void HistoryView::render_preview() {
     }
     preview_status_->SetLabel(wxString::Format(
         "Read-only step %llu (cursor %llu of %llu); replayed %llu steps, %llu delta bytes. "
-        "%llu annotations, %llu bookmarks, %llu types, %llu assignments, %llu function records, "
+        "%llu annotations, %llu bookmarks, %llu breakpoints, %llu types, %llu assignments, %llu function records, "
         "%llu regions, %llu references, %llu debug variables, %llu patches.",
         static_cast<unsigned long long>(preview_->target_step),
         static_cast<unsigned long long>(preview_->source_cursor),
@@ -703,6 +706,7 @@ void HistoryView::render_preview() {
         static_cast<unsigned long long>(preview_->delta_bytes),
         static_cast<unsigned long long>(state.annotations.size()),
         static_cast<unsigned long long>(state.bookmarks.size()),
+        static_cast<unsigned long long>(state.breakpoints.size()),
         static_cast<unsigned long long>(state.types.size()),
         static_cast<unsigned long long>(state.type_assignments.size()),
         static_cast<unsigned long long>(state.decisions.functions.size()),
@@ -710,6 +714,103 @@ void HistoryView::render_preview() {
         static_cast<unsigned long long>(state.decisions.references.size()),
         static_cast<unsigned long long>(state.debug_variables.size()),
         static_cast<unsigned long long>(state.patches.size())));
+    if (comparison_base_ && comparison_base_->user) {
+        const auto& before = *comparison_base_->user;
+        struct ChangeCounts { std::size_t added=0, removed=0, changed=0; };
+        auto count_changes = [](const auto& old_rows, const auto& new_rows, auto key) {
+            ChangeCounts counts;
+            using Row = typename std::decay_t<decltype(old_rows)>::value_type;
+            using Key = std::decay_t<decltype(key(std::declval<const Row&>()))>;
+            std::map<Key, const Row*> old_by_key;
+            std::map<Key, const Row*> new_by_key;
+            for (const auto& old_row : old_rows) {
+                old_by_key.emplace(key(old_row), &old_row);
+            }
+            for (const auto& new_row : new_rows) {
+                new_by_key.emplace(key(new_row), &new_row);
+            }
+            for (const auto& [identity, old_row] : old_by_key) {
+                const auto current = new_by_key.find(identity);
+                if (current == new_by_key.end()) ++counts.removed;
+                else if (!(*current->second == *old_row)) ++counts.changed;
+            }
+            for (const auto& [identity, new_row] : new_by_key) {
+                (void)new_row;
+                if (!old_by_key.contains(identity)) ++counts.added;
+            }
+            return counts;
+        };
+        const auto by_id = [](const auto& row) { return row.id; };
+        const auto annotations = count_changes(before.annotations, state.annotations, by_id);
+        const auto bookmarks = count_changes(before.bookmarks, state.bookmarks, by_id);
+        const auto breakpoints = count_changes(before.breakpoints, state.breakpoints, by_id);
+        const auto types = count_changes(before.types, state.types, by_id);
+        const auto assignments = count_changes(before.type_assignments, state.type_assignments, by_id);
+        const auto functions = count_changes(before.decisions.functions, state.decisions.functions, by_id);
+        const auto regions = count_changes(before.decisions.regions, state.decisions.regions, by_id);
+        const auto references = count_changes(before.decisions.references, state.decisions.references, by_id);
+        const auto debug_variables = count_changes(before.debug_variables, state.debug_variables, by_id);
+        struct PatchGroup {
+            std::vector<const PatchSpan*> before;
+            std::vector<const PatchSpan*> after;
+        };
+        std::map<std::uint64_t, PatchGroup> patch_groups;
+        for (const auto& patch : before.patches) patch_groups[patch.begin.value].before.push_back(&patch);
+        for (const auto& patch : state.patches) patch_groups[patch.begin.value].after.push_back(&patch);
+        const auto patch_less = [](const PatchSpan* left, const PatchSpan* right) {
+            if (left->original != right->original)
+                return std::lexicographical_compare(left->original.begin(), left->original.end(),
+                    right->original.begin(), right->original.end());
+            return std::lexicographical_compare(left->replacement.begin(), left->replacement.end(),
+                right->replacement.begin(), right->replacement.end());
+        };
+        ChangeCounts patches;
+        for (auto& [offset, group] : patch_groups) {
+            (void)offset;
+            std::sort(group.before.begin(), group.before.end(), patch_less);
+            std::sort(group.after.begin(), group.after.end(), patch_less);
+            std::size_t old_index = 0, new_index = 0;
+            std::size_t unmatched_old = 0, unmatched_new = 0;
+            while (old_index < group.before.size() && new_index < group.after.size()) {
+                if (*group.before[old_index] == *group.after[new_index]) {
+                    ++old_index;
+                    ++new_index;
+                } else if (patch_less(group.before[old_index], group.after[new_index])) {
+                    ++unmatched_old;
+                    ++old_index;
+                } else {
+                    ++unmatched_new;
+                    ++new_index;
+                }
+            }
+            unmatched_old += group.before.size() - old_index;
+            unmatched_new += group.after.size() - new_index;
+            const auto changed = std::min(unmatched_old, unmatched_new);
+            patches.changed += changed;
+            patches.removed += unmatched_old - changed;
+            patches.added += unmatched_new - changed;
+        }
+        const auto add_summary = [&](const wxString& name, const ChangeCounts& counts) {
+            add("Change summary", {}, name, wxString::Format("+%llu / -%llu / ~%llu",
+                static_cast<unsigned long long>(counts.added),
+                static_cast<unsigned long long>(counts.removed),
+                static_cast<unsigned long long>(counts.changed)));
+        };
+        add_summary("Annotations", annotations);
+        add_summary("Bookmarks", bookmarks);
+        add_summary("Breakpoints", breakpoints);
+        add_summary("Types", types);
+        add_summary("Type assignments", assignments);
+        add_summary("Function decisions", functions);
+        add_summary("Regions", regions);
+        add_summary("User references", references);
+        add_summary("Debug variables", debug_variables);
+        add_summary("Patches", patches);
+        preview_status_->SetLabel(wxString::Format(
+            "Step %llu compared with %llu. Change summary rows show additions, removals, and edits for every durable user-state collection.",
+            static_cast<unsigned long long>(preview_->target_step),
+            static_cast<unsigned long long>(comparison_base_->target_step)));
+    }
     preview_items_->populate(preview_rows_.size(), [this](std::size_t row, int column) {
         const auto& item = preview_rows_[row];
         switch (column) {
@@ -719,33 +820,6 @@ void HistoryView::render_preview() {
         default: return item.details;
         }
     });
-    if (comparison_base_ && comparison_base_->user) {
-        const auto& before = *comparison_base_->user;
-        struct ChangeCounts { std::size_t added=0, removed=0, changed=0; };
-        auto count_changes = [](const auto& old_rows, const auto& new_rows) {
-            ChangeCounts counts;
-            for (const auto& old_row : old_rows) {
-                const auto current = std::find_if(new_rows.begin(), new_rows.end(), [&](const auto& row) { return row.id == old_row.id; });
-                if (current == new_rows.end()) ++counts.removed;
-                else if (!(*current == old_row)) ++counts.changed;
-            }
-            for (const auto& new_row : new_rows)
-                if (std::none_of(old_rows.begin(), old_rows.end(), [&](const auto& row) { return row.id == new_row.id; })) ++counts.added;
-            return counts;
-        };
-        const auto annotations = count_changes(before.annotations, state.annotations);
-        const auto bookmarks = count_changes(before.bookmarks, state.bookmarks);
-        const auto types = count_changes(before.types, state.types);
-        const auto assignments = count_changes(before.type_assignments, state.type_assignments);
-        preview_status_->SetLabel(wxString::Format(
-            "Step %llu compared with %llu: annotations +%llu/-%llu/~%llu, bookmarks +%llu/-%llu/~%llu, types +%llu/-%llu/~%llu, assignments +%llu/-%llu/~%llu. Rows show selected-step state.",
-            static_cast<unsigned long long>(preview_->target_step),
-            static_cast<unsigned long long>(comparison_base_->target_step),
-            static_cast<unsigned long long>(annotations.added), static_cast<unsigned long long>(annotations.removed), static_cast<unsigned long long>(annotations.changed),
-            static_cast<unsigned long long>(bookmarks.added), static_cast<unsigned long long>(bookmarks.removed), static_cast<unsigned long long>(bookmarks.changed),
-            static_cast<unsigned long long>(types.added), static_cast<unsigned long long>(types.removed), static_cast<unsigned long long>(types.changed),
-            static_cast<unsigned long long>(assignments.added), static_cast<unsigned long long>(assignments.removed), static_cast<unsigned long long>(assignments.changed)));
-    }
 }
 
 } // namespace hexlab::desktop
