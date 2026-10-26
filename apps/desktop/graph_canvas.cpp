@@ -180,7 +180,7 @@ GraphCanvas::GraphCanvas(wxWindow *parent) : wxPanel(parent) {
         case WXK_RETURN:
             if (hit_ && std::holds_alternative<GraphEdgeId>(*hit_)) {
                 follow_edge(std::get<GraphEdgeId>(*hit_), true);
-            } else if (graph_ && follow_selection) follow_selection();
+            } else follow_focused_node();
             break;
         default:
             event.Skip();
@@ -666,6 +666,20 @@ GraphCanvas::InstructionRows GraphCanvas::instruction_rows(const GraphNode &node
     }
     return rows;
 }
+void GraphCanvas::follow_focused_node() {
+    if (!graph_ || !hit_) return;
+    const auto *id = std::get_if<GraphNodeId>(&*hit_);
+    if (!id) return;
+    const auto found = nodes_.find(*id);
+    if (found == nodes_.end()) return;
+    const auto &node = *found->second;
+    if (const auto index = instruction_index(node)) {
+        if (follow_instruction)
+            follow_instruction(graph_, node.block->instructions[*index]->instruction.address);
+    } else if (node.selection && navigate) {
+        (void)navigate(*node.selection);
+    }
+}
 void GraphCanvas::move_instruction(bool next) {
     if (!graph_ || navigation_nodes_.empty() || !navigate) return;
     hit_.reset();
@@ -832,11 +846,15 @@ void GraphCanvas::activate(wxPoint point, bool follow) {
         auto edge = edges_.at(edge_id);
         location = edge->selection;
     }
+    if (follow && instruction) {
+        if (follow_instruction) follow_instruction(graph_, std::get<Address>(*location));
+        if (focus_changed) focus_changed();
+        return;
+    }
     if (location && navigate && !navigate(*location)) {
         if (focus_changed) focus_changed();
         return;
     }
-    if (follow && instruction && follow_selection) follow_selection();
     if (focus_changed) focus_changed();
 }
 void GraphCanvas::show_context_menu(wxPoint point) {

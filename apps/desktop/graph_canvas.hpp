@@ -33,7 +33,9 @@ class GraphCanvas final : public wxPanel {
     std::function<bool(Location)> navigate;
     std::function<void(Location, GraphContextAction)> context_action;
     std::function<bool(Location, GraphContextAction)> context_action_available;
-    std::function<void()> follow_selection;
+    // Follow the exact graph instruction, independently of the asynchronously
+    // rendered listing row. The receiver validates the captured graph source.
+    std::function<void(std::shared_ptr<const ProjectGraph>, Address)> follow_instruction;
     std::function<void()> focus_changed;
 
   private:
@@ -78,6 +80,7 @@ class GraphCanvas final : public wxPanel {
     };
     InstructionRows instruction_rows(const GraphNode &, GraphRect) const;
     void move_instruction(bool next);
+    void follow_focused_node();
     std::optional<GraphNodeId> focused_node() const;
     void move_graph(bool forward);
     void cycle_edges(bool next);

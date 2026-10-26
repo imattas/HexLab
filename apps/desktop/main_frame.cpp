@@ -2746,7 +2746,46 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
                                                                 : ProjectActionKind::bookmark;
         return action_availability(project.get(), kind, location).enabled;
     };
-    ui.graph->canvas->follow_selection = [this] { impl_->follow(); };
+    ui.graph->canvas->follow_instruction = [this](std::shared_ptr<const ProjectGraph> source_graph, Address source) {
+        const auto id = projects().active_document();
+        const auto document = impl_->state().current();
+        const auto project = id ? projects().project(*id) : nullptr;
+        const auto current_graph = impl_->graph->canvas->graph();
+        if (!id || !document || document->id != *id || !impl_->shown ||
+            impl_->shown->id != *id || impl_->shown->revision != document->revision ||
+            !project || !project->loaded || !project->loaded->image ||
+            document->image != project->loaded->image ||
+            !source_graph || source_graph != current_graph ||
+            !project_graph_current(*project, *source_graph) || impl_->closer->closing_window()) {
+            impl_->log("Graph changed; stale instruction follow was canceled.");
+            return;
+        }
+        // Resolve from the current graph facts, never the listing's prior row.
+        // The reference service checks exact instruction provenance and rejects
+        // ambiguous transfer targets. Image mappings own both endpoints.
+        const auto &image = *project->loaded->image;
+        const auto *source_segment = image.segment_at(source);
+        if (!source_segment || !source_segment->executable) {
+            impl_->log("Graph instruction is outside executable image mappings.");
+            return;
+        }
+        auto target = project_follow_target(*project, source);
+        if (!target) {
+            impl_->log(text(target.error().message));
+            return;
+        }
+        if (target.value()) {
+            const auto *destination_segment = image.segment_at(*target.value());
+            if (!destination_segment || !destination_segment->executable) {
+                impl_->log("Graph target is outside executable image mappings.");
+                return;
+            }
+        }
+        Navigate(source);
+        if (impl_->state().selection() != std::optional<Location>{source}) return;
+        if (target.value()) Navigate(*target.value());
+        else impl_->log("Selected graph instruction has no resolved target.");
+    };
     ui.graph->kind_changed = [this](GraphKind kind, std::size_t call_depth) {
         if (auto id = projects().active_document()) {
             auto result = impl_->controller->request_graph(*id, impl_->state().selection(), kind, call_depth);
