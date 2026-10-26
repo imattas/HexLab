@@ -86,6 +86,20 @@ inline std::optional<IntegerDataflowShape> integer_dataflow_shape(Opcode opcode)
     }
 }
 
+inline std::optional<IntegerDataflowShape> immediate_shift_shape(Opcode opcode) noexcept {
+    switch (opcode) {
+    case Opcode::vpsllw: case Opcode::vpsrlw: return IntegerDataflowShape{16, 8, 16, false, false, false};
+    case Opcode::vpsraw: return IntegerDataflowShape{16, 8, 16, true, false, true};
+    case Opcode::vpslld: case Opcode::vpsrld: return IntegerDataflowShape{32, 8, 32, false, false, false};
+    case Opcode::vpsrad: return IntegerDataflowShape{32, 8, 32, true, false, true};
+    case Opcode::vpsllq: case Opcode::vpsrlq: return IntegerDataflowShape{64, 8, 64, false, false, false};
+    // These shift the 128-bit groups as a byte string, independently within
+    // each 16-byte AVX lane.
+    case Opcode::vpslldq: case Opcode::vpsrldq: return IntegerDataflowShape{128, 8, 128, false, false, false};
+    default: return std::nullopt;
+    }
+}
+
 // Deliberately separate from the VEX whitelist: EVEX comparisons write K
 // registers, and several VEX dataflow opcodes have no equivalent EVEX form.
 inline std::optional<IntegerDataflowShape> evex_integer_shape(Opcode opcode) noexcept {
@@ -230,6 +244,64 @@ inline bool is_variable_shift(Opcode opcode) noexcept {
         return true;
     default:
         return false;
+    }
+}
+
+inline bool is_left_immediate_shift(Opcode opcode) noexcept {
+    return opcode == Opcode::vpsllw || opcode == Opcode::vpslld || opcode == Opcode::vpsllq ||
+           opcode == Opcode::vpslldq;
+}
+
+inline bool is_arithmetic_immediate_shift(Opcode opcode) noexcept {
+    return opcode == Opcode::vpsraw || opcode == Opcode::vpsrad;
+}
+
+template <std::size_t Size>
+inline std::uint64_t load_lane(const std::array<std::byte, Size> &value,
+                               unsigned offset, unsigned width) noexcept;
+template <std::size_t Size>
+inline void store_lane(std::array<std::byte, Size> &value, unsigned offset,
+                       unsigned width, std::uint64_t lane) noexcept;
+
+template <std::size_t Size>
+inline void evaluate_immediate_shift(Opcode opcode, const std::array<std::byte, Size> &source,
+                                    std::uint8_t count, std::array<std::byte, Size> &output,
+                                    unsigned bytes) noexcept {
+    const auto shape = immediate_shift_shape(opcode);
+    if (!shape) return;
+    if (shape->result_bits == 128) {
+        for (unsigned base = 0; base < bytes; base += 16) {
+            for (unsigned i = 0; i < 16; ++i) {
+                std::byte value{};
+                if (count < 16) {
+                    if (is_left_immediate_shift(opcode)) {
+                        if (i >= count) value = source[base + i - count];
+                    } else if (i + count < 16) {
+                        value = source[base + i + count];
+                    }
+                }
+                output[base + i] = value;
+            }
+        }
+        return;
+    }
+    const auto lane_bytes = static_cast<unsigned>(shape->result_bits / 8);
+    const auto mask = shape->result_bits == 64 ? UINT64_MAX : (UINT64_C(1) << shape->result_bits) - 1;
+    for (unsigned offset = 0; offset < bytes; offset += lane_bytes) {
+        const auto value = load_lane(source, offset, shape->result_bits);
+        std::uint64_t shifted = 0;
+        if (is_arithmetic_immediate_shift(opcode)) {
+            const bool negative = (value & (UINT64_C(1) << (shape->result_bits - 1))) != 0;
+            if (count >= shape->result_bits) shifted = negative ? mask : 0;
+            else if (!count) shifted = value;
+            else {
+                shifted = value >> count;
+                if (negative) shifted |= (~UINT64_C(0)) << (shape->result_bits - count);
+            }
+        } else if (count < shape->result_bits) {
+            shifted = is_left_immediate_shift(opcode) ? value << count : value >> count;
+        }
+        store_lane(output, offset, shape->result_bits, shifted & mask);
     }
 }
 
@@ -433,7 +505,8 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
         return std::nullopt;
 
     const bool move = instruction.opcode == Opcode::vmovups;
-    if (!move && !is_avx_integer_bitwise_or_compare(instruction.opcode)) return std::nullopt;
+    const auto immediate_shift = immediate_shift_shape(instruction.opcode);
+    if (!move && !immediate_shift && !is_avx_integer_bitwise_or_compare(instruction.opcode)) return std::nullopt;
     if (!move && instruction.operands.size() != 3) return std::nullopt;
     if (move && instruction.operands.size() != 2) return std::nullopt;
 
@@ -456,6 +529,25 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
         } else if (!is_xmm_or_ymm(other, bits)) {
             return std::nullopt;
         }
+    } else if (immediate_shift) {
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        if (!destination || (destination->bank != RegisterBank::xmm && destination->bank != RegisterBank::ymm))
+            return std::nullopt;
+        bits = destination->width;
+        if ((bits != 128 && bits != 256) || !is_xmm_or_ymm(instruction.operands[0], bits))
+            return std::nullopt;
+        register_destination = destination->index;
+        const auto &source = instruction.operands[1];
+        if (const auto *memory = std::get_if<MemoryOperand>(&source)) {
+            if (memory->data_width != bits) return std::nullopt;
+        } else if (!is_xmm_or_ymm(source, bits)) {
+            return std::nullopt;
+        }
+        const auto *count = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        if (!count || count->encoded_width != 8 || count->effective_width != 8 ||
+            count->is_signed || count->value > 0xff ||
+            (instruction.vector_element_bits && instruction.vector_element_bits != immediate_shift->result_bits))
+            return std::nullopt;
     } else {
         const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
         if (!destination || (destination->bank != RegisterBank::xmm && destination->bank != RegisterBank::ymm))
@@ -488,6 +580,14 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
     const auto bytes = static_cast<unsigned>(bits / 8);
     if (move) {
         for (unsigned i = 0; i < bytes; ++i) result.bytes[i] = source1[i];
+        return result;
+    }
+
+    if (immediate_shift) {
+        const auto *count = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        if (!count) return std::nullopt;
+        evaluate_immediate_shift(instruction.opcode, source1, static_cast<std::uint8_t>(count->value),
+                                 result.bytes, bytes);
         return result;
     }
 

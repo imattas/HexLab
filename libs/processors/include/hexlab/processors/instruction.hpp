@@ -424,7 +424,9 @@ enum class Opcode {
     // Appended AVX packed floating division forms; preserve stored opcode IDs.
     vdivps, vdivpd,
     // AArch64 preserving bitfield move; append to preserve persisted IDs.
-    a64_bfm
+    a64_bfm,
+    // AVX2 immediate-count packed shifts; append to preserve cache IDs.
+    vpsllw, vpslld, vpsllq, vpsrlw, vpsrld, vpsrlq, vpsraw, vpsrad, vpslldq, vpsrldq
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

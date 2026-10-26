@@ -2959,6 +2959,33 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
         }
         return outcome;
     };
+    const auto arm_pc_target = [&](const Instruction &instruction, std::uint32_t raw_value)
+        -> std::optional<Address> {
+        if (!instruction.arm) return {};
+        auto target_mode = instruction.arm->target_mode.value_or(instruction.context.mode);
+        switch (instruction.arm->exchange) {
+        case ArmExchange::address_bit0:
+            // BXWritePC reserves 0b10 for an unpredictable A32 target.
+            if ((raw_value & 3u) == 2u) return {};
+            target_mode = (raw_value & 1u) ? ExecutionMode::thumb : ExecutionMode::a32;
+            break;
+        case ArmExchange::forced_a32: target_mode = ExecutionMode::a32; break;
+        case ArmExchange::forced_thumb: target_mode = ExecutionMode::thumb; break;
+        case ArmExchange::none: break;
+        }
+        if (target_mode != ExecutionMode::a32 && target_mode != ExecutionMode::thumb) return {};
+        const auto aligned = target_mode == ExecutionMode::thumb
+                                 ? (raw_value & ~UINT32_C(1))
+                                 : (raw_value & ~UINT32_C(3));
+        const Address target{instruction.address.space, aligned};
+        const auto *segment = image->segment_at(target);
+        if (!segment || !segment->executable || target.offset < segment->begin.offset ||
+            target.offset - segment->begin.offset >= segment->size)
+            return {};
+        const auto context = image->context_at(target);
+        if (!context || context.value().mode != target_mode) return {};
+        return target;
+    };
     const auto process_block = [&](const BasicBlock &block, RegisterState registers) {
         for (const auto &fact : block.instructions) {
             reference_detail::canceled(stop);
@@ -3013,13 +3040,9 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     target_register->width == 32 && target_register->index != 15) {
                     const auto found = registers.find({mode, target_register->index});
                     if (found != registers.end() && found->second.space == instruction.address.space) {
-                        const bool thumb_target = (found->second.offset & 1u) != 0;
-                        const auto aligned = found->second.offset & (thumb_target ? ~UINT64_C(1) : ~UINT64_C(3));
-                        const Address target{found->second.space, aligned};
-                        const auto *segment = image->segment_at(target);
-                        if (segment && segment->executable && target.offset >= segment->begin.offset &&
-                            target.offset - segment->begin.offset < segment->size)
-                            result.immediate_targets[{fact->id, static_cast<std::uint32_t>(control)}] = target;
+                        if (const auto target = arm_pc_target(instruction,
+                                static_cast<std::uint32_t>(found->second.offset)))
+                            result.immediate_targets[{fact->id, control}] = *target;
                     }
                 }
             }
@@ -3101,25 +3124,37 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     definition = {{destination->index, *literal->resolved_address}};
             } else if (instruction.opcode == Opcode::a32_mov && instruction.operands.size() == 2) {
                 const auto *destination = architecture_register(instruction, 0, RegisterBank::arm32_gpr, 32);
-                if (arm_instruction_unconditional && destination && destination->index != 15) {
+                if (arm_instruction_unconditional && destination) {
                     if (const auto operand2 = arm_operand2_value(instruction.operands[1])) {
-                        definition = {{destination->index, Address{instruction.address.space, *operand2}}};
-                        const Address target{instruction.address.space, *operand2};
-                        if (std::holds_alternative<ImmediateOperand>(instruction.operands[1]) &&
-                            riscv_target_segment(*image, target, OperandAccess::address))
-                            result.immediate_targets[{fact->id, 1}] = target;
+                        if (destination->index == 15 && instruction.arm->writes_pc) {
+                            if (const auto target = arm_pc_target(instruction, *operand2))
+                                result.immediate_targets[{fact->id,
+                                    analysis_detail::control_operand_index(instruction)}] = *target;
+                        } else if (destination->index != 15) {
+                            definition = {{destination->index, Address{instruction.address.space, *operand2}}};
+                            const Address target{instruction.address.space, *operand2};
+                            if (std::holds_alternative<ImmediateOperand>(instruction.operands[1]) &&
+                                riscv_target_segment(*image, target, OperandAccess::address))
+                                result.immediate_targets[{fact->id, 1}] = target;
+                        }
                     }
                 }
             } else if (instruction.opcode == Opcode::a32_mvn && instruction.operands.size() == 2) {
                 const auto *destination = architecture_register(instruction, 0, RegisterBank::arm32_gpr, 32);
-                if (arm_instruction_unconditional && destination && destination->index != 15) {
+                if (arm_instruction_unconditional && destination) {
                     if (const auto operand2 = arm_operand2_value(instruction.operands[1])) {
                         const auto value = static_cast<std::uint32_t>(~*operand2);
-                        definition = {{destination->index, Address{instruction.address.space, value}}};
-                        const Address target{instruction.address.space, value};
-                        if (std::holds_alternative<ImmediateOperand>(instruction.operands[1]) &&
-                            riscv_target_segment(*image, target, OperandAccess::address))
-                            result.immediate_targets[{fact->id, 1}] = target;
+                        if (destination->index == 15 && instruction.arm->writes_pc) {
+                            if (const auto target = arm_pc_target(instruction, value))
+                                result.immediate_targets[{fact->id,
+                                    analysis_detail::control_operand_index(instruction)}] = *target;
+                        } else if (destination->index != 15) {
+                            definition = {{destination->index, Address{instruction.address.space, value}}};
+                            const Address target{instruction.address.space, value};
+                            if (std::holds_alternative<ImmediateOperand>(instruction.operands[1]) &&
+                                riscv_target_segment(*image, target, OperandAccess::address))
+                                result.immediate_targets[{fact->id, 1}] = target;
+                        }
                     }
                 }
             } else if (instruction.operands.size() == 3 &&
@@ -3135,8 +3170,8 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                 const bool carry_arithmetic = instruction.opcode == Opcode::a32_adc ||
                                                instruction.opcode == Opcode::a32_sbc ||
                                                instruction.opcode == Opcode::a32_rsc;
-                if (arm_instruction_unconditional && destination && destination->index != 15 && source &&
-                    operand2 && (!carry_arithmetic || carry)) {
+                if (arm_instruction_unconditional && destination && source && operand2 &&
+                    (!carry_arithmetic || carry)) {
                     std::optional<Address> target;
                     if (carry_arithmetic && source->index != 15 && carry) {
                         const auto base = tracked(source->index);
@@ -3180,7 +3215,13 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                             target = Address{base->space, value};
                         }
                     }
-                    if (target && riscv_target_segment(*image, *target, OperandAccess::address)) {
+                    if (target && destination->index == 15 && instruction.arm->writes_pc) {
+                        if (const auto resolved = arm_pc_target(instruction,
+                                static_cast<std::uint32_t>(target->offset)))
+                            result.immediate_targets[{fact->id,
+                                analysis_detail::control_operand_index(instruction)}] = *resolved;
+                    } else if (target && destination->index != 15 &&
+                               riscv_target_segment(*image, *target, OperandAccess::address)) {
                         definition = {{destination->index, *target}};
                         if (std::holds_alternative<ImmediateOperand>(instruction.operands[2]))
                             result.immediate_targets[{fact->id, 2}] = *target;
@@ -3189,6 +3230,31 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
             }
             std::optional<std::pair<std::uint32_t, Address>> writeback_definition;
             std::optional<std::pair<std::uint32_t, Address>> loaded_pointer;
+            if (instruction.opcode == Opcode::a32_ldm && instruction.arm && instruction.arm->writes_pc &&
+                instruction.operands.size() >= 2) {
+                const auto *base_register = architecture_register(
+                    instruction, 0, RegisterBank::arm32_gpr, 32);
+                const auto *list = std::get_if<ArmRegisterListOperand>(&instruction.operands[1]);
+                if (base_register && list && (list->mask & 0x8000u)) {
+                    const auto base = tracked(base_register->index);
+                    if (base && base->offset <= UINT32_MAX) {
+                        const auto count = std::popcount(list->mask);
+                        std::int64_t pc_word_delta = 0;
+                        switch (instruction.arm->multiple_mode) {
+                        case ArmMultipleMode::ia: pc_word_delta = static_cast<std::int64_t>(count) - 1; break;
+                        case ArmMultipleMode::ib: pc_word_delta = static_cast<std::int64_t>(count); break;
+                        case ArmMultipleMode::da: pc_word_delta = 0; break;
+                        case ArmMultipleMode::db: pc_word_delta = -1; break;
+                        }
+                        const auto slot_offset = static_cast<std::int64_t>(base->offset) + pc_word_delta * 4;
+                        if (slot_offset >= 0 && slot_offset <= UINT32_MAX) {
+                            const Address slot{base->space, static_cast<std::uint64_t>(slot_offset)};
+                            if (const auto pointer = static_pointer_load(*image, relocations, slot, 32))
+                                loaded_pointer = std::pair{std::uint32_t{15}, *pointer};
+                        }
+                    }
+                }
+            }
             for (std::size_t i = 0; i < instruction.operands.size() && i < instruction.access.size(); ++i) {
                 const auto *memory = std::get_if<ArmMemoryOperand>(&instruction.operands[i]);
                 if (!memory || memory->base.bank != RegisterBank::arm32_gpr || memory->base.width != 32)
@@ -3357,8 +3423,15 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
             }
             if (writeback_definition)
                 registers[{mode, writeback_definition->first}] = writeback_definition->second;
-            if (loaded_pointer)
-                registers[{mode, loaded_pointer->first}] = loaded_pointer->second;
+            if (loaded_pointer) {
+                if (loaded_pointer->first == 15 && instruction.arm->writes_pc) {
+                    if (const auto target = arm_pc_target(instruction,
+                            static_cast<std::uint32_t>(loaded_pointer->second.offset)))
+                        result.immediate_targets[{fact->id, 1}] = *target;
+                } else {
+                    registers[{mode, loaded_pointer->first}] = loaded_pointer->second;
+                }
+            }
         }
         return registers;
     };

@@ -264,6 +264,20 @@ void SourceView::set_document(std::shared_ptr<const DocumentSnapshot> document) 
             if (!row.end_sequence && row.address && row.line > 0 && !row.file.empty())
                 rows_.push_back({*row.address, row.file, row.line, row.column});
     }
+    if (metadata->dex) {
+        constexpr std::size_t max_dex_source_rows = 250'000;
+        for (const auto &method : metadata->dex->methods) {
+            for (const auto &line : method.lines) {
+                if (rows_.size() >= max_dex_source_rows) break;
+                if (line.line == 0 || line.source_file.empty()) continue;
+                const auto method_space = static_cast<std::uint32_t>(std::uint64_t{method.method_index} + 1);
+                rows_.push_back({Address{AddressSpaceId{method_space}, line.address},
+                                 line.source_file, line.line, 0, 0, 0,
+                                 "DEX method #" + std::to_string(method.method_index)});
+            }
+            if (rows_.size() >= max_dex_source_rows) break;
+        }
+    }
     std::stable_sort(rows_.begin(), rows_.end(), [](const SourceRow &left, const SourceRow &right) {
         if (left.address.space.value != right.address.space.value)
             return left.address.space.value < right.address.space.value;

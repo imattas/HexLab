@@ -686,6 +686,16 @@ std::string operation_name(Opcode opcode) {
     case Opcode::vpsravw: return "vpsravw";
     case Opcode::vpsravd: return "vpsravd";
     case Opcode::vpsravq: return "vpsravq";
+    case Opcode::vpsllw: return "vpsllw";
+    case Opcode::vpslld: return "vpslld";
+    case Opcode::vpsllq: return "vpsllq";
+    case Opcode::vpsrlw: return "vpsrlw";
+    case Opcode::vpsrld: return "vpsrld";
+    case Opcode::vpsrlq: return "vpsrlq";
+    case Opcode::vpsraw: return "vpsraw";
+    case Opcode::vpsrad: return "vpsrad";
+    case Opcode::vpslldq: return "vpslldq";
+    case Opcode::vpsrldq: return "vpsrldq";
     case Opcode::vpaddw: return "vpaddw";
     case Opcode::vpaddsb: return "vpaddsb";
     case Opcode::vpaddsw: return "vpaddsw";
@@ -3390,6 +3400,47 @@ a64_unhandled:
             effect.register_writes = instruction.register_writes;
             effect.result_type = type_for(static_cast<std::uint16_t>(zero_upper ? 256 : width),
                                          shape->result_bits, shape->result_signed);
+            return effect;
+        }
+    }
+
+    if (const auto shape = x86_avx_detail::immediate_shift_shape(instruction.opcode);
+        x86 && instruction.context.mode == ExecutionMode::x86_64 && shape &&
+        instruction.operands.size() == 3 && !instruction.x86_evex && !instruction.x86_opmask &&
+        !instruction.x86_opmask_zeroing) {
+        const auto destination = as_register(instruction.operands[0]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        const auto *count = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        const auto width = destination ? destination->width : std::uint16_t{0};
+        const bool zero_upper = width == 128 && destination &&
+            std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [&](RegisterOperand reg) {
+                    return reg.bank == RegisterBank::ymm && reg.width == 256 && reg.index == destination->index;
+                });
+        if (destination && (width == 128 || width == 256) &&
+            x86_avx_detail::is_xmm_or_ymm(instruction.operands[0], width) &&
+            (x86_avx_detail::is_xmm_or_ymm(instruction.operands[1], width) ||
+             (memory && memory->data_width == width)) && count &&
+            count->encoded_width == 8 && count->effective_width == 8 && !count->is_signed &&
+            count->value <= 0xff && (!instruction.vector_bits || instruction.vector_bits == width) &&
+            (width != 128 || zero_upper) &&
+            (!instruction.vector_element_bits || instruction.vector_element_bits == shape->result_bits)) {
+            const auto result_width = static_cast<std::uint16_t>(zero_upper ? 256 : width);
+            const auto source_type = vector_type(width, TypeKind::integer, shape->first_bits,
+                static_cast<std::uint8_t>(width / shape->first_bits), shape->first_signed);
+            const auto result_type = vector_type(result_width, TypeKind::integer, shape->result_bits,
+                static_cast<std::uint8_t>(result_width / shape->result_bits), shape->result_signed);
+            const auto lane_name = [](std::uint16_t lane, bool is_signed) {
+                return std::string(is_signed ? "i" : "u") + std::to_string(lane);
+            };
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_" +
+                lane_name(shape->result_bits, shape->result_signed) + "x" +
+                std::to_string(result_width / shape->result_bits) + "_imm8_lane128" +
+                (zero_upper ? "_zero_upper" : ""),
+                {retag_expr(operands[1], source_type), retag_expr(operands[2], integer_type(8))},
+                memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = result_type;
             return effect;
         }
     }
