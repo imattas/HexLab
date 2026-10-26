@@ -5762,6 +5762,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         std::set<std::uint64_t> diamond_ids;
         std::set<std::pair<std::uint32_t, std::uint64_t>> diamond_addresses;
         std::size_t diamond_edge_count = 0;
+        std::size_t diamond_memory_phi_input_count = 0;
         if (diamond_cfg_valid) {
             for (const auto &block : function.blocks) {
                 if (!diamond_ids.insert(block.id.value).second ||
@@ -5771,6 +5772,18 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     break;
                 }
                 diamond_edge_count += block.successors.size();
+                const auto account_memory_phi = [&](const auto &phi) {
+                    if (phi.inputs.size() > 65536 - diamond_memory_phi_input_count) return false;
+                    diamond_memory_phi_input_count += phi.inputs.size();
+                    return true;
+                };
+                if ((block.memory_phi && !account_memory_phi(*block.memory_phi)) ||
+                    block.memory_partition_phis.size() > 4096 ||
+                    std::any_of(block.memory_partition_phis.begin(), block.memory_partition_phis.end(),
+                        [&](const auto &phi) { return !account_memory_phi(phi); })) {
+                    diamond_cfg_valid = false;
+                    break;
+                }
                 for (const auto &edge : block.successors) {
                     if (!edge.target || !edge_targets(edge, *edge.target)) {
                         diamond_cfg_valid = false;

@@ -109,7 +109,9 @@ predecessors, shared latches, deeper decision trees, and more than three latch
 tails remain on the state-machine or explicit label/goto path. Parent and child
 diamonds use the same bounded validation: at most 1,024 blocks and 4,096 edges,
 unique block IDs and addresses, resolved edges matching recorded block IDs, and
-complete memory-phi predecessor inputs on the consumed region. Multiple
+complete memory-phi predecessor inputs on the consumed region. The prepass
+rejects functions with more than 65,536 combined whole-memory and partition-
+memory phi inputs, and each block is limited to 4,096 partition phis. Multiple
 register-phi values use parallel copies, preserving simultaneous updates.
 General nested SSA joins, multiple nested latches, and side exits that are not a
 recognized child `break` retain the conservative fallback.
