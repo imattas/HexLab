@@ -680,11 +680,19 @@ DebuggerView::~DebuggerView() {
 }
 
 void DebuggerView::enqueue_inspection(int kind, std::function<void()> task) {
+    // Memory search is deliberately the lowest-priority inspection. It is
+    // bounded and cancellable, so an interactive request can make room for
+    // register, memory, module, region, and frame work without waiting for a
+    // large scan to finish.
+    constexpr int memory_search_kind = 7;
+    if (kind != memory_search_kind) memory_search_stop_.request_stop();
     {
         std::lock_guard lock(inspection_state_->mutex);
         if (inspection_state_->stopping) return;
         std::erase_if(inspection_state_->tasks, [kind](const auto &pending) { return pending.kind == kind; });
-        inspection_state_->tasks.push_back({kind, std::move(task)});
+        const auto position = std::find_if(inspection_state_->tasks.begin(), inspection_state_->tasks.end(),
+            [kind](const auto &pending) { return pending.kind > kind; });
+        inspection_state_->tasks.insert(position, {kind, std::move(task)});
     }
     inspection_state_->ready.notify_one();
 }
@@ -1796,7 +1804,7 @@ void DebuggerView::start_memory_search() {
     memory_search_status_->SetLabel("Searching mapped memory...");
     memory_search_start_button_->Disable();
     memory_search_cancel_button_->Enable();
-    enqueue_inspection(6, [session, state, generation, request, cancellation,
+    enqueue_inspection(7, [session, state, generation, request, cancellation,
                            pattern = std::move(pattern), options = std::move(options)]() mutable {
         std::string error;
         std::optional<debugger::MemorySearchReport> report;
@@ -2058,6 +2066,13 @@ void DebuggerView::clear_inspection() {
     ++memory_search_request_;
     ++watch_request_;
     memory_search_stop_.request_stop();
+    {
+        // Requests captured for the previous process cannot contribute to
+        // the new inspection state. Drop them before accepting new work so
+        // stale queued snapshots cannot delay the first result for a target.
+        std::lock_guard lock(inspection_state_->mutex);
+        inspection_state_->tasks.clear();
+    }
     registers_.clear(); selected_register_thread_.reset(); selected_register_index_.reset();
     registers_view_->DeleteAllItems(); register_value_->Clear();
     modules_.clear(); modules_view_->DeleteAllItems();
