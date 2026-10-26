@@ -356,8 +356,6 @@ enum class Opcode {
     ppc_lfs, ppc_lfd, ppc_stfs, ppc_stfd,
     ppc_fadds, ppc_fsubs, ppc_fmuls, ppc_fdivs,
     ppc_fadd, ppc_fsub, ppc_fmul, ppc_fdiv,
-    // Appended scalar PowerPC floating-point operations.
-    ppc_fcmpu, ppc_fcmpo, ppc_fmr, ppc_fneg, ppc_fabs, ppc_frsp,
     // MIPS64 COP1 branch-likely forms, appended for persisted opcode stability.
     mips64_bc1tl, mips64_bc1fl,
     // AArch64 conditional selects and scalar division; appended for cache stability.
@@ -374,7 +372,9 @@ enum class Opcode {
     vpsignb, vpsignw, vpsignd,
     vpunpcklbw, vpunpcklwd, vpunpckldq, vpunpcklqdq,
     vpunpckhbw, vpunpckhwd, vpunpckhdq, vpunpckhqdq,
-    vpacksswb, vpackssdw, vpackuswb, vpackusdw, vpshufb, vpsadbw
+    vpacksswb, vpackssdw, vpackuswb, vpackusdw, vpshufb, vpsadbw,
+    // Appended scalar PowerPC floating-point compare and unary operations.
+    ppc_fcmpu, ppc_fcmpo, ppc_fmr, ppc_fneg, ppc_fabs, ppc_frsp
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
