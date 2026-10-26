@@ -167,6 +167,16 @@ struct Writer {
                 number(edge.consumer_instruction_id, 8);
                 number(edge.producer_instruction_id, 8);
             }
+            require(graph.immediates.size() <= 32, "Reference producer immediates exceed 32 operands");
+            number(graph.immediates.size(), 1);
+            for (const auto &immediate : graph.immediates) {
+                number(immediate.instruction_id, 8);
+                number(immediate.operand_index, 1);
+                number(immediate.value, 8);
+                number(immediate.encoded_width, 2);
+                number(immediate.effective_width, 2);
+                number(immediate.is_signed ? 1 : 0, 1);
+            }
         }
         if (value.provenance.kind == ReferenceProvenanceKind::elf_relocation) {
             const auto encoded = elf_provenance_bytes(*value.provenance.elf);
@@ -380,6 +390,24 @@ struct Reader {
             graph.dependencies.reserve(static_cast<std::size_t>(count));
             for (std::uint64_t i = 0; i < count; ++i)
                 graph.dependencies.push_back({number(8), number(8)});
+        }
+        if (payload_version >= 15) {
+            auto &graph = value.provenance.producer_graph;
+            const auto count = number(1);
+            require(count <= 32, "Reference producer immediates exceed bound");
+            graph.immediates.reserve(static_cast<std::size_t>(count));
+            for (std::uint64_t i = 0; i < count; ++i) {
+                ReferenceProducerImmediate immediate;
+                immediate.instruction_id = number(8);
+                immediate.operand_index = static_cast<std::uint32_t>(number(1));
+                immediate.value = number(8);
+                immediate.encoded_width = static_cast<std::uint16_t>(number(2));
+                immediate.effective_width = static_cast<std::uint16_t>(number(2));
+                const auto is_signed = number(1);
+                require(is_signed <= 1, "Invalid reference producer immediate signed flag");
+                immediate.is_signed = is_signed != 0;
+                graph.immediates.push_back(immediate);
+            }
         }
         if (value.provenance.kind == ReferenceProvenanceKind::elf_relocation) {
             const auto size = number(4);
@@ -668,10 +696,17 @@ void validate_reference(const Reference &value) {
     }
     const auto &producer_graph = value.provenance.producer_graph;
     require(producer_graph.dependencies.size() <= 128, "Reference producer graph exceeds bound");
+    require(producer_graph.immediates.size() <= 32, "Reference producer immediates exceed bound");
     const bool has_graph = !producer_graph.dependencies.empty() || producer_graph.truncated ||
-                           producer_graph.ambiguous || producer_graph.cycle;
+                           producer_graph.ambiguous || producer_graph.cycle || !producer_graph.immediates.empty();
     require(!has_graph || value.provenance.kind == ReferenceProvenanceKind::dataflow,
             "Producer graph requires dataflow provenance");
+    std::set<std::pair<std::uint64_t, std::uint32_t>> immediate_identities;
+    for (const auto &immediate : producer_graph.immediates)
+        require(immediate.instruction_id && immediate.operand_index < 16 &&
+                    immediate.encoded_width <= 512 && immediate.effective_width <= 512 &&
+                    immediate_identities.emplace(immediate.instruction_id, immediate.operand_index).second,
+                "Invalid or duplicate producer immediate");
     std::map<std::uint64_t, std::set<std::uint64_t>> dependency_graph;
     for (const auto &edge : producer_graph.dependencies) {
         require(edge.consumer_instruction_id && edge.producer_instruction_id &&
@@ -958,7 +993,7 @@ Result<std::vector<std::byte>> encode_reference_index(const ReferenceIndex &inde
         using namespace reference_detail;
         canceled(stop);
         Writer out;
-        out.number(14, 1);
+        out.number(15, 1);
         out.number(0, 1);
         out.number(index.key() ? 1 : 0, 1);
         if (index.key())
@@ -989,7 +1024,7 @@ Result<std::shared_ptr<const ReferenceIndex>> decode_reference_index(std::span<c
         in.payload_version = static_cast<unsigned>(in.number(1));
         require((in.payload_version == 7 || in.payload_version == 8 || in.payload_version == 9 ||
                  in.payload_version == 10 || in.payload_version == 11 || in.payload_version == 12 ||
-                 in.payload_version == 13 || in.payload_version == 14) && in.number(1) == 0,
+                 in.payload_version == 13 || in.payload_version == 14 || in.payload_version == 15) && in.number(1) == 0,
                 "Unknown reference payload version");
         std::optional<AnalysisKey> key;
         if (in.flag())

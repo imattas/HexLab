@@ -420,7 +420,9 @@ enum class Opcode {
     rv_vfdiv_vv, rv_vfdiv_vf, rv_vfsgnj_vv, rv_vfsgnj_vf, rv_vfsgnjn_vv, rv_vfsgnjn_vf,
     rv_vfsgnjx_vv, rv_vfsgnjx_vf, rv_vfmin_vv, rv_vfmin_vf, rv_vfmax_vv, rv_vfmax_vf,
     rv_vmfeq_vv, rv_vmfeq_vf, rv_vmfne_vv, rv_vmfne_vf, rv_vmflt_vv, rv_vmflt_vf,
-    rv_vmfle_vv, rv_vmfle_vf, rv_vmfgt_vf, rv_vmfge_vf
+    rv_vmfle_vv, rv_vmfle_vf, rv_vmfgt_vf, rv_vmfge_vf,
+    // Appended AVX packed floating division forms; preserve stored opcode IDs.
+    vdivps, vdivpd
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

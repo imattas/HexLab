@@ -7,8 +7,13 @@ inspect memory captured by the dump.
 
 The loader reads the bounded stream directory and supports standard
 `SystemInfo`, `MemoryList`, `Memory64List`, `MemoryInfoList`, `ModuleList`,
-`ThreadList`, and `Exception` streams. Module names are decoded from bounded
-UTF-16 strings. Thread IDs must be nonzero and unique within `ThreadList`.
+`ThreadList`, `ThreadNames`, and `Exception` streams. Module and thread names
+are decoded from bounded UTF-16 strings. Thread-name rows retain their source
+record and string offsets and are matched by thread ID. Thread IDs must be
+nonzero and unique within `ThreadList`; thread-name IDs must also be nonzero
+and unique within `ThreadNames`. Name rows without a matching thread context
+remain in metadata and are not attached to another thread. Duplicate standard
+`ThreadNames` streams are rejected.
 An exception context is retained independently of the thread context; neither
 is substituted for the other.
 
@@ -48,8 +53,8 @@ extent is validated even when only a prefix is decoded. Decoding is capped at
 Context allocations, register bytes and strings are charged to the 64 MiB
 metadata budget. Stream, thread, memory and module counts remain independently
 bounded. Thread/context processing checks cancellation between records. The CLI
-summary lists at most 256 threads and prints wide register values from their
-captured bytes.
+summary lists at most 256 threads, includes captured names when available, and
+prints wide register values from their captured bytes.
 
 When `MemoryInfoList` is present, captured regions are split at protection
 boundaries and retain read, write, and execute permissions. If protection data
@@ -71,7 +76,8 @@ processor architectures remain metadata without an instruction decoder.
 
 ## Desktop context inspection
 
-**Binary Metadata > Minidump** shows separate exception and thread context rows.
+**Binary Metadata > Minidump** shows separate exception and thread context rows,
+including each captured thread name when the dump supplies one.
 The exception row is first and remains independent from the matching thread's
 context. Rows show context status, architecture, source file RVA/size,
 requested/decoded group masks, and stack or exception address. Missing contexts

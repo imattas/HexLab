@@ -14,7 +14,7 @@ families:
 | Packed integer shuffle | `pshufd` with its encoded byte selector |
 | Scalar moves | `movss`, `movsd` |
 | Scalar arithmetic | `addss`, `addsd`, `subss`, `subsd`, `mulss`, `mulsd`, `divss`, `divsd` |
-| AVX packed floating decoder | VEX.128/.256 `vmovups`, `vaddps/pd`, `vsubps/pd`, `vmulps/pd`, `vxorps/pd`, `vandps/pd` |
+| AVX packed floating decoder | VEX.128/.256 `vmovups`, `vaddps/pd`, `vsubps/pd`, `vmulps/pd`, `vdivps/pd`, `vxorps/pd`, `vandps/pd`; EVEX.128/.256/.512 `vaddps/pd`, `vsubps/pd`, `vmulps/pd`, `vdivps/pd` |
 | AVX2 packed integer subtraction | VEX.128/.256 `vpsubb/w/d/q` |
 | AVX2 packed integer comparisons | VEX.128/.256 `vpcmpeqb/w/d/q`, `vpcmpgtb/w/d/q` |
 | AVX2 packed word multiply | VEX.128/.256 `vpmullw`, `vpmulhw`, `vpmulhuw` |
@@ -78,18 +78,22 @@ selection. `pmaddwd` and `pmuludq` retain distinct input and output lane shapes;
 compile-only evidence and no fixture coverage yet.
 
 The currently decoded AVX subset lifts VEX.128 and VEX.256 `vmovups`,
-`vaddps/pd`, `vsubps/pd`, `vmulps/pd`, `vxorps/pd`, and `vandps/pd` into typed
+`vaddps/pd`, `vsubps/pd`, `vmulps/pd`, `vdivps/pd`, `vxorps/pd`, and `vandps/pd` into typed
 intrinsics. VEX.128 register destinations define both the XMM result and the
 full YMM view with the upper 128 bits cleared; the intrinsic name includes
 `zero_upper` and its result type is 256 bits. VEX.128 stores remain 128-bit
 memory writes. VEX.256 forms retain their full YMM results.
 
-Packed floating `vaddps/pd`, `vsubps/pd`, and `vmulps/pd` now record MXCSR as
+Packed floating `vaddps/pd`, `vsubps/pd`, `vmulps/pd`, and `vdivps/pd` record MXCSR as
 an implicit 32-bit read/write dependency. Their typed intrinsics consume the
 incoming MXCSR value and define its outgoing version alongside the vector
 result, so later SSA can observe the state dependency. The whole register is
 retained because per-flag exception behavior and control-field effects are not
-computed. Packed division opcodes are not in the current decoder subset.
+computed. `vdivps/pd` decode for VEX.128/.256 and EVEX.128/.256/.512 with exact
+vector and memory widths, opmask merge/zero behavior, and upper-register
+clearing. The decompiler preserves division as a typed MXCSR-dependent
+intrinsic; the lane evaluator does not execute floating-point division or
+calculate MXCSR flags.
 
 `x86_avx_semantics.hpp` provides a pure evaluator for the decoded AVX2 wrapping
 integer add/subtract families (`vpaddb/w/d/q`, `vpsubb/w/d/q`), integer logical
@@ -110,7 +114,7 @@ for byte, word, dword, and qword lanes. Each output lane is all ones when its
 comparison succeeds and zero otherwise. Qword variants use VEX map 2; byte,
 word, and dword variants use map 1. Typed decode records the non-destructive
 destination write and both source reads, retains XMM/YMM or full-width memory
-operands, and records VEX.128 upper-YMM clearing. The helper does not evaluate packed floating-point add/subtract/multiply:
+operands, and records VEX.128 upper-YMM clearing. The helper does not evaluate packed floating-point add/subtract/multiply/division:
 rounding mode, denormal handling, and MXCSR exception bits are not executed by
 the lane evaluator. The decompiler retains the packed floating arithmetic forms
 as typed state-aware intrinsics, not concrete FP evaluation or constant folding.
@@ -309,15 +313,14 @@ intrinsic names expose both input shapes, the active output shape, 128-bit
 lane grouping, and upper-YMM clearing. Intrinsics retain caller-owned memory
 read effects and all decoded register writes. This evaluator remains a pure
 helper, not optimizer constant folding or a fault/CPU-feature emulator.
-This expansion has source-review evidence only; no builds or tests were run
-for it. A serial processor/decompiler build and focused SIMD checks remain
-required before treating it as verified coverage.
+The Debug `hexlab_processors` and `hexlab_decompiler` builds passed for this
+expanded subset; no tests were run.
 
 Other EVEX opcodes and exact floating-point execution remain unsupported. MMX, most AVX/VEX forms,
 packed floating-point execution, remaining packed integer forms
 (including packed shifts in VEX forms, absolute value, rounded high-word
 multiply, immediate shuffles/blends, cross-128-bit permutations, and unsigned comparisons),
-other compare/test instructions, MXCSR behavior, and exact
+other compare/test instructions, precise MXCSR flag/rounding behavior, and exact
 upper-lane merge behavior remain outside this slice. See the
 [design](superpowers/specs/2026-10-22-x86-simd-design.md) and
 [implementation plan](superpowers/plans/2026-10-22-x86-simd.md) for the

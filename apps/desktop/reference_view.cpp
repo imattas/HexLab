@@ -435,6 +435,18 @@ void ReferenceView::update_detail() {
         }
         if (count < producer_graph.dependencies.size()) text_value += "  …\n";
     }
+    if (!producer_graph.immediates.empty()) {
+        text_value += wxString::Format("Immediate operands (%zu):\n", producer_graph.immediates.size());
+        const auto count = std::min<std::size_t>(producer_graph.immediates.size(), 32);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto &immediate = producer_graph.immediates[i];
+            text_value += wxString::Format("  #%llu operand %u = 0x%llx (%u-bit encoded, %u-bit effective%s)\n",
+                static_cast<unsigned long long>(immediate.instruction_id), immediate.operand_index,
+                static_cast<unsigned long long>(immediate.value), immediate.encoded_width,
+                immediate.effective_width,
+                immediate.is_signed ? ", signed" : "");
+        }
+    }
     if (producer_graph.ambiguous) text_value += "Producer chain has multiple equal-value path origins.\n";
     if (producer_graph.cycle) text_value += "A producer cycle was detected and omitted.\n";
     if (producer_graph.truncated) text_value += "Producer chain is bounded; some dependencies are omitted.\n";

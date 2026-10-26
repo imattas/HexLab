@@ -7,6 +7,13 @@
 #include <set>
 #include <unordered_set>
 
+namespace hexlab::symbols {
+HEXLAB_SYMBOLS_EXPORT DwarfCrossContributionDieResolver make_dwarf_package_cross_contribution_die_resolver(
+    std::shared_ptr<const DwarfPackageIndex>, std::vector<DwarfPackageSectionData>,
+    std::span<const std::uint8_t>, std::span<const std::uint8_t>, std::stop_token,
+    DwarfPackageTypeResolutionLimits, bool little_endian);
+}
+
 namespace hexlab::elf_detail {
 namespace {
 symbols::DwarfSupplementaryIdentity read_supplementary_identity(std::span<const std::uint8_t> bytes) {
@@ -196,6 +203,7 @@ std::shared_ptr<const symbols::DwarfPackageIndex> read_package_index(
 struct DwarfEmbeddedPackageResolvers {
     symbols::DwarfSplitUnitResolver split;
     symbols::DwarfTypeSignatureResolver type_signature;
+    symbols::DwarfCrossContributionDieResolver cross_contribution;
     std::shared_ptr<const DwarfPackage> package;
 };
 
@@ -325,10 +333,23 @@ DwarfEmbeddedPackageResolvers read_dwp_resolvers(const ByteStorage &storage, con
             return resolver(signature);
         };
     }
+    if (package->index) {
+        std::vector<symbols::DwarfPackageSectionData> source_sections;
+        source_sections.reserve(package->sections.size());
+        for (const auto &[id, bytes] : package->sections) source_sections.push_back({id, bytes});
+        auto resolver = symbols::make_dwarf_package_cross_contribution_die_resolver(
+            package->index, std::move(source_sections), package->strings, package->line_strings,
+            stop, {budget.limit - budget.used, 4096}, metadata.header.order == ByteOrder::little);
+        result.cross_contribution = [package, resolver = std::move(resolver)](std::uint64_t offset) {
+            (void)package; // Keep the package buffers borrowed by the resolver alive.
+            return resolver(offset);
+        };
+    }
     if (!package->index) return result;
     const auto address_size = static_cast<std::uint8_t>(metadata.header.is_64 ? 8 : 4);
     const auto little_endian = metadata.header.order == ByteOrder::little;
     result.split = [package = std::move(package), type_signature = result.type_signature,
+                    cross_contribution = result.cross_contribution,
                     stop, address_size, little_endian](const symbols::DwarfSplitUnitRequest &request)
                -> Result<std::shared_ptr<symbols::ImportResult>> {
         std::vector<symbols::DwarfPackageSectionData> source_sections;
@@ -338,7 +359,7 @@ DwarfEmbeddedPackageResolvers read_dwp_resolvers(const ByteStorage &storage, con
         auto imported = symbols::import_dwarf_package_unit(*package->index, request.dwo_id, source_sections,
                                                             package->strings, stop, package->line_strings,
                                                             address_size, little_endian,
-                                                            type_signature);
+                                                            type_signature, cross_contribution);
         if (!imported) return imported.error();
         return std::make_shared<symbols::ImportResult>(std::move(imported.value()));
     };

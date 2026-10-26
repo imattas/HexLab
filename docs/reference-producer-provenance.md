@@ -23,9 +23,20 @@ The older flat list remains available for existing clients.
 reference. The desktop References detail panel renders dependency edges and
 labels ambiguous, cyclic, or truncated results. The derived-analysis engine
 fingerprint was advanced so old flattened-only cache entries are recomputed.
-Reference payload version 13 persists the graph and continues to decode
-versions 7 through 12; the canonical reference identity remains based on the
-pre-graph record fields.
+Reference payload version 13 introduced the graph; version 15 retains immediate
+operand records and continues to decode versions 7 through 14. The canonical
+reference identity remains based on the pre-graph record fields.
+
+Version 15 also preserves immediate operands found on the reference instruction
+and its bounded producer instruction chain. Each entry retains the instruction
+identity, operand index, decoded value, encoded/effective widths, and signedness.
+The desktop detail panel shows these literals alongside dependency edges so a
+user can inspect the constants that participate in address construction.
+Immediate records are capped at 32 per reference; the graph is marked truncated
+when more are available. Earlier payload versions remain readable and are
+recomputed under the updated derived-analysis fingerprint. These records retain
+decoded literal evidence; relocation and dyld origins continue to use their
+format-specific provenance records.
 
 RISC-V RV32/RV64 address propagation also emits this graph for its resolved
 register-relative references. LUI/AUIPC definitions, ADDI/ORI address

@@ -26,6 +26,13 @@ struct MinidumpModule {
     std::uint32_t cv_record_size = 0, cv_record_rva = 0;
     bool operator==(const MinidumpModule &) const = default;
 };
+struct MinidumpThreadName {
+    std::uint32_t thread_id = 0;
+    std::string name;
+    // File offsets of the MINIDUMP_THREAD_NAME row and its MINIDUMP_STRING.
+    FileOffset record_file_offset{}, string_file_offset{};
+    bool operator==(const MinidumpThreadName &) const = default;
+};
 struct MinidumpRegister {
     std::string name;
     std::uint64_t value = 0;
@@ -83,6 +90,7 @@ struct MinidumpMetadata {
     std::vector<MinidumpMemoryRegion> memory;
     std::vector<MinidumpModule> modules;
     std::vector<MinidumpThread> threads;
+    std::vector<MinidumpThreadName> thread_names;
     std::optional<MinidumpException> exception;
     std::vector<std::string> diagnostics;
     bool operator==(const MinidumpMetadata &) const = default;

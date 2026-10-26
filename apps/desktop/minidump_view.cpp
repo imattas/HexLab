@@ -53,6 +53,11 @@ std::optional<ContextRecord> record_at(const MinidumpMetadata &dump, std::size_t
     return ContextRecord{t.context ? &*t.context : nullptr, &t, nullptr,
                          t.context_size, t.context_rva, t.id, t.record_file_offset};
 }
+const MinidumpThreadName *thread_name(const MinidumpMetadata &dump, std::uint32_t id) {
+    const auto found = std::lower_bound(dump.thread_names.begin(), dump.thread_names.end(), id,
+        [](const auto &row, std::uint32_t value) { return row.thread_id < value; });
+    return found != dump.thread_names.end() && found->thread_id == id ? &*found : nullptr;
+}
 std::optional<Location> source_location(const DocumentSnapshot &document, FileOffset at, std::uint64_t size) {
     if (!document.input_storage && !document.image) return {};
     const auto total = document.file_storage().size();
@@ -94,7 +99,7 @@ MinidumpView::MinidumpView(wxWindow *parent) : wxPanel(parent) {
     status_ = new wxStaticText(this, wxID_ANY, "No Minidump metadata");
     status_->SetName("minidump-status");
     contexts_ = new VirtualTable(this, "minidump-contexts",
-        {"Record", "Thread", "Context status", "Architecture", "Context file / size", "Requested / decoded", "Stack / exception address"});
+        {"Record", "Thread", "Thread name", "Context status", "Architecture", "Context file / size", "Requested / decoded", "Stack / exception address"});
     contexts_->SetMinSize(FromDIP(wxSize(-1, 160)));
     auto *tabs = new wxNotebook(this, wxID_ANY);
     auto *register_page = new wxPanel(tabs);
@@ -156,7 +161,7 @@ void MinidumpView::set_document(std::shared_ptr<const DocumentSnapshot> document
         (threads < dump->threads.size() ? "; thread preview limited to 65536" : ""));
     const auto count = threads + (dump->exception ? 1u : 0u);
     contexts_->populate(count, [this](std::size_t row, int column) { return context_cell(row, column); });
-    contexts_->fit_columns({0, 1, 2, 3, 4, 5, 6});
+    contexts_->fit_columns({0, 1, 2, 3, 4, 5, 6, 7});
     if (count) { contexts_->select_row(0); select_context(0); }
     else {
         wxString notes = "No thread or exception context descriptors.\n";
@@ -174,12 +179,16 @@ wxString MinidumpView::context_cell(std::size_t row, int column) const {
     switch (column) {
     case 0: return item->exception ? "Exception" : "Thread";
     case 1: return decimal(item->thread_id);
-    case 2: return c ? context_status(c->status)
+    case 2: {
+        const auto *name = thread_name(*dump, item->thread_id);
+        return name ? clipped(name->name) : wxString{};
+    }
+    case 3: return c ? context_status(c->status)
         : item->size ? wxString("not decoded (limit)") : wxString("not captured");
-    case 3: return architecture(c ? c->processor_architecture : dump->processor_architecture);
-    case 4: return number(item->rva) + " / " + decimal(item->size);
-    case 5: return c ? number(c->requested_groups) + " / " + number(c->decoded_groups) : wxString{};
-    case 6: return item->exception ? number(item->exception->address) : number(item->thread->stack_address) + " + " + number(item->thread->stack_size);
+    case 4: return architecture(c ? c->processor_architecture : dump->processor_architecture);
+    case 5: return number(item->rva) + " / " + decimal(item->size);
+    case 6: return c ? number(c->requested_groups) + " / " + number(c->decoded_groups) : wxString{};
+    case 7: return item->exception ? number(item->exception->address) : number(item->thread->stack_address) + " + " + number(item->thread->stack_size);
     default: return {};
     }
 }
@@ -202,6 +211,9 @@ void MinidumpView::select_context(std::size_t row) {
     wxString description = context_cell(row, 0) + " thread " + decimal(item->thread_id) +
         "\nRecord file: " + number(item->record.value) + "\nContext file: " + number(item->rva) +
         "; original size: " + decimal(item->size) + " bytes\n";
+    if (const auto *name = thread_name(*dump, item->thread_id))
+        description += "Thread name: " + clipped(name->name) + "; name row: " + number(name->record_file_offset.value) +
+            "; string: " + number(name->string_file_offset.value) + "\n";
     if (item->exception) description += "Exception code: " + number(item->exception->code) +
         "; flags: " + number(item->exception->flags) + "; address: " + number(item->exception->address) + "\n";
     else description += "Stack: " + number(item->thread->stack_address) + " + " + number(item->thread->stack_size) +
