@@ -116,7 +116,9 @@ struct FunctionBody {
     std::uint32_t index = 0;
     std::uint64_t code_offset = 0, code_size = 0;
     std::uint32_t local_count = 0;
+    std::vector<std::pair<std::uint32_t, std::uint8_t>> local_groups;
 };
+struct GlobalType { std::uint8_t value = 0; bool mutable_value = false; };
 int section_order(std::uint8_t id) {
     if (id >= 1 && id <= 9) return id;
     if (id == 12) return 10; // data-count precedes code in the binary encoding
@@ -761,22 +763,38 @@ Result<bool> map_linear_memory(WasmMetadata &metadata, ImageLayout &layout,
     return true;
 }
 
-bool parse_globals(Reader &r, std::uint32_t &count, std::string &reason, bool &unsupported) {
+bool parse_globals(Reader &r, std::uint32_t &count, std::uint32_t imported_count,
+                   std::vector<GlobalType> &globals,
+                   std::string &reason, bool &unsupported) {
     if (!r.uleb(count) || count > max_vector_items) { reason = "invalid global vector count"; return false; }
     for (std::uint32_t i = 0; i < count; ++i) {
         std::uint8_t mutability = 0;
-        if (!r.value_type() || !r.byte(mutability) || mutability > 1) { reason = "invalid global type"; return false; }
-        for (;;) {
-            std::uint8_t opcode = 0;
-            if (!r.byte(opcode)) { reason = "truncated global initializer"; return false; }
-            if (opcode == 0x0b) break;
-            if (opcode == 0x41) { if (!r.sleb(32)) { reason = "invalid i32 global initializer"; return false; } }
-            else if (opcode == 0x42) { if (!r.sleb(64)) { reason = "invalid i64 global initializer"; return false; } }
-            else if (opcode == 0x43) { if (!r.skip(4)) { reason = "truncated f32 global initializer"; return false; } }
-            else if (opcode == 0x44) { if (!r.skip(8)) { reason = "truncated f64 global initializer"; return false; } }
-            else if (opcode == 0x23) { std::uint32_t index = 0; if (!r.uleb(index)) { reason = "invalid global.get initializer"; return false; } }
-            else { unsupported = true; reason = "unsupported WebAssembly global initializer opcode " + std::to_string(opcode); return false; }
+        std::uint8_t type = 0;
+        if (!r.value_type(&type) || !r.byte(mutability) || mutability > 1) { reason = "invalid global type"; return false; }
+        std::uint8_t opcode = 0, end = 0;
+        if (!r.byte(opcode)) { reason = "truncated global initializer"; return false; }
+        if (opcode == 0x41 && type == 0x7f) {
+            if (!r.sleb(32)) { reason = "invalid i32 global initializer"; return false; }
+        } else if (opcode == 0x42 && type == 0x7e) {
+            if (!r.sleb(64)) { reason = "invalid i64 global initializer"; return false; }
+        } else if (opcode == 0x43 && type == 0x7d) {
+            if (!r.skip(4)) { reason = "truncated f32 global initializer"; return false; }
+        } else if (opcode == 0x44 && type == 0x7c) {
+            if (!r.skip(8)) { reason = "truncated f64 global initializer"; return false; }
+        } else if (opcode == 0x23) {
+            std::uint32_t index = 0;
+            if (!r.uleb(index) || index >= imported_count ||
+                globals[index].mutable_value || globals[index].value != type) {
+                reason = "global initializer must read an immutable imported global of matching type";
+                return false;
+            }
+        } else if (opcode == 0x41 || opcode == 0x42 || opcode == 0x43 || opcode == 0x44) {
+            reason = "global initializer type mismatch"; return false;
+        } else {
+            unsupported = true; reason = "unsupported WebAssembly global initializer opcode " + std::to_string(opcode); return false;
         }
+        if (!r.byte(end) || end != 0x0b) { reason = "global initializer must contain one expression and end"; return false; }
+        globals.push_back({type, mutability != 0});
     }
     if (r.position != r.bytes.size()) { reason = "trailing bytes in global section"; return false; }
     return true;
@@ -794,20 +812,229 @@ bool parse_code(Reader &r, std::uint32_t imported_count, std::vector<FunctionBod
         std::uint32_t groups = 0;
         if (!body.uleb(groups) || groups > max_vector_items) return false;
         std::uint32_t function_local_count = 0;
+        std::vector<std::pair<std::uint32_t, std::uint8_t>> local_groups;
+        local_groups.reserve(groups);
         for (std::uint32_t group = 0; group < groups; ++group) {
             std::uint32_t locals = 0;
-            if (!body.uleb(locals) || !body.value_type()) return false;
+            std::uint8_t type = 0;
+            if (!body.uleb(locals) || !body.value_type(&type)) return false;
             local_total += locals;
             if (local_total > 10'000'000 || locals > UINT32_MAX - function_local_count) return false;
             function_local_count += locals;
+            local_groups.push_back({locals, type});
         }
         const auto code_size = body.bytes.size() - body.position;
         if (!code_size || body.bytes.back() != std::byte{0x0b}) return false;
         const auto code_offset = section_file_offset + r.position + body.position;
-        bodies.push_back({imported_count + n, code_offset, code_size, function_local_count});
+        bodies.push_back({imported_count + n, code_offset, code_size, function_local_count,
+                          std::move(local_groups)});
         if (!r.skip(body_size)) return false;
     }
     return r.position == r.bytes.size();
+}
+
+// Validate the MVP stack machine independently of the disassembler's fixed-size
+// instruction representation. This also validates unreachable code: only operand
+// underflow becomes polymorphic after a terminating instruction.
+bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
+                   const WasmMetadata &metadata, const std::vector<GlobalType> &globals,
+                   std::string &reason, bool &unsupported) {
+    const auto type_index = metadata.function_type_indices[body.index];
+    const auto &signature = metadata.function_types[type_index];
+    Reader code{module.subspan(static_cast<std::size_t>(body.code_offset),
+                               static_cast<std::size_t>(body.code_size))};
+    struct Frame {
+        std::uint8_t kind, result;
+        std::size_t height;
+        bool unreachable = false, has_else = false;
+    };
+    std::vector<Frame> controls{{0xff, signature.result_count ? signature.result_types[0] : std::uint8_t{0}, 0}};
+    std::vector<std::uint8_t> stack;
+    const auto fail = [&](const char *message) { reason = "function[" + std::to_string(body.index) +
+        "] at operator byte " + std::to_string(code.position ? code.position - 1 : 0) + ": " + message; return false; };
+    const auto push = [&](std::uint8_t type) {
+        if (stack.size() >= max_vector_items) return false;
+        stack.push_back(type);
+        return true;
+    };
+    const auto pop = [&](std::uint8_t expected) {
+        const auto &frame = controls.back();
+        if (stack.size() == frame.height) return frame.unreachable;
+        const auto actual = stack.back();
+        stack.pop_back();
+        return !expected || !actual || actual == expected;
+    };
+    const auto pop_any = [&]() -> std::uint8_t {
+        const auto &frame = controls.back();
+        if (stack.size() == frame.height) return 0;
+        const auto value = stack.back(); stack.pop_back(); return value;
+    };
+    const auto dead = [&]() {
+        stack.resize(controls.back().height);
+        controls.back().unreachable = true;
+    };
+    const auto label = [&](std::uint32_t depth) -> std::uint8_t {
+        const auto &target = controls[controls.size() - 1 - depth];
+        return target.kind == 0x03 ? 0 : target.result;
+    };
+    const auto local_type = [&](std::uint32_t index) -> std::uint8_t {
+        if (index < signature.parameter_types.size()) return signature.parameter_types[index];
+        index -= signature.parameter_count;
+        for (const auto &[count, type] : body.local_groups) {
+            if (index < count) return type;
+            index -= count;
+        }
+        return 0;
+    };
+    while (code.position < code.bytes.size()) {
+        const auto op_begin = code.position;
+        std::uint8_t op = 0;
+        if (!code.byte(op)) return fail("truncated opcode");
+        std::uint32_t index = 0;
+        if (op == 0x00 || op == 0x0c || op == 0x0f) {
+            if (op == 0x0c && (!code.uleb(index) || index >= controls.size())) return fail("invalid branch depth");
+            if (op == 0x0f && controls.front().result && !pop(controls.front().result))
+                return fail("return type mismatch");
+            if (op == 0x0c && label(index) && !pop(label(index))) return fail("branch type mismatch");
+            dead();
+        } else if (op == 0x01) {
+        } else if (op >= 0x02 && op <= 0x04) {
+            std::uint8_t result = 0;
+            if (!code.byte(result)) return fail("truncated block type");
+            if (result != 0x40 && result != 0x7f && result != 0x7e && result != 0x7d && result != 0x7c) {
+                unsupported = true; return fail("indexed or non-MVP block type");
+            }
+            if (op == 0x04 && !pop(0x7f)) return fail("if condition must be i32");
+            if (controls.size() >= max_vector_items) return fail("control nesting limit exceeded");
+            controls.push_back({op, result == 0x40 ? std::uint8_t{0} : result, stack.size(),
+                                controls.back().unreachable});
+        } else if (op == 0x05 || op == 0x0b) {
+            if (controls.empty()) return fail("unmatched else or end");
+            auto &frame = controls.back();
+            if (op == 0x05 && (frame.kind != 0x04 || frame.has_else)) return fail("else without matching if");
+            if (frame.result && !pop(frame.result)) return fail("block result type mismatch");
+            if (stack.size() != frame.height) return fail("block stack height mismatch");
+            if (op == 0x05) {
+                frame.has_else = true;
+                frame.unreachable = controls.size() > 1 && controls[controls.size() - 2].unreachable;
+            } else {
+                if (frame.kind == 0x04 && frame.result && !frame.has_else)
+                    return fail("result-typed if requires else");
+                const auto result = frame.result;
+                controls.pop_back();
+                if (controls.empty()) return code.position == code.bytes.size() || fail("bytes after function end");
+                if (result && !push(result)) return fail("operand stack limit exceeded");
+            }
+        } else if (op == 0x0d) {
+            if (!code.uleb(index) || index >= controls.size()) return fail("invalid branch depth");
+            if (!pop(0x7f) || (label(index) && !pop(label(index))))
+                return fail("conditional branch type mismatch");
+            if (label(index) && !push(label(index))) return fail("operand stack limit exceeded");
+        } else if (op == 0x0e) {
+            std::uint32_t count = 0, first = 0;
+            if (!code.uleb(count) || count > 8) { unsupported = true; return fail("branch table exceeds decoder limit"); }
+            for (std::uint32_t n = 0; n <= count; ++n) {
+                if (!code.uleb(index) || index >= controls.size()) return fail("invalid branch table depth");
+                const auto type = label(index);
+                if (n == 0) first = type;
+                else if (first != type) return fail("branch table target types differ");
+            }
+            if (!pop(0x7f) || (first && !pop(static_cast<std::uint8_t>(first))))
+                return fail("branch table type mismatch");
+            dead();
+        } else if (op == 0x10 || op == 0x11) {
+            if (!code.uleb(index)) return fail("invalid call index");
+            const WasmFunctionType *callee = nullptr;
+            if (op == 0x10) {
+                if (index >= metadata.function_type_indices.size()) return fail("call index out of range");
+                callee = &metadata.function_types[metadata.function_type_indices[index]];
+            } else {
+                std::uint8_t table = 0;
+                if (!code.byte(table) || table != 0 || index >= metadata.function_types.size() ||
+                    metadata.imported_tables + metadata.defined_tables != 1)
+                    return fail("invalid indirect call type or table");
+                if (!pop(0x7f)) return fail("indirect call table index must be i32");
+                callee = &metadata.function_types[index];
+            }
+            for (auto it = callee->parameter_types.rbegin(); it != callee->parameter_types.rend(); ++it)
+                if (!pop(*it)) return fail("call argument type mismatch");
+            for (auto type : callee->result_types) if (!push(type)) return fail("operand stack limit exceeded");
+        } else if (op == 0x1a) {
+            if (!pop(0)) return fail("drop stack underflow");
+        } else if (op == 0x1b) {
+            if (!pop(0x7f)) return fail("select condition must be i32");
+            const auto rhs = pop_any(), lhs = pop_any();
+            if ((rhs && lhs && rhs != lhs) || (stack.size() == controls.back().height &&
+                !controls.back().unreachable && (!rhs || !lhs))) return fail("select operands differ or underflow");
+            if (!push(lhs ? lhs : rhs)) return fail("operand stack limit exceeded");
+        } else if (op >= 0x20 && op <= 0x24) {
+            if (!code.uleb(index)) return fail("invalid local or global index");
+            if (op <= 0x22) {
+                const auto type = local_type(index);
+                if (!type) return fail("local index out of range");
+                if (op != 0x20 && !pop(type)) return fail("local assignment type mismatch");
+                if (op != 0x21 && !push(type)) return fail("operand stack limit exceeded");
+            } else {
+                if (index >= globals.size()) return fail("global index out of range");
+                const auto &global = globals[index];
+                if (op == 0x24 && (!global.mutable_value || !pop(global.value)))
+                    return fail("global assignment requires matching mutable global");
+                if (op == 0x23 && !push(global.value)) return fail("operand stack limit exceeded");
+            }
+        } else if (op >= 0x28 && op <= 0x3e) {
+            static constexpr std::array<std::uint8_t, 23> alignment{
+                2,3,2,3,0,0,1,1,0,0,1,1,2,2,2,3,2,3,0,1,0,1,2};
+            if (metadata.imported_memories + metadata.defined_memories != 1)
+                return fail("memory instruction requires one memory");
+            std::uint32_t align = 0, offset = 0;
+            if (!code.uleb(align) || !code.uleb(offset) || align > alignment[op - 0x28])
+                return fail("invalid memory immediate or alignment");
+            std::uint8_t type = op <= 0x35 ? (op == 0x29 || (op >= 0x30 && op <= 0x35) ? 0x7e :
+                op == 0x2a ? 0x7d : op == 0x2b ? 0x7c : 0x7f) :
+                (op == 0x37 || op >= 0x3c ? 0x7e : op == 0x38 ? 0x7d : op == 0x39 ? 0x7c : 0x7f);
+            if (op >= 0x36 && !pop(type)) return fail("store value type mismatch");
+            if (!pop(0x7f)) return fail("memory address must be i32");
+            if (op <= 0x35 && !push(type)) return fail("operand stack limit exceeded");
+        } else if (op == 0x3f || op == 0x40) {
+            std::uint8_t memory = 0;
+            if (!code.byte(memory) || memory != 0 || metadata.imported_memories + metadata.defined_memories != 1)
+                return fail("invalid memory size/grow memory index");
+            if (op == 0x40 && !pop(0x7f)) return fail("memory.grow operand must be i32");
+            if (!push(0x7f)) return fail("operand stack limit exceeded");
+        } else if (op >= 0x41 && op <= 0x44) {
+            if (op == 0x41 || op == 0x42) {
+                if (!code.sleb(op == 0x41 ? 32 : 64)) return fail("invalid integer constant");
+            } else if (!code.skip(op == 0x43 ? 4 : 8)) return fail("truncated float constant");
+            if (!push(op == 0x41 ? 0x7f : op == 0x42 ? 0x7e : op == 0x43 ? 0x7d : 0x7c))
+                return fail("operand stack limit exceeded");
+        } else if (op >= 0x45 && op <= 0xbf) {
+            std::uint8_t input = 0, output = 0;
+            bool binary = true;
+            if (op <= 0x4f) { input = 0x7f; output = 0x7f; binary = op != 0x45; }
+            else if (op <= 0x5a) { input = 0x7e; output = 0x7f; binary = op != 0x50; }
+            else if (op <= 0x60) { input = 0x7d; output = 0x7f; }
+            else if (op <= 0x66) { input = 0x7c; output = 0x7f; }
+            else if (op <= 0x78) { input = output = 0x7f; binary = op > 0x69; }
+            else if (op <= 0x8a) { input = output = 0x7e; binary = op > 0x7b; }
+            else if (op <= 0x98) { input = output = 0x7d; binary = op > 0x91; }
+            else if (op <= 0xa6) { input = output = 0x7c; binary = op > 0x9f; }
+            else {
+                static constexpr std::array<std::uint8_t, 25> inputs{
+                    0x7e,0x7d,0x7d,0x7c,0x7c,0x7f,0x7f,0x7d,0x7d,0x7c,0x7c,
+                    0x7f,0x7f,0x7e,0x7e,0x7c,0x7f,0x7f,0x7e,0x7e,0x7d,0x7d,0x7c,0x7f,0x7e};
+                static constexpr std::array<std::uint8_t, 25> outputs{
+                    0x7f,0x7f,0x7f,0x7f,0x7f,0x7e,0x7e,0x7e,0x7e,0x7e,0x7e,
+                    0x7d,0x7d,0x7d,0x7d,0x7d,0x7c,0x7c,0x7c,0x7c,0x7c,0x7f,0x7e,0x7d,0x7c};
+                input = inputs[op - 0xa7]; output = outputs[op - 0xa7]; binary = false;
+            }
+            if (!pop(input) || (binary && !pop(input))) return fail("numeric operand type mismatch");
+            if (!push(output)) return fail("operand stack limit exceeded");
+        } else {
+            unsupported = true; return fail("opcode outside WebAssembly MVP scalar subset");
+        }
+        if (code.position - op_begin > 15) { unsupported = true; return fail("instruction exceeds 15-byte decoder limit"); }
+    }
+    return fail("missing function end");
 }
 }
 
@@ -830,6 +1057,7 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
         return Error{ErrorCode::malformed, "Unsupported WebAssembly magic or binary version"};
     std::vector<std::uint32_t> function_types;
     std::vector<FunctionBody> bodies;
+    std::vector<GlobalType> globals;
     WasmMetadata wasm;
     std::vector<Diagnostic> wasm_diagnostics;
     std::uint64_t name_bytes = 0;
@@ -862,12 +1090,18 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
         }
         bool valid = true;
         if (id == 1) valid = parse_types(section, type_count, wasm);
-        else if (id == 2) valid = parse_imports(section, type_count, wasm, section_begin, name_bytes,
-                                                parse_reason, unsupported_payload);
+        else if (id == 2) {
+            valid = parse_imports(section, type_count, wasm, section_begin, name_bytes,
+                                  parse_reason, unsupported_payload);
+            if (valid) for (const auto &entry : wasm.imports)
+                if (entry.kind == WasmExternalKind::global)
+                    globals.push_back({*entry.global_value_type, entry.global_mutable});
+        }
         else if (id == 3) valid = parse_functions(section, type_count, function_types);
         else if (id == 4) valid = parse_tables(section, wasm.defined_tables, wasm, parse_reason, unsupported_payload);
         else if (id == 5) valid = parse_memories(section, wasm.defined_memories, wasm, parse_reason, unsupported_payload);
-        else if (id == 6) valid = parse_globals(section, wasm.defined_globals, parse_reason, unsupported_payload);
+        else if (id == 6) valid = parse_globals(section, wasm.defined_globals, wasm.imported_globals, globals,
+                                                parse_reason, unsupported_payload);
         else if (id == 7) valid = parse_exports(section, wasm, section_begin, name_bytes, parse_reason, unsupported_payload);
         else if (id == 8) valid = parse_start(section, wasm, section_begin, parse_reason);
         else if (id == 9) valid = parse_elements(section, wasm, section_begin, parse_reason, unsupported_payload);
@@ -930,6 +1164,13 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
     wasm.type_count = type_count;
     wasm.defined_functions = static_cast<std::uint32_t>(function_types.size());
     wasm.function_type_indices.insert(wasm.function_type_indices.end(), function_types.begin(), function_types.end());
+    for (const auto &body : bodies) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "WebAssembly body validation canceled"};
+        parse_reason.clear(); unsupported_payload = false;
+        if (!validate_body(body, bytes, wasm, globals, parse_reason, unsupported_payload))
+            return Error{unsupported_payload ? ErrorCode::unsupported : ErrorCode::malformed,
+                         "WebAssembly body validation failed: " + parse_reason};
+    }
     auto table_applied = apply_initial_table_elements(wasm, wasm_diagnostics);
     if (!table_applied) return table_applied.error();
     if (wasm.start_function) {
@@ -1013,7 +1254,7 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
     loaded.metadata.wasm = std::move(wasm);
     loaded.metadata_complete = false;
     loaded.diagnostics.push_back({DiagnosticSeverity::info,
-        "Function bodies are mapped to function-relative address spaces; type-stack validation and linking are not implemented", {}});
+        "Function bodies are MVP type-validated and mapped to function-relative address spaces; host linking is not implemented", {}});
     loaded.diagnostics.insert(loaded.diagnostics.end(), wasm_diagnostics.begin(), wasm_diagnostics.end());
     auto read = loaded.metadata_reads.include({0}, bytes.size());
     if (!read) return read.error();
