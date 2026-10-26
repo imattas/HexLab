@@ -294,3 +294,52 @@ not infer hardware floating-point register conventions. Vector types are
 unsupported until an explicit vector calling-convention model is added. The
 register, chunk, aggregate, hidden-result, and stack rules follow sections
 2.1, 2.2, and 2.7 of the [RISC-V psABI specification](https://riscv-non-isa.github.io/riscv-elf-psabi-doc/).
+
+## PowerPC64 little-endian ELFv2
+
+`CallingConvention::ppc64le_elfv2` selects the little-endian ELFv2 C calling
+convention explicitly. The classifier does not infer ELFv2 from ELF class,
+machine type, or endianness, and makes no claim about big-endian ELFv2 or
+ELFv1. A function type may have `platform_default` or `c_decl`; any other
+declared convention is rejected.
+
+The supported scalar shapes are 1-, 2-, 4-, and 8-byte integer, boolean, and
+enum values; 8-byte pointers; and **binary** `float` (4 bytes) and `double`
+(8 bytes), identified by those exact type names. Integral arguments occupy
+one successive parameter doubleword. The first eight doublewords map to
+`R3`-`R10`; later integer values use their stack home. Floating arguments use
+the independent `F1`-`F13` bank but still consume one parameter doubleword,
+skipping its corresponding GPR. Once FPRs are exhausted, a floating argument
+uses its stack home even if the home would correspond to a GPR. Narrow scalar
+locations retain the payload `size` and an 8-byte `placement_size`. Returns
+use `R3` for integer/pointer scalars and `F1` for binary float/double.
+
+The aggregate subset consists of C-like structures with a complete stored
+layout, fixed size 8, 16, 24, or 32 bytes, alignment at most 8 bytes, and
+nonoverlapping, fixed-offset integer, boolean, enum, or pointer scalar fields.
+It rejects methods, bitfields, virtual bases, nested structures, arrays,
+unions, floating or vector fields, and 16-byte alignment. Callers must only
+use this subset for C-compatible value types; the type graph does not record
+C++ triviality or copy-constructor rules. Each whole doubleword is passed by
+value in its corresponding GPR or stack home, including a split at `R10`.
+Each structure doubleword travels as one whole memory image, satisfying the
+ABI's full-doubleword rule even when the image contains field padding.
+8- and 16-byte results use `R3` and optionally `R4`; 24- and 32-byte results
+use a hidden result-buffer pointer in `R3`, shifting the first explicit
+argument to `R4`. The hidden pointer has no asserted returned-register echo.
+
+Stack offsets are bytes from the callee's entry `SP`: parameter doubleword
+zero is at `SP+32`, doubleword eight at `SP+96`. These are parameter-save-area
+home positions rather than a compact list of spilled values.
+`stack_argument_bytes` is zero when every value uses a
+register; otherwise it reports the allocated parameter save area size after
+the initial 32-byte frame header, at least 64 bytes and long enough for every
+argument home. The caller maintains 16-byte stack alignment and cleans up its
+frame.
+
+Variadic signatures, vector and complex values, decimal and extended binary
+floating formats, 128-bit integers, arrays as parameters, unresolved types,
+other aggregate layouts, and unknown C++ class semantics are unsupported.
+The algorithm follows the OpenPOWER [64-bit ELFv2 ABI specification](https://openpower.foundation/specifications/64bitelfabi/),
+especially [parameter save area, register selection, and returns in the
+published source](https://github.com/OpenPOWERFoundation/ELFv2-ABI/blob/2c052b1ec5a5e2c51989eb109f8559a9df6d8202/specification/ch_2.xml).
