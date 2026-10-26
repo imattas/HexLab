@@ -19,9 +19,13 @@ following chain records:
   declared fixup page. Multi-start entries must terminate within the bounded
   segment-start record.
 
-Compressed symbol pools, unsupported import/symbol encodings, unsupported
+Uncompressed and zlib-compressed symbol pools are decoded. Compressed pool
+expansion is capped at 16 MiB per stream, each imported name at 64 KiB, and
+the entire compressed input must be consumed with no trailing bytes. Names
+decoded from compressed data retain their import record provenance but have
+no direct file offset. Unsupported import/symbol encodings, unsupported
 pointer formats, malformed extents, and targets that require unavailable
 runtime state leave the stream incomplete or fail parsing when the input is
-structurally malformed. No decompression or guessed target base is attempted.
+structurally malformed. No guessed target base is attempted.
 
 Format reference: [Apple dyld chained fixup definitions](https://github.com/apple-oss-distributions/dyld/blob/main/include/mach-o/fixup-chains.h).
