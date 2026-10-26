@@ -1152,6 +1152,32 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 return Branch{"predicate", instruction.direct_target, {}, std::move(predicate)};
             }
         }
+        if (instruction.opcode == Opcode::m6502_jmp && instruction.flow == FlowKind::jump &&
+            !instruction.direct_target && instruction.operands.size() == 1) {
+            const auto *pointer = std::get_if<MemoryOperand>(&instruction.operands.front());
+            if (pointer && !pointer->base && !pointer->index && !pointer->ip_relative &&
+                pointer->displacement >= 0 && pointer->displacement <= UINT16_MAX) {
+                const auto slot = static_cast<std::uint16_t>(pointer->displacement);
+                const auto high_slot = static_cast<std::uint16_t>((slot & 0xff00u) | ((slot + 1u) & 0x00ffu));
+                const auto byte_load = [&](std::uint16_t address) -> ExpressionPtr {
+                    MemoryValue value;
+                    value.type = integer_type(8);
+                    value.absolute = Address{instruction.address.space, address};
+                    return std::make_shared<Expression>(Expression{value.type, std::move(value)});
+                };
+                const auto low = byte_load(slot);
+                const auto high = byte_load(high_slot);
+                const auto high_word = std::make_shared<Expression>(Expression{integer_type(16),
+                    UnaryValue{"zext", high}});
+                const auto shifted_high = binary("shl", high_word, constant_expr(8, 16), 16);
+                Branch branch;
+                branch.condition = "true";
+                branch.indirect_target = binary("or",
+                    std::make_shared<Expression>(Expression{integer_type(16), UnaryValue{"zext", low}}),
+                    shifted_high, 16);
+                return branch;
+            }
+        }
         const auto op = instruction.opcode;
         if (!operands.empty()) {
             RegisterOperand destination = accumulator;
@@ -1226,19 +1252,92 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                     binary("or", binary("or", preserved, bit(carry, 0)), bit(zero, 1)),
                     binary("or", bit(overflow, 6), bit(negative, 7)));
                 const auto decimal_bit = boolean_binary("bit_extract", status_value, constant_expr(3, 8));
-                const auto decimal_result = std::make_shared<Expression>(Expression{
-                    integer_type(8), UnknownValue{subtract ? "NMOS 6502 decimal SBC result is unsupported"
-                                                            : "NMOS 6502 decimal ADC result is unsupported"}});
-                const auto decimal_status = binary("or", preserved,
-                    binary("and", std::make_shared<Expression>(Expression{
-                        integer_type(8), UnknownValue{subtract ? "NMOS 6502 decimal SBC C/Z/N/V flags are unsupported"
-                                                                : "NMOS 6502 decimal ADC C/Z/N/V flags are unsupported"}}),
-                        constant_expr(0xc3, 8)));
+                ExpressionPtr decimal_result;
+                ExpressionPtr decimal_status;
+                const auto decimal_unknown = std::make_shared<Expression>(Expression{
+                    integer_type(8), UnknownValue{"NMOS 6502 decimal operation with invalid BCD operands"}});
+                const auto decimal_unknown_flags = binary("and", decimal_unknown, constant_expr(0xc3, 8));
+                if (!subtract) {
+                    const auto low_a = binary("and", lhs, constant_expr(0x0f, 8));
+                    const auto low_b = binary("and", rhs, constant_expr(0x0f, 8));
+                    const auto low_sum = binary("add", binary("add", low_a, low_b), bool_byte(carry_in));
+                    const auto low_adjust = binary("select_if", boolean_binary("uge", low_sum, constant_expr(10, 8)),
+                        binary("pair", binary("add", low_sum, constant_expr(6, 8)), low_sum));
+                    const auto high_a = binary("and", lhs, constant_expr(0xf0, 8));
+                    const auto high_b = binary("and", rhs, constant_expr(0xf0, 8));
+                    const auto widen = [](ExpressionPtr value) -> ExpressionPtr {
+                        return std::make_shared<Expression>(Expression{integer_type(9), UnaryValue{"zext", std::move(value)}});
+                    };
+                    const auto pre_high_adjust = binary("add",
+                        binary("add", widen(high_a), widen(high_b), 9), widen(low_adjust), 9);
+                    const auto decimal_carry = boolean_binary("uge", pre_high_adjust, constant_expr(0xa0, 9));
+                    const auto intermediate_byte = std::make_shared<Expression>(Expression{integer_type(8),
+                        UnaryValue{"trunc", pre_high_adjust}});
+                    const auto decimal_negative = boolean_binary("bit_extract", intermediate_byte, constant_expr(7, 8));
+                    const auto decimal_overflow = boolean_binary("bit_extract",
+                        binary("and", binary("and",
+                            std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"bitnot", binary("xor", lhs, rhs)}}),
+                            binary("xor", lhs, intermediate_byte)), constant_expr(0x80, 8)), constant_expr(7, 8));
+                    const auto corrected = binary("select_if", decimal_carry,
+                        binary("pair", binary("add", pre_high_adjust, constant_expr(0x60, 9), 9), pre_high_adjust), 9);
+                    const auto corrected_byte = std::make_shared<Expression>(Expression{integer_type(8),
+                        UnaryValue{"trunc", binary("and", corrected, constant_expr(0xff, 9), 9)}});
+                    const auto valid_a = boolean_binary("ule", binary("and", lhs, constant_expr(0x0f, 8)), constant_expr(9, 8));
+                    const auto valid_b = boolean_binary("ule", binary("and", rhs, constant_expr(0x0f, 8)), constant_expr(9, 8));
+                    const auto valid_high_a = boolean_binary("ule", binary("shr", lhs, constant_expr(4, 8)), constant_expr(9, 8));
+                    const auto valid_high_b = boolean_binary("ule", binary("shr", rhs, constant_expr(4, 8)), constant_expr(9, 8));
+                    const auto valid = boolean_binary("and", boolean_binary("and", valid_a, valid_b),
+                        boolean_binary("and", valid_high_a, valid_high_b));
+                    decimal_result = binary("select_if", valid, binary("pair", corrected_byte, decimal_unknown));
+                    const auto valid_status = binary("or",
+                        binary("or", binary("or", preserved, bit(decimal_carry, 0)), bit(zero, 1)),
+                        binary("or", bit(decimal_overflow, 6), bit(decimal_negative, 7)));
+                    decimal_status = binary("select_if", valid,
+                        binary("pair", valid_status, binary("or", preserved, decimal_unknown_flags)));
+                } else {
+                    const auto borrow = boolean_unary("not", carry_in);
+                    const auto low_a = binary("and", lhs, constant_expr(0x0f, 8));
+                    const auto low_b = binary("and", rhs, constant_expr(0x0f, 8));
+                    const auto low_b_with_borrow = binary("add", low_b, bool_byte(borrow));
+                    const auto low_borrow = boolean_binary("ult", low_a, low_b_with_borrow);
+                    const auto raw_low = binary("sub", binary("sub", low_a, low_b), bool_byte(borrow));
+                    const auto corrected_low = binary("select_if", low_borrow,
+                        binary("pair", binary("sub", raw_low, constant_expr(6, 8)), raw_low));
+                    const auto high_a = binary("shr", lhs, constant_expr(4, 8));
+                    const auto high_b = binary("shr", rhs, constant_expr(4, 8));
+                    const auto high_b_with_borrow = binary("add", high_b, bool_byte(low_borrow));
+                    const auto high_borrow = boolean_binary("ult", high_a, high_b_with_borrow);
+                    const auto raw_high = binary("sub", binary("sub", high_a, high_b), bool_byte(low_borrow));
+                    const auto corrected_high = binary("select_if", high_borrow,
+                        binary("pair", binary("sub", raw_high, constant_expr(6, 8)), raw_high));
+                    const auto low_digit = binary("and", corrected_low, constant_expr(0x0f, 8));
+                    const auto high_digit = binary("and", corrected_high, constant_expr(0x0f, 8));
+                    const auto intermediate_byte = binary("or", low_digit,
+                        binary("shl", raw_high, constant_expr(4, 8)));
+                    const auto decimal_negative = boolean_binary("bit_extract", intermediate_byte, constant_expr(7, 8));
+                    const auto decimal_overflow = boolean_binary("bit_extract",
+                        binary("and", binary("and", binary("xor", lhs, rhs),
+                            binary("xor", lhs, intermediate_byte)), constant_expr(0x80, 8)), constant_expr(7, 8));
+                    const auto corrected_byte = binary("or", low_digit,
+                        binary("shl", high_digit, constant_expr(4, 8)));
+                    const auto valid_a = boolean_binary("ule", binary("and", lhs, constant_expr(0x0f, 8)), constant_expr(9, 8));
+                    const auto valid_b = boolean_binary("ule", binary("and", rhs, constant_expr(0x0f, 8)), constant_expr(9, 8));
+                    const auto valid_high_a = boolean_binary("ule", binary("shr", lhs, constant_expr(4, 8)), constant_expr(9, 8));
+                    const auto valid_high_b = boolean_binary("ule", binary("shr", rhs, constant_expr(4, 8)), constant_expr(9, 8));
+                    const auto valid = boolean_binary("and", boolean_binary("and", valid_a, valid_b),
+                        boolean_binary("and", valid_high_a, valid_high_b));
+                    decimal_result = binary("select_if", valid, binary("pair", corrected_byte, decimal_unknown));
+                    const auto valid_status = binary("or",
+                        binary("or", binary("or", preserved, bit(carry, 0)), bit(zero, 1)),
+                        binary("or", bit(decimal_overflow, 6), bit(decimal_negative, 7)));
+                    decimal_status = binary("select_if", valid,
+                        binary("pair", valid_status, binary("or", preserved, decimal_unknown_flags)));
+                }
                 const auto alternatives = binary("pair", decimal_result, result_byte);
                 const auto selected_result = binary("select_if", decimal_bit, alternatives);
                 const auto status_alternatives = binary("pair", decimal_status, binary_status);
                 const auto selected_status = binary("select_if", decimal_bit, status_alternatives);
-                Intrinsic effect{subtract ? "m6502_sbc_decimal_guarded" : "m6502_adc_decimal_guarded",
+                Intrinsic effect{subtract ? "m6502_sbc" : "m6502_adc",
                     {}, instruction.memory_read ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
                 effect.register_writes = {accumulator, status};
                 effect.register_output_values = {selected_result, selected_status};
