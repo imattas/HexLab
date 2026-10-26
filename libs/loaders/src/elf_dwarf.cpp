@@ -86,11 +86,14 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
                 "Relocations into compressed DWARF sections are unsupported", ErrorCode::unsupported);
         const bool x64 = metadata.header.machine == 62;
         const bool a64 = metadata.header.machine == 183;
+        const bool riscv = metadata.header.machine == 243;
         std::uint8_t width = 0;
         if (x64 && rel.type == 1) width = 8;          // R_X86_64_64
         else if (x64 && (rel.type == 10 || rel.type == 11)) width = 4; // R_X86_64_32/32S
         else if (a64 && rel.type == 257) width = 8;  // R_AARCH64_ABS64
         else if (a64 && rel.type == 258) width = 4;  // R_AARCH64_ABS32
+        else if (riscv && rel.type == 1) width = 4;  // R_RISCV_32
+        else if (riscv && rel.type == 2 && metadata.header.is_64) width = 8; // R_RISCV_64
         else throw Failure{{ErrorCode::unsupported, "unsupported ELF relocation in DWARF section (type " + std::to_string(rel.type) + ")"}};
         require(metadata.header.order == ByteOrder::little, "big-endian DWARF relocation is unsupported", ErrorCode::unsupported);
         require(rel.field_size && *rel.field_size == width, "DWARF relocation width is not proven");
@@ -111,8 +114,9 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
         require(rel.offset <= target.size() && width <= target.size() - rel.offset, "DWARF relocation field exceeds target section");
         const auto max_value = width == 8 ? UINT64_MAX : std::uint64_t(UINT32_MAX);
         std::uint64_t sum = symbol->value;
-        if (x64 && rel.type == 1) {
-            // R_X86_64_64 stores the low 64 bits of S+A.
+        if ((x64 && rel.type == 1) || (riscv && rel.type == 2)) {
+            // These 64-bit absolute relocations store the ABI-defined low
+            // 64 bits of S+A.
             sum += static_cast<std::uint64_t>(*rel.addend);
         } else if (x64 && rel.type == 11 && *rel.addend < 0) {
             const auto magnitude = static_cast<std::uint64_t>(-(*rel.addend + 1)) + 1;
