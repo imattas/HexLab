@@ -16,15 +16,21 @@ branches selecting FCC0 through FCC7. It also recognizes D-format
 arithmetic/unary operations and all 16 classic `C.<cond>.D` comparisons,
 conversions between S/D/W for the common
 `CVT` forms, and `ROUND.W`, `TRUNC.W`, `CEIL.W`, and `FLOOR.W` from S/D.
-Decoded instructions expose logical 32- or 64-bit FPR operands and explicit
-FCSR effects for arithmetic, square root, and conversions; comparisons write
-the selected FCC register, and branches read only their selected FCC register.
+Decoded instructions expose logical 32- or 64-bit FPR operands, including the
+correct destination width for S/D/W conversions, and explicit FCSR effects for
+arithmetic, square root, and conversions; comparisons write the selected FCC
+register, and branches read only their selected FCC register.
 Sign/move operations `ABS`, `MOV`, and `NEG` do not claim FCSR effects.
 All classic compare predicate bits and branch condition-code fields are
 preserved in the formatter and MIPS32 lifting. FPR pairing mode is not inferred
-from runtime CP0 state. COP1 likely branches, other formats, and functions
-remain unsupported.
+from runtime CP0 state. COP1 likely branches, long-word conversion forms,
+MFC1/MTC1/CFC1/CTC1 transfers, other formats, and functions remain unsupported.
 
 This slice does not evaluate IEEE arithmetic or conversions, runtime rounding
-modes, exception flags, or compare-result truth at runtime. It is an analysis
-representation, not an FPU emulator.
+modes, exception flags, or compare-result truth at runtime. The decompiler
+retains floating operations and conversions as typed `mips.*` intrinsics with
+their decoded FPR/FCSR effects. Conversion intrinsics carry the proper scalar
+result type but do not produce a computed value. Exact rounding and exception
+behavior remain unsupported by the semantic evaluator. Malformed fixed fields
+(including nonzero unused unary `ft` and reserved compare bits) are invalid;
+recognized but unmodeled formats/functions report unsupported.

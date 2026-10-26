@@ -46,8 +46,8 @@ architectural completion for whole functions containing unsupported effects.
 The bounded COP1 S/D/W scalar subset lifts to floating-typed FPR values.
 `LWC1`/`SWC1` and `LDC1`/`SDC1` retain 32-/64-bit floating memory types; S and
 D arithmetic, comparisons, conversions, and W rounding forms remain named
-`mips.*` intrinsics with their decoded FCSR effects attached. `BC1T` and
-`BC1F` produce branches over an explicit `mips.fcc0` predicate. The processor
-decoder records one delay slot, while delay-slot execution is not modeled by
-the decompiler. FCSR condition/flag behavior, IEEE arithmetic/conversion, and
-runtime rounding are left abstract.
+`mips.*` intrinsics with decoded FPR/FCSR effects and conversion result types.
+`BC1T` and `BC1F` produce branches over the selected `mips.fccN` predicate.
+The decoder records one delay slot; MIPS analysis owns and orders the slot
+through its explicit CFG edge. Intrinsic FCSR condition/flag behavior, IEEE
+arithmetic/conversion results, and runtime rounding remain abstract.
