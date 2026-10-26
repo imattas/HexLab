@@ -403,8 +403,21 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 }
                 continue;
             }
-            if (op == 0x23 || op == 0x24)
-                return unsupported("global access requires global value-flow metadata");
+            if (op == 0x23 || op == 0x24) {
+                const auto index = immediate(code[n]->instruction);
+                if (!metadata || metadata->globals.size() !=
+                        static_cast<std::uint64_t>(metadata->imported_globals) + metadata->defined_globals ||
+                    !index || *index >= metadata->globals.size())
+                    return unsupported("global index or exact type metadata is unavailable");
+                const auto &global = metadata->globals[static_cast<std::size_t>(*index)];
+                const auto type = wasm_value_type(global.value_type);
+                if (!type) return unsupported("global value type is not a supported numeric MVP type");
+                if (op == 0x24 && !global.mutable_value)
+                    return unsupported("global.set targets an immutable global");
+                if (op == 0x23) stack.push_back(*type);
+                else { auto value = shape_pop(stack, *type); if (!value) return value.error(); }
+                continue;
+            }
             if (op == 0x10) {
                 const auto index = immediate(code[n]->instruction);
                 const auto *callee = index ? signature_for(*index) : nullptr;
@@ -426,8 +439,29 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 }
                 continue;
             }
-            if (op == 0x11)
-                return unsupported("indirect calls are not modeled");
+            if (op == 0x11) {
+                const auto type_index = immediate(code[n]->instruction, 0);
+                if (!metadata || !type_index || *type_index >= metadata->function_types.size())
+                    return unsupported("call_indirect type metadata is unavailable");
+                const auto &callee = metadata->function_types[*type_index];
+                if (callee.parameter_count != callee.parameter_types.size() || callee.result_count != callee.result_types.size() ||
+                    callee.parameter_types.size() > 1 || callee.result_types.size() > 1)
+                    return unsupported("call_indirect supports at most one numeric parameter and result");
+                auto table_slot = shape_pop(stack, integer(32));
+                if (!table_slot) return table_slot.error();
+                for (auto it = callee.parameter_types.rbegin(); it != callee.parameter_types.rend(); ++it) {
+                    auto type = wasm_value_type(*it);
+                    if (!type) return unsupported("call_indirect parameter type is unsupported");
+                    auto argument = shape_pop(stack, *type);
+                    if (!argument) return argument.error();
+                }
+                if (!callee.result_types.empty()) {
+                    auto type = wasm_value_type(callee.result_types.front());
+                    if (!type) return unsupported("call_indirect result type is unsupported");
+                    stack.push_back(*type);
+                }
+                continue;
+            }
             if (op >= 0x28 && op <= 0x3e) {
                 const auto info = memory_op(op);
                 if (!info) return unsupported("memory opcode metadata is unavailable");
@@ -480,6 +514,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             const bool integer_division_or_remainder=(op>=0x6d&&op<=0x70)||(op>=0x7f&&op<=0x82);
             if(op==0x00)
                 lifted.trap_edges.push_back({code[n]->instruction.address,TrapEdgeKind::unconditional,"unreachable"});
+            else if(op==0x11) lifted.trap_edges.push_back({code[n]->instruction.address,TrapEdgeKind::may_trap,"call_indirect table bounds or type mismatch"});
             else if(integer_division_or_remainder)
                 lifted.trap_edges.push_back({code[n]->instruction.address,TrapEdgeKind::may_trap,code[n]->instruction.mnemonic_override});
             if(op==0x00)break;
@@ -516,7 +551,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             if(op==0x1a){auto v=pop({});if(!v)return v.error();continue;}
             if(op==0x1b){auto cond=pop(integer(32));if(!cond)return cond.error();auto when_true=pop({});if(!when_true)return when_true.error();auto when_false=pop(when_true.value()->type);if(!when_false)return when_false.error();auto alternatives=binary("pair",when_true.value(),when_false.value(),when_true.value()->type);stack.push_back(binary("select_if",cond.value(),alternatives,when_true.value()->type));continue;}
             if (op >= 0x20 && op <= 0x22) {
-                const auto index = immediate(i);
+                const auto index = immediate(code[n]->instruction);
                 const auto type = index ? local_type(*index) : std::optional<ValueType>{};
                 if (!index || !type)
                     return unsupported("local index is outside the typed parameter/local declarations");
@@ -533,10 +568,28 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     return Error{ErrorCode::resource_limit, "WebAssembly operand stack exceeds 128 values"};
                 continue;
             }
-            if (op == 0x23 || op == 0x24)
-                return unsupported("global access requires global value-flow metadata");
+            if (op == 0x23 || op == 0x24) {
+                const auto index = immediate(code[n]->instruction);
+                if (!metadata || metadata->globals.size() !=
+                        static_cast<std::uint64_t>(metadata->imported_globals) + metadata->defined_globals ||
+                    !index || *index >= metadata->globals.size()) return unsupported("global index metadata unavailable");
+                const auto &global = metadata->globals[static_cast<std::size_t>(*index)];
+                const auto type = wasm_value_type(global.value_type);
+                if (!type || (op == 0x24 && !global.mutable_value)) return unsupported("unsupported global type or immutable global.set");
+                if (op == 0x23) {
+                    Intrinsic get; get.name = "wasm_global_get_" + std::to_string(*index); get.memory_effect = IntrinsicMemoryEffect::unknown;
+                    const auto slot = stack.size(); const RegisterOperand reg{RegisterBank::wasm_stack, static_cast<std::uint8_t>(slot), type->bits, false};
+                    get.result_type = *type; get.register_writes.push_back(reg); emit(n, std::move(get));
+                    stack.push_back(std::make_shared<Expression>(Expression{*type, RegisterValue{reg, 0}}));
+                } else {
+                    auto value = pop(*type); if (!value) return value.error();
+                    Intrinsic set; set.name = "wasm_global_set_" + std::to_string(*index); set.operands.push_back(value.value());
+                    set.memory_effect = IntrinsicMemoryEffect::unknown; emit(n, std::move(set));
+                }
+                continue;
+            }
             if (op == 0x10) {
-                const auto index = immediate(i);
+                const auto index = immediate(code[n]->instruction);
                 const auto *callee = index ? signature_for(*index) : nullptr;
                 if (!index || !callee || callee->parameter_count != callee->parameter_types.size() ||
                     callee->result_count != callee->result_types.size())
@@ -571,7 +624,46 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     return Error{ErrorCode::resource_limit, "WebAssembly operand stack exceeds 128 values"};
                 continue;
             }
-            if (op == 0x11) return unsupported("indirect calls are not modeled");
+            if (op == 0x11) {
+                const auto type_index = immediate(i, 0), table_index = immediate(i, 1);
+                if (!metadata || !type_index || !table_index || *table_index != 0 ||
+                    static_cast<std::uint64_t>(metadata->imported_tables) + metadata->defined_tables != 1 ||
+                    *type_index >= metadata->function_types.size())
+                    return unsupported("call_indirect requires exact type and single-table metadata");
+                const auto *callee = &metadata->function_types[static_cast<std::size_t>(*type_index)];
+                if (callee->parameter_count != callee->parameter_types.size() ||
+                    callee->result_count != callee->result_types.size() ||
+                    callee->parameter_types.size() > 1 || callee->result_types.size() > 1)
+                    return unsupported("call_indirect supports at most one numeric parameter and result");
+                if (stack.empty() || stack.back()->type != integer(32))
+                    return unsupported("call_indirect table index is unavailable or not i32");
+                auto table_index_value = stack.back();
+                stack.pop_back();
+                std::vector<ExpressionPtr> arguments(callee->parameter_types.size());
+                for (std::size_t argument = callee->parameter_types.size(); argument > 0; --argument) {
+                    const auto arg_type = wasm_value_type(callee->parameter_types[argument - 1]);
+                    if (!arg_type) return unsupported("call_indirect parameter type is unsupported");
+                    auto value = pop(*arg_type);
+                    if (!value) return value.error();
+                    arguments[argument - 1] = value.value();
+                }
+                Intrinsic call;
+                call.name = "wasm_call_indirect_type_" + std::to_string(*type_index);
+                call.operands = std::move(arguments);
+                call.operands.push_back(std::move(table_index_value));
+                call.memory_effect = IntrinsicMemoryEffect::unknown;
+                if (!callee->result_types.empty()) {
+                    const auto result_type = wasm_value_type(callee->result_types.front());
+                    if (!result_type) return unsupported("call_indirect result type is unsupported");
+                    const auto result_slot = stack.size();
+                    const RegisterOperand reg{RegisterBank::wasm_stack, static_cast<std::uint8_t>(result_slot), result_type->bits, false};
+                    call.result_type = *result_type;
+                    call.register_writes.push_back(reg);
+                    emit(n, std::move(call));
+                    stack.push_back(std::make_shared<Expression>(Expression{*result_type, RegisterValue{reg, 0}}));
+                } else emit(n, std::move(call));
+                continue;
+            }
             if (op >= 0x28 && op <= 0x3e) {
                 const auto info = memory_op(op);
                 if (!info) return unsupported("memory opcode metadata is unavailable");

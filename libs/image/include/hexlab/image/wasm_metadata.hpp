@@ -98,6 +98,13 @@ struct WasmTableElement {
     bool operator==(const WasmTableElement &) const = default;
 };
 
+struct WasmGlobal {
+    std::uint8_t value_type = 0;
+    bool mutable_value = false;
+    bool imported = false;
+    bool operator==(const WasmGlobal &) const = default;
+};
+
 struct WasmFunctionName {
     std::uint32_t function_index = 0;
     std::string name;
@@ -147,6 +154,8 @@ struct WasmMetadata {
     // Sparse non-null slots after applying active element segments in module
     // order. Defined-table holes are null; imported-table holes are unknown.
     std::vector<WasmTableElement> initial_table_elements;
+    // Full imported-then-defined global index space.
+    std::vector<WasmGlobal> globals;
     std::vector<WasmFunctionName> function_names;
     std::vector<WasmLocalName> local_names;
     // Expanded, bounded local declarations for defined functions only.
