@@ -1036,7 +1036,7 @@ private:
     bool template_parameter_pattern(const std::vector<Token> &pattern,
                                     const std::vector<TemplateParameter> &parameters,
                                     std::map<std::string, TypePtr, std::less<>> &bindings,
-                                    const TypePtr &argument, unsigned &specificity) {
+                                    const TypePtr &argument, unsigned &strength) {
         auto parameter = [&](std::size_t index) -> const TemplateParameter * {
             if (index >= pattern.size() || !identifier(pattern[index].text)) return nullptr;
             const auto found = std::find_if(parameters.begin(), parameters.end(), [&](const auto &item) {
@@ -1048,25 +1048,25 @@ private:
         const TemplateParameter *deduced = parameter(0);
         TypePtr value = argument;
         if (deduced && pattern.size() == 1) {
-            specificity += 0;
+            strength = 0;
         } else if (deduced && pattern.size() == 2 && pattern[1].text == "*") {
             if (argument->kind() != Kind::pointer) return false;
             value = argument->element();
-            specificity += 2;
+            strength = 2;
         } else if (pattern.size() == 3 && pattern[0].text == "const" &&
                    (deduced = parameter(1)) && pattern[2].text == "*") {
             if (argument->kind() != Kind::pointer || !argument->element() ||
                 argument->element()->kind() != Kind::qualified ||
                 !(argument->element()->qualifiers() & static_cast<std::uint8_t>(Qualifier::const_))) return false;
             value = argument->element()->element();
-            specificity += 3;
+            strength = 3;
         } else {
             for (const auto &token : pattern)
                 if (std::any_of(parameters.begin(), parameters.end(), [&](const auto &item) { return item.name == token.text; }))
                     fail(ErrorCode::unsupported, "partial specialization pattern is outside the supported type, T*, and const T* forms");
             auto fixed = parse_type_tokens(pattern, {});
             if (fixed->id() != argument->id()) return false;
-            specificity += 8;
+            strength = 8;
             return true;
         }
         auto found = bindings.find(deduced->name);
@@ -1077,7 +1077,7 @@ private:
     bool template_value_parameter_pattern(const std::vector<Token> &pattern,
                                           const std::vector<TemplateParameter> &parameters,
                                           std::map<std::string, std::uint64_t, std::less<>> &bindings,
-                                          std::uint64_t argument, unsigned &specificity) {
+                                          std::uint64_t argument, unsigned &strength) {
         if (pattern.size() != 1)
             fail(ErrorCode::unsupported, "non-type specialization patterns must be one integer literal or parameter name");
         const auto &token = pattern.front().text;
@@ -1099,36 +1099,61 @@ private:
         // signed-only parsing incorrectly rejected valid high-bit unsigned
         // specialization arguments before they could be compared.
         const auto value = integer_magnitude(token, std::numeric_limits<std::uint64_t>::max());
-        specificity += 8;
+        strength = 8;
         return value == argument;
     }
     bool template_template_parameter_pattern(const std::vector<Token> &pattern,
                                             const std::vector<TemplateParameter> &parameters,
                                             std::map<std::string, std::string, std::less<>> &bindings,
-                                            const std::string &argument, unsigned &specificity) {
-        if (pattern.size() != 1 || !identifier(pattern.front().text))
-            fail(ErrorCode::unsupported, "template-template specialization patterns must be one template name or parameter name");
-        const auto &name = pattern.front().text;
-        const auto parameter = std::find_if(parameters.begin(), parameters.end(), [&](const auto &item) {
-            return item.name == name;
-        });
-        if (parameter != parameters.end()) {
-            if (!parameter->template_parameter || parameter->pack)
-                fail(ErrorCode::unsupported, "template-template specialization patterns can bind only template parameters");
-            validate_template_template_argument(*parameter, argument);
-            if (auto found = bindings.find(name); found != bindings.end()) return found->second == argument;
-            bindings.emplace(name, argument);
-            return true;
+                                            const TemplateParameter &primary_parameter,
+                                            const std::string &argument, unsigned &strength) {
+        std::string template_path;
+        for (const auto &token : pattern) {
+            if (!identifier(token.text) && token.text != "::")
+                fail(ErrorCode::unsupported, "template-template specialization patterns must be a template name or parameter name");
+            template_path += token.text;
         }
-        const auto fixed_name = qualify_name(name);
-        const auto found = result_.templates.find(fixed_name);
-        if (found == result_.templates.end())
+        if (template_path.empty())
+            fail(ErrorCode::unsupported, "template-template specialization patterns must be one template name or parameter name");
+        const auto &name = template_path;
+        if (pattern.size() == 1) {
+            const auto parameter = std::find_if(parameters.begin(), parameters.end(), [&](const auto &item) {
+                return item.name == name;
+            });
+            if (parameter != parameters.end()) {
+                if (!parameter->template_parameter || parameter->pack)
+                    fail(ErrorCode::unsupported, "template-template specialization patterns can bind only template parameters");
+                validate_template_template_argument(*parameter, argument);
+                if (auto found = bindings.find(name); found != bindings.end()) return found->second == argument;
+                bindings.emplace(name, argument);
+                return true;
+            }
+        }
+        const auto fixed_name = resolve_template_name(name);
+        if (fixed_name.empty())
             fail(ErrorCode::unsupported, "fixed template-template specialization pattern names an unsupported template");
-        // Validate the template's signature against the primary's template-template parameter
-        // before comparing the bound identity.
-        if (found->first != argument) return false;
-        specificity += 8;
+        const std::vector<TemplateParameter> *actual_parameters = nullptr;
+        if (auto actual = aggregate_templates_.find(fixed_name); actual != aggregate_templates_.end())
+            actual_parameters = &actual->second.parameters;
+        else if (auto alias = template_aliases_.find(fixed_name); alias != template_aliases_.end())
+            actual_parameters = &alias->second.parameters;
+        if (!actual_parameters || actual_parameters->size() != primary_parameter.nested_parameters.size())
+            fail(ErrorCode::malformed, "fixed template-template pattern arity does not match primary template parameter");
+        for (std::size_t nested = 0; nested < actual_parameters->size(); ++nested)
+            if (!same_template_parameter_shape(primary_parameter.nested_parameters[nested], (*actual_parameters)[nested]))
+                fail(ErrorCode::malformed, "fixed template-template pattern parameter kinds do not match primary template parameter");
+        if (fixed_name != argument) return false;
+        strength = 8;
         return true;
+    }
+    static bool dominates(const std::vector<unsigned> &left, const std::vector<unsigned> &right) {
+        if (left.size() != right.size()) return false;
+        bool strictly_better = false;
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            if (left[i] < right[i]) return false;
+            strictly_better = strictly_better || left[i] > right[i];
+        }
+        return strictly_better;
     }
     TypePtr instantiate_template_aggregate(const std::string &name, const std::vector<TemplateArgument> &arguments) {
         if (template_depth_ >= o_.max_nesting)
@@ -1157,31 +1182,36 @@ private:
             }
         }
 
-        const AggregateSpecialization *selected = nullptr;
-        TemplateBindings selected_bindings;
-        unsigned best_specificity = 0;
+        struct MatchingSpecialization {
+            const AggregateSpecialization *specialization = nullptr;
+            TemplateBindings bindings;
+            std::vector<unsigned> strengths;
+        };
+        std::vector<MatchingSpecialization> matches_found;
         for (const auto &specialization : definition->second.specializations) {
             if (specialization.patterns.size() != complete_arguments.size()) continue;
             TemplateBindings candidate_bindings;
-            unsigned specificity = specialization.parameters.empty() ? 10000u : 0u;
+            std::vector<unsigned> strengths(complete_arguments.size(), specialization.parameters.empty() ? 10000u : 0u);
             bool matches = true;
             for (std::size_t i = 0; i < complete_arguments.size(); ++i) {
                 const auto &primary_parameter = definition->second.parameters[i];
                 const auto &pattern = specialization.patterns[i];
+                unsigned pattern_strength = 0;
                 bool matched = false;
                 if (primary_parameter.value_parameter && complete_arguments[i].value) {
                     matched = template_value_parameter_pattern(pattern, specialization.parameters,
                                                                candidate_bindings.values,
-                                                               *complete_arguments[i].value, specificity);
+                                                               *complete_arguments[i].value, pattern_strength);
                 } else if (!primary_parameter.value_parameter && !primary_parameter.template_parameter &&
                            complete_arguments[i].type) {
                     matched = template_parameter_pattern(pattern, specialization.parameters,
                                                          candidate_bindings.types,
-                                                         complete_arguments[i].type, specificity);
+                                                         complete_arguments[i].type, pattern_strength);
                 } else if (primary_parameter.template_parameter && !complete_arguments[i].template_name.empty()) {
                     matched = template_template_parameter_pattern(pattern, specialization.parameters,
                                                                  candidate_bindings.templates,
-                                                                 complete_arguments[i].template_name, specificity);
+                                                                 primary_parameter,
+                                                                 complete_arguments[i].template_name, pattern_strength);
                 } else {
                     fail(ErrorCode::unsupported, "specialization argument kind is unsupported");
                 }
@@ -1189,6 +1219,7 @@ private:
                     matches = false;
                     break;
                 }
+                strengths[i] = specialization.parameters.empty() ? 10000u : pattern_strength;
             }
             if (!matches) continue;
             for (const auto &parameter : specialization.parameters)
@@ -1198,13 +1229,27 @@ private:
                      !candidate_bindings.types.contains(parameter.name)))
                     fail(ErrorCode::unsupported,
                          "partial specialization contains a parameter that cannot be deduced");
-            if (selected && specificity == best_specificity)
-                fail(ErrorCode::conflict, "ambiguous partial specialization for '" + instance_name + "'");
-            if (!selected || specificity > best_specificity) {
-                selected = &specialization;
-                selected_bindings = std::move(candidate_bindings);
-                best_specificity = specificity;
+            matches_found.push_back({&specialization, std::move(candidate_bindings), std::move(strengths)});
+        }
+
+        const AggregateSpecialization *selected = nullptr;
+        TemplateBindings selected_bindings;
+        if (!matches_found.empty()) {
+            std::vector<std::size_t> dominant;
+            for (std::size_t candidate = 0; candidate < matches_found.size(); ++candidate) {
+                bool is_dominated = false;
+                for (std::size_t other = 0; other < matches_found.size(); ++other)
+                    if (candidate != other && dominates(matches_found[other].strengths, matches_found[candidate].strengths)) {
+                        is_dominated = true;
+                        break;
+                    }
+                if (!is_dominated) dominant.push_back(candidate);
             }
+            if (dominant.size() != 1)
+                fail(ErrorCode::conflict, "ambiguous partial specialization for '" + instance_name + "'");
+            auto &winner = matches_found[dominant.front()];
+            selected = winner.specialization;
+            selected_bindings = std::move(winner.bindings);
         }
 
         const auto &body = selected ? selected->definition : definition->second.definition;

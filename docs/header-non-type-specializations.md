@@ -48,8 +48,10 @@ pattern is rejected.
 
 Template-template arguments can also be matched by a direct template-template
 parameter name or by a fixed previously declared class or alias template name.
-The template parameter shapes must match exactly. Compound template argument
-patterns and template-template parameter packs remain unsupported.
+The parameter shapes of template-template arguments must match the relevant
+template-template parameter exactly. Fixed template names use normal qualified-
+name, using-directive, and inline-namespace resolution. Compound template
+argument patterns and template-template parameter packs remain unsupported.
 
 The importer does not evaluate arithmetic or symbolic expressions in
 specialization patterns: `N + 1`, enumerators, negative values, and pointer or
@@ -59,7 +61,9 @@ template parameters and parameter packs can appear in primary class templates,
 but parameter packs remain unsupported by specializations. Scope is
 part of template identity, so same-named templates in distinct namespaces
 remain independent. Function
-and alias-template specializations remain unsupported. Ambiguous matches fail
-instead of depending on declaration order. Template argument and parameter
-counts remain capped at 32, and recursive instantiation remains bounded by the
-configured nesting limit.
+and alias-template specializations remain unsupported. Partial candidates are
+compared per primary argument. A candidate wins only when its pattern is at
+least as strong on every argument and stronger on at least one; incomparable
+or equivalent matches fail as ambiguous rather than depending on declaration
+order. Template argument and parameter counts remain capped at 32, and
+recursive instantiation remains bounded by the configured nesting limit.
