@@ -13,8 +13,8 @@ file(GENERATE OUTPUT "${_manifest}" CONTENT
 id=example.scalar-ir
 name=Scalar IR example
 version=1.0
-capability=processor.ir.scalar,1,22,0
-requires=processor.ir.scalar,1,22
+capability=processor.ir.scalar,1,23,0
+requires=processor.ir.scalar,1,23
 ")
 set(_package_dir "${CMAKE_INSTALL_LIBDIR}/hexlab/plugins")
 install(TARGETS hexlab_scalar_ir RUNTIME DESTINATION "${_package_dir}" LIBRARY DESTINATION "${_package_dir}")

@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define HEXLAB_PLUGIN_ABI_MAJOR 1u
-#define HEXLAB_PLUGIN_ABI_MINOR 22u
+#define HEXLAB_PLUGIN_ABI_MINOR 23u
 #define HEXLAB_PLUGIN_QUERY_SYMBOL "hexlab_plugin_query"
 #define HEXLAB_EXTENSION_API_VERSION 1u
 #define HEXLAB_PLUGIN_MAX_EXTENSION_INPUT 32u
@@ -186,7 +186,9 @@ typedef int32_t (*HexLabProcessorSemanticDecodeV3)(void* extension_context, uint
 /* ABI 1.22: bounded, pure scalar bit-vector instruction IR. Output storage is
    host-owned; conversion finishes under the module lock after callback return.
    No plugin pointers survive. Integer arithmetic wraps to width bits (8/16/32/64).
-   is_signed is 0 or1 and must agree across an operation and its inputs. */
+   is_signed is 0 or 1 and must agree across an operation and its inputs. ABI
+   1.23 appends operations only; the record API version and layout stay fixed,
+   and the host capability minor negotiates the expanded operation set. */
 #define HEXLAB_SCALAR_IR_API_VERSION 1u
 #define HEXLAB_SCALAR_IR_MAX_NODES 32u
 #define HEXLAB_SCALAR_IR_MAX_OUTPUTS 8u
@@ -203,7 +205,19 @@ typedef enum HexLabScalarIROperation {
     HEXLAB_SCALAR_IR_AND = 6,
     HEXLAB_SCALAR_IR_OR = 7,
     HEXLAB_SCALAR_IR_XOR = 8,
-    HEXLAB_SCALAR_IR_NOT = 9
+    HEXLAB_SCALAR_IR_NOT = 9,
+    /* ABI 1.23: result is a width-sized integer 0 or 1. Signed/unsigned
+       ordering is selected by the operation, not by host-language casts. */
+    HEXLAB_SCALAR_IR_EQ = 10,
+    HEXLAB_SCALAR_IR_NE = 11,
+    HEXLAB_SCALAR_IR_ULT = 12,
+    HEXLAB_SCALAR_IR_UGE = 13,
+    HEXLAB_SCALAR_IR_ULE = 14,
+    HEXLAB_SCALAR_IR_UGT = 15,
+    HEXLAB_SCALAR_IR_SLT = 16,
+    HEXLAB_SCALAR_IR_SGE = 17,
+    HEXLAB_SCALAR_IR_SLE = 18,
+    HEXLAB_SCALAR_IR_SGT = 19
 } HexLabScalarIROperation;
 
 typedef struct HexLabScalarIRNode {

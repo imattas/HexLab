@@ -100,6 +100,16 @@ std::optional<decompiler::Intrinsic> convert_scalar_ir(const HexLabInstructionIR
                 case HEXLAB_SCALAR_IR_AND:operation="and";break;
                 case HEXLAB_SCALAR_IR_OR:operation="or";break;
                 case HEXLAB_SCALAR_IR_XOR:operation="xor";break;
+                case HEXLAB_SCALAR_IR_EQ:operation="eq";break;
+                case HEXLAB_SCALAR_IR_NE:operation="ne";break;
+                case HEXLAB_SCALAR_IR_ULT:operation="ult";break;
+                case HEXLAB_SCALAR_IR_UGE:operation="uge";break;
+                case HEXLAB_SCALAR_IR_ULE:operation="ule";break;
+                case HEXLAB_SCALAR_IR_UGT:operation="ugt";break;
+                case HEXLAB_SCALAR_IR_SLT:operation="slt";break;
+                case HEXLAB_SCALAR_IR_SGE:operation="sge";break;
+                case HEXLAB_SCALAR_IR_SLE:operation="sle";break;
+                case HEXLAB_SCALAR_IR_SGT:operation="sgt";break;
                 default:return {};
                 }
                 costs[i]+=costs[node.right];depths[i]=1+std::max(depths[node.left],depths[node.right]);
