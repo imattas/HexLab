@@ -25,3 +25,6 @@ NZCV bits through arbitrary instructions, or recover higher-level idioms such
 as `CSET`/`CSETM` aliases. Existing compare propagation remains limited to
 supported acyclic paths; unsupported definitions retain an explicit NZCV-based
 condition instead of guessed operands.
+
+Integer `CCMP`/`CCMN` now chain flag conditions with encoded false-path NZCV
+values; see [AArch64 conditional compares](a64-conditional-compare.md).

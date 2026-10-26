@@ -62,7 +62,7 @@ struct CodeViewTypeRecord {
     std::uint16_t parameter_count = 0;
     std::string name;
     // CodeView's ODR-qualified name (present when the unique-name property is set).
-    // Used only to disambiguate forward declarations; displayed names remain stable.
+    // Used for forward resolution and import collision checks; displayed names remain stable.
     std::string unique_name;
     std::array<std::byte, 16> type_server_guid{};
     std::uint32_t type_server_age = 0;
