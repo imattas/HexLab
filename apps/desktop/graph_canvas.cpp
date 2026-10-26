@@ -144,6 +144,9 @@ GraphCanvas::GraphCanvas(wxWindow *parent) : wxPanel(parent) {
          [this](wxMouseEvent &event) { zoom_by(event.GetWheelRotation() > 0 ? 1.2 : 1. / 1.2, event.GetPosition()); });
     Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &event) {
         switch (event.GetKeyCode()) {
+        case WXK_F6:
+            if (focus_items) focus_items();
+            break;
         case WXK_HOME:
             fit();
             break;
@@ -178,9 +181,7 @@ GraphCanvas::GraphCanvas(wxWindow *parent) : wxPanel(parent) {
             else move_instruction(true);
             break;
         case WXK_RETURN:
-            if (hit_ && std::holds_alternative<GraphEdgeId>(*hit_)) {
-                follow_edge(std::get<GraphEdgeId>(*hit_), true);
-            } else follow_focused_node();
+            activate_focused_item();
             break;
         default:
             event.Skip();
@@ -346,6 +347,62 @@ wxString GraphCanvas::focus_description() const {
     const auto source_name = source == nodes_.end() ? wxString("?") : preview_text(source->second->label, 48);
     const auto target_name = target == nodes_.end() ? wxString("?") : preview_text(target->second->label, 48);
     return wxString("Focused ") + edge_name(edge->kind) + ": " + source_name + " -> " + target_name;
+}
+std::optional<GraphHit> GraphCanvas::focused_item() const {
+    if (hit_) return hit_;
+    if (const auto node = focused_node()) return GraphHit{*node};
+    return {};
+}
+wxString GraphCanvas::item_description(GraphHit item) const {
+    const auto describe_node = [this](GraphNodeId id) {
+        const auto found = nodes_.find(id);
+        if (found == nodes_.end()) return wxString("Unknown node");
+        const auto &node = *found->second;
+        wxString kind;
+        switch (node.kind) {
+        case GraphNodeKind::block: kind = "Block"; break;
+        case GraphNodeKind::function: kind = "Function"; break;
+        case GraphNodeKind::external: kind = "External"; break;
+        case GraphNodeKind::unresolved: kind = "Unresolved"; break;
+        case GraphNodeKind::boundary: kind = "Boundary"; break;
+        }
+        auto description = kind + wxString::Format(" node %llu: ", static_cast<unsigned long long>(id.value)) +
+                           wxString::FromUTF8(node.label);
+        if (node.selection) description += "; location " + location_text(*node.selection);
+        else description += "; no navigable location";
+        if (!node.comment.empty()) description += "; comment: " + wxString::FromUTF8(node.comment);
+        return description;
+    };
+    if (const auto *id = std::get_if<GraphNodeId>(&item)) return describe_node(*id);
+    const auto id = std::get<GraphEdgeId>(item);
+    const auto found = edges_.find(id);
+    if (found == edges_.end()) return {};
+    const auto &edge = *found->second;
+    auto description = wxString::Format("Edge %llu, ", static_cast<unsigned long long>(id.value)) +
+                       edge_name(edge.kind) + "; from " + describe_node(edge.source) +
+                       "; to " + describe_node(edge.target);
+    if (edge.selection) description += "; source " + location_text(*edge.selection);
+    if (edge.target_location) description += "; target " + location_text(*edge.target_location);
+    if (edge.boundary) description += "; boundary edge";
+    return description;
+}
+bool GraphCanvas::focus_item(GraphHit item) {
+    if (const auto *id = std::get_if<GraphNodeId>(&item)) return focus_node(*id);
+    const auto found = edges_.find(std::get<GraphEdgeId>(item));
+    if (found == edges_.end()) return false;
+    const auto source = found->second->selection;
+    hit_ = item;
+    edge_focus_incoming_ = false;
+    reveal_node(found->second->source);
+    Refresh();
+    if (focus_changed) focus_changed();
+    return !source || navigate_location(*source);
+}
+void GraphCanvas::activate_focused_item() {
+    if (hit_ && std::holds_alternative<GraphEdgeId>(*hit_))
+        follow_edge(std::get<GraphEdgeId>(*hit_), true);
+    else
+        follow_focused_node();
 }
 bool GraphCanvas::focus_node(GraphNodeId id, bool navigate_to_location) {
     const auto found = nodes_.find(id);

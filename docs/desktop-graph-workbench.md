@@ -8,6 +8,28 @@ precedence, which keeps function, boundary, and unresolved nodes addressable in
 graphs that contain them. Graph search and node navigation continue to work
 across every node kind, including nodes without a navigable address.
 
+**Graph items** opens a native, keyboard-accessible list of every current node
+and edge, including off-screen and addressless items. **F6** opens the list from
+the canvas; F6 or Escape returns to the canvas. The canvas retains its existing
+Tab/Shift+Tab node traversal. In the list, ordinary Tab moves to the read-only
+item details and source actions, so keyboard users can leave graph traversal.
+The Graph items button also hides the list when it is open.
+
+Each row describes the node kind, stable graph ID, full label, location and
+comment, or the edge kind and both endpoints with source and target locations
+when present. Native row selection follows graph focus; the Graph state column
+separately marks the canvas's graph-local multi-selection. Item details expose
+the full description, current source address, graph status and selection count
+in a read-only text control suitable for screen-reader review and copying.
+Canvas clicks, graph searches, branch traversal and linked-view selection update
+the list without moving keyboard focus. Arrow keys in the list focus an item
+and synchronize its source through the same stale-graph guard; Enter follows
+the focused node/instruction or edge using the existing graph follow behavior.
+Opening the list preserves the current selection. A replacement or cleared
+graph replaces or clears its rows, and partial graph status remains visible in
+the details. The native list and text controls provide an accessible alternative
+to the painted canvas; live assistive-technology validation remains outstanding.
+
 Selecting a graph node or instruction still navigates the linked views through
 the existing stale-graph guard. Unresolved external identities without a
 location remain graph-local because they have no image address to navigate to.

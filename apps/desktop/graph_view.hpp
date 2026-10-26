@@ -4,6 +4,7 @@
 #include <wx/button.h>
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
+#include <wx/listctrl.h>
 #include <vector>
 namespace hexlab::desktop {
 class GraphView final : public wxPanel {
@@ -27,6 +28,17 @@ class GraphView final : public wxPanel {
     std::vector<GraphNodeId> search_matches_;
     std::size_t search_index_ = 0;
     wxString status_base_;
+    wxPanel *items_panel_;
+    wxListCtrl *items_;
+    wxTextCtrl *item_details_;
+    std::shared_ptr<const ProjectGraph> items_graph_;
+    std::vector<GraphHit> item_rows_;
+    std::map<GraphHit, long> item_row_by_id_;
+    std::set<GraphNodeId> items_selected_nodes_;
+    std::optional<GraphHit> items_focus_;
+    bool updating_items_ = false;
+    void show_items();
+    void refresh_items();
     void refresh_status();
     void find_node(int direction, bool restart);
 };

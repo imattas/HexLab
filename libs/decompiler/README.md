@@ -38,6 +38,16 @@ operation names and full-register inputs/outputs instead of guessed lane
 assignments. This section describes the initial SSE2 layer; later VEX/EVEX
 slices have their own bounded coverage.
 
+EVEX.128/.256/.512 `VPACKSSWB`, `VPACKSSDW`, `VPACKUSWB`, and `VPACKUSDW`
+lift through typed intrinsics with signed word/dword inputs and narrowed
+signed/unsigned byte/word results. Packing repeats independently within each
+128-bit group, with source-one results before source-two results. Intrinsic
+names retain both input shapes, the active result shape, merge/zero masking,
+and upper-ZMM clearing for VL forms. Merge forms include the old destination
+and K-register inputs; memory sources retain read effects. Broadcast and
+unmodeled encodings remain unsupported. See [x64 SIMD coverage](../../docs/x64-simd-coverage.md)
+for the exact opcode and width whitelist and the caller-owned pure evaluator.
+
 `format_pseudocode` is the lossless diagnostic formatter: it prints each lifted
 basic block with labels and preserves control transfers as gotos.
 

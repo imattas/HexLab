@@ -174,6 +174,8 @@ map 2 means `0F38`.
 | --- | --- | --- | --- |
 | Signed saturating byte/word add/sub | `vpaddsb/sw`, `vpsubsb/sw` | 1 / EC, ED, E8, E9 / WIG | byte or word |
 | Unsigned saturating byte/word add/sub | `vpaddusb/usw`, `vpsubusb/usw` | 1 / DC, DD, D8, D9 / WIG | byte or word |
+| Signed/unsigned saturating word-to-byte pack | `vpacksswb`, `vpackuswb` | 1 / 63, 67 / WIG | byte |
+| Signed/unsigned saturating dword-to-word pack | `vpackssdw`, `vpackusdw` | 1 / 6B / W0; 2 / 2B / W0 | word |
 | Unsigned byte and signed word min/max | `vpminub`, `vpminsw`, `vpmaxub`, `vpmaxsw` | 1 / DA, EA, DE, EE / WIG | byte or word |
 | Signed byte and unsigned word min/max | `vpminsb`, `vpminuw`, `vpmaxsb`, `vpmaxuw` | 2 / 38, 3A, 3C, 3E / WIG | byte or word |
 | Signed/unsigned dword min/max | `vpminsd/ud`, `vpmaxsd/ud` | 2 / 39, 3B, 3D, 3F / W0 | dword |
@@ -213,6 +215,24 @@ adjacent signed word products into 16 dwords and uses mask bits 0-15.
 bytes, saturates each adjacent pair sum into a signed word, and uses mask bits
 0-31. Mask bits beyond the output element count are ignored. The old
 destination is preserved or zeroed at that same output element width.
+
+The four EVEX pack forms narrow both signed source vectors independently
+within each 128-bit group. Each group's low 64 result bits come from source
+one and its high 64 result bits from source two. `vpacksswb/dw` clamp to
+signed byte/word ranges; `vpackuswb/dw` clamp the signed inputs to unsigned
+byte/word ranges, so negative inputs become zero. The writemask selects the
+narrowed destination bytes or words after packing. Unmasked, merge and `{z}`
+forms all retain this ordering at 128, 256 and 512 bits. VL forms clear the
+remaining upper ZMM bits. Full-width memory inputs use the existing
+16/32/64-byte disp8 tuple scaling; broadcast (including dword-to-word
+`m32bcst`), rounding, and W1 dword-to-word encodings remain unsupported.
+The existing shared lane evaluator and typed EVEX decompiler path now admit
+these four forms through the explicit EVEX shape whitelist, preserving signed
+input types, narrowed result types, mask and old-destination dependencies,
+memory-read effects, and upper-register clearing.
+Windows Debug `hexlab_processors` and `hexlab_decompiler` targets built
+successfully in `agent-x86-simd-build` for this extension; no tests were added
+or run.
 
 `evaluate_x86_evex_integer` evaluates all explicitly decoded integer forms,
 including the original wrapping add/sub subset. It accepts caller-supplied

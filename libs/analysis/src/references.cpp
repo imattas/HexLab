@@ -2913,6 +2913,21 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     return {};
                 return found->second.offset != 0;
             };
+            std::optional<bool> predicate_executes;
+            if (instruction.arm) {
+                if (instruction.arm->predicate == ArmPredicate::always) {
+                    predicate_executes = true;
+                } else if (instruction.arm->predicate == ArmPredicate::condition &&
+                           (instruction.condition == 2 || instruction.condition == 3)) {
+                    if (const auto carry = current_carry())
+                        predicate_executes = instruction.condition == 2 ? *carry : !*carry;
+                }
+            }
+            // A known-false predicated instruction has no architectural effects.
+            // Preserve all facts through it; unknown predicates retain the
+            // conservative write invalidation below.
+            if (predicate_executes == false)
+                continue;
             if ((instruction.flow == FlowKind::call || instruction.flow == FlowKind::jump) &&
                 (instruction.opcode == Opcode::a32_bx || instruction.opcode == Opcode::a32_blx ||
                  instruction.opcode == Opcode::t32_bx || instruction.opcode == Opcode::t32_blx)) {
@@ -2935,8 +2950,7 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                 }
             }
             std::optional<std::pair<std::uint32_t, Address>> definition;
-            const bool arm_instruction_unconditional =
-                instruction.arm && instruction.arm->predicate == ArmPredicate::always;
+            const bool arm_instruction_unconditional = predicate_executes == true;
             const auto arm_register_value = [&](const RegisterOperand &reg) -> std::optional<std::uint32_t> {
                 if (reg.bank != RegisterBank::arm32_gpr || reg.width != 32 || reg.index == 15)
                     return {};
@@ -3204,7 +3218,7 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
             std::optional<bool> updated_carry;
             if (carry_may_change && instruction.arm->flags_known &&
                 (instruction.arm->flags_written & 2) &&
-                instruction.arm->predicate == ArmPredicate::always && !instruction.arm->writes_pc) {
+                arm_instruction_unconditional && !instruction.arm->writes_pc) {
                 const auto read_register = [&](const RegisterOperand &reg) { return arm_register_value(reg); };
                 const auto known_carry = current_carry();
                 const std::array<bool, 2> candidates{known_carry.value_or(false), known_carry.value_or(true)};
