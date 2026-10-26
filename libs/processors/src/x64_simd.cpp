@@ -313,6 +313,10 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
         case 0x58: operation = pp == 0 ? Opcode::vaddps : Opcode::vaddpd; break;
         case 0x5c: operation = pp == 0 ? Opcode::vsubps : Opcode::vsubpd; break;
         case 0x59: operation = pp == 0 ? Opcode::vmulps : Opcode::vmulpd; break;
+        case 0x5e:
+            if (map != 1) return false;
+            operation = pp == 0 ? Opcode::vdivps : Opcode::vdivpd;
+            break;
         case 0x57: operation = pp == 0 ? Opcode::vxorps : Opcode::vxorpd; break;
         case 0x54: operation = pp == 0 ? Opcode::vandps : Opcode::vandpd; break;
         case 0x74:
@@ -480,6 +484,17 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
     }
     state.i.opcode = operation;
     state.i.vector_bits = vector_width;
+    if (operation == Opcode::vaddps || operation == Opcode::vaddpd ||
+        operation == Opcode::vsubps || operation == Opcode::vsubpd ||
+        operation == Opcode::vmulps || operation == Opcode::vmulpd ||
+        operation == Opcode::vdivps || operation == Opcode::vdivpd) {
+        // Packed FP operations depend on MXCSR controls and update sticky
+        // exception flags; retain the whole register until bit-level effects
+        // are modeled.
+        constexpr RegisterOperand mxcsr{RegisterBank::mxcsr, 0, 32, false};
+        state.i.register_reads.push_back(mxcsr);
+        state.i.register_writes.push_back(mxcsr);
+    }
     if (const auto shape = x86_avx_detail::integer_dataflow_shape(operation))
         state.i.vector_element_bits = shape->result_bits;
     if (move && opcode == 0x11) {
@@ -633,12 +648,14 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
         integer_shape = x86_avx_detail::evex_integer_shape(operation);
         if (!integer_shape) unsupported("EVEX packed integer result shape is not modeled");
     } else {
-        if (map != 1 || (opcode != 0x58 && opcode != 0x5c && opcode != 0x59))
+        if (map != 1 || (opcode != 0x58 && opcode != 0x5c && opcode != 0x59 && opcode != 0x5e))
             return false;
         if (pp == 0 && !w)
-            operation = opcode == 0x58 ? Opcode::vaddps : opcode == 0x5c ? Opcode::vsubps : Opcode::vmulps;
+            operation = opcode == 0x58 ? Opcode::vaddps : opcode == 0x5c ? Opcode::vsubps :
+                        opcode == 0x59 ? Opcode::vmulps : Opcode::vdivps;
         else if (pp == 1 && w)
-            operation = opcode == 0x58 ? Opcode::vaddpd : opcode == 0x5c ? Opcode::vsubpd : Opcode::vmulpd;
+            operation = opcode == 0x58 ? Opcode::vaddpd : opcode == 0x5c ? Opcode::vsubpd :
+                        opcode == 0x59 ? Opcode::vmulpd : Opcode::vdivpd;
         else
             invalid("EVEX packed floating arithmetic has an unsupported pp/W combination");
     }
@@ -711,7 +728,7 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
     }
 
     state.i.vector_element_bits = (operation == Opcode::vaddps || operation == Opcode::vsubps ||
-                                   operation == Opcode::vmulps) ? 32 : 64;
+                                   operation == Opcode::vmulps || operation == Opcode::vdivps) ? 32 : 64;
     constexpr RegisterOperand mxcsr{RegisterBank::mxcsr, 0, 32, false};
     state.i.register_reads.push_back(mxcsr);
     state.i.register_writes.push_back(mxcsr);

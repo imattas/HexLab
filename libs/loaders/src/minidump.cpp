@@ -8,7 +8,7 @@ namespace hexlab {
 namespace {
 constexpr std::uint32_t stream_thread_list = 3, stream_module_list = 4,
     stream_memory_list = 5, stream_exception = 6, stream_system_info = 7,
-    stream_memory64_list = 9, stream_memory_info = 16;
+    stream_memory64_list = 9, stream_memory_info = 16, stream_thread_names = 24;
 constexpr std::uint64_t max_streams = 4096, max_memory_regions = 131072,
     max_modules = 65536, max_threads = 65536, max_metadata_bytes = 64u * 1024u * 1024u;
 constexpr std::uint64_t max_decoded_contexts = 4096;
@@ -31,12 +31,12 @@ Result<ByteView> read(const ByteStorage &storage, std::uint64_t offset, std::siz
         return Error{ErrorCode::io, "Minidump source returned a short read"};
     return bytes.value();
 }
-Result<std::string> utf8(std::uint32_t rva, const ByteStorage &storage, std::uint64_t &budget) {
+Result<std::string> utf8(std::uint64_t rva, const ByteStorage &storage, std::uint64_t &budget) {
     auto length = read(storage, rva, 4);
     if (!length) return length.error();
     const auto count = static_cast<std::uint32_t>(u(length.value().bytes, 0, 4));
     if (count > 131072 || (count & 1) || !extent(std::uint64_t(rva) + 4, count, storage.size()))
-        return Error{ErrorCode::malformed, "Minidump module string has an invalid UTF-16 extent"};
+        return Error{ErrorCode::malformed, "Minidump UTF-16 string has an invalid extent"};
     if (budget > max_metadata_bytes - std::min<std::uint64_t>(max_metadata_bytes, count))
         return Error{ErrorCode::resource_limit, "Minidump metadata exceeds its byte budget"};
     budget += count;
@@ -117,7 +117,7 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
             if (std::find_if(streams.begin(), streams.end(), [&](const auto &existing) {
                     return existing.type == row.type && (row.type == stream_thread_list || row.type == stream_module_list ||
                         row.type == stream_memory_list || row.type == stream_exception || row.type == stream_system_info ||
-                        row.type == stream_memory64_list || row.type == stream_memory_info);
+                        row.type == stream_memory64_list || row.type == stream_memory_info || row.type == stream_thread_names);
                 }) != streams.end())
                 return Error{ErrorCode::malformed, "Minidump contains duplicate standard streams"};
             streams.push_back(row);
@@ -367,6 +367,52 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
             if (!context) return context.error();
             row.context = std::move(context.value());
             metadata.exception = std::move(row);
+        }
+
+        if (auto names = stream(stream_thread_names)) {
+            if (names->size < 4)
+                return Error{ErrorCode::malformed, "Minidump ThreadNames stream is truncated"};
+            auto count_bytes = read(*storage, names->rva, 4);
+            if (!count_bytes) return count_bytes.error();
+            const auto count = u(count_bytes.value().bytes, 0, 4);
+            constexpr std::size_t record_size = 12;
+            if (count > max_threads || count > (names->size - 4) / record_size)
+                return Error{ErrorCode::resource_limit, "Minidump thread-name count exceeds stream bounds"};
+            auto bytes = read(*storage, names->rva, static_cast<std::size_t>(4 + count * record_size));
+            if (!bytes) return bytes.error();
+            constexpr std::size_t row_cost = sizeof(MinidumpThreadName) + sizeof(std::uint32_t);
+            if (budget > max_metadata_bytes || count > (max_metadata_bytes - budget) / row_cost)
+                return Error{ErrorCode::resource_limit, "Minidump thread-name metadata exceeds its byte budget"};
+            metadata.thread_names.reserve(static_cast<std::size_t>(count));
+            std::vector<std::uint32_t> thread_ids;
+            thread_ids.reserve(static_cast<std::size_t>(count));
+            for (std::uint64_t i = 0; i < count; ++i) {
+                if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump thread-name decoding canceled"};
+                const auto at = static_cast<std::size_t>(4 + i * record_size);
+                const auto thread_id = static_cast<std::uint32_t>(u(bytes.value().bytes, at, 4));
+                const auto name_rva = u(bytes.value().bytes, at + 4, 8);
+                if (!thread_id || !name_rva)
+                    return Error{ErrorCode::malformed, "Minidump thread-name row has a zero thread ID or string RVA"};
+                auto name = utf8(name_rva, *storage, budget);
+                if (!name) return name.error();
+                if (budget > max_metadata_bytes || name.value().size() > max_metadata_bytes - budget)
+                    return Error{ErrorCode::resource_limit, "Minidump thread names exceed the metadata byte budget"};
+                budget += name.value().size();
+                MinidumpThreadName row;
+                row.thread_id = thread_id;
+                row.name = std::move(name.value());
+                row.record_file_offset = {std::uint64_t{names->rva} + at};
+                row.string_file_offset = {name_rva};
+                thread_ids.push_back(thread_id);
+                metadata.thread_names.push_back(std::move(row));
+            }
+            std::sort(thread_ids.begin(), thread_ids.end());
+            if (std::adjacent_find(thread_ids.begin(), thread_ids.end()) != thread_ids.end())
+                return Error{ErrorCode::malformed, "Minidump ThreadNames stream has duplicate thread IDs"};
+            std::sort(metadata.thread_names.begin(), metadata.thread_names.end(), [](const auto &left, const auto &right) {
+                return left.thread_id < right.thread_id;
+            });
+            budget += count * row_cost;
         }
 
         if (context_issue_count)

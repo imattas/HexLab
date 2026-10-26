@@ -147,8 +147,18 @@ struct ReferenceProducerDependency {
     std::uint64_t consumer_instruction_id = 0, producer_instruction_id = 0;
     bool operator==(const ReferenceProducerDependency &) const = default;
 };
+struct ReferenceProducerImmediate {
+    std::uint64_t instruction_id = 0;
+    std::uint32_t operand_index = 0;
+    std::uint64_t value = 0;
+    std::uint16_t encoded_width = 0, effective_width = 0;
+    bool is_signed = false;
+    bool operator==(const ReferenceProducerImmediate &) const = default;
+};
 struct ReferenceProducerGraph {
     std::vector<ReferenceProducerDependency> dependencies;
+    // Immediate constants retained from instructions in this causal chain.
+    std::vector<ReferenceProducerImmediate> immediates;
     bool truncated = false, ambiguous = false, cycle = false;
     bool operator==(const ReferenceProducerGraph &) const = default;
 };

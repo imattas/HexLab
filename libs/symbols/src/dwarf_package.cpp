@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -744,12 +745,12 @@ DwarfSourceCrossContributionDieResolver make_dwarf_package_catalog_cross_contrib
     };
 }
 
-DwarfCrossContributionDieResolver make_dwarf_package_cross_contribution_die_resolver(
+HEXLAB_SYMBOLS_EXPORT DwarfCrossContributionDieResolver make_dwarf_package_cross_contribution_die_resolver(
     std::shared_ptr<const DwarfPackageIndex> index,
     std::vector<DwarfPackageSectionData> sections,
     std::span<const std::uint8_t> strings,
     std::span<const std::uint8_t> line_strings,
-    std::stop_token stop, DwarfPackageTypeResolutionLimits limits) {
+    std::stop_token stop, DwarfPackageTypeResolutionLimits limits, bool little_endian) {
     if (!index || index->kind != DwarfPackageIndexKind::compile_units)
         return [](std::uint64_t) -> hexlab::Result<DwarfCrossContributionDie> {
             return hexlab::Error{hexlab::ErrorCode::invalid_argument,
@@ -761,17 +762,45 @@ DwarfCrossContributionDieResolver make_dwarf_package_cross_contribution_die_reso
         std::span<const std::uint8_t> strings, line_strings;
         std::stop_token stop;
         DwarfPackageTypeResolutionLimits limits;
+        bool little_endian = true;
+        std::recursive_mutex invocation_mutex;
+        std::mutex mutex;
         std::uint64_t bytes = 0;
         std::uint32_t requests = 0;
+        std::unordered_set<std::uint64_t> active_offsets;
+        std::unordered_map<std::uint64_t, DwarfCrossContributionDie> cache;
+        std::function<hexlab::Result<DwarfCrossContributionDie>(std::uint64_t)> resolve;
     };
     auto state = std::make_shared<State>();
     state->index = std::move(index); state->sections = std::move(sections);
     state->strings = strings; state->line_strings = line_strings;
     state->stop = stop; state->limits = limits;
-    return [state](std::uint64_t absolute_offset) -> hexlab::Result<DwarfCrossContributionDie> {
+    state->little_endian = little_endian;
+    const std::weak_ptr<State> weak_state = state;
+    state->resolve = [weak_state](std::uint64_t absolute_offset) -> hexlab::Result<DwarfCrossContributionDie> {
+        const auto state = weak_state.lock();
+        if (!state) return hexlab::Error{hexlab::ErrorCode::canceled, "DWARF package resolver expired"};
+        std::lock_guard invocation_lock(state->invocation_mutex);
         if (state->stop.stop_requested()) return hexlab::Error{hexlab::ErrorCode::canceled, "DWARF package reference resolution canceled"};
-        if (state->requests >= state->limits.max_requests) return too_large("DWP cross-contribution request limit exceeded");
-        ++state->requests;
+        {
+            std::lock_guard lock(state->mutex);
+            if (const auto found = state->cache.find(absolute_offset); found != state->cache.end())
+                return found->second;
+            if (state->active_offsets.contains(absolute_offset))
+                return malformed("cycle in DWP cross-contribution DIE references");
+            if (state->requests >= state->limits.max_requests)
+                return too_large("DWP cross-contribution request limit exceeded");
+            ++state->requests;
+            state->active_offsets.insert(absolute_offset);
+        }
+        struct ActiveGuard {
+            std::shared_ptr<State> state;
+            std::uint64_t offset;
+            ~ActiveGuard() {
+                std::lock_guard lock(state->mutex);
+                state->active_offsets.erase(offset);
+            }
+        } active_guard{state, absolute_offset};
         std::optional<std::uint64_t> owner;
         for (const auto &row : state->index->rows) {
             const auto info = std::find_if(row.sections.begin(), row.sections.end(), [](const auto &s) { return s.section_id == 1; });
@@ -782,20 +811,64 @@ DwarfCrossContributionDieResolver make_dwarf_package_cross_contribution_die_reso
         if (!owner) return hexlab::Error{hexlab::ErrorCode::unsupported, "DW_FORM_ref_addr target is absent from the selected DWP CU index"};
         auto contribution = find_dwarf_package_contribution(*state->index, *owner, state->sections, state->stop);
         if (!contribution) return contribution.error();
+        const auto info_contribution = std::find_if(contribution.value().sections.begin(),
+            contribution.value().sections.end(), [](const auto &section) { return section.section_id == 1; });
+        if (info_contribution == contribution.value().sections.end())
+            return malformed("DWP target contribution has no INFO section");
+        const auto info = info_contribution->bytes;
+        if (info.size() < 4) return malformed("truncated DWP target unit header");
+        const auto initial_length = read_unsigned(info, 0, 4, state->little_endian);
+        std::size_t initial_length_size = 4;
+        std::size_t offset_size = 4;
+        std::uint64_t unit_length = initial_length;
+        if (initial_length == 0xffffffffu) {
+            if (info.size() < 12) return malformed("truncated DWARF64 DWP target unit length");
+            unit_length = read_unsigned(info, 4, 8, state->little_endian);
+            initial_length_size = 12;
+            offset_size = 8;
+        } else if (initial_length >= 0xfffffff0u) {
+            return malformed("DWP target unit uses a reserved initial length");
+        }
+        if (unit_length != info.size() - initial_length_size ||
+            info.size() - initial_length_size < 2)
+            return malformed("DWP target unit extent is invalid");
+        const auto version = read_unsigned(info, initial_length_size, 2, state->little_endian);
+        if (version != (state->index->version == 2 ? 4u : 5u))
+            return malformed("DWP target unit version does not match its package index");
+        const auto address_field = state->index->version == 2
+            ? initial_length_size + 2 + offset_size
+            : initial_length_size + 3;
+        if (address_field >= info.size()) return malformed("truncated DWP target address-size field");
+        const auto address_size = static_cast<std::uint8_t>(info[address_field]);
+        if (address_size != 4 && address_size != 8)
+            return malformed("DWP target unit has an unsupported address size");
         std::uint64_t cost = 0;
         for (const auto &section : contribution.value().sections) {
             if (section.bytes.size() > state->limits.max_bytes - std::min(state->limits.max_bytes, cost)) return too_large("DWP target contribution exceeds the cross-reference byte limit");
             cost += section.bytes.size();
         }
-        if (cost > state->limits.max_bytes - state->bytes) return too_large("DWP cross-contribution byte budget exceeded");
-        state->bytes += cost;
+        {
+            std::lock_guard lock(state->mutex);
+            if (cost > state->limits.max_bytes - state->bytes)
+                return too_large("DWP cross-contribution byte budget exceeded");
+            state->bytes += cost;
+        }
+        const DwarfCrossContributionDieResolver recursive_resolver = [weak_state](std::uint64_t nested_offset)
+            -> hexlab::Result<DwarfCrossContributionDie> {
+            const auto nested = weak_state.lock();
+            if (!nested) return hexlab::Error{hexlab::ErrorCode::canceled, "DWARF package resolver expired"};
+            return nested->resolve(nested_offset);
+        };
         auto imported = import_dwarf_package_unit(*state->index, *owner, state->sections, state->strings,
-                                                   state->stop, state->line_strings);
+                                                   state->stop, state->line_strings, address_size,
+                                                   state->little_endian, {},
+                                                   recursive_resolver);
         if (!imported) return imported.error();
         DwarfCrossContributionDie result;
-        result.info_section_offset = absolute_offset;
+        result.info_section_offset = info_contribution->section_offset;
+        result.die_offset = absolute_offset - info_contribution->section_offset;
         result.contribution_signature = *owner;
-        result.contribution_size = cost;
+        result.contribution_size = info.size();
         result.index_kind = DwarfPackageIndexKind::compile_units;
         result.bytes_examined = cost;
         result.identity_verified = true;
@@ -815,8 +888,30 @@ DwarfCrossContributionDieResolver make_dwarf_package_cross_contribution_die_reso
             result.kind = DwarfReferencedDieKind::variable; result.name = variable.name; result.type = variable.type;
         }
         if (!result.type) return hexlab::Error{hexlab::ErrorCode::unsupported, "DWP reference target offset does not identify a supported type, subprogram, or variable DIE"};
+        auto encoded_type = types::encode(*result.type);
+        if (!encoded_type) return encoded_type.error();
+        const auto cached_summary_cost = static_cast<std::uint64_t>(sizeof(DwarfCrossContributionDie)) +
+            result.name.size() + encoded_type.value().size();
+        {
+            std::lock_guard lock(state->mutex);
+            if (cached_summary_cost > state->limits.max_bytes - state->bytes)
+                return too_large("DWP cross-contribution cached type summaries exceed the byte limit");
+            state->bytes += cached_summary_cost;
+            state->cache.emplace(absolute_offset, result);
+        }
         return result;
     };
+    return [state](std::uint64_t absolute_offset) { return state->resolve(absolute_offset); };
+}
+
+HEXLAB_SYMBOLS_EXPORT DwarfCrossContributionDieResolver make_dwarf_package_cross_contribution_die_resolver(
+    std::shared_ptr<const DwarfPackageIndex> index,
+    std::vector<DwarfPackageSectionData> sections,
+    std::span<const std::uint8_t> strings,
+    std::span<const std::uint8_t> line_strings,
+    std::stop_token stop, DwarfPackageTypeResolutionLimits limits) {
+    return make_dwarf_package_cross_contribution_die_resolver(
+        std::move(index), std::move(sections), strings, line_strings, stop, limits, true);
 }
 
 } // namespace hexlab::symbols

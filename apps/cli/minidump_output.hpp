@@ -33,6 +33,19 @@ inline void minidump_context(std::ostream &out, const MinidumpContext &context, 
     for (const auto &diagnostic : context.diagnostics)
         out << indent << "  Context note: " << diagnostic << '\n';
 }
+inline void minidump_quoted_text(std::ostream &out, const std::string &value) {
+    constexpr std::size_t limit = 256;
+    out << '"';
+    for (std::size_t i = 0; i < std::min(value.size(), limit); ++i) {
+        const auto byte = static_cast<unsigned char>(value[i]);
+        if (byte == '"' || byte == '\\') out << '\\' << static_cast<char>(byte);
+        else if (byte < 0x20 || byte == 0x7f) out << "\\x" << std::hex << std::setw(2) << std::setfill('0')
+                                                   << static_cast<unsigned>(byte) << std::dec << std::setfill(' ');
+        else out << static_cast<char>(byte);
+    }
+    if (value.size() > limit) out << "...";
+    out << '"';
+}
 inline void minidump_description(std::ostream &out, const ImageMetadata &metadata) {
     if (!metadata.minidump) return;
     const auto &dump = *metadata.minidump;
@@ -43,15 +56,29 @@ inline void minidump_description(std::ostream &out, const ImageMetadata &metadat
     const auto count = std::min(dump.threads.size(), max_threads);
     for (std::size_t i = 0; i < count; ++i) {
         const auto &thread = dump.threads[i];
+        const auto name = std::lower_bound(dump.thread_names.begin(), dump.thread_names.end(), thread.id,
+            [](const auto &row, std::uint32_t id) { return row.thread_id < id; });
         out << "  Thread " << thread.id << " stack=0x" << std::hex << thread.stack_address
-            << "+0x" << thread.stack_size << std::dec << " context-bytes=" << thread.context_size << '\n';
+            << "+0x" << thread.stack_size << std::dec << " context-bytes=" << thread.context_size;
+        if (name != dump.thread_names.end() && name->thread_id == thread.id) {
+            out << " name=";
+            minidump_quoted_text(out, name->name);
+        }
+        out << '\n';
         if (thread.context) minidump_context(out, *thread.context, "    ");
     }
     if (dump.threads.size() > count)
         out << "  (" << dump.threads.size() - count << " additional threads omitted from CLI summary)\n";
     if (dump.exception) {
+        const auto name = std::lower_bound(dump.thread_names.begin(), dump.thread_names.end(), dump.exception->thread_id,
+            [](const auto &row, std::uint32_t id) { return row.thread_id < id; });
         out << "  Exception thread=" << dump.exception->thread_id << " code=0x"
-            << std::hex << dump.exception->code << " address=0x" << dump.exception->address << std::dec << '\n';
+            << std::hex << dump.exception->code << " address=0x" << dump.exception->address << std::dec;
+        if (name != dump.thread_names.end() && name->thread_id == dump.exception->thread_id) {
+            out << " name=";
+            minidump_quoted_text(out, name->name);
+        }
+        out << '\n';
         if (dump.exception->context) minidump_context(out, *dump.exception->context, "    ");
     }
 }

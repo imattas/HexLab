@@ -668,6 +668,8 @@ std::string operation_name(Opcode opcode) {
     case Opcode::vsubpd: return "vsubpd";
     case Opcode::vmulps: return "vmulps";
     case Opcode::vmulpd: return "vmulpd";
+    case Opcode::vdivps: return "vdivps";
+    case Opcode::vdivpd: return "vdivpd";
     case Opcode::vxorps: return "vxorps";
     case Opcode::vxorpd: return "vxorpd";
     case Opcode::vandps: return "vandps";
@@ -3348,7 +3350,8 @@ a64_unhandled:
     const bool avx_move = instruction.opcode == Opcode::vmovups;
     const bool avx_float_arithmetic = instruction.opcode == Opcode::vaddps || instruction.opcode == Opcode::vaddpd ||
         instruction.opcode == Opcode::vsubps || instruction.opcode == Opcode::vsubpd ||
-        instruction.opcode == Opcode::vmulps || instruction.opcode == Opcode::vmulpd;
+        instruction.opcode == Opcode::vmulps || instruction.opcode == Opcode::vmulpd ||
+        instruction.opcode == Opcode::vdivps || instruction.opcode == Opcode::vdivpd;
     const bool avx_bitwise = instruction.opcode == Opcode::vxorps || instruction.opcode == Opcode::vxorpd ||
         instruction.opcode == Opcode::vandps || instruction.opcode == Opcode::vandpd;
     const bool avx_integer_arithmetic = instruction.opcode == Opcode::vpaddb || instruction.opcode == Opcode::vpaddw ||
@@ -3415,7 +3418,8 @@ a64_unhandled:
                 : (instruction.opcode == Opcode::vpandd || instruction.opcode == Opcode::vpord ||
                    instruction.opcode == Opcode::vpxord) ? std::uint16_t{32}
                 : (instruction.opcode == Opcode::vaddpd || instruction.opcode == Opcode::vsubpd ||
-                instruction.opcode == Opcode::vmulpd || instruction.opcode == Opcode::vxorpd || instruction.opcode == Opcode::vandpd)
+                instruction.opcode == Opcode::vmulpd || instruction.opcode == Opcode::vdivpd ||
+                instruction.opcode == Opcode::vxorpd || instruction.opcode == Opcode::vandpd)
                 ? std::uint16_t{64} : std::uint16_t{32};
             return vector_type(width, floating ? TypeKind::floating : TypeKind::integer,
                                (floating || avx_integer_lanes || avx_integer_bitwise) ? lane_bits : width,
@@ -3466,7 +3470,8 @@ a64_unhandled:
                 auto second = retag_expr(operands[1], input_type);
                 auto third = retag_expr(operands[2], input_type);
                 const bool packed_double = instruction.opcode == Opcode::vaddpd || instruction.opcode == Opcode::vsubpd ||
-                    instruction.opcode == Opcode::vmulpd || instruction.opcode == Opcode::vxorpd || instruction.opcode == Opcode::vandpd;
+                    instruction.opcode == Opcode::vmulpd || instruction.opcode == Opcode::vdivpd ||
+                    instruction.opcode == Opcode::vxorpd || instruction.opcode == Opcode::vandpd;
                 const std::string suffix = (avx_bitwise || avx_integer_bitwise)
                     ? "_bits" + std::to_string(vector_width) + (zero_upper ? "_zero_upper" : "")
                     : avx_integer_lanes

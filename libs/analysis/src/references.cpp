@@ -51,6 +51,11 @@ Result<std::shared_ptr<const ReferenceIndex>> ReferenceIndex::create(std::vector
             require(graph_bytes <= reference_payload_limit - text_bytes,
                     "Reference producer graph exceeds payload budget");
             text_bytes += graph_bytes;
+            const auto immediate_bytes = reference.provenance.producer_graph.immediates.size() *
+                                         sizeof(ReferenceProducerImmediate);
+            require(immediate_bytes <= reference_payload_limit - text_bytes,
+                    "Reference producer immediates exceed payload budget");
+            text_bytes += immediate_bytes;
             if (reference.provenance.elf_vtable) {
                 const auto size = reference.provenance.elf_vtable->type_name
                                       ? reference.provenance.elf_vtable->type_name->size()
@@ -3116,6 +3121,13 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
         const RegisterReferenceFacts non_x86_producers = image
             ? non_x86_producer_facts(*image, relocation_spans, functions, non_x86_target_facts, stop)
             : RegisterReferenceFacts{};
+        std::unordered_map<std::uint64_t, const Instruction *> instructions_by_id;
+        instructions_by_id.reserve(functions.instructions.size());
+        for (const auto &fact : functions.instructions) {
+            canceled(stop);
+            if (fact)
+                instructions_by_id.emplace(fact->id, &fact->instruction);
+        }
         const auto producer_ids_for = [&](ReferenceOperandKey key) {
             std::vector<std::uint64_t> ids;
             if (const auto found = x86_facts.producer_instruction_ids.find(key);
@@ -3130,13 +3142,38 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
             return ids;
         };
         const auto producer_graph_for = [&](ReferenceOperandKey key) {
+            ReferenceProducerGraph graph;
             if (const auto found = x86_facts.producer_graphs.find(key);
-                found != x86_facts.producer_graphs.end()) return found->second;
-            if (const auto found = riscv_facts.producer_graphs.find(key);
-                found != riscv_facts.producer_graphs.end()) return found->second;
-            if (const auto found = non_x86_producers.producer_graphs.find(key);
-                found != non_x86_producers.producer_graphs.end()) return found->second;
-            return ReferenceProducerGraph{};
+                found != x86_facts.producer_graphs.end()) graph = found->second;
+            else if (const auto found = riscv_facts.producer_graphs.find(key);
+                     found != riscv_facts.producer_graphs.end()) graph = found->second;
+            else if (const auto found = non_x86_producers.producer_graphs.find(key);
+                     found != non_x86_producers.producer_graphs.end()) graph = found->second;
+
+            std::set<std::pair<std::uint64_t, std::uint32_t>> seen;
+            const auto retain_immediates = [&](std::uint64_t instruction_id) {
+                const auto instruction = instructions_by_id.find(instruction_id);
+                if (instruction == instructions_by_id.end())
+                    return;
+                for (std::size_t index = 0; index < instruction->second->operands.size(); ++index) {
+                    canceled(stop);
+                    const auto *immediate = std::get_if<ImmediateOperand>(&instruction->second->operands[index]);
+                    if (!immediate || index >= 16 || !seen.emplace(instruction_id,
+                            static_cast<std::uint32_t>(index)).second)
+                        continue;
+                    if (graph.immediates.size() == 32) {
+                        graph.truncated = true;
+                        return;
+                    }
+                    graph.immediates.push_back({instruction_id, static_cast<std::uint32_t>(index), immediate->value,
+                                                immediate->encoded_width, immediate->effective_width,
+                                                immediate->is_signed});
+                }
+            };
+            retain_immediates(key.first);
+            for (const auto producer : producer_ids_for(key))
+                retain_immediates(producer);
+            return graph;
         };
         const auto relocation_reason = macho ? UnresolvedReason::macho_relocation : UnresolvedReason::elf_relocation;
         const auto reason_for = [&](const OperandResolution &value) {
