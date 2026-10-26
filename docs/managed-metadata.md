@@ -42,8 +42,17 @@ are parsed with the bounded signature grammar and TypeDefOrRef tags resolve to
 full TypeDef, TypeRef, or TypeSpec tokens. Recursive TypeSpec graphs and invalid
 tags or row indexes are rejected; this metadata catalog does not create
 editable project types or resolve external assemblies. A null TypeRef scope is
-also retained as unresolved; ExportedType implementation resolution is not yet
-implemented.
+also retained as unresolved.
+
+`parse_managed_type_catalog` retains up to 250,000 ECMA-335 `ExportedType`
+rows, including flags, `TypeDefId`, full names, and the original Implementation
+coded index and token. Nested ExportedType rows form `Outer+Inner` names and
+inherit the enclosing row's AssemblyRef identity. Invalid coded indexes,
+out-of-range rows, empty names, duplicate exported full names, and nested
+implementation cycles are errors. File implementations retain their metadata
+token and remain unresolved; the loader does not open linked modules. An
+AssemblyRef implementation binds only when its root row has the `Forwarder`
+flag (`0x00200000`). Assembled full names are capped at 4,096 bytes.
 
 The parser preserves field signature indexes but does not yet decode field
 signature blobs into editable C++ project types or resolve custom attributes.
@@ -66,10 +75,15 @@ AssemblyRef identity, including version, culture, flags, and public-key bytes.
 After parsing the set of assemblies in a workspace, callers can run
 `bind_managed_type_references` across the catalogs. It binds a TypeRef only
 when exactly one loaded catalog has an exact AssemblyRef identity match and
-exactly one TypeDef has the requested full name. Nested TypeRefs inherit the
-outer TypeRef's assembly scope. Missing assemblies, duplicate loaded identities,
-and duplicate type names stay unresolved. Binding uses only supplied catalogs;
-it never searches disk or loads code.
+exactly one TypeDef has the requested full name. It can also follow an
+ExportedType row with an AssemblyRef implementation through further supplied
+catalogs, including nested names. Nested TypeRefs inherit the outer TypeRef's
+assembly scope. Missing assemblies, duplicate loaded identities, duplicate
+TypeDef/ExportedType names, File implementations, and forwarding cycles stay
+unresolved with a reason in `unresolved_scope`. Binding is bounded by the
+4,096-catalog limit and never searches disk or loads code. ModuleRef and null
+TypeRef scopes remain unresolved. Public-key-to-token conversion and missing
+assembly identities are not inferred.
 
 `managed_type_is_assignable_across_catalogs` follows local TypeDef base and
 interface edges plus uniquely bound external TypeRefs. It returns false when a

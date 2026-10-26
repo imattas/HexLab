@@ -71,7 +71,7 @@ Result<bool> resolve_type_signature(ManagedTypeSignature& signature,const Manage
   if(!budget--)return Error{ErrorCode::resource_limit,"Resolved managed signature node limit exceeded"};
   if(signature.metadata_type_coded_index){const auto coded=signature.metadata_type_coded_index,tag=coded&3u,rid=coded>>2;if(!rid||tag==3)return malformed("Signature contains an invalid TypeDefOrRef coded index");const std::uint32_t table=tag==0?2u:tag==1?1u:27u;const auto token=(table<<24)|rid;signature.metadata_type_token=token;
     if(tag==0){if(rid>catalog.definitions.size())return malformed("Signature TypeDef token is out of range");signature.metadata_type_name=catalog.definitions[rid-1].full_name;signature.metadata_type_scope="module";}
-    else if(tag==1){if(rid>catalog.references.size())return malformed("Signature TypeRef token is out of range");const auto& ref=catalog.references[rid-1];signature.metadata_type_name=ref.full_name;signature.metadata_type_scope=ref.unresolved_scope.empty()?"module":ref.unresolved_scope;signature.metadata_type_external_unresolved=ref.external_scope_unresolved;}
+    else if(tag==1){if(rid>catalog.references.size())return malformed("Signature TypeRef token is out of range");const auto& ref=catalog.references[rid-1];signature.metadata_type_name=ref.full_name;signature.metadata_type_scope=ref.resolved_catalog_index&&ref.assembly_scope?"assembly:"+ref.assembly_scope->name:ref.unresolved_scope.empty()?"module":ref.unresolved_scope;signature.metadata_type_external_unresolved=ref.external_scope_unresolved;}
     else {if(rid>catalog.specifications.size())return malformed("Signature TypeSpec token is out of range");const auto& spec=catalog.specifications[rid-1];if(spec.token!=token)return malformed("Signature TypeSpec token is unresolved");if(!active_specs.insert(token).second)return malformed("Recursive TypeSpec signature cycle");signature.type_spec_signature=std::make_shared<ManagedTypeSignature>(spec.signature);auto resolved=resolve_type_signature(*signature.type_spec_signature,catalog,active_specs,depth+1,budget);active_specs.erase(token);if(!resolved)return resolved.error();signature.metadata_type_name="TypeSpec";signature.metadata_type_scope="metadata";}
   }
   // A GENERICINST carries its own argument vector. If its constructor is an
@@ -539,6 +539,92 @@ Result<ManagedTypeCatalog> parse_managed_type_catalog(std::span<const std::byte>
       for(auto it=path.rbegin();it!=path.rend();++it){auto& ref=catalog.references[*it];if(ref.resolution_scope_kind==ManagedTypeResolutionScopeKind::nested_type_ref){const auto parent=(ref.resolution_scope_token&0x00ffffffu)-1;if(parent>=catalog.references.size()||state[parent]!=2)return malformed("Nested TypeRef parent is unresolved");const auto& outer=catalog.references[parent];ref.full_name=outer.full_name+"+"+ref.name;ref.external_scope_unresolved=outer.external_scope_unresolved;ref.unresolved_scope=outer.unresolved_scope;ref.assembly_scope=outer.assembly_scope;}else ref.full_name=ref.namespace_name.empty()?ref.name:ref.namespace_name+"."+ref.name;state[*it]=2;}
     }
   }
+  const auto exported_count=rows(39);
+  if(exported_count>250000)return Error{ErrorCode::resource_limit,"ExportedType row limit exceeded"};
+  if(exported_count){
+    const auto row=metadata.tables.row_sizes.find(39);
+    const auto offset=table_offset(39);
+    const auto implementation_width=coded_width(10,metadata.tables.row_counts);
+    if(row==metadata.tables.row_sizes.end()||row->second!=8+2*string_width+implementation_width||
+       offset>tables.size()||std::uint64_t{exported_count}*row->second>tables.size()-offset)
+      return malformed("ExportedType rows exceed tables stream or have inconsistent layout");
+    catalog.exported_types.reserve(exported_count);
+    for(std::uint32_t n=0;n<exported_count;++n){
+      const auto at=static_cast<std::size_t>(offset+std::uint64_t{n}*row->second);
+      ManagedExportedType type;type.token=0x27000000u|(n+1);
+      type.flags=u32(tables,at);type.type_def_id=u32(tables,at+4);
+      auto name=read_string(read_index(tables,at+8,string_width));if(!name)return name.error();
+      auto ns=read_string(read_index(tables,at+8+string_width,string_width));if(!ns)return ns.error();
+      if(name.value().empty())return malformed("ExportedType has an empty name");
+      type.name=std::move(name.value());type.namespace_name=std::move(ns.value());
+      const auto coded=read_index(tables,at+8+2*string_width,implementation_width);
+      type.implementation_coded_index=coded;
+      const auto tag=coded&3u,rid=coded>>2;
+      if(!rid||tag==3)return malformed("ExportedType has an invalid Implementation coded index");
+      if(tag==0){
+        if(rid>rows(38))return malformed("ExportedType File implementation is out of range");
+        type.implementation_kind=ManagedExportedTypeImplementationKind::file;
+        type.implementation_token=0x26000000u|rid;
+      }else if(tag==1){
+        if(rid>rows(35))return malformed("ExportedType AssemblyRef implementation is out of range");
+        type.implementation_kind=ManagedExportedTypeImplementationKind::assembly_ref;
+        type.implementation_token=0x23000000u|rid;
+        const auto assembly_row=metadata.tables.row_sizes.find(35);
+        const auto assembly_offset=assembly_row==metadata.tables.row_sizes.end()?UINT64_MAX:table_offset(35)+std::uint64_t{rid-1}*assembly_row->second;
+        if(assembly_row==metadata.tables.row_sizes.end()||assembly_row->second!=12+blob_width+2*string_width||
+           assembly_offset>tables.size()||assembly_row->second>tables.size()-assembly_offset)
+          return malformed("ExportedType AssemblyRef row exceeds tables stream");
+        const auto aa=static_cast<std::size_t>(assembly_offset);ManagedAssemblyIdentity identity;
+        identity.major=u16(tables,aa);identity.minor=u16(tables,aa+2);
+        identity.build=u16(tables,aa+4);identity.revision=u16(tables,aa+6);identity.flags=u32(tables,aa+8);
+        auto key=read_blob(read_index(tables,aa+12,blob_width));if(!key)return key.error();
+        identity.public_key_or_token=std::move(key.value());
+        auto assembly_name=read_string(read_index(tables,aa+12+blob_width,string_width));if(!assembly_name)return assembly_name.error();
+        identity.name=std::move(assembly_name.value());
+        auto culture=read_string(read_index(tables,aa+12+blob_width+string_width,string_width));if(!culture)return culture.error();
+        identity.culture=std::move(culture.value());
+        if(identity.name.empty())return malformed("ExportedType AssemblyRef has an empty name");
+        type.assembly_scope=std::move(identity);
+        type.forwarding_valid=(type.flags&0x00200000u)!=0;
+      }else{
+        if(rid>exported_count)return malformed("Nested ExportedType implementation is out of range");
+        if(!type.namespace_name.empty())return malformed("Nested ExportedType has a namespace");
+        type.implementation_kind=ManagedExportedTypeImplementationKind::exported_type;
+        type.implementation_token=0x27000000u|rid;
+      }
+      catalog.exported_types.push_back(std::move(type));
+    }
+    std::vector<std::uint8_t> state(exported_count);
+    std::set<std::string> names;
+    for(std::size_t start=0;start<exported_count;++start){
+      if(state[start]==2)continue;
+      std::vector<std::size_t> path;auto current=start;
+      while(state[current]!=2){
+        if(state[current]==1)return malformed("ExportedType implementations contain a cycle");
+        state[current]=1;path.push_back(current);
+        const auto& type=catalog.exported_types[current];
+        if(type.implementation_kind!=ManagedExportedTypeImplementationKind::exported_type)break;
+        current=(type.implementation_token&0x00ffffffu)-1;
+      }
+      for(auto it=path.rbegin();it!=path.rend();++it){
+        auto& type=catalog.exported_types[*it];
+        if(type.implementation_kind==ManagedExportedTypeImplementationKind::exported_type){
+          const auto& parent=catalog.exported_types[(type.implementation_token&0x00ffffffu)-1];
+          if(parent.full_name.size()+1+type.name.size()>4096)
+            return Error{ErrorCode::resource_limit,"Nested ExportedType name exceeds 4096 bytes"};
+          type.full_name=parent.full_name+"+"+type.name;
+          type.assembly_scope=parent.assembly_scope;
+          type.forwarding_valid=parent.forwarding_valid;
+        }else{
+          if(type.namespace_name.size()+(!type.namespace_name.empty())+type.name.size()>4096)
+            return Error{ErrorCode::resource_limit,"ExportedType full name exceeds 4096 bytes"};
+          type.full_name=type.namespace_name.empty()?type.name:type.namespace_name+"."+type.name;
+        }
+        if(!names.insert(type.full_name).second)return malformed("Duplicate ExportedType full name");
+        state[*it]=2;
+      }
+    }
+  }
   const auto spec_count=rows(27);
   if(spec_count>1000000)return Error{ErrorCode::resource_limit,"TypeSpec row limit exceeded"};
   const auto spec_row=metadata.tables.row_sizes.find(27);const auto spec_offset=table_offset(27);const auto spec_blob_width=(metadata.tables.heap_sizes&4)?4u:2u;
@@ -613,19 +699,66 @@ std::optional<ManagedTypeNode> bound_type_node(const ManagedTypeCatalog& catalog
 
 Result<bool> bind_managed_type_references(std::span<ManagedTypeCatalog> catalogs){
   if(catalogs.size()>4096)return Error{ErrorCode::resource_limit,"Managed assembly binding exceeds 4096 catalogs"};
+  struct NamedType {
+    std::uint32_t definition_token=0;
+    const ManagedExportedType* exported=nullptr;
+    bool duplicate=false;
+  };
+  std::vector<std::map<std::string,NamedType>> names(catalogs.size());
+  for(std::size_t i=0;i<catalogs.size();++i){
+    for(const auto& definition:catalogs[i].definitions){
+      auto& entry=names[i][definition.full_name];
+      if(entry.definition_token||entry.exported)entry.duplicate=true;
+      entry.definition_token=definition.token;
+    }
+    for(const auto& exported:catalogs[i].exported_types){
+      auto& entry=names[i][exported.full_name];
+      if(entry.definition_token||entry.exported)entry.duplicate=true;
+      entry.exported=&exported;
+    }
+  }
   for(auto& source:catalogs)for(auto& reference:source.references){
     reference.resolved_catalog_index.reset();reference.resolved_definition_token.reset();
     if(!reference.assembly_scope)continue;
-    std::optional<std::uint32_t> target_catalog;std::size_t assembly_matches=0;
-    for(std::uint32_t i=0;i<catalogs.size();++i){
-      const auto& identity=catalogs[i].assembly_identity;
-      if(identity&&assembly_scope_matches(*reference.assembly_scope,*identity)){target_catalog=i;++assembly_matches;}
+    reference.external_scope_unresolved=true;
+    reference.unresolved_scope="assembly:"+reference.assembly_scope->name;
+    const ManagedAssemblyIdentity* scope=&*reference.assembly_scope;
+    std::set<std::uint32_t> visited_catalogs;
+    for(std::size_t hop=0;hop<=catalogs.size();++hop){
+      std::optional<std::uint32_t> target_catalog;std::size_t assembly_matches=0;
+      for(std::uint32_t i=0;i<catalogs.size();++i){
+        const auto& identity=catalogs[i].assembly_identity;
+        if(identity&&assembly_scope_matches(*scope,*identity)){target_catalog=i;++assembly_matches;}
+      }
+      if(assembly_matches!=1){reference.unresolved_scope=assembly_matches?"duplicate assembly identity":"assembly identity not supplied";break;}
+      if(!visited_catalogs.insert(*target_catalog).second){reference.unresolved_scope="ExportedType forwarding cycle";break;}
+      const auto found=names[*target_catalog].find(reference.full_name);
+      if(found==names[*target_catalog].end()){reference.unresolved_scope="type name absent from assembly catalog";break;}
+      const auto& named=found->second;
+      if(named.duplicate){reference.unresolved_scope="duplicate type name in assembly catalog";break;}
+      if(named.definition_token){
+        reference.resolved_catalog_index=*target_catalog;
+        reference.resolved_definition_token=named.definition_token;
+        reference.unresolved_scope.clear();
+        reference.external_scope_unresolved=false;
+        break;
+      }
+      if(!named.exported->assembly_scope){reference.unresolved_scope="ExportedType File implementation unresolved";break;}
+      if(!named.exported->forwarding_valid){reference.unresolved_scope="ExportedType AssemblyRef lacks Forwarder flag";break;}
+      scope=&*named.exported->assembly_scope;
+      if(hop==catalogs.size())reference.unresolved_scope="ExportedType forwarding budget exhausted";
     }
-    if(assembly_matches!=1)continue;
-    std::optional<std::uint32_t> target_definition;std::size_t type_matches=0;
-    for(const auto& definition:catalogs[*target_catalog].definitions)
-      if(definition.full_name==reference.full_name){target_definition=definition.token;++type_matches;}
-    if(type_matches==1){reference.resolved_catalog_index=*target_catalog;reference.resolved_definition_token=*target_definition;}
+  }
+  // TypeSpec signatures were resolved during parsing, before cross-catalog
+  // binding. Refresh their TypeRef display state after the bindings settle.
+  for(auto& catalog:catalogs){
+    std::set<std::uint32_t> active_specs;std::size_t budget=100000;
+    for(auto& spec:catalog.specifications){
+      active_specs.insert(spec.token);
+      auto refreshed=resolve_type_signature(spec.signature,catalog,active_specs,0,budget);
+      active_specs.erase(spec.token);
+      if(!refreshed)return refreshed.error();
+    }
   }
   return true;
 }
