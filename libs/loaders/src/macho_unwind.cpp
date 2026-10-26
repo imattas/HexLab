@@ -125,7 +125,9 @@ Result<std::int64_t> cfi_scale(std::uint64_t factor, std::int64_t alignment) {
 
 Result<bool> run_cfi(std::span<const std::byte> instructions, std::uint32_t cpu, std::uint64_t code_alignment,
                      std::int64_t data_alignment, std::uint64_t target, std::uint64_t &location,
-                     CfiState &state, const CfiState &initial) {
+                     CfiState &state, const CfiState &initial,
+                     std::optional<std::uint64_t> fde_begin = std::nullopt,
+                     std::uint64_t fde_size = 0) {
     std::size_t cursor = 0;
     auto read_u = [&]() { return cfi_uleb(instructions, cursor); };
     auto read_s = [&]() { return cfi_sleb(instructions, cursor); };
@@ -168,6 +170,23 @@ Result<bool> run_cfi(std::span<const std::byte> instructions, std::uint32_t cpu,
         }
         switch (op) {
         case 0: break; // nop
+        case 1: { // DW_CFA_set_loc: absolute address-sized location in an FDE program
+            if (!fde_begin)
+                return failure(ErrorCode::unsupported, "Mach-O DW_CFA_set_loc has no FDE address context");
+            if (instructions.size() - cursor < 8)
+                return failure(ErrorCode::malformed, "Truncated Mach-O DW_CFA_set_loc address");
+            std::uint64_t absolute = 0;
+            for (unsigned i = 0; i < 8; ++i)
+                absolute |= std::uint64_t(std::to_integer<unsigned>(instructions[cursor++])) << (8 * i);
+            if (absolute < *fde_begin || absolute - *fde_begin > fde_size)
+                return failure(ErrorCode::malformed, "Mach-O DW_CFA_set_loc address is outside its FDE interval");
+            const auto next_location = absolute - *fde_begin;
+            if (next_location < location)
+                return failure(ErrorCode::malformed, "Mach-O DW_CFA_set_loc moves the location backwards");
+            if (next_location > target) return true;
+            location = next_location;
+            break;
+        }
         case 5: case 6: case 7: case 8: {
             auto reg = read_u(); if (!reg) return reg.error();
             if (op == 5) { auto factor = read_u(); if (!factor) return factor.error(); auto result=set_offset(reg.value(),factor.value()); if(!result)return result.error(); }
@@ -556,6 +575,8 @@ Result<MachOUnwindResult> evaluate_eh_frame(const MachOEhFrameFunction &fde, std
         pc.offset - fde.address->offset >= fde.size)
         return failure(ErrorCode::out_of_bounds, "PC is outside Mach-O eh_frame FDE range");
     if (!fde.code_alignment) return failure(ErrorCode::malformed, "Mach-O CIE code alignment is zero");
+    if (fde.size > UINT64_MAX - fde.address->offset)
+        return failure(ErrorCode::overflow, "Mach-O CFI FDE interval overflows");
     CfiState state, initial;
     std::uint64_t location = 0;
     auto run = run_cfi(fde.cie_instructions, cpu, fde.code_alignment, fde.data_alignment, UINT64_MAX, location, state, initial);
@@ -563,7 +584,8 @@ Result<MachOUnwindResult> evaluate_eh_frame(const MachOEhFrameFunction &fde, std
     initial = state;
     location = 0;
     run = run_cfi(fde.instructions, cpu, fde.code_alignment, fde.data_alignment,
-                  pc.offset - fde.address->offset, location, state, initial);
+                  pc.offset - fde.address->offset, location, state, initial,
+                  fde.address->offset, fde.size);
     if (!run) return run.error();
     std::uint64_t cfa = 0;
     if (state.cfa_expression) {
