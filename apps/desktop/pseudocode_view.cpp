@@ -1018,6 +1018,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     source_origins_.clear();
     variables_.clear();
     stack_access_rows_.clear();
+    stack_access_sites_.clear();
     stack_access_editable_.clear();
     variable_definition_rows_.clear();
     variable_links_.clear();
@@ -1116,16 +1117,15 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
             if (annotation && !annotation->comment.empty()) recovered_local_comments.emplace(name, annotation->comment);
         }
         // Stack locals already have a stable identity in the lifter (their
-        // recovered frame slot name). Bind user edits to the first access so
-        // the existing address-keyed project annotation/type records survive
-        // save/reopen and follow normal undo/redo semantics.
+        // recovered frame slot name). Keep every access site so edits can be
+        // applied atomically without relying on which use happens to be first.
         if (recovered_types) {
             for (const auto &variable : recovered_types.value().stack_variables) {
                 const auto sites = access_sites.find(variable.name);
                 if (sites == access_sites.end() || sites->second.empty()) continue;
                 const auto *annotation = project_ ? annotation_at(*project_, sites->second.front()) : nullptr;
                 const auto display = annotation && !annotation->name.empty() ? annotation->name : variable.name;
-                variables_.push_back({variable.name, sites->second.front(), display});
+                variables_.push_back({variable.name, sites->second.front(), display, true, false, sites->second});
             }
         }
     }
@@ -1147,9 +1147,19 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
         if (evidence.type && !evidence.ambiguous)
             recovered_local_types.insert_or_assign(evidence.name, recovered_type_text(evidence.type, 0));
     std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> variable_origin_counts;
-    for (const auto &variable : variables_) ++variable_origin_counts[address_identity(variable.definition)];
+    for (const auto &variable : variables_) {
+        if (variable.access_sites.empty())
+            ++variable_origin_counts[address_identity(variable.definition)];
+        else
+            for (const auto address : variable.access_sites)
+                ++variable_origin_counts[address_identity(address)];
+    }
     for (auto &variable : variables_) {
-        const bool shared_origin = variable_origin_counts[address_identity(variable.definition)] != 1;
+        const bool shared_origin = variable.access_sites.empty()
+            ? variable_origin_counts[address_identity(variable.definition)] != 1
+            : std::any_of(variable.access_sites.begin(), variable.access_sites.end(), [&](Address address) {
+                  return variable_origin_counts[address_identity(address)] != 1;
+              });
         variable.function_entry_collision = variable.definition == match->function->entry;
         variable.editable = !shared_origin && !variable.function_entry_collision;
     }
@@ -1242,8 +1252,12 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     }
     if (stack) {
         std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> stack_origin_counts;
-        for (const auto &slot : stack->slots)
-            if (!slot.accesses.empty()) ++stack_origin_counts[address_identity(slot.accesses.front())];
+        for (const auto &slot : stack->slots) {
+            std::set<std::pair<std::uint32_t, std::uint64_t>> unique_accesses;
+            for (const auto address : slot.accesses)
+                if (unique_accesses.insert(address_identity(address)).second)
+                    ++stack_origin_counts[address_identity(address)];
+        }
         for (const auto &slot : stack->slots) {
             const auto row = stack_slots_->InsertItem(stack_slots_->GetItemCount(), stack_offset(slot.offset_from_entry_sp));
             stack_slots_->SetItem(row, 1, slot.width ? wxString::Format("%u", slot.width) : wxString("?"));
@@ -1259,10 +1273,14 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
                                   wxString::Format("%llu", static_cast<unsigned long long>(slot.accesses.size())));
             const auto access = slot.accesses.empty() ? match->function->entry : slot.accesses.front();
             stack_access_rows_.push_back(access);
+            stack_access_sites_.push_back(slot.accesses);
             const bool unique_origin = !slot.accesses.empty() &&
                 access != match->function->entry &&
-                stack_origin_counts[address_identity(access)] == 1 &&
-                variable_origin_counts[address_identity(access)] <= 1;
+                std::all_of(slot.accesses.begin(), slot.accesses.end(), [&](Address site) {
+                    return site != match->function->entry &&
+                           stack_origin_counts[address_identity(site)] == 1 &&
+                           variable_origin_counts[address_identity(site)] == 1;
+                });
             stack_access_editable_.push_back(unique_origin ? 1 : 0);
             auto local_name = project_ ? text(presentation_name(*project_, access)) : wxString{};
             if (!unique_origin) local_name += " (read-only: ambiguous origin)";
@@ -1563,7 +1581,13 @@ void PseudocodeView::rename_local() {
     const auto submit = submit_;
     const auto current = text(presentation_name(*project_, at));
     const auto value = ask(*this, "Rename local", "Local name (stored at its first stack access):", current, false);
-    if (value) submit(Rename{at, utf8(*value)});
+    if (value) {
+        const auto index = static_cast<std::size_t>(row);
+        if (index < stack_access_sites_.size() && !stack_access_sites_[index].empty())
+            submit(RenameStackLocal{stack_access_sites_[index], utf8(current), utf8(*value)});
+        else
+            submit(Rename{at, utf8(*value)});
+    }
 }
 void PseudocodeView::comment_local() {
     const auto row = stack_slots_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
@@ -1598,7 +1622,12 @@ void PseudocodeView::rename_variable() {
     const auto at = match->definition;
     const auto submit = submit_;
     const auto value = ask(*this, "Rename pseudocode variable", "Variable name:", text(match->display), false);
-    if (value) submit(Rename{at, utf8(*value)});
+    if (value) {
+        if (!match->access_sites.empty())
+            submit(RenameStackLocal{match->access_sites, match->display, utf8(*value)});
+        else
+            submit(Rename{at, utf8(*value)});
+    }
 }
 
 void PseudocodeView::assign_variable_type() {
@@ -1612,6 +1641,9 @@ void PseudocodeView::assign_variable_type() {
     const auto submit = submit_;
     const auto state = project_->state;
     const auto *assigned = type_assignment(*project_, match->definition);
+    if (!assigned && !match->access_sites.empty())
+        for (const auto address : match->access_sites)
+            if ((assigned = type_assignment(*project_, address))) break;
     const auto assigned_id = assigned ? std::optional<std::uint64_t>(assigned->type_id) : std::nullopt;
     const auto *current = assigned ? type_definition(*project_, assigned->type_id) : nullptr;
     const auto initial = current ? current->name : std::string{};
@@ -1620,12 +1652,22 @@ void PseudocodeView::assign_variable_type() {
     if (!value) return;
     const auto name = utf8(*value);
     if (name.empty()) {
-        if (assigned_id) submit(AssignType{at, *assigned_id, true});
+        if (assigned_id) {
+            if (!match->access_sites.empty())
+                submit(AssignStackLocalType{match->access_sites, assigned_id, *assigned_id, true});
+            else
+                submit(AssignType{at, *assigned_id, true});
+        }
         return;
     }
     const auto found = std::find_if(state->user->types.begin(), state->user->types.end(),
                                     [&](const auto &type) { return type.name == name; });
-    if (found != state->user->types.end()) submit(AssignType{at, found->id, false});
+    if (found != state->user->types.end()) {
+        if (!match->access_sites.empty())
+            submit(AssignStackLocalType{match->access_sites, assigned_id, found->id, false});
+        else
+            submit(AssignType{at, found->id, false});
+    }
 }
 
 } // namespace hexlab::desktop

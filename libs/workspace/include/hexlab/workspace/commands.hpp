@@ -27,6 +27,13 @@ struct PatchBytes {Location location;std::vector<std::byte> replacement;};
 struct DefineType {std::string name;types::TypePtr type;};
 struct UpdateType {std::uint64_t type_id;std::string name;types::TypePtr type;};
 struct AssignType {Address location;std::uint64_t type_id;bool remove=false;};
+// Apply one logical stack-local edit to every recovered access site in a single
+// project history step. The rows remain address keyed for compatibility.
+struct RenameStackLocal {std::vector<Address> access_sites;std::string expected_name;std::string name;};
+struct AssignStackLocalType {
+    std::vector<Address> access_sites;std::optional<std::uint64_t> expected_type_id;
+    std::uint64_t type_id=0;bool remove=false;
+};
 struct PortableTypeDefinition {
     std::string name;types::TypePtr type;std::optional<std::uint64_t> existing_id;
     std::optional<database::DwarfSourceOrigin> origin;
@@ -55,7 +62,7 @@ struct PortableDebugVariable {
 struct ImportPortableDebugVariables {std::vector<PortableDebugVariable> variables;};
 struct ImportSymbols {};
 struct ImportDwarfInfo {};
-using ProjectCommand=std::variant<Rename,Comment,BookmarkCommand,SetProjectBreakpoint,DefineRegion,DefineFunction,SetFunctionChunks,SuppressFunction,ResetFunctionOverride,SetReference,PatchBytes,DefineType,UpdateType,AssignType,ImportPortableTypes,ImportPortableDebugVariables,ImportSymbols,ImportDwarfInfo>;
+using ProjectCommand=std::variant<Rename,Comment,BookmarkCommand,SetProjectBreakpoint,DefineRegion,DefineFunction,SetFunctionChunks,SuppressFunction,ResetFunctionOverride,SetReference,PatchBytes,DefineType,UpdateType,AssignType,RenameStackLocal,AssignStackLocalType,ImportPortableTypes,ImportPortableDebugVariables,ImportSymbols,ImportDwarfInfo>;
 struct CommandAvailability {bool enabled=false;std::string reason;};
 struct ProjectSnapshot;
 enum class ProjectActionKind {rename,comment,bookmark,define_code,define_data,define_function,function_chunks,suppress_function,reference,patch,undo,redo,save,save_as,export_binary,search,reanalyze,define_type,assign_type,import_symbols,import_dwarf,reset_function};
