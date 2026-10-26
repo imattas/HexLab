@@ -123,6 +123,10 @@ struct ProjectState {
 enum class ProjectMode {read_write,read_only,collaborative};
 enum class ReplacePolicy {fail_if_exists,replace_existing};
 struct SavedProject {std::filesystem::path path;ProjectUuid uuid;};
+struct BackupRotationResult { SavedProject backup; std::size_t removed_generations=0; bool retention_satisfied=true; };
+struct RotatedBackup { SavedProject backup; std::uint64_t created_unix_ms=0; };
+struct BackupListing { std::vector<RotatedBackup> backups; bool complete=true; };
+struct BackupPruneResult { std::size_t remaining=0, removed=0; bool retention_satisfied=true; };
 enum class RecoveryArtifactKind {interrupted_save,previous_version};
 struct ProjectRecoveryCandidate {std::filesystem::path path;ProjectUuid uuid;RecoveryArtifactKind kind;};
 struct StateDelta;
@@ -222,6 +226,19 @@ public:
     // logical project UUID and edit history. Unlike save_as(), this is a
     // restore point, not a new independent project identity.
     HEXLAB_DATABASE_EXPORT Result<SavedProject> backup_to(const std::filesystem::path&,ReplacePolicy,std::stop_token);
+    // Creates a timestamped sibling backup and prunes only validated backups
+    // matching this base filename and project UUID. Retention is best-effort
+    // when the directory exceeds the bounded scan/validation budget.
+    HEXLAB_DATABASE_EXPORT Result<BackupRotationResult> backup_to_rotating(const std::filesystem::path& base,
+        std::size_t retain,std::stop_token);
+    HEXLAB_DATABASE_EXPORT Result<BackupListing> list_rotated_backups(const std::filesystem::path& base,
+        std::stop_token) const;
+    HEXLAB_DATABASE_EXPORT Result<BackupPruneResult> prune_rotated_backups(const std::filesystem::path& base,
+        std::size_t retain,std::stop_token);
+    // Replaces a closed target project from a validated same-UUID backup. The
+    // caller must reopen the returned path to refresh its in-memory snapshot.
+    HEXLAB_DATABASE_EXPORT static Result<SavedProject> restore_backup_in_place(
+        const std::filesystem::path& backup,const std::filesystem::path& target,std::stop_token);
     HEXLAB_DATABASE_EXPORT ProjectMode mode() const noexcept;
     HEXLAB_DATABASE_EXPORT const std::filesystem::path& path()const noexcept;
     HEXLAB_DATABASE_EXPORT Result<CacheLookup> load_reference_cache(const AnalysisKey&,std::stop_token);

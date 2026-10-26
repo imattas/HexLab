@@ -77,6 +77,10 @@ struct MemoryRegion {
     bool executable = false;
     std::string type;
 };
+struct AuxiliaryVectorEntry {
+    std::uint64_t type = 0;
+    std::uint64_t value = 0;
+};
 struct RegisterValue {
     std::string name;
     std::vector<std::byte> bytes;
@@ -191,6 +195,9 @@ public:
     virtual Result<std::vector<MemoryRegion>> memory_regions() {
         return Error{ErrorCode::unsupported, "memory map inspection is not supported by this backend"};
     }
+    virtual Result<std::vector<AuxiliaryVectorEntry>> auxiliary_vector() {
+        return Error{ErrorCode::unsupported, "auxiliary-vector inspection is not supported by this backend"};
+    }
     virtual Result<std::vector<RegisterValue>> read_registers(ThreadId) = 0;
     virtual Status write_registers(ThreadId, std::span<const RegisterValue>) = 0;
     virtual Result<Breakpoint> add_breakpoint(std::uint64_t address, BreakpointKind) = 0;
@@ -264,6 +271,7 @@ public:
     Result<std::vector<ThreadRunState>> thread_run_states();
     Result<std::vector<ModuleInfo>> modules();
     Result<std::vector<MemoryRegion>> memory_regions();
+    Result<std::vector<AuxiliaryVectorEntry>> auxiliary_vector();
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread);
     // Evaluates a bounded register/memory expression against one stopped thread.
     Result<std::uint64_t> evaluate_expression(ThreadId thread, std::string_view expression);

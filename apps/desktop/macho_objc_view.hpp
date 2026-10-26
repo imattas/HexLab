@@ -18,6 +18,7 @@ struct MachOObjCViewRow {
     std::string provenance;
     std::string details;
     std::optional<Address> address;
+    std::optional<Address> code_address;
 };
 
 inline constexpr std::size_t macho_objc_view_row_limit = 250000;

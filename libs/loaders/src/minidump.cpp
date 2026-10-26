@@ -431,6 +431,7 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
         case 5: arch = Architecture::arm; width = 32; break;
         case 9: arch = Architecture::x86_64; mode = ExecutionMode::x86_64; break;
         case 12: arch = Architecture::arm64; mode = ExecutionMode::a64; break;
+        case 0x8003: arch = Architecture::arm64; mode = ExecutionMode::a64; break;
         default:
             if (!regions.empty() && regions.back().begin + regions.back().size <= (UINT64_C(1) << 32)) width = 32;
             metadata.diagnostics.emplace_back("Minidump processor architecture is not supported for instruction decoding");
@@ -449,6 +450,7 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
         case 5: loaded.metadata.machine = 0x01c0; break;
         case 9: loaded.metadata.machine = 0x8664; break;
         case 12: loaded.metadata.machine = 0xaa64; break;
+        case 0x8003: loaded.metadata.machine = 0xaa64; break;
         default: break;
         }
         loaded.metadata.minidump = std::move(metadata);

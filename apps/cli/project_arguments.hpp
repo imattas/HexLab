@@ -26,7 +26,7 @@ using LocationExpression = std::variant<Location, X86LogicalAddress>;
 using CommandFactory = std::function<Result<ProjectCommand>(const ProjectSnapshot &)>;
 struct Arguments {
     std::wstring action;
-    std::filesystem::path path, output, exchange_input, type_library_input;
+    std::filesystem::path path, output, exchange_input, type_library_input, backup_base;
     ExchangeConflictPolicy exchange_conflicts = ExchangeConflictPolicy::fail;
     bool readonly = false, replace = false;
     bool type_skip_assignments_on_mismatch = false, type_replace_assignments = false;
@@ -68,6 +68,8 @@ struct Arguments {
     bool history_json = false;
     bool history_verify_replay = false;
     bool recovery_json = false;
+    bool backup_json = false;
+    std::size_t backup_retention = 0;
     std::uint64_t history_target_step = 0;
     database::HistoryPreviewLimits history_preview_limits;
 };

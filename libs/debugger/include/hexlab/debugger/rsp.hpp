@@ -98,6 +98,9 @@ public:
     // Reads the standard qXfer operating-system process-list object.
     Result<std::optional<std::string>> read_processes_annex(
         std::size_t limit = 1024 * 1024, std::size_t chunk = 4096, std::stop_token = {});
+    // Reads the binary qXfer auxiliary-vector object under independent byte and chunk limits.
+    Result<std::optional<std::vector<std::byte>>> read_auxv_annex(
+        std::size_t limit = 1024 * 1024, std::size_t chunk = 4096, std::stop_token = {});
     Result<std::vector<std::byte>> read_register(std::uint64_t number, std::stop_token = {});
     Status write_register(std::uint64_t number, std::span<const std::byte>, std::stop_token = {});
     Result<std::vector<std::byte>> read_memory(std::uint64_t address, std::size_t size, std::stop_token = {});

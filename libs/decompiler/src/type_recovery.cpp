@@ -600,6 +600,12 @@ std::optional<RegisterOperand> classified_register(std::string_view name) {
         if (parsed.ec != std::errc{} || parsed.ptr != end) return {};
         return index;
     };
+    if (name.starts_with("ST")) {
+        const auto index = parse_index(2);
+        if (index && *index < 8)
+            return RegisterOperand{RegisterBank::x87, static_cast<std::uint8_t>(*index), 80, false};
+        return {};
+    }
     if (name.starts_with("XMM")) {
         const auto index = parse_index(3);
         if (index && *index < 16) return RegisterOperand{RegisterBank::xmm, static_cast<std::uint8_t>(*index), 128, false};

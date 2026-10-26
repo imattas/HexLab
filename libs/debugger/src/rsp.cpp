@@ -857,6 +857,39 @@ Result<std::optional<std::string>> Client::read_processes_annex(std::size_t limi
     }
     return Error{ErrorCode::resource_limit, "RSP process annex exceeds configured limit"};
 }
+Result<std::optional<std::vector<std::byte>>> Client::read_auxv_annex(
+    std::size_t limit, std::size_t chunk, std::stop_token stop) {
+    const auto packet_limit = std::min(max_packet_, peer_packet_size_);
+    if (limit == 0 || limit > 1024 * 1024 || chunk == 0 || chunk > 64 * 1024 || packet_limit < 32)
+        return Error{ErrorCode::invalid_argument, "invalid RSP auxiliary-vector annex bounds"};
+    const auto bounded_chunk = std::min(chunk, packet_limit / 2);
+    std::vector<std::byte> result;
+    result.reserve(std::min(limit, bounded_chunk));
+    for (std::size_t offset = 0; offset <= limit;) {
+        const auto request_size = std::min(bounded_chunk, limit - std::min(offset, limit));
+        if (offset == limit && request_size == 0)
+            return Error{ErrorCode::resource_limit, "RSP auxiliary-vector annex exceeds configured limit"};
+        auto response = transact("qXfer:auxv:read::" + hex_u64(offset) + "," + hex_u64(request_size), stop);
+        if (!response) return response.error();
+        if (response.value().empty()) {
+            if (offset == 0) return std::optional<std::vector<std::byte>>{};
+            return Error{ErrorCode::malformed, "RSP auxiliary-vector annex ended without final marker"};
+        }
+        const char marker = response.value().front();
+        if (marker != 'm' && marker != 'l')
+            return Error{ErrorCode::malformed, "invalid RSP auxiliary-vector annex marker"};
+        const auto count = response.value().size() - 1;
+        if (count > request_size || count > limit - result.size())
+            return Error{ErrorCode::resource_limit, "RSP auxiliary-vector chunk exceeds configured limit"};
+        for (std::size_t i = 1; i < response.value().size(); ++i)
+            result.push_back(static_cast<std::byte>(static_cast<unsigned char>(response.value()[i])));
+        if (marker == 'l') return std::optional<std::vector<std::byte>>(std::move(result));
+        if (count == 0 || offset > std::numeric_limits<std::size_t>::max() - count)
+            return Error{ErrorCode::malformed, "RSP auxiliary-vector annex made no progress"};
+        offset += count;
+    }
+    return Error{ErrorCode::resource_limit, "RSP auxiliary-vector annex exceeds configured limit"};
+}
 Result<std::vector<std::byte>> Client::read_register(std::uint64_t number, std::stop_token stop) {
     auto response = transact("p" + hex_u64(number), stop); if (!response) return response.error(); return decode_hex(response.value());
 }

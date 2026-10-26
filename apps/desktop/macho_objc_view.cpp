@@ -29,10 +29,11 @@ void mark_limit(std::vector<MachOObjCViewRow> &rows) {
 }
 
 bool add(std::vector<MachOObjCViewRow> &rows, std::string kind, std::string owner, std::string name,
-         std::string status, std::string provenance, std::string details, std::optional<Address> address = {}) {
+         std::string status, std::string provenance, std::string details, std::optional<Address> address = {},
+         std::optional<Address> code_address = {}) {
     if (rows.size() >= macho_objc_view_row_limit) { mark_limit(rows); return false; }
     rows.push_back({std::move(kind), std::move(owner), std::move(name), std::move(status),
-                    std::move(provenance), std::move(details), address});
+                    std::move(provenance), std::move(details), address, code_address});
     return true;
 }
 
@@ -66,7 +67,7 @@ void add_method(std::vector<MachOObjCViewRow> &rows, const MachOObjCMethod &meth
                           "; pointer=" + method.implementation_pointer_status;
     add(rows, std::move(kind), owner, value(method.selector), std::move(status),
         "method entry " + number(method.entry.offset), std::move(details),
-        method.implementation ? method.implementation : std::optional<Address>{method.entry});
+        method.implementation ? method.implementation : std::optional<Address>{method.entry}, method.implementation);
 }
 
 void add_property(std::vector<MachOObjCViewRow> &rows, const MachOObjCProperty &property,

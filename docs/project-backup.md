@@ -26,6 +26,38 @@ the original project be open at the same time without triggering the duplicate
 project lease policy. `--replace` selects atomic replacement if the output
 already exists; it does not modify the backup.
 
+For a rotating set, pass a stable base filename. HexLab creates timestamped
+siblings such as `sample.backup-017...-<random-token>.hxproj`; the base file
+itself is not overwritten. Listing validates candidates against the open
+project UUID. Pruning retains the newest requested count and removes only
+validated siblings for that UUID. Scans are bounded to 8,192 directory entries,
+64 candidates, and 1 GiB of candidate bytes; an incomplete scan performs no
+pruning and reports incomplete retention.
+
+```text
+hexlab_cli project backup rotate sample.hxproj --base backups/sample.hxproj --retain 8
+hexlab_cli project backup list sample.hxproj --base backups/sample.hxproj --json
+hexlab_cli project backup prune sample.hxproj --base backups/sample.hxproj --retain 8
+```
+
+Rotation publishes and validates the new backup before pruning older entries.
+If candidate validation, directory scanning, or deletion is incomplete, extra
+backups may remain and the command returns exit code 3. Listing returns exit 3
+when the bounded scan is incomplete.
+
+Restore into an existing project in place with:
+
+```text
+hexlab_cli project backup restore-in-place backups/sample.backup-...hxproj --target sample.hxproj
+```
+
+The backup and target must share the same project UUID. The restore acquires the
+project lease, checks the target revisions again after acquiring it, validates
+the staged SQLite copy and atomically publishes it at the existing path. The
+target UUID and backup history are preserved; reopen the project afterward.
+Close all project connections first, including read-only/collaborative peers.
+The prior target is retained as a `.hexlab-previous-*.tmp` recovery artifact.
+
 The implementation uses SQLite's online backup API, so committed WAL content
 is included in one coherent snapshot. Before publication, it validates the
 copied schema and state, reads and hashes all embedded input chunks, and checks
@@ -45,5 +77,5 @@ Cancellation or validation failure before publication leaves the destination
 unchanged and removes the owned staging database and its journal companions.
 The backup preserves the UUID intentionally; opening it while the source
 project is already open can trigger the existing duplicate-project lease
-policy. Restoring to a new path creates a new UUID. This workflow does not
-rotate backups, restore a file in place, or copy an external source binary.
+policy. Restoring to a new path creates a new UUID. Backup workflows do not
+copy an external source binary.

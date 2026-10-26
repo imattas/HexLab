@@ -729,8 +729,9 @@ struct MainFrame::Impl {
     wxTextCtrl *macho_objc_filter = nullptr;
     wxStaticText *macho_objc_filter_status = nullptr;
     wxTimer macho_objc_filter_timer;
-    wxButton *macho_objc_import_types = nullptr;
+    wxButton *macho_objc_import_types = nullptr, *macho_objc_pseudocode = nullptr;
     std::shared_ptr<const std::vector<MachOObjCViewRow>> macho_objc_rows;
+    std::shared_ptr<const std::vector<std::size_t>> macho_objc_visible_rows;
     std::shared_ptr<const MachOObjCScan> macho_objc_scan;
     std::shared_ptr<const DocumentSnapshot> macho_objc_source;
     PeView *pe_view = nullptr;
@@ -2005,6 +2006,8 @@ struct MainFrame::Impl {
     }
     void show_macho_objc_placeholder() {
         if (!macho_objc) return;
+        macho_objc_rows.reset();
+        macho_objc_visible_rows.reset();
         const bool has_document = static_cast<bool>(shown);
         auto placeholder = std::make_shared<const std::vector<MachOObjCViewRow>>(
             std::vector<MachOObjCViewRow>{{"Scan", "", "Objective-C runtime metadata",
@@ -2015,6 +2018,7 @@ struct MainFrame::Impl {
             return row < placeholder->size() ? macho_objc_view_cell((*placeholder)[row], column, nullptr) : wxString{};
         });
         if (macho_objc_filter_status) macho_objc_filter_status->SetLabel("No runtime records loaded");
+        if (macho_objc_pseudocode) macho_objc_pseudocode->Enable(false);
         macho_objc->activate = {};
     }
     bool navigate_from_document(const std::shared_ptr<const DocumentSnapshot> &source, Location destination) {
@@ -2065,12 +2069,27 @@ struct MainFrame::Impl {
             if (row >= visible->size()) return wxString{};
             return macho_objc_view_cell((*rows)[(*visible)[row]], column, doc->image.get());
         });
+        macho_objc_visible_rows = visible;
         if (macho_objc_filter_status)
             macho_objc_filter_status->SetLabel(wxString::Format("%zu of %zu rows", visible->size(), rows->size()));
         macho_objc->activate = [this, doc, rows, visible](std::size_t row) {
             if (row < visible->size() && (*rows)[(*visible)[row]].address)
                 navigate_from_document(doc, *(*rows)[(*visible)[row]].address);
         };
+        if (macho_objc_pseudocode) {
+            const auto selected = macho_objc ? macho_objc->selected_row() : std::optional<std::size_t>{};
+            const bool enabled = selected && *selected < visible->size() &&
+                                 (*rows)[(*visible)[*selected]].code_address.has_value();
+            macho_objc_pseudocode->Enable(enabled);
+        }
+    }
+    std::optional<Address> selected_macho_objc_implementation() const {
+        if (!macho_objc || !macho_objc_rows || !macho_objc_visible_rows) return {};
+        const auto selected = macho_objc->selected_row();
+        if (!selected || *selected >= macho_objc_visible_rows->size()) return {};
+        const auto original = (*macho_objc_visible_rows)[*selected];
+        if (original >= macho_objc_rows->size()) return {};
+        return (*macho_objc_rows)[original].code_address;
     }
     void populate_macho_objc() {
         const auto doc = shown;
@@ -3161,6 +3180,19 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.macho_objc_import_types->SetName("macho-objc-import-types");
     ui.macho_objc_import_types->Enable(false);
     ui.macho_objc_import_types->SetToolTip("Persist class instance layouts and parsed method signatures from validated Objective-C runtime records.");
+    ui.macho_objc_pseudocode = new wxButton(metadata, wxID_ANY, "Pseudocode at implementation");
+    ui.macho_objc_pseudocode->SetName("macho-objc-pseudocode");
+    ui.macho_objc_pseudocode->Enable(false);
+    ui.macho_objc_pseudocode->SetToolTip("Open the selected method implementation in the pseudocode view when the runtime record has an exact implementation address.");
+    ui.macho_objc_pseudocode->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        const auto doc = impl_->macho_objc_source;
+        const auto implementation = impl_->selected_macho_objc_implementation();
+        if (!doc || !implementation || !impl_->navigate_from_document(doc, *implementation)) return;
+        if (impl_->pages && impl_->pseudocode) {
+            impl_->pages->SetSelection(impl_->pages->FindPage(impl_->pseudocode));
+            impl_->sync();
+        }
+    });
     ui.macho_objc_import_types->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         const auto doc = impl_->shown;
         if (!doc || !doc->project || !doc->project->state || !impl_->macho_objc_scan) return;
@@ -3200,12 +3232,18 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
                                wxALL | wxALIGN_CENTER_VERTICAL, FromDIP(3));
     macho_objc_layout->Add(macho_objc_filter_row, 0, wxEXPAND);
     macho_objc_layout->Add(ui.macho_objc_import_types, 0, wxALL, FromDIP(3));
+    macho_objc_layout->Add(ui.macho_objc_pseudocode, 0, wxALL, FromDIP(3));
     macho_objc_layout->Add(ui.macho_objc, 1, wxEXPAND);
     auto *macho_objc_panel = new wxPanel(metadata);
     macho_objc_panel->SetSizer(macho_objc_layout);
     ui.macho_objc->Reparent(macho_objc_panel);
     ui.macho_objc_filter->Reparent(macho_objc_panel);
     ui.macho_objc_filter_status->Reparent(macho_objc_panel);
+    const auto update_objc_pseudocode_action = [this, button = ui.macho_objc_pseudocode](wxListEvent &) {
+        if (button) button->Enable(impl_->selected_macho_objc_implementation().has_value());
+    };
+    ui.macho_objc->Bind(wxEVT_LIST_ITEM_SELECTED, update_objc_pseudocode_action);
+    ui.macho_objc->Bind(wxEVT_LIST_ITEM_DESELECTED, update_objc_pseudocode_action);
     ui.macho_objc_filter->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
         impl_->macho_objc_filter_timer.Stop();
         if (impl_->macho_objc_filter_status) impl_->macho_objc_filter_status->SetLabel("Filtering...");

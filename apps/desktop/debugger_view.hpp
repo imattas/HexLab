@@ -97,6 +97,7 @@ class DebuggerView final : public wxPanel {
     wxListCtrl *breakpoints_view_ = nullptr;
     wxListCtrl *modules_view_ = nullptr;
     wxListCtrl *memory_regions_view_ = nullptr;
+    wxListCtrl *auxiliary_vector_view_ = nullptr;
     std::vector<debugger::ThreadInfo> threads_;
     bool thread_run_states_supported_ = false;
     std::vector<debugger::RegisterValue> registers_;
@@ -119,6 +120,7 @@ class DebuggerView final : public wxPanel {
     std::vector<debugger::ProcessInfo> processes_;
     std::vector<debugger::ModuleInfo> modules_;
     std::vector<debugger::MemoryRegion> memory_regions_;
+    std::vector<debugger::AuxiliaryVectorEntry> auxiliary_vector_;
     std::vector<std::string> watch_expressions_;
     std::optional<database::ProjectUuid> watch_project_uuid_;
     std::vector<debugger::Breakpoint> breakpoints_;
@@ -131,6 +133,7 @@ class DebuggerView final : public wxPanel {
     std::uint64_t memory_request_ = 0;
     std::uint64_t module_request_ = 0;
     std::uint64_t region_request_ = 0;
+    std::uint64_t auxv_request_ = 0;
     std::uint64_t locals_request_ = 0;
     std::uint64_t memory_search_request_ = 0;
     std::uint64_t watch_request_ = 0;
@@ -170,6 +173,7 @@ class DebuggerView final : public wxPanel {
     void move_memory_page(int direction);
     void refresh_modules();
     void refresh_memory_regions();
+    void refresh_auxiliary_vector();
     void add_watch_expression();
     void remove_watch_expression();
     void refresh_watches();

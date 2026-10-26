@@ -53,6 +53,43 @@ std::string it_state_text(ThumbITState state) {
         return "clear";
     return "mask " + std::to_string(state.bits);
 }
+constexpr std::uint16_t all_nzcv = 0xffff;
+bool arm_condition_holds(std::uint8_t condition, std::uint8_t nzcv) {
+    const bool n = (nzcv & 8) != 0, z = (nzcv & 4) != 0, c = (nzcv & 2) != 0, v = (nzcv & 1) != 0;
+    switch (condition) {
+    case 0: return z;
+    case 1: return !z;
+    case 2: return c;
+    case 3: return !c;
+    case 4: return n;
+    case 5: return !n;
+    case 6: return v;
+    case 7: return !v;
+    case 8: return c && !z;
+    case 9: return !c || z;
+    case 10: return n == v;
+    case 11: return n != v;
+    case 12: return !z && n == v;
+    case 13: return z || n != v;
+    default: return true;
+    }
+}
+std::uint16_t arm_condition_mask(std::uint8_t condition) {
+    if (condition >= 14) return all_nzcv;
+    std::uint16_t result = 0;
+    for (std::uint8_t nzcv = 0; nzcv < 16; ++nzcv)
+        if (arm_condition_holds(condition, nzcv)) result |= std::uint16_t(1u << nzcv);
+    return result;
+}
+std::uint16_t predicate_guard(const Instruction &instruction) {
+    if (!instruction.arm || instruction.arm->predicate != ArmPredicate::condition) return all_nzcv;
+    return arm_condition_mask(instruction.condition);
+}
+std::uint16_t skipped_predicate_guard(const Instruction &instruction) {
+    if (!instruction.arm || instruction.arm->predicate == ArmPredicate::always) return 0;
+    if (instruction.arm->predicate == ArmPredicate::unknown_it) return all_nzcv;
+    return static_cast<std::uint16_t>(all_nzcv & ~arm_condition_mask(instruction.condition));
+}
 } // namespace
 uint64_t Ids::make(FactKind kind, Address address, std::span<const std::byte> extra) {
     std::vector<std::byte> key{std::byte(static_cast<unsigned>(kind))};
@@ -971,7 +1008,8 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
         delayed_slots.insert(slot);
         value.edges.push_back({slot, BlockEdgeKind::delay_slot});
     }
-    const auto continuation = [&](BlockEdgeKind kind) {
+    const auto continuation = [&](BlockEdgeKind kind, std::uint16_t flags_guard = all_nzcv,
+                                  bool flags_unknown_after = false) {
         auto next = analysis_detail::continuation_address(instruction);
         if (next) {
             const auto next_context = image.context_at(next.value());
@@ -985,11 +1023,16 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
             value.edges.push_back({next.value(), kind,
                                    instruction.context.mode == ExecutionMode::thumb && instruction.arm
                                        ? instruction.arm->it_after
-                                       : ThumbITState{}});
+                                       : ThumbITState{},
+                                   flags_guard, flags_unknown_after});
         else
             value.stop =
                 FunctionStop{address, FunctionStopReason::target_overflow, "Continuation exceeds address model"};
     };
+    const auto executes_with = predicate_guard(instruction);
+    const auto skips_with = skipped_predicate_guard(instruction);
+    const bool writes_nzcv = instruction.arm &&
+                             (instruction.arm->flags_written != 0 || !instruction.arm->flags_known);
     const auto unresolved = [&]() {
         if (!instruction.operands.empty()) {
             const auto resolution = take(relocations.operand(instruction, 0, stop));
@@ -1030,29 +1073,30 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
     switch (instruction.flow) {
     case FlowKind::ret:
         value.stop = FunctionStop{address, FunctionStopReason::ret, "Return"};
-        if (instruction.arm && (instruction.arm->predicate == ArmPredicate::condition ||
-                                instruction.arm->predicate == ArmPredicate::unknown_it))
-            continuation(BlockEdgeKind::conditional_false);
+        value.stop_guard = executes_with;
+        if (skips_with) continuation(BlockEdgeKind::conditional_false, skips_with);
         break;
     case FlowKind::trap:
         value.stop = FunctionStop{address, FunctionStopReason::trap, "Trap"};
-        if (instruction.context.architecture == Architecture::arm && instruction.arm &&
-            (instruction.arm->predicate == ArmPredicate::condition ||
-             instruction.arm->predicate == ArmPredicate::unknown_it))
-            continuation(BlockEdgeKind::conditional_false);
+        value.stop_guard = executes_with;
+        if (instruction.context.architecture == Architecture::arm && skips_with)
+            continuation(BlockEdgeKind::conditional_false, skips_with);
         break;
     case FlowKind::fallthrough:
         if (instruction.context.architecture == Architecture::arm && instruction.arm && instruction.arm->writes_pc) {
             value.stop = FunctionStop{address, FunctionStopReason::unsupported,
                                       "ARM instruction writes PC without a modeled control-flow edge"};
-            if (instruction.arm->predicate == ArmPredicate::condition ||
-                instruction.arm->predicate == ArmPredicate::unknown_it)
-                continuation(BlockEdgeKind::conditional_false);
+            value.stop_guard = executes_with;
+            if (skips_with) continuation(BlockEdgeKind::conditional_false, skips_with);
+        } else if (instruction.arm && instruction.arm->predicate != ArmPredicate::always) {
+            continuation(BlockEdgeKind::fallthrough, executes_with, writes_nzcv);
+            if (skips_with) continuation(BlockEdgeKind::fallthrough, skips_with);
         } else
-            continuation(BlockEdgeKind::fallthrough);
+            continuation(BlockEdgeKind::fallthrough, all_nzcv, writes_nzcv);
         break;
     case FlowKind::call:
         value.call = true;
+        value.call_guard = executes_with;
         value.call_target = arm_target_matches() ? target : std::nullopt;
         if (value.call_target && target_it().known)
             thumb_states.emplace(*value.call_target, target_it());
@@ -1066,45 +1110,55 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
                     : "Call target remains unresolved"};
         else if (auto denied = permission(*value.call_target))
             value.call_issue = FunctionStop{address, *denied, "Call target has no permitted initialized code"};
-        continuation(BlockEdgeKind::call_continuation);
-        if (instruction.context.architecture == Architecture::arm && instruction.arm &&
-            (instruction.arm->predicate == ArmPredicate::condition ||
-             instruction.arm->predicate == ArmPredicate::unknown_it))
-            continuation(BlockEdgeKind::conditional_false);
+        continuation(BlockEdgeKind::call_continuation, executes_with, true);
+        if (instruction.context.architecture == Architecture::arm && skips_with)
+            continuation(BlockEdgeKind::conditional_false, skips_with);
         break;
-    case FlowKind::conditional_branch:
+    case FlowKind::conditional_branch: {
         if (instruction.context.architecture == Architecture::arm) {
             if (!arm_target_matches()) {
                 value.stop = FunctionStop{address, FunctionStopReason::unsupported,
                                           "ARM branch target conflicts with source-backed execution-state metadata"};
+                value.stop_guard = executes_with;
+                if (skips_with) continuation(BlockEdgeKind::conditional_false, skips_with);
                 break;
             }
         }
         value.edges.push_back({target, target ? BlockEdgeKind::conditional_true : BlockEdgeKind::unresolved,
-                               target_it()});
-        if (!target)
+                               target_it(), executes_with, writes_nzcv});
+        if (!target) {
             value.stop = FunctionStop{address, unresolved(), "Conditional target remains unresolved"};
-        continuation(BlockEdgeKind::conditional_false);
+            value.stop_guard = executes_with;
+        }
+        const auto branch_not_taken = instruction.context.architecture == Architecture::arm && instruction.arm &&
+                                              instruction.arm->predicate == ArmPredicate::condition
+                                          ? static_cast<std::uint16_t>(all_nzcv & ~executes_with)
+                                          : all_nzcv;
+        continuation(BlockEdgeKind::conditional_false, branch_not_taken);
         break;
+    }
     case FlowKind::jump:
     {
         const bool predicated_arm_transfer = instruction.context.architecture == Architecture::arm && instruction.arm &&
-                                            (instruction.arm->predicate == ArmPredicate::condition ||
-                                             instruction.arm->predicate == ArmPredicate::unknown_it);
+                                             instruction.arm->predicate != ArmPredicate::always;
         if (instruction.context.architecture == Architecture::arm) {
             if (!arm_target_matches()) {
                 value.stop = FunctionStop{address, FunctionStopReason::unsupported,
                                           "ARM branch target conflicts with source-backed execution-state metadata"};
-                if (predicated_arm_transfer)
-                    continuation(BlockEdgeKind::conditional_false);
+                value.stop_guard = executes_with;
+                if (predicated_arm_transfer && skips_with)
+                    continuation(BlockEdgeKind::conditional_false, skips_with);
                 break;
             }
         }
-        value.edges.push_back({target, target ? BlockEdgeKind::jump : BlockEdgeKind::unresolved, target_it()});
-        if (!target)
+        value.edges.push_back({target, target ? BlockEdgeKind::jump : BlockEdgeKind::unresolved, target_it(),
+                               executes_with, writes_nzcv});
+        if (!target) {
             value.stop = FunctionStop{address, unresolved(), "Jump target remains unresolved"};
+            value.stop_guard = executes_with;
+        }
         if (predicated_arm_transfer)
-            continuation(BlockEdgeKind::conditional_false);
+            continuation(BlockEdgeKind::conditional_false, skips_with);
         break;
         }
     case FlowKind::switch_dispatch:
@@ -1227,7 +1281,7 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
     return finish();
 }
 void Recovery::discover() {
-    using Work = std::pair<Address, ThumbITState>;
+    struct Work { Address address; ThumbITState it; std::uint16_t flags = all_nzcv; };
     const auto initial_state = [&](Address at) {
         const auto context = take(image.context_at(at));
         return context.mode == ExecutionMode::thumb ? ThumbITState{true, 0} : ThumbITState{};
@@ -1244,22 +1298,28 @@ void Recovery::discover() {
         pending_functions.pop_front();
         if (!done.insert(entry).second)
             continue;
-        std::deque<Work> pending{{entry, thumb_states.contains(entry) ? thumb_states.at(entry) : initial_state(entry)}};
+        std::deque<Work> pending{{entry, thumb_states.contains(entry) ? thumb_states.at(entry) : initial_state(entry), all_nzcv}};
         if (auto definition = definitions.find(entry); definition != definitions.end())
             for (const auto &chunk : definition->second->chunks)
-                pending.push_back({chunk.begin, initial_state(chunk.begin)});
-        AddressSet visited;
+                pending.push_back({chunk.begin, initial_state(chunk.begin), all_nzcv});
+        AddressMap<PathVisitState> visited;
         while (!pending.empty()) {
             canceled();
-            const auto [address, incoming_it] = pending.front();
+            const auto work = pending.front();
             pending.pop_front();
-            if (!within_chunks(entry, address))
-                continue;
-            if (!visited.insert(address).second) {
+            const auto address = work.address;
+            const auto incoming_it = work.it;
+            bool it_conflict = false;
+            const auto fresh_flags = add_new_path_flags(visited, address, incoming_it, work.flags, it_conflict);
+            if (it_conflict) {
                 if (thumb_states.contains(address) && thumb_states.at(address) != incoming_it)
                     (void)node(address, incoming_it);
                 continue;
             }
+            if (!fresh_flags) continue;
+            reachable_flags[address] = static_cast<std::uint16_t>(reachable_flags[address] | fresh_flags);
+            if (!within_chunks(entry, address))
+                continue;
             if (memberships++ >= options.membership_budget) {
                 discovery_exhausted = true;
                 output->complete = false;
@@ -1269,7 +1329,8 @@ void Recovery::discover() {
             if (!current.fact || !within_chunks(entry, address, current.fact->instruction.length))
                 continue;
             const auto &dispatch = current.fact->instruction;
-            if (dispatch.flow == FlowKind::jump && switch_scanned.insert(address).second) {
+            if (dispatch.flow == FlowKind::jump && (fresh_flags & predicate_guard(dispatch)) &&
+                switch_scanned.insert(address).second) {
                 FunctionRecord temporary_function;
                 temporary_function.id = {1};
                 temporary_function.entry = address;
@@ -1317,12 +1378,16 @@ void Recovery::discover() {
                         current.stop.reset();
                 }
             }
-            if (current.call_target && !permission(*current.call_target) &&
+            if (current.call_target && (fresh_flags & current.call_guard) && !permission(*current.call_target) &&
                 add_seed(all_seeds, {FunctionSeedKind::direct_call, *current.call_target, address, {}}))
                 pending_functions.push_back(*current.call_target);
             for (const auto &edge : current.edges)
-                if (edge.target)
-                    pending.push_back({*edge.target, edge.target_it});
+                if (edge.target) {
+                    auto next_flags = static_cast<std::uint16_t>(fresh_flags & edge.flags_guard);
+                    if (!next_flags) continue;
+                    if (edge.flags_unknown_after) next_flags = all_nzcv;
+                    pending.push_back({*edge.target, edge.target_it, next_flags});
+                }
         }
     }
 }
@@ -1353,7 +1418,8 @@ void Recovery::find_conflicts() {
     for (const auto &[at, node] : nodes) {
         canceled();
         for (const auto &edge : node.edges) {
-            if (!edge.target)
+            if (!edge.target || (reachable_flags.contains(at) &&
+                                 !(reachable_flags.at(at) & edge.flags_guard)))
                 continue;
             if (edge.kind == BlockEdgeKind::delay_slot)
                 slot_sources.try_emplace(*edge.target, at);
@@ -1399,24 +1465,28 @@ void Recovery::trusted_seeds() {
         pending_functions.pop_front();
         if (!done.insert(entry).second)
             continue;
-        std::deque<std::pair<Address, ThumbITState>> pending{{
-            entry, thumb_states.contains(entry) ? thumb_states.at(entry) : ThumbITState{true, 0}}};
+        struct Work { Address address; ThumbITState it; std::uint16_t flags = all_nzcv; };
+        std::deque<Work> pending{{entry, thumb_states.contains(entry) ? thumb_states.at(entry) : ThumbITState{true, 0}, all_nzcv}};
         if (auto definition = definitions.find(entry); definition != definitions.end())
             for (const auto &chunk : definition->second->chunks)
                 pending.push_back({chunk.begin, thumb_states.contains(chunk.begin) ? thumb_states.at(chunk.begin)
-                                                                                   : ThumbITState{true, 0}});
-        AddressSet visited;
+                                                                                   : ThumbITState{true, 0}, all_nzcv});
+        AddressMap<PathVisitState> visited;
         while (!pending.empty()) {
             canceled();
-            const auto [at, incoming_it] = pending.front();
+            const auto work = pending.front();
             pending.pop_front();
-            if (!within_chunks(entry, at))
-                continue;
-            if (!visited.insert(at).second) {
-                if (thumb_states.contains(at) && thumb_states.at(at) != incoming_it)
-                    (void)node(at, incoming_it);
+            const auto at = work.address;
+            const auto incoming_it = work.it;
+            bool it_conflict = false;
+            const auto fresh_flags = add_new_path_flags(visited, at, incoming_it, work.flags, it_conflict);
+            if (it_conflict) {
+                if (thumb_states.contains(at) && thumb_states.at(at) != incoming_it) (void)node(at, incoming_it);
                 continue;
             }
+            if (!fresh_flags) continue;
+            if (!within_chunks(entry, at))
+                continue;
             if (memberships++ >= options.membership_budget) {
                 output->complete = false;
                 return;
@@ -1424,7 +1494,7 @@ void Recovery::trusted_seeds() {
             auto &current = node(at, incoming_it);
             if (ambiguous.contains(at) || !current.fact || !within_chunks(entry, at, current.fact->instruction.length))
                 continue;
-            if (current.call_target && !suppressed.contains(*current.call_target)) {
+            if (current.call_target && (fresh_flags & current.call_guard) && !suppressed.contains(*current.call_target)) {
                 if (auto denied = permission(*current.call_target))
                     output->candidates.push_back(
                         {*current.call_target, at, *denied, "Direct call cannot seed permitted initialized code"});
@@ -1433,8 +1503,12 @@ void Recovery::trusted_seeds() {
                     pending_functions.push_back(*current.call_target);
             }
             for (const auto &edge : current.edges)
-                if (edge.target)
-                    pending.push_back({*edge.target, edge.target_it});
+                if (edge.target) {
+                    auto next_flags = static_cast<std::uint16_t>(fresh_flags & edge.flags_guard);
+                    if (!next_flags) continue;
+                    if (edge.flags_unknown_after) next_flags = all_nzcv;
+                    pending.push_back({*edge.target, edge.target_it, next_flags});
+                }
         }
     }
 }
@@ -1442,6 +1516,7 @@ void Recovery::assign_owners() {
     functions.clear();
     owners.clear();
     function_nodes.clear();
+    reachable_flags.clear();
     output->calls.clear();
     for (const auto &[entry, seeds] : valid_seeds) {
         auto function = std::make_shared<FunctionRecord>();
@@ -1451,27 +1526,41 @@ void Recovery::assign_owners() {
         functions.emplace(entry, std::move(function));
     }
     for (auto &[entry, function] : functions) {
-        std::deque<std::pair<Address, ThumbITState>> pending{{
-            entry, thumb_states.contains(entry) ? thumb_states.at(entry) : ThumbITState{true, 0}}};
+        struct Work { Address address; ThumbITState it; std::uint16_t flags = all_nzcv; };
+        std::deque<Work> pending{{entry, thumb_states.contains(entry) ? thumb_states.at(entry) : ThumbITState{true, 0}, all_nzcv}};
         if (auto definition = definitions.find(entry); definition != definitions.end())
             for (const auto &chunk : definition->second->chunks)
                 pending.push_back({chunk.begin, thumb_states.contains(chunk.begin) ? thumb_states.at(chunk.begin)
-                                                                                   : ThumbITState{true, 0}});
-        AddressSet visited;
+                                                                                   : ThumbITState{true, 0}, all_nzcv});
+        AddressMap<PathVisitState> visited;
         const auto record = [&](FunctionStop issue) {
             if (!terminal_complete(issue.reason))
                 function->complete = false;
-            function->stops.push_back(std::move(issue));
+            const auto duplicate = std::any_of(function->stops.begin(), function->stops.end(), [&](const auto &old) {
+                return old.address == issue.address && old.reason == issue.reason && old.detail == issue.detail;
+            });
+            if (!duplicate) function->stops.push_back(std::move(issue));
+        };
+        const auto record_call = [&](FunctionCall call) {
+            const auto duplicate = std::any_of(output->calls.begin(), output->calls.end(), [&](const auto &old) {
+                return old.owner == call.owner && old.source == call.source && old.tail_candidate == call.tail_candidate;
+            });
+            if (!duplicate) output->calls.push_back(std::move(call));
         };
         while (!pending.empty()) {
             canceled();
-            const auto [at, incoming_it] = pending.front();
+            const auto work = pending.front();
             pending.pop_front();
-            if (!visited.insert(at).second) {
-                if (thumb_states.contains(at) && thumb_states.at(at) != incoming_it)
-                    (void)node(at, incoming_it);
+            const auto at = work.address;
+            const auto incoming_it = work.it;
+            bool it_conflict = false;
+            const auto fresh_flags = add_new_path_flags(visited, at, incoming_it, work.flags, it_conflict);
+            if (it_conflict) {
+                if (thumb_states.contains(at) && thumb_states.at(at) != incoming_it) (void)node(at, incoming_it);
                 continue;
             }
+            if (!fresh_flags)
+                continue;
             if (owner_steps++ >= options.membership_budget) {
                 record({at, FunctionStopReason::budget, "Function ownership budget reached"});
                 break;
@@ -1487,30 +1576,38 @@ void Recovery::assign_owners() {
                         "Instruction crosses the function's declared or metadata-proven chunk boundary"});
                 continue;
             }
-            owners[at].push_back(function->id);
+            auto &address_owners = owners[at];
+            if (std::find(address_owners.begin(), address_owners.end(), function->id) == address_owners.end())
+                address_owners.push_back(function->id);
             function_nodes[function->id].insert(at);
-            if (current.stop)
+            reachable_flags[at] = static_cast<std::uint16_t>(reachable_flags[at] | fresh_flags);
+            if (current.stop && (fresh_flags & current.stop_guard))
                 record(*current.stop);
             if (ambiguous.contains(at)) {
                 record({at, FunctionStopReason::overlap, "Conflicting instruction streams stop trusted ownership"});
                 continue;
             }
-            if (current.call_issue)
+            const bool call_reachable = current.call && (fresh_flags & current.call_guard);
+            if (call_reachable && current.call_issue)
                 record(*current.call_issue);
-            if (current.call) {
+            if (call_reachable) {
                 std::optional<FunctionId> callee;
                 if (current.call_target) {
                     auto target = functions.find(*current.call_target);
                     if (target != functions.end())
                         callee = target->second->id;
                 }
-                output->calls.push_back({function->id, at, current.call_target, callee, false});
+                record_call({function->id, at, current.call_target, callee, false});
             }
             for (const auto &edge : current.edges) {
                 if (!edge.target)
                     continue;
-                const bool call_continuation_entry = current.call && current.call_target == edge.target &&
-                                                     !permission(*edge.target) && !suppressed.contains(*edge.target);
+                auto next_flags = static_cast<std::uint16_t>(fresh_flags & edge.flags_guard);
+                if (!next_flags) continue;
+                if (edge.flags_unknown_after) next_flags = all_nzcv;
+                const bool call_continuation_entry = call_reachable && edge.kind == BlockEdgeKind::call_continuation &&
+                                                     current.call_target == edge.target && !permission(*edge.target) &&
+                                                     !suppressed.contains(*edge.target);
                 if (*edge.target != entry && (functions.contains(*edge.target) || root_entries.contains(*edge.target) ||
                                               call_continuation_entry)) {
                     if (!functions.contains(*edge.target)) {
@@ -1519,7 +1616,7 @@ void Recovery::assign_owners() {
                         continue;
                     }
                     if (edge.kind == BlockEdgeKind::jump) {
-                        output->calls.push_back({function->id, at, edge.target, functions.at(*edge.target)->id, true});
+                        record_call({function->id, at, edge.target, functions.at(*edge.target)->id, true});
                         record({at, FunctionStopReason::tail_candidate,
                                 "Transfer reaches another established function entry"});
                     } else
@@ -1535,7 +1632,7 @@ void Recovery::assign_owners() {
                             "Flow crosses a declared execution-context boundary"});
                     continue;
                 }
-                    pending.push_back({*edge.target, edge.target_it});
+                    pending.push_back({*edge.target, edge.target_it, next_flags});
             }
         }
         const auto owned = function_nodes.find(function->id);
@@ -1623,7 +1720,7 @@ namespace hexlab {
 Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     Sha256 hash;
     constexpr std::string_view version =
-        "hexlab-functions-v54/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v1/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v3/guard-multiblock-v1/unicode-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
+        "hexlab-functions-v55/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v1/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v3/guard-multiblock-v1/unicode-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
         "elf-reference-provenance-v1/elf-arithmetic-v2/macho-symbol-roots-v1/macho-relocation-flow-v1/"
         "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1";
     (void)hash.update(std::as_bytes(std::span(version)));

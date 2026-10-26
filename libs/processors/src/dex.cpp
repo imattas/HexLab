@@ -30,6 +30,8 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
     FlowKind flow = FlowKind::fallthrough;
     std::optional<Address> target;
     std::optional<DexSwitchTable> dex_switch;
+    std::vector<unsigned> dex_register_reads;
+    std::optional<std::uint16_t> dex_type_index;
     const auto ensure = [&](unsigned count) {
         std::uint16_t ignored = 0;
         return code_unit(bytes, count - 1, ignored);
@@ -113,6 +115,37 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
     } else if (op == 0x23) {
         words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX new-array");
         text = "new-array " + vr(hi & 15) + ", " + vr(hi >> 4) + ", type@" + std::to_string(word(1));
+    } else if (op == 0x24) {
+        words = 3;
+        if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX filled-new-array");
+        const unsigned count = (first >> 12) & 15;
+        const unsigned last = (first >> 8) & 15;
+        const auto list = word(2);
+        if (count > 5) return fail(DecodeStatus::invalid, "DEX filled-new-array register count exceeds five");
+        const std::array<unsigned, 5> regs{static_cast<unsigned>(list & 15), static_cast<unsigned>((list >> 4) & 15),
+            static_cast<unsigned>((list >> 8) & 15), static_cast<unsigned>((list >> 12) & 15), last};
+        text = "filled-new-array {";
+        for (unsigned i = 0; i < count; ++i) {
+            if (i) text += ", ";
+            text += vr(regs[i]);
+            dex_register_reads.push_back(regs[i]);
+        }
+        dex_type_index = word(1);
+        text += "}, type@" + std::to_string(*dex_type_index);
+    } else if (op == 0x25) {
+        words = 3;
+        if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX filled-new-array/range");
+        const auto count = static_cast<unsigned>(hi);
+        const auto start = static_cast<unsigned>(word(2));
+        if (count && start > UINT16_MAX - (count - 1))
+            return fail(DecodeStatus::invalid, "DEX filled-new-array register range overflows 16-bit register indexes");
+        if (count && start + count - 1 > UINT8_MAX)
+            return fail(DecodeStatus::unsupported, "DEX register indexes above 255 exceed the typed operand model");
+        text = "filled-new-array/range {";
+        if (count) text += vr(start) + " .. " + vr(start + count - 1);
+        dex_type_index = word(1);
+        text += "}, type@" + std::to_string(*dex_type_index);
+        for (unsigned i = 0; i < count; ++i) dex_register_reads.push_back(start + i);
     } else if (op >= 0x44 && op <= 0x51) {
         words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX array access");
         static constexpr std::array<std::string_view, 14> names{
@@ -244,7 +277,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
                               (op >= 0x52 && op <= 0x58) || (op >= 0x60 && op <= 0x66);
     instruction.memory_write = (op >= 0x4b && op <= 0x51) || (op >= 0x59 && op <= 0x5f) ||
                                (op >= 0x67 && op <= 0x6d);
-    if (op == 0x22 || op == 0x23 || (op >= 0x6e && op <= 0x78))
+    if (op == 0x22 || op == 0x23 || op == 0x24 || op == 0x25 || (op >= 0x6e && op <= 0x78))
         instruction.memory_read = instruction.memory_write = true;
     instruction.mnemonic_override = std::move(text); instruction.flow = flow; instruction.direct_target = target;
     instruction.dex_switch = std::move(dex_switch);
@@ -252,6 +285,16 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         instruction.operands.emplace_back(RegisterOperand{RegisterBank::dex_vreg, hi, 32, false});
         instruction.access.push_back(OperandAccess::read);
         instruction.register_reads.push_back({RegisterBank::dex_vreg, hi, 32, false});
+    }
+    for (const auto index : dex_register_reads) {
+        const RegisterOperand reg{RegisterBank::dex_vreg, static_cast<std::uint8_t>(index), 32, false};
+        instruction.operands.emplace_back(reg);
+        instruction.access.push_back(OperandAccess::read);
+        instruction.register_reads.push_back(reg);
+    }
+    if (dex_type_index) {
+        instruction.operands.emplace_back(ImmediateOperand{*dex_type_index, 16, 16, false, {}});
+        instruction.access.push_back(OperandAccess::read);
     }
     if (target) instruction.operands.emplace_back(RelativeOperand{static_cast<std::int64_t>(target->offset) - static_cast<std::int64_t>(at.offset),16,32,{}});
     return {DecodeStatus::decoded, std::move(instruction), {}};
