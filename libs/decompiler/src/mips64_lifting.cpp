@@ -19,6 +19,9 @@ ExpressionPtr reg(RegisterOperand value) {
 ExpressionPtr unary(std::string operation, ExpressionPtr value, std::uint16_t width) {
     return std::make_shared<Expression>(Expression{integer(width), UnaryValue{std::move(operation), std::move(value)}});
 }
+ExpressionPtr typed_unary(std::string operation, ExpressionPtr value, ValueType type) {
+    return std::make_shared<Expression>(Expression{type, UnaryValue{std::move(operation), std::move(value)}});
+}
 ExpressionPtr binary(std::string operation, ExpressionPtr left, ExpressionPtr right, std::uint16_t width) {
     return std::make_shared<Expression>(Expression{integer(width), BinaryValue{std::move(operation), std::move(left), std::move(right)}});
 }
@@ -136,10 +139,34 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
         return assign(binary("or", preserved, std::move(inserted), 64));
     }
 
-    // COP1 transfers and conversions have architectural details (MFC1 sign
-    // extension, rounding mode, FCSR exception flags) that are deliberately
-    // kept explicit as typed intrinsics instead of being approximated.
+    // Bit-preserving GPR/FPR transfers are ordinary SSA values. FCSR control
+    // views remain explicit intrinsics because their bit-level aliases are
+    // not modeled here; the aggregate FCSR word is representable directly.
     if (op >= Opcode::mips64_mfc1 && op <= Opcode::mips64_ctc1) {
+        if (items.size() == 2) {
+            const auto *general = std::get_if<RegisterOperand>(&items[0]);
+            const auto *cop = std::get_if<RegisterOperand>(&items[1]);
+            if (general && cop && general->bank == RegisterBank::mips_gpr && general->width == 64) {
+                if (op == Opcode::mips64_mfc1 && cop->bank == RegisterBank::mips_fpr && cop->width == 32)
+                    return assign(unary("sext", unary("bitcast_f32", operand(items[1]), 32), 64));
+                if (op == Opcode::mips64_dmfc1 && cop->bank == RegisterBank::mips_fpr && cop->width == 64)
+                    return assign(unary("bitcast_f64", operand(items[1]), 64));
+                if (op == Opcode::mips64_cfc1 && cop->bank == RegisterBank::mips_fcsr && cop->index == 0 &&
+                    cop->width == 32)
+                    return assign(unary("sext", operand(items[1]), 64));
+            }
+            if (general && cop && general->bank == RegisterBank::mips_gpr && general->width == 64) {
+                if (op == Opcode::mips64_mtc1 && cop->bank == RegisterBank::mips_fpr && cop->width == 32) {
+                    auto raw = unary("trunc32", operand(items[0]), 32);
+                    return Assign{*cop, typed_unary("bitcast_f32", std::move(raw), floating(32))};
+                }
+                if (op == Opcode::mips64_dmtc1 && cop->bank == RegisterBank::mips_fpr && cop->width == 64)
+                    return Assign{*cop, typed_unary("bitcast_f64", operand(items[0]), floating(64))};
+                if (op == Opcode::mips64_ctc1 && cop->bank == RegisterBank::mips_fcsr && cop->index == 0 &&
+                    cop->width == 32)
+                    return Assign{*cop, unary("trunc32", operand(items[0]), 32)};
+            }
+        }
         static constexpr const char *names[]{"mips64.mfc1.sext32", "mips64.dmfc1", "mips64.cfc1.sext32",
             "mips64.mtc1", "mips64.dmtc1", "mips64.ctc1"};
         std::string name = names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::mips64_mfc1)];

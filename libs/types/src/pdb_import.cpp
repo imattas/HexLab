@@ -6,6 +6,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <string_view>
@@ -15,6 +16,8 @@ namespace hexlab::types {
 namespace {
 constexpr std::size_t max_odr_collision_definitions = 100'000;
 constexpr std::size_t max_odr_identity_bytes = 16 * 1024 * 1024;
+constexpr std::size_t max_odr_compare_pairs = 2'000'000;
+constexpr std::size_t max_odr_compare_depth = 128;
 bool valid_type_name(std::string_view text, std::size_t byte_limit = 512) {
     if (text.empty() || text.size() > byte_limit) return false;
     for (std::size_t i = 0; i < text.size();) {
@@ -148,22 +151,96 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             record.kind != CodeViewTypeKind::method_list && valid_type_name(record.name))
             full_definitions_by_name[record.name].push_back(&node);
     }
-    // A repeated ODR name can arrive from either the same TPI stream or a
-    // type-server namespace. Even different aggregate kinds claiming the
-    // same identity are inconsistent. Decide this before converting pointers,
-    // functions, or data-symbol types.
-    std::map<std::string_view, const PdbTypeGraphNode *> first_definition_by_odr;
-    for (const auto &node : graph.nodes) {
-        const auto &record = node.record;
-        if (record.forward_declaration || !aggregate_identity_kind(record.kind) ||
-            !valid_type_name(record.name) || record.unique_name.empty())
-            continue;
-        const auto [first, inserted] = first_definition_by_odr.emplace(
-            std::string_view{record.unique_name.data(), record.unique_name.size()}, &node);
-        if (!inserted) {
-            ambiguous_names.insert(first->second->record.name);
-            ambiguous_names.insert(record.name);
+    // Compare repeated complete UDT identities structurally before allowing
+    // them to share a storage name. Type::id() is only a hash and cannot prove
+    // equality. References are compared across namespace-aware graph nodes.
+    std::map<std::pair<TypeKey, TypeKey>, bool> odr_pair_cache;
+    std::set<std::pair<TypeKey, TypeKey>> odr_active_pairs;
+    std::size_t odr_compared_pairs = 0;
+    bool odr_comparison_exhausted = false;
+    const auto resolve_odr_reference = [&](TypeKey source, std::uint32_t ref) -> std::optional<TypeKey> {
+        if (ref < 0x1000) return std::nullopt;
+        const auto ns = static_cast<std::uint8_t>(ref >> 24);
+        const auto index = ref & 0x00ffffffu;
+        const TypeKey local{ns ? ns : source.first, index};
+        if (nodes.contains(local)) return local;
+        const TypeKey same_namespace{source.first, ref};
+        if (nodes.contains(same_namespace)) return same_namespace;
+        return std::nullopt;
+    };
+    std::function<bool(TypeKey, TypeKey, std::size_t)> same_node;
+    std::function<bool(TypeKey, std::uint32_t, TypeKey, std::uint32_t, std::size_t)> same_ref;
+    same_ref = [&](TypeKey a, std::uint32_t ar, TypeKey b, std::uint32_t br, std::size_t depth) {
+        if (ar < 0x1000 || br < 0x1000) return ar == br;
+        const auto ak = resolve_odr_reference(a, ar), bk = resolve_odr_reference(b, br);
+        return ak && bk && same_node(*ak, *bk, depth + 1);
+    };
+    same_node = [&](TypeKey a, TypeKey b, std::size_t depth) {
+        if (a == b) return true;
+        if (depth > max_odr_compare_depth || odr_compared_pairs >= max_odr_compare_pairs) {
+            odr_comparison_exhausted = true; return false;
         }
+        const auto pair = a < b ? std::pair{a,b} : std::pair{b,a};
+        if (const auto cached = odr_pair_cache.find(pair); cached != odr_pair_cache.end()) return cached->second;
+        if (odr_active_pairs.contains(pair)) return true; // coinductive cycle; outer frames compare remaining edges
+        const auto ai = nodes.find(a), bi = nodes.find(b);
+        if (ai == nodes.end() || bi == nodes.end()) return false;
+        ++odr_compared_pairs; odr_active_pairs.insert(pair);
+        const auto &x = ai->second->record, &y = bi->second->record;
+        // These records do not retain enough decoded payload to establish
+        // structural identity. Exact same-node references returned above.
+        if (x.kind == CodeViewTypeKind::unsupported || y.kind == CodeViewTypeKind::unsupported ||
+            x.kind == CodeViewTypeKind::type_server || y.kind == CodeViewTypeKind::type_server) {
+            odr_active_pairs.erase(pair);
+            odr_pair_cache.emplace(pair, false);
+            return false;
+        }
+        bool equal = x.leaf == y.leaf && x.kind == y.kind && x.name == y.name && x.unique_name == y.unique_name &&
+            x.forward_declaration == y.forward_declaration && x.size == y.size &&
+            x.pointer_kind == y.pointer_kind && x.pointer_mode == y.pointer_mode && x.pointer_options == y.pointer_options &&
+            x.qualifier_bits == y.qualifier_bits && x.bitfield_width == y.bitfield_width && x.bitfield_position == y.bitfield_position &&
+            x.calling_convention == y.calling_convention && x.function_options == y.function_options &&
+            x.vftable_vfptr_offset == y.vftable_vfptr_offset && x.vftable_slot_kinds == y.vftable_slot_kinds &&
+            x.vftable_names == y.vftable_names && x.this_adjustment == y.this_adjustment && x.parameter_count == y.parameter_count &&
+            x.fields.size() == y.fields.size() && x.field_list_continuations.size() == y.field_list_continuations.size();
+        if (equal) equal = same_ref(a,x.referenced_type,b,y.referenced_type,depth) &&
+            same_ref(a,x.field_list,b,y.field_list,depth) && same_ref(a,x.derivation_list,b,y.derivation_list,depth) &&
+            same_ref(a,x.vtable_shape,b,y.vtable_shape,depth) && same_ref(a,x.underlying_type,b,y.underlying_type,depth) &&
+            same_ref(a,x.member_class_type,b,y.member_class_type,depth) && same_ref(a,x.member_this_type,b,y.member_this_type,depth) &&
+            same_ref(a,x.vftable_complete_class_type,b,y.vftable_complete_class_type,depth) &&
+            same_ref(a,x.vftable_overridden_type,b,y.vftable_overridden_type,depth);
+        const auto &xf = ai->second->expanded_fields.empty() ? x.fields : ai->second->expanded_fields;
+        const auto &yf = bi->second->expanded_fields.empty() ? y.fields : bi->second->expanded_fields;
+        if (equal) equal = xf.size() == yf.size();
+        for (std::size_t i = 0; equal && i < xf.size(); ++i) {
+            const auto &f=xf[i], &g=yf[i];
+            equal = f.leaf==g.leaf && f.attributes==g.attributes && f.offset==g.offset && f.name==g.name && f.value==g.value &&
+                same_ref(a,f.type,b,g.type,depth) && same_ref(a,f.auxiliary_type,b,g.auxiliary_type,depth);
+        }
+        if (equal) for (std::size_t i=0;i<x.field_list_continuations.size();++i)
+            if (!same_ref(a,x.field_list_continuations[i],b,y.field_list_continuations[i],depth)) { equal=false; break; }
+        odr_active_pairs.erase(pair);
+        // A successful result may have used the coinductive active-pair rule;
+        // avoid memoizing it because a later mismatch in the enclosing cycle
+        // must not turn that provisional assumption into a proof.
+        if (!equal) odr_pair_cache.emplace(pair,false);
+        return equal;
+    };
+    std::map<std::string_view, std::vector<const PdbTypeGraphNode *>, std::less<>> definitions_by_odr;
+    for (const auto &node : graph.nodes) {
+        const auto &r=node.record;
+        if (!r.forward_declaration && aggregate_identity_kind(r.kind) && valid_type_name(r.name) && valid_type_name(r.unique_name,4096))
+            definitions_by_odr[std::string_view{r.unique_name}].push_back(&node);
+    }
+    std::set<std::string_view, std::less<>> equivalent_odr_names;
+    for (const auto &[identity, defs] : definitions_by_odr) {
+        if (defs.size() < 2) continue;
+        bool equivalent=true;
+        for (std::size_t i=1;i<defs.size();++i)
+            if (defs[i]->record.kind != defs.front()->record.kind || defs[i]->record.name != defs.front()->record.name ||
+                !same_node({defs.front()->name_space,defs.front()->record.index},{defs[i]->name_space,defs[i]->record.index},0)) { equivalent=false; break; }
+        if (equivalent && !odr_comparison_exhausted) equivalent_odr_names.insert(identity);
+        else for (const auto *def:defs) ambiguous_names.insert(def->record.name);
     }
     std::map<TypeKey, std::string> storage_names;
     std::map<std::string, std::vector<const PdbTypeGraphNode *>, std::less<>> generated_by_name;
@@ -222,7 +299,12 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
     // Hashed storage names are deterministic; still reject hash/prefix/name
     // collisions rather than allowing a shared project storage identity.
     for (const auto &[name, entries] : generated_by_name) {
-        if (reserved_names.contains(name) || entries.size() > 1)
+        const bool same_odr_identity = entries.size() > 1 && std::all_of(entries.begin(), entries.end(), [&](const auto *entry) {
+            return entry->record.unique_name == entries.front()->record.unique_name &&
+                entry->record.kind == entries.front()->record.kind && entry->record.name == entries.front()->record.name &&
+                equivalent_odr_names.contains(entry->record.unique_name);
+        });
+        if (reserved_names.contains(name) || (entries.size() > 1 && !same_odr_identity))
             for (const auto *entry : entries) ambiguous_names.insert(entry->record.name);
     }
     for (const auto &generated : generated_by_name)
@@ -827,9 +909,11 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
     std::set<TypeKey> aggregate_metadata_owners;
     for (const auto &[owner_key, unused] : methods_by_owner) { (void)unused; aggregate_metadata_owners.insert(owner_key); }
     for (const auto &[owner_key, unused] : static_data_by_owner) { (void)unused; aggregate_metadata_owners.insert(owner_key); }
+    std::set<std::string, std::less<>> applied_metadata_names;
     for (const auto &owner_key : aggregate_metadata_owners) {
         const auto owner_name = storage_names.find(owner_key);
         if (owner_name == storage_names.end()) continue;
+        if (!applied_metadata_names.insert(owner_name->second).second) continue;
         const auto definition = result.definitions.find(owner_name->second);
         if (definition == result.definitions.end() ||
             (definition->second->kind() != Kind::structure && definition->second->kind() != Kind::union_type)) continue;
