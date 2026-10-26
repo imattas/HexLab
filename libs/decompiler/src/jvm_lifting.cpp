@@ -23,7 +23,9 @@ std::optional<std::uint64_t> imm(const Instruction &i,std::size_t n=0){if(n>=i.o
 bool target(const Instruction &i){return i.flow==FlowKind::jump||i.flow==FlowKind::conditional_branch;}
 Error no(std::string s){return {ErrorCode::unsupported,"JVM lift unsupported: "+std::move(s)};}
 bool jvm_may_throw(std::uint8_t opcode) {
-    return (opcode >= 0x2e && opcode <= 0x35) || (opcode >= 0x4f && opcode <= 0x56) ||
+    // Keep in sync with JVM exceptional-edge recovery in functions.cpp.
+    return (opcode >= 0x12 && opcode <= 0x14) ||
+           (opcode >= 0x2e && opcode <= 0x35) || (opcode >= 0x4f && opcode <= 0x56) ||
            opcode == 0x6c || opcode == 0x6d || opcode == 0x70 || opcode == 0x71 ||
            (opcode >= 0xb2 && opcode <= 0xc3) || opcode == 0xc5 || opcode == 0xbf;
 }
@@ -199,6 +201,12 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         if (sources[i]->begin == function.entry) entry = i;
     }
     if (!entry) return no("function entry has no basic block");
+    constexpr std::string_view exception_cap_diagnostic =
+        "JVM exception table exceeds the bounded CFG handler budget";
+    if (std::any_of(function.stops.begin(), function.stops.end(), [&](const auto &stop) {
+            return stop.detail == exception_cap_diagnostic;
+        }))
+        return no("exception-edge coverage is incomplete because the bounded handler scan was exhausted");
     std::vector<std::vector<std::size_t>> successors(count), predecessors(count);
     std::vector<bool> handler_entries(count, false);
     for (std::size_t i = 0; i < count; ++i) {
