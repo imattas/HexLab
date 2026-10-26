@@ -277,6 +277,9 @@ Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &database, std::stop_tok
                         if (property == 4 || property == 6) f.value=r32(); // introducing virtual slot offset
                         f.name=read_name(at,limit);
                     }
+                    else if (member==0x1409) { // LF_VFUNCTAB: type of the implicit vfptr.
+                        f.type=r32();
+                    }
                     else if (member==0x1510) { // LF_NESTTYPE: nested type declaration.
                         (void)r16(); f.type=r32(); f.name=read_name(at,limit);
                     }
@@ -770,6 +773,8 @@ Result<PdbTypeGraph> resolve_pdb_type_graph(const PdbTypeStream &stream, std::st
                         add_reference(record.index, field.type, PdbTypeReferenceKind::method_list);
                     else if (field.leaf == 0x1511)
                         add_reference(record.index, field.type, PdbTypeReferenceKind::method_type);
+                    else if (field.leaf == 0x1409)
+                        add_reference(record.index, field.type, PdbTypeReferenceKind::vftable_pointer_type);
                 for (const auto continuation : record.field_list_continuations)
                     add_reference(record.index, continuation, PdbTypeReferenceKind::field_list_continuation);
             }

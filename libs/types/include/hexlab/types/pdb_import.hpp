@@ -9,7 +9,7 @@
 
 namespace hexlab::types {
 
-enum class PdbAggregateDeclarationKind : std::uint8_t { static_data, nested_type, method };
+enum class PdbAggregateDeclarationKind : std::uint8_t { static_data, nested_type, method, vftable_pointer };
 enum class PdbVirtualDispatchKind : std::uint8_t { non_virtual, virtual_method, introducing_virtual, pure_virtual, pure_introducing_virtual, unknown };
 struct PdbAggregateDeclaration {
     std::uint8_t name_space = 0;
@@ -30,6 +30,8 @@ struct PdbAggregateDeclaration {
     std::int32_t this_adjustment = 0;
     // Accepted LF_MFUNCTION option bits (C++ return-by-UDT/constructor flags).
     std::uint8_t function_options = 0;
+    // LF_VFUNCTAB records retain the pointer type as preview metadata. They
+    // do not encode a byte offset, so this declaration never changes layout.
 };
 
 struct PdbImportedVTableSlot {

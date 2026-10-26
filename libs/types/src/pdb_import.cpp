@@ -691,7 +691,8 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             declaration.aggregate_type_index = record.index;
             declaration.declaration_ordinal = ordinal;
             declaration.kind = kind;
-            declaration.name = field.name;
+            declaration.name = kind == PdbAggregateDeclarationKind::vftable_pointer
+                ? "implicit vfptr" : field.name;
             declaration.type = type.value();
             declaration.attributes = attributes;
             switch (attributes & 3) {
@@ -759,9 +760,11 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             return true;
         };
         for (const auto &field : node.expanded_fields) {
-            if (field.leaf == 0x150e || field.leaf == 0x1510 || field.leaf == 0x1511) {
+            if (field.leaf == 0x150e || field.leaf == 0x1510 || field.leaf == 0x1511 || field.leaf == 0x1409) {
                 const auto kind = field.leaf == 0x150e ? PdbAggregateDeclarationKind::static_data :
-                    field.leaf == 0x1510 ? PdbAggregateDeclarationKind::nested_type : PdbAggregateDeclarationKind::method;
+                    field.leaf == 0x1510 ? PdbAggregateDeclarationKind::nested_type :
+                    field.leaf == 0x1409 ? PdbAggregateDeclarationKind::vftable_pointer :
+                                          PdbAggregateDeclarationKind::method;
                 const auto status = append(kind, field, field.type, field.attributes,
                     kind == PdbAggregateDeclarationKind::method &&
                     (dispatch_kind(field.attributes) == PdbVirtualDispatchKind::introducing_virtual ||

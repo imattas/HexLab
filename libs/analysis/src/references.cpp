@@ -201,6 +201,7 @@ using ReferenceOperandKey = std::pair<std::uint64_t, std::uint32_t>;
 struct RegisterReferenceFacts {
     std::map<ReferenceOperandKey, Address> immediate_targets;
     std::map<ReferenceOperandKey, Address> memory_targets;
+    std::set<ReferenceOperandKey> relocation_pair_targets;
     std::set<std::uint64_t> address_definitions;
     std::map<ReferenceOperandKey, std::vector<std::uint64_t>> producer_instruction_ids;
     std::map<ReferenceOperandKey, ReferenceProducerGraph> producer_graphs;
@@ -1847,10 +1848,16 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
     RegisterReferenceFacts result;
     if (!image)
         return result;
-    // Resolve a deliberately narrow R_RISCV_PCREL_HI20/LO12 pair. The LO
-    // symbol must be a defined local label naming the HI place; both fields
-    // must be adjacent, unique, and match decoded AUIPC/ADDI register flow.
-    if (elf && elf->header.machine == 243 && elf->header.is_64 && elf->header.order == ByteOrder::little) {
+    struct PairedMemoryTarget {
+        Address target;
+        std::uint64_t high_instruction = 0;
+    };
+    std::map<ReferenceOperandKey, PairedMemoryTarget> paired_memory_targets;
+    // Resolve PCREL_HI20/LO12 pairs from their local label relationship. The
+    // LO label must identify one unique HI relocation, and the decoded base
+    // register must match the AUIPC destination. Memory references additionally
+    // require the CFG-propagated register value to reach that access unchanged.
+    if (elf && elf->header.machine == 243 && elf->header.order == ByteOrder::little) {
         using SourceKey = std::tuple<std::optional<std::uint32_t>, std::uint64_t, bool, std::uint32_t, std::uint64_t>;
         const auto source_key = [](const ElfTableSource &s) -> SourceKey {
             return {s.section, s.file_offset, bool(s.address), s.address ? s.address->space.value : 0,
@@ -1872,16 +1879,18 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
         std::map<PlaceKey, std::vector<const ElfRelocation *>> highs;
         for (const auto &row : elf->relocations)
             if (row.type == 23 && row.place && row.field_size == 4 && row.symbol_table &&
-                row.symbol_index_validated && row.addend)
+                row.symbol_index_validated && row.explicit_addend && row.addend)
                 highs[{row.place->space.value, row.place->offset}].push_back(&row);
         for (const auto &low : elf->relocations) {
-            if (low.type != 24 || !low.place || low.field_size != 4 || !low.explicit_addend || !low.addend ||
+            if ((low.type != 24 && low.type != 25) || !low.place || low.field_size != 4 ||
+                !low.explicit_addend || !low.addend ||
                 *low.addend != 0) continue;
             const auto *label = symbol_for(low);
             if (!label || label->state != ElfSymbolState::defined || label->binding != 0 || !label->address ||
                 label->address->space != low.place->space) continue;
             const auto low_matches = std::count_if(elf->relocations.begin(), elf->relocations.end(), [&](const auto &candidate) {
-                if (candidate.type != 24 || !candidate.place || *candidate.place != *low.place) return false;
+                if ((candidate.type != 24 && candidate.type != 25) || !candidate.place ||
+                    *candidate.place != *low.place) return false;
                 const auto *candidate_label = symbol_for(candidate);
                 return candidate_label && candidate_label->address && *candidate_label->address == *label->address;
             });
@@ -1889,13 +1898,12 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
             const auto hi_it = highs.find({label->address->space.value, label->address->offset});
             if (hi_it == highs.end() || hi_it->second.size() != 1) continue;
             const auto &high = *hi_it->second.front();
-            if (high.place->space != low.place->space || high.place->offset > UINT64_MAX - 4 ||
-                low.place->offset != high.place->offset + 4) continue;
+            if (high.place->space != low.place->space || !high.target_section || !low.target_section ||
+                high.target_section != low.target_section) continue;
             const auto *target_symbol = symbol_for(high);
             if (!target_symbol || !target_symbol->address || target_symbol->state != ElfSymbolState::defined ||
                 target_symbol->address->space != high.place->space ||
                 (elf->header.object_type == 3 && target_symbol->binding != 0 && target_symbol->visibility == 0)) continue;
-            if (!high.explicit_addend) continue;
             std::uint64_t target_offset = 0;
             if (*high.addend >= 0) {
                 const auto add = static_cast<std::uint64_t>(*high.addend);
@@ -1906,6 +1914,7 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
                 if (subtract > target_symbol->address->offset) continue;
                 target_offset = target_symbol->address->offset - subtract;
             }
+            if (!elf->header.is_64 && target_offset > UINT32_MAX) continue;
             const auto target = Address{high.place->space, target_offset};
             if (!riscv_target_segment(*image, target, OperandAccess::address)) continue;
             const auto hi_fact = std::find_if(functions.instructions.begin(), functions.instructions.end(),
@@ -1915,13 +1924,39 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
             if (hi_fact == functions.instructions.end() || lo_fact == functions.instructions.end()) continue;
             const auto &hi = (*hi_fact)->instruction;
             const auto &lo = (*lo_fact)->instruction;
-            if (hi.opcode != Opcode::rv_auipc || hi.length != 4 || hi.operands.size() != 2 ||
-                lo.opcode != Opcode::rv_addi || lo.length != 4 || lo.operands.size() != 3) continue;
-            const auto *hi_dst = riscv_register(hi, 0), *lo_dst = riscv_register(lo, 0), *lo_src = riscv_register(lo, 1);
-            if (!hi_dst || !lo_dst || !lo_src || !hi_dst->index || hi_dst->width != 64 ||
-                lo_dst->width != 64 || lo_src->width != 64 || hi_dst->index != lo_src->index) continue;
-            result.immediate_targets[{(*hi_fact)->id, 1}] = target;
-            result.immediate_targets[{(*lo_fact)->id, 2}] = target;
+            const auto expected_width = static_cast<std::uint8_t>(elf->header.is_64 ? 64 : 32);
+            if (hi.opcode != Opcode::rv_auipc || hi.length != 4 || hi.operands.size() != 2) continue;
+            const auto *hi_dst = riscv_register(hi, 0);
+            if (!hi_dst || !hi_dst->index || hi_dst->width != expected_width) continue;
+            bool matched_low = false;
+            if (low.type == 24 && lo.opcode == Opcode::rv_addi && lo.length == 4 && lo.operands.size() == 3) {
+                const auto *lo_dst = riscv_register(lo, 0), *lo_src = riscv_register(lo, 1);
+                if (lo_dst && lo_src && lo_dst->width == expected_width && lo_src->width == expected_width &&
+                    hi_dst->index == lo_src->index) {
+                    result.immediate_targets[{(*lo_fact)->id, 2}] = target;
+                    matched_low = true;
+                }
+            } else {
+                const bool load_i = low.type == 24 &&
+                    (lo.opcode == Opcode::rv_lb || lo.opcode == Opcode::rv_lbu || lo.opcode == Opcode::rv_lh ||
+                     lo.opcode == Opcode::rv_lhu || lo.opcode == Opcode::rv_lw || lo.opcode == Opcode::rv_lwu ||
+                     lo.opcode == Opcode::rv_ld || lo.opcode == Opcode::rv_flw || lo.opcode == Opcode::rv_fld);
+                const bool store_s = low.type == 25 &&
+                    (lo.opcode == Opcode::rv_sb || lo.opcode == Opcode::rv_sh || lo.opcode == Opcode::rv_sw ||
+                     lo.opcode == Opcode::rv_sd || lo.opcode == Opcode::rv_fsw || lo.opcode == Opcode::rv_fsd);
+                const auto memory_index = 1u;
+                const auto *memory = lo.operands.size() > memory_index
+                    ? std::get_if<MemoryOperand>(&lo.operands[memory_index]) : nullptr;
+                if ((load_i || store_s) && lo.length == 4 && memory && memory->base &&
+                    memory->base->bank == RegisterBank::riscv_gpr &&
+                    memory->base->width == expected_width && memory->address_width == expected_width &&
+                    memory->base->index == hi_dst->index) {
+                    paired_memory_targets[{(*lo_fact)->id, memory_index}] = {target, (*hi_fact)->id};
+                    matched_low = true;
+                }
+            }
+            if (matched_low)
+                result.immediate_targets[{(*hi_fact)->id, 1}] = target;
         }
     }
     using RegisterState = std::unordered_map<std::uint32_t, RiscvAddressValue>;
@@ -2084,8 +2119,16 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
                     if (base == registers.end())
                         continue;
                     const auto access = instruction.access[i];
-                    const Address target{base->second.address.space,
-                                         riscv_add(base->second.address.offset, memory->displacement, width)};
+                    Address target{base->second.address.space,
+                                   riscv_add(base->second.address.offset, memory->displacement, width)};
+                    const auto paired = paired_memory_targets.find({fact->id, static_cast<std::uint32_t>(i)});
+                    if (paired != paired_memory_targets.end() && !base->second.graph.ambiguous &&
+                        base->second.address == paired->second.target &&
+                        std::find(base->second.tails.begin(), base->second.tails.end(),
+                                  paired->second.high_instruction) != base->second.tails.end()) {
+                        target = paired->second.target;
+                        result.relocation_pair_targets.insert({fact->id, static_cast<std::uint32_t>(i)});
+                    }
                     const auto access_width = std::max<std::uint64_t>(1, (memory->data_width + 7) / 8);
                     if (riscv_target_segment(*image, target, access, access_width)) {
                         result.memory_targets[{fact->id, static_cast<std::uint32_t>(i)}] = target;
@@ -3173,7 +3216,14 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                             take(resolver.operand(instruction, static_cast<std::uint32_t>(i), stop));
                         auto expression = *memory;
                         bool dataflow_target = false;
-                        if (resolution.relocated())
+                        const ReferenceOperandKey operand_key{fact->id, static_cast<std::uint32_t>(i)};
+                        if (riscv_facts.relocation_pair_targets.contains(operand_key)) {
+                            if (const auto target = riscv_facts.memory_targets.find(operand_key);
+                                target != riscv_facts.memory_targets.end()) {
+                                expression.resolved_address = target->second;
+                                dataflow_target = true;
+                            }
+                        } else if (resolution.relocated())
                             expression.resolved_address = resolution.address;
                         else if (const auto x86_target =
                                      x86_facts.memory_targets.find({fact->id, static_cast<std::uint32_t>(i)});
@@ -3306,7 +3356,8 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                                               mips_computed != mips_facts.immediate_targets.end() ||
                                               ppc_computed != ppc_facts.immediate_targets.end();
                     const bool paired_riscv_target = computed != riscv_facts.immediate_targets.end() &&
-                        instruction.context.architecture == Architecture::riscv64 &&
+                        (instruction.context.architecture == Architecture::riscv32 ||
+                         instruction.context.architecture == Architecture::riscv64) &&
                         (instruction.opcode == Opcode::rv_auipc || instruction.opcode == Opcode::rv_addi);
                     if (resolution.relocated() || has_computed) {
                         ReferenceTarget target;

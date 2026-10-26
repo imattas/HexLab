@@ -1,6 +1,45 @@
 #include "macho_dyld_internal.hpp"
 #include <set>
+#include <string_view>
 namespace hexlab::macho_detail {
+namespace {
+bool valid_utf8(std::string_view text) {
+    std::size_t cursor = 0;
+    while (cursor < text.size()) {
+        const auto first = static_cast<unsigned char>(text[cursor++]);
+        if (first < 0x80)
+            continue;
+        unsigned count = 0;
+        std::uint32_t value = 0, minimum = 0;
+        if (first >= 0xc2 && first <= 0xdf) {
+            count = 1;
+            value = first & 0x1f;
+            minimum = 0x80;
+        } else if (first >= 0xe0 && first <= 0xef) {
+            count = 2;
+            value = first & 0x0f;
+            minimum = 0x800;
+        } else if (first >= 0xf0 && first <= 0xf4) {
+            count = 3;
+            value = first & 0x07;
+            minimum = 0x10000;
+        } else
+            return false;
+        if (count > text.size() - cursor)
+            return false;
+        for (unsigned i = 0; i < count; ++i) {
+            const auto next = static_cast<unsigned char>(text[cursor++]);
+            if ((next & 0xc0) != 0x80)
+                return false;
+            value = (value << 6) | (next & 0x3f);
+        }
+        if (value < minimum || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff))
+            return false;
+    }
+    return true;
+}
+} // namespace
+
 void read_exports(const Reader &reader, const Image &image, MachOMetadata &metadata, std::uint32_t stream_id,
                   std::uint32_t libraries, std::optional<Address> header_anchor, Budget &budget, std::stop_token stop) {
     auto &stream = metadata.dyld_streams[stream_id];
@@ -53,14 +92,18 @@ void read_exports(const Reader &reader, const Image &image, MachOMetadata &metad
             StreamReader terminal(bytes.bytes.subspan(begin, static_cast<std::size_t>(size)), stop);
             row.flags = terminal.uleb();
             const auto kind = row.flags & 3;
-            if ((row.flags & ~UINT64_C(0x1f)) || kind == 3 || ((row.flags & 8) && ((row.flags & 0x10) || kind != 0)))
+            const bool terminal_layout_known = !(row.flags & ~UINT64_C(0x1f)) && kind != 3 &&
+                !((row.flags & 8) && ((row.flags & 0x10) || kind != 0));
+            if (!terminal_layout_known)
                 row.complete = false;
-            else if (row.flags & 8) {
+            if (row.flags & 8) {
                 row.library_ordinal = terminal.uleb();
                 require(*row.library_ordinal != 0 && *row.library_ordinal <= libraries,
                         "Mach-O reexport library ordinal exceeds dependency list");
                 row.import_name = terminal.text();
                 budget.include(row.import_name->size());
+                if (!valid_utf8(*row.import_name))
+                    row.complete = false;
             } else {
                 row.value = terminal.uleb();
                 if (kind == 0) {
@@ -79,8 +122,10 @@ void read_exports(const Reader &reader, const Image &image, MachOMetadata &metad
                     }
                 }
             }
-            if (row.complete)
+            if (terminal_layout_known)
                 require(terminal.end(), "Trailing bytes in known Mach-O export terminal");
+            if (!valid_utf8(row.name))
+                row.complete = false;
             if (!names.insert(row.name).second)
                 row.complete = false;
             stream.complete = stream.complete && row.complete;
