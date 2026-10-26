@@ -228,13 +228,10 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
                 const bool double_format = rs == 17;
                 const auto source_width = double_format ? 64u : 32u;
                 const auto left = fpr(fs, source_width), right = fpr(ft, source_width);
+                unsigned destination_width = source_width;
                 const auto set_unary_conversion = [&](Opcode opcode, unsigned dst_width) {
                     i.opcode = opcode; unary = true;
-                    const auto destination = fpr(fd, dst_width);
-                    i.operands = {destination, left};
-                    i.access = {OperandAccess::write, OperandAccess::read};
-                    i.register_reads = {left, fcsr()};
-                    i.register_writes = {destination, fcsr()};
+                    destination_width = dst_width;
                     explicit_operands = true;
                 };
                 if ((rs == 16 || rs == 17) && fp_function <= 7) {
@@ -267,7 +264,8 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
                 } else if ((rs == 16 || rs == 17) && fp_function == 0x24) {
                     set_unary_conversion(rs == 16 ? Opcode::mips_cvt_w_s : Opcode::mips_cvt_w_d, 32);
                 } else if (rs == 20 && (fp_function == 0x20 || fp_function == 0x21)) {
-                    const auto destination = fpr(fd, fp_function == 0x21 ? 64 : 32);
+                    destination_width = fp_function == 0x21 ? 64 : 32;
+                    const auto destination = fpr(fd, destination_width);
                     const auto source = fpr(fs, 32);
                     i.opcode = fp_function == 0x20 ? Opcode::mips_cvt_s_w : Opcode::mips_cvt_d_w;
                     i.operands = {destination, source};
@@ -285,7 +283,7 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
                     const auto condition_code = static_cast<unsigned>((i.condition >> 4) & 7);
                     i.register_reads = {left, right}; i.register_writes = {fcc(condition_code)};
                 } else {
-                    const auto destination = fpr(fd, source_width);
+                    const auto destination = fpr(fd, destination_width);
                     i.operands = unary ? std::vector<Operand>{destination, left}
                                        : std::vector<Operand>{destination, left, right};
                     i.access = unary ? std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read}

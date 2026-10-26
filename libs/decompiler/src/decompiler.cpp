@@ -1685,6 +1685,12 @@ a64_unhandled:
                 }
                 if (converts_from_word && effect.operands.size() > 1)
                     effect.operands[1] = retag_expr(effect.operands[1], integer_type(32));
+                if (!converts_to_word) {
+                    if (op == Opcode::mips_cvt_s_d || op == Opcode::mips_cvt_s_w)
+                        effect.result_type = floating_type(32);
+                    else if (op == Opcode::mips_cvt_d_s || op == Opcode::mips_cvt_d_w)
+                        effect.result_type = floating_type(64);
+                }
                 effect.register_writes = instruction.register_writes;
                 return effect;
             }
