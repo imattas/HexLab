@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 #include <span>
+#include <string_view>
 #include <tuple>
 
 namespace hexlab::types {
@@ -147,12 +148,30 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             record.kind != CodeViewTypeKind::method_list && valid_type_name(record.name))
             full_definitions_by_name[record.name].push_back(&node);
     }
+    // A repeated ODR name can arrive from either the same TPI stream or a
+    // type-server namespace. Even different aggregate kinds claiming the
+    // same identity are inconsistent. Decide this before converting pointers,
+    // functions, or data-symbol types.
+    std::map<std::string_view, const PdbTypeGraphNode *> first_definition_by_odr;
+    for (const auto &node : graph.nodes) {
+        const auto &record = node.record;
+        if (record.forward_declaration || !aggregate_identity_kind(record.kind) ||
+            !valid_type_name(record.name) || record.unique_name.empty())
+            continue;
+        const auto [first, inserted] = first_definition_by_odr.emplace(
+            std::string_view{record.unique_name.data(), record.unique_name.size()}, &node);
+        if (!inserted) {
+            ambiguous_names.insert(first->second->record.name);
+            ambiguous_names.insert(record.name);
+        }
+    }
     std::map<TypeKey, std::string> storage_names;
     std::map<std::string, std::vector<const PdbTypeGraphNode *>, std::less<>> generated_by_name;
     std::set<std::string, std::less<>> reserved_names;
     std::size_t generated_definition_count = 0;
     std::size_t generated_identity_bytes = 0;
     for (const auto &[display, definitions] : full_definitions_by_name) {
+        if (ambiguous_names.contains(display)) continue;
         if (definitions.size() == 1) {
             storage_names.emplace(TypeKey{definitions.front()->name_space, definitions.front()->record.index}, display);
             reserved_names.insert(display);
@@ -200,15 +219,10 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             !node.record.unique_name.empty() || ambiguous_names.contains(node.record.name)) continue;
         if (!full_definitions_by_name.contains(node.record.name)) reserved_names.insert(node.record.name);
     }
-    // Hashed storage names are deterministic; still detect hash/prefix/name
-    // collisions explicitly and reject the affected displayed-name group.
+    // Hashed storage names are deterministic; still reject hash/prefix/name
+    // collisions rather than allowing a shared project storage identity.
     for (const auto &[name, entries] : generated_by_name) {
-        const bool distinct_identities = std::any_of(entries.begin(), entries.end(), [&](const auto &entry) {
-            return entry->record.kind != entries.front()->record.kind ||
-                   entry->record.name != entries.front()->record.name ||
-                   entry->record.unique_name != entries.front()->record.unique_name;
-        });
-        if (reserved_names.contains(name) || distinct_identities)
+        if (reserved_names.contains(name) || entries.size() > 1)
             for (const auto *entry : entries) ambiguous_names.insert(entry->record.name);
     }
     for (const auto &generated : generated_by_name)
@@ -268,6 +282,9 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
                     : "PDB type reference targets an unresolved external TPI namespace"};
         const auto &node = *found->second;
         const auto &record = node.record;
+        if (aggregate_identity_kind(record.kind) && !record.name.empty() &&
+            ambiguous_names.contains(record.name))
+            return Error{ErrorCode::unsupported, "PDB aggregate has an ambiguous CodeView identity"};
         if (const auto visit = visits.find(key); visit != visits.end() && visit->second == Visit::active) {
             const auto &active_record = node.record;
             if (!active_record.name.empty() && (active_record.kind == CodeViewTypeKind::structure ||

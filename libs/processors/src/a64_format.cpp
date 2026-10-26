@@ -17,6 +17,8 @@ std::string mnemonic(Opcode opcode, std::uint8_t condition) {
     if (opcode == Opcode::a64_csneg) return "csneg";
     if (opcode == Opcode::a64_udiv) return "udiv";
     if (opcode == Opcode::a64_sdiv) return "sdiv";
+    if (opcode == Opcode::a64_ccmp) return "ccmp";
+    if (opcode == Opcode::a64_ccmn) return "ccmn";
     if (opcode == Opcode::a64_vadd) return "add";
     if (opcode == Opcode::a64_vsub) return "sub";
     if (opcode == Opcode::a64_vand) return "and";
@@ -44,6 +46,19 @@ std::string mnemonic(Opcode opcode, std::uint8_t condition) {
     return result;
 }
 std::string format(const Instruction &i) {
+    if ((i.opcode == Opcode::a64_ccmp || i.opcode == Opcode::a64_ccmn) && i.operands.size() == 3) {
+        static constexpr const char *conditions[]{"eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc",
+                                                   "hi", "ls", "ge", "lt", "gt", "le", "al", "nv"};
+        const auto *left = std::get_if<RegisterOperand>(&i.operands[0]);
+        const auto *right_reg = std::get_if<RegisterOperand>(&i.operands[1]);
+        const auto *right_imm = std::get_if<ImmediateOperand>(&i.operands[1]);
+        const auto *fallback = std::get_if<ImmediateOperand>(&i.operands[2]);
+        if (!left || (!right_reg && !right_imm) || !fallback)
+            return "?a64-conditional-compare";
+        return mnemonic(i.opcode, i.condition) + " " + register_name(*left) + ", " +
+            (right_reg ? register_name(*right_reg) : "#" + hex(right_imm->value)) + ", #" +
+            hex(fallback->value) + ", " + conditions[i.condition & 15];
+    }
     if ((i.opcode == Opcode::a64_csel || i.opcode == Opcode::a64_csinc ||
          i.opcode == Opcode::a64_csinv || i.opcode == Opcode::a64_csneg) && i.operands.size() == 3) {
         static constexpr const char *conditions[]{"eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc",

@@ -712,6 +712,77 @@ bool is_binary(Opcode opcode) {
 
 ExpressionPtr boolean_binary(std::string operation, ExpressionPtr left, ExpressionPtr right);
 ExpressionPtr boolean_unary(std::string operation, ExpressionPtr value);
+ExpressionPtr boolean_constant(bool value);
+
+ExpressionPtr a64_nzcv_arithmetic(ExpressionPtr left, ExpressionPtr right, bool subtract) {
+    if (!left || !right || (left->type.bits != 32 && left->type.bits != 64) ||
+        left->type.bits != right->type.bits) return {};
+    const auto width = left->type.bits;
+    auto result = std::make_shared<Expression>(Expression{integer_type(width),
+        BinaryValue{subtract ? "sub" : "add", left, right}});
+    const auto lhs_sign = boolean_unary("signbit", left);
+    const auto rhs_sign = boolean_unary("signbit", right);
+    const auto result_sign = boolean_unary("signbit", result);
+    const auto different_inputs = boolean_binary("bool_xor", lhs_sign, rhs_sign);
+    const auto sign_changed = boolean_binary("bool_xor", lhs_sign, result_sign);
+    const auto overflow = boolean_binary("bool_and",
+        subtract ? different_inputs : boolean_unary("not", different_inputs), sign_changed);
+    const auto carry = subtract ? boolean_binary("uge", left, right)
+                                : boolean_binary("ult", result, left);
+    const auto zero = boolean_binary("eq", result, constant_expr(0, width));
+    const auto placed = [](ExpressionPtr flag, unsigned shift) -> ExpressionPtr {
+        auto value = std::make_shared<Expression>(Expression{integer_type(4),
+            UnaryValue{"zext", std::move(flag)}});
+        return shift ? std::make_shared<Expression>(Expression{integer_type(4),
+            BinaryValue{"shl", std::move(value), constant_expr(shift, 4)}}) : value;
+    };
+    auto high = std::make_shared<Expression>(Expression{integer_type(4),
+        BinaryValue{"or", placed(result_sign, 3), placed(zero, 2)}});
+    auto low = std::make_shared<Expression>(Expression{integer_type(4),
+        BinaryValue{"or", placed(carry, 1), placed(overflow, 0)}});
+    return std::make_shared<Expression>(Expression{integer_type(4),
+        BinaryValue{"or", std::move(high), std::move(low)}});
+}
+
+ExpressionPtr a64_nzcv_logical(ExpressionPtr result) {
+    if (!result || (result->type.bits != 32 && result->type.bits != 64)) return {};
+    // A64 ANDS sets C and V to zero even for the shifted-register form.
+    // The shift has no carry-out effect on NZCV (unlike A32 logical ops).
+    const auto n = std::make_shared<Expression>(Expression{integer_type(4),
+        BinaryValue{"shl", std::make_shared<Expression>(Expression{integer_type(4),
+            UnaryValue{"zext", boolean_unary("signbit", result)}}), constant_expr(3, 4)}});
+    const auto z = std::make_shared<Expression>(Expression{integer_type(4),
+        BinaryValue{"shl", std::make_shared<Expression>(Expression{integer_type(4),
+            UnaryValue{"zext", boolean_binary("eq", result, constant_expr(0, result->type.bits))}}),
+            constant_expr(2, 4)}});
+    return std::make_shared<Expression>(Expression{integer_type(4), BinaryValue{"or", n, z}});
+}
+
+ExpressionPtr a64_nzcv_predicate(std::uint8_t condition, ExpressionPtr flags) {
+    if (condition >= 14) return boolean_constant(true);
+    if (!flags || flags->type.bits != 4) return {};
+    const auto bit = [&](unsigned index) {
+        return boolean_binary("bit_extract", flags, constant_expr(index, 4));
+    };
+    const auto n = bit(3), z = bit(2), c = bit(1), v = bit(0);
+    switch (condition) {
+    case 0: return z;
+    case 1: return boolean_unary("not", z);
+    case 2: return c;
+    case 3: return boolean_unary("not", c);
+    case 4: return n;
+    case 5: return boolean_unary("not", n);
+    case 6: return v;
+    case 7: return boolean_unary("not", v);
+    case 8: return boolean_binary("bool_and", c, boolean_unary("not", z));
+    case 9: return boolean_binary("bool_or", boolean_unary("not", c), z);
+    case 10: return boolean_binary("eq", n, v);
+    case 11: return boolean_binary("ne", n, v);
+    case 12: return boolean_binary("bool_and", boolean_unary("not", z), boolean_binary("eq", n, v));
+    case 13: return boolean_binary("bool_or", z, boolean_binary("ne", n, v));
+    default: return {};
+    }
+}
 
 // Keep readable predicates compatible with existing ARM pseudocode. Parallel
 // output formulas request the expanded, typed boolean condition explicitly.
@@ -1533,6 +1604,36 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
     if (a64 && !instruction.operands.empty()) {
         const auto destination_operand = as_register(instruction.operands.front());
         const auto ignored_write = [&]() -> Statement { return Intrinsic{"nop", {}, IntrinsicMemoryEffect::none}; };
+        if ((instruction.opcode == Opcode::a64_ccmp || instruction.opcode == Opcode::a64_ccmn) &&
+            instruction.operands.size() == 3) {
+            const auto *left = std::get_if<RegisterOperand>(&instruction.operands[0]);
+            const auto *right_reg = std::get_if<RegisterOperand>(&instruction.operands[1]);
+            const auto *right_imm = std::get_if<ImmediateOperand>(&instruction.operands[1]);
+            const auto *fallback = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+            if (!left || (left->bank != RegisterBank::arm64_gpr && left->bank != RegisterBank::arm64_zero) ||
+                (left->width != 32 && left->width != 64) ||
+                (!right_reg && !right_imm) ||
+                (right_reg && (right_reg->width != left->width ||
+                    (right_reg->bank != RegisterBank::arm64_gpr && right_reg->bank != RegisterBank::arm64_zero))) ||
+                (right_imm && (right_imm->encoded_width != 5 || right_imm->value > 31)) ||
+                !fallback || fallback->encoded_width != 4 || fallback->value > 15)
+                goto a64_unhandled;
+            const auto flags{RegisterOperand{RegisterBank::arm_flags, 0, 4, false}};
+            const auto left_value = operand_expr(instruction.operands[0]);
+            const auto right_value = operand_expr(instruction.operands[1]);
+            const auto comparison = a64_nzcv_arithmetic(left_value, right_value,
+                instruction.opcode == Opcode::a64_ccmp);
+            const auto predicate = a64_nzcv_predicate(instruction.condition, reg_expr(flags));
+            if (!comparison || !predicate) goto a64_unhandled;
+            Intrinsic effect{instruction.opcode == Opcode::a64_ccmp ? "a64_ccmp" : "a64_ccmn",
+                {left_value, right_value, constant_expr(fallback->value, 4),
+                 constant_expr(instruction.condition, 4)}, IntrinsicMemoryEffect::none};
+            effect.register_writes = {flags};
+            effect.register_output_values = {
+                instruction.condition >= 14 ? comparison :
+                    arm32_select(predicate, comparison, constant_expr(fallback->value, 4))};
+            return effect;
+        }
         if (destination_operand && instruction.operands.size() == 3 &&
             (instruction.opcode == Opcode::a64_udiv || instruction.opcode == Opcode::a64_sdiv)) {
             const auto destination = *destination_operand;
@@ -1692,12 +1793,51 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
              instruction.opcode == Opcode::a64_eor || instruction.opcode == Opcode::a64_ands)) {
             const auto destination = *destination_operand;
             const auto left = operand_expr(instruction.operands[1]);
-            const auto right = operand_expr(instruction.operands[2]);
+            auto right = operand_expr(instruction.operands[2]);
+            if (instruction.operands.size() > 3) {
+                const auto *shift = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+                if (!shift || !std::holds_alternative<RegisterOperand>(instruction.operands[2]))
+                    goto a64_unhandled;
+                const auto kind = (std::to_integer<unsigned>(instruction.bytes[2]) >> 6) & 3;
+                if (shift->value) {
+                    if (kind == 0)
+                        right = std::make_shared<Expression>(Expression{integer_type(destination.width),
+                            BinaryValue{"shl", right, constant_expr(shift->value, destination.width)}});
+                    else if (kind == 1)
+                        right = std::make_shared<Expression>(Expression{integer_type(destination.width),
+                            BinaryValue{"shr", right, constant_expr(shift->value, destination.width)}});
+                    else if (kind == 2)
+                        right = std::make_shared<Expression>(Expression{integer_type(destination.width),
+                            BinaryValue{"sar", right, constant_expr(shift->value, destination.width)}});
+                    else
+                        right = std::make_shared<Expression>(Expression{integer_type(destination.width),
+                            UnaryValue{"ror_" + std::to_string(shift->value), right}});
+                }
+            }
             const char *operation = instruction.opcode == Opcode::a64_and || instruction.opcode == Opcode::a64_ands
                                         ? "and"
                                     : instruction.opcode == Opcode::a64_orr ? "or" : "xor";
             auto value = std::make_shared<Expression>(Expression{integer_type(destination.width),
                 BinaryValue{operation, left, right}});
+            if (instruction.opcode == Opcode::a64_ands) {
+                const RegisterOperand flags{RegisterBank::arm_flags, 0, 4, false};
+                Intrinsic effect{destination.bank == RegisterBank::arm64_zero ? "tst" : "a64_ands",
+                    {left, right}, IntrinsicMemoryEffect::none};
+                if (destination.bank == RegisterBank::arm64_gpr) {
+                    effect.register_writes.push_back(destination);
+                    effect.register_output_values.push_back(value);
+                    if (destination.width == 32) {
+                        auto wide = destination;
+                        wide.width = 64;
+                        effect.register_writes.push_back(wide);
+                        effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                            integer_type(64), UnaryValue{"zext32", value}}));
+                    }
+                }
+                effect.register_writes.push_back(flags);
+                effect.register_output_values.push_back(a64_nzcv_logical(value));
+                return effect;
+            }
             return destination.bank == RegisterBank::arm64_zero ? ignored_write() : Assign{destination, std::move(value)};
         }
         if (destination_operand && instruction.operands.size() >= 3 &&
@@ -1728,9 +1868,27 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             const bool subtract = instruction.opcode == Opcode::a64_sub || instruction.opcode == Opcode::a64_subs;
             auto value = std::make_shared<Expression>(Expression{integer_type(destination.width),
                 BinaryValue{subtract ? "sub" : "add", left, right}});
+            if (instruction.opcode == Opcode::a64_subs || instruction.opcode == Opcode::a64_adds) {
+                const RegisterOperand flags{RegisterBank::arm_flags, 0, 4, false};
+                Intrinsic effect{destination.bank == RegisterBank::arm64_zero
+                    ? (subtract ? "cmp" : "cmn") : (subtract ? "a64_subs" : "a64_adds"),
+                    {left, right}, IntrinsicMemoryEffect::none};
+                if (destination.bank == RegisterBank::arm64_gpr) {
+                    effect.register_writes.push_back(destination);
+                    effect.register_output_values.push_back(value);
+                    if (destination.width == 32) {
+                        auto wide = destination;
+                        wide.width = 64;
+                        effect.register_writes.push_back(wide);
+                        effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                            integer_type(64), UnaryValue{"zext32", value}}));
+                    }
+                }
+                effect.register_writes.push_back(flags);
+                effect.register_output_values.push_back(a64_nzcv_arithmetic(left, right, subtract));
+                return effect;
+            }
             if (destination.bank == RegisterBank::arm64_zero) {
-                if (instruction.opcode == Opcode::a64_subs)
-                    return Intrinsic{"cmp", {left, right}, IntrinsicMemoryEffect::read};
                 return ignored_write();
             }
             return Assign{destination, std::move(value)};
@@ -2332,6 +2490,11 @@ a64_unhandled:
         Branch branch{condition, instruction.direct_target, {}};
         if (instruction.flow == FlowKind::jump && !instruction.direct_target && !operands.empty())
             branch.indirect_target = operands.front();
+        if (a64 && instruction.opcode == Opcode::a64_b_cond && instruction.condition < 14) {
+            branch.predicate = a64_nzcv_predicate(instruction.condition,
+                reg_expr({RegisterBank::arm_flags, 0, 4, false}));
+            branch.condition = "predicate";
+        }
         if (instruction.context.architecture == Architecture::arm && instruction.arm &&
             instruction.arm->predicate == ArmPredicate::condition && instruction.condition < 14) {
             branch.predicate = arm32_condition_expr(instruction.condition, reg_expr({RegisterBank::arm_flags, 0, 4, false}));
@@ -3761,8 +3924,12 @@ ExpressionPtr a64_subs_predicate(std::uint8_t condition, ExpressionPtr lhs, Expr
         BinaryValue{"sub", lhs, rhs}});
     const auto equal = boolean_binary("eq", lhs, rhs);
     const auto not_equal = boolean_unary("not", equal);
-    const auto sign = boolean_unary("sign_sub", subtraction);
-    const auto overflow = boolean_unary("overflow_sub", subtraction);
+    const auto sign = boolean_unary("signbit", subtraction);
+    const auto left_sign = boolean_unary("signbit", lhs);
+    const auto right_sign = boolean_unary("signbit", rhs);
+    const auto overflow = boolean_binary("bool_and",
+        boolean_binary("bool_xor", left_sign, right_sign),
+        boolean_binary("bool_xor", left_sign, sign));
     const auto below = boolean_binary("ult", lhs, rhs);
     const auto above_equal = boolean_binary("uge", lhs, rhs);
     const auto above = boolean_binary("ugt", lhs, rhs);
@@ -3859,8 +4026,9 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
         std::uint64_t producer_instruction_id = 0;
     };
     struct PendingA64Compare {
-        ExpressionPtr left, right;
+        ExpressionPtr left, right, nzcv;
         std::vector<RegisterOperand> registers;
+        unsigned conditional_depth = 0;
     };
 
     auto is_x86_context = [](const Instruction &instruction) {
@@ -4072,7 +4240,7 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
     auto is_a64_compare = [](const Instruction &instruction) {
         return instruction.context.architecture == Architecture::arm64 &&
             instruction.context.mode == ExecutionMode::a64 && instruction.opcode == Opcode::a64_subs &&
-            instruction.operands.size() >= 3 && std::get_if<RegisterOperand>(&instruction.operands[0]) &&
+            instruction.operands.size() == 3 && std::get_if<RegisterOperand>(&instruction.operands[0]) &&
             std::get<RegisterOperand>(instruction.operands[0]).bank == RegisterBank::arm64_zero;
     };
     auto same_a64_flag_state = [](const std::optional<PendingA64Compare> &left,
@@ -4081,8 +4249,17 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
         const auto same_expression = [](const ExpressionPtr &a, const ExpressionPtr &b) {
             return (!a || !b) ? a == b : a->type == b->type && expression_text(*a) == expression_text(*b);
         };
-        return left->registers == right->registers && same_expression(left->left, right->left) &&
-               same_expression(left->right, right->right);
+        return left->registers == right->registers &&
+               left->conditional_depth == right->conditional_depth &&
+               same_expression(left->left, right->left) &&
+               same_expression(left->right, right->right) && same_expression(left->nzcv, right->nzcv);
+    };
+    const auto a64_pending_predicate = [](std::uint8_t condition,
+                                          const PendingA64Compare &state) -> ExpressionPtr {
+        if (condition >= 14) return boolean_constant(true);
+        if (state.left && state.right)
+            return a64_subs_predicate(condition, state.left, state.right);
+        return a64_nzcv_predicate(condition, state.nzcv);
     };
     auto update_a64_flag_state = [&](std::optional<PendingA64Compare> state,
                                      const Instruction &instruction) {
@@ -4101,6 +4278,43 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             if (!supported) return std::optional<PendingA64Compare>{};
             pending.left = operand_expr(instruction.operands[1]);
             pending.right = operand_expr(instruction.operands[2]);
+            pending.nzcv = a64_nzcv_arithmetic(pending.left, pending.right, true);
+            if (!pending.nzcv) return std::optional<PendingA64Compare>{};
+            return std::optional<PendingA64Compare>{std::move(pending)};
+        }
+        if (instruction.context.architecture == Architecture::arm64 &&
+            instruction.context.mode == ExecutionMode::a64 &&
+            (instruction.opcode == Opcode::a64_ccmp || instruction.opcode == Opcode::a64_ccmn)) {
+            if (instruction.operands.size() != 3 ||
+                !std::holds_alternative<RegisterOperand>(instruction.operands[0]) ||
+                (!std::holds_alternative<RegisterOperand>(instruction.operands[1]) &&
+                 !std::holds_alternative<ImmediateOperand>(instruction.operands[1])))
+                return std::optional<PendingA64Compare>{};
+            const auto *fallback = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+            if (!fallback || fallback->encoded_width != 4 || fallback->value > 15 ||
+                (instruction.condition < 14 && (!state || state->conditional_depth >= 6)))
+                return std::optional<PendingA64Compare>{};
+            const auto left = operand_expr(instruction.operands[0]);
+            const auto right = operand_expr(instruction.operands[1]);
+            const auto compared = a64_nzcv_arithmetic(left, right,
+                instruction.opcode == Opcode::a64_ccmp);
+            if (!compared) return std::optional<PendingA64Compare>{};
+            const auto predicate = state ? a64_pending_predicate(instruction.condition, *state)
+                                         : boolean_constant(true);
+            if (!predicate) return std::optional<PendingA64Compare>{};
+            PendingA64Compare pending;
+            pending.nzcv = instruction.condition >= 14 ? compared :
+                arm32_select(predicate, compared, constant_expr(fallback->value, 4));
+            if (instruction.condition < 14) {
+                pending.registers = state->registers;
+                pending.conditional_depth = state->conditional_depth + 1;
+            }
+            for (std::size_t index = 0; index < 2; ++index) {
+                const auto *reg = std::get_if<RegisterOperand>(&instruction.operands[index]);
+                if (reg && reg->bank != RegisterBank::arm64_zero &&
+                    std::find(pending.registers.begin(), pending.registers.end(), *reg) == pending.registers.end())
+                    pending.registers.push_back(*reg);
+            }
             return std::optional<PendingA64Compare>{std::move(pending)};
         }
         if (state) {
@@ -4255,6 +4469,7 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             const bool a64_context = decoded.context.architecture == Architecture::arm64 &&
                                      decoded.context.mode == ExecutionMode::a64;
             const auto x86_compare_before_instruction = pending_x86_compare;
+            const auto a64_compare_before_instruction = pending_a64_compare;
             pending_x86_compare = update_x86_flag_state(std::move(pending_x86_compare), decoded, fact->id);
             pending_a64_compare = update_a64_flag_state(std::move(pending_a64_compare), decoded);
             std::vector<Statement> ppc_before;
@@ -4346,10 +4561,11 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
                     if (decoded.condition >= 14)
                         condition = boolean_constant(true);
                     else if (pending_a64_compare)
-                        condition = a64_subs_predicate(decoded.condition, pending_a64_compare->left,
-                                                      pending_a64_compare->right);
+                        condition = a64_pending_predicate(decoded.condition, *pending_a64_compare);
+                    else if (a64_compare_before_instruction)
+                        condition = a64_pending_predicate(decoded.condition, *a64_compare_before_instruction);
                     if (!condition && decoded.condition < 14)
-                        condition = boolean_unary("arm_condition_" + std::to_string(decoded.condition),
+                        condition = a64_nzcv_predicate(decoded.condition,
                             reg_expr({RegisterBank::arm_flags, 0, 4, false}));
                     auto false_value = operand_expr(decoded.operands[2]);
                     if (decoded.opcode == Opcode::a64_csinc)
@@ -4399,8 +4615,7 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
                     if (branch->predicate) branch->condition = "predicate";
                 }
                 if (a64_context && decoded.opcode == Opcode::a64_b_cond && pending_a64_compare) {
-                    branch->predicate = a64_subs_predicate(decoded.condition, pending_a64_compare->left,
-                                                           pending_a64_compare->right);
+                    branch->predicate = a64_pending_predicate(decoded.condition, *pending_a64_compare);
                     if (branch->predicate) branch->condition = "predicate";
                 }
                 for (const auto &successor : source.successors) {

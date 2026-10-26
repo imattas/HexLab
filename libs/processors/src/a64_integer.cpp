@@ -46,6 +46,24 @@ bool logical_immediate(Instruction &i, std::uint32_t word, unsigned width) {
 } // namespace
 bool integer(Instruction &i, std::uint32_t word) {
     const unsigned width = (word >> 31) ? 64 : 32;
+    // Conditional compare (register/immediate). The mask intentionally omits
+    // bit 11 so both forms match: zero selects Rm, one selects imm5. It checks
+    // the fixed high pattern and reserved-zero bits 10 and 4. Bit 30 selects
+    // subtraction (CCMP) rather than addition (CCMN).
+    if ((word & 0x3fe00410u) == 0x3a400000u) {
+        i.opcode = (word & 0x40000000u) ? Opcode::a64_ccmp : Opcode::a64_ccmn;
+        i.condition = static_cast<std::uint8_t>((word >> 12) & 15);
+        operand(i, reg((word >> 5) & 31, width), OperandAccess::read);
+        if (word & 0x00000800u)
+            immediate(i, (word >> 16) & 31, 5, width);
+        else
+            operand(i, reg((word >> 16) & 31, width), OperandAccess::read);
+        immediate(i, word & 15, 4, 4);
+        if (i.condition < 14)
+            i.register_reads.push_back(nzcv);
+        i.register_writes.push_back(nzcv);
+        return true;
+    }
     // Conditional select: choose Rn or transformed Rm according to NZCV.
     // op (bit 30) and o2 (bit 10) select CSEL/CSINC/CSINV/CSNEG.
     if ((word & 0x1fe00000u) == 0x1a800000u && !(word & 0x20000000u) &&

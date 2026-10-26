@@ -60,10 +60,12 @@ struct SwitchAnalysis {
 // Calls, unknown effects, alternate entries, bypasses, and cyclic proof
 // regions cannot establish a cross-block bound. Guard graph construction and
 // proof work share budgets across all dispatch sites in one invocation.
-// RV64 also recognizes the contiguous SLLI/ADD/LD/JALR absolute-pointer form
-// when a nearby AUIPC[/ADDI] definition resolves the table base. The selector
-// scale is fixed to eight bytes; arbitrary register-value propagation and
-// relative-offset RV64 tables remain unsupported. AArch64 also recognizes
+// RV64 also recognizes the SLLI/ADD/LD/JALR absolute-pointer form when a
+// nearby AUIPC[/ADDI] definition resolves the table base. Its contiguous
+// AUIPC[/ADDI]/SLLI/ADD/LW/ADD/JALR form resolves signed 32-bit offsets
+// relative to the table base. A proven adjacent SLTIU/BEQ guard can bound
+// either table; arbitrary register-value propagation remains unsupported.
+// AArch64 also recognizes
 // contiguous ADR/LDR/BR and ADRP/ADD/LDR/BR sequences
 // when ADR/ADRP and ADD resolve the table base and LDR indexes 64-bit absolute
 // pointers with a 64-bit register shifted by three. Every form reads

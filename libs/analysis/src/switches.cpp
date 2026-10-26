@@ -613,6 +613,27 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                 compared_register = register_operand(compare, 0);
                 immediate = std::get_if<ImmediateOperand>(&compare.operands[1]);
                 exclusive_upper_bound = branch.condition == 8;
+            } else if (context.architecture == Architecture::riscv64 && context.mode == ExecutionMode::rv64 &&
+                       compare.opcode == Opcode::rv_sltiu && compare.operands.size() == 3 &&
+                       branch.opcode == Opcode::rv_beq && branch.operands.size() == 3) {
+                // SLTIU Xguard, Xselector, positive_bound; BEQ Xguard, X0,
+                // default proves that the fallthrough selector is below the
+                // bound. A negative immediate is sign-extended before the
+                // unsigned comparison and is not a useful table bound here.
+                const auto *guard = register_operand(compare, 0);
+                compared_register = register_operand(compare, 1);
+                immediate = std::get_if<ImmediateOperand>(&compare.operands[2]);
+                const auto *left = register_operand(branch, 0);
+                const auto *right = register_operand(branch, 1);
+                if (!guard || !compared_register || !immediate || guard->bank != RegisterBank::riscv_gpr ||
+                    guard->width != 64 || guard->index == 0 || *guard == *compared_register ||
+                    !((same_register(left, guard) && right && right->bank == RegisterBank::riscv_gpr &&
+                       right->width == 64 && right->index == 0) ||
+                      (same_register(right, guard) && left && left->bank == RegisterBank::riscv_gpr &&
+                       left->width == 64 && left->index == 0)) ||
+                    immediate->encoded_width != 12 || immediate->effective_width != 64 ||
+                    !immediate->is_signed || immediate->value == 0 || immediate->value > 2047)
+                    continue;
             } else {
                 continue;
             }
@@ -676,6 +697,9 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                  (selector.bank != RegisterBank::arm32_gpr || selector.width != 32 || selector.high_byte ||
                   !compared_register || compared_register->bank != RegisterBank::arm32_gpr ||
                   compared_register->width != selector.width)) ||
+                (context.architecture == Architecture::riscv64 &&
+                 (selector.bank != RegisterBank::riscv_gpr || selector.width != 64 || selector.index == 0 ||
+                  !compared_register || compared_register->width != 64)) ||
                 !immediate || immediate->effective_width != (x86_zero_extend_index ? compared_register->width : selector.width) ||
                 immediate->effective_width > 64 || immediate->encoded_width == 0 ||
                 immediate->encoded_width > immediate->effective_width ||
@@ -1647,6 +1671,143 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
+std::optional<SwitchSite> riscv_indexed_relative_switch(
+    const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
+    const std::vector<std::shared_ptr<const InstructionFact>> &facts,
+    std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
+    std::stop_token stop) {
+    // AUIPC Xbase[, ADDI Xbase, Xbase, lo]; SLLI Xindex, Xselector, 2;
+    // ADD Xaddress, Xbase, Xindex; LW Xoffset, 0(Xaddress);
+    // ADD Xtarget, Xbase, Xoffset; JALR X0, 0(Xtarget).
+    // LW sign-extends the table's 32-bit entries before the target ADD.
+    if (dispatch_index < 5 || stop.stop_requested())
+        return {};
+    const auto &dispatch = facts[dispatch_index];
+    const auto &target_add = facts[dispatch_index - 1];
+    const auto &load = facts[dispatch_index - 2];
+    const auto &address_add = facts[dispatch_index - 3];
+    const auto &scale = facts[dispatch_index - 4];
+    const auto &last_setup = facts[dispatch_index - 5];
+    if (!dispatch || !target_add || !load || !address_add || !scale || !last_setup)
+        return {};
+    const auto &branch_instruction = dispatch->instruction;
+    const auto &target_instruction = target_add->instruction;
+    const auto &load_instruction = load->instruction;
+    const auto &address_instruction = address_add->instruction;
+    const auto &scale_instruction = scale->instruction;
+    const auto &setup_instruction = last_setup->instruction;
+    if (branch_instruction.context.architecture != Architecture::riscv64 ||
+        branch_instruction.context.mode != ExecutionMode::rv64 ||
+        branch_instruction.opcode != Opcode::rv_jalr || branch_instruction.flow != FlowKind::jump ||
+        target_instruction.opcode != Opcode::rv_add || load_instruction.opcode != Opcode::rv_lw ||
+        address_instruction.opcode != Opcode::rv_add || scale_instruction.opcode != Opcode::rv_slli ||
+        (setup_instruction.opcode != Opcode::rv_auipc && setup_instruction.opcode != Opcode::rv_addi) ||
+        branch_instruction.operands.size() != 2 || target_instruction.operands.size() != 3 ||
+        load_instruction.operands.size() != 2 || address_instruction.operands.size() != 3 ||
+        scale_instruction.operands.size() != 3)
+        return {};
+
+    std::size_t first = dispatch_index - 5;
+    if (setup_instruction.opcode == Opcode::rv_addi) {
+        if (first == 0 || !facts[first - 1] ||
+            facts[first - 1]->instruction.opcode != Opcode::rv_auipc)
+            return {};
+        --first;
+    }
+    // All definitions and uses are adjacent in one recovered block. This
+    // avoids guessing across unknown writes, calls, or other control paths.
+    for (std::size_t index = first; index < dispatch_index; ++index) {
+        if (!facts[index] || !facts[index + 1])
+            return {};
+        const auto &current = facts[index]->instruction;
+        const auto next = analysis_detail::continuation_address(current);
+        if (current.context != branch_instruction.context || current.flow != FlowKind::fallthrough ||
+            !next || next.value() != facts[index + 1]->instruction.address)
+            return {};
+    }
+
+    const auto *branch_destination = register_operand(branch_instruction, 0);
+    const auto *branch_memory = std::get_if<MemoryOperand>(&branch_instruction.operands[1]);
+    const auto *target_destination = register_operand(target_instruction, 0);
+    const auto *target_left = register_operand(target_instruction, 1);
+    const auto *target_right = register_operand(target_instruction, 2);
+    const auto *loaded_offset = register_operand(load_instruction, 0);
+    const auto *load_memory = std::get_if<MemoryOperand>(&load_instruction.operands[1]);
+    const auto *address_destination = register_operand(address_instruction, 0);
+    const auto *address_left = register_operand(address_instruction, 1);
+    const auto *address_right = register_operand(address_instruction, 2);
+    const auto *scaled_index = register_operand(scale_instruction, 0);
+    const auto *selector = register_operand(scale_instruction, 1);
+    const auto *amount = std::get_if<ImmediateOperand>(&scale_instruction.operands[2]);
+    const auto gpr64 = [](const RegisterOperand *reg) {
+        return reg && reg->bank == RegisterBank::riscv_gpr && reg->width == 64 && reg->index != 0;
+    };
+    if (!branch_destination || branch_destination->bank != RegisterBank::riscv_gpr ||
+        branch_destination->width != 64 || branch_destination->index != 0 ||
+        !branch_memory || !target_destination || !target_left || !target_right ||
+        !gpr64(target_destination) || !gpr64(loaded_offset) || !load_memory ||
+        !gpr64(address_destination) || !address_left || !address_right ||
+        !gpr64(scaled_index) || !gpr64(selector) ||
+        !amount || amount->encoded_width != 6 || amount->effective_width != 64 ||
+        amount->is_signed || amount->value != 2 ||
+        !same_register(branch_memory->base ? &*branch_memory->base : nullptr, target_destination) ||
+        branch_memory->segment || branch_memory->index || branch_memory->ip_relative ||
+        branch_memory->displacement != 0 || branch_memory->address_width != 64 ||
+        !same_register(load_memory->base ? &*load_memory->base : nullptr, address_destination) ||
+        load_memory->segment || load_memory->index || load_memory->ip_relative ||
+        load_memory->displacement != 0 || load_memory->address_width != 64 ||
+        load_memory->data_width != 32)
+        return {};
+
+    const auto *base = same_register(target_left, loaded_offset) ? target_right
+        : same_register(target_right, loaded_offset) ? target_left : nullptr;
+    if (!gpr64(base) || same_register(base, selector) || same_register(base, scaled_index) ||
+        same_register(base, address_destination) || same_register(base, loaded_offset) ||
+        !((same_register(address_left, base) && same_register(address_right, scaled_index)) ||
+          (same_register(address_right, base) && same_register(address_left, scaled_index))))
+        return {};
+    const auto *setup_destination = register_operand(setup_instruction, 0);
+    if (!same_register(setup_destination, base))
+        return {};
+    if (first != dispatch_index - 5) {
+        const auto *high_destination = register_operand(facts[first]->instruction, 0);
+        if (!same_register(high_destination, base))
+            return {};
+    }
+    const auto table = riscv_table_base(image, facts, dispatch_index - 4, *base, relocations, stop);
+    if (!table)
+        return {};
+
+    SwitchSite site;
+    site.dispatch = branch_instruction.address;
+    site.table = *table;
+    site.selector = *selector;
+    site.scale = 4;
+    site.entry_encoding = SwitchEntryEncoding::signed_offset_from_table;
+    if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
+                                               facts[first]->instruction.address, site.dispatch,
+                                               branch_instruction.context, guards, stop)) {
+        site.case_count = bound->case_count;
+        site.default_target = bound->default_target;
+    }
+    const auto scan_limit = site.case_count ? *site.case_count : max_entries;
+    for (std::size_t index = 0; index < scan_limit; ++index) {
+        if (stop.stop_requested())
+            return {};
+        const auto target = table_target(image, site.table, index, 4, true, relocations, stop);
+        if (!target || !decodes_at(image, branch_instruction.context, target->address, stop)) {
+            site.complete = false;
+            break;
+        }
+        site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
+                              target->relocation_rows, target->dyld_classic_rows, target->dyld_chained_rows});
+    }
+    if (!site.case_count && site.cases.size() == max_entries)
+        site.complete = false;
+    return site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1)
+        ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
+}
+
 std::optional<SwitchSite> thumb_table_branch_switch(
     const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
@@ -1759,6 +1920,10 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
                 auto riscv_switch = riscv_indexed_absolute_switch(image, function, snapshot,
                                                                    found->second->instructions, fact_index,
                                                                    guards, relocations, stop);
+                if (!riscv_switch && !stop.stop_requested())
+                    riscv_switch = riscv_indexed_relative_switch(image, function, snapshot,
+                                                                  found->second->instructions, fact_index,
+                                                                  guards, relocations, stop);
                 if (stop.stop_requested())
                     return Error{ErrorCode::canceled, "Switch analysis canceled"};
                 if (riscv_switch) {
