@@ -48,6 +48,17 @@ std::shared_ptr<const ProjectState> read_state(Connection& connection,int versio
     else if(version>=9)budget(connection,"project_breakpoints","34",remaining);
     if(version>=12)budget(connection,"loader_diagnostics","16+coalesce(length(location),0)+length(CAST(message AS BLOB))",remaining);
     if(version>=12){auto rows=take(connection.prepare("SELECT source,severity,location,message FROM loader_diagnostics ORDER BY source,ordinal"));while(take(rows->step())){const auto source=take(rows->integer(0)),severity=take(rows->integer(1));require(source>=0&&source<=1&&severity>=0&&severity<=2,"Invalid persisted loader diagnostic");Diagnostic item{static_cast<DiagnosticSeverity>(severity),take(rows->text(3)),{}};if(!take(rows->is_null(2))){auto location=location_column(*rows,2);auto address=std::get_if<Address>(&location);require(address,"Persisted loader diagnostic has non-address location");item.location=*address;}if(source==0)state->loader_diagnostics.push_back(std::move(item));else state->runtime_relocation_diagnostics.push_back(std::move(item));}}
+    if(version>=13){
+        budget(connection,"type_import_diagnostics","8+length(CAST(source AS BLOB))+coalesce(length(location),0)+coalesce(length(function_entry),0)+length(CAST(message AS BLOB))",remaining);
+        auto rows=take(connection.prepare("SELECT source,severity,location,function_entry,message FROM type_import_diagnostics ORDER BY ordinal"));
+        while(take(rows->step())){
+            const auto severity=take(rows->integer(1));require(severity>=0&&severity<=2,"Invalid persisted type import diagnostic severity");
+            TypeImportDiagnostic item;item.source=take(rows->text(0));require(!item.source.empty(),"Persisted type import diagnostic has no source");item.severity=static_cast<DiagnosticSeverity>(severity);
+            if(!take(rows->is_null(2)))item.location=address_column(*rows,2);
+            if(!take(rows->is_null(3)))item.function_entry=address_column(*rows,3);
+            item.message=take(rows->text(4));state->type_import_diagnostics.push_back(std::move(item));
+        }
+    }
     auto user=std::make_shared<UserState>();
     auto annotations=take(connection.prepare("SELECT id,location,name,comment FROM annotations ORDER BY id"));
     while(take(annotations->step()))user->annotations.push_back({unsigned_column(*annotations,0),location_column(*annotations,1),take(annotations->text(2)),take(annotations->text(3))});
@@ -314,6 +325,43 @@ Result<bool> ProjectStore::replace_loader_diagnostics(std::span<const Diagnostic
         detail::take(transaction->commit());
         state->loader_diagnostics.assign(loader.begin(),loader.end());
         state->runtime_relocation_diagnostics.assign(runtime.begin(),runtime.end());
+        impl_->state=std::move(state);
+        return true;
+    });
+}
+Result<bool> ProjectStore::replace_type_import_diagnostics(std::span<const TypeImportDiagnostic> diagnostics,
+        std::stop_token stop){
+    return detail::guarded([&]()->Result<bool>{
+        std::lock_guard lock(impl_->mutex);
+        if(impl_->mode==ProjectMode::read_only)return Error{ErrorCode::read_only,"Project is read only"};
+        if(diagnostics.size()>2048)return Error{ErrorCode::resource_limit,"Type import diagnostics exceed the 2,048-row limit"};
+        std::size_t bytes=0;
+        for(const auto& item:diagnostics){
+            if(item.source.empty() || item.source.size()>4096 || static_cast<unsigned>(item.severity)>2 || item.message.size()>65536)
+                return Error{ErrorCode::invalid_argument,"Type import diagnostic is outside persistence limits"};
+            const auto cost=item.source.size()+item.message.size()+48;
+            if(bytes>project_payload_limit || cost>project_payload_limit-bytes)
+                return Error{ErrorCode::resource_limit,"Type import diagnostics exceed project payload limit"};
+            bytes+=cost;
+        }
+        if(stop.stop_requested())return Error{ErrorCode::canceled,"Type import diagnostic persistence canceled"};
+        auto state=std::make_shared<ProjectState>(*impl_->state);
+        detail::Cancellation cancellation(*impl_->connection,stop);
+        auto transaction=detail::take(Transaction::begin(*impl_->connection));
+        detail::take(impl_->connection->execute("DELETE FROM type_import_diagnostics"));
+        auto insert=detail::take(impl_->connection->prepare("INSERT INTO type_import_diagnostics(ordinal,source,severity,location,function_entry,message) VALUES(?1,?2,?3,?4,?5,?6)"));
+        std::uint64_t ordinal=0;
+        for(const auto& item:diagnostics){
+            if(stop.stop_requested())return Error{ErrorCode::canceled,"Type import diagnostic persistence canceled"};
+            detail::take(insert->bind_integer(1,static_cast<std::int64_t>(ordinal++)));
+            detail::take(insert->bind_text(2,item.source));
+            detail::take(insert->bind_integer(3,static_cast<int>(item.severity)));
+            if(item.location)detail::take(insert->bind_blob(4,detail::take(encode_location(Location{*item.location}))));else detail::take(insert->bind_null(4));
+            if(item.function_entry)detail::take(insert->bind_blob(5,detail::take(encode_location(Location{*item.function_entry}))));else detail::take(insert->bind_null(5));
+            detail::take(insert->bind_text(6,item.message));detail::take(insert->step());detail::take(insert->reset());
+        }
+        detail::take(transaction->commit());
+        state->type_import_diagnostics.assign(diagnostics.begin(),diagnostics.end());
         impl_->state=std::move(state);
         return true;
     });

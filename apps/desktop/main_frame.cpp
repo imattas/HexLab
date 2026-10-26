@@ -1959,7 +1959,19 @@ struct MainFrame::Impl {
                 navigate_from_document(source_document, location);
             };
             type_symbols->diagnostics_changed = [this, id](std::vector<AnalysisIssueDiagnostic> diagnostics) {
-                if (analysis_issues) analysis_issues->set_type_diagnostics(id, std::move(diagnostics));
+                if (!id || !analysis_issues) return;
+                analysis_issues->set_type_diagnostics(id, diagnostics);
+                const auto project = controller->documents().project(*id);
+                const auto actor = controller->documents().actor(*id);
+                if (!project || project->mode == database::ProjectMode::read_only || !actor) return;
+                std::vector<database::TypeImportDiagnostic> persisted;
+                persisted.reserve(diagnostics.size());
+                for (const auto &item : diagnostics)
+                    persisted.push_back({item.source, item.severity, item.message, item.address, item.function_entry});
+                auto submitted = actor->replace_type_import_diagnostics(std::move(persisted));
+                if (!submitted) {
+                    controller->documents().report_error(*id, submitted.error());
+                }
             };
             auto project = id ? controller->documents().project(*id) : nullptr;
             type_symbols->update(id, project, state().selection(), [this, id](ProjectCommand command) {

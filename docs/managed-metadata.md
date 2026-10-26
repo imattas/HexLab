@@ -109,11 +109,16 @@ ordinal spaces; substitution still requires an explicit declaring-type or
 method argument context and leaves unbound variables open.
 
 `managed_type_is_assignable_across_catalogs` follows local TypeDef base and
-interface edges plus uniquely bound external TypeRefs. It returns false when a
-chain contains an unresolved reference or the bounded traversal cannot prove
-the relation. It still does not substitute constructed generic base/interface
-edges or compare closed generic assignability. Strong-name public-key-to-token
-conversion is not inferred by this resolver.
+interface edges plus uniquely bound external TypeRefs. For closed generic
+TypeSpec instances, it now substitutes the current constructed type arguments
+for `VAR` nodes in TypeSpec base and interface edges, then compares the
+resulting catalog-qualified TypeDef identity and argument shape. Closed generic
+arguments are compared invariantly; generic variance and constraint satisfaction
+are not inferred. Open `VAR`/`MVAR` values, unresolved or ambiguous references,
+invalid arity, TypeSpec cycles, and array signatures with explicit bounds that
+the current signature model does not retain cannot prove assignability and
+return false. The graph/signature work has fixed node and edge budgets.
+Strong-name public-key-to-token conversion is not inferred by this resolver.
 
 Method-shaped `MemberRef` signatures now carry recursively substituted
 `ManagedTypeSignature` trees when their TypeSpec owner resolves to an

@@ -98,6 +98,14 @@ Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::persist_breakpoin
         auto next=std::make_shared<ProjectSnapshot>(*snapshot_);next->state=take(store_->snapshot());snapshot_=std::move(next);return snapshot_;
     });
 }
+Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::replace_type_import_diagnostics(
+    std::span<const database::TypeImportDiagnostic> diagnostics,std::stop_token stop){
+    return project_detail::guarded([&]()->Result<std::shared_ptr<const ProjectSnapshot>>{
+        using namespace project_detail;std::lock_guard lock(mutex_);canceled(stop);
+        take(store_->replace_type_import_diagnostics(diagnostics,stop));
+        auto next=std::make_shared<ProjectSnapshot>(*snapshot_);next->state=take(store_->snapshot());snapshot_=std::move(next);return snapshot_;
+    });
+}
 Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::refresh_analysis(std::stop_token stop){return project_detail::guarded([&]()->Result<std::shared_ptr<const ProjectSnapshot>>{
     using namespace project_detail;std::lock_guard lock(mutex_);canceled(stop);if(!snapshot_->loaded)return snapshot_;auto key=take(project_analysis_key(*snapshot_,options_));if(snapshot_->basis && snapshot_->basis->key==key && snapshot_->pending_byte_ranges.ranges().empty() && snapshot_->basis->decisions==snapshot_->state->user->decisions)return snapshot_;
     ProjectAnalysisRequest request;request.snapshot=snapshot_;request.options=options_;request.key=key;request.cache.status=snapshot_->derived_cache_status;request.cache.reason=snapshot_->derived_cache_reason;

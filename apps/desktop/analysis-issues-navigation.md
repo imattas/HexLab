@@ -56,7 +56,8 @@ invalid. If a pinned function disappears or becomes ambiguous after analysis,
 the pin remains visible with an unavailable message and an empty queue until
 the user changes or clears it.
 
-This workflow changes desktop presentation and navigation only. It does not
-write analysis decisions or persist preferences in project databases. GUI and
-runtime verification remain follow-up work; this implementation was reviewed
-without opening the desktop or running tests.
+The latest completed type-import report is stored as project metadata for
+writable projects and survives reopening; it is replaced by the next completed
+header or PDB import. Read-only and file-only tabs keep their report only while
+open. This does not write analysis decisions or persist view preferences. GUI
+and runtime verification remain separate from this navigation description.

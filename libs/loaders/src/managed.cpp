@@ -3,9 +3,11 @@
 #include "hexlab/loaders/loaded_image.hpp"
 #include <algorithm>
 #include <array>
+#include <compare>
 #include <limits>
 #include <set>
 #include <string_view>
+#include <tuple>
 
 namespace hexlab {
 namespace {
@@ -831,6 +833,218 @@ Result<bool> refresh_generic_instance_arity(ManagedTypeSignature& signature,
   }
   return true;
 }
+
+struct ManagedCatalogIndex {
+  std::map<std::uint32_t,const ManagedTypeDefinition*> definitions;
+  std::map<std::uint32_t,const ManagedTypeReference*> references;
+  std::map<std::uint32_t,const ManagedTypeSpecification*> specifications;
+};
+struct ManagedTypeShape {
+  std::uint8_t element_type=0;
+  bool generic_instance_is_value_type=false, type_variable=false, method_variable=false;
+  std::uint32_t generic_index=0, array_rank=0;
+  std::optional<ManagedTypeNode> definition, variable_owner;
+  std::vector<ManagedTypeShape> children;
+  bool operator==(const ManagedTypeShape&) const = default;
+  bool operator<(const ManagedTypeShape& other) const {
+    return std::tie(element_type,generic_instance_is_value_type,type_variable,method_variable,
+                    generic_index,array_rank,definition,variable_owner,children)<
+           std::tie(other.element_type,other.generic_instance_is_value_type,other.type_variable,
+                    other.method_variable,other.generic_index,other.array_rank,other.definition,
+                    other.variable_owner,other.children);
+  }
+};
+struct ManagedConstructedType {
+  ManagedTypeNode definition;
+  bool value_type=false;
+  std::vector<ManagedTypeShape> arguments;
+  bool operator==(const ManagedConstructedType&) const = default;
+  bool operator<(const ManagedConstructedType& other) const {
+    return std::tie(definition,value_type,arguments)<
+           std::tie(other.definition,other.value_type,other.arguments);
+  }
+};
+constexpr std::size_t max_assignability_catalogs=4096;
+constexpr std::size_t max_assignability_metadata_nodes=1'000'000;
+constexpr std::size_t max_assignability_graph_nodes=100'000;
+constexpr std::size_t max_assignability_signature_nodes=100'000;
+
+std::optional<std::vector<ManagedCatalogIndex>> index_managed_catalogs(
+    std::span<const ManagedTypeCatalog> catalogs){
+  if(catalogs.size()>max_assignability_catalogs)return {};
+  std::vector<ManagedCatalogIndex> result(catalogs.size());
+  std::size_t total=0;
+  for(std::size_t i=0;i<catalogs.size();++i){
+    const auto& source=catalogs[i];
+    if(source.definitions.size()>max_assignability_metadata_nodes-total)return {};
+    total+=source.definitions.size();
+    if(source.references.size()>max_assignability_metadata_nodes-total)return {};
+    total+=source.references.size();
+    if(source.specifications.size()>max_assignability_metadata_nodes-total)return {};
+    total+=source.specifications.size();
+    auto& target=result[i];
+    for(const auto& definition:source.definitions)
+      if(!definition.token||(definition.token>>24)!=2||!target.definitions.emplace(definition.token,&definition).second)return {};
+    for(const auto& reference:source.references)
+      if(!reference.token||(reference.token>>24)!=1||!target.references.emplace(reference.token,&reference).second)return {};
+    for(const auto& specification:source.specifications)
+      if(!specification.token||(specification.token>>24)!=27||!target.specifications.emplace(specification.token,&specification).second)return {};
+  }
+  return result;
+}
+
+std::optional<ManagedTypeNode> resolved_definition_node(
+    std::span<const ManagedCatalogIndex> indexes,std::uint32_t source_catalog,std::uint32_t token){
+  if(source_catalog>=indexes.size())return {};
+  const auto table=token>>24;
+  if(table==2){
+    if(indexes[source_catalog].definitions.contains(token))return ManagedTypeNode{source_catalog,token};
+    return {};
+  }
+  if(table!=1)return {};
+  const auto found=indexes[source_catalog].references.find(token);
+  if(found==indexes[source_catalog].references.end()||!found->second->resolved_catalog_index||
+     !found->second->resolved_definition_token)return {};
+  const auto catalog=*found->second->resolved_catalog_index;
+  const auto definition=*found->second->resolved_definition_token;
+  if(catalog>=indexes.size()||!indexes[catalog].definitions.contains(definition))return {};
+  return ManagedTypeNode{catalog,definition};
+}
+
+std::optional<ManagedTypeShape> managed_signature_shape(
+    std::span<const ManagedCatalogIndex> indexes,std::uint32_t source_catalog,
+    const ManagedTypeSignature& signature,std::optional<ManagedTypeNode> variable_owner,
+    unsigned depth,std::size_t& budget,std::set<ManagedTypeNode>& active_specs){
+  if(depth>16||!budget||source_catalog>=indexes.size())return {};
+  --budget;
+  const auto token=signature.metadata_type_token;
+  if(signature.element_type==0x15&&!signature.generic_instance_arity_valid)return {};
+  if((token>>24)==27&&signature.type_spec_signature&&
+     (signature.element_type==0x11||signature.element_type==0x12)){
+    const ManagedTypeNode spec_node{source_catalog,token};
+    if(!active_specs.insert(spec_node).second)return {};
+    auto result=managed_signature_shape(indexes,source_catalog,*signature.type_spec_signature,
+                                        variable_owner,depth+1,budget,active_specs);
+    active_specs.erase(spec_node);
+    return result;
+  }
+  if(signature.element_type==0x14)return {}; // Array sizes/lower bounds are not retained in the current signature model.
+  ManagedTypeShape shape;
+  shape.element_type=signature.element_type;
+  shape.generic_instance_is_value_type=signature.generic_instance_is_value_type;
+  shape.generic_index=signature.generic_index;
+  shape.array_rank=signature.array_rank;
+  if(signature.element_type==0x13){shape.type_variable=true;shape.variable_owner=variable_owner;return shape;}
+  if(signature.element_type==0x1e){shape.method_variable=true;return shape;}
+  if(signature.element_type==0x11||signature.element_type==0x12||signature.element_type==0x15){
+    if((token>>24)==27)return {}; // A TypeSpec constructor is not a definition identity.
+    auto definition=resolved_definition_node(indexes,source_catalog,token);
+    if(!definition)return {};
+    shape.definition=*definition;
+  }
+  for(const auto& child:signature.children){
+    auto converted=managed_signature_shape(indexes,source_catalog,child,variable_owner,
+                                           depth+1,budget,active_specs);
+    if(!converted)return {};
+    shape.children.push_back(std::move(*converted));
+  }
+  return shape;
+}
+
+bool managed_shape_is_closed(const ManagedTypeShape& shape){
+  if(shape.type_variable||shape.method_variable)return false;
+  return std::all_of(shape.children.begin(),shape.children.end(),managed_shape_is_closed);
+}
+
+std::optional<ManagedConstructedType> constructed_type_from_shape(
+    std::span<const ManagedCatalogIndex> indexes,const ManagedTypeShape& shape){
+  if(!shape.definition||shape.element_type!=0x11&&shape.element_type!=0x12&&shape.element_type!=0x15)return {};
+  if(shape.element_type!=0x15&&!shape.children.empty())return {};
+  const auto [catalog,token]=*shape.definition;
+  if(catalog>=indexes.size())return {};
+  const auto definition=indexes[catalog].definitions.find(token);
+  if(definition==indexes[catalog].definitions.end())return {};
+  const auto arity=definition->second->generic_parameters.size();
+  if(shape.element_type==0x15){
+    if(shape.children.size()!=arity)return {};
+  }else if(arity!=0)return {};
+  if(!std::all_of(shape.children.begin(),shape.children.end(),managed_shape_is_closed))return {};
+  return ManagedConstructedType{*shape.definition,
+      shape.element_type==0x11||shape.generic_instance_is_value_type,shape.children};
+}
+
+std::optional<ManagedConstructedType> constructed_type_from_token(
+    std::span<const ManagedTypeCatalog> catalogs,std::span<const ManagedCatalogIndex> indexes,
+    std::uint32_t source_catalog,std::uint32_t token,std::size_t& signature_budget){
+  if(source_catalog>=indexes.size())return {};
+  if((token>>24)==27){
+    const auto found=indexes[source_catalog].specifications.find(token);
+    if(found==indexes[source_catalog].specifications.end())return {};
+    std::set<ManagedTypeNode> active_specs{{source_catalog,token}};
+    auto shape=managed_signature_shape(indexes,source_catalog,found->second->signature,
+                                       std::nullopt,0,signature_budget,active_specs);
+    if(!shape)return {};
+    return constructed_type_from_shape(indexes,*shape);
+  }
+  const auto node=resolved_definition_node(indexes,source_catalog,token);
+  if(!node)return {};
+  const auto [catalog,definition_token]=*node;
+  const auto definition=indexes[catalog].definitions.find(definition_token);
+  if(definition==indexes[catalog].definitions.end()||!definition->second->generic_parameters.empty())return {};
+  (void)catalogs;
+  return ManagedConstructedType{*node,false,{}};
+}
+
+bool catalog_has_type_token(std::span<const ManagedCatalogIndex> indexes,
+                            std::uint32_t catalog,std::uint32_t token){
+  if(catalog>=indexes.size())return false;
+  const auto table=token>>24;
+  if(table==2)return indexes[catalog].definitions.contains(token);
+  if(table==1)return indexes[catalog].references.contains(token);
+  if(table==27)return indexes[catalog].specifications.contains(token);
+  return false;
+}
+
+std::optional<ManagedTypeShape> substitute_type_variables(
+    const ManagedTypeShape& source,ManagedTypeNode owner,
+    std::span<const ManagedTypeShape> arguments,unsigned depth,std::size_t& budget){
+  if(depth>16||!budget)return {};
+  --budget;
+  if(source.method_variable)return {};
+  if(source.type_variable){
+    if(source.variable_owner!=owner||source.generic_index>=arguments.size())return {};
+    return arguments[source.generic_index];
+  }
+  auto result=source;
+  result.children.clear();
+  for(const auto& child:source.children){
+    auto substituted=substitute_type_variables(child,owner,arguments,depth+1,budget);
+    if(!substituted)return {};
+    result.children.push_back(std::move(*substituted));
+  }
+  return result;
+}
+
+std::optional<ManagedConstructedType> constructed_edge_type(
+    std::span<const ManagedCatalogIndex> indexes,const ManagedConstructedType& owner,
+    std::uint32_t edge_token,std::size_t& signature_budget){
+  if((edge_token>>24)!=27){
+    const auto node=resolved_definition_node(indexes,owner.definition.first,edge_token);
+    if(!node)return {};
+    const auto definition=indexes[node->first].definitions.find(node->second);
+    if(definition==indexes[node->first].definitions.end()||!definition->second->generic_parameters.empty())return {};
+    return ManagedConstructedType{*node,false,{}};
+  }
+  const auto found=indexes[owner.definition.first].specifications.find(edge_token);
+  if(found==indexes[owner.definition.first].specifications.end())return {};
+  std::set<ManagedTypeNode> active_specs{{owner.definition.first,edge_token}};
+  auto shape=managed_signature_shape(indexes,owner.definition.first,found->second->signature,
+                                     owner.definition,0,signature_budget,active_specs);
+  if(!shape)return {};
+  auto substituted=substitute_type_variables(*shape,owner.definition,owner.arguments,0,signature_budget);
+  if(!substituted)return {};
+  return constructed_type_from_shape(indexes,*substituted);
+}
 }
 
 Result<bool> bind_managed_type_references(std::span<ManagedTypeCatalog> catalogs){
@@ -937,21 +1151,54 @@ bool managed_type_is_assignable_across_catalogs(std::span<const ManagedTypeCatal
                                                  std::uint32_t candidate_catalog,std::uint32_t candidate,
                                                  std::uint32_t target_catalog,std::uint32_t target){
   if(!candidate||!target||candidate_catalog>=catalogs.size()||target_catalog>=catalogs.size())return false;
-  const ManagedTypeNode wanted{target_catalog,target};
-  std::vector<ManagedTypeNode> pending{{candidate_catalog,candidate}};
-  std::set<ManagedTypeNode> visited;std::size_t budget=100000;
-  while(!pending.empty()&&budget--){
-    const auto node=pending.back();pending.pop_back();if(node==wanted)return true;
-    if(!visited.insert(node).second||node.first>=catalogs.size())continue;
-    const auto& catalog=catalogs[node.first];
-    const auto definition=std::find_if(catalog.definitions.begin(),catalog.definitions.end(),
-                                       [&](const auto& value){return value.token==node.second;});
-    if(definition==catalog.definitions.end())continue;
-    const auto add=[&](std::uint32_t edge){
-      if(auto resolved=bound_type_node(catalog,node.first,edge);resolved&&!visited.contains(*resolved))pending.push_back(*resolved);
+  auto indexes=index_managed_catalogs(catalogs);
+  if(!indexes||!catalog_has_type_token(*indexes,candidate_catalog,candidate)||
+     !catalog_has_type_token(*indexes,target_catalog,target))return false;
+  if(candidate_catalog==target_catalog&&candidate==target){
+    if((candidate>>24)==27){
+      const auto found=indexes->at(candidate_catalog).specifications.find(candidate);
+      if(found==indexes->at(candidate_catalog).specifications.end())return false;
+      const auto* root=resolved_type_spec_root(found->second->signature);
+      if(!root||(root->element_type==0x15&&!root->generic_instance_arity_valid))return false;
+    }
+    return true;
+  }
+
+  // Preserve exact identity for two unconstructed references to the same
+  // generic TypeDef, while requiring closed argument vectors for traversal or
+  // comparison against a constructed TypeSpec.
+  const auto raw_candidate=resolved_definition_node(*indexes,candidate_catalog,candidate);
+  const auto raw_target=resolved_definition_node(*indexes,target_catalog,target);
+  if((candidate>>24)!=27&&(target>>24)!=27&&raw_candidate&&raw_target&&*raw_candidate==*raw_target)
+    return true;
+
+  std::size_t signature_budget=max_assignability_signature_nodes;
+  auto source=constructed_type_from_token(catalogs,*indexes,candidate_catalog,candidate,signature_budget);
+  auto wanted=constructed_type_from_token(catalogs,*indexes,target_catalog,target,signature_budget);
+  if(!source||!wanted)return false;
+  if(*source==*wanted)return true;
+
+  std::vector<ManagedConstructedType> pending{*source};
+  std::set<ManagedConstructedType> visited;
+  std::size_t graph_budget=max_assignability_graph_nodes;
+  while(!pending.empty()&&graph_budget){
+    auto current=std::move(pending.back());pending.pop_back();
+    if(current==*wanted)return true;
+    if(!visited.insert(current).second)continue;
+    if(visited.size()>max_assignability_graph_nodes)return false;
+    const auto definition=indexes->at(current.definition.first).definitions.find(current.definition.second);
+    if(definition==indexes->at(current.definition.first).definitions.end())continue;
+    const auto explore=[&](std::uint32_t edge)->bool{
+      if(!graph_budget)return false;
+      --graph_budget;
+      auto next=constructed_edge_type(*indexes,current,edge,signature_budget);
+      if(!next)return false;
+      if(*next==*wanted)return true;
+      if(!visited.contains(*next))pending.push_back(std::move(*next));
+      return false;
     };
-    if(definition->base_type_token)add(definition->base_type_token);
-    for(const auto edge:definition->interface_tokens)add(edge);
+    if(definition->second->base_type_token&&explore(definition->second->base_type_token))return true;
+    for(const auto edge:definition->second->interface_tokens)if(explore(edge))return true;
   }
   return false;
 }

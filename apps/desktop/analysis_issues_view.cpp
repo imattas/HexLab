@@ -474,6 +474,7 @@ void AnalysisIssuesView::rebuild() {
     const auto *file_diagnostics = !project_ && document_snapshot_ ? &document_snapshot_->diagnostics : nullptr;
     const auto *durable_loader = project_ && project_->state ? &project_->state->loader_diagnostics : nullptr;
     const auto *durable_runtime = project_ && project_->state ? &project_->state->runtime_relocation_diagnostics : nullptr;
+    const auto *durable_type_import = project_ && project_->state ? &project_->state->type_import_diagnostics : nullptr;
     const auto *loader_items = loaded ? &loaded->diagnostics : durable_loader;
     const auto *runtime_items = loaded ? &loaded->runtime_relocation_diagnostics : durable_runtime;
     const auto diagnostic_count = project_
@@ -482,13 +483,15 @@ void AnalysisIssuesView::rebuild() {
         : file_diagnostics ? std::min(max_loader_rows, file_diagnostics->size()) : 0;
     const auto active_type = document_ && type_diagnostics_.contains(document_->value) ? &type_diagnostics_.at(document_->value) : nullptr;
     const auto active_decompiler = document_ && decompiler_diagnostics_.contains(document_->value) ? &decompiler_diagnostics_.at(document_->value) : nullptr;
-    const auto producer_count = std::min(max_loader_rows, active_type ? active_type->size() : 0) +
+    const auto durable_type_count = !active_type && durable_type_import ? durable_type_import->size() : 0;
+    const auto producer_count = std::min(max_loader_rows, active_type ? active_type->size() : durable_type_count) +
                                 std::min(max_loader_rows, active_decompiler ? active_decompiler->size() : 0);
     const auto diagnostic_total = diagnostic_count + producer_count;
     const bool diagnostic_source_truncated = project_
         ? (loader_items && loader_items->size() > max_loader_rows) || (runtime_items && runtime_items->size() > max_loader_rows)
         : file_diagnostics && file_diagnostics->size() > max_loader_rows;
     const bool producer_source_truncated = (active_type && active_type->size() > max_loader_rows) ||
+                                           (!active_type && durable_type_import && durable_type_import->size() > max_loader_rows) ||
                                            (active_decompiler && active_decompiler->size() > max_loader_rows);
     const auto diagnostic_budget = std::min(max_loader_rows * 4, diagnostic_total);
     const auto function_row_limit = max_rows - diagnostic_budget;
@@ -559,6 +562,16 @@ void AnalysisIssuesView::rebuild() {
     if (project_) {
         if (loader_items) add_diagnostics(*loader_items, "Loader");
         if (runtime_items) add_diagnostics(*runtime_items, "Runtime relocation");
+        if (!active_type && durable_type_import) {
+            for (std::size_t i = 0; i < std::min(max_loader_rows, durable_type_import->size()) && diagnostic_rows < diagnostic_budget; ++i) {
+                const auto &item = (*durable_type_import)[i];
+                wxString detail = text(item.source) + " " + severity_text(item.severity) + ": " + preview_text(item.message, 4096);
+                Row row{Kind::type_import_diagnostic, item.location, {}, item.function_entry, std::move(detail)};
+                row.severity = item.severity;
+                rows_.push_back(std::move(row));
+                ++diagnostic_rows;
+            }
+        }
     } else if (file_diagnostics) {
         add_diagnostics(*file_diagnostics, "File inspection");
     }
