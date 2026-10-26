@@ -567,7 +567,19 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 }
                 continue;
             }
-            if(op==0x3f||op==0x40)return unsupported("memory.size and memory.grow are not modeled");
+            if (op == 0x3f || op == 0x40) {
+                const auto memory_index = immediate(code[n]->instruction);
+                if (!metadata ||
+                    static_cast<std::uint64_t>(metadata->imported_memories) + metadata->defined_memories != 1 ||
+                    !memory_index || *memory_index != 0)
+                    return unsupported("memory.size/grow requires one validated memory at index zero");
+                if (op == 0x40) {
+                    auto delta = shape_pop(stack, integer(32));
+                    if (!delta) return delta.error();
+                }
+                stack.push_back(integer(32));
+                continue;
+            }
             if(op==0x41||op==0x42||op==0x43||op==0x44){stack.push_back(op==0x41?integer(32):op==0x42?integer(64):op==0x43?floating(32):floating(64));}
             else if(auto info=numeric(op)){for(unsigned p=0;p<info->pops;++p){auto v=shape_pop(stack,info->input);if(!v)return v.error();}stack.push_back(info->output);}
             else if(auto cv=conversion(op)){auto v=shape_pop(stack,cv->input);if(!v)return v.error();stack.push_back(cv->output);}
@@ -831,7 +843,33 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 }
                 continue;
             }
-            if(op==0x3f||op==0x40)return unsupported("memory.size and memory.grow are not modeled");
+            if (op == 0x3f || op == 0x40) {
+                const auto memory_index = immediate(code[n]->instruction);
+                if (!metadata ||
+                    static_cast<std::uint64_t>(metadata->imported_memories) + metadata->defined_memories != 1 ||
+                    !memory_index || *memory_index != 0)
+                    return unsupported("memory.size/grow requires one validated memory at index zero");
+
+                Intrinsic effect;
+                if (op == 0x3f) {
+                    effect.name = "wasm_memory_size_pages";
+                } else {
+                    auto delta = pop(integer(32));
+                    if (!delta) return delta.error();
+                    effect.name = "wasm_memory_grow_pages";
+                    effect.operands.push_back(delta.value());
+                }
+                // The current page count is runtime state. Growth changes the
+                // addressable memory; a failed grow is represented by the
+                // intrinsic's i32 -1 result rather than a trap edge.
+                effect.memory_effect = op == 0x3f ? IntrinsicMemoryEffect::read
+                                                  : IntrinsicMemoryEffect::unknown;
+                const std::vector<std::uint8_t> result_types{0x7f};
+                auto result_values = append_call_results(effect, result_types);
+                if (!result_values) return result_values.error();
+                emit(n, std::move(effect));
+                continue;
+            }
             if (auto info = numeric(op)) {
                 if (info->pops == 1) {
                     auto operand = pop(info->input);

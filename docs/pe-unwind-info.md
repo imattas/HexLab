@@ -26,3 +26,17 @@ The desktop PE metadata view exposes AMD64 runtime-function records and
 available C/C++ handler rows, plus ARM64 runtime-function and handler rows.
 Rows navigate to their source file offset when provenance is available and are
 capped at 4,096 entries so large exception tables remain responsive.
+
+The FH3/FH4 exception planners expose catch qualifiers from the MSVC adjective
+bits (`const`, `volatile`, `unaligned`, and reference binding). For typed catches,
+these qualifiers do not prevent an exact decorated TypeDescriptor-name match;
+the planner reports the qualifiers alongside the candidate. FH4 `std::...`
+catch-all metadata is considered a match only when the caller identifies the
+exception as C++; it is a non-match for a known non-C++ exception and unresolved
+when the exception kind is unknown. FH3's planner has no exception-kind input,
+so the same adjective remains unresolved there. The legacy `bad_alloc`
+compatibility bit, COM+ bit, unknown adjective bits, typed uses of `std::...`,
+and catch-all qualifiers remain conservative unresolved candidates because
+their matching conditions are not available in the planner inputs. These plans
+describe candidate selection only and do not invoke handlers or runtime
+compatibility logic.

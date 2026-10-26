@@ -52,6 +52,8 @@ struct PeFh3CatchCandidate {
     std::optional<std::string> decorated_type_name;
     std::uint64_t handler_address = 0;
     std::optional<std::uint64_t> catch_object_address;
+    bool catch_const = false, catch_volatile = false, catch_unaligned = false, catch_by_reference = false;
+    bool std_dotdot = false, badalloc_compatibility = false, complus_catch = false;
     PeRecordSource source;
     std::optional<PeRecordSource> type_descriptor_source;
 };
@@ -108,6 +110,8 @@ struct PeFh4CatchCandidate {
     std::optional<std::string> decorated_type_name;
     std::uint64_t handler_address = 0;
     std::optional<std::uint64_t> catch_object_address;
+    bool catch_const = false, catch_volatile = false, catch_unaligned = false, catch_by_reference = false;
+    bool std_dotdot = false, badalloc_compatibility = false, complus_catch = false;
     std::vector<std::uint64_t> continuation_addresses;
     PeRecordSource source;
 };

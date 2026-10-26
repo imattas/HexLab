@@ -23,12 +23,18 @@ SSA integration. The behavior follows Intel's [FRNDINT instruction
 reference](https://cdrdv2-public.intel.com/812383/253666-sdm-vol-2a.pdf).
 
 The caller-driven API evaluates `FMUL` for zero, finite, infinity, and NaN
-operands, including normalization of subnormal and pseudo-denormal inputs when
-the result is normal. Zero products preserve the XORed sign; infinity products
-preserve the sign XOR; and finite products form the significand product with
-integer limbs and apply FCW precision-control and rounding-control fields.
-Denormal inputs set DE when masked, and stop before arithmetic when DM is
-clear.
+operands, including normalization of subnormal and pseudo-denormal inputs.
+Finite products form the exact significand product with integer limbs, then
+apply FCW precision-control and rounding-control fields. Gradual underflow
+rounds directly into the binary80 subnormal lattice, retaining fewer
+significant bits as the exponent approaches the least subnormal. A rounded
+result that reaches the least normal value is encoded as normal. With UE
+masked, the underflow flag is raised only when the tiny result is inexact; with
+UE unmasked, a tiny result raises UE even when exact. PE records discarded
+bits, and C1 follows whether rounding moved the numeric result upward. An
+unmasked UE reports UE/ES/B and withholds a value; masked UE returns the
+rounded value. Denormal inputs set DE when masked, and stop before arithmetic
+when DM is clear.
 
 The caller-driven `FADD`/`FSUB` API handles finite, zero, infinity, and NaN
 binary80 operands. It aligns finite significands with an integer
@@ -47,14 +53,12 @@ subtraction, and zero multiplied by infinity. Unmasked IE sets IE/ES/B and
 returns no destination value. Ordinary infinities and finite-plus-infinity
 results retain their architectural signs.
 
-Gradual-underflow result rounding remains unsupported.
-
 For x87 register arithmetic, an unmasked PE still commits the rounded value
 while marking exception delivery incomplete. Unmasked overflow remains
 fail-closed because the biased x87 register result is not modeled. Masked
 overflow returns the RC-selected infinity or largest finite value. These
 operations do not use host floating point. Reserved precision-control encoding
-01 and unsupported gradual-underflow results fail closed. The operation and
+01 and unmasked UE withhold the result value. The operation and
 exception behavior follows Intel's [x87 floating-point operation and exception
 definitions](https://cdrdv2-public.intel.com/874240/325462-090-sdm-vol-1-2abcd-3abcd-4.pdf).
 Intel specifies x87 NaN source priority. Ghidra's native decompiler

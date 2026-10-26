@@ -386,6 +386,19 @@ bool wide_bit(Product128 value, unsigned bit) noexcept {
                     : bit < 128 && ((value.hi >> (bit - 64)) & 1) != 0;
 }
 
+bool wide_any_below(Product128 value, unsigned bit_count) noexcept {
+    if (bit_count >= 128) return value.hi != 0 || value.lo != 0;
+    if (bit_count >= 64) {
+        const auto high_count = bit_count - 64;
+        const auto high_mask = high_count == 0 ? std::uint64_t{0}
+            : (std::uint64_t{1} << high_count) - 1;
+        return value.lo != 0 || (value.hi & high_mask) != 0;
+    }
+    const auto low_mask = bit_count == 0 ? std::uint64_t{0}
+        : (std::uint64_t{1} << bit_count) - 1;
+    return (value.lo & low_mask) != 0;
+}
+
 Product128 multiply_u64(std::uint64_t a, std::uint64_t b) noexcept {
     const std::uint64_t a0 = static_cast<std::uint32_t>(a), a1 = a >> 32;
     const std::uint64_t b0 = static_cast<std::uint32_t>(b), b1 = b >> 32;
@@ -779,7 +792,9 @@ std::optional<X87ArithmeticResult> evaluate_x87_multiply(const X87MultiplyReques
     const bool top = (product.hi >> 63) != 0;
     std::uint64_t significand = top ? (product.hi >> 0) : ((product.hi << 1) | (product.lo >> 63));
     const std::uint64_t tail = top ? product.lo : (product.lo << 1);
+    const Product128 exact_product{significand, tail};
     int exponent = a_exp + b_exp - 16383 + (top ? 1 : 0);
+    const int exact_exponent = exponent;
     const auto pc = static_cast<std::uint8_t>((request.control_word >> 8) & 3);
     const unsigned precision = pc == 0 ? 24 : pc == 2 ? 53 : 64;
     const unsigned discard = 64 - precision;
@@ -807,7 +822,7 @@ std::optional<X87ArithmeticResult> evaluate_x87_multiply(const X87MultiplyReques
 
     X87ArithmeticResult result;
     result.status_word = static_cast<std::uint16_t>(arithmetic_status & ~fsw_c1);
-    if (inexact && increment) result.status_word |= fsw_c1;
+    if (inexact && (negative != increment)) result.status_word |= fsw_c1;
     const bool overflow = exponent >= 0x7fff;
     if (overflow) {
         result.overflow = true;
@@ -828,7 +843,56 @@ std::optional<X87ArithmeticResult> evaluate_x87_multiply(const X87MultiplyReques
         }
         return result;
     }
-    if (exponent <= 0) return {}; // gradual-underflow rounding is deliberately unsupported for now
+    if (exact_exponent <= 0) {
+        // The normalized product is a 128-bit fixed-point value. Shift it
+        // into the binary80 subnormal range, then round once at the effective
+        // precision. Smaller values have fewer precision bits available, down
+        // to the subnormal quantum at fraction bit zero.
+        const int precision_shift = exact_exponent + 63 - static_cast<int>(precision);
+        const unsigned subnormal_discard = precision_shift > 0
+            ? static_cast<unsigned>(precision_shift) : 0;
+        const unsigned shift = static_cast<unsigned>(65 - exact_exponent) + subnormal_discard;
+        if (shift < 64)
+            retained = (exact_product.lo >> shift) | (exact_product.hi << (64 - shift));
+        else if (shift == 64)
+            retained = exact_product.hi;
+        else if (shift < 128)
+            retained = exact_product.hi >> (shift - 64);
+        else
+            retained = 0;
+        guard = shift != 0 && wide_bit(exact_product, shift - 1);
+        sticky = shift > 1 && wide_any_below(exact_product, shift - 1);
+        const bool subnormal_inexact = guard || sticky;
+        const bool subnormal_increment = round_up(negative,
+            static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10),
+            retained, guard, sticky);
+        if (subnormal_increment) ++retained;
+        const auto fraction = retained << subnormal_discard;
+        const bool rounded_to_normal = (fraction & integer_bit) != 0;
+        const bool tiny = !rounded_to_normal;
+
+        result.status_word &= static_cast<std::uint16_t>(~fsw_c1);
+        result.precision = subnormal_inexact;
+        result.underflow = tiny && (subnormal_inexact ||
+            (request.control_word & fcw_underflow_mask) == 0);
+        if (subnormal_inexact) result.status_word |= fsw_precision;
+        if (subnormal_inexact && (negative != subnormal_increment)) result.status_word |= fsw_c1;
+        if (result.underflow) result.status_word |= fsw_underflow;
+
+        if (result.underflow && (request.control_word & fcw_underflow_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_underflow);
+            result.completed = false;
+            return result;
+        }
+        result.value = rounded_to_normal
+            ? X87Binary80{integer_bit, static_cast<std::uint16_t>(1 | (negative ? sign_mask : 0))}
+            : X87Binary80{fraction, static_cast<std::uint16_t>(negative ? sign_mask : 0)};
+        if (subnormal_inexact && (request.control_word & fcw_precision_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_precision);
+            result.completed = false;
+        }
+        return result;
+    }
     if (inexact) result.status_word |= fsw_precision;
     result.precision = inexact;
     result.value = X87Binary80{significand, static_cast<std::uint16_t>(exponent | (negative ? sign_mask : 0))};
