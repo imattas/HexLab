@@ -37,6 +37,7 @@ std::vector<std::uint8_t> inflate_zlib(std::span<const std::uint8_t> input,
             "Expanded DWARF section exceeds ELF metadata budget", ErrorCode::resource_limit);
     budget.include(expected_size);
     canceled(stop);
+    require(!input.empty(), "Malformed or truncated compressed DWARF zlib stream");
     std::vector<std::uint8_t> output(static_cast<std::size_t>(expected_size));
     std::uint8_t empty_output = 0;
     std::size_t input_offset = 0;
