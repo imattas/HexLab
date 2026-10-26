@@ -32,9 +32,12 @@ explicit PC edit and clear IT state. CPSR's other editable bits are NZCV.
 These paths require a native ARM32 debugger build and have only cross-target
 syntax validation so far.
 
-Windows ARM64 builds expose `x0`-`x30`, `sp`, `pc`, `cpsr`, `v0`-`v31`,
-`fpcr`, and `fpsr`; `x18` remains read-only because Windows reserves it as the
-thread environment pointer. The ARM64-specific branch remains conditional on
-an ARM64 build and still needs target-host validation. The backend does not
-claim a complete Windows XSAVE view: AVX-512/ZMM/opmask and WOW64 AVX remain
-unavailable.
+Windows ARM64 builds expose `x0`-`x30` and their `w0`-`w30` low-word aliases,
+`sp`/`wsp`, `pc`, `cpsr`, `fp`/`lr` aliases for `x29`/`x30`, `v0`-`v31`,
+`fpcr`, and `fpsr`. Writing a W register zero-extends into its X register;
+writing either FP/LR alias updates the matching X register. Writes that name
+the same underlying register through two aliases are rejected. `x18` and
+`w18` remain read-only because Windows reserves them as the thread environment
+pointer. The ARM64-specific branch remains conditional on an ARM64 build and
+still needs target-host validation. The backend does not claim a complete
+Windows XSAVE view: AVX-512/ZMM/opmask and WOW64 AVX remain unavailable.

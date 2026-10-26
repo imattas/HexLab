@@ -42,6 +42,8 @@ Reference payload version 12 can also retain up to 32 unique producer instructio
 
 Known absolute memory operands remain references even when their target is outside the current image mapping; this preserves useful external-data cross-references. PC-relative and register-derived accesses remain subject to mapped-range and permission checks. A source-backed unresolved Mach-O relocation takes precedence over sequence-level address propagation and remains an unresolved reference.
 
+Reference-index completeness follows the loader metadata used to resolve those edges. ELF indexes remain partial when relocation, dynamic-symbol, or RTTI metadata is incomplete; Mach-O indexes now remain partial when symbol, relocation, or dyld metadata is incomplete. A resolved subset can still be queried, but its index reports that absent rows may reflect unavailable source metadata.
+
 ## Acceptance obligations behind each row
 
 Each processor entry must eventually split into concrete execution modes, byte order, address/data units and instruction extensions. Required evidence includes literal decode fixtures, invalid/truncated cases, typed operands and modifiers, control-flow effects, register/memory effects, independent oracles and lifting equivalence. A family label alone cannot satisfy this obligation.

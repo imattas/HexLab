@@ -408,6 +408,11 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     std::vector<std::optional<Shape>> branch_shapes(labels.size()),end_shapes(labels.size());
     std::vector<std::optional<std::size_t>> label_heights(labels.size());
     std::vector<std::vector<std::size_t>> predecessors(starts.size());
+    // A Wasm branch may discard temporaries while preserving the target
+    // label's result operands. Remember which source stack slots feed each
+    // target slot so the ordinary common-IR phi machinery can express that
+    // edge-specific stack projection.
+    std::vector<std::map<std::size_t, std::vector<std::size_t>>> incoming_slot_sources(starts.size());
     std::vector<std::size_t> work{0};std::vector<bool> queued(starts.size());queued[0]=true;entries[0]=Shape{};
     const auto shape_pop=[&](Shape &stack,ValueType expected)->Result<ValueType>{if(stack.empty())return unsupported("operand stack underflow");auto actual=stack.back();stack.pop_back();if(expected.kind!=TypeKind::unknown&&actual!=expected)return unsupported("operand stack type mismatch");return actual;};
     const auto signature_results = [&]() -> Result<std::vector<ValueType>> {
@@ -553,7 +558,23 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         exits[bi]=stack;
         for(const auto &edge:successors[bi]){
             Shape edge_shape=stack;
-            if(edge.label){const auto li=*edge.label;if(!branch_shapes[li]||!label_heights[li])return unsupported("branch reaches a label before its stack shape is known");const auto &types=labels[li].kind==3?labels[li].parameters:labels[li].result_types;if(!matching_suffix(edge_shape,types)||edge_shape.size()<*label_heights[li]+types.size())return unsupported("branch values do not match target label types");edge_shape.resize(*label_heights[li]);edge_shape.insert(edge_shape.end(),types.begin(),types.end());if(*branch_shapes[li]!=edge_shape)return unsupported("branch stack prefix disagrees at its target");if(edge_shape!=stack)return unsupported("branch stack trimming is not representable on this CFG edge");}
+            std::vector<std::size_t> source_slots(stack.size());
+            for (std::size_t slot = 0; slot < source_slots.size(); ++slot) source_slots[slot] = slot;
+            if(edge.label){const auto li=*edge.label;if(!branch_shapes[li]||!label_heights[li])return unsupported("branch reaches a label before its stack shape is known");const auto &types=labels[li].kind==3?labels[li].parameters:labels[li].result_types;if(!matching_suffix(edge_shape,types)||edge_shape.size()<*label_heights[li]+types.size())return unsupported("branch values do not match target label types");
+                const auto value_base = edge_shape.size() - types.size();
+                edge_shape.resize(*label_heights[li]);
+                source_slots.resize(*label_heights[li]);
+                edge_shape.insert(edge_shape.end(), types.begin(), types.end());
+                for (std::size_t value = 0; value < types.size(); ++value)
+                    source_slots.push_back(value_base + value);
+                if(*branch_shapes[li]!=edge_shape)return unsupported("branch stack prefix disagrees at its target");
+            }
+            if (source_slots.size() != edge_shape.size())
+                return Error{ErrorCode::malformed, "WebAssembly edge stack projection has an inconsistent height"};
+            auto &maps = incoming_slot_sources[edge.target];
+            const auto [map_it, inserted] = maps.emplace(bi, source_slots);
+            if (!inserted && map_it->second != source_slots)
+                return unsupported("multiple edges from one block require different stack projections at a join");
             auto &inputs=predecessors[edge.target];if(std::find(inputs.begin(),inputs.end(),bi)==inputs.end())inputs.push_back(bi);
             if(!entries[edge.target]){entries[edge.target]=edge_shape;if(!queued[edge.target]){work.push_back(edge.target);queued[edge.target]=true;}}
             else if(*entries[edge.target]!=edge_shape)return unsupported("operand stack shapes disagree at a control-flow join");
@@ -581,9 +602,9 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             else if(op==0x11) lifted.trap_edges.push_back({code[n]->instruction.address,TrapEdgeKind::may_trap,"call_indirect table bounds or type mismatch"});
             if(op==0x00)break;
         }
-        for(std::size_t slot=0;slot<phi_versions[bi].size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};LiftedBlock::Phi phi{reg,phi_versions[bi][slot],{}};for(const auto pred:predecessors[bi]){if(slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor has no stack value for join"};phi.inputs.push_back({BlockId{static_cast<std::uint64_t>(pred+1)},output_versions[pred][slot]});}lifted.phis.push_back(std::move(phi));}
+        for(std::size_t slot=0;slot<phi_versions[bi].size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};LiftedBlock::Phi phi{reg,phi_versions[bi][slot],{}};for(const auto pred:predecessors[bi]){const auto projection=incoming_slot_sources[bi].find(pred);if(projection==incoming_slot_sources[bi].end()||slot>=projection->second.size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack projection is unavailable"};const auto source_slot=projection->second[slot];if(source_slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor has no stack value for join"};phi.inputs.push_back({BlockId{static_cast<std::uint64_t>(pred+1)},output_versions[pred][source_slot]});}lifted.phis.push_back(std::move(phi));}
         Stack stack;
-        if(!predecessors[bi].empty())for(std::size_t slot=0;slot<entries[bi]->size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};if(predecessors[bi].size()>1)stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,phi_versions[bi][slot]}}));else{const auto pred=predecessors[bi].front();if(slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack value is unavailable"};stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,output_versions[pred][slot]}}));}}
+        if(!predecessors[bi].empty())for(std::size_t slot=0;slot<entries[bi]->size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};if(predecessors[bi].size()>1)stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,phi_versions[bi][slot]}}));else{const auto pred=predecessors[bi].front();const auto projection=incoming_slot_sources[bi].find(pred);if(projection==incoming_slot_sources[bi].end()||slot>=projection->second.size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack projection is unavailable"};const auto source_slot=projection->second[slot];if(source_slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack value is unavailable"};stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,output_versions[pred][source_slot]}}));}}
         auto pop=[&](ValueType expected)->Result<ExpressionPtr>{if(stack.empty())return unsupported("operand stack underflow");auto v=stack.back();stack.pop_back();if(expected.kind!=TypeKind::unknown&&v->type!=expected)return unsupported("operand stack type mismatch");return v;};
         auto emit=[&](std::size_t n,Statement statement){const auto *fact=code[n];lifted.instructions.push_back({{fact->instruction.address,fact->id},std::move(statement)});};
         const auto take_results = [&](const std::vector<ValueType> &types) -> Result<std::vector<ExpressionPtr>> {

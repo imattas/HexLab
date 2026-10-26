@@ -8,7 +8,7 @@
     {"name": "linux-gcc-headless-release", "generator": "Ninja", "binaryDir": "${sourceDir}/out/build/linux-gcc-headless-release", "cacheVariables": {"CMAKE_C_COMPILER": "gcc", "CMAKE_CXX_COMPILER": "g++", "CMAKE_BUILD_TYPE": "Release", "HEXLAB_BUILD_DESKTOP": "OFF", "BUILD_TESTING": "ON", "HEXLAB_ENABLE_PINNED_LLVM_ORACLES": "OFF"}},
     {"name": "macos-headless", "generator": "Ninja", "binaryDir": "${sourceDir}/out/build/macos-headless", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug", "HEXLAB_BUILD_DESKTOP": "OFF", "BUILD_TESTING": "ON", "HEXLAB_ENABLE_PINNED_LLVM_ORACLES": "OFF"}},
     {"name": "linux-desktop", "generator": "Ninja", "binaryDir": "${sourceDir}/out/build/linux-desktop", "cacheVariables": {"CMAKE_C_COMPILER": "clang", "CMAKE_CXX_COMPILER": "clang++", "CMAKE_BUILD_TYPE": "Release", "HEXLAB_BUILD_DESKTOP": "ON", "BUILD_TESTING": "OFF", "HEXLAB_ENABLE_PINNED_LLVM_ORACLES": "OFF"}},
-    {"name": "macos-desktop", "generator": "Ninja", "binaryDir": "${sourceDir}/out/build/macos-desktop", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "HEXLAB_BUILD_DESKTOP": "ON", "BUILD_TESTING": "OFF", "HEXLAB_ENABLE_PINNED_LLVM_ORACLES": "OFF"}}
+    {"name": "macos-desktop", "generator": "Ninja", "binaryDir": "${sourceDir}/out/build/macos-desktop", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "CMAKE_OSX_ARCHITECTURES": "arm64;x86_64", "HEXLAB_BUILD_DESKTOP": "ON", "BUILD_TESTING": "OFF", "HEXLAB_ENABLE_PINNED_LLVM_ORACLES": "OFF"}}
   ],
   "buildPresets": [
     {"name": "windows-headless", "configurePreset": "windows-headless", "configuration": "Debug"},
