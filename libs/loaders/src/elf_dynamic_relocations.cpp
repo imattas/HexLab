@@ -384,6 +384,8 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                                       relocation.kind == ElfRelocationKind::jump_slot);
             const bool symbol_with_addend = riscv64 && relocation.type == symbol_addend_type &&
                                             relocation.kind == ElfRelocationKind::absolute;
+            const bool aarch64_abs64 = metadata.header.machine == 183 && relocation.type == 257 &&
+                                       relocation.kind == ElfRelocationKind::absolute;
             const bool i386_absolute = i386 && relocation.type == 1 &&
                                        relocation.kind == ElfRelocationKind::absolute;
             const bool i386_pc_relative = i386 && relocation.type == 2 &&
@@ -393,14 +395,14 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             const bool x64_32 = x64 && relocation.type == 10 && relocation.kind == ElfRelocationKind::absolute;
             const bool x64_32s = x64 && relocation.type == 11 && relocation.kind == ElfRelocationKind::absolute;
             if (!relative && !symbol_slot && !symbol_with_addend && !i386_absolute && !i386_pc_relative &&
-                !x64_64 && !x64_pc32 && !x64_32 && !x64_32s) {
+                !x64_64 && !x64_pc32 && !x64_32 && !x64_32s && !aarch64_abs64) {
                 skip(index, i386
                     ? "Supported dynamic types are R_386_32, R_386_PC32, R_386_RELATIVE, R_386_GLOB_DAT, and R_386_JMP_SLOT"
                     : x64
                     ? "Supported dynamic types are R_X86_64_64, PC32, 32, 32S, RELATIVE, GLOB_DAT, and JUMP_SLOT"
                     : riscv64
                         ? "Supported dynamic types are R_RISCV_RELATIVE, R_RISCV_64, and R_RISCV_JUMP_SLOT"
-                        : "Supported dynamic types are R_AARCH64_RELATIVE, GLOB_DAT, and JUMP_SLOT");
+                        : "Supported dynamic types are R_AARCH64_ABS64, RELATIVE, GLOB_DAT, and JUMP_SLOT");
                 continue;
             }
             if (i386 && relocation.explicit_addend) {
@@ -515,11 +517,12 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     // the specified low 32 bits, including negative addends.
                     value = static_cast<std::uint32_t>(
                         static_cast<std::uint32_t>(value) + addend - static_cast<std::uint32_t>(place));
-                } else if (symbol_with_addend) {
+                } else if (symbol_with_addend || aarch64_abs64) {
                     if (!relocation.addend) {
-                        skip(index, relocation.explicit_addend
-                                        ? "R_RISCV_64 relocation addend is unavailable"
-                                        : "R_RISCV_64 implicit addend is unavailable");
+                        const auto relocation_name = aarch64_abs64 ? "R_AARCH64_ABS64" : "R_RISCV_64";
+                        skip(index, std::string(relocation_name) +
+                                        (relocation.explicit_addend ? " relocation addend is unavailable"
+                                                                    : " implicit addend is unavailable"));
                         continue;
                     }
                     value += static_cast<std::uint64_t>(*relocation.addend);
@@ -590,7 +593,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 continue;
             }
             if (!packed_relative && metadata.header.machine == 183 && (relocation.place->offset & 7) != 0) {
-                skip(index, "R_AARCH64_RELATIVE target is not 8-byte aligned");
+                skip(index, "AArch64 dynamic relocation target is not 8-byte aligned");
                 continue;
             }
             const auto *segment = source.image->segment_at(*relocation.place);
