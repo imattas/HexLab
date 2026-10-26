@@ -239,6 +239,32 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
         unsupported("VEX opcode map is outside the enabled AVX subset");
     const auto vector_width = static_cast<std::uint16_t>(l ? 256 : 128);
     const auto bank = l ? RegisterBank::ymm : RegisterBank::xmm;
+    if (map == 2 && opcode >= 0x1c && opcode <= 0x1e) {
+        if (pp != 1)
+            invalid("VPABS requires VEX.pp=66");
+        if (vvvv != 0)
+            invalid("VPABS requires the reserved VEX.vvvv encoding");
+        const auto decoded = modrm(state, vector_width, vector_width);
+        auto destination = decoded.reg;
+        destination.bank = bank;
+        destination.width = vector_width;
+        Operand source = decoded.rm;
+        if (auto *reg = std::get_if<RegisterOperand>(&source)) {
+            reg->bank = bank;
+            reg->width = vector_width;
+        } else if (auto *memory = std::get_if<MemoryOperand>(&source)) {
+            memory->data_width = vector_width;
+        }
+        if (!l)
+            state.i.register_writes.push_back({RegisterBank::ymm, destination.index, 256, false});
+        state.i.opcode = opcode == 0x1c ? Opcode::vpabsb :
+                         opcode == 0x1d ? Opcode::vpabsw : Opcode::vpabsd;
+        state.i.vector_bits = vector_width;
+        state.i.vector_element_bits = opcode == 0x1c ? 8 : opcode == 0x1d ? 16 : 32;
+        state.operand(destination, OperandAccess::write);
+        state.operand(std::move(source), OperandAccess::read);
+        return true;
+    }
     if (map == 1 && (opcode == 0x71 || opcode == 0x72 || opcode == 0x73)) {
         if (pp != 1)
             invalid("AVX2 immediate packed shifts require VEX.pp=66");

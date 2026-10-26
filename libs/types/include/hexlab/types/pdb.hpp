@@ -29,7 +29,7 @@ struct PdbDatabase {
     std::map<std::string, std::uint32_t> named_streams;
 };
 
-enum class CodeViewTypeKind : std::uint8_t { primitive, pointer, array, structure, class_type, union_type, enumeration, field_list, typedef_type, modifier, bitfield, type_server, unsupported, procedure, argument_list, method_list, member_function, vftable_shape, vftable };
+enum class CodeViewTypeKind : std::uint8_t { primitive, pointer, array, structure, class_type, union_type, enumeration, field_list, typedef_type, modifier, bitfield, type_server, unsupported, procedure, argument_list, method_list, member_function, vftable_shape, vftable, vector };
 struct CodeViewField { std::uint16_t leaf = 0; std::uint32_t type = 0; std::uint16_t attributes = 0; std::uint64_t offset = 0; std::string name; std::uint64_t value = 0; std::uint32_t auxiliary_type = 0; };
 struct CodeViewTypeRecord {
     std::uint32_t index = 0;
@@ -43,6 +43,7 @@ struct CodeViewTypeRecord {
     std::uint32_t vtable_shape = 0;
     std::uint32_t underlying_type = 0;
     std::uint64_t size = 0; // Aggregate/array extent or LF_POINTER byte size.
+    std::uint32_t element_count = 0; // LF_VECTOR lane count.
     std::uint8_t pointer_kind = 0; // CodeView CV_ptrtype_e value.
     std::uint8_t pointer_mode = 0; // CodeView CV_ptrmode_e value.
     std::uint32_t pointer_options = 0; // CodeView pointer modifiers and flags.
@@ -98,7 +99,7 @@ struct PdbIdStream {
     std::vector<CodeViewIdRecord> records;
 };
 
-enum class PdbTypeReferenceKind : std::uint8_t { pointee, array_element, array_index, member, enum_underlying, typedef_target, qualifier_base, field_list, field_list_continuation, bitfield_underlying, nested_type, base_class, virtual_base_class, virtual_base_pointer_type, function_result, function_argument_list, argument_type, method_type, method_list, member_function_class, member_function_this, class_vtable_shape, vftable_complete_class, vftable_overridden_table, class_derivation_list, vftable_pointer_type, friend_class, friend_function };
+enum class PdbTypeReferenceKind : std::uint8_t { pointee, array_element, array_index, member, enum_underlying, typedef_target, qualifier_base, field_list, field_list_continuation, bitfield_underlying, nested_type, base_class, virtual_base_class, virtual_base_pointer_type, function_result, function_argument_list, argument_type, method_type, method_list, member_function_class, member_function_this, class_vtable_shape, vftable_complete_class, vftable_overridden_table, class_derivation_list, vftable_pointer_type, friend_class, friend_function, vector_element };
 struct PdbTypeReference {
     std::uint32_t source_index = 0, target_index = 0;
     PdbTypeReferenceKind kind = PdbTypeReferenceKind::member;

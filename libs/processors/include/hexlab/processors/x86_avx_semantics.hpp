@@ -201,6 +201,15 @@ inline unsigned lane_width(Opcode opcode) noexcept {
     }
 }
 
+inline std::optional<unsigned> absolute_lane_width(Opcode opcode) noexcept {
+    switch (opcode) {
+    case Opcode::vpabsb: return 8;
+    case Opcode::vpabsw: return 16;
+    case Opcode::vpabsd: return 32;
+    default: return std::nullopt;
+    }
+}
+
 inline bool is_xmm_or_ymm(const Operand &operand, unsigned bits) noexcept {
     const auto *reg = std::get_if<RegisterOperand>(&operand);
     return reg && reg->width == bits && reg->index < 16 && !reg->high_byte &&
@@ -227,6 +236,18 @@ inline std::int64_t signed_lane(std::uint64_t value, unsigned width) noexcept {
     const auto sign = UINT64_C(1) << (width - 1);
     if (!(value & sign)) return static_cast<std::int64_t>(value);
     return static_cast<std::int64_t>(value) - static_cast<std::int64_t>(UINT64_C(1) << width);
+}
+template <std::size_t Size>
+inline void evaluate_absolute_lanes(unsigned lane_bits,
+    const std::array<std::byte, Size> &source, std::array<std::byte, Size> &output,
+    unsigned bytes) noexcept {
+    const auto mask = (UINT64_C(1) << lane_bits) - 1;
+    for (unsigned offset = 0; offset < bytes; offset += lane_bits / 8) {
+        const auto raw = load_lane(source, offset, lane_bits);
+        const auto signed_value = signed_lane(raw, lane_bits);
+        const auto absolute = signed_value < 0 ? (UINT64_C(0) - raw) & mask : raw;
+        store_lane(output, offset, lane_bits, absolute);
+    }
 }
 inline bool is_equal_compare(Opcode opcode) noexcept {
     return opcode == Opcode::vpcmpeqb || opcode == Opcode::vpcmpeqw ||
@@ -489,8 +510,9 @@ inline bool evaluate_integer_lanes(Opcode opcode, unsigned lane_bits,
 } // namespace x86_avx_detail
 
 // Evaluates the subset with fully specified integer/bitwise lane semantics.
-// For arithmetic, source1 is operand 1 (VEX.vvvv) and source2 is operand 2
-// (ModRM.r/m); for VMOVUPS, source1 contains the loaded/stored vector. Memory
+// For binary arithmetic, source1 is operand 1 (VEX.vvvv) and source2 is
+// operand 2 (ModRM.r/m); for unary VPABS, source1 contains its sole ModRM.r/m
+// vector source. For VMOVUPS, source1 contains the loaded/stored vector. Memory
 // reads and writes are caller-owned. Floating-point add/subtract/multiply are
 // deliberately not evaluated because MXCSR rounding, denormals, and exception
 // state are not inputs to this helper.
@@ -506,8 +528,10 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
 
     const bool move = instruction.opcode == Opcode::vmovups;
     const auto immediate_shift = immediate_shift_shape(instruction.opcode);
-    if (!move && !immediate_shift && !is_avx_integer_bitwise_or_compare(instruction.opcode)) return std::nullopt;
-    if (!move && instruction.operands.size() != 3) return std::nullopt;
+    const auto absolute = absolute_lane_width(instruction.opcode);
+    if (!move && !immediate_shift && !absolute && !is_avx_integer_bitwise_or_compare(instruction.opcode))
+        return std::nullopt;
+    if (!move && !absolute && instruction.operands.size() != 3) return std::nullopt;
     if (move && instruction.operands.size() != 2) return std::nullopt;
 
     const bool store = move && std::holds_alternative<MemoryOperand>(instruction.operands[0]);
@@ -529,6 +553,23 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
         } else if (!is_xmm_or_ymm(other, bits)) {
             return std::nullopt;
         }
+    } else if (absolute) {
+        if (instruction.operands.size() != 2) return std::nullopt;
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto &source = instruction.operands[1];
+        if (!destination || (destination->bank != RegisterBank::xmm && destination->bank != RegisterBank::ymm))
+            return std::nullopt;
+        bits = destination->width;
+        if ((bits != 128 && bits != 256) || !is_xmm_or_ymm(instruction.operands[0], bits) ||
+            (instruction.vector_bits && instruction.vector_bits != bits) ||
+            (instruction.vector_element_bits && instruction.vector_element_bits != *absolute))
+            return std::nullopt;
+        if (const auto *memory = std::get_if<MemoryOperand>(&source)) {
+            if (memory->data_width != bits) return std::nullopt;
+        } else if (!is_xmm_or_ymm(source, bits)) {
+            return std::nullopt;
+        }
+        register_destination = destination->index;
     } else if (immediate_shift) {
         const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
         if (!destination || (destination->bank != RegisterBank::xmm && destination->bank != RegisterBank::ymm))
@@ -588,6 +629,11 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
         if (!count) return std::nullopt;
         evaluate_immediate_shift(instruction.opcode, source1, static_cast<std::uint8_t>(count->value),
                                  result.bytes, bytes);
+        return result;
+    }
+
+    if (absolute) {
+        evaluate_absolute_lanes(*absolute, source1, result.bytes, bytes);
         return result;
     }
 

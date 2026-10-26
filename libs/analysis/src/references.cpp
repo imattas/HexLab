@@ -3096,7 +3096,7 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                 if (const auto *reg = std::get_if<RegisterOperand>(&operand))
                     return arm_register_value(*reg);
                 const auto *shifted = std::get_if<ArmShiftedRegisterOperand>(&operand);
-                if (!shifted || shifted->shift == ArmShift::rrx)
+                if (!shifted)
                     return {};
                 auto value = arm_register_value(shifted->source);
                 if (!value)
