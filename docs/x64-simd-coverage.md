@@ -159,9 +159,10 @@ old-destination dependency for merge mode, and mask-register input in a typed
 intrinsic. The additional integer forms below have their own explicit opcode
 selection and shape metadata; they are not inferred from neighboring opcodes.
 
-The EVEX.512 integer subset additionally covers the following 30 forms in
-64-bit mode. Every form requires `pp=66`, a ZMM first source, and a ZMM or
-512-bit memory second source. The table's map 1 means `0F`; map 2 means `0F38`.
+The EVEX integer subset covers the following forms in 64-bit mode at
+EVEX.128/.256/.512 widths. Every form requires `pp=66`, a vector first source,
+and a same-width vector or memory second source. The table's map 1 means `0F`;
+map 2 means `0F38`.
 `WIG` accepts either W bit, while W0/W1 are checked explicitly.
 
 | Family | Forms | Map / opcode / W | Destination mask element |
@@ -185,8 +186,9 @@ The dword min/max, low-dword multiply and even-dword product forms belong to
 AVX-512F; the byte/word forms in this extension require AVX-512BW. Decoding does
 not query the host CPU or certify runtime feature availability.
 
-All of these forms retain ZMM0-ZMM31 operands, 512-bit memory widths, address
-base/index reads, and the full-vector compressed disp8 scale of 64. EVEX P0.R
+All of these forms retain width-matched XMM/YMM/ZMM0-ZMM31 operands and
+128/256/512-bit memory widths, address base/index reads, and full-vector
+compressed disp8 scales of 16/32/64 bytes. EVEX P0.R
 extends ModRM.reg by 8 and P0.R' extends it by 16, preserving the distinct
 ZMM8-15 and ZMM16-23 destination ranges. The reserved encoded all-ones
 vvvv/V' fields on EVEX `vmovups` are checked as decoded inverted value zero.
@@ -207,11 +209,12 @@ bytes, saturates each adjacent pair sum into a signed word, and uses mask bits
 0-31. Mask bits beyond the output element count are ignored. The old
 destination is preserved or zeroed at that same output element width.
 
-`evaluate_x86_evex_integer` evaluates all 38 explicitly decoded integer forms,
+`evaluate_x86_evex_integer` evaluates all explicitly decoded integer forms,
 including the original wrapping add/sub subset. It accepts caller-supplied
-64-byte source vectors, an optional old destination, and a runtime mask.
+64-byte source vectors, an optional old destination, and a runtime mask; VL
+forms evaluate only their active 16 or 32 bytes and clear the higher bytes.
 Masked merge requires old-destination bytes; zero masking does not. The helper
-validates ZMM indices/widths, source-memory width, mask identity, and the result
+validates width-matched XMM/YMM/ZMM indices and widths, source-memory width, mask identity, and the result
 shape before evaluating. Saturating results clamp to the appropriate signed or
 unsigned range, averages round up, low products wrap to their result width,
 and high-word products retain the specified signedness. Signed word
@@ -226,12 +229,13 @@ destination, and mask input. For example, a masked mixed-byte multiply-add has
 a name ending in `u8x64_i8x64_to_i16x32_evex512_k3_merge`. These remain typed
 opaque operations in common IR; pure helper evaluation is not optimizer
 constant folding. A memory source is conservatively recorded as a possible
-512-bit read. Neither helper nor IR executes memory access/fault suppression,
+128-, 256-, or 512-bit read according to EVEX.LL. Neither helper nor IR executes memory access/fault suppression,
 alignment faults, or CPU feature checks.
 
-Broadcast, embedded rounding, EVEX.128/.256, qword min/max selected by W1,
-low-qword multiply, EVEX integer comparison-to-mask destinations, and all
-unlisted maps/prefix/opcode forms remain explicitly unsupported. A wrong W
+Broadcast, embedded rounding, qword min/max selected by W1, low-qword
+multiply, EVEX compare-to-mask destinations, and all unlisted maps/prefix/opcode
+forms remain explicitly unsupported. EVEX VL vector register indices 16-31
+are retained in decoding and formatting. A wrong W
 selector cannot silently become a dword operation. Existing reserved prefix
 and zeroing-with-K0 checks remain in force. The EVEX whitelist deliberately
 does not infer support from an operation's VEX opcode identity.
@@ -276,8 +280,7 @@ This expansion has source-review evidence only; no builds or tests were run
 for it. A serial processor/decompiler build and focused SIMD checks remain
 required before treating it as verified coverage.
 
-EVEX.128/.256 forms, other EVEX opcodes,
-and exact floating-point execution remain unsupported. MMX, most AVX/VEX forms,
+Other EVEX opcodes and exact floating-point execution remain unsupported. MMX, most AVX/VEX forms,
 packed floating-point execution, remaining packed integer forms
 (including packed shifts in VEX forms, absolute value, rounded high-word
 multiply, immediate shuffles/blends, cross-128-bit permutations, and unsigned comparisons),

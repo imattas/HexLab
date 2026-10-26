@@ -495,8 +495,8 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
                unsigned vector_bits, unsigned mask, bool zeroing, bool reg_high, bool rm_high, bool broadcast) {
     if (map != 1 && map != 2)
         unsupported("EVEX opcode map is outside the enabled AVX-512 subset");
-    if (vector_bits != 512)
-        unsupported("Only EVEX.512 vector forms are covered");
+    if (vector_bits != 128 && vector_bits != 256 && vector_bits != 512)
+        unsupported("EVEX vector length is outside the modeled 128/256/512-bit forms");
     if (broadcast)
         unsupported("EVEX broadcast and embedded-rounding forms are not covered");
     if (zeroing && mask == 0)
@@ -582,10 +582,13 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
             invalid("EVEX packed floating arithmetic has an unsupported pp/W combination");
     }
 
-    auto decoded = modrm(state, 512, 512);
-    auto vector_register = [](RegisterOperand reg) {
-        reg.bank = RegisterBank::zmm;
-        reg.width = 512;
+    auto decoded = modrm(state, static_cast<std::uint16_t>(vector_bits), static_cast<std::uint16_t>(vector_bits));
+    const auto vector_bank = vector_bits == 128 ? RegisterBank::xmm :
+                             vector_bits == 256 ? RegisterBank::ymm : RegisterBank::zmm;
+    auto vector_register = [&](RegisterOperand reg) {
+        reg.bank = vector_bits == 128 ? RegisterBank::xmm :
+                   vector_bits == 256 ? RegisterBank::ymm : RegisterBank::zmm;
+        reg.width = static_cast<std::uint16_t>(vector_bits);
         reg.high_byte = false;
         return reg;
     };
@@ -598,15 +601,22 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
         if (rm_high)
             reg->index = static_cast<std::uint8_t>(reg->index + 16);
     } else if (auto *memory = std::get_if<MemoryOperand>(&rm)) {
-        memory->data_width = 512;
+        memory->data_width = static_cast<std::uint16_t>(vector_bits);
         // All currently accepted EVEX forms use a full-width, non-broadcast
-        // tuple; compressed disp8 therefore scales by the 64-byte vector size.
+        // tuple; compressed disp8 therefore scales by the vector size.
         if (memory->displacement_encoding && memory->displacement_encoding->size == 1)
-            memory->displacement *= 64;
+            memory->displacement *= static_cast<std::int64_t>(vector_bits / 8);
     }
 
     state.i.opcode = operation;
-    state.i.vector_bits = 512;
+    state.i.x86_evex = true;
+    state.i.vector_bits = static_cast<std::uint16_t>(vector_bits);
+    auto add_upper_zero_writes = [&](RegisterOperand reg) {
+        if (vector_bits == 128)
+            state.i.register_writes.push_back({RegisterBank::ymm, reg.index, 256, false});
+        if (vector_bits < 512)
+            state.i.register_writes.push_back({RegisterBank::zmm, reg.index, 512, false});
+    };
     if (mask) {
         state.i.x86_opmask = static_cast<std::uint8_t>(mask);
         state.i.x86_opmask_zeroing = zeroing;
@@ -615,13 +625,15 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
 
     if (move_load) {
         state.operand(destination, mask && !zeroing ? OperandAccess::read_write : OperandAccess::write);
+        add_upper_zero_writes(destination);
         state.operand(std::move(rm), OperandAccess::read);
         return true;
     }
     if (move_store) {
-        if (auto *reg = std::get_if<RegisterOperand>(&rm))
+        if (auto *reg = std::get_if<RegisterOperand>(&rm)) {
             state.operand(*reg, mask ? OperandAccess::read_write : OperandAccess::write);
-        else
+            add_upper_zero_writes(*reg);
+        } else
             state.operand(std::move(rm), OperandAccess::write);
         state.operand(destination, OperandAccess::read);
         return true;
@@ -630,7 +642,8 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
     if (integer_shape) {
         state.i.vector_element_bits = integer_shape->result_bits;
         state.operand(destination, mask && !zeroing ? OperandAccess::read_write : OperandAccess::write);
-        state.operand(RegisterOperand{RegisterBank::zmm, static_cast<std::uint8_t>(vvvv), 512, false},
+        add_upper_zero_writes(destination);
+        state.operand(RegisterOperand{vector_bank, static_cast<std::uint8_t>(vvvv), static_cast<std::uint16_t>(vector_bits), false},
                       OperandAccess::read);
         state.operand(std::move(rm), OperandAccess::read);
         return true;
@@ -642,7 +655,8 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
     state.i.register_reads.push_back(mxcsr);
     state.i.register_writes.push_back(mxcsr);
     state.operand(destination, mask && !zeroing ? OperandAccess::read_write : OperandAccess::write);
-    state.operand(RegisterOperand{RegisterBank::zmm, static_cast<std::uint8_t>(vvvv), 512, false},
+    add_upper_zero_writes(destination);
+    state.operand(RegisterOperand{vector_bank, static_cast<std::uint8_t>(vvvv), static_cast<std::uint16_t>(vector_bits), false},
                   OperandAccess::read);
     state.operand(std::move(rm), OperandAccess::read);
     return true;

@@ -71,9 +71,9 @@ std::string register_name(const RegisterOperand &r) {
     if (r.bank == RegisterBank::x87_control) return r.index == 0 && r.width == 16 ? "fcw" : "?x87-control";
     if (r.bank == RegisterBank::x87_tag) return r.index == 0 && r.width == 16 ? "ftw" : "?x87-tag";
     if (r.bank == RegisterBank::xmm)
-        return r.width == 128 && r.index < 16 ? "xmm" + std::to_string(r.index) : "?xmm-register";
+        return r.width == 128 && r.index < 32 ? "xmm" + std::to_string(r.index) : "?xmm-register";
     if (r.bank == RegisterBank::ymm)
-        return r.width == 256 && r.index < 16 ? "ymm" + std::to_string(r.index) : "?ymm-register";
+        return r.width == 256 && r.index < 32 ? "ymm" + std::to_string(r.index) : "?ymm-register";
     if (r.bank == RegisterBank::zmm)
         return r.width == 512 && r.index < 32 ? "zmm" + std::to_string(r.index) : "?zmm-register";
     if (r.bank == RegisterBank::opmask)

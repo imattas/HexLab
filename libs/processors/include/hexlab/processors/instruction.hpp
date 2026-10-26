@@ -537,6 +537,7 @@ struct Instruction {
     // EVEX writemask decorator. K0 means unmasked and is represented by an
     // empty optional; a present index is 1..7. Zeroing applies only to the
     // destination's inactive vector elements.
+    bool x86_evex = false;
     std::optional<std::uint8_t> x86_opmask;
     bool x86_opmask_zeroing = false;
     bool memory_read = false, memory_write = false;

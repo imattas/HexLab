@@ -139,7 +139,7 @@ bool same_scalar_instruction(const Instruction &a,const Instruction &b){
        a.flow!=b.flow||a.condition!=b.condition||a.delay_slots!=b.delay_slots||a.direct_target!=b.direct_target||
        a.memory_read!=b.memory_read||a.memory_write!=b.memory_write||!a.extended_bytes.empty()||
        a.dex_switch||a.jvm_switch||a.x86_condition||a.x86_loop_condition||a.x86_loop_counter_width||
-       a.x86_repeat!=X86RepeatPrefix::none||a.x86_opmask||a.x86_opmask_zeroing||a.stack_value_width||
+       a.x86_repeat!=X86RepeatPrefix::none||a.x86_evex||a.x86_opmask||a.x86_opmask_zeroing||a.stack_value_width||
        a.stack_slot_count||a.x87_stack_delta||a.lock_prefix||a.arm||a.atomic_aq||a.atomic_rl||a.csr_read||a.csr_write||
        a.rounding_mode||a.writes_fflags||a.riscv_vector_masked||a.vector_bits||a.vector_element_bits)return false;
     for(std::size_t i=0;i<a.operands.size();++i){
