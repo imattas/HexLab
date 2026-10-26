@@ -208,9 +208,11 @@ void read_chained(const Reader &reader, const Image &image, MachOMetadata &metad
     std::vector<std::uint8_t> decompressed_symbols;
     std::span<const std::uint8_t> symbols;
     if (header.symbols_format == 0) {
+        extent(bytes, header.symbols_offset, 0);
         symbols = {reinterpret_cast<const std::uint8_t *>(bytes.data() + header.symbols_offset),
                    bytes.size() - header.symbols_offset};
     } else if (header.symbols_format == 1) {
+        extent(bytes, header.symbols_offset, 0);
         const auto compressed = bytes.subspan(header.symbols_offset);
         decompressed_symbols = inflate_symbol_pool(compressed, budget, stop);
         symbols = decompressed_symbols;
