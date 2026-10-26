@@ -19,6 +19,15 @@ does not consume recursive C++ stack frames. This recognizer accepts at most
 4,096 blocks and 1,024 nodes on any root-to-leaf path; larger or deeper trees
 retain the fallback.
 
+Ghidra's native C++ decompiler is a useful architectural reference for this
+stage. Its `blockaction.cc` tracks loop heads, tails, and loop containment, then
+uses branch-path tracing and explicit goto edges when a graph cannot be
+collapsed into structured regions. HexLab follows the same decomposition
+principle while validating the exact CFG predecessors and SSA phi inputs needed
+by each emitted region. The implementation is independent; this is a behavioral
+reference, not copied source. See
+[Ghidra's native block structuring implementation](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/blockaction.cc).
+
 Whenever a structured edge carries more than one register-phi value, the
 formatter captures every incoming source in a temporary before assigning any
 destination. This preserves simultaneous SSA updates, including swaps, in

@@ -29,7 +29,9 @@ and this task's SDD artifacts. The design is
    preserving the linear child-body order and join execution.
 - [x] Document the supported shape and fallback limits; record source review and
    compile requirement in the task report.
-- [ ] Root compiles `hexlab_decompiler` Debug and performs integration review.
+- [x] Root compiled `hexlab_decompiler` Debug and reviewed integration. The
+  integrated Windows Debug target completed successfully; no tests were added
+  or run and `out/` was not touched.
 
 ## Review focus
 
