@@ -132,7 +132,8 @@ X87StackState transfer_x87_stack_state(const X87StackState &input, const Instruc
     }
     const bool writes_tag = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
         [](RegisterOperand reg) { return reg.bank == RegisterBank::x87_tag; });
-    if (writes_tag && !instruction.x87_stack_delta) result.tags.fill(std::nullopt);
+    const bool frees_tag = name == "ffree" || name == "ffreep";
+    if (writes_tag && !instruction.x87_stack_delta && !frees_tag) result.tags.fill(std::nullopt);
     // Explicit ST destinations can change a value's tag class. Invalidate
     // those physical tags before applying any implicit push/pop transition.
     if (result.top) {
@@ -141,7 +142,9 @@ X87StackState transfer_x87_stack_state(const X87StackState &input, const Instruc
             if (instruction.access[i] == OperandAccess::read) continue;
             const auto *reg = std::get_if<RegisterOperand>(&instruction.operands[i]);
             if (!reg || reg->bank != RegisterBank::x87 || reg->index >= 8) continue;
-            result.tags[(*result.top + reg->index) & 7].reset();
+            auto &tag = result.tags[(*result.top + reg->index) & 7];
+            if (frees_tag) tag = X87Tag::empty;
+            else tag.reset();
         }
     }
     if (instruction.x87_stack_delta > 0) {
