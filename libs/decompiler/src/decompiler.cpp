@@ -6332,8 +6332,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         return edge.condition == "true" && edge.true_target == std::optional<Address>{target} && !edge.false_target;
     };
     // A post-tested loop with an explicit preheader has an initial header-phi
-    // edge as well as a recurrent edge. Keep this recognizer linear and prove
-    // the complete CFG before emitting either copy sequence.
+    // edge as well as a recurrent edge. Prove the complete CFG before emitting
+    // either copy sequence; one disjoint body diamond may rejoin before the latch.
     auto try_ssa_post_tested_loop = [&]() -> std::optional<StructuredPseudocode> {
         if (function.blocks.size() < 3 || function.blocks.size() > 1024) return {};
         std::map<std::uint64_t, std::set<std::uint64_t>> predecessors;
@@ -6368,6 +6368,13 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             }
             return find_block(*block.successors.front().target);
         };
+        struct BodyDiamond {
+            const LiftedBlock *branch = nullptr, *join = nullptr;
+            const Branch *condition = nullptr;
+            std::vector<const LiftedBlock *> yes, no;
+            BlockId yes_tail{}, no_tail{};
+        };
+        std::optional<BodyDiamond> diamond;
         std::vector<const LiftedBlock *> path;
         std::set<std::uint64_t> covered;
         auto *current = entry;
@@ -6375,7 +6382,59 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         while (current && covered.insert(current->id.value).second) {
             path.push_back(current);
             condition = terminal_conditional(*current);
-            if (condition) break;
+            if (condition) {
+                const auto in_path = [&](Address target) {
+                    return std::any_of(path.begin(), path.end(), [&](const auto *block) {
+                        return block->begin == target;
+                    });
+                };
+                const bool yes_back = in_path(*condition->true_target);
+                const bool no_back = in_path(*condition->false_target);
+                if (yes_back != no_back) break;
+                if (yes_back || diamond) return {};
+
+                struct Arm {
+                    const LiftedBlock *join = nullptr;
+                    std::vector<const LiftedBlock *> blocks;
+                    BlockId tail{};
+                };
+                const auto trace_arm = [&](Address target) -> std::optional<Arm> {
+                    Arm arm;
+                    auto *cursor = find_block(target);
+                    auto predecessor = current->id;
+                    std::set<std::uint64_t> seen;
+                    while (cursor && arm.blocks.size() < 64 &&
+                           predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor.value}) {
+                        if (covered.contains(cursor->id.value) || !seen.insert(cursor->id.value).second ||
+                            terminal_conditional(*cursor) || contains_return(*cursor)) return {};
+                        const auto *next = linear_successor(*cursor);
+                        if (!next) return {};
+                        arm.blocks.push_back(cursor);
+                        predecessor = cursor->id;
+                        cursor = next;
+                    }
+                    if (!cursor || covered.contains(cursor->id.value) || seen.contains(cursor->id.value)) return {};
+                    arm.join = cursor;
+                    arm.tail = predecessor;
+                    return arm;
+                };
+                const auto yes = trace_arm(*condition->true_target);
+                const auto no = trace_arm(*condition->false_target);
+                if (!yes || !no || yes->join != no->join || yes->tail == no->tail ||
+                    predecessors[yes->join->id.value] !=
+                        std::set<std::uint64_t>{yes->tail.value, no->tail.value}) return {};
+                std::set<std::uint64_t> arms;
+                for (const auto *block : yes->blocks)
+                    if (!arms.insert(block->id.value).second) return {};
+                for (const auto *block : no->blocks)
+                    if (!arms.insert(block->id.value).second) return {};
+                for (const auto id : arms) covered.insert(id);
+                diamond = BodyDiamond{current, yes->join, condition, yes->blocks, no->blocks,
+                                      yes->tail, no->tail};
+                current = yes->join;
+                condition = nullptr;
+                continue;
+            }
             current = linear_successor(*current);
         }
         if (!current || !condition || condition->indirect_target || contains_return(*current)) return {};
@@ -6392,10 +6451,15 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         if (header_position == path.begin()) return {}; // Require a real initial incoming edge.
         const auto *header = *header_position;
         const auto header_offset = static_cast<std::size_t>(header_position - path.begin());
+        if (diamond) {
+            const auto branch_position = std::find(path.begin(), path.end(), diamond->branch);
+            if (branch_position < header_position || branch_position == path.end() ||
+                branch_position + 1 == path.end() || *(branch_position + 1) != diamond->join) return {};
+        }
         const auto *preheader = path[header_offset - 1];
         if (predecessors[header->id.value] != std::set<std::uint64_t>{preheader->id.value, latch->id.value}) return {};
         for (std::size_t i = 1; i < path.size(); ++i) {
-            if (i != header_offset &&
+            if (i != header_offset && (!diamond || path[i] != diamond->join) &&
                 predecessors[path[i]->id.value] != std::set<std::uint64_t>{path[i - 1]->id.value}) return {};
         }
 
@@ -6450,8 +6514,27 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         }
         out << "    bool __hexlab_do_repeat;\n    do {\n";
         for (std::size_t i = header_offset; i < path.size(); ++i) {
+            if (diamond && path[i] == diamond->branch) {
+                emit_block(*diamond->branch, 8, true);
+                out << "        if (" << branch_condition_text(*diamond->condition) << ") {\n";
+                const auto emit_arm = [&](const std::vector<const LiftedBlock *> &arm) {
+                    auto predecessor = diamond->branch->id;
+                    for (const auto *block : arm) {
+                        edge_copies(*block, predecessor, 12);
+                        emit_block(*block, 12, true);
+                        predecessor = block->id;
+                    }
+                    edge_copies(*diamond->join, predecessor, 12);
+                };
+                emit_arm(diamond->yes);
+                out << "        } else {\n";
+                emit_arm(diamond->no);
+                out << "        }\n";
+                continue;
+            }
             emit_block(*path[i], 8, true);
-            if (i + 1 < path.size()) edge_copies(*path[i + 1], path[i]->id, 8);
+            if (i + 1 < path.size() && (!diamond || path[i + 1] != diamond->join))
+                edge_copies(*path[i + 1], path[i]->id, 8);
         }
         // Evaluate the branch before recurrent copies: the predicate may read
         // a header-phi destination overwritten by those simultaneous updates.

@@ -848,6 +848,140 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                 result.complete = false;
                 stack_extent_known = false;
             }
+            // Address formation from the current stack or frame base is the
+            // non-x86 equivalent of LEA. Retain its source location as an
+            // address-taken slot even when the resulting pointer is later
+            // passed to an opaque call or stored elsewhere.
+            bool forms_stack_address = false;
+            FlowValue address_base;
+            std::int64_t address_displacement = 0;
+            const auto address_destination = register_at(instruction, 0);
+            const auto address_source = register_at(instruction, 1);
+            if (instruction.context.architecture == Architecture::arm64 &&
+                (instruction.opcode == Opcode::a64_add || instruction.opcode == Opcode::a64_sub) &&
+                instruction.operands.size() >= 3 && address_destination && address_source &&
+                address_destination->bank == RegisterBank::arm64_gpr && address_destination->index != 29) {
+                if (address_source->bank == RegisterBank::arm64_sp) {
+                    address_base = state.stack_depth;
+                    forms_stack_address = true;
+                } else if (address_source->bank == RegisterBank::arm64_gpr && address_source->index == 29 &&
+                           state.arm64_frame_pointer) {
+                    address_base = state.frame_depth;
+                    forms_stack_address = true;
+                }
+                if (forms_stack_address) {
+                    const auto immediate = immediate_value(instruction, 2);
+                    if (!immediate) {
+                        result.complete = false;
+                        forms_stack_address = false;
+                    } else if (instruction.opcode == Opcode::a64_sub) {
+                        if (*immediate == INT64_MIN) {
+                            result.complete = false;
+                            forms_stack_address = false;
+                        } else {
+                            address_displacement = -*immediate;
+                        }
+                    } else {
+                        address_displacement = *immediate;
+                    }
+                }
+            } else if (instruction.context.architecture == Architecture::arm &&
+                       (instruction.opcode == Opcode::a32_add || instruction.opcode == Opcode::a32_sub) &&
+                       instruction.operands.size() >= 3 && address_destination && address_source &&
+                       address_destination->bank == RegisterBank::arm32_gpr && address_destination->index != 13 &&
+                       address_destination->index != state.frame_register) {
+                if (arm32_register(address_source, 13)) {
+                    address_base = state.stack_depth;
+                    forms_stack_address = true;
+                } else if (state.frame_register >= 0 && arm32_register(address_source, state.frame_register)) {
+                    address_base = state.frame_depth;
+                    forms_stack_address = true;
+                }
+                if (forms_stack_address) {
+                    const auto immediate = immediate_value(instruction, 2);
+                    if (!immediate) {
+                        result.complete = false;
+                        forms_stack_address = false;
+                    } else if (instruction.opcode == Opcode::a32_sub) {
+                        if (*immediate == INT64_MIN) {
+                            result.complete = false;
+                            forms_stack_address = false;
+                        } else {
+                            address_displacement = -*immediate;
+                        }
+                    } else address_displacement = *immediate;
+                }
+            } else if ((instruction.context.architecture == Architecture::mips32 ||
+                        instruction.context.architecture == Architecture::mips64) &&
+                       (instruction.opcode == Opcode::mips_addiu || instruction.opcode == Opcode::mips_addi ||
+                        instruction.opcode == Opcode::mips64_daddi || instruction.opcode == Opcode::mips64_daddiu) &&
+                       instruction.operands.size() >= 3 && address_destination && address_source &&
+                       address_destination->bank == RegisterBank::mips_gpr &&
+                       address_destination->index != 29 && address_destination->index != 30) {
+                if (mips_register(address_source, 29)) {
+                    address_base = state.stack_depth;
+                    forms_stack_address = true;
+                } else if (mips_register(address_source, 30) && state.frame_register == 30) {
+                    address_base = state.frame_depth;
+                    forms_stack_address = true;
+                }
+                if (forms_stack_address) {
+                    const auto immediate = immediate_value(instruction, 2);
+                    if (immediate) address_displacement = *immediate;
+                    else {
+                        result.complete = false;
+                        forms_stack_address = false;
+                    }
+                }
+            } else if ((instruction.context.architecture == Architecture::riscv32 ||
+                        instruction.context.architecture == Architecture::riscv64) &&
+                       instruction.opcode == Opcode::rv_addi && instruction.operands.size() >= 3 &&
+                       address_destination && address_source && address_destination->bank == RegisterBank::riscv_gpr &&
+                       address_destination->index != 2 && address_destination->index != 8) {
+                if (riscv_register(address_source, 2)) {
+                    address_base = state.stack_depth;
+                    forms_stack_address = true;
+                } else if (riscv_register(address_source, 8) && state.frame_register == 8) {
+                    address_base = state.frame_depth;
+                    forms_stack_address = true;
+                }
+                if (forms_stack_address) {
+                    const auto immediate = immediate_value(instruction, 2);
+                    if (immediate) address_displacement = *immediate;
+                    else {
+                        result.complete = false;
+                        forms_stack_address = false;
+                    }
+                }
+            } else if (instruction.context.architecture == Architecture::powerpc &&
+                       instruction.opcode == Opcode::ppc_addi && instruction.operands.size() >= 3 &&
+                       address_destination && address_source && address_destination->bank == RegisterBank::ppc_gpr &&
+                       address_destination->index != 1 && address_destination->index != 31) {
+                if (ppc_register(address_source, 1)) {
+                    address_base = state.stack_depth;
+                    forms_stack_address = true;
+                } else if (ppc_register(address_source, 31) && state.frame_register == 31) {
+                    address_base = state.frame_depth;
+                    forms_stack_address = true;
+                }
+                if (forms_stack_address) {
+                    const auto immediate = immediate_value(instruction, 2);
+                    if (immediate) address_displacement = *immediate;
+                    else {
+                        result.complete = false;
+                        forms_stack_address = false;
+                    }
+                }
+            }
+            if (forms_stack_address) {
+                std::int64_t offset = 0;
+                if (!address_base.known || !subtract_checked(address_displacement, address_base.value, offset)) {
+                    result.complete = false;
+                } else if (!record_stack_slot(result, offset, 0, false, false, true,
+                                              instruction.address, access_detail_count)) {
+                    return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
+                }
+            }
             // AArch64 pair transfers have one memory operand but access two
             // adjacent cells of the element width. Recover both stack slots
             // only when the base is a tracked SP or frame pointer.

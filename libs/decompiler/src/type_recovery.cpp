@@ -3649,6 +3649,14 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         collect_banks(right, right_banks);
         return left_banks == right_banks;
     };
+    // A caller and callee can use different register argument conventions yet
+    // still share an exact stack argument base. Only those stack slots can be
+    // propagated across that boundary; register values and return values stay
+    // gated by the register-file check below.
+    const auto shares_stack_argument_base = [](const AbiDescription &left, const AbiDescription &right) {
+        return left.pointer_bits != 0 && left.pointer_bits == right.pointer_bits &&
+               left.stack_argument_base && left.stack_argument_base == right.stack_argument_base;
+    };
     const auto returned_register = [](const AbiDescription &abi, const types::TypePtr &type)
         -> std::optional<RegisterOperand> {
         if (!type || type->kind() == types::Kind::void_type) return {};
@@ -4323,7 +4331,9 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                 std::vector<AbiArgumentSlot> classified_target_slots;
                 if (target != entries.end()) {
                     const auto callee = target->second;
-                    if (!same_register_file(abis[i], abis[callee])) continue;
+                    const bool register_file_match = same_register_file(abis[i], abis[callee]);
+                    const bool shared_stack = shares_stack_argument_base(abis[i], abis[callee]);
+                    if (!register_file_match && !shared_stack) continue;
                     signature = explicit_prototypes[callee]
                         ? explicit_prototypes[callee] : current[callee].inferred_prototype;
                     if (abis[callee].name == "AArch64 AAPCS64" && signature) {
@@ -4334,7 +4344,8 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                 } else {
                     const auto external = external_entries.find(entry_key(*call->direct_target));
                     if (external == external_entries.end() || external->second.ambiguous ||
-                        !same_register_file(abis[i], external->second.abi)) continue;
+                        (!same_register_file(abis[i], external->second.abi) &&
+                         !shares_stack_argument_base(abis[i], external->second.abi))) continue;
                     signature = external->second.prototype;
                     target_slots = &external->second.slots;
                     target_abi = &external->second.abi;
@@ -4343,6 +4354,7 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                 for (std::size_t slot_index = 0; slot_index < target_slots->size(); ++slot_index) {
                     const auto &argument_slot = (*target_slots)[slot_index];
                     if (!argument_slot.supported) continue;
+                    if (argument_slot.reg && !same_register_file(abis[i], *target_abi)) continue;
                     const auto parameter_index = argument_slot.parameter_index.value_or(static_cast<std::uint16_t>(slot_index));
                     if (signature && parameter_index >= signature->parameters().size()) continue;
                     if (!signature && argument_slot.component_index) continue;
@@ -4556,11 +4568,12 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                 const auto callee = target->second;
                 const bool cycle = recursive_edge(caller, callee);
                 const bool register_file_match = same_register_file(abis[caller], abis[callee]);
+                const bool shared_stack = shares_stack_argument_base(abis[caller], abis[callee]);
                 for (std::size_t slot_index = 0; slot_index < abi_slots[callee].size(); ++slot_index) {
                     auto &candidate = consensus[callee][slot_index];
                     const auto &callee_slot = abi_slots[callee][slot_index];
                     if (!callee_slot.reg) {
-                        if (!callee_slot.stack_offset || !register_file_match) {
+                        if (!callee_slot.stack_offset || (!register_file_match && !shared_stack)) {
                             candidate.valid = false;
                             continue;
                         }

@@ -36,6 +36,16 @@ the same instruction remain distinct. Address-only sites with unknown width
 coalesce with a unique typed slot at the same entry-SP offset; ambiguous widths
 remain unknown-width slots and mark the analysis partial.
 
+Immediate stack-address formation is also retained as an address-taking site:
+A32/Thumb `ADD`/`SUB` from SP or the tracked r7/r11 frame base, AArch64
+`ADD`/`SUB` from SP or a tracked x29, MIPS `ADDI`/`ADDIU` and MIPS64
+`DADDI`/`DADDIU` from `$sp` or tracked `$fp`, RISC-V `ADDI` from `sp` or
+tracked `s0/fp`, and PowerPC `ADDI` from `r1` or tracked `r31`. These facts
+have unknown width and the address-producing instruction as provenance. If an
+explicit stack load/store names the same entry-SP byte offset, the address
+fact coalesces into that typed slot. This records pointers handed to opaque
+code without claiming to follow later accesses through the derived register.
+
 Project analysis derives and retains one `StackFrameAnalysis` per recovered
 function in the source-keyed derived cache. The cache format validates these
 records against a fresh rooted function recovery before publication; incremental
