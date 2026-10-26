@@ -172,26 +172,76 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     if (code.empty()) return unsupported("empty or unavailable function body");
 
     const auto function_index = static_cast<std::uint32_t>(function.entry.space.value);
-    const WasmFunctionType *function_signature = nullptr;
-    if (metadata && function.entry.space.value <= UINT32_MAX &&
-        function_index < metadata->function_type_indices.size()) {
-        const auto type_index = metadata->function_type_indices[function_index];
-        if (type_index < metadata->function_types.size())
-            function_signature = &metadata->function_types[type_index];
-    }
-    const auto parameter_type = [&](std::uint64_t index) -> std::optional<ValueType> {
-        if (!function_signature || index >= function_signature->parameter_types.size()) return {};
-        return wasm_value_type(function_signature->parameter_types[static_cast<std::size_t>(index)]);
+    const auto signature_for = [&](std::uint64_t index) -> const WasmFunctionType * {
+        if (!metadata || index > UINT32_MAX || index >= metadata->function_type_indices.size()) return nullptr;
+        const auto type_index = metadata->function_type_indices[static_cast<std::size_t>(index)];
+        if (type_index >= metadata->function_types.size()) return nullptr;
+        return &metadata->function_types[type_index];
     };
-    const auto parameter_name = [&](std::uint64_t index) {
+    const WasmFunctionType *function_signature = function.entry.space.value <= UINT32_MAX
+        ? signature_for(function_index) : nullptr;
+    if (function_signature && function_signature->result_types.size() > 1)
+        return unsupported("multi-value function results are not modeled");
+    const WasmFunctionLocals *declared_locals = nullptr;
+    if (metadata) {
+        const auto found = std::find_if(metadata->function_locals.begin(), metadata->function_locals.end(),
+            [&](const WasmFunctionLocals &item) { return item.function_index == function_index; });
+        if (found != metadata->function_locals.end() &&
+            std::find_if(std::next(found), metadata->function_locals.end(), [&](const WasmFunctionLocals &item) {
+                return item.function_index == function_index;
+            }) != metadata->function_locals.end())
+            return unsupported("function local metadata contains duplicate function entries");
+        if (found != metadata->function_locals.end() && found->function_index == function_index)
+            declared_locals = &*found;
+    }
+    std::vector<ValueType> local_types;
+    if (function_signature) {
+        if (function_signature->parameter_count != function_signature->parameter_types.size() ||
+            function_signature->result_count != function_signature->result_types.size())
+            return unsupported("function signature metadata is inconsistent");
+        if (function_signature->parameter_types.size() > 256)
+            return Error{ErrorCode::resource_limit, "WebAssembly typed local lifting is limited to 256 parameters and locals"};
+        for (const auto type : function_signature->parameter_types) {
+            const auto converted = wasm_value_type(type);
+            if (!converted) return unsupported("function signature contains an unsupported parameter type");
+            local_types.push_back(*converted);
+        }
+    }
+    if (declared_locals) {
+        if (declared_locals->value_types.size() > 256 - local_types.size())
+            return Error{ErrorCode::resource_limit, "WebAssembly typed local lifting is limited to 256 parameters and locals"};
+        for (const auto type : declared_locals->value_types) {
+            const auto converted = wasm_value_type(type);
+            if (!converted) return unsupported("function local metadata contains an unsupported type");
+            local_types.push_back(*converted);
+        }
+    }
+    if (local_types.size() > 256)
+        return Error{ErrorCode::resource_limit, "WebAssembly typed local lifting is limited to 256 parameters and locals"};
+    const auto local_type = [&](std::uint64_t index) -> std::optional<ValueType> {
+        if (index >= local_types.size()) return {};
+        return local_types[static_cast<std::size_t>(index)];
+    };
+    const auto local_register = [&](std::uint64_t index) -> RegisterOperand {
+        const auto type = *local_type(index);
+        return {RegisterBank::wasm_local, static_cast<std::uint8_t>(index), type.bits, false};
+    };
+    const auto local_name = [&](std::uint64_t index) {
+        std::string base = index < (function_signature ? function_signature->parameter_types.size() : 0)
+            ? "arg" + std::to_string(index) : "local" + std::to_string(index);
         if (metadata) {
             const auto named = std::find_if(metadata->local_names.begin(), metadata->local_names.end(),
                 [&](const WasmLocalName &item) {
                     return item.function_index == function_index && item.local_index == index;
                 });
-            if (named != metadata->local_names.end()) return named->name;
+            if (named != metadata->local_names.end()) base = named->name;
         }
-        return "arg" + std::to_string(index);
+        std::string result = "wasm_";
+        for (const unsigned char ch : base)
+            result.push_back((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                             (ch >= '0' && ch <= '9') || ch == '_' ? static_cast<char>(ch) : '_');
+        result += "_l" + std::to_string(index);
+        return result;
     };
 
     constexpr std::size_t max_instructions = 100000;
@@ -340,15 +390,44 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             if(op==0x1b){auto c=shape_pop(stack,integer(32));if(!c)return c.error();auto a=shape_pop(stack,{});if(!a)return a.error();auto b=shape_pop(stack,a.value());if(!b)return b.error();stack.push_back(a.value());continue;}
             if(op==0x0c||op==0x0d){if(op==0x0d){auto c=shape_pop(stack,integer(32));if(!c)return c.error();}continue;}
             if(op==0x0e){auto c=shape_pop(stack,integer(32));if(!c)return c.error();continue;}
-            if (op == 0x20) {
+            if (op >= 0x20 && op <= 0x22) {
                 const auto index = immediate(code[n]->instruction);
-                if (!index || !parameter_type(*index))
-                    return unsupported("local.get requires an available typed function parameter");
-                stack.push_back(*parameter_type(*index));
+                const auto type = index ? local_type(*index) : std::optional<ValueType>{};
+                if (!index || !type)
+                    return unsupported("local index is outside the typed parameter/local declarations");
+                if (op == 0x20) stack.push_back(*type);
+                else {
+                    auto value = shape_pop(stack, *type);
+                    if (!value) return value.error();
+                    if (op == 0x22) stack.push_back(value.value());
+                }
                 continue;
             }
-            if(op>=0x21&&op<=0x24)return unsupported("local writes, declared locals and globals require local dataflow support");
-            if(op>=0x10&&op<=0x11)return unsupported("call signatures are unavailable to the function-local lifter");
+            if (op == 0x23 || op == 0x24)
+                return unsupported("global access requires global value-flow metadata");
+            if (op == 0x10) {
+                const auto index = immediate(code[n]->instruction);
+                const auto *callee = index ? signature_for(*index) : nullptr;
+                if (!callee || callee->parameter_count != callee->parameter_types.size() ||
+                    callee->result_count != callee->result_types.size())
+                    return unsupported("direct call target or function signature metadata is unavailable");
+                if (callee->parameter_types.size() > max_stack || callee->result_types.size() > 1)
+                    return unsupported("direct call has too many parameters or multiple results");
+                for (auto it = callee->parameter_types.rbegin(); it != callee->parameter_types.rend(); ++it) {
+                    const auto type = wasm_value_type(*it);
+                    if (!type) return unsupported("direct call parameter type is unsupported");
+                    auto argument = shape_pop(stack, *type);
+                    if (!argument) return argument.error();
+                }
+                if (!callee->result_types.empty()) {
+                    const auto type = wasm_value_type(callee->result_types.front());
+                    if (!type) return unsupported("direct call result type is unsupported");
+                    stack.push_back(*type);
+                }
+                continue;
+            }
+            if (op == 0x11)
+                return unsupported("indirect calls are not modeled");
             if (op >= 0x28 && op <= 0x3e) {
                 const auto info = memory_op(op);
                 if (!info) return unsupported("memory opcode metadata is unavailable");
@@ -410,6 +489,19 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         if(!predecessors[bi].empty())for(std::size_t slot=0;slot<entries[bi]->size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};if(predecessors[bi].size()>1)stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,phi_versions[bi][slot]}}));else{const auto pred=predecessors[bi].front();if(slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack value is unavailable"};stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,output_versions[pred][slot]}}));}}
         auto pop=[&](ValueType expected)->Result<ExpressionPtr>{if(stack.empty())return unsupported("operand stack underflow");auto v=stack.back();stack.pop_back();if(expected.kind!=TypeKind::unknown&&v->type!=expected)return unsupported("operand stack type mismatch");return v;};
         auto emit=[&](std::size_t n,Statement statement){const auto *fact=code[n];lifted.instructions.push_back({{fact->instruction.address,fact->id},std::move(statement)});};
+        if (bi == 0 && !local_types.empty()) {
+            const auto parameter_count = function_signature ? function_signature->parameter_types.size() : 0;
+            const auto *origin = code[begin];
+            for (std::size_t index = 0; index < local_types.size(); ++index) {
+                ExpressionPtr initial;
+                if (index < parameter_count)
+                    initial = std::make_shared<Expression>(Expression{local_types[index], VariableValue{local_name(index)}});
+                else
+                    initial = constant(0, local_types[index]);
+                lifted.instructions.push_back({{origin->instruction.address, origin->id},
+                    Assign{local_register(index), std::move(initial)}});
+            }
+        }
         for(std::size_t n=begin;n<finish;++n){const auto *fact=code[n];const auto &i=fact->instruction;const auto op=std::to_integer<std::uint8_t>(i.bytes[0]);
             if(op==0x41||op==0x42||op==0x43||op==0x44){auto v=immediate(i);if(!v)return unsupported("constant immediate unavailable");stack.push_back(constant(*v,op==0x41?integer(32):op==0x42?integer(64):op==0x43?floating(32):floating(64)));continue;}
             if(op==0x00){emit(n,Intrinsic{"wasm_unreachable",{},IntrinsicMemoryEffect::none});break;}
@@ -423,16 +515,63 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             if(op==0x0e){auto selector=pop(integer(32));if(!selector)return selector.error();auto targets=table_targets(n);if(!targets)return targets.error();LiftedBlock::SwitchDispatch dispatch;dispatch.selector=selector.value();for(const auto &target:targets.value()){const auto target_block=block_for(target.target);if(!target_block)return unsupported("br_table target is not a basic block");const auto address=code[starts[*target_block]]->instruction.address;if(target.value)dispatch.cases.push_back({*target.value,address});else dispatch.default_target=address;}lifted.switch_dispatch=std::move(dispatch);continue;}
             if(op==0x1a){auto v=pop({});if(!v)return v.error();continue;}
             if(op==0x1b){auto cond=pop(integer(32));if(!cond)return cond.error();auto when_true=pop({});if(!when_true)return when_true.error();auto when_false=pop(when_true.value()->type);if(!when_false)return when_false.error();auto alternatives=binary("pair",when_true.value(),when_false.value(),when_true.value()->type);stack.push_back(binary("select_if",cond.value(),alternatives,when_true.value()->type));continue;}
-            if (op == 0x20) {
+            if (op >= 0x20 && op <= 0x22) {
                 const auto index = immediate(i);
-                const auto type = index ? parameter_type(*index) : std::optional<ValueType>{};
+                const auto type = index ? local_type(*index) : std::optional<ValueType>{};
                 if (!index || !type)
-                    return unsupported("local.get requires an available typed function parameter");
-                stack.push_back(std::make_shared<Expression>(Expression{*type, VariableValue{parameter_name(*index)}}));
+                    return unsupported("local index is outside the typed parameter/local declarations");
+                if (op == 0x20) {
+                    const auto reg = local_register(*index);
+                    stack.push_back(std::make_shared<Expression>(Expression{*type, RegisterValue{reg, 0}}));
+                } else {
+                    auto value = pop(*type);
+                    if (!value) return value.error();
+                    emit(n, Assign{local_register(*index), value.value()});
+                    if (op == 0x22) stack.push_back(value.value());
+                }
+                if (stack.size() > max_stack)
+                    return Error{ErrorCode::resource_limit, "WebAssembly operand stack exceeds 128 values"};
                 continue;
             }
-            if(op>=0x21&&op<=0x24)return unsupported("local writes, declared locals and globals require local dataflow support");
-            if(op>=0x10&&op<=0x11)return unsupported("call signatures are unavailable to the function-local lifter");
+            if (op == 0x23 || op == 0x24)
+                return unsupported("global access requires global value-flow metadata");
+            if (op == 0x10) {
+                const auto index = immediate(i);
+                const auto *callee = index ? signature_for(*index) : nullptr;
+                if (!index || !callee || callee->parameter_count != callee->parameter_types.size() ||
+                    callee->result_count != callee->result_types.size())
+                    return unsupported("direct call target or function signature metadata is unavailable");
+                if (callee->parameter_types.size() > max_stack || callee->result_types.size() > 1)
+                    return unsupported("direct call has too many parameters or multiple results");
+                std::vector<ExpressionPtr> arguments(callee->parameter_types.size());
+                for (std::size_t argument = callee->parameter_types.size(); argument > 0; --argument) {
+                    const auto type = wasm_value_type(callee->parameter_types[argument - 1]);
+                    if (!type) return unsupported("direct call parameter type is unsupported");
+                    auto value = pop(*type);
+                    if (!value) return value.error();
+                    arguments[argument - 1] = value.value();
+                }
+                Intrinsic call;
+                call.name = "wasm_call_function_" + std::to_string(*index);
+                call.operands = std::move(arguments);
+                call.memory_effect = IntrinsicMemoryEffect::unknown;
+                if (!callee->result_types.empty()) {
+                    const auto type = wasm_value_type(callee->result_types.front());
+                    if (!type) return unsupported("direct call result type is unsupported");
+                    const auto result_slot = stack.size();
+                    const RegisterOperand reg{RegisterBank::wasm_stack, static_cast<std::uint8_t>(result_slot), type->bits, false};
+                    call.result_type = *type;
+                    call.register_writes.push_back(reg);
+                    emit(n, std::move(call));
+                    stack.push_back(std::make_shared<Expression>(Expression{*type, RegisterValue{reg, 0}}));
+                } else {
+                    emit(n, std::move(call));
+                }
+                if (stack.size() > max_stack)
+                    return Error{ErrorCode::resource_limit, "WebAssembly operand stack exceeds 128 values"};
+                continue;
+            }
+            if (op == 0x11) return unsupported("indirect calls are not modeled");
             if (op >= 0x28 && op <= 0x3e) {
                 const auto info = memory_op(op);
                 if (!info) return unsupported("memory opcode metadata is unavailable");

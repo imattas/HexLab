@@ -112,6 +112,14 @@ struct WasmLocalName {
     bool operator==(const WasmLocalName &) const = default;
 };
 
+struct WasmFunctionLocals {
+    // Function index in the full imported-then-defined index space.
+    std::uint32_t function_index = 0;
+    // Declared local value types, excluding parameters, in local-index order.
+    std::vector<std::uint8_t> value_types;
+    bool operator==(const WasmFunctionLocals &) const = default;
+};
+
 struct WasmMetadata {
     std::uint32_t type_count = 0;
     std::uint32_t imported_functions = 0, imported_tables = 0, imported_memories = 0, imported_globals = 0;
@@ -141,6 +149,8 @@ struct WasmMetadata {
     std::vector<WasmTableElement> initial_table_elements;
     std::vector<WasmFunctionName> function_names;
     std::vector<WasmLocalName> local_names;
+    // Expanded, bounded local declarations for defined functions only.
+    std::vector<WasmFunctionLocals> function_locals;
     bool operator==(const WasmMetadata &) const = default;
 };
 
