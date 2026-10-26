@@ -1677,6 +1677,10 @@ class DebuggerSession:
     def state(self):
         return self._call("state")
 
+    def processes(self):
+        """Return a bounded snapshot of processes visible to this backend."""
+        return tuple(self._call("processes"))
+
     def launch(self, executable, arguments=(), *, working_directory=""):
         return self._call("launch", os.fspath(executable), tuple(os.fspath(arg) for arg in arguments), os.fspath(working_directory))
 
@@ -1711,6 +1715,10 @@ class DebuggerSession:
     def interrupt(self):
         return self._call("interrupt")
 
+    def terminate(self):
+        """Permanently terminate the selected target; distinct from detach/close."""
+        return self._call("terminate")
+
     def detach(self):
         return self._call("detach")
 
@@ -1719,6 +1727,41 @@ class DebuggerSession:
 
     def write_memory(self, address, data):
         return self._call("write_memory", address, bytes(data))
+
+    def evaluate_expression(self, thread_id, expression):
+        """Evaluate a bounded register/memory expression on a stopped thread."""
+        if not isinstance(expression, str):
+            raise TypeError("expression must be str")
+        if len(expression.encode("utf-8")) > 256:
+            raise ValueError("expression exceeds 256 bytes")
+        return self._call("evaluate_expression", thread_id, expression)
+
+    def search_memory(self, pattern, *, ranges=(), writable=None, executable=None,
+                      alignment=1, chunk_size=64 * 1024,
+                      max_bytes=64 * 1024 * 1024,
+                      max_comparisons=64 * 1024 * 1024,
+                      max_results=4096, max_read_failures=64,
+                      stop_on_read_failure=False, cancel=None):
+        """Search readable target maps with a byte pattern and explicit work caps.
+
+        Returns a report even when canceled or capped, preserving partial matches
+        and read failures alongside an explicit completion status.
+        """
+        if not isinstance(pattern, str):
+            raise TypeError("pattern must be str")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        options = {
+            "ranges": tuple(ranges), "writable": writable, "executable": executable,
+            "alignment": alignment, "chunk_size": chunk_size,
+            "max_bytes": max_bytes, "max_comparisons": max_comparisons,
+            "max_results": max_results, "max_read_failures": max_read_failures,
+            "stop_on_read_failure": stop_on_read_failure,
+        }
+        token_handle = None if cancel is None else cancel._handle
+        return self._call("search_memory", pattern, options, token_handle)
 
     def threads(self):
         return self._call("threads")
