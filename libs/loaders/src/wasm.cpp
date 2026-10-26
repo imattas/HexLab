@@ -1214,6 +1214,24 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
             return Error{ErrorCode::malformed, "WebAssembly start function must have type [] -> []"};
         wasm.start_function->function_type_index = type_index;
     }
+    // Build descriptors in kind-specific index order. Imports are retained in
+    // source order, but each kind's index is assigned monotonically as it is
+    // parsed, so filtering imports preserves the corresponding index order.
+    std::vector<WasmLimits> table_limits;
+    std::vector<WasmLimits> memory_limits;
+    table_limits.reserve(static_cast<std::size_t>(wasm.imported_tables) + wasm.defined_tables);
+    memory_limits.reserve(static_cast<std::size_t>(wasm.imported_memories) + wasm.defined_memories);
+    for (const auto &entry : wasm.imports) {
+        if (entry.kind == WasmExternalKind::table) {
+            if (!entry.limits) return Error{ErrorCode::malformed, "WebAssembly table import has no limits"};
+            table_limits.push_back(*entry.limits);
+        } else if (entry.kind == WasmExternalKind::memory) {
+            if (!entry.limits) return Error{ErrorCode::malformed, "WebAssembly memory import has no limits"};
+            memory_limits.push_back(*entry.limits);
+        }
+    }
+    table_limits.insert(table_limits.end(), wasm.defined_table_limits.begin(), wasm.defined_table_limits.end());
+    memory_limits.insert(memory_limits.end(), wasm.defined_memory_limits.begin(), wasm.defined_memory_limits.end());
     for (auto &entry : wasm.exports) {
         std::uint64_t count = 0;
         switch (entry.kind) {
@@ -1221,9 +1239,21 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
             count = wasm.function_type_indices.size();
             if (entry.index < count) entry.function_type_index = wasm.function_type_indices[entry.index];
             break;
-        case WasmExternalKind::table: count = static_cast<std::uint64_t>(wasm.imported_tables) + wasm.defined_tables; break;
-        case WasmExternalKind::memory: count = static_cast<std::uint64_t>(wasm.imported_memories) + wasm.defined_memories; break;
-        case WasmExternalKind::global: count = static_cast<std::uint64_t>(wasm.imported_globals) + wasm.defined_globals; break;
+        case WasmExternalKind::table:
+            count = table_limits.size();
+            if (entry.index < count) entry.limits = table_limits[entry.index];
+            break;
+        case WasmExternalKind::memory:
+            count = memory_limits.size();
+            if (entry.index < count) entry.limits = memory_limits[entry.index];
+            break;
+        case WasmExternalKind::global:
+            count = wasm.globals.size();
+            if (entry.index < count) {
+                entry.global_value_type = wasm.globals[entry.index].value_type;
+                entry.global_mutable = wasm.globals[entry.index].mutable_value;
+            }
+            break;
         }
         if (entry.index >= count)
             return Error{ErrorCode::malformed, "WebAssembly export index is outside its kind-specific index space"};
