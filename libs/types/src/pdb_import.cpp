@@ -329,15 +329,16 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             std::set<std::string, std::less<>> names;
             std::map<std::string, std::size_t, std::less<>> virtual_base_names;
             for (const auto &field : node.expanded_fields) {
+                const bool fixed_base = field.leaf == 0x1400 || field.leaf == 0x151a;
                 const bool virtual_base = field.leaf == 0x1401 || field.leaf == 0x1402;
-                if (field.leaf != 0x150d && field.leaf != 0x1400 && !virtual_base) continue;
-                if ((field.leaf == 0x1400 || virtual_base) && record.kind == CodeViewTypeKind::union_type)
+                if (field.leaf != 0x150d && !fixed_base && !virtual_base) continue;
+                if ((fixed_base || virtual_base) && record.kind == CodeViewTypeKind::union_type)
                     return fail(Error{ErrorCode::unsupported, "PDB union contains a base-class subobject"});
                 std::string member_name = field.name;
                 const auto field_namespace_tag = static_cast<std::uint8_t>(field.type >> 24);
                 const auto field_namespace = field_namespace_tag ? field_namespace_tag : target_namespace;
                 const auto field_index = field.type & 0x00ffffffu;
-                if (field.leaf == 0x1400 || virtual_base) {
+                if (fixed_base || virtual_base) {
                     const auto base = nodes.find({field_namespace, field_index});
                     if (base == nodes.end() || base->second->record.name.empty())
                         return fail(Error{ErrorCode::unsupported, "PDB base class is unresolved or unnamed"});

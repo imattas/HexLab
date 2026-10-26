@@ -81,7 +81,7 @@ Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &database, std::stop_tok
             std::uint64_t value = 0; for (std::size_t i=0;i<width;++i) value |= std::uint64_t(std::to_integer<unsigned>(bytes[at++])) << (8*i);
             const bool signed_leaf = kind == 0x8000 || kind == 0x8001 || kind == 0x8003 || kind == 0x8009;
             const bool negative = signed_leaf && (value & (std::uint64_t{1} << (width * 8 - 1)));
-            require(!nonnegative || !negative, "CodeView virtual-base offset/index must be nonnegative");
+            require(!nonnegative || !negative, "CodeView offset/index must be nonnegative");
             if (signed_leaf && width < 8 && (value & (std::uint64_t{1} << (width * 8 - 1))))
                 value |= (~std::uint64_t{0}) << (width * 8);
             return value;
@@ -254,8 +254,10 @@ Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &database, std::stop_tok
                     auto member= r16();
                     CodeViewField f; f.leaf=member;
                     if (member==0x150d) { f.attributes=r16(); f.type=r32(); f.offset=numeric(at,limit); f.name=read_name(at,limit); }
-                    else if (member==0x1400) { // LF_BCLASS: non-virtual base subobject.
-                        f.attributes=r16(); f.type=r32(); f.offset=numeric(at,limit);
+                    else if (member==0x1400 || member==0x151a) { // LF_BCLASS / LF_BINTERFACE
+                        // Both describe a fixed-offset base. Keep the original leaf
+                        // so interface-base provenance survives graph expansion.
+                        f.attributes=r16(); f.type=r32(); f.offset=numeric(at,limit,member==0x151a);
                     }
                     else if (member==0x1401 || member==0x1402) { // LF_VBCLASS / LF_IVBCLASS
                         require(limit - at >= 10, "Truncated CodeView virtual-base header");
@@ -756,7 +758,7 @@ Result<PdbTypeGraph> resolve_pdb_type_graph(const PdbTypeStream &stream, std::st
                 for (const auto &field : record.fields)
                     if (field.leaf == 0x150d || field.leaf == 0x150e)
                         add_reference(record.index, field.type, PdbTypeReferenceKind::member);
-                    else if (field.leaf == 0x1400)
+                    else if (field.leaf == 0x1400 || field.leaf == 0x151a)
                         add_reference(record.index, field.type, PdbTypeReferenceKind::base_class);
                     else if (field.leaf == 0x1401 || field.leaf == 0x1402) {
                         add_reference(record.index, field.type, PdbTypeReferenceKind::virtual_base_class);
