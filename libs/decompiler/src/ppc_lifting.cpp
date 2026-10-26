@@ -8,13 +8,38 @@ namespace {
 using R = RegisterOperand;
 ValueType integer(std::uint16_t bits) { return {TypeKind::integer, bits, false}; }
 ValueType floating(std::uint16_t bits) { return {TypeKind::floating, bits, false}; }
+ValueType vmx_vector_type(std::uint16_t lane_bits) {
+    return {TypeKind::vector, 128, false, lane_bits ? TypeKind::integer : TypeKind::unknown,
+            lane_bits, static_cast<std::uint8_t>(lane_bits ? 128 / lane_bits : 0)};
+}
 ExpressionPtr constant(std::uint64_t value, std::uint16_t bits) {
     const auto type = integer(bits);
     return std::make_shared<Expression>(Expression{type, ConstantValue{value, type}});
 }
 ExpressionPtr reg(R value) {
-    const auto type = value.bank == RegisterBank::ppc_fpr ? floating(value.width) : integer(value.width);
+    const auto type = value.bank == RegisterBank::ppc_fpr ? floating(value.width) :
+                      value.bank == RegisterBank::ppc_vr ? vmx_vector_type(0) : integer(value.width);
     return std::make_shared<Expression>(Expression{type, RegisterValue{value, {}}});
+}
+ExpressionPtr typed_vmx_reg(R value, ValueType type) {
+    return std::make_shared<Expression>(Expression{type, RegisterValue{value, {}}});
+}
+struct VmxOperation { const char *mnemonic; std::uint16_t lane_bits; };
+std::optional<VmxOperation> vmx_operation(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::ppc_vaddubm: return VmxOperation{"vaddubm", 8};
+    case Opcode::ppc_vadduhm: return VmxOperation{"vadduhm", 16};
+    case Opcode::ppc_vadduwm: return VmxOperation{"vadduwm", 32};
+    case Opcode::ppc_vsububm: return VmxOperation{"vsububm", 8};
+    case Opcode::ppc_vsubuhm: return VmxOperation{"vsubuhm", 16};
+    case Opcode::ppc_vsubuwm: return VmxOperation{"vsubuwm", 32};
+    case Opcode::ppc_vand: return VmxOperation{"vand", 0};
+    case Opcode::ppc_vandc: return VmxOperation{"vandc", 0};
+    case Opcode::ppc_vor: return VmxOperation{"vor", 0};
+    case Opcode::ppc_vxor: return VmxOperation{"vxor", 0};
+    case Opcode::ppc_vnor: return VmxOperation{"vnor", 0};
+    default: return std::nullopt;
+    }
 }
 ExpressionPtr binary(std::string operation, ExpressionPtr left, ExpressionPtr right, std::uint16_t bits) {
     return std::make_shared<Expression>(Expression{integer(bits), BinaryValue{std::move(operation), std::move(left), std::move(right)}});
@@ -221,6 +246,29 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
     if (i.opcode == Opcode::ppc_b || i.opcode == Opcode::ppc_bc ||
         i.opcode == Opcode::ppc_bclr || i.opcode == Opcode::ppc_bcctr)
         return lift_control(i, width, before);
+
+    if (const auto vmx = vmx_operation(i.opcode)) {
+        const auto *left = ops.size() == 3 ? std::get_if<R>(&ops[1]) : nullptr;
+        const auto *right = ops.size() == 3 ? std::get_if<R>(&ops[2]) : nullptr;
+        const auto valid_vr = [](const R *value) {
+            return value && value->bank == RegisterBank::ppc_vr && value->width == 128 && value->index < 32;
+        };
+        if (!valid_vr(dst) || !valid_vr(left) || !valid_vr(right) ||
+            i.vector_bits != 128 || i.vector_element_bits != vmx->lane_bits ||
+            i.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read, OperandAccess::read} ||
+            i.register_reads != std::vector<R>{*left, *right} || i.register_writes != std::vector<R>{*dst} ||
+            i.memory_read || i.memory_write)
+            return effect(i, "ppc_malformed_vmx");
+        const auto type = vmx_vector_type(vmx->lane_bits);
+        const auto suffix = vmx->lane_bits ? "_i" + std::to_string(vmx->lane_bits) + "x" +
+            std::to_string(type.lanes) : std::string{"_bits128"};
+        Intrinsic result{"ppc_" + std::string(vmx->mnemonic) + suffix,
+                         {typed_vmx_reg(*left, type), typed_vmx_reg(*right, type)},
+                         IntrinsicMemoryEffect::none};
+        result.register_writes = {*dst};
+        result.result_type = type;
+        return result;
+    }
 
     if ((i.opcode == Opcode::ppc_lfs || i.opcode == Opcode::ppc_lfd ||
          i.opcode == Opcode::ppc_stfs || i.opcode == Opcode::ppc_stfd) && ops.size() == 2 && dst &&
