@@ -473,6 +473,85 @@ Result<database::StateDelta> validate_command(const ProjectSnapshot &snapshot, c
                     std::optional<TypeAssignment> after;
                     if(!value.remove)after=TypeAssignment{found==rows.end()?allocate():found->id,value.location,value.type_id};
                     change(rows,found,std::move(after));
+                } else if constexpr (std::is_same_v<T, RenameStackLocal>) {
+                    require(!value.access_sites.empty() && value.access_sites.size() <= 4096,
+                            "Stack-local rename requires 1 to 4096 access sites", ErrorCode::resource_limit);
+                    require((value.name.empty() || valid_utf8_name(value.name)) && value.name.size() <= 1024,
+                            "Stack-local name is invalid or exceeds 1024 bytes");
+                    auto sites = value.access_sites;
+                    std::sort(sites.begin(), sites.end(), [](Address a, Address b) {
+                        return std::pair{a.space.value, a.offset} < std::pair{b.space.value, b.offset};
+                    });
+                    require(std::adjacent_find(sites.begin(), sites.end()) == sites.end(),
+                            "Stack-local rename contains duplicate access sites");
+                    require(std::all_of(sites.begin(), sites.end(), [&](Address address) {
+                                return address.space == sites.front().space;
+                            }), "Stack-local access sites must share one address space");
+                    for (const auto address : sites) check_location(snapshot, Location{address}, true);
+                    auto &rows = user.annotations;
+                    for (const auto address : sites) {
+                        const auto found = std::find_if(rows.begin(), rows.end(), [&](const auto &row) {
+                            return row.location == Location{address};
+                        });
+                        require(found == rows.end() || found->name.empty() ||
+                                    found->name == value.expected_name,
+                                "A stack-local access site has a conflicting annotation name", ErrorCode::conflict);
+                    }
+                    if (!value.name.empty()) for (const auto &existing : rows) {
+                        const auto address = std::get_if<Address>(&existing.location);
+                        if (!address || address->space != sites.front().space || existing.name != value.name ||
+                            std::binary_search(sites.begin(), sites.end(), *address, [](Address a, Address b) {
+                                return std::pair{a.space.value, a.offset} < std::pair{b.space.value, b.offset};
+                            })) continue;
+                        throw Failure{{ErrorCode::conflict, "Name already exists at address " +
+                                                               std::to_string(address->offset)}};
+                    }
+                    for (const auto address : sites) {
+                        const Location location{address};
+                        auto found = std::find_if(rows.begin(), rows.end(), [&](const auto &row) {
+                            return row.location == location;
+                        });
+                        Annotation row = found == rows.end() ? Annotation{allocate(), location, {}, {}} : *found;
+                        row.name = value.name;
+                        change(rows, found, row.name.empty() && row.comment.empty()
+                                                ? std::optional<Annotation>{}
+                                                : std::optional{std::move(row)});
+                    }
+                } else if constexpr (std::is_same_v<T, AssignStackLocalType>) {
+                    require(!value.access_sites.empty() && value.access_sites.size() <= 4096,
+                            "Stack-local type assignment requires 1 to 4096 access sites", ErrorCode::resource_limit);
+                    auto sites = value.access_sites;
+                    std::sort(sites.begin(), sites.end(), [](Address a, Address b) {
+                        return std::pair{a.space.value, a.offset} < std::pair{b.space.value, b.offset};
+                    });
+                    require(std::adjacent_find(sites.begin(), sites.end()) == sites.end(),
+                            "Stack-local type assignment contains duplicate access sites");
+                    require(std::all_of(sites.begin(), sites.end(), [&](Address address) {
+                                return address.space == sites.front().space;
+                            }), "Stack-local access sites must share one address space");
+                    for (const auto address : sites) check_location(snapshot, Location{address});
+                    require(value.remove || std::any_of(user.types.begin(), user.types.end(),
+                        [&](const auto &row) { return row.id == value.type_id; }), "Unknown type definition");
+                    auto &rows = user.type_assignments;
+                    for (const auto address : sites) {
+                        const auto found = std::find_if(rows.begin(), rows.end(), [&](const auto &row) {
+                            return row.location == Location{address};
+                        });
+                        require(found == rows.end() ||
+                                    (value.expected_type_id && found->type_id == *value.expected_type_id),
+                                "A stack-local access site has a conflicting type assignment", ErrorCode::conflict);
+                    }
+                    for (const auto address : sites) {
+                        auto found = std::find_if(rows.begin(), rows.end(), [&](const auto &row) {
+                            return row.location == Location{address};
+                        });
+                        if (value.remove) {
+                            if (found != rows.end()) change(rows, found, std::optional<TypeAssignment>{});
+                        } else if (found == rows.end() || found->type_id != value.type_id) {
+                            change(rows, found, std::optional<TypeAssignment>{TypeAssignment{
+                                found == rows.end() ? allocate() : found->id, address, value.type_id}});
+                        }
+                    }
                 } else if constexpr (std::is_same_v<T, ImportPortableTypes>) {
                     // Validate the complete graph before staging any row changes. This command
                     // is intentionally atomic because imported assignments refer to names,

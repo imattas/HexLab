@@ -22,6 +22,7 @@ struct PseudocodeVariableEdit {
     std::string display;
     bool editable = true;
     bool function_entry_collision = false;
+    std::vector<Address> access_sites;
 };
 struct PseudocodeNavigationToken {
     DocumentId document;
@@ -61,6 +62,7 @@ class PseudocodeView final : public wxPanel {
     std::vector<SourceOriginLine> source_origins_;
     std::optional<Address> current_instruction_;
     std::vector<Address> stack_access_rows_;
+    std::vector<std::vector<Address>> stack_access_sites_;
     std::vector<std::uint8_t> stack_access_editable_;
     std::vector<Address> variable_definition_rows_;
     const FunctionRecord *function_ = nullptr;
