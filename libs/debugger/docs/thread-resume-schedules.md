@@ -23,7 +23,7 @@ These selector rules follow the [GDB packet specification](https://sourceware.or
 | Backend | Supported filtered schedule | Explicit restrictions |
 | --- | --- | --- |
 | Linux x86/x64 | One selected thread continues or steps; multiple selected threads may continue while others stay stopped. The event owner can remain stopped when another thread runs. | Every traced thread must be stopped. Deferred-event owners cannot be rescheduled. A pending software-breakpoint step-over limits runnable selection; multi-thread continue through that breakpoint is rejected. Mixed step/continue and multiple steps remain unsupported. |
-| Linux AArch64 | One selected thread continues or steps; multiple selected threads may continue. The event owner can remain stopped when another thread runs. | All-thread-stop, hardware configuration, deferred-event and pending-step checks remain active. Pending software/hardware execute-breakpoint step-over limits selection; mixtures and multiple steps remain unsupported. |
+| Linux AArch64 | One selected thread continues or steps; multiple selected threads may continue. The event owner can remain stopped when another thread runs. A scheduled action may preserve/redeliver its queued signal by default or suppress it with `signal_disposition = handled`; `not_handled` explicitly requests redelivery. | All-thread-stop, hardware configuration, deferred-event and pending-step checks remain active. Pending software/hardware execute-breakpoint step-over limits selection; mixtures and multiple steps remain unsupported. |
 | Windows | The event thread steps alone, or a continue-only subset including the event owner runs. Unselected peers retain one debugger-owned suspend count. | Foreign-thread steps, a held event owner with other runnable threads, mixed step/continue, multiple steps and an active displaced software-breakpoint step reject. ARM32 stepping remains unsupported. A Windows ARM64 execute-breakpoint step-over cannot run a multi-thread subset. |
 | Darwin | One exact continue or step action for a target proven to contain one thread. | Process-wide ptrace cannot implement multithread schedules; the existing Mach-thread census and stop-identity restrictions remain conservative. |
 
@@ -31,6 +31,18 @@ The Linux resume mechanisms predate this server integration. Explicit stop
 actions now preserve deferred-event owners instead of rejecting an otherwise
 safe schedule; trying to run those owners still fails. Backend feature/action
 availability does not imply support for every possible schedule combination.
+
+On Linux AArch64, a stopped action retains its pending signal for a later
+resume; `handled` explicitly suppresses it. Continue and single-step actions
+inject the retained signal unless `handled` is specified. Injecting a signal
+while a software or hardware execute breakpoint is pending bypasses the
+displaced-instruction step-over for that resume, leaving the breakpoint in
+place for a later encounter after signal handling. Queued signals are removed
+only after a successful resume or explicit suppression. This follows Linux
+ptrace signal-delivery semantics: the signal is injected by the next restart
+operation, and a zero signal suppresses it ([ptrace(2)](https://man7.org/linux/man-pages/man2/ptrace.2.html)).
+The RSP server still does not negotiate signal-delivery packets, so this
+disposition is currently available through the native scheduling API.
 
 ## Windows suspension ownership
 

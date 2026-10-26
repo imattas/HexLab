@@ -129,6 +129,17 @@ a timeout, and attached processes are not killed merely to force detach.
 Fork/vfork inferior tracking, cross-architecture AArch32 tracees, cross-endian
 tracees and general multi-thread single-step schedules remain unsupported.
 
+Thread resume schedules support signal-aware continue and single-step actions.
+An action without a signal disposition preserves/redelivers its queued signal;
+`handled` suppresses it and `not_handled` explicitly requests reinjection.
+Signals belonging to stop actions remain queued for that thread until a later
+resume or detach. When a signal is injected during a pending execute-breakpoint
+stop, the displaced-instruction helper is deferred so the original breakpoint
+remains installed and can be observed after the signal handler returns. Failed
+ptrace resumes retain queued signal state for retry. These rules use the
+documented ptrace restart signal argument ([ptrace(2)](https://man7.org/linux/man-pages/man2/ptrace.2.html));
+the RSP server does not yet expose signal-delivery packets.
+
 The kernel's [SVE ptrace interface](https://docs.kernel.org/arch/arm64/sve.html)
 defines VL in bytes and separate Z/P/FFR layouts. General and vector state
 remain explicit stopped-thread snapshots; inactive vector state is never
