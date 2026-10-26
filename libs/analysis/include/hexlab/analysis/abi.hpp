@@ -17,7 +17,9 @@ enum class CallingConvention {
     // Appended to preserve the ordinal values of previously shipped entries.
     x86_32_vectorcall, windows_x64_vectorcall, aapcs32,
     // Explicit MIPS ABI selectors; only Linux N64 is currently classified.
-    mips_o32, mips_n32, mips_n64
+    mips_o32, mips_n32, mips_n64,
+    // Explicit little-endian PowerPC64 ELFv2; ELF class alone cannot select it.
+    ppc64le_elfv2
 };
 enum class AbiLocationKind { register_, stack };
 enum class AbiStackCleanup { caller, callee };
@@ -96,6 +98,10 @@ struct AbiSignatureClassification {
 // AAPCS32 models the base PCS with R0-R3, split composites, and hidden result
 // pointers. It does not model VFP/Advanced SIMD register allocation or
 // AAPCS32 variadic call-site promotions.
+// PowerPC64 ELFv2 is selected explicitly as ppc64le_elfv2. It models binary
+// float/double, 1/2/4/8-byte integer and pointer scalars, and bounded C-like
+// integer-only structures with complete 8-byte chunks. See
+// docs/abi-classification.md for the exact limits and stack-area semantics.
 // For Microsoft x64, layout-only C-compatible aggregates of exactly 1, 2, 4,
 // or 8 bytes are passed/returned as integer values. Other aggregate parameters
 // are passed indirectly in their positional argument slot; other aggregate

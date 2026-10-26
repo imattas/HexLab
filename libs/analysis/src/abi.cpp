@@ -1503,6 +1503,187 @@ AbiSignatureClassification classify_riscv_integer(CallingConvention convention,
 } // namespace
 
 namespace {
+AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_type) {
+    AbiSignatureClassification out;
+    out.convention = CallingConvention::ppc64le_elfv2;
+    out.pointer_size = 8;
+    out.stack_alignment = 16;
+    out.stack_slot_size = 8;
+    out.stack_cleanup = AbiStackCleanup::caller;
+
+    const auto fail_signature = [&](std::string reason) {
+        out.complete = false;
+        out.result = unsupported(reason);
+        if (function_type.kind() == types::Kind::function)
+            for (std::size_t i = 0; i < function_type.parameters().size(); ++i)
+                out.arguments.push_back(unsupported(reason));
+        return out;
+    };
+    if (function_type.kind() != types::Kind::function || !function_type.result_type())
+        return fail_signature("input type is not a function signature");
+    if (function_type.variadic())
+        return fail_signature("PowerPC64 ELFv2 variadic placement is unsupported");
+    if (function_type.function_convention() != types::FunctionConvention::platform_default &&
+        function_type.function_convention() != types::FunctionConvention::c_decl)
+        return fail_signature("function declaration requests a different calling convention");
+
+    struct Shape {
+        enum class Class { invalid, integer, floating, aggregate, void_result } cls = Class::invalid;
+        std::uint64_t size = 0;
+        std::string reason;
+    };
+    const auto shape = [&](const types::Type &source, bool result) {
+        const auto &type = unqualified(source);
+        Shape s;
+        s.size = type.size().value_or(0);
+        if (type.kind() == types::Kind::void_type && result) {
+            s.cls = Shape::Class::void_result;
+            return s;
+        }
+        if (!s.size || !power_of_two(type.alignment()) || type.alignment() > 8) {
+            s.reason = "PowerPC64 ELFv2 value has incomplete size or unsupported alignment";
+            return s;
+        }
+        switch (type.kind()) {
+        case types::Kind::boolean:
+        case types::Kind::integer:
+        case types::Kind::enumeration:
+            if (s.size == 1 || s.size == 2 || s.size == 4 || s.size == 8)
+                s.cls = Shape::Class::integer;
+            else s.reason = "PowerPC64 ELFv2 integer width is unsupported";
+            break;
+        case types::Kind::pointer:
+            if (s.size == 8) s.cls = Shape::Class::integer;
+            else s.reason = "pointer width does not match PowerPC64 ELFv2";
+            break;
+        case types::Kind::floating:
+            // The type graph has no decimal/binary or long-double format tag.
+            // Only these C spellings identify the two binary scalar formats.
+            if ((s.size == 4 && type.name() == "float") ||
+                (s.size == 8 && type.name() == "double"))
+                s.cls = Shape::Class::floating;
+            else s.reason = "only binary float and double are modeled for PowerPC64 ELFv2";
+            break;
+        case types::Kind::structure: {
+            // Whole doubleword memory images avoid endian-dependent partial
+            // aggregate slots; padding may still exist inside the image.
+            // Reject classes with methods and all field classes needing special
+            // float, vector, union, or bitfield treatment. The caller must
+            // supply only C-compatible types; triviality is not modeled.
+            if ((s.size != 8 && s.size != 16 && s.size != 24 && s.size != 32) ||
+                type.members().empty() || !type.methods().empty()) {
+                s.reason = "PowerPC64 ELFv2 aggregate is outside the bounded C-like layout subset";
+                break;
+            }
+            bool valid = true;
+            std::uint64_t end = 0;
+            for (const auto &member : type.members()) {
+                if (!member.type || member.bit_width || member.bit_offset ||
+                    member.virtual_base || member.offset < end) { valid = false; break; }
+                const auto &field = unqualified(*member.type);
+                const auto field_size = field.size().value_or(0);
+                if ((field.kind() != types::Kind::boolean &&
+                     field.kind() != types::Kind::integer &&
+                     field.kind() != types::Kind::enumeration &&
+                     field.kind() != types::Kind::pointer) ||
+                    (field_size != 1 && field_size != 2 && field_size != 4 && field_size != 8) ||
+                    (field.kind() == types::Kind::pointer && field_size != 8) ||
+                    !power_of_two(field.alignment()) || field.alignment() > 8 ||
+                    member.offset > s.size || field_size > s.size - member.offset) {
+                    valid = false;
+                    break;
+                }
+                end = member.offset + field_size;
+            }
+            if (valid) s.cls = Shape::Class::aggregate;
+            else s.reason = "PowerPC64 ELFv2 aggregate fields require unsupported layout rules";
+            break;
+        }
+        default:
+            s.reason = "PowerPC64 ELFv2 vector, complex, array, union, or unresolved value is unsupported";
+            break;
+        }
+        return s;
+    };
+
+    const auto result = shape(*function_type.result_type(), true);
+    if (result.cls == Shape::Class::invalid)
+        return fail_signature(result.reason);
+    if (result.cls == Shape::Class::integer)
+        out.result.locations.push_back(reg_location("R3", result.size, 0, 8));
+    else if (result.cls == Shape::Class::floating)
+        out.result.locations.push_back(reg_location("F1", result.size, 0, 8));
+    else if (result.cls == Shape::Class::aggregate) {
+        if (result.size <= 16) {
+            for (std::uint64_t part = 0; part < result.size / 8; ++part)
+                out.result.locations.push_back(reg_location("R" + std::to_string(3 + part), 8, part * 8, 8));
+        } else {
+            out.result.indirect = true;
+            out.hidden_result_pointer = {true, {}, {
+                reg_location("R3", 8, 0, 8, AbiLocationRole::hidden_result_argument)}};
+            out.hidden_result_pointer.indirect = true;
+        }
+    }
+
+    // Each value occupies its parameter-save-area home, even when it uses FPRs.
+    // The home doubleword index selects R3-R10 and then SP+32 onward.
+    std::uint64_t slot = out.result.indirect ? 1 : 0;
+    std::uint64_t next_fpr = 1;
+    bool spilled = false;
+    bool placement_known = true;
+    for (const auto &parameter : function_type.parameters()) {
+        if (!placement_known) {
+            out.arguments.push_back(unsupported("preceding value makes PowerPC64 ELFv2 placement indeterminate"));
+            continue;
+        }
+        if (!parameter.type) {
+            out.arguments.push_back(unsupported("parameter has no type"));
+            out.complete = placement_known = false;
+            continue;
+        }
+        const auto value = shape(*parameter.type, false);
+        if (value.cls == Shape::Class::invalid || value.cls == Shape::Class::void_result) {
+            out.arguments.push_back(unsupported(value.reason.empty() ?
+                "void is only valid as a function result" : value.reason));
+            out.complete = placement_known = false;
+            continue;
+        }
+        const auto words = value.cls == Shape::Class::aggregate ? value.size / 8 : 1;
+        if (slot > (std::numeric_limits<std::uint64_t>::max() - 32) / 8 - words) {
+            out.arguments.push_back(unsupported("PowerPC64 ELFv2 parameter area overflows"));
+            out.complete = placement_known = false;
+            continue;
+        }
+        AbiValueLocation argument;
+        if (value.cls == Shape::Class::floating && next_fpr <= 13) {
+            argument.locations.push_back(reg_location("F" + std::to_string(next_fpr++),
+                                                     value.size, 0, 8));
+        } else if (value.cls != Shape::Class::floating && slot < 8 && words == 1) {
+            argument.locations.push_back(reg_location("R" + std::to_string(3 + slot),
+                                                     value.size, 0, 8));
+        } else {
+            for (std::uint64_t part = 0; part < words; ++part) {
+                const auto home = slot + part;
+                const auto part_size = value.cls == Shape::Class::aggregate ? 8 : value.size;
+                if (value.cls != Shape::Class::floating && home < 8)
+                    argument.locations.push_back(reg_location("R" + std::to_string(3 + home),
+                                                             part_size, part * 8, 8));
+                else {
+                    argument.locations.push_back(stack_location(32 + home * 8, part_size, 8,
+                                                                part * 8, 8));
+                    spilled = true;
+                }
+            }
+        }
+        slot += words;
+        out.arguments.push_back(std::move(argument));
+    }
+    // Once a stack home is used, the caller reserves the whole parameter save
+    // area, including its first eight doublewords.
+    if (spilled) out.stack_argument_bytes = std::max<std::uint64_t>(64, slot * 8);
+    return out;
+}
+
 AbiSignatureClassification classify_mips_n64(const types::Type &function_type) {
     AbiSignatureClassification out; out.convention = CallingConvention::mips_n64;
     out.pointer_size = 8; out.stack_alignment = 16; out.stack_slot_size = 8;
@@ -1631,6 +1812,8 @@ AbiSignatureClassification classify_mips_n64(const types::Type &function_type) {
 
 AbiSignatureClassification classify_abi_signature(CallingConvention convention,
                                                      const types::Type &function_type) {
+    if (convention == CallingConvention::ppc64le_elfv2)
+        return classify_ppc64le_elfv2(function_type);
     if (convention == CallingConvention::mips_n64)
         return classify_mips_n64(function_type);
     if (convention == CallingConvention::mips_o32 || convention == CallingConvention::mips_n32) {
