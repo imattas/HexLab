@@ -117,10 +117,11 @@ and any implicit this location in addition to locations.
 
 Decompiler type recovery consumes this classifier when a function has an
 explicit project prototype and a recognized System V AMD64, Microsoft x64,
-32-bit cdecl, or AAPCS64 profile. Single-location arguments constrain the
-matching incoming register or proven entry-stack load; indirect aggregate
-arguments constrain the address value as a pointer to the declared aggregate.
-Split aggregate/scalar values are not forced into one recovered variable type.
+32-bit cdecl, AAPCS64, MIPS N32, or PowerPC64 ELFv2 profile. Single-location
+arguments constrain the matching incoming register or proven entry-stack load;
+indirect aggregate arguments constrain the address value as a pointer to the
+declared aggregate. Split aggregate/scalar values are not forced into one
+recovered variable type.
 When a supported prototype can be rendered, typed pseudocode labels each
 parameter with its classified register or entry-stack offset. Unsupported
 placements receive no annotation, and indirect-call signatures are never

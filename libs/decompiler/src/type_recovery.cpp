@@ -636,11 +636,34 @@ std::optional<RegisterOperand> ppc64_classified_register(std::string_view name) 
                            static_cast<std::uint8_t>(index), 64, false};
 }
 
+std::optional<RegisterOperand> mips_n32_classified_register(std::string_view name) {
+    if (name.size() < 2) return {};
+    const auto parse_index = [&](std::size_t prefix) -> std::optional<unsigned> {
+        unsigned index = 0;
+        const auto parsed = std::from_chars(name.data() + prefix, name.data() + name.size(), index);
+        if (parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size()) return {};
+        return index;
+    };
+    if (name[0] == 'A') {
+        const auto index = parse_index(1);
+        if (index && *index < 8)
+            return RegisterOperand{RegisterBank::mips_gpr, static_cast<std::uint8_t>(4 + *index), 64, false};
+    } else if (name[0] == 'F') {
+        const auto index = parse_index(1);
+        if (index && (*index == 0 || (*index >= 12 && *index <= 19)))
+            return RegisterOperand{RegisterBank::mips_fpr, static_cast<std::uint8_t>(*index), 64, false};
+    } else if (name == "V0") {
+        return RegisterOperand{RegisterBank::mips_gpr, 2, 64, false};
+    }
+    return {};
+}
+
 std::optional<CallingConvention> classifier_convention(const AbiDescription &abi) {
     if (abi.name == "x86-64 System V") return CallingConvention::sysv_x86_64;
     if (abi.name == "x86-64 Windows") return CallingConvention::windows_x64;
     if (abi.name == "AArch64 AAPCS64") return CallingConvention::aapcs64;
     if (abi.name == "PowerPC64 ELFv2") return CallingConvention::ppc64le_elfv2;
+    if (abi.name == "MIPS N32 hard-float scalar profile") return CallingConvention::mips_n32;
     if (abi.name == "x86-32 cdecl") return CallingConvention::x86_32_cdecl;
     return {};
 }
@@ -762,6 +785,41 @@ std::vector<AbiArgumentSlot> ppc64_elfv2_prototype_slots(const types::TypePtr &p
         } else if (location.stack_offset <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
             slots.push_back({value_class, {}, static_cast<std::int64_t>(location.stack_offset),
                              static_cast<std::uint16_t>(index)});
+        }
+    }
+    return slots;
+}
+
+std::vector<AbiArgumentSlot> mips_n32_prototype_slots(const types::TypePtr &prototype) {
+    std::vector<AbiArgumentSlot> slots;
+    if (!prototype || prototype->kind() != types::Kind::function || prototype->parameters().size() > 256)
+        return slots;
+    const auto classified = classify_abi_signature(CallingConvention::mips_n32, *prototype);
+    if (classified.arguments.size() != prototype->parameters().size()) return slots;
+    for (std::size_t index = 0; index < classified.arguments.size(); ++index) {
+        const auto &placement = classified.arguments[index];
+        const auto type = index < prototype->parameters().size()
+            ? unqualified_type(prototype->parameters()[index].type) : types::TypePtr{};
+        const auto value_class = type && type->kind() == types::Kind::floating
+            ? AbiValueClass::floating : AbiValueClass::integer;
+        const auto parameter_index = static_cast<std::uint16_t>(index);
+        if (!placement.supported || placement.locations.size() != 1) {
+            slots.push_back({value_class, {}, {}, parameter_index, {}, {}, {}, false});
+            continue;
+        }
+        const auto &location = placement.locations.front();
+        if (location.kind == AbiLocationKind::register_) {
+            const auto reg = mips_n32_classified_register(location.register_name);
+            if (!reg) {
+                slots.push_back({value_class, {}, {}, parameter_index, {}, {}, {}, false});
+                continue;
+            }
+            slots.push_back({value_class, *reg, {}, parameter_index});
+        } else if (location.kind == AbiLocationKind::stack &&
+                   location.stack_offset <= static_cast<std::uint64_t>(INT64_MAX)) {
+            slots.push_back({value_class, {}, static_cast<std::int64_t>(location.stack_offset), parameter_index});
+        } else {
+            slots.push_back({value_class, {}, {}, parameter_index, {}, {}, {}, false});
         }
     }
     return slots;
@@ -1614,9 +1672,12 @@ static Result<TypeRecoveryResult> recover_types_impl(
                         constrained_type = pointer.value();
                     }
                     if (location.kind == AbiLocationKind::register_) {
-                        if (const auto reg = abi.name == "PowerPC64 ELFv2"
-                                ? ppc64_classified_register(location.register_name)
-                                : classified_register(location.register_name))
+                        const auto reg = abi.name == "PowerPC64 ELFv2"
+                            ? ppc64_classified_register(location.register_name)
+                            : abi.name == "MIPS N32 hard-float scalar profile"
+                                ? mips_n32_classified_register(location.register_name)
+                                : classified_register(location.register_name);
+                        if (reg)
                             constrain_register(*reg, constrained_type);
                     } else if (location.stack_offset <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
                         constrain_stack_slot(static_cast<std::int64_t>(location.stack_offset), constrained_type);
@@ -2867,7 +2928,19 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 }
             }
         }
-        if (abi.name == "AArch64 AAPCS64") {
+        if (abi.name == "MIPS N32 hard-float scalar profile") {
+            bool observed_argument = !stack_arguments.empty();
+            for (const auto reg : abi.integer_argument_registers)
+                observed_argument = observed_argument || incoming_register_fact(reg) != nullptr;
+            for (const auto reg : abi.floating_argument_registers)
+                observed_argument = observed_argument || incoming_register_fact(reg) != nullptr;
+            if (observed_argument) {
+                unresolved_argument_order = true;
+                inferred_parameters.clear();
+                result.diagnostics.push_back(
+                    "MIPS N32 register and stack reads do not establish ordered parameter declarations without a prototype");
+            }
+        } else if (abi.name == "AArch64 AAPCS64") {
             std::vector<std::pair<RegisterOperand, Fact>> integer_facts, floating_facts;
             for (const auto reg : abi.integer_argument_registers)
                 if (const auto *fact = incoming_register_fact(reg)) integer_facts.emplace_back(reg, *fact);
@@ -3509,6 +3582,9 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         if (abi.name == "PowerPC64 ELFv2")
             return prototype && prototype->kind() == types::Kind::function
                 ? ppc64_elfv2_prototype_slots(prototype) : std::vector<AbiArgumentSlot>{};
+        if (abi.name == "MIPS N32 hard-float scalar profile")
+            return prototype && prototype->kind() == types::Kind::function
+                ? mips_n32_prototype_slots(prototype) : std::vector<AbiArgumentSlot>{};
         if (abi.name == "MIPS64 Linux N64 hard-float scalar profile" &&
             prototype && prototype->kind() == types::Kind::function) {
             std::vector<AbiArgumentSlot> slots;

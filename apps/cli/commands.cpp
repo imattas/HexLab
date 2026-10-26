@@ -836,8 +836,10 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
                 if (take(detect_format(*member_storage)) != DetectedFormat::macho_candidate) continue;
                 summaries.push_back(take(summarize_macho_ar_member(*member_storage, i)));
             }
+            const auto entry_symbol = wide_to_utf8(args[5]);
             std::vector<std::string_view> roots, definitions;
             for (const auto &name : root.undefined) roots.emplace_back(name);
+            roots.emplace_back(entry_symbol); // The entry may be defined only by an archive member.
             for (const auto &name : root.definitions) definitions.emplace_back(name);
             const auto selected = take(select_ar_members_fixed_point(archive, summaries, roots, definitions));
             if (!selected.unresolved_symbols.empty())
@@ -845,7 +847,7 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
             std::vector<std::shared_ptr<const ByteStorage>> objects{root_storage};
             for (const auto &item : selected.members)
                 objects.push_back(take(open_ar_member(storage, archive.members[item.member_index])));
-            const auto linked = take(link_macho64_executable(objects, wide_to_utf8(args[5])));
+            const auto linked = take(link_macho64_executable(objects, entry_symbol));
             write_archive_output(path_from_wide(args[7]), linked, false);
             out << "Linked static Mach-O: objects=" << objects.size() << " bytes=" << linked.size()
                 << " relocations-applied=true\n";
