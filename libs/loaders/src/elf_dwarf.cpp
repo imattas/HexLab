@@ -277,18 +277,38 @@ DwarfEmbeddedPackageResolvers read_dwp_resolvers(const ByteStorage &storage, con
             {1, ".debug_info.dwo"}, {3, ".debug_abbrev.dwo"}, {4, ".debug_line.dwo"},
             {5, ".debug_loclists.dwo"}, {6, ".debug_str_offsets.dwo"}, {7, ".debug_macro.dwo"},
             {8, ".debug_rnglists.dwo"}, {9, ".debug_addr.dwo"}};
+    // RELA offsets in a DWP refer to the containing ELF section, not to an
+    // individual CU/TU contribution. Keep full package-section buffers and
+    // apply relocations before the package resolver slices contributions.
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> relocation_buffers;
+    const auto add_relocation_buffer = [&](const ElfSection *section, std::vector<std::uint8_t> &bytes) {
+        if (!section || bytes.empty()) return;
+        const auto index = static_cast<std::uint32_t>(section - metadata.sections.data());
+        relocation_buffers.emplace_back(index, &bytes);
+    };
     for (const auto &[id, name] : names) {
         canceled(stop);
         if (!has_compile_units && id != 1 && id != 2 && id != 3 && id != 4 && id != 6) continue;
-        if (const auto *section = debug_section(metadata, name); section && section->size)
-            package->sections.emplace(id, read_debug_bytes(storage, metadata, *section, budget, stop));
+        if (const auto *section = debug_section(metadata, name); section && section->size) {
+            auto [entry, inserted] = package->sections.emplace(
+                id, read_debug_bytes(storage, metadata, *section, budget, stop));
+            require(inserted, "duplicate DWP package section ID");
+            add_relocation_buffer(section, entry->second);
+        }
     }
     if (const auto *strings = optional_debug_section(metadata, ".debug_str.dwo")) {
-        if (strings->size) package->strings = read_debug_bytes(storage, metadata, *strings, budget, stop);
+        if (strings->size) {
+            package->strings = read_debug_bytes(storage, metadata, *strings, budget, stop);
+            add_relocation_buffer(strings, package->strings);
+        }
     }
     if (const auto *strings = optional_debug_section(metadata, ".debug_line_str.dwo")) {
-        if (strings->size) package->line_strings = read_debug_bytes(storage, metadata, *strings, budget, stop);
+        if (strings->size) {
+            package->line_strings = read_debug_bytes(storage, metadata, *strings, budget, stop);
+            add_relocation_buffer(strings, package->line_strings);
+        }
     }
+    relocate_dwarf_data(metadata, relocation_buffers, stop);
 
     DwarfEmbeddedPackageResolvers result;
     result.package = package;

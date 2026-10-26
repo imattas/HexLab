@@ -5,7 +5,7 @@
 #include "hexlab/analysis/signatures.hpp"
 namespace hexlab {
 struct ProjectOperationId {std::uint64_t value=0;bool operator==(const ProjectOperationId&)const=default;};
-enum class ProjectOperationKind {open_project,import_binary,command,undo,redo,save,save_as,backup,export_binary,analyze,persist_recognition,read_recognition,close,refresh_external,refresh_if_external,history_page,history_preview,persist_breakpoint_hits,history_audit};
+enum class ProjectOperationKind {open_project,import_binary,command,undo,redo,save,save_as,backup,export_binary,analyze,persist_recognition,read_recognition,close,refresh_external,refresh_if_external,history_page,history_preview,persist_breakpoint_hits,persist_type_import_diagnostics,history_audit};
 struct ProjectReply {
     ProjectOperationKind kind;std::shared_ptr<const ProjectSnapshot> snapshot;
     std::optional<database::SavedProject> saved;std::optional<ExportReceipt> exported;
@@ -40,6 +40,7 @@ public:
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> persist_function_recognition(FunctionRecognitionEvidence);
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> read_function_recognition(FunctionRecognitionKind);
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> persist_breakpoint_hit_counts(std::vector<database::BreakpointHitCount>);
+    HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> replace_type_import_diagnostics(std::vector<database::TypeImportDiagnostic>);
     // Read-only, revision-pinned durable history queries. The history preview
     // is never adopted into the live project session.
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> history_page(std::uint64_t expected_edit,

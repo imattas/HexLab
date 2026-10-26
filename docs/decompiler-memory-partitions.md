@@ -16,13 +16,16 @@ The partitioner recognizes three bounded forms:
 - **Pointer-relative ranges:** a base register must have a proven SSA pointer
   origin through supported copies, constant offsets, constant-proven SSA
   register offsets, and unanimous phi inputs. Integer offsets are propagated
-  from literals, same-width copies, and unanimous phis before pointer origins
-  are solved, so an address expression such as `base + offset_register` can
-  produce an exact range when that register has one proven value.
+  from literals, same-width copies, unanimous phis, and checked same-width
+  `add`, `sub`, or `mul` trees with no intermediate wrap and at most 32
+  expression levels before pointer origins are solved, so an address
+  expression such as `base + offset_register` can produce an exact range when
+  that register has one proven value.
   The memory access may have no index register, or use a same-width index whose
   exact nonnegative integer constant is proven through a literal, same-width
-  copy, or unanimous phi. Indexed scale/shift and displacement arithmetic must
-  fit the checked signed offset bounds. The access also needs a bounded byte
+  copy, unanimous phi, or a checked same-width `add`, `sub`, or `mul` tree with
+  no intermediate wrap and at most 32 expression levels. Indexed scale/shift
+  and displacement arithmetic must fit the checked signed offset bounds. The access also needs a bounded byte
   width. Ranges sharing the same root register version and overlapping offsets
   are grouped together. Call results and call-clobbered register
   definitions are accepted as opaque roots, so accesses through a copied or
@@ -51,7 +54,8 @@ the function keeps only whole-memory SSA.
 This does not partition heap or global accesses whose address cannot be proven,
 aliases reached through unrelated roots, variable or signed-negative indices,
 index extensions other than the proven same-width form, or pointer arithmetic
-whose offset is not a proven nonnegative constant (or direct subtraction of
-one) in a same-width integer expression. The IR keeps these partitions
+whose offset is not a proven nonnegative constant in a supported same-width
+integer expression. Signed-negative offset interpretation and wrapping
+arithmetic remain unsupported. The IR keeps these partitions
 supplementary: passes that ignore `memory_partition` continue to use the coarser
 `memory_version` chain.

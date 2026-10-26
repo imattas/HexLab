@@ -63,19 +63,45 @@ std::optional<PointerOrigin> pointer_origin(const ExpressionPtr &expression, con
 
 std::optional<std::uint64_t> integer_constant(const ExpressionPtr &expression,
                                               const IntegerConstants &constants) {
-    if (!expression || expression->type.kind != TypeKind::integer || !expression->type.bits ||
-        expression->type.bits > 64) return {};
-    if (const auto *constant = std::get_if<ConstantValue>(&expression->value)) {
-        if (constant->type.kind != TypeKind::integer || constant->type.bits != expression->type.bits) return {};
-        if (expression->type.bits == 64) return constant->value;
-        return constant->value & ((std::uint64_t{1} << expression->type.bits) - 1);
-    }
-    if (const auto *reg = std::get_if<RegisterValue>(&expression->value)) {
-        if (!reg->version || reg->reg.width != expression->type.bits) return {};
-        const auto found = constants.find({key(reg->reg), *reg->version});
-        if (found != constants.end()) return found->second;
-    }
-    return {};
+    const auto evaluate = [&](const auto &self, const ExpressionPtr &node, unsigned depth)
+        -> std::optional<std::uint64_t> {
+        constexpr unsigned max_constant_expression_depth = 32;
+        if (depth > max_constant_expression_depth || !node ||
+            node->type.kind != TypeKind::integer || !node->type.bits || node->type.bits > 64) return {};
+        const auto width = node->type.bits;
+        const auto mask = width == 64 ? std::numeric_limits<std::uint64_t>::max()
+                                      : (std::uint64_t{1} << width) - 1;
+        if (const auto *constant = std::get_if<ConstantValue>(&node->value)) {
+            if (constant->type.kind != TypeKind::integer || constant->type.bits != width ||
+                constant->value > mask) return {};
+            return constant->value;
+        }
+        if (const auto *reg = std::get_if<RegisterValue>(&node->value)) {
+            if (!reg->version || reg->reg.width != width) return {};
+            const auto found = constants.find({key(reg->reg), *reg->version});
+            if (found != constants.end() && found->second <= mask) return found->second;
+            return {};
+        }
+        const auto *binary = std::get_if<BinaryValue>(&node->value);
+        if (!binary || !binary->left || !binary->right ||
+            binary->left->type.kind != TypeKind::integer || binary->right->type.kind != TypeKind::integer ||
+            binary->left->type.bits != width || binary->right->type.bits != width ||
+            (binary->operation != "add" && binary->operation != "sub" && binary->operation != "mul")) return {};
+        const auto left = self(self, binary->left, depth + 1);
+        const auto right = self(self, binary->right, depth + 1);
+        if (!left || !right) return {};
+        if (binary->operation == "add") {
+            if (*right > mask - *left) return {};
+            return *left + *right;
+        }
+        if (binary->operation == "sub") {
+            if (*left < *right) return {};
+            return *left - *right;
+        }
+        if (*right && *left > mask / *right) return {};
+        return *left * *right;
+    };
+    return evaluate(evaluate, expression, 0);
 }
 
 std::optional<DynamicMemoryRange> dynamic_memory_range(const MemoryValue &memory, const PointerOrigins &origins,

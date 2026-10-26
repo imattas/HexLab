@@ -34,20 +34,24 @@ keeps findings aligned with edited or restored project bytes even before a newly
 loaded diagnostic set is written to the project. Project loader and runtime-relocation
 diagnostics are stored with the project in schema v12 and are replaced together in
 one transaction only after a complete loader pass succeeds. A failed or canceled
-load leaves the last completed set intact. Type-import and decompiler findings remain transient and
-scoped to their producing open document. It caps the combined list at 20,000 findings, admits up to
+load leaves the last completed set intact. The latest completed C-header/PDB
+type-import report is stored with writable projects in schema v13, outside user
+edit history, and replaced atomically when another import completes. Read-only
+and file-only documents keep import reports only for the open document.
+Decompiler findings remain transient and scoped to the selected function. It caps the combined list at 20,000 findings, admits up to
 2,048 rows per diagnostic source (loader, runtime relocation, type import, and
 decompiler) within the combined cap, and scans at most 100,000 functions; the status line reports when those limits truncate
 the view and whether analysis is partial.
 
 Type-import rows remain until the next completed header or PDB import replaces
-them; canceling an import leaves the last completed result visible. Decompiler
-rows reflect the current pseudocode render and clear when no recovered function
-is selected. Switching or closing tabs clears the old document's visible loader
-diagnostics. A file-only tab has no recovered-function scope; its addressed
+them; canceling an import leaves the last completed result visible. Writable
+project reports survive closing and reopening the project. Decompiler rows
+reflect the current pseudocode render and clear when no recovered function
+is selected. Transient type-import rows and decompiler rows are scoped to an open
+document. A file-only tab has no recovered-function scope; its addressed
 diagnostics still navigate within that binary. TSV export is available for
-projects, whose protected paths prevent overwriting the source. These bounded
-UI results are kept per open document and are not persisted. Debugger output has no structured
+projects, whose protected paths prevent overwriting the source. Transient UI
+results are kept per open document and are not persisted. Debugger output has no structured
 diagnostic model and is not included. The page does not re-run analysis,
 classify every candidate as a defect, or resolve conflicts; use the normal
 project edit commands after navigating to a finding when an analysis decision

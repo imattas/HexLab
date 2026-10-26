@@ -39,7 +39,7 @@ struct ProjectActor::Impl {
     struct Work {
         ProjectOperationId id;ProjectOperationKind kind=ProjectOperationKind::command;
         std::filesystem::path path;ProjectMode mode=ProjectMode::read_write;ReplacePolicy policy=ReplacePolicy::fail_if_exists;
-        AnalysisOptions options;OpenRequest input;std::optional<ProjectCommand> command;std::vector<ProjectCommand> commands;std::optional<FunctionRecognitionEvidence> recognition;std::vector<database::BreakpointHitCount> breakpoint_hits;FunctionRecognitionKind recognition_kind=FunctionRecognitionKind::byte_signatures;database::HistoryPreviewLimits history_preview_limits{};database::HistoryAuditLimits history_audit_limits{};uint64_t expected_edit=0,after_step=0,target_step=0;std::size_t history_limit=256;uint64_t group=0;bool force=false,replace_options=false,finished=false;
+        AnalysisOptions options;OpenRequest input;std::optional<ProjectCommand> command;std::vector<ProjectCommand> commands;std::optional<FunctionRecognitionEvidence> recognition;std::vector<database::BreakpointHitCount> breakpoint_hits;std::vector<database::TypeImportDiagnostic> type_import_diagnostics;FunctionRecognitionKind recognition_kind=FunctionRecognitionKind::byte_signatures;database::HistoryPreviewLimits history_preview_limits{};database::HistoryAuditLimits history_audit_limits{};uint64_t expected_edit=0,after_step=0,target_step=0;std::size_t history_limit=256;uint64_t group=0;bool force=false,replace_options=false,finished=false;
         std::stop_source stop;std::promise<Result<ProjectReply>> promise;std::shared_future<Result<ProjectReply>> future=promise.get_future().share();
     };
     struct Waiting {std::shared_ptr<Work> work;AnalysisKey source;};
@@ -214,6 +214,10 @@ struct ProjectActor::Impl {
                 result.snapshot=take(context.session->persist_breakpoint_hit_counts(work->breakpoint_hits,work->stop.get_token()));
                 publish(result.snapshot);break;
             }
+            case ProjectOperationKind::persist_type_import_diagnostics:{
+                result.snapshot=take(context.session->replace_type_import_diagnostics(work->type_import_diagnostics,work->stop.get_token()));
+                publish(result.snapshot);break;
+            }
             case ProjectOperationKind::history_page:{
                 result.history_page=take(context.store->history_page(work->expected_edit,work->after_step,
                     work->history_limit,work->stop.get_token()));
@@ -276,6 +280,7 @@ Result<ProjectSubmission> ProjectActor::ready(bool force){auto work=std::make_sh
 Result<ProjectSubmission> ProjectActor::persist_function_recognition(FunctionRecognitionEvidence evidence){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::persist_recognition;work->recognition=std::move(evidence);return impl_->enqueue(std::move(work));}
 Result<ProjectSubmission> ProjectActor::read_function_recognition(FunctionRecognitionKind kind){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::read_recognition;work->recognition_kind=kind;return impl_->enqueue(std::move(work));}
 Result<ProjectSubmission> ProjectActor::persist_breakpoint_hit_counts(std::vector<database::BreakpointHitCount> counters){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::persist_breakpoint_hits;work->breakpoint_hits=std::move(counters);return impl_->enqueue(std::move(work));}
+Result<ProjectSubmission> ProjectActor::replace_type_import_diagnostics(std::vector<database::TypeImportDiagnostic> diagnostics){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::persist_type_import_diagnostics;work->type_import_diagnostics=std::move(diagnostics);return impl_->enqueue(std::move(work));}
 Result<ProjectSubmission> ProjectActor::history_page(uint64_t expected_edit,uint64_t after_step,std::size_t limit){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::history_page;work->expected_edit=expected_edit;work->after_step=after_step;work->history_limit=limit;return impl_->enqueue(std::move(work));}
 Result<ProjectSubmission> ProjectActor::preview_history_at(uint64_t expected_edit,uint64_t target_step,database::HistoryPreviewLimits limits){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::history_preview;work->expected_edit=expected_edit;work->target_step=target_step;work->history_preview_limits=limits;return impl_->enqueue(std::move(work));}
 Result<ProjectSubmission> ProjectActor::audit_history(uint64_t expected_edit,uint64_t after_step,database::HistoryAuditLimits limits){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::history_audit;work->expected_edit=expected_edit;work->after_step=after_step;work->history_audit_limits=limits;return impl_->enqueue(std::move(work));}
