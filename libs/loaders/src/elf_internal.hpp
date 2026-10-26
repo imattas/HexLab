@@ -62,6 +62,8 @@ class Reader {
     }
 };
 void read_tables(const ByteStorage &, ElfMetadata &, Budget &, std::stop_token);
+std::vector<std::uint8_t> read_debug_section_bytes(const ByteStorage &, const ElfMetadata &,
+    const ElfSection &, Budget &, std::stop_token);
 void read_core_notes(ElfMetadata &, Budget &, std::stop_token);
 Result<bool> read_source_lines(const ByteStorage &, ElfMetadata &, Budget &, std::stop_token);
 Result<bool> read_dwarf_info(const ByteStorage &, ElfMetadata &, Budget &, std::stop_token,
