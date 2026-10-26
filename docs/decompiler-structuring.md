@@ -96,26 +96,25 @@ Each nested branch must have a single predecessor, and the full region must
 have disjoint arms with validated edges and memory phis. Deeper nesting, shared
 arm blocks, and ambiguous joins retain the state-machine or goto fallback.
 
-A pre-tested parent loop also accepts a two-latch conditional join: both arms
-of one loop-body branch may follow disjoint, phi-free unconditional chains
-back to the loop header. The header must have exactly the preheader and those
-two latch tails as predecessors; every header phi must have one input for each
-edge. Each arm emits its own simultaneous phi copies and `continue`, so the
-header condition is reevaluated after either latch. One arm may contain one
-additional conditional whose two validated paths also reach the header, giving
-three latch tails in total. Header phis must cover the preheader and every tail;
-each leaf emits its own simultaneous copies and `continue`. Ambiguous header
-predecessors, shared latches, deeper decision trees, and more than three latch
-tails remain on the state-machine or explicit label/goto path. Parent and child
-diamonds use the same bounded validation: at most 1,024 blocks and 4,096 edges,
-unique block IDs and addresses, resolved edges matching recorded block IDs, and
-complete memory-phi predecessor inputs on the consumed region. The prepass
-rejects loop-diamond structuring for functions with more than 65,536 combined
-whole-memory and partition-memory phi inputs, and each block is limited to
-4,096 partition phis. Multiple
-register-phi values use parallel copies, preserving simultaneous updates.
-General nested SSA joins, multiple nested latches, and side exits that are not a
-recognized child `break` retain the conservative fallback.
+A pre-tested parent loop accepts a bounded conditional decision tree whose
+leaves follow disjoint, phi-free unconditional chains back to the loop header.
+The tree may contain up to eight latch tails and four nested branch levels.
+The header must have exactly the preheader and every latch tail as CFG
+predecessors, and every header phi must contain exactly one input for each
+predecessor. Each leaf emits its own simultaneous edge copies and `continue`,
+so the header condition is reevaluated after every latch. Branches and chains
+must have exact recorded edges and unique predecessors; shared latches,
+overlapping paths, extra header predecessors, or larger/deeper trees use the
+state-machine or explicit label/goto path. Parent and child diamonds use the
+same bounded validation: at most 1,024 blocks and 4,096 edges, unique block IDs
+and addresses, resolved edges matching recorded block IDs, and complete
+whole-memory and partition-memory phi predecessor inputs on the consumed
+region. The prepass rejects loop-diamond structuring for functions with more
+than 65,536 combined whole-memory and partition-memory phi inputs, and each
+block is limited to 4,096 partition phis. Multiple register-phi values use
+parallel copies, preserving simultaneous updates.
+General nested SSA joins, overlapping latch paths, and side exits that are not
+a recognized child `break` retain the conservative fallback.
 It can also contain a complete switch dispatch when every distinct target
 follows a bounded, phi-free straight-line path to one shared continuation.
 Each case path stays inside the loop, emits once, and ends with a switch
