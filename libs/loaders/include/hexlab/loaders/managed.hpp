@@ -102,19 +102,32 @@ struct ManagedTypeSpecification {
   std::uint32_t token=0;
   ManagedTypeSignature signature;
 };
+enum class ManagedExportedTypeImplementationKind { file, assembly_ref, exported_type };
+struct ManagedExportedType {
+  std::uint32_t token=0, flags=0, type_def_id=0;
+  std::uint32_t implementation_coded_index=0, implementation_token=0;
+  ManagedExportedTypeImplementationKind implementation_kind=ManagedExportedTypeImplementationKind::file;
+  std::string name, namespace_name, full_name;
+  bool forwarding_valid=false;
+  // Present only when this row (or its enclosing ExportedType) names an
+  // AssemblyRef. File implementations retain their token but stay unresolved.
+  std::optional<ManagedAssemblyIdentity> assembly_scope;
+};
 struct ManagedTypeCatalog {
   std::optional<ManagedAssemblyIdentity> assembly_identity;
   std::vector<ManagedTypeDefinition> definitions;
   std::vector<ManagedTypeReference> references;
+  std::vector<ManagedExportedType> exported_types;
   std::vector<ManagedTypeSpecification> specifications;
 };
 // Returns true only when `candidate` is proven assignable to `target` through
 // the bounded in-module TypeDef base/interface graph. Unknown/external edges
 // and unresolved TypeSpecs return false.
 HEXLAB_LOADERS_EXPORT bool managed_type_is_assignable(const ManagedTypeCatalog&,std::uint32_t candidate,std::uint32_t target);
-// Binds exact AssemblyRef identities to a unique catalog and a unique TypeDef
-// full name. Missing and ambiguous inputs remain unbound. The operation is
-// deterministic and does not load assemblies from disk.
+// Binds exact AssemblyRef identities through unique TypeDefs or supported
+// ExportedType forwarders in the supplied catalogs. Missing, ambiguous,
+// unsupported, and cyclic paths remain unbound with an unresolved_scope
+// diagnostic. The operation never loads assemblies from disk.
 HEXLAB_LOADERS_EXPORT Result<bool> bind_managed_type_references(std::span<ManagedTypeCatalog> catalogs);
 // Like the in-module query above, but follows uniquely bound TypeRefs across
 // the supplied catalogs. Tokens are interpreted in the catalog identified by
