@@ -13,6 +13,13 @@ manual code-region roots are admitted before metadata-derived roots. Omitted
 automatic roots remain ownership boundaries, so the cap cannot make their
 bytes silently merge into another function.
 
+ARM predicate handling is shared in intent across reachable scanning and
+function recovery: A32 conditional instructions and Thumb instructions with a
+conditional or unresolved IT predicate preserve the skipped path for terminal
+returns/traps and unsupported PC writes. An unsupported PC write remains a
+bounded stop; the extra edge does not invent or validate a target. Thumb
+`unknown_it` is used only when the propagated incoming IT state is unresolved.
+
 Validated PE TLS callback entries are also roots because the loader invokes
 them independently of the image entry point. Callback RVAs are translated
 against the currently mapped PE base, then passed through the normal

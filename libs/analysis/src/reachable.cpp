@@ -12,6 +12,11 @@
 
 namespace hexlab {
 namespace {
+bool arm_predicate_can_skip(const Instruction &instruction) {
+    return instruction.arm && (instruction.arm->predicate == ArmPredicate::condition ||
+                               instruction.arm->predicate == ArmPredicate::unknown_it);
+}
+
 struct FixupFailure {
     Error error;
 };
@@ -402,11 +407,11 @@ Result<AnalysisSnapshot> analyze(const Image &image, const ImageMetadata &metada
                           "Instruction length is known, but typed operand/control-flow semantics are unavailable");
                 continue;
             }
-            if (arm_mode && instruction.arm && instruction.arm->writes_pc &&
-                instruction.flow == FlowKind::fallthrough) {
+            const bool unmodeled_arm_pc_write = arm_mode && instruction.arm && instruction.arm->writes_pc &&
+                                                instruction.flow == FlowKind::fallthrough;
+            if (unmodeled_arm_pc_write) {
                 terminate(address, StopReason::unsupported,
                           "ARM instruction writes PC without a modeled control-flow edge");
-                continue;
             }
             const auto opaque = relocation_index.value().instruction_fixup(instruction, stop);
             if (!opaque)
@@ -445,18 +450,22 @@ Result<AnalysisSnapshot> analyze(const Image &image, const ImageMetadata &metada
             };
             if (instruction.flow == FlowKind::ret) {
                 terminate(address, StopReason::ret, "Return", false);
-                if (arm_mode && instruction.arm && instruction.arm->predicate == ArmPredicate::condition)
+                if (arm_mode && arm_predicate_can_skip(instruction))
                     fallthrough();
                 continue;
             }
             if (instruction.flow == FlowKind::trap) {
                 terminate(address, StopReason::trap, "Trap", false);
-                if (arm_mode && instruction.arm && instruction.arm->predicate == ArmPredicate::condition)
+                if (arm_mode && arm_predicate_can_skip(instruction))
                     fallthrough();
                 continue;
             }
             if (instruction.flow == FlowKind::fallthrough) {
-                fallthrough();
+                if (unmodeled_arm_pc_write) {
+                    if (arm_predicate_can_skip(instruction))
+                        fallthrough();
+                } else
+                    fallthrough();
                 continue;
             }
             if (instruction.flow == FlowKind::switch_dispatch) {

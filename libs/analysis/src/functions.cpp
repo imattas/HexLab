@@ -1008,11 +1008,19 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
     case FlowKind::trap:
         value.stop = FunctionStop{address, FunctionStopReason::trap, "Trap"};
         if (instruction.context.architecture == Architecture::arm && instruction.arm &&
-            instruction.arm->predicate == ArmPredicate::condition)
+            (instruction.arm->predicate == ArmPredicate::condition ||
+             instruction.arm->predicate == ArmPredicate::unknown_it))
             continuation(BlockEdgeKind::conditional_false);
         break;
     case FlowKind::fallthrough:
-        continuation(BlockEdgeKind::fallthrough);
+        if (instruction.context.architecture == Architecture::arm && instruction.arm && instruction.arm->writes_pc) {
+            value.stop = FunctionStop{address, FunctionStopReason::unsupported,
+                                      "ARM instruction writes PC without a modeled control-flow edge"};
+            if (instruction.arm->predicate == ArmPredicate::condition ||
+                instruction.arm->predicate == ArmPredicate::unknown_it)
+                continuation(BlockEdgeKind::conditional_false);
+        } else
+            continuation(BlockEdgeKind::fallthrough);
         break;
     case FlowKind::call:
         value.call = true;
@@ -1537,7 +1545,7 @@ namespace hexlab {
 Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     Sha256 hash;
     constexpr std::string_view version =
-        "hexlab-functions-v50/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v3/dex-switch-flow-v1/jvm-switch-flow-v1/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v3/arm-a32-predicate-thumb-it-flow-v3/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v3/guard-multiblock-v1/unicode-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
+        "hexlab-functions-v51/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v3/dex-switch-flow-v1/jvm-switch-flow-v1/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v3/guard-multiblock-v1/unicode-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
         "elf-reference-provenance-v1/elf-arithmetic-v2/macho-symbol-roots-v1/macho-relocation-flow-v1/"
         "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1";
     (void)hash.update(std::as_bytes(std::span(version)));
