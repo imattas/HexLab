@@ -2439,6 +2439,35 @@ a64_unhandled:
         const auto assign_value = [&](ExpressionPtr value) -> Statement {
             return dst ? Statement{Assign{*dst, std::move(value)}} : Statement{Intrinsic{"riscv", operands}};
         };
+        if (dst && operands.size() == 3 &&
+            (op == Opcode::rv_sh1add || op == Opcode::rv_sh2add || op == Opcode::rv_sh3add ||
+             op == Opcode::rv_add_uw || op == Opcode::rv_sh1add_uw || op == Opcode::rv_sh2add_uw ||
+             op == Opcode::rv_sh3add_uw || op == Opcode::rv_slli_uw)) {
+            auto index = operands[1];
+            const auto base = operands[2];
+            const bool unsigned_word = op == Opcode::rv_add_uw || op == Opcode::rv_sh1add_uw ||
+                                       op == Opcode::rv_sh2add_uw || op == Opcode::rv_sh3add_uw ||
+                                       op == Opcode::rv_slli_uw;
+            if (unsigned_word) {
+                index = std::make_shared<Expression>(Expression{integer_type(64),
+                    UnaryValue{"zext", std::make_shared<Expression>(Expression{integer_type(32),
+                        UnaryValue{"trunc32", std::move(index)}})}});
+            }
+            const auto shift = op == Opcode::rv_sh1add || op == Opcode::rv_sh1add_uw ? 1u :
+                               op == Opcode::rv_sh2add || op == Opcode::rv_sh2add_uw ? 2u :
+                               op == Opcode::rv_sh3add || op == Opcode::rv_sh3add_uw ? 3u : 0u;
+            if (op == Opcode::rv_slli_uw) {
+                auto value = std::make_shared<Expression>(Expression{integer_type(dst->width),
+                    BinaryValue{"shl", std::move(index), operands[2]}});
+                return assign_value(std::move(value));
+            }
+            if (shift)
+                index = std::make_shared<Expression>(Expression{integer_type(dst->width),
+                    BinaryValue{"shl", std::move(index), constant_expr(shift, dst->width)}});
+            auto value = std::make_shared<Expression>(Expression{integer_type(dst->width),
+                BinaryValue{"add", std::move(index), base}});
+            return assign_value(std::move(value));
+        }
         if (dst && (op == Opcode::rv_lui || op == Opcode::rv_auipc) && operands.size() >= 2) {
             auto value = operands[1];
             if (op == Opcode::rv_auipc)

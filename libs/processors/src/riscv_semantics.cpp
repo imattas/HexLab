@@ -137,6 +137,34 @@ std::optional<std::uint64_t> evaluate_riscv_zbb_count_operation(RiscvOpcode opco
     }
 }
 
+std::optional<std::uint64_t> evaluate_riscv_zba_operation(RiscvOpcode opcode, unsigned xlen,
+                                                           std::uint64_t lhs,
+                                                           std::uint64_t rhs) noexcept {
+    if (xlen != 32 && xlen != 64) return {};
+    const std::uint64_t mask = xlen == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
+    switch (opcode) {
+    case RiscvOpcode::sh1add: return ((lhs << 1) + rhs) & mask;
+    case RiscvOpcode::sh2add: return ((lhs << 2) + rhs) & mask;
+    case RiscvOpcode::sh3add: return ((lhs << 3) + rhs) & mask;
+    case RiscvOpcode::add_uw:
+        if (xlen != 64) return {};
+        return static_cast<std::uint64_t>(static_cast<std::uint32_t>(lhs)) + rhs;
+    case RiscvOpcode::sh1add_uw:
+        if (xlen != 64) return {};
+        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(lhs)) << 1) + rhs;
+    case RiscvOpcode::sh2add_uw:
+        if (xlen != 64) return {};
+        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(lhs)) << 2) + rhs;
+    case RiscvOpcode::sh3add_uw:
+        if (xlen != 64) return {};
+        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(lhs)) << 3) + rhs;
+    case RiscvOpcode::slli_uw:
+        if (xlen != 64 || rhs > 63) return {};
+        return static_cast<std::uint64_t>(static_cast<std::uint32_t>(lhs)) << rhs;
+    default: return {};
+    }
+}
+
 std::optional<RiscvVectorIntegerConfig>
 make_riscv_vector_integer_config(std::uint16_t vlen_bits, std::uint8_t xlen_bits,
                                  std::uint64_t vl, std::uint64_t vstart,

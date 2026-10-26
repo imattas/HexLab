@@ -2076,7 +2076,7 @@ private:
                     }
                     std::optional<std::uint64_t> effective_alignment;
                     if(al!=d.type->alignment()||member_alignment||packed_member||packed)effective_alignment=al;
-                    members.push_back({d.name,d.type,field_off,width,bit_offset,effective_alignment});
+                    members.push_back({d.name,d.type,field_off,width,bit_offset,effective_alignment,{},access});
                     if(!take(","))break;
                     continue;
                 }
@@ -2098,7 +2098,7 @@ private:
                 std::optional<std::uint64_t> effective_alignment;
                 if(al!=d.type->alignment()||member_alignment||packed_member||packed)
                     effective_alignment=al;
-                members.push_back({d.name,d.type,field_off,std::nullopt,std::nullopt,effective_alignment});if(!take(","))break;
+                members.push_back({d.name,d.type,field_off,std::nullopt,std::nullopt,effective_alignment,{},access});if(!take(","))break;
             } need(";");
         }
         aggregate_scopes_.pop_back();

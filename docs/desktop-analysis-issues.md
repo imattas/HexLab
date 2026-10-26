@@ -28,7 +28,14 @@ addressed diagnostics within that function's chunks and function-associated
 decompiler diagnostics, and hides unlocated diagnostics, which the status line reports.
 
 The view reads immutable project or file-only document snapshots and does not edit
-analysis decisions. It caps the combined list at 20,000 findings, admits up to
+analysis decisions. It shows diagnostics from the snapshot's loaded image when one
+is available, and falls back to persisted findings when no image is loaded. This
+keeps findings aligned with edited or restored project bytes even before a newly
+loaded diagnostic set is written to the project. Project loader and runtime-relocation
+diagnostics are stored with the project in schema v12 and are replaced together in
+one transaction only after a complete loader pass succeeds. A failed or canceled
+load leaves the last completed set intact. Type-import and decompiler findings remain transient and
+scoped to their producing open document. It caps the combined list at 20,000 findings, admits up to
 2,048 rows per diagnostic source (loader, runtime relocation, type import, and
 decompiler) within the combined cap, and scans at most 100,000 functions; the status line reports when those limits truncate
 the view and whether analysis is partial.

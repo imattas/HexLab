@@ -408,7 +408,9 @@ enum class Opcode {
     rv_vwadd_vv, rv_vwadd_vx, rv_vwadd_wv, rv_vwadd_wx,
     rv_vwaddu_vv, rv_vwaddu_vx, rv_vwaddu_wv, rv_vwaddu_wx,
     rv_vwsub_vv, rv_vwsub_vx, rv_vwsub_wv, rv_vwsub_wx,
-    rv_vwsubu_vv, rv_vwsubu_vx, rv_vwsubu_wv, rv_vwsubu_wx
+    rv_vwsubu_vv, rv_vwsubu_vx, rv_vwsubu_wv, rv_vwsubu_wx,
+    // Appended RISC-V Zba scalar address-generation forms.
+    rv_sh1add, rv_sh2add, rv_sh3add, rv_add_uw, rv_sh1add_uw, rv_sh2add_uw, rv_sh3add_uw, rv_slli_uw
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
