@@ -13,6 +13,8 @@ namespace hexlab {
 namespace {
 constexpr std::uint64_t max_input_bytes = 256u * 1024u * 1024u;
 constexpr std::uint32_t max_vector_items = 1'000'000;
+constexpr std::size_t max_wasm_control_depth = 100'000;
+constexpr std::size_t max_wasm_operand_stack = 1'000'000;
 constexpr std::uint32_t max_name_bytes = 1024u * 1024u;
 constexpr std::uint64_t max_total_name_bytes = 16u * 1024u * 1024u;
 constexpr std::uint64_t wasm_page_bytes = 65536;
@@ -838,7 +840,8 @@ bool parse_code(Reader &r, std::uint32_t imported_count, std::vector<FunctionBod
 // underflow becomes polymorphic after a terminating instruction.
 bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
                    const WasmMetadata &metadata, const std::vector<GlobalType> &globals,
-                   std::string &reason, bool &unsupported) {
+                   std::stop_token stop, std::string &reason, bool &unsupported,
+                   bool &canceled, bool &limited) {
     const auto type_index = metadata.function_type_indices[body.index];
     const auto &signature = metadata.function_types[type_index];
     Reader code{module.subspan(static_cast<std::size_t>(body.code_offset),
@@ -853,7 +856,7 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
     const auto fail = [&](const char *message) { reason = "function[" + std::to_string(body.index) +
         "] at operator byte " + std::to_string(code.position ? code.position - 1 : 0) + ": " + message; return false; };
     const auto push = [&](std::uint8_t type) {
-        if (stack.size() >= max_vector_items) return false;
+        if (stack.size() >= max_wasm_operand_stack) { limited = true; return false; }
         stack.push_back(type);
         return true;
     };
@@ -886,7 +889,12 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
         }
         return 0;
     };
+    std::size_t operator_count = 0;
     while (code.position < code.bytes.size()) {
+        if ((operator_count++ & 0xfff) == 0 && stop.stop_requested()) {
+            canceled = true;
+            return fail("validation canceled");
+        }
         const auto op_begin = code.position;
         std::uint8_t op = 0;
         if (!code.byte(op)) return fail("truncated opcode");
@@ -905,7 +913,10 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
                 unsupported = true; return fail("indexed or non-MVP block type");
             }
             if (op == 0x04 && !pop(0x7f)) return fail("if condition must be i32");
-            if (controls.size() >= max_vector_items) return fail("control nesting limit exceeded");
+            if (controls.size() >= max_wasm_control_depth) {
+                limited = true;
+                return fail("control nesting limit exceeded");
+            }
             controls.push_back({op, result == 0x40 ? std::uint8_t{0} : result, stack.size(),
                                 controls.back().unreachable});
         } else if (op == 0x05 || op == 0x0b) {
@@ -1167,8 +1178,11 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
     for (const auto &body : bodies) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "WebAssembly body validation canceled"};
         parse_reason.clear(); unsupported_payload = false;
-        if (!validate_body(body, bytes, wasm, globals, parse_reason, unsupported_payload))
-            return Error{unsupported_payload ? ErrorCode::unsupported : ErrorCode::malformed,
+        bool canceled = false, limited = false;
+        if (!validate_body(body, bytes, wasm, globals, stop, parse_reason,
+                           unsupported_payload, canceled, limited))
+            return Error{canceled ? ErrorCode::canceled : limited ? ErrorCode::resource_limit :
+                         unsupported_payload ? ErrorCode::unsupported : ErrorCode::malformed,
                          "WebAssembly body validation failed: " + parse_reason};
     }
     auto table_applied = apply_initial_table_elements(wasm, wasm_diagnostics);
