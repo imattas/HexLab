@@ -51,6 +51,10 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
     if (op == 0x00) {
         if (hi) return fail(DecodeStatus::unsupported, "DEX payload pseudo-instruction is not decoded");
         text = "nop";
+    } else if (op == 0xfe || op == 0xff) {
+        words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX method-handle/type constant");
+        text = std::string(op == 0xfe ? "const-method-handle " : "const-method-type ") + vr(hi) +
+               (op == 0xfe ? ", method_handle@" : ", proto@") + std::to_string(word(1));
     } else if (op >= 0x01 && op <= 0x09) {
         static constexpr std::array<std::string_view, 9> names{
             "move", "move/from16", "move/16", "move-wide", "move-wide/from16", "move-wide/16",
@@ -243,6 +247,31 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         text = std::string(names[op - 0x74]) + " {";
         if (count) text += vr(start) + " .. " + vr(std::uint32_t(start) + count - 1);
         text += "}, method@" + std::to_string(word(1)); flow = FlowKind::call;
+    } else if (op >= 0xfa && op <= 0xfd) {
+        const bool polymorphic = op == 0xfa || op == 0xfb;
+        const bool range = op == 0xfb || op == 0xfd;
+        words = (op == 0xfa || op == 0xfb) ? 4 : 3;
+        if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX polymorphic/custom invoke");
+        const unsigned count = range ? hi : ((first >> 12) & 15);
+        if (count > 15 || (!range && count > 5))
+            return fail(DecodeStatus::unsupported, "DEX invoke argument words exceed the typed instruction operand budget");
+        text = polymorphic ? (range ? "invoke-polymorphic/range {" : "invoke-polymorphic {")
+                           : (range ? "invoke-custom/range {" : "invoke-custom {");
+        if (range) {
+            const auto start = word(2);
+            if (count && start > UINT16_MAX - (count - 1))
+                return fail(DecodeStatus::invalid, "DEX invoke register range overflows 16-bit register indexes");
+            text += count ? vr(start) + " .. " + vr(start + count - 1) : "";
+        } else {
+            const auto packed = word(2);
+            const std::array<unsigned, 5> regs{unsigned(packed & 15), unsigned((packed >> 4) & 15),
+                unsigned((packed >> 8) & 15), unsigned((packed >> 12) & 15), unsigned((hi >> 4) & 15)};
+            for (unsigned n = 0; n < count; ++n) { if (n) text += ", "; text += vr(regs[n]); }
+        }
+        const auto reference_index = word(1);
+        text += polymorphic ? "}, meth@" + std::to_string(reference_index) + ", proto@" + std::to_string(word(3))
+                            : "}, call_site@" + std::to_string(reference_index);
+        flow = FlowKind::call;
     } else if (op >= 0x7b && op <= 0x8f) {
         static constexpr std::array<std::string_view, 21> names{
             "neg-int", "not-int", "neg-long", "not-long", "neg-float", "neg-double",
@@ -275,7 +304,8 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
                               (op >= 0x52 && op <= 0x58) || (op >= 0x60 && op <= 0x66);
     instruction.memory_write = (op >= 0x4b && op <= 0x51) || (op >= 0x59 && op <= 0x5f) ||
                                (op >= 0x67 && op <= 0x6d);
-    if (op == 0x22 || op == 0x23 || op == 0x24 || op == 0x25 || (op >= 0x6e && op <= 0x78))
+    if (op == 0x22 || op == 0x23 || op == 0x24 || op == 0x25 ||
+        (op >= 0x6e && op <= 0x78) || (op >= 0xfa && op <= 0xfd))
         instruction.memory_read = instruction.memory_write = true;
     instruction.mnemonic_override = std::move(text); instruction.flow = flow; instruction.direct_target = target;
     instruction.dex_switch = std::move(dex_switch);
@@ -327,7 +357,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
             imm(static_cast<std::uint64_t>(static_cast<std::int64_t>(std::bit_cast<std::int32_t>(le32(word(1), word(2))))), 32, width, true);
         else imm(std::uint64_t(word(1)) | (std::uint64_t(word(2)) << 16) |
                  (std::uint64_t(word(3)) << 32) | (std::uint64_t(word(4)) << 48), 64, 64);
-    } else if (op == 0x1a || op == 0x1b || op == 0x1c || op == 0x1f || op == 0x22) {
+    } else if (op == 0x1a || op == 0x1b || op == 0x1c || op == 0x1f || op == 0x22 || op == 0xfe || op == 0xff) {
         // check-cast refines a reference's verifier type without defining a vreg.
         reg(hi, op == 0x1f ? read : write);
         imm(op == 0x1b ? le32(word(1), word(2)) : word(1), op == 0x1b ? 32 : 16, op == 0x1b ? 32 : 16);
@@ -335,9 +365,11 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
     else if (op == 0x20 || op == 0x21 || op == 0x23) {
         reg(a, write); reg(b, read);
         if (op != 0x21) imm(word(1), 16, 16);
-    } else if (op == 0x24 || op == 0x25 || (op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78)) {
-        const bool range = op == 0x25 || op >= 0x74;
-        const unsigned count = range ? hi : b;
+    } else if (op == 0x24 || op == 0x25 || (op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78) ||
+               (op >= 0xfa && op <= 0xfd)) {
+        const bool invoke_ext = op >= 0xfa;
+        const bool range = op == 0x25 || op >= 0x74 || op == 0xfb || op == 0xfd;
+        const unsigned count = invoke_ext ? (range ? hi : ((first >> 12) & 15)) : (range ? hi : b);
         if (count > 15)
             return fail(DecodeStatus::unsupported, "DEX register list exceeds the typed instruction operand budget");
         if (range) {
@@ -348,12 +380,14 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         } else {
             const auto list = word(2);
             const std::array<unsigned, 5> regs{unsigned(list & 15), unsigned((list >> 4) & 15),
-                unsigned((list >> 8) & 15), unsigned((list >> 12) & 15), a};
+                unsigned((list >> 8) & 15), unsigned((list >> 12) & 15),
+                invoke_ext ? unsigned((hi >> 4) & 15) : a};
             for (unsigned i = 0; i < count; ++i) reg(regs[i], read);
         }
         // Invoke lists encode argument words, including both words of wide
         // arguments. Prototype/type resolution belongs to method analysis.
         imm(word(1), 16, 16);
+        if (invoke_ext && (op == 0xfa || op == 0xfb)) imm(word(3), 16, 16);
     } else if (op >= 0x2d && op <= 0x31) {
         reg(hi, write);
         reg(word(1) & 255, read, op >= 0x2f ? 64 : 32);

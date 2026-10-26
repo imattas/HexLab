@@ -21,6 +21,11 @@ upstream BSD-2-Clause-Patent notice is retained in
 See [EDK II Decompress.c](https://github.com/tianocore/edk2/blob/master/BaseTools/Source/C/Common/Decompress.c)
 and the [UEFI PI firmware-storage definitions](https://uefi.org/specs/PI/1.10/V3_Code_Definitions.html).
 
-The Tiano custom GUID-defined decompression protocol is separate and remains
-opaque. This parser does not load PE/TE images, execute compressed code, or
-extract sections to disk.
+GUID-defined sections with `EFI_GUIDED_SECTION_PROCESSING_REQUIRED` clear are
+traversed from their `DataOffset` as ordinary nested section streams, as
+specified by PI. The GUID, attributes, and payload bounds remain available on
+the parent section. If processing is required, the payload stays opaque and is
+marked `processing_required`; no custom extraction protocol is inferred from
+the GUID. This means the Tiano custom GUID-defined decompression protocol is
+still unsupported. This parser does not load PE/TE images, execute compressed
+code, or extract sections to disk.

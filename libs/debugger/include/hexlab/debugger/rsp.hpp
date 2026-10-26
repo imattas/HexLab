@@ -42,6 +42,7 @@ struct Capabilities {
     std::map<std::string, std::string, std::less<>> features;
     bool no_ack_mode = false;
     bool non_stop_supported = false;
+    bool thread_events_supported = false;
 };
 
 HEXLAB_DEBUGGER_EXPORT std::string encode_packet(std::string_view payload);
@@ -56,6 +57,9 @@ public:
     Result<Capabilities> negotiate(std::stop_token = {});
     Status set_non_stop_mode(bool enabled, std::stop_token = {});
     bool non_stop_mode() const noexcept { return non_stop_mode_; }
+    // Requests asynchronous thread-created/thread-exited stop notifications.
+    Status set_thread_events(bool enabled, std::stop_token = {});
+    bool thread_events_enabled() const noexcept { return thread_events_enabled_; }
     Result<StopReply> read_stop_reply(std::stop_token = {});
     Result<std::optional<StopReply>> read_stop_reply_optional(std::stop_token = {});
     Result<StopReply> wait_stop_reply(std::chrono::milliseconds timeout, std::stop_token = {});
@@ -130,6 +134,8 @@ private:
     bool no_ack_mode_ = false;
     bool non_stop_supported_ = false;
     bool non_stop_mode_ = false;
+    bool thread_events_supported_ = false;
+    bool thread_events_enabled_ = false;
     bool stop_reply_sequence_active_ = false;
     std::deque<std::string> pending_notifications_;
     std::size_t pending_notification_bytes_ = 0;

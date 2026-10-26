@@ -72,6 +72,9 @@ Result<Statement> lift_one(const Instruction &instruction) {
         if (op == 0x18) return 10;
         if (op == 0x1a || op == 0x1c || op == 0x1f || op == 0x20) return 4;
         if (op == 0x1b) return 6;
+        if (op == 0xfe || op == 0xff) return 4;
+        if (op == 0xfa || op == 0xfb) return 8;
+        if (op == 0xfc || op == 0xfd) return 6;
         if (op == 0x1d || op == 0x1e || op == 0x27) return 2;
         if (op == 0x2b || op == 0x2c) return 6;
         if (op >= 0x2d && op <= 0x31) return 4;
@@ -221,12 +224,14 @@ Result<Statement> lift_one(const Instruction &instruction) {
         const auto value = static_cast<std::int32_t>(static_cast<std::int8_t>(hi) >> 4);
         return assign(hi & 15, constant(static_cast<std::uint32_t>(value)));
     }
-    if (op == 0x1a || op == 0x1b || op == 0x1c) {
+    if (op == 0x1a || op == 0x1b || op == 0x1c || op == 0xfe || op == 0xff) {
         const auto index = op == 0x1b
             ? std::uint32_t(unit(instruction, 1)) | (std::uint32_t(unit(instruction, 2)) << 16)
             : std::uint32_t(unit(instruction, 1));
-        const auto description = std::string(op == 0x1c ? "DEX class constant type@" : "DEX string constant string@") +
-                                 std::to_string(index);
+        const auto description = op == 0x1c ? "DEX class constant type@" + std::to_string(index) :
+            op == 0xfe ? "DEX method-handle constant method_handle@" + std::to_string(index) :
+            op == 0xff ? "DEX method-type constant proto@" + std::to_string(index) :
+                         "DEX string constant string@" + std::to_string(index);
         return assign(hi, unknown_value(pointer32(), description));
     }
     if (op == 0x1f) {
@@ -525,10 +530,13 @@ Result<Statement> lift_one(const Instruction &instruction) {
         store.memory_effect = IntrinsicMemoryEffect::write;
         return Statement{std::move(store)};
     }
-    if ((op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78)) {
+    if ((op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78) ||
+        (op >= 0xfa && op <= 0xfd)) {
         static constexpr std::array<const char *, 5> names{
             "virtual", "super", "direct", "static", "interface"};
-        const bool range = op >= 0x74;
+        const bool invoke_ext = op >= 0xfa;
+        const bool polymorphic = op == 0xfa || op == 0xfb;
+        const bool range = op >= 0x74 && op <= 0x78 || op == 0xfb || op == 0xfd;
         const auto kind = static_cast<unsigned>(range ? op - 0x74 : op - 0x6e);
         const auto method_index = unit(instruction, 1);
         std::vector<ExpressionPtr> arguments;
@@ -557,7 +565,13 @@ Result<Statement> lift_one(const Instruction &instruction) {
             arguments.push_back(typed_reg(argument.value(), unknown_type(32)));
         }
         Intrinsic call;
-        call.name = "dex_invoke_" + std::string(names[kind]) + "_method@" + std::to_string(method_index);
+        if (invoke_ext) {
+            call.name = polymorphic ? "dex_invoke_polymorphic_method@" + std::to_string(method_index) +
+                                      "_proto@" + std::to_string(unit(instruction, 3))
+                                    : "dex_invoke_custom_callsite@" + std::to_string(method_index);
+        } else {
+            call.name = "dex_invoke_" + std::string(names[kind]) + "_method@" + std::to_string(method_index);
+        }
         call.operands = std::move(arguments);
         call.memory_effect = IntrinsicMemoryEffect::unknown;
         return Statement{std::move(call)};

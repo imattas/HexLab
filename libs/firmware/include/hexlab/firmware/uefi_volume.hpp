@@ -90,7 +90,9 @@ struct UefiVolumeParseOptions {
 // Finds PI firmware volumes embedded at any file offset and inventories their
 // FFS file headers and bounded section metadata. Standard EFI and Tiano
 // compressed sections are decoded only into a bounded temporary buffer for
-// child-section inventory; GUID-defined payloads remain opaque.
+// child-section inventory. GUID-defined sections that do not require a
+// processor are traversed as ordinary nested section streams; processor-
+// required payloads remain opaque.
 HEXLAB_FIRMWARE_EXPORT Result<std::vector<UefiFirmwareVolume>> parse_uefi_firmware_volumes(
     std::span<const std::byte> bytes, UefiVolumeParseOptions options = {}, std::stop_token stop = {});
 HEXLAB_FIRMWARE_EXPORT std::string uefi_guid_string(const std::array<std::uint8_t, 16> &guid);

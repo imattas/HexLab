@@ -1049,6 +1049,12 @@ public:
                 client_.reset(); transport_.reset(); return enabled.error();
             }
         }
+        if (features.value().thread_events_supported) {
+            auto enabled = client_->set_thread_events(true);
+            if (!enabled && enabled.error().code != ErrorCode::unsupported) {
+                client_.reset(); transport_.reset(); return enabled.error();
+            }
+        }
         supports_vcont_continue_ = false;
         supports_vcont_continue_signal_ = false;
         supports_vcont_thread_step_signal_ = false;

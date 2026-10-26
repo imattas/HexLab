@@ -55,5 +55,9 @@ clobber all FCC state because its bit-level mapping is not modeled; FEXR26 and
 FENR28 remain named effects with an aggregate FCSR dependency. MIPS64-only
 doubleword transfer forms are not decoded in this MIPS32 mode.
 The decoder records one delay slot; MIPS analysis owns and orders the slot
-through its explicit CFG edge. Intrinsic FCSR condition/flag behavior, IEEE
-arithmetic/conversion results, and runtime rounding remain abstract.
+through its explicit CFG edge. COP1 operations remain symbolic in decompiled
+functions; the standalone processor semantic helper evaluates binary32 `DIV.S`
+with FCSR rounding, Cause, Flags, and enabled-exception behavior when
+`FCSR.FS=0`. Other IEEE arithmetic/conversions, compare-result truth, and
+flush-subnormal mode remain abstract. See the evaluator limits in
+[`mips32.md`](mips32.md).

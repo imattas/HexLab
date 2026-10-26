@@ -479,6 +479,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::vpabsb: return "vpabsb";
     case Opcode::vpabsw: return "vpabsw";
     case Opcode::vpabsd: return "vpabsd";
+    case Opcode::vcmpps: return "vcmpps";
+    case Opcode::vcmppd: return "vcmppd";
     case Opcode::vpunpcklbw: return "vpunpcklbw";
     case Opcode::vpunpcklwd: return "vpunpcklwd";
     case Opcode::vpunpckldq: return "vpunpckldq";

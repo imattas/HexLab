@@ -41,3 +41,17 @@ result type but do not produce a computed value. Exact rounding and exception
 behavior remain unsupported by the semantic evaluator. Malformed fixed fields
 (including nonzero unused unary `ft` and reserved compare bits) are invalid;
 recognized but unmodeled formats/functions report unsupported.
+
+The standalone MIPS32 semantic helper now evaluates binary32 `DIV.S` from
+operand bit patterns with integer rational arithmetic. It implements all four
+FCSR rounding modes, normal/subnormal rounding, signed zero/infinity, overflow,
+underflow, divide-by-zero, invalid, and inexact conditions. It replaces the
+FCSR Cause field on each operation, accumulates Flag bits only when no enabled
+exception is taken, and reports whether the destination write is suppressed.
+Flush-subnormal mode (`FCSR.FS=1`) is explicitly unsupported. NaN propagation
+quietens the first NaN payload; invalid `0/0` and `inf/inf` produce the
+canonical quiet NaN. Tininess is detected after rounding. The current decompiler
+still emits `DIV.S` as an intrinsic and does not connect this helper to function
+execution. The rounding, flag, and Cause behavior follows the MIPS32
+[Instruction Set Manual, `DIV.fmt`](https://courses.cs.washington.edu/courses/cse378/documentation/MIPS32_Architecture_For_Programmers_Volume_II.pdf)
+and [Volume I FCSR field definitions](https://courses.grainger.illinois.edu/cs426/fa2022/Resources/MIPS32INT-AFP-03.02.pdf).
