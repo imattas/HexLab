@@ -602,6 +602,15 @@ Result<std::vector<MemoryRegion>> DebugSession::memory_regions() {
         return Error{ErrorCode::invalid_argument, "backend returned more than 65536 memory regions"};
     return result;
 }
+Result<std::vector<AuxiliaryVectorEntry>> DebugSession::auxiliary_vector() {
+    if (!impl_->backend || !impl_->process ||
+        (impl_->state != SessionState::running && impl_->state != SessionState::stopped))
+        return invalid_state("auxiliary vector");
+    auto result = impl_->backend->auxiliary_vector();
+    if (result && result.value().size() > 4096)
+        return Error{ErrorCode::resource_limit, "auxiliary vector exceeds the 4096-entry inspection limit"};
+    return result;
+}
 Result<std::vector<RegisterValue>> DebugSession::read_registers(ThreadId thread) {
     if (!impl_->backend || !impl_->process || (impl_->state != SessionState::running && impl_->state != SessionState::stopped)) return invalid_state("read_registers");
     return impl_->backend->read_registers(thread);

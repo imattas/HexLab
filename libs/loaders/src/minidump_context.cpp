@@ -16,6 +16,7 @@ std::size_t context_prefix_size(std::uint16_t architecture) {
     case 5: return 416;  // Windows ARM CONTEXT including trailing padding.
     case 9: return 1232; // Windows AMD64 fixed CONTEXT; no XSTATE following it.
     case 12: return 912; // Windows ARM64 fixed CONTEXT.
+    case 0x8003: return 796; // Breakpad ARM64 context (packed to four-byte alignment).
     default: return 64; // Retain evidence without inferring an architecture.
     }
 }
@@ -27,8 +28,9 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
     result.source_rva = source_rva; result.source_size = source_size;
     const auto bytes = input.first(std::min({input.size(), static_cast<std::size_t>(source_size), context_prefix_size(architecture)}));
     result.captured_prefix.assign(bytes.begin(), bytes.end());
-    const std::uint32_t family = architecture == 0 ? 0x10000u : architecture == 5 ? 0x200000u
-        : architecture == 9 ? 0x100000u : architecture == 12 ? 0x400000u : 0;
+    const std::uint64_t family = architecture == 0 ? 0x10000u : architecture == 5 ? 0x200000u
+        : architecture == 9 ? 0x100000u : architecture == 12 ? 0x400000u
+        : architecture == 0x8003 ? 0x80000000ull : 0;
     if (!family) {
         result.status = MinidumpContextStatus::unsupported_architecture;
         result.diagnostics.emplace_back("Context architecture is unsupported; captured prefix retained without register guesses");
@@ -40,9 +42,11 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
         result.diagnostics.emplace_back("Context is truncated before ContextFlags");
         return result;
     }
-    result.flags = static_cast<std::uint32_t>(fixed(bytes, flags_at, 4));
+    result.flags = fixed(bytes, flags_at, architecture == 0x8003 ? 8 : 4);
     result.requested_groups = result.flags & 0xffffu;
-    if ((result.flags & 0x00ff0000u) != family) {
+    const auto flags_family = architecture == 0x8003
+        ? result.flags & 0xffffff00ull : result.flags & 0x00ff0000u;
+    if (flags_family != family) {
         result.status = MinidumpContextStatus::architecture_mismatch;
         result.diagnostics.emplace_back("ContextFlags architecture family does not match SystemInfo; registers were not decoded");
         return result;
@@ -146,6 +150,19 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
             for (std::size_t i=0;i<8;++i) { add("bvr"+std::to_string(i),336+i*4,4); add("bcr"+std::to_string(i),368+i*4,4); }
             add("wvr0",400,4); add("wcr0",404,4);
         }
+    } else if (architecture == 0x8003) {
+        // Breakpad's packed ARM64 context predates the Microsoft CONTEXT
+        // layout. Its integer group also carries the frame/link, SP, PC and CPSR.
+        if (group(2,276,"legacy ARM64 integer/control")) {
+            result.integer_valid = result.control_valid = true;
+            for (std::size_t i=0;i<31;++i) add("x"+std::to_string(i),8+i*8,8);
+            add("sp",256,8); add("pc",264,8); add("cpsr",272,4);
+        }
+        if (group(4,796,"legacy ARM64 floating/NEON")) {
+            result.floating_valid = result.floating_low_valid = true;
+            add("fpsr",276,4); add("fpcr",280,4);
+            for (std::size_t i=0;i<32;++i) add("v"+std::to_string(i),284+i*16,16);
+        }
     } else {
         if (group(2,240,"ARM64 integer")) {
             result.integer_valid = true;
@@ -170,7 +187,8 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
             for (std::size_t i=0;i<2;++i) { add("wcr"+std::to_string(i),888+i*4,4); add("wvr"+std::to_string(i),896+i*8,8); }
         }
     }
-    const std::uint32_t supported = architecture == 0 ? 0x3fu : architecture == 9 ? 0x1fu : architecture == 5 ? 0xfu : 0xdfu;
+    const std::uint32_t supported = architecture == 0 ? 0x3fu : architecture == 9 ? 0x1fu : architecture == 5 ? 0xfu :
+        architecture == 0x8003 ? 0x6u : 0xdfu;
     const bool extra = (result.requested_groups & ~supported) != 0;
     if (extra) result.diagnostics.emplace_back("Context requests unsupported extended/group flags; original source extent is retained");
     if (result.registers.empty() && !result.requested_groups) {

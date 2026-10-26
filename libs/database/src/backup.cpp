@@ -1,6 +1,9 @@
 #include "native_files.hpp"
 #include "history_internal.hpp"
 #include "testing.hpp"
+#include <algorithm>
+#include <chrono>
+#include <string>
 namespace hexlab::database {
 Result<SavedProject> ProjectStore::save_as(const std::filesystem::path& destination,ReplacePolicy policy,std::stop_token stop){
     return save_as_impl(destination,policy,stop,{});
@@ -154,6 +157,231 @@ Result<SavedProject> ProjectStore::backup_to(const std::filesystem::path& destin
         SavedProject saved{target,copied->uuid};
         detail::publish_file(*temporary,target,policy);
         return saved;
+    });
+}
+
+Result<BackupRotationResult> ProjectStore::backup_to_rotating(const std::filesystem::path& base,
+        std::size_t retain,std::stop_token stop){
+    return detail::guarded([&]()->Result<BackupRotationResult>{
+        if(base.empty() || retain==0 || retain>32)
+            return Error{ErrorCode::invalid_argument,"Backup rotation requires a base path and retention from 1 through 32"};
+        if(stop.stop_requested())return Error{ErrorCode::canceled,"Project backup rotation canceled"};
+        const auto normalized=std::filesystem::absolute(base).lexically_normal();
+        if(!std::filesystem::is_directory(normalized.parent_path()))
+            return Error{ErrorCode::invalid_argument,"Backup rotation directory does not exist"};
+        if(detail::same_file(impl_->path,normalized))
+            return Error{ErrorCode::invalid_argument,"Backup rotation base aliases the open project"};
+
+        const auto millis=std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        if(millis<0)return Error{ErrorCode::io,"System clock is before the Unix epoch"};
+        const auto token=detail::new_uuid();
+        constexpr char digits[]="0123456789abcdef";
+        auto name=normalized.stem().native();
+        const auto append_ascii=[&](std::string_view value){
+            for(const auto ch:value)name.push_back(static_cast<std::filesystem::path::value_type>(ch));
+        };
+        append_ascii(".backup-");
+        auto timestamp=std::to_string(millis);
+        if(timestamp.size()<13)timestamp.insert(0,13-timestamp.size(),'0');
+        append_ascii(timestamp);append_ascii("-");
+        for(const auto byte:token){const auto value=std::to_integer<unsigned>(byte);name.push_back(static_cast<std::filesystem::path::value_type>(digits[value>>4]));name.push_back(static_cast<std::filesystem::path::value_type>(digits[value&15]));}
+        name+=normalized.extension().native();
+        const auto latest=normalized.parent_path()/std::filesystem::path(name);
+        auto saved=backup_to(latest,ReplacePolicy::fail_if_exists,stop);
+        if(!saved)return saved.error();
+        BackupRotationResult result{saved.value(),0,true};
+
+        struct Candidate {std::filesystem::path path;std::string order;bool newest=false;std::uint64_t size=0;};
+        std::vector<Candidate> candidates{{latest,timestamp+"-new",true,0}};
+        const auto prefix=normalized.stem().native()+std::filesystem::path(".backup-").native();
+        const auto extension=normalized.extension().native();
+        std::error_code error;
+        std::filesystem::directory_iterator current(normalized.parent_path(),error),end;
+        if(error){result.retention_satisfied=false;return result;}
+        constexpr std::size_t directory_entry_limit=8192,candidate_limit=64;
+        constexpr std::uint64_t validation_byte_limit=UINT64_C(1024)*1024*1024;
+        std::size_t entries=0;
+        std::uint64_t validation_bytes=0;
+        while(current!=end){
+            if(stop.stop_requested()){result.retention_satisfied=false;return result;}
+            if(++entries>directory_entry_limit){result.retention_satisfied=false;return result;}
+            const auto entry=*current;current.increment(error);
+            if(error){result.retention_satisfied=false;return result;}
+            const auto filename=entry.path().filename().native();
+            if(!filename.starts_with(prefix)||!filename.ends_with(extension)||filename.size()<prefix.size()+13+1+32+extension.size())continue;
+            const auto token_begin=prefix.size()+14;
+            if(filename.size()-extension.size()!=token_begin+32)continue;
+            const auto stamp=filename.substr(prefix.size(),13);
+            const auto separator=filename[prefix.size()+13];
+            if(separator!=static_cast<std::filesystem::path::value_type>('-'))continue;
+            const auto is_decimal=[](auto ch){return ch>=static_cast<std::filesystem::path::value_type>('0')&&ch<=static_cast<std::filesystem::path::value_type>('9');};
+            if(!std::all_of(stamp.begin(),stamp.end(),is_decimal))continue;
+            bool token_valid=true;
+            for(std::size_t i=token_begin;i<token_begin+32;++i){const auto ch=filename[i];token_valid=token_valid&&((ch>=static_cast<std::filesystem::path::value_type>('0')&&ch<=static_cast<std::filesystem::path::value_type>('9'))||(ch>=static_cast<std::filesystem::path::value_type>('a')&&ch<=static_cast<std::filesystem::path::value_type>('f')));}
+            if(!token_valid||entry.path()==latest)continue;
+            const auto status=entry.symlink_status(error);
+            if(error){result.retention_satisfied=false;return result;}
+            if(!std::filesystem::is_regular_file(status))continue;
+            const auto size=entry.file_size(error);
+            if(error||size>validation_byte_limit-validation_bytes){result.retention_satisfied=false;return result;}
+            validation_bytes+=size;
+            if(candidates.size()>=candidate_limit){result.retention_satisfied=false;return result;}
+            std::string order;order.reserve(13+1+32);
+            for(const auto ch:stamp)order.push_back(static_cast<char>(ch));
+            order.push_back('-');
+            for(std::size_t i=token_begin;i<token_begin+32;++i)order.push_back(static_cast<char>(filename[i]));
+            candidates.push_back({entry.path(),std::move(order),false,size});
+        }
+        std::sort(candidates.begin()+1,candidates.end(),[](const Candidate& left,const Candidate& right){return left.order>right.order;});
+        std::size_t kept=1;
+        for(std::size_t i=1;i<candidates.size();++i){
+            if(stop.stop_requested()){result.retention_satisfied=false;return result;}
+            auto candidate=ProjectStore::open(candidates[i].path,ProjectMode::read_only,stop);
+            if(!candidate){result.retention_satisfied=false;continue;}
+            auto state=candidate.value()->snapshot();
+            const bool matching=state&&state.value()->uuid==saved.value().uuid;
+            candidate.value().reset();
+            if(!matching){result.retention_satisfied=false;continue;}
+            if(kept<retain){++kept;continue;}
+            std::error_code remove_error;
+            if(std::filesystem::remove(candidates[i].path,remove_error))++result.removed_generations;
+            else result.retention_satisfied=false;
+        }
+        return result;
+    });
+}
+
+Result<BackupListing> ProjectStore::list_rotated_backups(const std::filesystem::path& base,std::stop_token stop) const {
+    return detail::guarded([&]()->Result<BackupListing>{
+        if(base.empty())return Error{ErrorCode::invalid_argument,"Backup listing requires a base path"};
+        const auto normalized=std::filesystem::absolute(base).lexically_normal();
+        auto state=detail::take(snapshot());
+        BackupListing listing;
+        const auto prefix=normalized.stem().native()+std::filesystem::path(".backup-").native();
+        const auto extension=normalized.extension().native();
+        std::error_code ec;
+        std::filesystem::directory_iterator it(normalized.parent_path(),ec),end;
+        if(ec)return Error{ErrorCode::io,"Cannot scan backup directory: "+ec.message()};
+        constexpr std::size_t entry_limit=8192,candidate_limit=64;
+        constexpr std::uint64_t byte_limit=UINT64_C(1024)*1024*1024;
+        std::size_t entries=0;std::uint64_t bytes=0;
+        while(it!=end){
+            if(stop.stop_requested()){listing.complete=false;break;}
+            if(++entries>entry_limit){listing.complete=false;break;}
+            const auto entry=*it;it.increment(ec);if(ec){listing.complete=false;break;}
+            const auto name=entry.path().filename().native();
+            if(!name.starts_with(prefix)||!name.ends_with(extension)||name.size()!=prefix.size()+13+1+32+extension.size())continue;
+            const auto stamp=name.substr(prefix.size(),13);const auto dash=name[prefix.size()+13];
+            if(dash!=static_cast<std::filesystem::path::value_type>('-')||
+               !std::all_of(stamp.begin(),stamp.end(),[](auto ch){return ch>=static_cast<std::filesystem::path::value_type>('0')&&ch<=static_cast<std::filesystem::path::value_type>('9');}))continue;
+            bool token=true;for(std::size_t i=prefix.size()+14;i<prefix.size()+14+32;++i){const auto c=name[i];token=token&&((c>=static_cast<std::filesystem::path::value_type>('0')&&c<=static_cast<std::filesystem::path::value_type>('9'))||(c>=static_cast<std::filesystem::path::value_type>('a')&&c<=static_cast<std::filesystem::path::value_type>('f')));}
+            if(!token)continue;
+            const auto status=entry.symlink_status(ec);if(ec){listing.complete=false;break;}
+            if(!std::filesystem::is_regular_file(status))continue;
+            const auto size=entry.file_size(ec);if(ec||size>byte_limit-bytes){listing.complete=false;break;}bytes+=size;
+            if(listing.backups.size()>=candidate_limit){listing.complete=false;break;}
+            auto candidate=ProjectStore::open(entry.path(),ProjectMode::read_only,stop);
+            if(!candidate){listing.complete=false;continue;}
+            auto candidate_state=candidate.value()->snapshot();
+            if(!candidate_state||candidate_state.value()->uuid!=state->uuid){listing.complete=false;continue;}
+            std::uint64_t timestamp=0;for(auto c:stamp)timestamp=timestamp*10+static_cast<unsigned>(c-'0');
+            listing.backups.push_back({SavedProject{entry.path(),state->uuid},timestamp});
+        }
+        std::sort(listing.backups.begin(),listing.backups.end(),[](const auto& a,const auto& b){return a.created_unix_ms>b.created_unix_ms;});
+        return listing;
+    });
+}
+
+Result<BackupPruneResult> ProjectStore::prune_rotated_backups(const std::filesystem::path& base,std::size_t retain,std::stop_token stop) {
+    return detail::guarded([&]()->Result<BackupPruneResult>{
+        if(retain==0||retain>32)return Error{ErrorCode::invalid_argument,"Backup retention must be 1 through 32"};
+        auto listing=detail::take(list_rotated_backups(base,stop));
+        BackupPruneResult result;result.remaining=listing.backups.size();result.retention_satisfied=listing.complete;
+        if(!listing.complete)return result; // Never delete from a partial view.
+        for(std::size_t i=retain;i<listing.backups.size();++i){
+            if(stop.stop_requested()){result.retention_satisfied=false;break;}
+            std::error_code ec;
+            if(std::filesystem::remove(listing.backups[i].backup.path,ec)){++result.removed;--result.remaining;}
+            else result.retention_satisfied=false;
+        }
+        if(result.remaining>retain)result.retention_satisfied=false;
+        return result;
+    });
+}
+
+Result<SavedProject> ProjectStore::restore_backup_in_place(const std::filesystem::path& backup,
+        const std::filesystem::path& target,std::stop_token stop){
+    return detail::guarded([&]()->Result<SavedProject>{
+        if(backup.empty()||target.empty())return Error{ErrorCode::invalid_argument,"Backup and in-place restore target paths are required"};
+        if(stop.stop_requested())return Error{ErrorCode::canceled,"In-place project restore canceled"};
+        const auto source_path=std::filesystem::absolute(backup).lexically_normal();
+        const auto target_path=std::filesystem::absolute(target).lexically_normal();
+        if(detail::same_file(source_path,target_path))return Error{ErrorCode::invalid_argument,"In-place restore target aliases its backup"};
+        auto source=detail::take(ProjectStore::open(source_path,ProjectMode::read_only,stop));
+        auto source_state=detail::take(source->snapshot());
+        auto target_probe=detail::take(ProjectStore::open(target_path,ProjectMode::read_only,stop));
+        const auto target_state=detail::take(target_probe->snapshot());
+        if(source_state->uuid!=target_state->uuid)
+            return Error{ErrorCode::conflict,"In-place restore requires a backup of the target project's UUID"};
+        auto lease=detail::take(ProjectLease::acquire(target_state->uuid));
+        target_probe.reset();
+        // Re-read after acquiring the ordinary project lease. This detects a
+        // writer that committed while the initial validation was in progress.
+        auto target_locked=detail::take(ProjectStore::open(target_path,ProjectMode::read_only,stop));
+        const auto locked_state=detail::take(target_locked->snapshot());
+        if(locked_state->uuid!=target_state->uuid||locked_state->revisions!=target_state->revisions||
+           locked_state->history_cursor!=target_state->history_cursor)
+            return Error{ErrorCode::conflict,"Target project changed while acquiring the restore lease"};
+
+        std::vector<std::filesystem::path> protected_paths{source_path};
+        const auto add_provenance=[&](const ProjectState& state,const std::filesystem::path& project){
+            if(!state.provenance)return;
+            const auto& provenance=*state.provenance;
+            if(provenance.native_path.is_absolute())protected_paths.push_back(provenance.native_path);
+            if(!provenance.relative_path.empty()){
+                auto relative=std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(provenance.relative_path.data()),provenance.relative_path.size()));
+                protected_paths.push_back((project.parent_path()/relative).lexically_normal());
+            }
+        };
+        add_provenance(*source_state,source_path);add_provenance(*target_state,target_path);
+        auto protected_files=detail::protect_files(target_path,protected_paths);
+        auto temporary=detail::reserve_owned_file(target_path.parent_path(),L".hexlab-restore-",true);
+        auto output=detail::take(Connection::open(temporary->path,OpenMode::create,stop));
+        detail::Cancellation cancellation(*source->impl_->connection,stop);
+        detail::take(source->impl_->connection->backup_to(*output,stop));
+        const auto version=detail::schema_version(*output);
+        detail::validate_schema(*output,version);
+        auto copied=detail::read_state(*output,version);
+        detail::require(copied->uuid==source_state->uuid&&copied->uuid==target_state->uuid,
+                        "Restored copy changed the logical project identity");
+        {
+            auto transaction=detail::take(Transaction::begin(*output));
+            if(copied->provenance){
+                const auto& provenance=*copied->provenance;
+                std::filesystem::path original;
+                if(!provenance.relative_path.empty()){
+                    auto relative=std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(provenance.relative_path.data()),provenance.relative_path.size()));
+                    original=(source_path.parent_path()/relative).lexically_normal();
+                }else if(provenance.native_path.is_absolute())original=provenance.native_path;
+                if(!original.empty()){
+                    auto relative=original.lexically_relative(target_path.parent_path());if(relative.empty())relative=original;
+                    auto encoded=relative.generic_u8string();detail::require(encoded.size()<=131072,"Restored provenance path exceeds its budget");
+                    auto update=detail::take(output->prepare("UPDATE input_provenance SET relative_path=?1 WHERE singleton=1"));
+                    detail::take(update->bind_text(1,std::string_view(reinterpret_cast<const char*>(encoded.data()),encoded.size())));
+                    detail::take(update->step());
+                }
+            }
+            detail::take(transaction->commit());
+        }
+        detail::validate_schema(*output,detail::schema_version(*output));
+        const auto restored_state=detail::read_state(*output);
+        {auto original=detail::extract_input(*output,*restored_state,stop);}
+        detail::take(output->checkpoint());output.reset();
+        target_locked.reset();
+        if(stop.stop_requested())return Error{ErrorCode::canceled,"In-place project restore canceled before publication"};
+        detail::publish_file(*temporary,target_path,ReplacePolicy::replace_existing);
+        return SavedProject{target_path,source_state->uuid};
     });
 }
 }

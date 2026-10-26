@@ -190,6 +190,56 @@ int run_project_backup_restore(const project_detail::Arguments &args, std::ostre
     return 0;
 }
 
+int run_project_backup_list(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
+    const auto listing = take(store->list_rotated_backups(args.backup_base, {}));
+    if (args.backup_json) {
+        out << "{\"complete\":" << (listing.complete ? "true" : "false") << ",\"backups\":[";
+        for (std::size_t i=0;i<listing.backups.size();++i) {
+            if (i) out << ',';
+            const auto &row=listing.backups[i];
+            out << "{\"path\":" << json_string(path_utf8(row.backup.path))
+                << ",\"uuid\":" << json_string(uuid_text(row.backup.uuid))
+                << ",\"created_unix_ms\":" << row.created_unix_ms << '}';
+        }
+        out << "]}\n";
+    } else {
+        out << "Validated rotated backups for " << escape(path_utf8(args.backup_base)) << ": " << listing.backups.size()
+            << (listing.complete ? " (complete scan)\n" : " (scan incomplete)\n");
+        for (const auto &row : listing.backups)
+            out << escape(path_utf8(row.backup.path)) << " uuid=" << uuid_text(row.backup.uuid)
+                << " created-unix-ms=" << row.created_unix_ms << '\n';
+    }
+    return listing.complete ? 0 : 3;
+}
+
+int run_project_backup_rotate(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
+    const auto result = take(store->backup_to_rotating(args.backup_base, args.backup_retention, {}));
+    out << "Created rotated backup: " << escape(path_utf8(result.backup.path)) << " uuid=" << uuid_text(result.backup.uuid)
+        << "; removed=" << result.removed_generations << "; retention=" << (result.retention_satisfied ? "satisfied" : "incomplete") << '\n';
+    return result.retention_satisfied ? 0 : 3;
+}
+
+int run_project_backup_prune(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
+    const auto result = take(store->prune_rotated_backups(args.backup_base, args.backup_retention, {}));
+    out << "Pruned rotated backups: removed=" << result.removed << " remaining=" << result.remaining
+        << "; retention=" << (result.retention_satisfied ? "satisfied" : "incomplete") << '\n';
+    return result.retention_satisfied ? 0 : 3;
+}
+
+int run_project_backup_restore_in_place(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    const auto restored = take(database::ProjectStore::restore_backup_in_place(args.path, args.output, {}));
+    out << "Restored project in place: " << escape(path_utf8(restored.path)) << " uuid=" << uuid_text(restored.uuid)
+        << " (close all project connections before restore; reopen target afterward)\n";
+    return 0;
+}
+
 int run_history_audit(const project_detail::Arguments &args, std::ostream &out, std::ostream &err) {
     using namespace project_detail;
     auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
@@ -372,6 +422,10 @@ void project_usage(std::ostream &out) {
            "       hexlab_cli project recovery restore <artifact.tmp> --output <project.hxproj> [--replace]\n"
            "       hexlab_cli project backup <project.hxproj> --output <backup.hxproj> [--replace]\n"
            "       hexlab_cli project backup restore <backup.hxproj> --output <new-project.hxproj> [--replace]\n"
+           "       hexlab_cli project backup list <project.hxproj> --base <backup-name.hxproj> [--json]\n"
+           "       hexlab_cli project backup rotate <project.hxproj> --base <backup-name.hxproj> [--retain N]\n"
+           "       hexlab_cli project backup prune <project.hxproj> --base <backup-name.hxproj> [--retain N]\n"
+           "       hexlab_cli project backup restore-in-place <backup.hxproj> --target <existing-project.hxproj>\n"
            "       hexlab_cli project exchange import <project> --input <file> [--conflict fail|skip|replace] [--dry-run] [--json]\n"
            "Actions: create inspect rename comment bookmark define undefine reference patch undo redo\n"
            "         save save-as export functions references switches stack graph search signatures signature-apply signature-create flirt flirt-apply fingerprints fingerprint-create recognition-evidence methods managed-types fields\n"
@@ -384,6 +438,8 @@ void project_usage(std::ostream &out) {
            "recovery restore: revalidates an artifact and publishes an independent project copy; source artifact stays intact\n"
            "backup project: writes a consistent read-only SQLite snapshot while preserving project UUID and history\n"
            "backup restore: validates the backup and creates an independent project with a new UUID; the backup is retained\n"
+           "backup rotate/prune: only same-UUID, validated generated siblings are pruned; incomplete bounded scans preserve files and return exit 3\n"
+           "backup restore-in-place: requires a same-UUID backup and closed target connections; target retains its UUID and must be reopened\n"
            "exchange import --dry-run: read-only plan with bounded row-level conflict output; --json emits a machine-readable report\n"
            "create: --input <binary> [--format auto|pe|elf|raw|macho|wasm|ihex|srec] [--replace]\n"
            "        ihex/srec preserve firmware text and sparse data; CPU analysis and VA patches are unavailable\n"
@@ -452,6 +508,10 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
             return run_project_backup(args, out);
         if (args.action == L"backup-restore")
             return run_project_backup_restore(args, out);
+        if (args.action == L"backup-list") return run_project_backup_list(args, out);
+        if (args.action == L"backup-rotate") return run_project_backup_rotate(args, out);
+        if (args.action == L"backup-prune") return run_project_backup_prune(args, out);
+        if (args.action == L"backup-restore-in-place") return run_project_backup_restore_in_place(args, out);
         auto pool = std::make_shared<AnalysisPool>();
         auto actor = take(ProjectActor::create({{1}, 1}, pool));
         struct Close {

@@ -2,12 +2,16 @@
 #include <algorithm>
 namespace hexlab::function_detail {
 void build_blocks(Recovery& recovery){
+    const auto edge_reachable = [&](Address at, const NodeEdge& edge) {
+        const auto flags = recovery.reachable_flags.find(at);
+        return flags == recovery.reachable_flags.end() || (flags->second & edge.flags_guard) != 0;
+    };
     AddressSet leaders;AddressMap<size_t> predecessors;
     for(const auto& [entry,function]:recovery.functions)if(recovery.owners.contains(entry))leaders.insert(entry);
     for(const auto& [at,owners]:recovery.owners){
         recovery.canceled();const auto& node=recovery.nodes.at(at);
         if(!node.fact || recovery.ambiguous.contains(at)){leaders.insert(at);continue;}
-        for(const auto& edge:node.edges)if(edge.target && recovery.owners.contains(*edge.target)){
+        for(const auto& edge:node.edges)if(edge_reachable(at, edge) && edge.target && recovery.owners.contains(*edge.target)){
             ++predecessors[*edge.target];
             const auto linear_end=advance(at,node.fact->instruction.length);
             if(edge.kind!=BlockEdgeKind::fallthrough || !linear_end || *edge.target!=linear_end.value() || recovery.owners.at(*edge.target)!=owners)leaders.insert(*edge.target);
@@ -30,11 +34,16 @@ void build_blocks(Recovery& recovery){
             if(!node.fact){block->stop=node.stop;break;}
             block->instructions.push_back(node.fact);if(node.stop)block->stop=node.stop;else if(node.call_issue)block->stop=node.call_issue;
             bool linear=false;
-            if(node.edges.size()==1){const auto& edge=node.edges[0];auto next=advance(current,node.fact->instruction.length);
+            const NodeEdge* only_reachable_edge=nullptr;
+            for(const auto& edge:node.edges)if(edge_reachable(current,edge)){
+                if(only_reachable_edge){only_reachable_edge=nullptr;break;}
+                only_reachable_edge=&edge;
+            }
+            if(only_reachable_edge){const auto& edge=*only_reachable_edge;auto next=advance(current,node.fact->instruction.length);
                 linear=edge.kind==BlockEdgeKind::fallthrough && edge.target && next && *edge.target==next.value() && recovery.owners.contains(*edge.target) && recovery.owners.at(*edge.target)==block->owners && !leaders.contains(*edge.target) && !recovery.node_blocks.contains(*edge.target);
             }
-            if(linear){current=*node.edges[0].target;continue;}
-            for(const auto& edge:node.edges)block->successors.push_back({current,edge.target,{},edge.kind});break;
+            if(linear){current=*only_reachable_edge->target;continue;}
+            for(const auto& edge:node.edges)if(edge_reachable(current, edge))block->successors.push_back({current,edge.target,{},edge.kind});break;
         }
         recovery.blocks.push_back(std::move(block));
     }

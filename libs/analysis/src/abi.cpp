@@ -39,9 +39,9 @@ struct Scalar {
     std::string reason;
 };
 
-Scalar scalar_type(const types::Type &type, std::uint64_t pointer_size) {
+Scalar scalar_type(const types::Type &type, std::uint64_t pointer_size, bool allow_binary80 = false) {
     if (type.kind() == types::Kind::qualified && type.element())
-        return scalar_type(*type.element(), pointer_size);
+        return scalar_type(*type.element(), pointer_size, allow_binary80);
     const auto size = type.size().value_or(0);
     switch (type.kind()) {
     case types::Kind::boolean:
@@ -57,7 +57,8 @@ Scalar scalar_type(const types::Type &type, std::uint64_t pointer_size) {
     case types::Kind::floating:
         if (size == 4 || size == 8)
             return {true, true, size, {}};
-        return {false, true, size, "only 32-bit and 64-bit floating scalars are supported"};
+        if (allow_binary80 && size == 10) return {true, true, size, {}};
+        return {false, true, size, "only 32-bit and 64-bit floating scalars are supported outside SysV AMD64 binary80"};
     case types::Kind::void_type:
         return {false, false, 0, "void is only valid as a function result"};
     default:
@@ -465,8 +466,10 @@ AbiValueLocation classify_result(CallingConvention convention, const types::Type
         result.indirect = true;
         return result;
     }
-    const auto scalar = scalar_type(type, pointer_size);
+    const auto scalar = scalar_type(type, pointer_size, convention == CallingConvention::sysv_x86_64);
     if (!scalar.supported) return unsupported(scalar.reason);
+    if (convention == CallingConvention::sysv_x86_64 && scalar.floating && scalar.size == 10)
+        return {{true}, {}, {reg_location("ST0", 10)}};
     if (is_x86_32(convention)) {
         if (scalar.floating) return {{true}, {}, {reg_location("ST0", scalar.size)}};
         if (scalar.size <= 4) return {{true}, {}, {reg_location(scalar.size == 1 ? "AL" : scalar.size == 2 ? "AX" : "EAX", scalar.size)}};
@@ -2073,6 +2076,21 @@ AbiSignatureClassification classify_abi_signature(CallingConvention convention,
                 out.complete = allocation_known = false;
                 continue;
             }
+            // Binary80 is X87/X87UP for results but MEMORY for SysV AMD64
+            // arguments. Its stack slot occupies 16 bytes with 16-byte alignment.
+            const auto &sysv_scalar_type = unqualified(*parameter.type);
+            if (sysv_scalar_type.kind() == types::Kind::floating &&
+                sysv_scalar_type.size().value_or(0) == 10) {
+                auto location = reserve_stack(stack_cursor, 16, 16, 8);
+                if (!location) {
+                    out.arguments.push_back(unsupported("SysV binary80 stack placement overflows"));
+                    out.complete = allocation_known = false;
+                } else {
+                    location->size = 10;
+                    out.arguments.push_back({true, {}, {std::move(*location)}});
+                }
+                continue;
+            }
         }
         if (convention == CallingConvention::windows_x64 && windows_x64_vector_argument(*parameter.type)) {
             if (!allocation_known) {
@@ -2096,7 +2114,8 @@ AbiSignatureClassification classify_abi_signature(CallingConvention convention,
             out.arguments.push_back(std::move(value));
             continue;
         }
-        const auto scalar = scalar_type(*parameter.type, out.pointer_size);
+        const auto scalar = scalar_type(*parameter.type, out.pointer_size,
+                                        convention == CallingConvention::sysv_x86_64);
         if (!scalar.supported) {
             out.arguments.push_back(unsupported(scalar.reason));
             out.complete = allocation_known = false;

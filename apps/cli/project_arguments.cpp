@@ -176,6 +176,14 @@ Arguments parse(std::span<const std::wstring_view> args) {
             result.action = L"backup-restore";
             result.path = path_from_wide(args[2]);
             option_start = 3;
+        } else if (args.size() >= 3 && (args[1] == L"list" || args[1] == L"rotate" || args[1] == L"prune")) {
+            result.action = args[1] == L"list" ? L"backup-list" : args[1] == L"rotate" ? L"backup-rotate" : L"backup-prune";
+            result.path = path_from_wide(args[2]);
+            option_start = 3;
+        } else if (args.size() >= 3 && args[1] == L"restore-in-place") {
+            result.action = L"backup-restore-in-place";
+            result.path = path_from_wide(args[2]);
+            option_start = 3;
         } else {
             require(args.size() >= 2, "Backup requires a project path");
             result.action = L"backup";
@@ -263,6 +271,16 @@ Arguments parse(std::span<const std::wstring_view> args) {
     } else if (result.action == L"backup-restore") {
         result.output = path_from_wide(options.needed(L"--output"));
         result.replace = options.flag(L"--replace");
+    } else if (result.action == L"backup-list") {
+        result.backup_base = path_from_wide(options.needed(L"--base"));
+        result.backup_json = options.flag(L"--json");
+    } else if (result.action == L"backup-rotate" || result.action == L"backup-prune") {
+        result.backup_base = path_from_wide(options.needed(L"--base"));
+        const auto retention = options.count(L"--retain", 5);
+        require(retention >= 1 && retention <= 32, "Backup retention must be 1..32");
+        result.backup_retention = static_cast<std::size_t>(retention);
+    } else if (result.action == L"backup-restore-in-place") {
+        result.output = path_from_wide(options.needed(L"--target"));
     } else if (result.action == L"exchange-export") {
         result.output = path_from_wide(options.needed(L"--output"));
         result.replace = options.flag(L"--replace");
@@ -615,7 +633,7 @@ Arguments parse(std::span<const std::wstring_view> args) {
                                 : kind == L"fingerprints" ? FunctionRecognitionKind::normalized_fingerprints
                                                            : FunctionRecognitionKind::flirt_patterns;
     } else
-        require(result.action == L"history-audit" || result.action == L"history-preview" || result.action == L"recovery-list" || result.action == L"recovery-restore" || result.action == L"backup" || result.action == L"backup-restore" || result.action == L"exchange-export" || result.action == L"exchange-import" || result.action == L"inspect" || result.action == L"functions" || result.action == L"methods" || result.action == L"managed-types" || result.action == L"fields" || result.action == L"stack" || result.action == L"undo" ||
+        require(result.action == L"history-audit" || result.action == L"history-preview" || result.action == L"recovery-list" || result.action == L"recovery-restore" || result.action == L"backup" || result.action == L"backup-restore" || result.action == L"backup-list" || result.action == L"backup-rotate" || result.action == L"backup-prune" || result.action == L"backup-restore-in-place" || result.action == L"exchange-export" || result.action == L"exchange-import" || result.action == L"inspect" || result.action == L"functions" || result.action == L"methods" || result.action == L"managed-types" || result.action == L"fields" || result.action == L"stack" || result.action == L"undo" ||
                     result.action == L"redo" || result.action == L"save",
                 "Unknown project action");
     require(options.values.empty(),

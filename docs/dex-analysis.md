@@ -74,7 +74,7 @@ while source line rows do not include columns.
 
 The decoder supports the common scalar move, result, return, constant, string
 reference, monitor, throw, goto, conditional branch, packed/sparse switch,
-invoke, and integer/floating arithmetic encodings listed in the supported-subset
+invoke, `filled-new-array`/`filled-new-array/range`, and integer/floating arithmetic encodings listed in the supported-subset
 source. It retains method call flow and direct intra-method branch targets.
 Reference operands are shown
 as table indices because string/type/field/method names are not yet attached to
@@ -85,6 +85,18 @@ recovered method remain incomplete. No Dalvik verifier-wide type model is
 claimed. `inspect` and `disassemble` accept automatic detection or `--format
 dex`; CLI decompilation supports the bounded method lifting subset described in
 `dex-lifting.md`.
+
+Filled-array instructions decode their 35c register list (up to five entries)
+or 3rc contiguous range, retain each source register and the 16-bit type index
+as typed operands, and expose source-register reads plus allocation memory
+effects. The range form rejects 16-bit arithmetic overflow and reports register
+indexes above 255 as unsupported because the shared register operand model is
+8-bit. These instructions fall through; they are not reported as direct method
+calls or branches. The type index remains unresolved text such as `type@N`.
+The decoder does not resolve whether the type is an array of single-word
+elements or pair the produced object with the required following
+`move-result-object`; those are verifier/lifter responsibilities and remain
+unsupported.
 
 Format and instruction details follow the Android Open Source Project's
 [DEX file format](https://source.android.com/docs/core/runtime/dex-format),

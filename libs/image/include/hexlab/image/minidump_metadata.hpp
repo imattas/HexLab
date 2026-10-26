@@ -48,7 +48,7 @@ enum class MinidumpContextStatus : std::uint8_t {
 };
 struct MinidumpContext {
     std::uint16_t processor_architecture = 0xffff;
-    std::uint32_t flags = 0;
+    std::uint64_t flags = 0;
     bool control_valid = false, integer_valid = false;
     std::vector<MinidumpRegister> registers;
     std::vector<std::string> diagnostics;

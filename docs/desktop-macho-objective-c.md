@@ -27,6 +27,11 @@ case-insensitively. Filtering is debounced while typing and preserves each
 visible row's original address target. The filter affects only the displayed
 rows; it does not change the scan or type-import plan.
 
+Selecting a method row with a validated implementation enables **Pseudocode at
+implementation**. It navigates through the existing document/revision guard,
+selects that implementation, and opens the synchronized pseudocode page. Rows
+with only a method-entry address cannot invoke this action.
+
 The **Import Objective-C types** action writes eligible declarations into the
 current project through the normal project command/history path. It creates
 `ObjC2.Class.<name>` declarations with an exact instance size when every

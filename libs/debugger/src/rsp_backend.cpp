@@ -29,6 +29,7 @@ std::string hex_thread_token(std::uint64_t value) {
 struct TargetRegister { std::string name, group; std::size_t number = 0, bits = 0; };
 struct TargetDescription {
     Architecture architecture = Architecture::unknown;
+    std::size_t pointer_bits = 0;
     bool big_endian = false;
     bool endian_declared = false;
     std::vector<TargetRegister> registers;
@@ -61,6 +62,33 @@ Architecture target_architecture(std::string_view name) {
         normalized == "ppc" || normalized.starts_with("ppc:"))
         return Architecture::powerpc;
     return Architecture::unknown;
+}
+std::optional<std::size_t> auxiliary_word_bytes(Architecture architecture, std::size_t pointer_bits = 0) {
+    switch (architecture) {
+    case Architecture::x86:
+    case Architecture::arm:
+    case Architecture::riscv32:
+    case Architecture::mips32:
+        return 4;
+    case Architecture::x86_64:
+    case Architecture::arm64:
+    case Architecture::riscv64:
+    case Architecture::mips64:
+        return 8;
+    case Architecture::powerpc:
+        if (pointer_bits == 32 || pointer_bits == 64) return pointer_bits / 8;
+        return {};
+    default:
+        return {};
+    }
+}
+std::uint64_t target_integer(std::span<const std::byte> bytes, bool big_endian) {
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+        const auto shift_index = big_endian ? bytes.size() - 1 - i : i;
+        value |= std::uint64_t(std::to_integer<unsigned char>(bytes[i])) << (shift_index * 8);
+    }
+    return value;
 }
 std::optional<bool> target_architecture_endian(std::string_view name) {
     if (name == "aarch64_be" || name == "aarch64: big endian") return true;
@@ -596,6 +624,17 @@ Status parse_target_xml_document(std::string_view xml, TargetXmlContext& context
                     return Error{ErrorCode::malformed, "target XML contains conflicting architecture declarations"};
                 out.architecture = architecture;
             }
+            if (architecture == Architecture::powerpc) {
+                std::string normalized(name);
+                std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                const std::size_t pointer_bits = normalized.find("64") != std::string::npos ? 64 :
+                    normalized.find("32") != std::string::npos ? 32 : 0;
+                if (pointer_bits != 0 && out.pointer_bits != 0 && out.pointer_bits != pointer_bits)
+                    return Error{ErrorCode::malformed, "target XML contains conflicting PowerPC pointer widths"};
+                if (pointer_bits != 0) out.pointer_bits = pointer_bits;
+            }
             if (const auto endian = target_architecture_endian(name)) {
                 if (out.endian_declared && out.big_endian != *endian)
                     return Error{ErrorCode::malformed, "target XML architecture conflicts with its byte-order declaration"};
@@ -617,6 +656,16 @@ Result<TargetDescription> parse_target_xml(std::string_view xml, rsp::Client& cl
     if (!parsed) return parsed.error();
     auto& out = context.target;
     if (out.registers.empty()) return Error{ErrorCode::unsupported, "target XML contains no usable registers"};
+    if (out.architecture == Architecture::powerpc) {
+        const auto pc = std::find_if(out.registers.begin(), out.registers.end(), [](const auto& reg) {
+            return reg.name == "pc";
+        });
+        if (pc != out.registers.end() && (pc->bits == 32 || pc->bits == 64)) {
+            if (out.pointer_bits != 0 && out.pointer_bits != pc->bits)
+                return Error{ErrorCode::malformed, "PowerPC target XML architecture and PC register widths conflict"};
+            out.pointer_bits = pc->bits;
+        }
+    }
     std::size_t total = 0; for (const auto& reg : out.registers) { const auto bytes = (reg.bits + 7) / 8; if (bytes > 512 || total > 64 * 1024 - bytes) return Error{ErrorCode::resource_limit, "target XML register storage exceeds limit"}; total += bytes; }
     return std::move(out);
 }
@@ -1047,6 +1096,7 @@ public:
         memory_map_advertised_ = false;
         threads_xml_advertised_ = false;
         osdata_advertised_ = false;
+        auxv_advertised_ = false;
         const auto xml_feature = features.value().features.find("qXfer:features:read");
         if (xml_feature != features.value().features.end() && xml_feature->second != "-") {
             target_xml_advertised_ = true;
@@ -1066,6 +1116,8 @@ public:
         threads_xml_advertised_ = threads_xml != features.value().features.end() && threads_xml->second != "-";
         const auto osdata = features.value().features.find("qXfer:osdata:read");
         osdata_advertised_ = osdata != features.value().features.end() && osdata->second != "-";
+        const auto auxv = features.value().features.find("qXfer:auxv:read");
+        auxv_advertised_ = auxv != features.value().features.end() && auxv->second != "-";
         auto initial = client_->read_stop_reply_optional();
         if (!initial) { client_.reset(); transport_.reset(); return initial.error(); }
         remote_process_id_.reset();
@@ -1286,7 +1338,7 @@ public:
             client_.reset(); transport_.reset(); pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
             expected_step_threads_.clear(); legacy_expected_step_ = false; terminated_ = true; remote_process_id_.reset();
             breakpoints_.clear(); target_.reset(); target_xml_advertised_ = false; libraries_advertised_ = false;
-            memory_map_advertised_ = false; threads_xml_advertised_ = false; multiprocess_supported_ = false;
+            memory_map_advertised_ = false; threads_xml_advertised_ = false; auxv_advertised_ = false; multiprocess_supported_ = false;
             extended_mode_supported_ = false;
             non_stop_mode_ = false;
         }
@@ -1321,7 +1373,7 @@ public:
         remote_thread_tokens_.clear(); thread_token_ids_.clear(); thread_run_states_.clear(); next_thread_token_ = 1;
         inferiors_.clear();
         breakpoints_.clear(); target_.reset(); target_xml_advertised_ = false; libraries_advertised_ = false;
-        memory_map_advertised_ = false; threads_xml_advertised_ = false; multiprocess_supported_ = false;
+        memory_map_advertised_ = false; threads_xml_advertised_ = false; auxv_advertised_ = false; multiprocess_supported_ = false;
         extended_mode_supported_ = false;
         non_stop_mode_ = false;
         remote_process_id_.reset(); terminated_ = false;
@@ -1729,6 +1781,38 @@ public:
         if (!xml.value()) return unsupported("remote advertised qXfer:memory-map:read but returned no memory map");
         return parse_memory_map_xml(*xml.value());
     }
+    Result<std::vector<AuxiliaryVectorEntry>> auxiliary_vector() override {
+        if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
+        if (!auxv_advertised_) return unsupported("remote did not advertise qXfer:auxv:read");
+        if (!target_) return unsupported("remote auxv decoding requires usable target XML architecture and byte order metadata");
+        if (!target_->endian_declared) return unsupported("remote auxv decoding requires declared target byte order");
+        const auto word_bytes = auxiliary_word_bytes(target_->architecture, target_->pointer_bits);
+        if (!word_bytes) return unsupported("remote auxv decoding does not support this target architecture");
+        auto raw = client_->read_auxv_annex();
+        if (!raw) return raw.error();
+        if (!raw.value()) return unsupported("remote advertised qXfer:auxv:read but returned no auxiliary vector");
+        const auto record_bytes = *word_bytes * 2;
+        if (raw.value()->size() > 1024 * 1024 || raw.value()->size() % record_bytes != 0)
+            return Error{ErrorCode::malformed, "remote auxiliary vector has an invalid byte length"};
+        const auto count = raw.value()->size() / record_bytes;
+        if (count == 0 || count > 4096)
+            return Error{ErrorCode::malformed, "remote auxiliary vector entry count is outside supported bounds"};
+        std::vector<AuxiliaryVectorEntry> result;
+        result.reserve(count);
+        const auto bytes = std::span<const std::byte>(*raw.value());
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto offset = i * record_bytes;
+            const auto type = target_integer(bytes.subspan(offset, *word_bytes), target_->big_endian);
+            const auto value = target_integer(bytes.subspan(offset + *word_bytes, *word_bytes), target_->big_endian);
+            result.push_back({type, value});
+            if (type == 0) {
+                if (value != 0 || i + 1 != count)
+                    return Error{ErrorCode::malformed, "remote auxiliary vector has an invalid AT_NULL terminator"};
+                return result;
+            }
+        }
+        return Error{ErrorCode::malformed, "remote auxiliary vector is missing AT_NULL terminator"};
+    }
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread) override {
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
         const auto wire_id = thread_id(thread);
@@ -1935,6 +2019,7 @@ private:
     bool memory_map_advertised_ = false;
     bool threads_xml_advertised_ = false;
     bool osdata_advertised_ = false;
+    bool auxv_advertised_ = false;
     bool multiprocess_supported_ = false;
     bool extended_mode_supported_ = false;
     bool non_stop_mode_ = false;
@@ -2012,6 +2097,7 @@ public:
     Result<std::vector<ThreadRunState>> thread_run_states() override { return active().thread_run_states(); }
     Result<std::vector<ModuleInfo>> modules() override { return active().modules(); }
     Result<std::vector<MemoryRegion>> memory_regions() override { return active().memory_regions(); }
+    Result<std::vector<AuxiliaryVectorEntry>> auxiliary_vector() override { return active().auxiliary_vector(); }
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread) override { return active().read_registers(thread); }
     Status write_registers(ThreadId thread, std::span<const RegisterValue> registers) override { return active().write_registers(thread, registers); }
     Result<Breakpoint> add_breakpoint(std::uint64_t address, BreakpointKind kind) override { return active().add_breakpoint(address, kind); }

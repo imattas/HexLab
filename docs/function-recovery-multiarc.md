@@ -13,12 +13,19 @@ manual code-region roots are admitted before metadata-derived roots. Omitted
 automatic roots remain ownership boundaries, so the cap cannot make their
 bytes silently merge into another function.
 
-ARM predicate handling is shared in intent across reachable scanning and
-function recovery: A32 conditional instructions and Thumb instructions with a
-conditional or unresolved IT predicate preserve the skipped path for terminal
-returns/traps and unsupported PC writes. An unsupported PC write remains a
-bounded stop; the extra edge does not invent or validate a target. Thumb
-`unknown_it` is used only when the propagated incoming IT state is unresolved.
+ARM predicate handling tracks possible NZCV valuations during function
+recovery. A32 condition codes and the condition attached to each Thumb IT
+slot guard both execution and skip edges. For conditional branches, the taken
+and not-taken edges refine those valuations; writes to NZCV widen the executed
+path to all valuations while the predicate-false path retains its prior
+valuations. Calls conservatively widen the continuing executed path because
+the callee may change flags. Terminal returns, traps, unsupported PC writes,
+and unresolved transfers retain guarded stops and possible skip edges. The
+model does not evaluate flag-producing instruction semantics, so it prunes
+only contradictions implied by known predicate conditions. Unknown Thumb IT
+state remains conservative and does not narrow conditions. Shared block CFGs
+publish the union of edges reachable by their owners; per-owner edge filtering
+is not represented in the public CFG.
 
 Validated PE TLS callback entries are also roots because the loader invokes
 them independently of the image entry point. Callback RVAs are translated

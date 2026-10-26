@@ -30,6 +30,7 @@ The supported fixed little-endian Windows CONTEXT layouts are:
 | AMD64 | Control (`rsp`, `rip`, segments and flags), integer, segments, debug, and fixed x87/XMM0-15/MXCSR floating storage. Both top-level and FXSAVE MXCSR copies are retained. |
 | ARM32 | Control (`sp`, `lr`, `pc`, `cpsr`), integer R0-12, FPSCR and D0-31/Q0-15 aliases, and fixed breakpoint/watchpoint registers. |
 | ARM64 | Control (`x29`, `x30`, `sp`, `pc`, `cpsr`), integer X0-28 with X18 retained only when explicitly requested by its separate flag, full or low/high partial NEON V-register storage, FPCR/FPSR when the low/full group is available, and fixed breakpoint/watchpoint registers. |
+| Breakpad ARM64 (`processor_architecture=0x8003`) | Its packed legacy layout and 64-bit ContextFlags are decoded separately: integer/control group includes X0-X30, SP, PC and CPSR; floating group includes FPSR, FPCR and V0-V31. |
 
 Public `MinidumpContext` metadata records decoded, partial, not-captured,
 unsupported-architecture, architecture-mismatch, or malformed status; raw flags;
@@ -47,7 +48,7 @@ reject the input; in-range incomplete layouts remain inspectable with status
 and diagnostics. Context issues also mark overall metadata incomplete.
 
 Context reads retain at most 716 bytes for x86, 416 for ARM32, 1,232 for AMD64,
-912 for ARM64, and 64 for unknown architectures. The full advertised source
+912 for Microsoft ARM64, 796 for Breakpad ARM64, and 64 for unknown architectures. The full advertised source
 extent is validated even when only a prefix is decoded. Decoding is capped at
 4,096 contexts; later descriptors retain source extents with a global diagnostic.
 Context allocations, register bytes and strings are charged to the 64 MiB
@@ -55,6 +56,9 @@ metadata budget. Stream, thread, memory and module counts remain independently
 bounded. Thread/context processing checks cancellation between records. The CLI
 summary lists at most 256 threads, includes captured names when available, and
 prints wide register values from their captured bytes.
+
+The legacy ARM64 layout follows the Breakpad `MDRawContextARM64_Old` format,
+also described as `CONTEXT_ARM64_OLD` by [minidump-common](https://docs.rs/minidump-common/latest/minidump_common/format/struct.CONTEXT_ARM64_OLD.html).
 
 When `MemoryInfoList` is present, captured regions are split at protection
 boundaries and retain read, write, and execute permissions. If protection data

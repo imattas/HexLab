@@ -26,10 +26,30 @@ struct AddressLess {
 };
 using AddressSet = std::set<Address, AddressLess>;
 template <class T> using AddressMap = std::map<Address, T, AddressLess>;
+struct PathVisitState { ThumbITState it{}; std::uint16_t flags = 0; };
+inline std::uint16_t add_new_path_flags(AddressMap<PathVisitState> &visited, Address at, ThumbITState it,
+                                       std::uint16_t incoming, bool &it_conflict) {
+    auto found = visited.find(at);
+    if (found == visited.end()) {
+        visited.emplace(at, PathVisitState{it, incoming});
+        return incoming;
+    }
+    if (found->second.it != it) {
+        it_conflict = true;
+        return 0;
+    }
+    const auto fresh = static_cast<std::uint16_t>(incoming & ~found->second.flags);
+    found->second.flags = static_cast<std::uint16_t>(found->second.flags | incoming);
+    return fresh;
+}
 struct NodeEdge {
     std::optional<Address> target;
     BlockEdgeKind kind;
     ThumbITState target_it{};
+    // NZCV valuations required before this instruction for the edge to execute.
+    // The all-ones default denotes an unmodelled or unconditional edge.
+    std::uint16_t flags_guard = 0xffff;
+    bool flags_unknown_after = false;
 };
 struct Node {
     Address at;
@@ -40,6 +60,8 @@ struct Node {
     bool call = false;
     std::optional<Address> call_target;
     std::optional<FunctionStop> call_issue;
+    std::uint16_t call_guard = 0xffff;
+    std::uint16_t stop_guard = 0xffff;
     std::vector<std::uint64_t> decisions;
     ThumbITState incoming_it{};
 };
@@ -61,6 +83,7 @@ class Recovery {
     Ids ids;
     AddressMap<Node> nodes;
     AddressMap<ThumbITState> thumb_states;
+    AddressMap<std::uint16_t> reachable_flags;
     AddressMap<std::vector<FunctionSeed>> roots, all_seeds, valid_seeds;
     // Validated object-format function ranges constrain control-flow recovery
     // when no explicit user chunk definition overrides them.

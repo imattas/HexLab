@@ -42,7 +42,7 @@ enum : int { launch_id = wxID_HIGHEST + 220, attach_id, detach_id, terminate_id,
             previous_memory_id, next_memory_id, refresh_modules_id, refresh_processes_id,
             detach_remote_process_id,
             refresh_memory_regions_id, write_memory_id, write_register_id, navigate_pc_id, navigate_frame_id,
-            memory_search_id, cancel_memory_search_id, add_watch_id, remove_watch_id, refresh_watches_id };
+            memory_search_id, cancel_memory_search_id, add_watch_id, remove_watch_id, refresh_watches_id, refresh_auxv_id };
 
 std::string narrow(const wxString &value) { return value.ToStdString(); }
 std::string hex(std::span<const std::byte> bytes) {
@@ -428,6 +428,18 @@ DebuggerView::DebuggerView(wxWindow *parent, std::unique_ptr<debugger::Backend> 
     watch_box->Add(watch_view_, 1, wxEXPAND);
     watch_page->SetSizer(watch_box);
     memory_tabs_->AddPage(watch_page, "Watches", false);
+
+    auto *auxv_page = new wxPanel(memory_tabs_);
+    auto *auxv_box = new wxBoxSizer(wxVERTICAL);
+    auxv_box->Add(new wxStaticText(auxv_page, wxID_ANY,
+        "Linux auxiliary vector entries from the connected remote target."), 0, wxEXPAND | wxBOTTOM, FromDIP(4));
+    auxv_box->Add(make_button(auxv_page, "debug-auxv-refresh", "Refresh", refresh_auxv_id), 0, wxBOTTOM, FromDIP(4));
+    auxiliary_vector_view_ = make_list(auxv_page, "debug-auxv", {"Type", "Value"});
+    auxiliary_vector_view_->SetColumnWidth(0, FromDIP(120));
+    auxiliary_vector_view_->SetColumnWidth(1, FromDIP(220));
+    auxv_box->Add(auxiliary_vector_view_, 1, wxEXPAND);
+    auxv_page->SetSizer(auxv_box);
+    memory_tabs_->AddPage(auxv_page, "Auxv", false);
     memory_column->Add(memory_tabs_, 1, wxEXPAND);
     inspect->Add(memory_column, 1, wxEXPAND | wxRIGHT, FromDIP(5));
     auto *module_column = new wxBoxSizer(wxVERTICAL);
@@ -492,6 +504,7 @@ DebuggerView::DebuggerView(wxWindow *parent, std::unique_ptr<debugger::Backend> 
     }, memory_search_results_->GetId());
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { refresh_modules(); }, refresh_modules_id);
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { refresh_memory_regions(); }, refresh_memory_regions_id);
+    Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { refresh_auxiliary_vector(); }, refresh_auxv_id);
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { refresh_processes(); }, refresh_processes_id);
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { detach_remote_process(); }, detach_remote_process_id);
     Bind(wxEVT_CHOICE, [this](wxCommandEvent &event) {
@@ -2096,6 +2109,39 @@ void DebuggerView::refresh_memory_regions() {
     });
 }
 
+void DebuggerView::refresh_auxiliary_vector() {
+    auxiliary_vector_view_->DeleteAllItems();
+    auxiliary_vector_.clear();
+    const auto generation = session_generation_;
+    const auto request = ++auxv_request_;
+    auto session = session_; auto state = inspection_state_;
+    enqueue_inspection(4, [session, state, generation, request] {
+        std::lock_guard backend_lock(state->backend_mutex);
+        auto result = session->auxiliary_vector();
+        std::vector<debugger::AuxiliaryVectorEntry> values; std::string error;
+        if (result) values = std::move(result.value()); else error = result.error().message;
+        if (auto *app = wxTheApp) app->CallAfter([state, generation, request, values = std::move(values), error = std::move(error)]() mutable {
+            std::lock_guard lock(state->mutex); auto *view = state->target;
+            if (!view || view->session_generation_ != generation || view->auxv_request_ != request) return;
+            view->auxiliary_vector_.clear();
+            if (!error.empty()) {
+                view->auxiliary_vector_view_->InsertItem(0, "Unavailable");
+                view->auxiliary_vector_view_->SetItem(0, 1, wxString::FromUTF8(error));
+                view->report(wxString::FromUTF8(error));
+                return;
+            }
+            view->auxiliary_vector_ = std::move(values);
+            for (const auto &entry : view->auxiliary_vector_) {
+                const auto row = view->auxiliary_vector_view_->InsertItem(
+                    view->auxiliary_vector_view_->GetItemCount(),
+                    wxString::Format("%llu", static_cast<unsigned long long>(entry.type)));
+                view->auxiliary_vector_view_->SetItem(row, 1,
+                    wxString::Format("0x%llX", static_cast<unsigned long long>(entry.value)));
+            }
+        });
+    });
+}
+
 void DebuggerView::add_watch_expression() {
     auto expression = narrow(watch_expression_->GetValue());
     const auto first = std::find_if_not(expression.begin(), expression.end(), [](unsigned char c) { return std::isspace(c); });
@@ -2191,7 +2237,7 @@ void DebuggerView::clear_inspection() {
     ++session_generation_;
     inspection_state_->session_generation.fetch_add(1, std::memory_order_acq_rel);
     inspection_state_->stop_generation.fetch_add(1, std::memory_order_acq_rel);
-    ++register_request_; ++memory_request_; ++module_request_; ++region_request_; ++locals_request_;
+    ++register_request_; ++memory_request_; ++module_request_; ++region_request_; ++auxv_request_; ++locals_request_;
     ++memory_search_request_;
     ++watch_request_;
     memory_search_stop_.request_stop();
@@ -2206,6 +2252,7 @@ void DebuggerView::clear_inspection() {
     registers_view_->DeleteAllItems(); register_value_->Clear();
     modules_.clear(); modules_view_->DeleteAllItems();
     memory_regions_.clear(); memory_regions_view_->DeleteAllItems();
+    auxiliary_vector_.clear(); auxiliary_vector_view_->DeleteAllItems();
     locals_view_->DeleteAllItems();
     memory_view_->Clear(); memory_address_->Clear();
     memory_search_matches_.clear(); memory_search_results_->DeleteAllItems();

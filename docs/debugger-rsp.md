@@ -178,6 +178,29 @@ thread listing; an unknown token is rejected rather than interpreted as a raw
 wire ID. Stop and enumeration IDs must name concrete positive threads, not the
 `0`/`-1` selector forms.
 
+## Linux auxiliary vector
+
+When `qSupported` advertises `qXfer:auxv:read`, the debugger's **Auxv** tab
+retrieves the target's Linux auxiliary vector through `qXfer:auxv:read`. The
+client requests bounded chunks using the negotiated packet limit and accepts
+the protocol's `m`/`l` continuation markers. Empty first replies mean the
+annex is unavailable; malformed markers, zero-progress continuation, truncated
+annexes, and data beyond the 1 MiB cap are errors. The transfer uses the normal
+RSP transaction path, so stop notifications remain queued and transport errors
+or disconnects are reported; the desktop drops stale refresh results after a
+session change.
+
+Decoding requires usable target XML metadata that identifies a supported
+32-bit or 64-bit architecture and declares byte order (or names an architecture
+with an explicit byte order). PowerPC word width comes from an explicit 32/64
+architecture marker or a 32/64-bit PC register; ambiguous width is unsupported.
+Each entry is read as two target words, capped at 4,096 entries, and the sequence must end with a final
+`AT_NULL` record whose value is zero. The UI presents numeric type IDs and
+hexadecimal values, including the terminator. Unsupported architectures,
+missing target XML, and stubs that do not advertise the annex return
+`unsupported`; no host architecture, pointer width, or byte order is guessed. Other operating
+systems' auxv formats and architecture-specific symbolic names are not decoded.
+
 When `qSupported` advertises `qXfer:osdata:read`, `DebugSession::processes()`
 reads the standard `processes` annex and returns its decimal PID values with
 the optional `command` column as each process name. The bounded XML reader

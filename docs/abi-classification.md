@@ -360,3 +360,7 @@ other aggregate layouts, and unknown C++ class semantics are unsupported.
 The algorithm follows the OpenPOWER [64-bit ELFv2 ABI specification](https://openpower.foundation/specifications/64bitelfabi/),
 especially [parameter save area, register selection, and returns in the
 published source](https://github.com/OpenPOWERFoundation/ELFv2-ABI/blob/2c052b1ec5a5e2c51989eb109f8559a9df6d8202/specification/ch_2.xml).
+
+## SysV AMD64 binary80 scalar
+
+A 10-byte floating scalar uses the binary80 long double ABI class only for SysV AMD64. Results use ST0. Arguments use the MEMORY class and occupy a 16-byte aligned, 16-byte stack slot while retaining a 10-byte payload width. Other classifiers continue to reject binary80. This does not model x87 register-stack state or general extended-precision expression recovery. The class rules follow the [System V AMD64 psABI](https://gitlab.com/x86-psABIs/x86-64-ABI).
