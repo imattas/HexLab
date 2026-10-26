@@ -412,12 +412,16 @@ stores stop that proof. Aggregate returns without a modeled result register rema
 untyped. Targets in a different register file and unsupported slot classes are
 left unresolved.
 
-Explicit prototypes can model aggregate return registers only when the
-decompiler call IR represents the complete result in one register. System V
-AMD64 delegates this decision to the shared eightbyte classifier, so supported
-single-location INTEGER and SSE results use RAX or XMM0, including mixed
-aggregate shapes classified into one register. Returns split across multiple
-GPR/XMM registers and hidden-result-pointer aggregates remain unresolved in call
-SSA. Windows x64 and AAPCS64 retain their bounded single-register cases; AAPCS64
-models a one-member HFA in v0. This path is prototype-driven and never guesses
-aggregate returns from observed register widths.
+Explicit prototypes can model aggregate return registers when the decompiler
+can represent the classified result pieces. System V AMD64 delegates this
+decision to the shared eightbyte classifier. A single-location INTEGER or SSE
+result uses RAX or XMM0, including mixed aggregate shapes classified into one
+register. Two-location results are modeled only when both pieces are direct
+GPR/XMM values, cover the aggregate exactly without gaps or overlap, and the
+existing aggregate projection logic can derive each piece type. This supports
+bounded INTEGER, SSE, and mixed INTEGER/SSE two-eightbyte returns. Hidden-result
+pointers, x87 classes, unsupported layouts, and results with any other number
+or arrangement of locations remain unresolved. Windows x64 and AAPCS64 retain
+their bounded single-register cases; AAPCS64 models a one-member HFA in v0.
+This path is prototype-driven and never guesses aggregate returns from
+observed register widths.

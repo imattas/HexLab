@@ -834,6 +834,56 @@ std::optional<types::TypePtr> sysv64_component_type(const types::TypePtr &input,
     const auto vector = types::Type::vector(lane, members.size(), component_size);
     return vector ? std::optional<types::TypePtr>{vector.value()} : std::nullopt;
 }
+
+struct Sysv64ReturnPiece {
+    RegisterOperand reg;
+    std::uint8_t offset = 0;
+    std::uint8_t size = 0;
+    types::TypePtr type;
+};
+
+std::optional<std::vector<Sysv64ReturnPiece>> sysv64_aggregate_return_pieces(
+    const types::TypePtr &input) {
+    const auto aggregate = unqualified_type(input);
+    if (!aggregate || !aggregate->size() || *aggregate->size() == 0 || *aggregate->size() > 16 ||
+        aggregate->kind() != types::Kind::structure)
+        return {};
+    const auto signature = types::Type::function(input, {}, false);
+    if (!signature) return {};
+    const auto classified = classify_abi_signature(CallingConvention::sysv_x86_64, *signature.value());
+    const auto &result = classified.result;
+    if (!result.supported || result.indirect || result.locations.size() != 2) return {};
+    std::vector<Sysv64ReturnPiece> pieces;
+    pieces.reserve(result.locations.size());
+    std::set<std::tuple<unsigned, unsigned, unsigned, bool>> seen;
+    for (const auto &location : result.locations) {
+        if (location.kind != AbiLocationKind::register_ || location.role != AbiLocationRole::value ||
+            location.value_offset > UINT8_MAX || location.size == 0 || location.size > UINT8_MAX)
+            return {};
+        const auto reg = classified_register(location.register_name);
+        if (!reg || !reg->width || location.size > reg->width / 8 ||
+            (reg->bank != RegisterBank::gpr && reg->bank != RegisterBank::xmm) ||
+            !seen.emplace(static_cast<unsigned>(reg->bank), reg->index, reg->width, reg->high_byte).second)
+            return {};
+        const auto piece_class = reg->bank == RegisterBank::xmm ? AbiValueClass::floating
+                                                                 : AbiValueClass::integer;
+        const auto projected = sysv64_component_type(input,
+            static_cast<std::uint8_t>(location.value_offset), static_cast<std::uint8_t>(location.size), piece_class);
+        if (!projected) return {};
+        pieces.push_back({*reg, static_cast<std::uint8_t>(location.value_offset),
+                          static_cast<std::uint8_t>(location.size), *projected});
+    }
+    std::sort(pieces.begin(), pieces.end(), [](const auto &left, const auto &right) {
+        return left.offset < right.offset;
+    });
+    std::uint64_t cursor = 0;
+    for (const auto &piece : pieces) {
+        if (piece.offset != cursor) return {};
+        cursor += piece.size;
+    }
+    if (cursor != *aggregate->size()) return {};
+    return pieces;
+}
 } // namespace
 
 AbiDescription x86_64_windows_abi() {
@@ -1128,6 +1178,23 @@ static Result<TypeRecoveryResult> recover_types_impl(
                     returned.floating = s.result_type->kind() == types::Kind::floating;
                     returned.constrained = true;
                     merge_exact_type(returned, s.result_type);
+                }
+                if (s.result_type && !s.return_register && s.result_type->kind() == types::Kind::structure) {
+                    if (const auto pieces = sysv64_aggregate_return_pieces(s.result_type)) {
+                        for (const auto &piece : *pieces) {
+                            for (std::size_t n = 0; n < s.register_writes.size(); ++n) {
+                                if (s.register_writes[n] != piece.reg || n >= s.register_output_versions.size()) continue;
+                                auto &returned = ensure(piece.reg, s.register_output_versions[n]);
+                                returned.bits = type_bits(piece.type);
+                                returned.sign = is_signed_type(piece.type);
+                                returned.pointer = is_pointer_type(piece.type);
+                                returned.floating = piece.type->kind() == types::Kind::floating;
+                                returned.constrained = true;
+                                merge_exact_type(returned, piece.type);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             else if constexpr(std::is_same_v<T,Return>) register_expr(s.value,register_expr);
@@ -3803,9 +3870,13 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                     target_abi = &external->second.abi;
                 }
                 const auto result_register = returned_register(*target_abi, type);
-                if (!result_register) continue;
-                call->return_register = result_register;
-                call->result_type = type;
+                if (result_register) {
+                    call->return_register = result_register;
+                    call->result_type = type;
+                    continue;
+                }
+                if (target_abi->name == "x86-64 System V" && sysv64_aggregate_return_pieces(type))
+                    call->result_type = type;
             }
         }
 
