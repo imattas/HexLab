@@ -660,7 +660,7 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
             else if(unit_type!=1)return unsupported("unsupported DWARF v5 unit type "+std::to_string(unit_type));
             as_value=as.value();aboff_value=aboff.value();}
         else return unsupported("only DWARF versions 4 and 5 are supported");
-        if(sections.expected_split_dwo_id && version.value()==5){if(unit_type!=5||!dwo_id)return malformed("DWO contribution contains a non-split compile unit");if(*dwo_id!=*sections.expected_split_dwo_id)return malformed("DWO contribution ID does not match its skeleton");if(sections.expected_split_address_size&&as_value!=*sections.expected_split_address_size)return malformed("DWO address size does not match its skeleton");output.split_unit=true;output.split_dwo_id=*dwo_id;}
+        if(sections.expected_split_dwo_id && version.value()==5){if(unit_type==6){if(sections.expected_split_address_size&&as_value!=*sections.expected_split_address_size)return malformed("DWO type-unit address size does not match its skeleton");}else {if(unit_type!=5||!dwo_id)return malformed("DWO contribution contains a non-split compile unit");if(*dwo_id!=*sections.expected_split_dwo_id)return malformed("DWO contribution ID does not match its skeleton");if(sections.expected_split_address_size&&as_value!=*sections.expected_split_address_size)return malformed("DWO address size does not match its skeleton");output.split_unit=true;output.split_dwo_id=*dwo_id;}}
         else if(unit_type==5)return unsupported("split compile unit must be imported through its matching skeleton");
         if(as_value!=4&&as_value!=8)return unsupported("DWARF address size must be 4 or 8");auto abbrevs=read_abbrevs(sections.abbrev,aboff_value,sections.stop);if(!abbrevs)return abbrevs.error();
         std::vector<Die> dies;std::vector<std::size_t> parents;Reader body(sections.info,info.position(),unit_end);
@@ -1021,7 +1021,7 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
                 prior_function_signatures.emplace(sections.info_section_offset+die.offset,std::move(signature));
         }
         for(const auto&[offset,type]:cache)absolute_type_references.emplace(sections.info_section_offset+offset,type);
-        if(type_signature){const auto target_offset=unit_offset+*type_die_offset;auto target=by_offset.find(target_offset);if(target==by_offset.end())return malformed("DWARF type-unit target DIE is not indexed");auto target_type=resolve_type(target->second);if(!target_type)return target_type.error();signature_types.emplace(*type_signature,target_type.value());}
+        if(type_signature){const auto target_offset=unit_offset+*type_die_offset;auto target=by_offset.find(target_offset);if(target==by_offset.end())return malformed("DWARF type-unit target DIE is not indexed");auto target_type=resolve_type(target->second);if(!target_type)return target_type.error();signature_types.emplace(*type_signature,target_type.value());output.type_signatures.push_back({*type_signature,target_type.value(),origin(sections,unit_offset,dies[target->second])});}
         auto parent_function_index=[&](std::size_t i)->std::optional<std::size_t>{auto p=dies[i].parent;while(p){if(dies[*p].tag==tag_subprogram)return *p;p=dies[*p].parent;}return {};};
         for(std::size_t i=0;i<dies.size();++i){if(canceled())return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF import canceled"};const auto&d=dies[i];
             if(d.tag==tag_variable||d.tag==tag_formal_parameter){
