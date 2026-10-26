@@ -88,7 +88,8 @@ DecodeResult decode_jvm(std::span<const std::byte> b, Address at) {
             const auto low=s32(b,n), high=s32(b,n+4); n+=8;
             if(high<low) return fail(DecodeStatus::invalid,"tableswitch high bound precedes low bound");
             const auto count=std::uint64_t(std::int64_t(high)-low)+1;
-            if(count>1024) return fail(DecodeStatus::unsupported,"tableswitch exceeds the 1024-case bounded decode limit");
+            if (n > 65535 || count > (65535 - n) / 4)
+                return fail(DecodeStatus::unsupported,"tableswitch exceeds the classfile Code extent limit");
             if(count>(b.size()-n)/4) return fail(DecodeStatus::truncated,"truncated tableswitch targets");
             parsed.cases.reserve(static_cast<std::size_t>(count));
             for(std::uint64_t k=0;k<count;++k){
@@ -100,7 +101,8 @@ DecodeResult decode_jvm(std::span<const std::byte> b, Address at) {
         } else {
             const auto pairs=s32(b,n); n+=4;
             if(pairs<0) return fail(DecodeStatus::invalid,"negative lookupswitch pair count");
-            if(pairs>1024) return fail(DecodeStatus::unsupported,"lookupswitch exceeds the 1024-pair bounded decode limit");
+            if (n > 65535 || std::uint64_t(pairs) > (65535 - n) / 8)
+                return fail(DecodeStatus::unsupported,"lookupswitch exceeds the classfile Code extent limit");
             if(std::uint64_t(pairs)>(b.size()-n)/8) return fail(DecodeStatus::truncated,"truncated lookupswitch pairs");
             parsed.cases.reserve(static_cast<std::size_t>(pairs));
             std::int32_t previous=INT32_MIN;

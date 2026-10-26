@@ -47,9 +47,11 @@ format 14; Apple's header is the format authority for this decode.
 
 The 32-bit cache (format 4) and firmware (format 5) pointer formats retain
 their bounded 30-bit/2-bit and 26-bit/6-bit target/next fields respectively,
-and follow their 4-byte-stride chains. Their target bases require dyld cache or
-firmware mapping context, so the rows remain explicitly incomplete and no
-rebase address is inferred. These formats are accepted only in 32-bit slices.
+and follow their 4-byte-stride chains. Format 4 is cache-relative and remains
+unresolved without a cache mapping context. Apple defines format 5's 26-bit
+target as a VM address, so the parser records it as a direct target without
+adding an invented base. The current resolver does not yet resolve format 5.
+These formats are accepted only in 32-bit slices.
 
 The parser applies these hard limits before allocating symbol strings or
 following chain records:

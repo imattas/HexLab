@@ -426,19 +426,41 @@ DwarfPackageResolvers read_dwp_supplementary_resolver(
         {5, ".debug_loclists.dwo"}, {6, ".debug_str_offsets.dwo"}, {7, ".debug_macro.dwo"},
         {8, ".debug_rnglists.dwo"}, {9, ".debug_addr.dwo"},
     };
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> relocation_buffers;
+    const auto add_relocation_buffer = [&](const ElfSection *section, std::vector<std::uint8_t> &bytes) {
+        if (!section || bytes.empty()) return;
+        const auto index = static_cast<std::uint32_t>(section - metadata.sections.data());
+        relocation_buffers.emplace_back(index, &bytes);
+    };
     for (const auto &[id, name] : names) {
         canceled(stop);
         if (!package->index && id != 1 && id != 3 && id != 4 && id != 6) continue;
         const auto *section = debug_section(metadata, name);
-        if (section && section->size)
-            package->sections.emplace(id, read_debug_bytes(*tracking, metadata, *section, budget, stop));
-        else if (id == 1 || id == 3)
+        if (section && section->size) {
+            auto [entry, inserted] = package->sections.emplace(
+                id, read_debug_bytes(*tracking, metadata, *section, budget, stop));
+            require(inserted, "duplicate DWP supplementary package section ID");
+            add_relocation_buffer(section, entry->second);
+        } else if (id == 1 || id == 3) {
             throw Failure{{ErrorCode::unsupported, "DWP supplementary package lacks INFO or ABBREV data"}};
+        }
     }
-    if (const auto *strings = debug_section(metadata, ".debug_str.dwo"))
-        if (strings->size) package->strings = read_debug_bytes(*tracking, metadata, *strings, budget, stop);
-    if (const auto *strings = debug_section(metadata, ".debug_line_str.dwo"))
-        if (strings->size) package->line_strings = read_debug_bytes(*tracking, metadata, *strings, budget, stop);
+    if (const auto *strings = debug_section(metadata, ".debug_str.dwo")) {
+        if (strings->size) {
+            package->strings = read_debug_bytes(*tracking, metadata, *strings, budget, stop);
+            add_relocation_buffer(strings, package->strings);
+        }
+    }
+    if (const auto *strings = debug_section(metadata, ".debug_line_str.dwo")) {
+        if (strings->size) {
+            package->line_strings = read_debug_bytes(*tracking, metadata, *strings, budget, stop);
+            add_relocation_buffer(strings, package->line_strings);
+        }
+    }
+    // Supplementary DWARF forms can point into relocated package sections too.
+    // Apply RELA to complete section buffers before the index resolver slices
+    // individual CU/TU contributions, exactly as for selected DWP packages.
+    relocate_dwarf_data(metadata, relocation_buffers, stop);
     require(budget.used <= max_bytes, "DWP supplementary package exceeds configured byte limit", ErrorCode::resource_limit);
     const auto examined = budget.used;
     std::vector<symbols::DwarfPackageSectionData> package_sections;

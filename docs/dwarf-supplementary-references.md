@@ -41,9 +41,14 @@ existing support. Cross-package signature catalogs are separate from
 supplementary offset selection.
 
 Package sections and decoded index tables share the configured supplementary
-byte budget (64 MiB by default). The CU resolver uses the remaining byte budget
+byte budget (64 MiB by default). For little-endian ET_REL supplementary DWP
+files, the loader applies the bounded explicit-addend absolute relocation set
+documented in [DWARF v5 import](dwarf-v5-import.md#elf-dwarf-data-relocations)
+to consumed INFO, ABBREV, string, address, location, range, and line-string
+sections before slicing contributions. REL, compressed targets, and unsupported
+relocation types remain unsupported. The CU resolver uses the remaining byte budget
 and at most `min(configured_requests, 4096)` requests. The importer additionally
 checks its shared supplementary request and reported-byte/encoded-type budgets
 for both forms, including cached resolutions. Cancellation and failed imports
-publish no partial import result. Automatic discovery, supplementary package
-relocations, and unsupported type/location/range forms remain explicit limits.
+publish no partial import result. Automatic discovery and unsupported
+type/location/range forms remain explicit limits.
