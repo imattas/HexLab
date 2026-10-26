@@ -403,7 +403,12 @@ enum class Opcode {
     // MIPS32 COP1 data/control transfers; appended to preserve serialized IDs.
     mips_mfc1, mips_cfc1, mips_mtc1, mips_ctc1,
     // AArch64 signed word load; append to preserve persisted opcode IDs.
-    a64_ldrsw
+    a64_ldrsw,
+    // RVV widening add/sub forms, appended after all prior persisted IDs.
+    rv_vwadd_vv, rv_vwadd_vx, rv_vwadd_wv, rv_vwadd_wx,
+    rv_vwaddu_vv, rv_vwaddu_vx, rv_vwaddu_wv, rv_vwaddu_wx,
+    rv_vwsub_vv, rv_vwsub_vx, rv_vwsub_wv, rv_vwsub_wx,
+    rv_vwsubu_vv, rv_vwsubu_vx, rv_vwsubu_wv, rv_vwsubu_wx
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

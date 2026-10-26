@@ -569,6 +569,12 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
                                              "vwmaccsu.vv", "vwmaccsu.vx", "vwmaccus.vx"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vwmaccu_vv)];
     }
+    if (op >= Opcode::rv_vwadd_vv && op <= Opcode::rv_vwsubu_wx) {
+        static constexpr const char *names[]{"vwadd.vv","vwadd.vx","vwadd.wv","vwadd.wx",
+            "vwaddu.vv","vwaddu.vx","vwaddu.wv","vwaddu.wx","vwsub.vv","vwsub.vx","vwsub.wv","vwsub.wx",
+            "vwsubu.vv","vwsubu.vx","vwsubu.wv","vwsubu.wx"};
+        return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vwadd_vv)];
+    }
     if (op >= Opcode::rv_vdivu_vv && op <= Opcode::rv_vrem_vx) {
         static constexpr const char *names[]{"vdivu.vv", "vdivu.vx", "vdiv.vv", "vdiv.vx",
                                              "vremu.vv", "vremu.vx", "vrem.vv", "vrem.vx"};

@@ -16,7 +16,7 @@ enum class CallingConvention {
     x86_32_stdcall, x86_32_fastcall, x86_32_thiscall, riscv32, riscv64,
     // Appended to preserve the ordinal values of previously shipped entries.
     x86_32_vectorcall, windows_x64_vectorcall, aapcs32,
-    // Explicit MIPS ABI selectors; only Linux N64 is currently classified.
+    // Explicit MIPS ABI selectors; Linux N32 and N64 scalar subsets are classified.
     mips_o32, mips_n32, mips_n64,
     // Explicit little-endian PowerPC64 ELFv2; ELF class alone cannot select it.
     ppc64le_elfv2
@@ -92,9 +92,13 @@ struct AbiSignatureClassification {
 // 8/16-byte SysV AMD64 and AAPCS64 vectors, plus 16-byte Microsoft x64 vectors,
 // are classified where their lane shape is modeled. Unsupported conventions,
 // target-dependent vector widths, and unresolved types remain explicit.
-// MIPS N64 is explicitly selected and models eight argument slots, scalar
+// MIPS N32 is explicitly selected and models ILP32 pointers, eight 64-bit
+// argument slots, scalar integer/pointer and single/double floating locations,
+// scalar returns, and stack overflow arguments. Aggregates and variadics are
+// rejected. Its placement rules follow the MIPS N32/64 subprogram interface;
+// Linux-specific extensions are not modeled. MIPS N64 is explicitly selected and models eight argument slots, scalar
 // GPR/FPR locations, bounded integer-class aggregate chunks, and hidden result
-// pointers for larger aggregate returns. O32 and N32 are recognized but unsupported.
+// pointers for larger aggregate returns. O32 remains recognized but unsupported.
 // AAPCS32 models the base PCS with R0-R3, split composites, and hidden result
 // pointers. It does not model VFP/Advanced SIMD register allocation or
 // AAPCS32 variadic call-site promotions.

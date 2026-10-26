@@ -67,7 +67,12 @@ enum class RiscvOpcode {
     vmacc_vv, vmacc_vx, vnmsac_vv, vnmsac_vx, vmadd_vv, vmadd_vx, vnmsub_vv, vnmsub_vx,
     // RVV widening integer multiply-accumulate; append for persisted decoder IDs.
     vwmaccu_vv, vwmaccu_vx, vwmacc_vv, vwmacc_vx,
-    vwmaccsu_vv, vwmaccsu_vx, vwmaccus_vx
+    vwmaccsu_vv, vwmaccsu_vx, vwmaccus_vx,
+    // RVV widening add/sub forms (append for serialized ID stability).
+    vwadd_vv, vwadd_vx, vwadd_wv, vwadd_wx,
+    vwaddu_vv, vwaddu_vx, vwaddu_wv, vwaddu_wx,
+    vwsub_vv, vwsub_vx, vwsub_wv, vwsub_wx,
+    vwsubu_vv, vwsubu_vx, vwsubu_wv, vwsubu_wx
 };
 
 struct RiscvRegister {
