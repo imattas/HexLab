@@ -55,7 +55,7 @@ continues the event owner. At the next stop it rewinds a post-trap PC, restores
 the successor bytes, and rearms the owned breakpoint. Restoration failure
 keeps the event stopped and is retried before continuation; the temporary
 breakpoint exception must be continued as handled. Windows ARM32
-hardware breakpoints use the eight BVR/BCR execute comparators ([Armv7-A/R Architecture Reference Manual](https://developer.arm.com/documentation/ddi0406/b/Application-Level-Architecture/Introduction-to-the-ARM-Architecture/Debug)). Only execute
+hardware breakpoints use up to eight BVR/BCR execute comparators exposed by the Windows ARM32 context ([Armv7-A/R Architecture Reference Manual](https://developer.arm.com/documentation/ddi0406/b/Application-Level-Architecture/Introduction-to-the-ARM-Architecture/Debug)). Since hardware may implement fewer, each update verifies the programmed context and fails with `unsupported` if the requested comparator count is unavailable. Only execute
 breakpoints are supported; data watchpoints remain unsupported. ARM addresses
 must be four-byte aligned. Thumb addresses use the low address bit as a Thumb
 tag, which selects the indicated halfword in the aligned word; the current API
@@ -64,7 +64,7 @@ a pending debug event and are transactional across the current target threads.
 New threads receive the active configuration at their creation event. The
 backend preserves unowned comparators, rejects occupied slots and external edits
 to owned slots, and matches execution stops to the configured instruction
-addresses. Removing breakpoints and detaching clear the owned comparators.
+addresses after clearing the low Thumb tag from both the configured and reported`r`naddresses. Removing breakpoints and detaching clear the owned comparators.
 Runtime behavior still requires validation on native ARM32 Windows.
 
 Windows x86 and x64 hardware breakpoints use DR0-DR3/DR7. Execution

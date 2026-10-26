@@ -699,7 +699,7 @@ public:
             target_architecture() == Architecture::arm && !hardware_breakpoints_.empty()) {
             for (const auto& breakpoint : hardware_breakpoints_) {
                 if (breakpoint.enabled && breakpoint.kind == BreakpointKind::execute &&
-                    (breakpoint.address & ~std::uint64_t{1}) == result.address)
+                    (breakpoint.address & ~std::uint64_t{1}) == (result.address & ~std::uint64_t{1}))
                     result.breakpoint_ids.push_back(breakpoint.id);
             }
             if (!result.breakpoint_ids.empty()) {
@@ -2433,6 +2433,7 @@ private:
             CONTEXT context{};
             context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
             if (!GetThreadContext(thread, &context)) return win_error("GetThreadContext for ARM32 hardware breakpoint");
+            const auto original = context;
             for (std::size_t i = 0; i < std::max(desired->breakpoint_count, expected->breakpoint_count); ++i) {
                 const bool was_owned = i < expected->breakpoint_count;
                 const bool will_be_owned = i < desired->breakpoint_count;
@@ -2447,6 +2448,25 @@ private:
                 context.Bvr[i] = will_be_owned ? desired->breakpoint_value[i] : 0;
             }
             if (!SetThreadContext(thread, &context)) return win_error("SetThreadContext for ARM32 hardware breakpoint");
+            CONTEXT observed{};
+            observed.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (!GetThreadContext(thread, &observed)) {
+                const auto read_error = win_error("GetThreadContext verifying ARM32 hardware breakpoint");
+                if (!SetThreadContext(thread, &original))
+                    return Error{ErrorCode::io, read_error.message + "; failed to restore prior ARM32 debug-register context"};
+                return read_error;
+            }
+            bool verified = true;
+            for (std::size_t i = 0; i < std::max(desired->breakpoint_count, expected->breakpoint_count); ++i) {
+                const auto expected_control = i < desired->breakpoint_count ? desired->breakpoint_control[i] : 0u;
+                const auto expected_value = i < desired->breakpoint_count ? desired->breakpoint_value[i] : 0u;
+                verified = verified && observed.Bcr[i] == expected_control && observed.Bvr[i] == expected_value;
+            }
+            if (!verified) {
+                if (!SetThreadContext(thread, &original))
+                    return Error{ErrorCode::io, "ARM32 debug comparator is unavailable and prior context restoration failed"};
+                return Error{ErrorCode::unsupported, "the ARM32 target does not expose enough hardware execute comparators"};
+            }
             return std::monostate{};
 #endif
         }
