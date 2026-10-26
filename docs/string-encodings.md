@@ -21,6 +21,13 @@ non-ASCII scalar, previews are UTF-8, and candidates may overlap other encoding
 interpretations. These code-page labels identify plausible byte mappings;
 they do not prove the source file's declared encoding or locale.
 
+Windows-1250 is also scanned for Central European text, using a fixed mapping
+and breaking runs at undefined bytes. Windows-1254 adds the Turkish Windows
+code page, including dotted/dotless I and G-breve/S-cedilla letters. Both emit
+only runs containing a non-ASCII scalar, retain original file/address extents,
+and use UTF-8 previews. These mappings are heuristic; overlapping
+interpretations are retained.
+
 All encoding passes use the same file-backed scan domains, string-record budget,
 and cancellation checks. Returned previews are UTF-8, while each record retains
 the source byte length and encoding identity.
