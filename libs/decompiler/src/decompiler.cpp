@@ -7159,13 +7159,13 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             std::set<std::uint64_t> nested_tails;
                             if (nested->join != header ||
                                 !collect_latch_tails(collect_latch_tails, *nested, nested_tails) ||
-                                nested_tails.size() > 8)
+                                nested_tails.size() > function.blocks.size())
                                 continue;
                             expected = nested_tails;
                             expected.insert(sibling_tail->id.value);
                             expected.insert(entry->id.value);
                             if (nested_tails.size() < 2 ||
-                                expected.size() != nested_tails.size() + 2 || expected.size() > 10 ||
+                                expected.size() != nested_tails.size() + 2 ||
                                 diamond_predecessors[nested->join->id.value] != expected)
                                 continue;
                         } else if (nested->join == header || expected.size() != 3 ||

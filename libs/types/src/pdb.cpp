@@ -335,8 +335,12 @@ Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &database, std::stop_tok
       catch (const std::bad_alloc &) { return Error{ErrorCode::resource_limit,"PDB TPI data exceeds available memory"}; }
 }
 
-Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database, std::stop_token stop) {
+static Result<PdbIdStream> parse_pdb_ids_impl(const PdbDatabase &database,
+        std::span<const std::uint32_t> requested_indices, bool retain_all, std::stop_token stop) {
     try {
+        require(retain_all || (std::is_sorted(requested_indices.begin(), requested_indices.end()) &&
+                std::adjacent_find(requested_indices.begin(), requested_indices.end()) == requested_indices.end()),
+                "Requested PDB IPI indices must be sorted and unique", ErrorCode::invalid_argument);
         require(database.streams.size() > 4 && database.streams[4].has_value(),
                 "PDB IPI stream is absent", ErrorCode::unsupported);
         const auto bytes = std::span<const std::byte>(*database.streams[4]);
@@ -351,9 +355,11 @@ Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database, std::stop_token s
         PdbIdStream result;
         result.type_index_begin = begin;
         result.type_index_end = end;
-        result.records.reserve(end - begin);
+        result.records.reserve(retain_all ? end - begin : std::min<std::size_t>(end - begin, requested_indices.size()));
+        const auto record_count = end - begin;
+        std::uint32_t decoded_records = 0;
         std::size_t pos = header_size;
-        while (result.records.size() < end - begin) {
+        while (decoded_records < record_count) {
             check_cancel(stop);
             if (pos + 4 > bytes.size())
                 throw Failure{{ErrorCode::malformed, "Truncated PDB IPI record header at stream offset " + std::to_string(pos)}};
@@ -365,8 +371,11 @@ Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database, std::stop_token s
                 throw Failure{{ErrorCode::malformed, "Invalid PDB IPI record length at stream offset " + std::to_string(pos)}};
             const auto limit = pos + 2 + length;
             std::size_t at = pos + 4;
+            const auto index = begin + decoded_records;
+            const bool retain = retain_all || std::binary_search(requested_indices.begin(),
+                                                                  requested_indices.end(), index);
             CodeViewIdRecord record;
-            record.index = begin + static_cast<std::uint32_t>(result.records.size());
+            record.index = index;
             record.leaf = leaf;
             record.record_offset = static_cast<std::uint32_t>(pos);
             record.record_size = static_cast<std::uint32_t>(limit - pos);
@@ -379,10 +388,13 @@ Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database, std::stop_token s
             };
             const auto read_name = [&]() {
                 std::string name;
+                std::size_t name_size = 0;
                 while (at < limit && bytes[at] != std::byte{0}) {
-                    if (name.size() >= 4096)
+                    if (name_size >= 4096)
                         throw Failure{{ErrorCode::resource_limit, "PDB IPI function name exceeds 4096 bytes at stream offset " + std::to_string(pos)}};
-                    name.push_back(static_cast<char>(std::to_integer<unsigned char>(bytes[at++])));
+                    if (retain) name.push_back(static_cast<char>(std::to_integer<unsigned char>(bytes[at])));
+                    ++name_size;
+                    ++at;
                 }
                 if (at == limit)
                     throw Failure{{ErrorCode::malformed, "Unterminated PDB IPI function name at stream offset " + std::to_string(pos)}};
@@ -392,8 +404,12 @@ Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database, std::stop_token s
             const auto read_id_list = [&](std::uint32_t count) {
                 if (count > max_type_records || count > (limit - at) / 4)
                     throw Failure{{ErrorCode::malformed, "Invalid PDB IPI reference count at stream offset " + std::to_string(pos)}};
-                record.references.reserve(count);
-                for (std::uint32_t i = 0; i < count; ++i) record.references.push_back(read_index());
+                if (retain) {
+                    record.references.reserve(count);
+                    for (std::uint32_t i = 0; i < count; ++i) record.references.push_back(read_index());
+                } else {
+                    at += static_cast<std::size_t>(count) * 4;
+                }
             };
             switch (leaf) {
             case 0x1601: // LF_FUNC_ID: parent ID, TPI function type, name.
@@ -449,7 +465,8 @@ Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database, std::stop_token s
                 record.kind = CodeViewIdKind::unsupported;
                 break; // Keep the unknown leaf and its exact stream extent.
             }
-            result.records.push_back(std::move(record));
+            if (retain) result.records.push_back(std::move(record));
+            ++decoded_records;
             pos = limit;
         }
         if (pos != bytes.size())
@@ -457,6 +474,15 @@ Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database, std::stop_token s
         return result;
     } catch (const Failure &failure) { return failure.error; }
       catch (const std::bad_alloc &) { return Error{ErrorCode::resource_limit, "PDB IPI data exceeds available memory"}; }
+}
+
+Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database, std::stop_token stop) {
+    return parse_pdb_ids_impl(database, {}, true, stop);
+}
+
+Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database,
+        std::span<const std::uint32_t> requested_indices, std::stop_token stop) {
+    return parse_pdb_ids_impl(database, requested_indices, false, stop);
 }
 
 Result<PdbTypeServerSet> resolve_pdb_type_servers(const PdbDatabase &database,
