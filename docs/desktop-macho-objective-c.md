@@ -22,6 +22,11 @@ persistence. A partial or unavailable scan remains labeled with its status and
 reason. Unsupported runtime forms are shown only as the scanner reports them;
 the view does not infer runtime relationships.
 
+The page filter searches kind, owner, name, address, status, provenance, and details
+case-insensitively. Filtering is debounced while typing and preserves each
+visible row's original address target. The filter affects only the displayed
+rows; it does not change the scan or type-import plan.
+
 The **Import Objective-C types** action writes eligible declarations into the
 current project through the normal project command/history path. It creates
 `ObjC2.Class.<name>` declarations with an exact instance size when every

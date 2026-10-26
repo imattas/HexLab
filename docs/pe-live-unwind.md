@@ -4,7 +4,19 @@
 
 AMD64 metadata evaluation applies parsed `UWOP_PUSH_NONVOL`, stack allocation, frame-register setup, nonvolatile GPR saves, XMM128 saves, and machine-frame operations. It honors the current PC within the prolog, evaluates chained unwind records with a 32-record bound, then recovers the return address and caller stack pointer. ARM64 evaluation handles canonical packed records including saved integer/floating-point registers and frame-chain forms, resolves validated `.pdata` parent links, and evaluates xdata allocation, GPR/FP save, frame-pointer, `save_next`, SVE vector/predicate, and end-marker opcodes. ARM64 prolog/epilog position selects the applicable portion of its unwind sequence. `alloc_z`, `save_zreg`, and `save_preg` require an `sve_vl` context value in bytes, a multiple of 16 from 16 to 256. `pac_sign_lr` and packed CR=2 report unsupported because authentication keys are not part of the supplied snapshot.
 
-All reads are limited to the exact scalar or vector width needed, with an upper bound of 256 bytes. Address arithmetic is checked. Missing/wrong-width registers, short reads, out-of-range PCs, invalid metadata, excessive operation/link depth, absent SVE state, and unsupported authentication return explicit `Result` errors. FH3 and ARM64 language metadata and actual handler invocation remain outside this API.
+All reads are limited to the exact scalar or vector width needed, with an upper bound of 256 bytes. Address arithmetic is checked. Missing/wrong-width registers, short reads, out-of-range PCs, invalid metadata, excessive operation/link depth, absent SVE state, and unsupported authentication return explicit `Result` errors. ARM64 language metadata and actual handler invocation remain outside this API.
+
+For AMD64 FH3 C++ records, `plan_pe_fh3_exception` maps the live IP to a
+validated EH state and returns source-backed cleanup and active catch
+candidates. It exposes the FuncInfo `/EHs` and dynamic-stack-alignment flags.
+When no provable active catch matches, the planner classifies `noexcept`
+termination or checks a legacy dynamic exception specification using exact
+decorated type identity: an empty list rejects every C++ type, a listed exact
+type is permitted to continue searching, and a fully decoded nonmember reaches
+the legacy `unexpected` path. Missing exception identity, unknown type entries,
+or exception-spec adjectives remain ambiguous. The planner never invokes
+cleanup, catch, terminate, or unexpected code, and does not model type
+conversions, rethrows, foreign exceptions, or the effects of `/EHs`.
 
 For AMD64 FH4 C++ records, `plan_pe_fh4_exception` complements the one-frame
 OS unwinder. It uses the stopped PC to select the function's current EH state,

@@ -66,6 +66,7 @@
 #include <wx/stattext.h>
 #include <wx/statusbr.h>
 #include <wx/textctrl.h>
+#include <wx/timer.h>
 #include <wx/dialog.h>
 #include <wx/listctrl.h>
 #include <wx/valnum.h>
@@ -725,6 +726,9 @@ struct MainFrame::Impl {
     VirtualTable *elf_programs, *elf_sections, *elf_dynamic, *elf_tables;
     VirtualTable *macho_metadata;
     VirtualTable *macho_objc = nullptr;
+    wxTextCtrl *macho_objc_filter = nullptr;
+    wxStaticText *macho_objc_filter_status = nullptr;
+    wxTimer macho_objc_filter_timer;
     wxButton *macho_objc_import_types = nullptr;
     std::shared_ptr<const std::vector<MachOObjCViewRow>> macho_objc_rows;
     std::shared_ptr<const MachOObjCScan> macho_objc_scan;
@@ -757,10 +761,14 @@ struct MainFrame::Impl {
     std::size_t navigation_position = 0;
     bool restoring_navigation = false;
     explicit Impl(MainFrame &owner, std::shared_ptr<plugins::ModuleProvider> provider)
-        : frame(owner), compare_timer(&owner),
+        : frame(owner), compare_timer(&owner), macho_objc_filter_timer(&owner),
           plugin_provider(provider ? std::move(provider) : plugins::make_native_module_provider()) {
         flirt_work->target = &owner;
         owner.Bind(wxEVT_TIMER, [this](wxTimerEvent &) { poll_compare(); }, compare_timer.GetId());
+        owner.Bind(wxEVT_TIMER, [this](wxTimerEvent &) {
+            if (macho_objc_source && macho_objc_rows)
+                display_macho_objc_rows(macho_objc_source, macho_objc_rows);
+        }, macho_objc_filter_timer.GetId());
     }
     ~Impl() {
         stop_compare();
@@ -1994,6 +2002,7 @@ struct MainFrame::Impl {
         macho_objc->populate(placeholder->size(), [placeholder](std::size_t row, int column) {
             return row < placeholder->size() ? macho_objc_view_cell((*placeholder)[row], column, nullptr) : wxString{};
         });
+        if (macho_objc_filter_status) macho_objc_filter_status->SetLabel("No runtime records loaded");
         macho_objc->activate = {};
     }
     bool navigate_from_document(const std::shared_ptr<const DocumentSnapshot> &source, Location destination) {
@@ -2015,13 +2024,40 @@ struct MainFrame::Impl {
     void display_macho_objc_rows(const std::shared_ptr<const DocumentSnapshot> &doc,
                                  const std::shared_ptr<const std::vector<MachOObjCViewRow>> &rows) {
         if (!macho_objc || !doc || !rows) return;
-        macho_objc->populate(rows->size(), [doc, rows](std::size_t row, int column) {
-            if (row >= rows->size()) return wxString{};
-            return macho_objc_view_cell((*rows)[row], column, doc->image.get());
+        wxString query = macho_objc_filter ? macho_objc_filter->GetValue() : wxString{};
+        query.Trim(true).Trim(false);
+        query.MakeLower();
+        auto visible = std::make_shared<std::vector<std::size_t>>();
+        visible->reserve(rows->size());
+        for (std::size_t index = 0; index < rows->size(); ++index) {
+            const auto &row = (*rows)[index];
+            if (query.empty()) {
+                visible->push_back(index);
+                continue;
+            }
+            const std::string_view fields[] = {row.kind, row.owner, row.name, row.status, row.provenance, row.details};
+            bool matches = false;
+            for (const auto field : fields) {
+                auto text = wxString::FromUTF8(field.data(), field.size());
+                text.MakeLower();
+                if (text.Find(query) != wxNOT_FOUND) { matches = true; break; }
+            }
+            if (!matches) {
+                auto address = macho_objc_view_cell(row, 3, doc->image.get());
+                address.MakeLower();
+                matches = address.Find(query) != wxNOT_FOUND;
+            }
+            if (matches) visible->push_back(index);
+        }
+        macho_objc->populate(visible->size(), [doc, rows, visible](std::size_t row, int column) {
+            if (row >= visible->size()) return wxString{};
+            return macho_objc_view_cell((*rows)[(*visible)[row]], column, doc->image.get());
         });
-        macho_objc->activate = [this, doc, rows](std::size_t row) {
-            if (row < rows->size() && (*rows)[row].address)
-                navigate_from_document(doc, *(*rows)[row].address);
+        if (macho_objc_filter_status)
+            macho_objc_filter_status->SetLabel(wxString::Format("%zu of %zu rows", visible->size(), rows->size()));
+        macho_objc->activate = [this, doc, rows, visible](std::size_t row) {
+            if (row < visible->size() && (*rows)[(*visible)[row]].address)
+                navigate_from_document(doc, *(*rows)[(*visible)[row]].address);
         };
     }
     void populate_macho_objc() {
@@ -3104,6 +3140,11 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.macho_objc = new VirtualTable(metadata, "macho-objc",
                                      {"Kind", "Owner", "Name", "Address", "Status", "Provenance", "Details"});
     ui.macho_objc->SetToolTip("Objective-C runtime records from the bounded scan of the displayed Mach-O snapshot. Activate an addressable row to navigate.");
+    ui.macho_objc_filter = new wxTextCtrl(metadata, wxID_ANY);
+    ui.macho_objc_filter->SetName("macho-objc-filter");
+    ui.macho_objc_filter->SetHint("Filter kind, class, selector, status, provenance, or details");
+    ui.macho_objc_filter->SetToolTip("Case-insensitive filter over the loaded Objective-C runtime rows. Activating a filtered row still navigates to its original address.");
+    ui.macho_objc_filter_status = new wxStaticText(metadata, wxID_ANY, "No runtime records loaded");
     ui.macho_objc_import_types = new wxButton(metadata, wxID_ANY, "Import Objective-C types");
     ui.macho_objc_import_types->SetName("macho-objc-import-types");
     ui.macho_objc_import_types->Enable(false);
@@ -3139,11 +3180,25 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         wxMessageBox(message, "Import Objective-C types", wxOK | wxICON_INFORMATION, this);
     });
     auto *macho_objc_layout = new wxBoxSizer(wxVERTICAL);
+    auto *macho_objc_filter_row = new wxBoxSizer(wxHORIZONTAL);
+    macho_objc_filter_row->Add(new wxStaticText(metadata, wxID_ANY, "Filter"), 0,
+                               wxALL | wxALIGN_CENTER_VERTICAL, FromDIP(3));
+    macho_objc_filter_row->Add(ui.macho_objc_filter, 1, wxALL | wxEXPAND, FromDIP(3));
+    macho_objc_filter_row->Add(ui.macho_objc_filter_status, 0,
+                               wxALL | wxALIGN_CENTER_VERTICAL, FromDIP(3));
+    macho_objc_layout->Add(macho_objc_filter_row, 0, wxEXPAND);
     macho_objc_layout->Add(ui.macho_objc_import_types, 0, wxALL, FromDIP(3));
     macho_objc_layout->Add(ui.macho_objc, 1, wxEXPAND);
     auto *macho_objc_panel = new wxPanel(metadata);
     macho_objc_panel->SetSizer(macho_objc_layout);
     ui.macho_objc->Reparent(macho_objc_panel);
+    ui.macho_objc_filter->Reparent(macho_objc_panel);
+    ui.macho_objc_filter_status->Reparent(macho_objc_panel);
+    ui.macho_objc_filter->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+        impl_->macho_objc_filter_timer.Stop();
+        if (impl_->macho_objc_filter_status) impl_->macho_objc_filter_status->SetLabel("Filtering...");
+        impl_->macho_objc_filter_timer.StartOnce(150);
+    });
     ui.annotations = new VirtualTable(metadata, "annotations", {"Address / offset", "Name", "Comment", "State"});
     auto *bookmark_panel = new wxPanel(metadata);
     auto *bookmark_layout = new wxBoxSizer(wxVERTICAL);

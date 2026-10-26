@@ -278,11 +278,17 @@ struct PeCxxFuncInfo {
     std::int32_t unwind_help = 0;
     std::uint32_t es_type_list_rva = 0;
     std::int32_t eh_flags = 0;
+    // FuncInfo magic 0x19930522 makes these EHFlags bits meaningful.
+    bool has_ehs_flag = false;
+    bool has_dynamic_stack_alignment = false;
+    bool is_noexcept = false;
+    std::uint32_t unknown_eh_flags = 0;
     std::vector<PeCxxUnwindMapEntry> unwind_map;
     std::vector<PeCxxTryBlockMapEntry> try_blocks;
     std::vector<PeCxxIpToStateEntry> ip_to_state;
     std::optional<PeCxxExceptionSpecTypeList> exception_spec_types;
     PeRecordSource source;
+    std::optional<PeRecordSource> eh_flags_source;
     bool operator==(const PeCxxFuncInfo &) const = default;
 };
 enum class PeCxxFuncInfo4Status : std::uint8_t { decoded_subset, unsupported, malformed };

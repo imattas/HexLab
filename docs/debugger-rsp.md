@@ -188,6 +188,18 @@ and the process list at 4,096 entries. Missing command columns fall back to
 enumeration as unsupported; listing does not attach to or change the selected
 remote process.
 
+Remote target XML architecture names are mapped conservatively to HexLab's
+architecture enum for x86/x86-64, AArch32/AArch64, RV32/RV64, MIPS32/MIPS64,
+and PowerPC. Variant suffixes are accepted only for the corresponding GDB
+architecture family; unknown names remain `unknown`. Repeated recognized
+architecture declarations must agree or the target description is rejected
+as malformed. This metadata does not infer an execution mode. Byte order comes
+from the target XML `endian` attribute, or from an explicit AArch64 endian
+architecture name when that attribute is absent; conflicting declarations
+are rejected. The name field follows GDB's target-description architecture element, which uses
+an architecture accepted by GDB's `set architecture` command
+([GDB target-description format](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Target-Description-Format.html)).
+
 Remote hardware execute and data watchpoints retain owned IDs, kind and size.
 The common `DebugSession::set_breakpoint_enabled` operation sends `z` to
 disable or `Z` to re-enable the exact owned tuple, preserving its local ID.

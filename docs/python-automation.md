@@ -500,6 +500,13 @@ Every event must be explicitly acknowledged with `continue_event(sequence)` or
 `single_step(sequence)` before waiting for another. Use `interrupt()` to request
 a stop while the process runs. `connect_remote(host, port)` selects GDB Remote
 Serial Protocol, and the context manager detaches an active target on close.
+For a server that negotiated multiprocess extended-remote, use `processes()`
+to list inferiors, `attach_remote_process(pid)` to select a different listed
+inferior, and `detach_remote_process(pid)` to detach a secondary inferior while
+keeping the selected one. Selecting another inferior replaces the session's
+active process and pending stop event. The worker exposes both operations under
+the same names and requires its current stop event to be acknowledged before
+switching.
 `thread_run_states()` returns an immutable tuple of `ThreadRunState(thread_id,
 state)` rows, where state is a `ThreadState` enum with `RUNNING`, `STOPPED`,
 `EXITED`, and `UNKNOWN` values.
@@ -536,7 +543,8 @@ with hexlab.DebuggerWorker() as debugger:
 ```
 
 Allowed operation names are `state`, `processes`, `launch`, `attach`,
-`connect_remote`, `continue_event`, `single_step`, `interrupt`, `terminate`,
+`connect_remote`, `attach_remote_process`, `detach_remote_process`,
+`continue_event`, `single_step`, `interrupt`, `terminate`,
 `detach`, `read_memory`, `write_memory`, `evaluate_expression`,
 `search_memory`, `threads`, `thread_run_states`, `resume_threads`, `modules`,
 `memory_regions`, `registers`, `write_registers`, `breakpoints`,

@@ -556,6 +556,9 @@ Result<PeFh3ExceptionPlan> plan_pe_fh3_exception(const PeMetadata &metadata, std
     PeFh3ExceptionPlan plan;
     plan.function_begin_rva = runtime->begin_rva;
     plan.establisher_frame = establisher_frame;
+    plan.has_ehs_flag = fh3.has_ehs_flag;
+    plan.has_dynamic_stack_alignment = fh3.has_dynamic_stack_alignment;
+    plan.is_noexcept = fh3.is_noexcept;
     if (conflicting_duplicate_ip_state) {
         plan.dispatch = PeFh3DispatchDisposition::ambiguous;
         plan.dispatch_source = fh3.source;
@@ -681,6 +684,56 @@ Result<PeFh3ExceptionPlan> plan_pe_fh3_exception(const PeMetadata &metadata, std
         plan.dispatch = PeFh3DispatchDisposition::ambiguous;
         plan.dispatch_source = fh3.source;
         plan.dispatch_diagnostic = "FH3 catch matching requires a decorated exception type and supported handler adjectives";
+    } else if (fh3.exception_spec_types) {
+        const auto &specification = *fh3.exception_spec_types;
+        if (fh3.is_noexcept) {
+            plan.dispatch = PeFh3DispatchDisposition::ambiguous;
+            plan.dispatch_source = fh3.eh_flags_source ? fh3.eh_flags_source
+                                                       : std::optional<PeRecordSource>{fh3.source};
+            plan.dispatch_diagnostic = "FH3 FuncInfo combines noexcept and a dynamic exception type list";
+        } else if (specification.types.empty()) {
+            plan.exception_spec_allows = false;
+            plan.dispatch = PeFh3DispatchDisposition::unexpected_exception_spec;
+            plan.dispatch_source = specification.source;
+            plan.dispatch_diagnostic = "the empty FH3 exception specification allows no C++ exception type";
+        } else if (!exception_decorated_type) {
+            plan.dispatch = PeFh3DispatchDisposition::ambiguous;
+            plan.dispatch_source = specification.source;
+            plan.dispatch_diagnostic = "FH3 exception-specification matching requires an exact decorated exception type";
+        } else {
+            bool unresolved_type = false;
+            for (std::size_t type_index = 0; type_index < specification.types.size(); ++type_index) {
+                const auto &allowed = specification.types[type_index];
+                if (allowed.adjectives != 0 || !allowed.type_descriptor_rva ||
+                    *allowed.type_descriptor_rva == 0 || !allowed.decorated_type_name) {
+                    unresolved_type = true;
+                    continue;
+                }
+                if (*allowed.decorated_type_name == *exception_decorated_type) {
+                    plan.exception_spec_allows = true;
+                    plan.exception_spec_type_index = static_cast<std::uint32_t>(type_index);
+                    plan.dispatch = PeFh3DispatchDisposition::continue_search;
+                    plan.dispatch_source = allowed.source;
+                    plan.dispatch_diagnostic = "exact decorated type is permitted by the FH3 dynamic exception specification";
+                    return plan;
+                }
+            }
+            if (unresolved_type) {
+                plan.dispatch = PeFh3DispatchDisposition::ambiguous;
+                plan.dispatch_source = specification.source;
+                plan.dispatch_diagnostic = "an unresolved or qualified FH3 exception-specification type prevents safe classification";
+            } else {
+                plan.exception_spec_allows = false;
+                plan.dispatch = PeFh3DispatchDisposition::unexpected_exception_spec;
+                plan.dispatch_source = specification.source;
+                plan.dispatch_diagnostic = "the exact decorated exception type is not listed by the FH3 dynamic exception specification";
+            }
+        }
+    } else if (fh3.is_noexcept) {
+        plan.dispatch = PeFh3DispatchDisposition::terminate_noexcept;
+        plan.dispatch_source = fh3.eh_flags_source ? fh3.eh_flags_source
+                                                   : std::optional<PeRecordSource>{fh3.source};
+        plan.dispatch_diagnostic = "C++ exception has no provable active handler in an FH3 noexcept function";
     } else {
         plan.dispatch = PeFh3DispatchDisposition::continue_search;
         plan.dispatch_source = fh3.source;

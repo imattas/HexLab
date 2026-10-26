@@ -38,7 +38,8 @@ enum class PeFh3CatchDisposition : std::uint8_t {
     catch_all, exact_type, different_type, type_unknown, unsupported_adjectives
 };
 enum class PeFh3DispatchDisposition : std::uint8_t {
-    unresolved, handler_candidate, continue_search, ambiguous
+    unresolved, handler_candidate, continue_search, unexpected_exception_spec,
+    terminate_noexcept, ambiguous
 };
 struct PeFh3CleanupAction {
     std::int32_t state = -1;
@@ -58,9 +59,17 @@ struct PeFh3ExceptionPlan {
     std::uint32_t function_begin_rva = 0;
     std::int32_t state = -1;
     std::uint64_t establisher_frame = 0;
+    bool has_ehs_flag = false;
+    bool has_dynamic_stack_alignment = false;
+    bool is_noexcept = false;
     PeFh3DispatchDisposition dispatch = PeFh3DispatchDisposition::unresolved;
     std::optional<std::uint32_t> selected_try_index, selected_handler_index;
     std::optional<PeRecordSource> dispatch_source;
+    // For a decoded legacy dynamic exception specification, this is set only
+    // when exact decorated-name matching proves the result. False means the
+    // exception violates the list and reaches the legacy unexpected path.
+    std::optional<bool> exception_spec_allows;
+    std::optional<std::uint32_t> exception_spec_type_index;
     std::string dispatch_diagnostic;
     std::vector<PeFh3CleanupAction> cleanup_actions;
     std::vector<PeFh3CatchCandidate> handlers;
@@ -68,8 +77,9 @@ struct PeFh3ExceptionPlan {
 
 // Build a bounded FH3 exception-state plan using source-tracked FuncInfo data.
 // This reports cleanup and catch candidates only; it never invokes target code.
-// Typed catches match only exact decorated-name identity, so conversions and
-// rethrow/foreign-exception semantics remain explicitly ambiguous.
+// Typed catches and legacy dynamic exception specifications match only exact
+// decorated-name identity. The plan classifies noexcept termination and the
+// legacy unexpected path without invoking target code.
 HEXLAB_IMAGE_EXPORT Result<PeFh3ExceptionPlan>
 plan_pe_fh3_exception(const PeMetadata &, std::uint64_t module_base,
                       std::uint64_t instruction_pointer, std::uint64_t establisher_frame,
