@@ -225,6 +225,23 @@ struct ElfEhFrameFunction {
     ElfCfiSectionKind source_kind = ElfCfiSectionKind::eh_frame;
     bool operator==(const ElfEhFrameFunction &) const = default;
 };
+enum class ElfArmEhabiRecipeKind : std::uint8_t { cantunwind, compact_inline, extab_reference };
+// One validated linked-image .ARM.exidx row. The row establishes an entry
+// root only; EHABI table order does not prove a precise function extent.
+// For extab_reference, extab_word is the raw first word at extab_address and
+// the extab source fields identify those bytes without claiming a decoded recipe.
+struct ElfArmEhabiFunction {
+    std::uint32_t section = 0;
+    std::uint64_t file_offset = 0;
+    Address begin;
+    std::uint32_t raw_start = 0, raw_recipe = 0;
+    ElfArmEhabiRecipeKind recipe_kind = ElfArmEhabiRecipeKind::cantunwind;
+    std::optional<Address> extab_address;
+    std::optional<std::uint32_t> extab_word;
+    std::optional<std::uint32_t> extab_section;
+    std::optional<std::uint64_t> extab_file_offset;
+    bool operator==(const ElfArmEhabiFunction &) const = default;
+};
 // Structural Itanium C++ ABI metadata. Addresses are link-time image addresses;
 // parsed slots are candidate executable targets and do not prove call-site dispatch.
 enum class ElfRttiDescriptorKind : std::uint8_t { class_type, single_inheritance, multiple_inheritance };
@@ -309,6 +326,7 @@ struct ElfMetadata {
     // Legacy name: includes validated .eh_frame and .debug_frame recipes.
     // source_kind identifies the record's actual CFI section format.
     std::vector<ElfEhFrameFunction> eh_frame_functions;
+    std::vector<ElfArmEhabiFunction> arm_ehabi_functions;
     std::vector<ElfRttiClass> rtti_classes;
     std::vector<ElfVTableHeader> vtable_headers;
     bool rtti_complete = true;

@@ -227,6 +227,11 @@ wxString macho_metadata_cell(const DocumentSnapshot &doc, const MachOMetadataRow
                                       ? field("cache-level", (r.raw >> 30) & 3) +
                                             field("target-offset", r.target.value_or(0)) + "base unresolved "
                                       : wxString()) +
+                                 (format == 13
+                                      ? field("shared-cache-target-offset", r.target.value_or(0)) +
+                                            (r.authenticated ? field("key", r.key) : field("high8", r.high8)) +
+                                            "cache base unresolved "
+                                      : wxString()) +
                                  (r.bind ? "bind " : "rebase ") + (r.authenticated ? "authenticated " : "") +
                                  (r.non_pointer ? "non-pointer " : "") + state(r.complete);
     }

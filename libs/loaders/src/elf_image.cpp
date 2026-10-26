@@ -416,6 +416,9 @@ Result<LoadedImage> load_elf(std::shared_ptr<const ByteStorage> storage, const E
             auto unwind_result = read_unwind_ranges(*tracking, *loaded.image, elf, budget, stop);
             if (!unwind_result)
                 partial("DWARF unwind information unavailable: " + unwind_result.error().message);
+            auto ehabi_result = read_arm_ehabi(*tracking, *loaded.image, elf, budget, stop);
+            if (!ehabi_result)
+                partial("ELF ARM EHABI information unavailable: " + ehabi_result.error().message);
             if (architecture == Architecture::arm && !header.is_64 && header.order == ByteOrder::little) {
                 auto context_layout = loaded.image->layout();
                 populate_arm_context(elf, context_layout, budget, stop);

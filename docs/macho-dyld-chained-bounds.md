@@ -6,7 +6,10 @@ raw pointer words and the source file/address coordinates. Rebase targets and
 bind imports are exposed through the existing Mach-O dyld resolver; pointer
 authentication remains metadata and is not applied. Kernel-cache formats 8
 and 11 retain their encoded target information but stay unresolved without
-the shared-cache base-pointer table.
+the shared-cache base-pointer table. ARM64e userland24 format 12 uses a
+24-bit import index and an 8-byte chain stride. ARM64e shared-cache format
+13 retains its 34-bit cache-relative target and authentication fields, but
+stays unresolved without the shared-cache base.
 
 The parser applies these hard limits before allocating symbol strings or
 following chain records:

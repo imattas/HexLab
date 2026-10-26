@@ -278,6 +278,25 @@ void validate_pointer_bits(const MachODyldChainedOrigin &v) {
                             static_cast<std::uint32_t>(target - (UINT64_C(0x4000000) + v.max_valid_pointer) / 2),
                         "Owned generic32 scalar restoration differs from original word");
         }
+    } else if (format == 8 || format == 11) {
+        require(p.field_size == 8 && p.stride == (format == 8 ? 4 : 1) && !p.bind &&
+                    p.authenticated == bool(raw >> 63) && p.next == ((raw >> 51) & 0xfff) &&
+                    p.target == (raw & 0x3fffffff) && p.diversity == ((raw >> 32) & 0xffff) &&
+                    p.address_diversity == bool((raw >> 48) & 1) && p.key == ((raw >> 49) & 3) &&
+                    !p.target_is_offset && !p.complete,
+                "Owned kernel-cache pointer differs from original word");
+    } else if (format == 13) {
+        require(p.field_size == 8 && p.stride == 8 && !p.bind &&
+                    p.authenticated == bool(raw >> 63) && p.next == ((raw >> 52) & 0x7ff) &&
+                    p.target == (raw & UINT64_C(0x3ffffffff)) && !p.target_is_offset && !p.complete,
+                "Owned ARM64e shared-cache pointer differs from original word");
+        if (p.authenticated)
+            require(p.diversity == ((raw >> 34) & 0xffff) && p.address_diversity == bool((raw >> 50) & 1) &&
+                        p.key == (((raw >> 51) & 1) ? 2 : 0) && !p.high8,
+                    "Owned authenticated shared-cache pointer differs from original word");
+        else
+            require(p.high8 == ((raw >> 34) & 0xff) && !p.diversity && !p.address_diversity && !p.key,
+                    "Owned unauthenticated shared-cache pointer differs from original word");
     } else {
         require(format == 1 || format == 9 || format == 12, "Unknown owned chained pointer layout");
         require(p.field_size == 8 && p.stride == 8 && p.bind == bool((raw >> 62) & 1) &&

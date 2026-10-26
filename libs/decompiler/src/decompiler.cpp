@@ -630,6 +630,15 @@ std::string operation_name(Opcode opcode) {
     case Opcode::vandpd: return "vandpd";
     case Opcode::vmovups: return "vmovups";
     case Opcode::vpaddb: return "vpaddb";
+    case Opcode::vpsllvw: return "vpsllvw";
+    case Opcode::vpsllvd: return "vpsllvd";
+    case Opcode::vpsllvq: return "vpsllvq";
+    case Opcode::vpsrlvw: return "vpsrlvw";
+    case Opcode::vpsrlvd: return "vpsrlvd";
+    case Opcode::vpsrlvq: return "vpsrlvq";
+    case Opcode::vpsravw: return "vpsravw";
+    case Opcode::vpsravd: return "vpsravd";
+    case Opcode::vpsravq: return "vpsravq";
     case Opcode::vpaddw: return "vpaddw";
     case Opcode::vpaddsb: return "vpaddsb";
     case Opcode::vpaddsw: return "vpaddsw";
@@ -3312,9 +3321,13 @@ a64_unhandled:
         instruction.opcode == Opcode::vpmulhuw;
     const bool avx_integer_compare = x86_avx_detail::is_equal_compare(instruction.opcode) ||
                                      x86_avx_detail::is_greater_compare(instruction.opcode);
-    const bool avx_integer_lanes = !instruction.x86_evex &&
+    const bool avx_integer_shift = instruction.opcode == Opcode::vpsllvw || instruction.opcode == Opcode::vpsllvd ||
+        instruction.opcode == Opcode::vpsllvq || instruction.opcode == Opcode::vpsrlvw ||
+        instruction.opcode == Opcode::vpsrlvd || instruction.opcode == Opcode::vpsrlvq ||
+        instruction.opcode == Opcode::vpsravw || instruction.opcode == Opcode::vpsravd || instruction.opcode == Opcode::vpsravq;
+    const bool avx_integer_lanes = (!instruction.x86_evex || avx_integer_shift) &&
         (avx_integer_arithmetic || avx_integer_subtraction || avx_integer_multiply ||
-         avx_integer_minmax || avx_integer_compare);
+         avx_integer_minmax || avx_integer_compare || avx_integer_shift);
     const auto avx_integer_lane_bits = instruction.opcode == Opcode::vpcmpeqb || instruction.opcode == Opcode::vpcmpgtb ||
         instruction.opcode == Opcode::vpaddb || instruction.opcode == Opcode::vpsubb ||
         instruction.opcode == Opcode::vpaddsb || instruction.opcode == Opcode::vpaddusb ||
@@ -3327,6 +3340,8 @@ a64_unhandled:
         : instruction.opcode == Opcode::vpcmpeqd || instruction.opcode == Opcode::vpcmpgtd ||
           instruction.opcode == Opcode::vpaddd || instruction.opcode == Opcode::vpsubd ? 32u
         : instruction.opcode == Opcode::vpaddq || instruction.opcode == Opcode::vpsubq ? 64u
+        : instruction.opcode == Opcode::vpsllvw || instruction.opcode == Opcode::vpsrlvw || instruction.opcode == Opcode::vpsravw ? 16u
+        : instruction.opcode == Opcode::vpsllvq || instruction.opcode == Opcode::vpsrlvq || instruction.opcode == Opcode::vpsravq ? 64u
         : avx_integer_multiply ? 16u : 0u;
     const bool avx_integer_bitwise = instruction.opcode == Opcode::vpand || instruction.opcode == Opcode::vpor ||
         instruction.opcode == Opcode::vpxor || instruction.opcode == Opcode::vpandd ||

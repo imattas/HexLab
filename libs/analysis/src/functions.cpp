@@ -192,12 +192,32 @@ void Recovery::seed_roots() {
             return;
         }
         const auto context = take(image.context_at(seed.entry));
+        const ElfArmEhabiFunction *ehabi_function_entry = nullptr;
+        if (seed.kind == FunctionSeedKind::unwind && seed.unwind_evidence && metadata.elf) {
+            const auto found = std::find_if(metadata.elf->arm_ehabi_functions.begin(),
+                metadata.elf->arm_ehabi_functions.end(), [&](const auto &row) {
+                    return row.begin == seed.entry && row.section == seed.unwind_evidence->section &&
+                           row.file_offset == seed.unwind_evidence->file_offset;
+                });
+            if (found != metadata.elf->arm_ehabi_functions.end())
+                ehabi_function_entry = &*found;
+        }
+        const bool has_ehabi_entry = ehabi_function_entry != nullptr;
+        if (ehabi_function_entry) {
+            const auto expected_mode = (ehabi_function_entry->raw_start & 1u) ? ExecutionMode::thumb : ExecutionMode::a32;
+            if (context.architecture != Architecture::arm || context.mode != expected_mode) {
+                if (report_invalid)
+                    output->candidates.push_back({seed.entry, seed.source, FunctionStopReason::unsupported,
+                                                  "EHABI entry state conflicts with mapped ARM code context"});
+                return;
+            }
+        }
         if (context.architecture == Architecture::arm && context.mode == ExecutionMode::thumb) {
             const auto &profile = image.layout().arm_profile;
             const bool clear = profile && std::any_of(profile->roots.begin(), profile->roots.end(), [&](const auto &r) {
                 return r.at == seed.entry && r.mode == ExecutionMode::thumb && r.known_thumb_it_clear;
             });
-            if (!clear) {
+            if (!clear && !has_ehabi_entry) {
                 if (report_invalid)
                     output->candidates.push_back({seed.entry, seed.source, FunctionStopReason::unsupported,
                                                   "Thumb function root lacks source-backed known-clear IT state"});
@@ -456,6 +476,15 @@ void Recovery::seed_roots() {
             metadata_chunks[range.begin].push_back({range.begin, range.size, {}});
             FunctionSeed seed{FunctionSeedKind::unwind, range.begin, {}, {}};
             seed.unwind_evidence = FunctionSeedUnwindEvidence{range.section, range.file_offset, range.record_size};
+            root(std::move(seed), false);
+        }
+    // A validated EHABI row establishes a linked ARM function entry, but its
+    // successor row is not used to claim a precise function extent.
+    if (metadata.elf)
+        for (const auto &function : metadata.elf->arm_ehabi_functions) {
+            canceled();
+            FunctionSeed seed{FunctionSeedKind::unwind, function.begin, {}, {}};
+            seed.unwind_evidence = FunctionSeedUnwindEvidence{function.section, function.file_offset, 8};
             root(std::move(seed), false);
         }
     if (metadata.macho) {

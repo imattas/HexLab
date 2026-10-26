@@ -360,4 +360,120 @@ Result<bool> read_unwind_ranges(const ByteStorage &storage, const Image &image, 
         return Error{ErrorCode::resource_limit, "Cannot allocate ELF unwind metadata"};
     }
 }
+
+Result<bool> read_arm_ehabi(const ByteStorage &storage, const Image &image, ElfMetadata &metadata,
+                            Budget &budget, std::stop_token stop) {
+    try {
+        metadata.arm_ehabi_functions.clear();
+        std::vector<const ElfSection *> tables, extabs;
+        for (const auto &section : metadata.sections) {
+            canceled(stop);
+            if (section.name == ".ARM.exidx" || section.type == 0x70000001u)
+                tables.push_back(&section);
+            if (section.name == ".ARM.extab")
+                extabs.push_back(&section);
+        }
+        if (tables.empty()) return false;
+        require(metadata.header.object_type != 1,
+                "Relocatable ELF .ARM.exidx requires relocation application", ErrorCode::unsupported);
+        require((metadata.header.object_type == 2 || metadata.header.object_type == 3) &&
+                    !metadata.header.is_64 && metadata.header.order == ByteOrder::little &&
+                    metadata.header.machine == 40,
+                "ELF .ARM.exidx roots require a linked little-endian ELF32 ARM image", ErrorCode::unsupported);
+        Reader reader(storage, ByteOrder::little, stop);
+        std::sort(tables.begin(), tables.end(), [](const auto *a, const auto *b) {
+            return std::tie(a->address, a->offset, a->index) < std::tie(b->address, b->offset, b->index);
+        });
+        std::sort(extabs.begin(), extabs.end(), [](const auto *a, const auto *b) {
+            return std::tie(a->address, a->offset, a->index) < std::tie(b->address, b->offset, b->index);
+        });
+        const auto prel31 = [&](std::uint32_t raw, std::uint64_t place) {
+            std::int64_t delta = raw & 0x7fffffffu;
+            if (delta & 0x40000000ll) delta |= ~0x7fffffffll;
+            const auto target = add_signed(place, delta);
+            require(target <= UINT32_MAX, "ELF .ARM.exidx PREL31 target exceeds ELF32", ErrorCode::overflow);
+            return target;
+        };
+        std::vector<ElfArmEhabiFunction> parsed;
+        std::uint64_t previous_table_end = 0;
+        bool have_previous_table = false;
+        std::optional<std::uint64_t> previous_start;
+        std::uint64_t count = 0;
+        for (const auto *section : tables) {
+            canceled(stop);
+            require((section->flags & 2) && !(section->flags & 0x800) && section->type != 8,
+                    "ELF .ARM.exidx must be allocated initialized data", ErrorCode::unsupported);
+            require(section->entry_size == 0 || section->entry_size == 8,
+                    "ELF .ARM.exidx has an unsupported entry size", ErrorCode::unsupported);
+            require(section->size % 8 == 0, "ELF .ARM.exidx size is not a whole number of rows");
+            const auto section_end = add(section->address, section->size);
+            require(section_end <= UINT32_MAX + UINT64_C(1), "ELF .ARM.exidx exceeds ELF32 address space", ErrorCode::overflow);
+            require(!have_previous_table || previous_table_end <= section->address,
+                    "ELF .ARM.exidx table sections overlap or are out of order");
+            previous_table_end = section_end;
+            have_previous_table = true;
+            require(section->size <= metadata_limit, "ELF .ARM.exidx exceeds metadata budget", ErrorCode::resource_limit);
+            budget.include(section->size);
+            const auto bytes = reader.bytes(section->offset, static_cast<std::size_t>(section->size)).bytes;
+            for (std::uint64_t offset = 0; offset < section->size; offset += 8) {
+                canceled(stop);
+                require(++count <= metadata_limit / sizeof(ElfArmEhabiFunction),
+                        "ELF .ARM.exidx row count exceeds metadata budget", ErrorCode::resource_limit);
+                const auto row = static_cast<std::size_t>(offset);
+                const auto raw_start = static_cast<std::uint32_t>(reader.value(bytes, row, 4));
+                const auto raw_recipe = static_cast<std::uint32_t>(reader.value(bytes, row + 4, 4));
+                const auto decoded = prel31(raw_start, add(section->address, offset));
+                const Address begin{{0}, decoded & ~UINT64_C(1)};
+                require(!previous_start || begin.offset > *previous_start,
+                        "ELF .ARM.exidx function starts are not strictly increasing");
+                previous_start = begin.offset;
+                const auto *segment = image.segment_at(begin);
+                require(segment && segment->executable && begin.offset >= segment->begin.offset &&
+                            begin.offset - segment->begin.offset < segment->file_size,
+                        "ELF .ARM.exidx row does not start in initialized executable memory");
+                ElfArmEhabiFunction function;
+                function.section = section->index;
+                function.file_offset = add(section->offset, offset);
+                function.begin = begin;
+                function.raw_start = raw_start;
+                function.raw_recipe = raw_recipe;
+                if (raw_recipe == 1) {
+                    function.recipe_kind = ElfArmEhabiRecipeKind::cantunwind;
+                } else if (raw_recipe & 0x80000000u) {
+                    function.recipe_kind = ElfArmEhabiRecipeKind::compact_inline;
+                } else {
+                    function.recipe_kind = ElfArmEhabiRecipeKind::extab_reference;
+                    const auto target = prel31(raw_recipe, add(add(section->address, offset), 4));
+                    require((target & 3) == 0, "ELF .ARM.exidx extab reference is not word aligned");
+                    const ElfSection *extab = nullptr;
+                    for (const auto *candidate : extabs) {
+                        if (target >= candidate->address && target - candidate->address <= candidate->size &&
+                            candidate->size - (target - candidate->address) >= 4) {
+                            require((candidate->flags & 2) && candidate->type == 1 && !(candidate->flags & 0x800),
+                                    "ELF .ARM.extab is not allocated initialized data", ErrorCode::unsupported);
+                            extab = candidate;
+                            break;
+                        }
+                    }
+                    require(extab != nullptr, "ELF .ARM.exidx extab reference leaves .ARM.extab", ErrorCode::unsupported);
+                    const auto extab_offset = target - extab->address;
+                    const auto extab_file = add(extab->offset, extab_offset);
+                    const auto word = reader.bytes(extab_file, 4).bytes;
+                    function.extab_address = Address{{0}, target};
+                    function.extab_word = static_cast<std::uint32_t>(reader.value(word, 0, 4));
+                    function.extab_section = extab->index;
+                    function.extab_file_offset = extab_file;
+                }
+                budget.include(sizeof(ElfArmEhabiFunction));
+                parsed.push_back(std::move(function));
+            }
+        }
+        metadata.arm_ehabi_functions = std::move(parsed);
+        return true;
+    } catch (const Failure &failure) {
+        return failure.error;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate ELF ARM EHABI metadata"};
+    }
+}
 } // namespace hexlab::elf_detail

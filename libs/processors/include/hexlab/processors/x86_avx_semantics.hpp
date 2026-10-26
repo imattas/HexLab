@@ -81,6 +81,12 @@ inline std::optional<IntegerDataflowShape> integer_dataflow_shape(Opcode opcode)
 // registers, and several VEX dataflow opcodes have no equivalent EVEX form.
 inline std::optional<IntegerDataflowShape> evex_integer_shape(Opcode opcode) noexcept {
     switch (opcode) {
+    case Opcode::vpsllvw: case Opcode::vpsrlvw: return IntegerDataflowShape{16,16,16,false,false,false};
+    case Opcode::vpsllvd: case Opcode::vpsrlvd: return IntegerDataflowShape{32,32,32,false,false,false};
+    case Opcode::vpsllvq: case Opcode::vpsrlvq: return IntegerDataflowShape{64,64,64,false,false,false};
+    case Opcode::vpsravw: return IntegerDataflowShape{16,16,16,true,false,true};
+    case Opcode::vpsravd: return IntegerDataflowShape{32,32,32,true,false,true};
+    case Opcode::vpsravq: return IntegerDataflowShape{64,64,64,true,false,true};
     case Opcode::vpaddb: case Opcode::vpsubb: case Opcode::vpaddusb: case Opcode::vpsubusb:
     case Opcode::vpminub: case Opcode::vpmaxub:
         return IntegerDataflowShape{8,8,8,false,false,false};

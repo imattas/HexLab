@@ -29,6 +29,10 @@ require the entire process thread group to be owned and stopped. If the task
 list and ptrace ownership do not match, these operations fail closed.
 
 Register inspection and writes cover x0-x30, sp, pc, pstate, and vector state.
+The 32-bit w0-w30/wsp views expose the low halves of the X/SP registers;
+writing them zero-extends to 64 bits. `fp` and `lr` are aliases of x29 and
+x30. A batch rejects overlapping GPR aliases before writing either regset,
+and an unaligned PC write is rejected before any target modification.
 The backend reads `NT_ARM_SVE` header-first, then fetches its complete bounded
 payload using the UAPI `size`, `max_size`, `vl`, `max_vl`, and format flags.
 For active SVE-format state it exposes z0-z31 at the current vector length,

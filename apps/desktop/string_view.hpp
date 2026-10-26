@@ -26,6 +26,7 @@ class StringBrowserView final : public wxPanel {
     VirtualTable *references_ = nullptr;
     wxStaticText *reference_summary_ = nullptr;
     wxButton *export_ = nullptr;
+    wxButton *export_all_ = nullptr;
     wxButton *previous_references_ = nullptr;
     wxButton *next_references_ = nullptr;
     wxTimer filter_timer_;
@@ -36,7 +37,7 @@ class StringBrowserView final : public wxPanel {
 
     void refresh_strings();
     void refresh_references();
-    void export_filtered_strings();
+    void export_strings(bool filtered);
     void choose_string(std::size_t record_index, bool navigate_to_string);
     std::optional<Location> string_location(std::size_t record_index) const;
 };

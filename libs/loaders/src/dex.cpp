@@ -2,11 +2,13 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <map>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -113,26 +115,28 @@ bool decode_mutf8(std::span<const std::byte> raw, std::uint32_t expected_units, 
     return true;
 }
 
-Result<std::vector<std::uint32_t>> parse_map(std::span<const std::byte> bytes, std::uint32_t offset) {
+struct MapData { std::vector<std::uint32_t> offsets; std::uint32_t method_handle_count = 0; };
+Result<MapData> parse_map(std::span<const std::byte> bytes, std::uint32_t offset) {
     if (!offset || (offset & 3) || !extent(offset, 1, 4, bytes.size()))
         return Error{ErrorCode::malformed, "DEX map_list offset is invalid"};
     Reader r{bytes}; r.seek(offset);
     std::uint32_t count = 0;
     if (!r.u32(count) || count == 0 || count > 4096 || !extent(offset + 4, count, 12, bytes.size()))
         return Error{ErrorCode::malformed, "DEX map_list extent is invalid"};
-    std::vector<std::uint32_t> offsets;
+    MapData result;
     std::array<bool, 0x10001> seen{};
-    offsets.reserve(count);
+    result.offsets.reserve(count);
     std::uint32_t previous = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
         std::uint16_t type = 0, unused = 0; std::uint32_t size = 0, item_off = 0;
         if (!r.u16(type) || !r.u16(unused) || !r.u32(size) || !r.u32(item_off) || unused || type >= seen.size() || seen[type] ||
             item_off > bytes.size() || (i && item_off < previous))
             return Error{ErrorCode::malformed, "DEX map entry is invalid, duplicated, or out of order"};
-        seen[type] = true; previous = item_off; offsets.push_back(item_off);
+        seen[type] = true; previous = item_off; result.offsets.push_back(item_off);
+        if (type == 0x0008) result.method_handle_count = size;
         if (size && item_off == bytes.size()) return Error{ErrorCode::malformed, "DEX map entry starts at end of file"};
     }
-    return offsets;
+    return result;
 }
 
 Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_token stop) {
@@ -234,9 +238,336 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         for(auto t:p.parameters)out+=types[t]; return out+")"+types[p.return_type];
     };
     std::vector<Code> code;
+    std::vector<DexStaticValue> decoded_static_values;
+    std::vector<DexAnnotationItem> decoded_annotations;
+    std::vector<DexAnnotationLink> annotation_links;
+    std::unordered_map<std::uint32_t, std::uint32_t> annotation_item_indices;
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> annotation_set_indices;
+    std::uint64_t total_annotation_set_entries = 0;
+    std::uint64_t total_annotation_sets = 0;
+    std::uint64_t total_annotation_directory_entries = 0;
+    std::uint64_t total_annotation_parameter_slots = 0;
+    std::uint64_t total_annotation_links = 0;
+    std::uint64_t total_annotation_model_bytes = 0;
     std::unordered_set<std::uint32_t> class_data_offsets;
     std::uint64_t total_code_units=0;
     std::uint64_t total_try_items=0, total_catch_handlers=0;
+    std::uint64_t total_encoded_value_nodes = 0;
+    std::uint64_t total_encoded_value_bytes = 0;
+    std::function<Result<DexEncodedValue>(Reader &, std::uint32_t, unsigned)> decode_encoded_value;
+    decode_encoded_value = [&](Reader &reader, std::uint32_t name_index, unsigned depth) -> Result<DexEncodedValue> {
+        constexpr std::uint64_t max_value_nodes = 250'000;
+        constexpr std::uint64_t max_value_bytes = 64ull * 1024 * 1024;
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX encoded-value parsing canceled"};
+        if (depth > 64) return Error{ErrorCode::resource_limit, "DEX encoded-value nesting exceeds 64 levels"};
+        if (++total_encoded_value_nodes > max_value_nodes)
+            return Error{ErrorCode::resource_limit, "DEX encoded values exceed 250,000 nodes"};
+        if (total_encoded_value_bytes > max_value_bytes - sizeof(DexEncodedValue))
+            return Error{ErrorCode::resource_limit, "DEX encoded-value metadata exceeds 64 MiB"};
+        total_encoded_value_bytes += sizeof(DexEncodedValue);
+        if (reader.pos >= reader.bytes.size()) return Error{ErrorCode::malformed, "Truncated DEX encoded_value"};
+        DexEncodedValue value;
+        value.file_offset = reader.pos;
+        value.name_index = name_index;
+        const auto header = std::to_integer<std::uint8_t>(reader.bytes[reader.pos++]);
+        value.type = header & 0x1f;
+        value.value_arg = header >> 5;
+        auto read_scalar = [&](unsigned width, bool is_signed, bool left_aligned = false) -> bool {
+            if (width > 8 || width > reader.bytes.size() - reader.pos) return false;
+            std::uint64_t bits = 0;
+            for (unsigned i = 0; i < width; ++i)
+                bits |= std::uint64_t(std::to_integer<std::uint8_t>(reader.bytes[reader.pos++])) << (8 * i);
+            if (left_aligned) bits <<= (8 - width) * 8;
+            else if (is_signed && width < 8 && (bits & (UINT64_C(1) << (width * 8 - 1))))
+                bits |= (~UINT64_C(0)) << (width * 8);
+            value.payload = bits;
+            return true;
+        };
+        const auto bad_arg = [&]() -> Result<DexEncodedValue> {
+            return Error{ErrorCode::malformed, "DEX encoded_value has an invalid value_arg"};
+        };
+        switch (value.type) {
+        case 0x00: // VALUE_BYTE
+            if (value.value_arg != 0) return bad_arg();
+            if (!read_scalar(1, true)) return Error{ErrorCode::malformed, "Truncated DEX byte encoded_value"};
+            break;
+        case 0x02: case 0x03: case 0x04: case 0x06: // short, char, int, long
+        case 0x10: case 0x11: // float, double
+        case 0x15: case 0x16: case 0x17: case 0x18: case 0x19: case 0x1a: case 0x1b: {
+            if (version < 38 && (value.type == 0x15 || value.type == 0x16))
+                return Error{ErrorCode::malformed, "DEX method-type and method-handle values require version 038 or later"};
+            const unsigned max_arg = value.type == 0x02 || value.type == 0x03 ? 1 :
+                value.type == 0x04 || value.type == 0x10 || value.type == 0x15 || value.type == 0x16 ||
+                value.type == 0x17 || value.type == 0x18 || value.type == 0x19 || value.type == 0x1a || value.type == 0x1b ? 3 : 7;
+            if (value.value_arg > max_arg) return bad_arg();
+            const unsigned width = value.value_arg + 1;
+            const bool floating = value.type == 0x10 || value.type == 0x11;
+            const bool signed_value = value.type == 0x02 || value.type == 0x04 || value.type == 0x06;
+            if (!read_scalar(width, signed_value, floating))
+                return Error{ErrorCode::malformed, "Truncated DEX scalar encoded_value"};
+            if (!floating) {
+                const auto index = value.payload;
+                const bool valid = value.type == 0x15 ? index < protos.size() :
+                    value.type == 0x16 ? index < map.value().method_handle_count :
+                    value.type == 0x17 ? index < strings.size() :
+                    value.type == 0x18 ? index < types.size() :
+                    (value.type == 0x19 || value.type == 0x1b) ? index < fields.size() :
+                    value.type == 0x1a ? index < methods.size() : true;
+                if (!valid) return Error{ErrorCode::malformed, "DEX encoded_value references an invalid table index"};
+            }
+            break;
+        }
+        case 0x1c: { // VALUE_ARRAY
+            if (value.value_arg != 0) return bad_arg();
+            std::uint32_t count = 0;
+            if (!reader.uleb(count)) return Error{ErrorCode::malformed, "Truncated DEX encoded_array"};
+            if (count > max_value_nodes || count > max_value_nodes - total_encoded_value_nodes ||
+                count > (max_value_bytes - total_encoded_value_bytes) / sizeof(DexEncodedValue))
+                return Error{ErrorCode::resource_limit, "DEX encoded_array exceeds value-node budget"};
+            total_encoded_value_bytes += std::uint64_t(count) * sizeof(DexEncodedValue);
+            value.children.reserve(count);
+            for (std::uint32_t i = 0; i < count; ++i) {
+                auto child = decode_encoded_value(reader, UINT32_MAX, depth + 1);
+                if (!child) return child.error();
+                value.children.push_back(std::move(child.value()));
+            }
+            break;
+        }
+        case 0x1d: { // VALUE_ANNOTATION
+            if (value.value_arg != 0) return bad_arg();
+            std::uint32_t type = 0, count = 0;
+            if (!reader.uleb(type) || !reader.uleb(count))
+                return Error{ErrorCode::malformed, "Truncated DEX encoded_annotation"};
+            if (type >= types.size()) return Error{ErrorCode::malformed, "DEX encoded_annotation type index is invalid"};
+            value.payload = type;
+            if (count > max_value_nodes || count > max_value_nodes - total_encoded_value_nodes ||
+                count > (max_value_bytes - total_encoded_value_bytes) / sizeof(DexEncodedValue))
+                return Error{ErrorCode::resource_limit, "DEX encoded_annotation exceeds value-node budget"};
+            total_encoded_value_bytes += std::uint64_t(count) * sizeof(DexEncodedValue);
+            value.children.reserve(count);
+            std::uint32_t previous_name = 0;
+            for (std::uint32_t i = 0; i < count; ++i) {
+                std::uint32_t element_name = 0;
+                if (!reader.uleb(element_name) || element_name >= strings.size() || (i && element_name <= previous_name))
+                    return Error{ErrorCode::malformed, "DEX encoded_annotation element names are invalid or unordered"};
+                previous_name = element_name;
+                auto child = decode_encoded_value(reader, element_name, depth + 1);
+                if (!child) return child.error();
+                value.children.push_back(std::move(child.value()));
+            }
+            break;
+        }
+        case 0x1e: // VALUE_NULL
+            if (value.value_arg != 0) return bad_arg();
+            break;
+        case 0x1f: // VALUE_BOOLEAN
+            if (value.value_arg > 1) return bad_arg();
+            value.payload = value.value_arg;
+            break;
+        default:
+            return Error{ErrorCode::malformed, "DEX encoded_value has an unknown value type"};
+        }
+        return value;
+    };
+    const auto dex_data_end = static_cast<std::size_t>(std::uint64_t(data_off) + data_size);
+    std::function<Result<std::uint32_t>(std::uint32_t)> read_annotation_item;
+    read_annotation_item = [&](std::uint32_t offset) -> Result<std::uint32_t> {
+        constexpr std::uint64_t max_annotation_items = 250'000;
+        constexpr std::uint64_t max_annotation_bytes = 64ull * 1024 * 1024;
+        if (const auto found = annotation_item_indices.find(offset); found != annotation_item_indices.end())
+            return found->second;
+        if (offset < data_off || offset >= dex_data_end)
+            return Error{ErrorCode::malformed, "DEX annotation_item offset is outside the data section"};
+        if (decoded_annotations.size() >= max_annotation_items)
+            return Error{ErrorCode::resource_limit, "DEX annotation items exceed 250,000"};
+        if (total_annotation_model_bytes > max_annotation_bytes - sizeof(DexAnnotationItem))
+            return Error{ErrorCode::resource_limit, "DEX annotation metadata exceeds 64 MiB"};
+        Reader item{bytes.first(dex_data_end)};
+        if (!item.seek(offset)) return Error{ErrorCode::malformed, "DEX annotation_item offset is invalid"};
+        const auto visibility = std::to_integer<std::uint8_t>(item.bytes[item.pos++]);
+        std::uint32_t type = 0, count = 0;
+        if (visibility > 2 || !item.uleb(type) || !item.uleb(count) || type >= types.size())
+            return Error{ErrorCode::malformed, "DEX annotation_item visibility, type, or element count is invalid"};
+        if (count > 250'000 || count > 250'000 - total_encoded_value_nodes ||
+            count > (max_annotation_bytes - total_annotation_model_bytes - sizeof(DexAnnotationItem)) / sizeof(DexEncodedValue))
+            return Error{ErrorCode::resource_limit, "DEX annotation elements exceed metadata budget"};
+        total_annotation_model_bytes += sizeof(DexAnnotationItem) + std::uint64_t(count) * sizeof(DexEncodedValue);
+        DexAnnotationItem annotation;
+        annotation.visibility = visibility;
+        annotation.type_index = type;
+        annotation.file_offset = offset;
+        annotation.elements.reserve(count);
+        std::uint32_t previous_name = 0;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX annotation parsing canceled"};
+            std::uint32_t name = 0;
+            if (!item.uleb(name) || name >= strings.size() || (i && name <= previous_name))
+                return Error{ErrorCode::malformed, "DEX annotation element names are invalid or unordered"};
+            previous_name = name;
+            auto value = decode_encoded_value(item, name, 0);
+            if (!value) return value.error();
+            annotation.elements.push_back(std::move(value.value()));
+        }
+        const auto index = static_cast<std::uint32_t>(decoded_annotations.size());
+        decoded_annotations.push_back(std::move(annotation));
+        annotation_item_indices.emplace(offset, index);
+        return index;
+    };
+    std::function<Result<std::vector<std::uint32_t>>(std::uint32_t)> read_annotation_set;
+    read_annotation_set = [&](std::uint32_t offset) -> Result<std::vector<std::uint32_t>> {
+        constexpr std::uint64_t max_set_entries = 1'000'000;
+        constexpr std::uint64_t max_annotation_bytes = 64ull * 1024 * 1024;
+        if (!offset || (offset & 3) || offset < data_off || offset >= dex_data_end)
+            return Error{ErrorCode::malformed, "DEX annotation_set_item offset is invalid"};
+        if (const auto found = annotation_set_indices.find(offset); found != annotation_set_indices.end())
+            return found->second;
+        if (total_annotation_sets >= 1'000'000)
+            return Error{ErrorCode::resource_limit, "DEX annotation sets exceed one million"};
+        ++total_annotation_sets;
+        Reader set{bytes.first(dex_data_end)};
+        if (!set.seek(offset)) return Error{ErrorCode::malformed, "DEX annotation_set_item offset is invalid"};
+        std::uint32_t count = 0;
+        if (!set.u32(count)) return Error{ErrorCode::malformed, "Truncated DEX annotation_set_item"};
+        if (count > max_set_entries || count > max_set_entries - total_annotation_set_entries)
+            return Error{ErrorCode::resource_limit, "DEX annotation-set entries exceed one million"};
+        if (!extent(set.pos, count, 4, set.bytes.size()))
+            return Error{ErrorCode::malformed, "DEX annotation_set_item extent exceeds the data section"};
+        if (count > (max_annotation_bytes - std::min(total_annotation_model_bytes, max_annotation_bytes)) / sizeof(std::uint32_t))
+            return Error{ErrorCode::resource_limit, "DEX annotation-set metadata exceeds 64 MiB"};
+        total_annotation_model_bytes += std::uint64_t(count) * sizeof(std::uint32_t);
+        total_annotation_set_entries += count;
+        std::vector<std::uint32_t> indices;
+        indices.reserve(count);
+        std::uint32_t previous_type = 0;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX annotation-set parsing canceled"};
+            std::uint32_t item_offset = 0;
+            if (!set.u32(item_offset) || !item_offset)
+                return Error{ErrorCode::malformed, "DEX annotation_set_item contains a null annotation offset"};
+            auto annotation_index = read_annotation_item(item_offset);
+            if (!annotation_index) return annotation_index.error();
+            const auto type = decoded_annotations[annotation_index.value()].type_index;
+            if (i && type <= previous_type)
+                return Error{ErrorCode::malformed, "DEX annotation_set_item types are duplicated or unordered"};
+            previous_type = type;
+            indices.push_back(annotation_index.value());
+        }
+        annotation_set_indices.emplace(offset, indices);
+        return indices;
+    };
+    auto add_annotation_links = [&](DexAnnotationTargetKind kind, std::uint32_t class_def_index,
+                                    std::uint32_t member_index, std::uint32_t parameter_index,
+                                    std::uint32_t set_offset, std::uint64_t source_offset) -> Result<bool> {
+        if (!set_offset) return true;
+        auto indices = read_annotation_set(set_offset);
+        if (!indices) return indices.error();
+        constexpr std::uint64_t max_annotation_links = 1'000'000;
+        constexpr std::uint64_t max_annotation_bytes = 64ull * 1024 * 1024;
+        for (const auto annotation_index : indices.value()) {
+            if (total_annotation_links >= max_annotation_links ||
+                total_annotation_model_bytes > max_annotation_bytes - sizeof(DexAnnotationLink))
+                return Error{ErrorCode::resource_limit, "DEX annotation links exceed the one-million/64 MiB budget"};
+            ++total_annotation_links;
+            total_annotation_model_bytes += sizeof(DexAnnotationLink);
+            annotation_links.push_back({kind, class_def_index, member_index, parameter_index, annotation_index, source_offset});
+        }
+        return true;
+    };
+    auto parse_annotation_directory = [&](std::uint32_t offset, std::uint32_t class_def_index,
+                                          std::uint32_t class_type,
+                                          const std::vector<std::uint32_t> &declared_fields,
+                                          const std::vector<std::uint32_t> &declared_methods) -> Result<bool> {
+        constexpr std::uint64_t max_directory_entries = 1'000'000;
+        if (!offset) return true;
+        if ((offset & 3) || offset < data_off || offset >= dex_data_end)
+            return Error{ErrorCode::malformed, "DEX annotations_directory_item offset is invalid"};
+        Reader directory{bytes.first(dex_data_end)};
+        if (!directory.seek(offset)) return Error{ErrorCode::malformed, "DEX annotations_directory_item offset is invalid"};
+        std::uint32_t class_set = 0, field_count = 0, method_count = 0, parameter_count = 0;
+        if (!directory.u32(class_set) || !directory.u32(field_count) || !directory.u32(method_count) || !directory.u32(parameter_count))
+            return Error{ErrorCode::malformed, "Truncated DEX annotations_directory_item"};
+        const std::uint64_t entry_count = std::uint64_t(field_count) + method_count + parameter_count;
+        if (entry_count > max_directory_entries || entry_count > max_directory_entries - total_annotation_directory_entries)
+            return Error{ErrorCode::resource_limit, "DEX annotation directory entry count or extent exceeds budget"};
+        if (!extent(directory.pos, entry_count, 8, directory.bytes.size()))
+            return Error{ErrorCode::malformed, "DEX annotation directory entries exceed the data section"};
+        total_annotation_directory_entries += entry_count;
+        if (class_set && ((class_set & 3) || class_set < data_off || class_set >= dex_data_end))
+            return Error{ErrorCode::malformed, "DEX class annotation set offset is invalid"};
+        if (class_set) {
+            auto linked = add_annotation_links(DexAnnotationTargetKind::class_def, class_def_index, UINT32_MAX, UINT32_MAX,
+                                               class_set, offset);
+            if (!linked) return linked.error();
+        }
+        std::uint32_t previous_index = 0;
+        for (std::uint32_t i = 0; i < field_count; ++i) {
+            if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX annotation-directory parsing canceled"};
+            const auto entry_offset = directory.pos;
+            std::uint32_t field_index = 0, set_offset = 0;
+            if (!directory.u32(field_index) || !directory.u32(set_offset) || field_index >= fields.size() ||
+                fields[field_index].owner != class_type ||
+                !std::binary_search(declared_fields.begin(), declared_fields.end(), field_index) ||
+                (i && field_index <= previous_index))
+                return Error{ErrorCode::malformed, "DEX annotated field index is invalid or unordered for its class"};
+            previous_index = field_index;
+            if (!set_offset || (set_offset & 3) || set_offset < data_off || set_offset >= dex_data_end)
+                return Error{ErrorCode::malformed, "DEX field annotation set offset is invalid"};
+            auto linked = add_annotation_links(DexAnnotationTargetKind::field, class_def_index, field_index,
+                                               UINT32_MAX, set_offset, entry_offset + 4);
+            if (!linked) return linked.error();
+        }
+        previous_index = 0;
+        for (std::uint32_t i = 0; i < method_count; ++i) {
+            if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX annotation-directory parsing canceled"};
+            const auto entry_offset = directory.pos;
+            std::uint32_t method_index = 0, set_offset = 0;
+            if (!directory.u32(method_index) || !directory.u32(set_offset) || method_index >= methods.size() ||
+                methods[method_index].owner != class_type ||
+                !std::binary_search(declared_methods.begin(), declared_methods.end(), method_index) ||
+                (i && method_index <= previous_index))
+                return Error{ErrorCode::malformed, "DEX annotated method index is invalid or unordered for its class"};
+            previous_index = method_index;
+            if (!set_offset || (set_offset & 3) || set_offset < data_off || set_offset >= dex_data_end)
+                return Error{ErrorCode::malformed, "DEX method annotation set offset is invalid"};
+            auto linked = add_annotation_links(DexAnnotationTargetKind::method, class_def_index, method_index,
+                                               UINT32_MAX, set_offset, entry_offset + 4);
+            if (!linked) return linked.error();
+        }
+        previous_index = 0;
+        for (std::uint32_t i = 0; i < parameter_count; ++i) {
+            if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX parameter-annotation parsing canceled"};
+            std::uint32_t method_index = 0, ref_list_offset = 0;
+            if (!directory.u32(method_index) || !directory.u32(ref_list_offset) || method_index >= methods.size() ||
+                methods[method_index].owner != class_type ||
+                !std::binary_search(declared_methods.begin(), declared_methods.end(), method_index) ||
+                (i && method_index <= previous_index))
+                return Error{ErrorCode::malformed, "DEX annotated-parameter method index is invalid or unordered for its class"};
+            previous_index = method_index;
+            if (!ref_list_offset || (ref_list_offset & 3) || ref_list_offset < data_off || ref_list_offset >= dex_data_end)
+                return Error{ErrorCode::malformed, "DEX annotation_set_ref_list offset is invalid"};
+            Reader refs{bytes.first(dex_data_end)};
+            if (!refs.seek(ref_list_offset)) return Error{ErrorCode::malformed, "DEX annotation_set_ref_list offset is invalid"};
+            std::uint32_t count = 0;
+            const auto expected = protos[methods[method_index].proto].parameters.size();
+            if (!refs.u32(count) || count != expected || !extent(refs.pos, count, 4, refs.bytes.size()))
+                return Error{ErrorCode::malformed, "DEX annotation_set_ref_list count or extent disagrees with method prototype"};
+            if (count > 1'000'000 || count > 1'000'000 - total_annotation_parameter_slots)
+                return Error{ErrorCode::resource_limit, "DEX annotation parameter slots exceed one million"};
+            total_annotation_parameter_slots += count;
+            for (std::uint32_t parameter_index = 0; parameter_index < count; ++parameter_index) {
+                if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX parameter-annotation parsing canceled"};
+                const auto ref_offset = refs.pos;
+                std::uint32_t set_offset = 0;
+                if (!refs.u32(set_offset)) return Error{ErrorCode::malformed, "Truncated DEX annotation_set_ref_list"};
+                if (set_offset && ((set_offset & 3) || set_offset < data_off || set_offset >= dex_data_end))
+                    return Error{ErrorCode::malformed, "DEX parameter annotation set offset is invalid"};
+                auto linked = add_annotation_links(DexAnnotationTargetKind::parameter, class_def_index, method_index,
+                                                   parameter_index, set_offset, ref_offset);
+                if (!linked) return linked.error();
+            }
+        }
+        return true;
+    };
     for(std::uint32_t ci=0;ci<class_count;++ci){
         if(stop.stop_requested())return Error{ErrorCode::canceled,"DEX class-data parsing canceled"};
         ids.seek(class_off+std::size_t(ci)*32);std::uint32_t class_type=0,access=0,super=0,interfaces=0,source_file=0,annotations=0,class_data=0,static_values=0;
@@ -247,18 +578,32 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
            (class_data&&(class_data<data_off||class_data>=data_end))||
            (static_values&&(static_values<data_off||static_values>=data_end)))
             return Error{ErrorCode::malformed,"DEX class_def data offset is outside the data section"};
-        if(!class_data)continue;
+        std::vector<std::uint32_t> static_field_indices;
+        std::vector<std::uint32_t> declared_field_indices;
+        std::vector<std::uint32_t> declared_method_indices;
+        if(class_data){
         if(!class_data_offsets.insert(class_data).second)return Error{ErrorCode::malformed,"DEX classes share a class_data_item offset"};
         if(class_data_offsets.size()>max_items)return Error{ErrorCode::resource_limit,"DEX class-data count exceeds item budget"};
-        Reader cd{bytes};cd.seek(class_data);std::uint32_t sf=0,inf=0,dm=0,vm=0;
+        Reader cd{bytes.first(static_cast<std::size_t>(data_end))};cd.seek(class_data);std::uint32_t sf=0,inf=0,dm=0,vm=0;
         if(!cd.uleb(sf)||!cd.uleb(inf)||!cd.uleb(dm)||!cd.uleb(vm)||sf>max_items||inf>max_items||dm>max_items||vm>max_items)return Error{ErrorCode::malformed,"DEX class_data counts are invalid"};
         const auto encoded_field_count=std::uint64_t(sf)+inf, defined=std::uint64_t(dm)+vm;
         if(encoded_field_count>max_items||defined>max_items)return Error{ErrorCode::resource_limit,"DEX class_data exceeds item budget"};
-        for(std::uint64_t group=0;group<2;++group){const auto count=group?inf:sf;std::uint64_t field_idx=0;for(std::uint32_t n=0;n<count;++n){std::uint32_t delta=0,flags=0;if(!cd.uleb(delta)||!cd.uleb(flags))return Error{ErrorCode::malformed,"Truncated DEX encoded field"};field_idx+=delta;if(field_idx>=fields.size()||fields[field_idx].owner!=class_type)return Error{ErrorCode::malformed,"DEX encoded field index is invalid for its defining class"};}}
+        for(std::uint64_t group=0;group<2;++group){
+            const auto count=group?inf:sf;std::uint64_t field_idx=0;
+            for(std::uint32_t n=0;n<count;++n){
+                std::uint32_t delta=0,flags=0;
+                if(!cd.uleb(delta)||!cd.uleb(flags)||(n&&delta==0))return Error{ErrorCode::malformed,"Truncated or unordered DEX encoded field"};
+                field_idx+=delta;
+                if(field_idx>=fields.size()||fields[field_idx].owner!=class_type)return Error{ErrorCode::malformed,"DEX encoded field index is invalid for its defining class"};
+                declared_field_indices.push_back(static_cast<std::uint32_t>(field_idx));
+                if(group==0)static_field_indices.push_back(static_cast<std::uint32_t>(field_idx));
+            }
+        }
         for(std::uint64_t group=0;group<2;++group){
             const auto count=group?vm:dm;std::uint64_t method_idx=0;
             for(std::uint32_t n=0;n<count;++n){std::uint32_t delta=0,flags=0,code_off=0;if(!cd.uleb(delta)||!cd.uleb(flags)||!cd.uleb(code_off))return Error{ErrorCode::malformed,"Truncated DEX encoded method"};method_idx+=delta;
                 if(method_idx>=methods.size()||methods[method_idx].owner!=class_type)return Error{ErrorCode::malformed,"DEX encoded method index is invalid for its defining class"};
+                declared_method_indices.push_back(static_cast<std::uint32_t>(method_idx));
                 if(!code_off)continue;
                 if((code_off&3)||code_off<data_off||code_off>=std::uint64_t(data_off)+data_size||!extent(code_off,1,16,file_size))return Error{ErrorCode::malformed,"DEX code_item header offset is invalid"};
                 Reader cr{bytes};cr.seek(code_off);std::uint16_t registers=0,ins=0,outs=0,tries=0;std::uint32_t debug=0,insns=0;
@@ -286,9 +631,36 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
                 code.push_back({static_cast<std::uint32_t>(method_idx),insns_off,insns*2,debug,registers,ins,std::move(exception_regions)});
             }
         }
+        }
+        std::sort(declared_field_indices.begin(), declared_field_indices.end());
+        std::sort(declared_method_indices.begin(), declared_method_indices.end());
+        if(static_values){
+            Reader values{bytes.first(static_cast<std::size_t>(data_end))};
+            if(!values.seek(static_values))return Error{ErrorCode::malformed,"DEX static_values offset is invalid"};
+            std::uint32_t value_count=0;
+            if(!values.uleb(value_count))return Error{ErrorCode::malformed,"Truncated DEX encoded_array_item"};
+            if(value_count>static_field_indices.size())return Error{ErrorCode::malformed,"DEX static_values has more entries than the class static fields"};
+            if(value_count>max_items-decoded_static_values.size())return Error{ErrorCode::resource_limit,"DEX static-value count exceeds item budget"};
+            if(value_count>(64ull*1024*1024-total_encoded_value_bytes)/sizeof(DexStaticValue))return Error{ErrorCode::resource_limit,"DEX static-value metadata exceeds 64 MiB"};
+            total_encoded_value_bytes+=std::uint64_t(value_count)*sizeof(DexStaticValue);
+            for(std::uint32_t i=0;i<value_count;++i){
+                auto value=decode_encoded_value(values,UINT32_MAX,0);
+                if(!value)return value.error();
+                decoded_static_values.push_back({class_type,static_field_indices[i],std::move(value.value())});
+            }
+            if(values.pos>data_end)return Error{ErrorCode::malformed,"DEX static_values extends outside the data section"};
+        }
+        if(annotations){
+            auto parsed_annotations = parse_annotation_directory(annotations, ci, class_type,
+                                                                  declared_field_indices, declared_method_indices);
+            if(!parsed_annotations)return parsed_annotations.error();
+        }
     }
     if(code.size()>max_items)return Error{ErrorCode::resource_limit,"DEX defined method count exceeds address-space budget"};
     DexMetadata dex_metadata;
+    dex_metadata.static_values = std::move(decoded_static_values);
+    dex_metadata.annotations = std::move(decoded_annotations);
+    dex_metadata.annotation_links = std::move(annotation_links);
     dex_metadata.code.reserve(code.size());
     for (auto &compiled : code)
         dex_metadata.code.push_back({compiled.method,compiled.registers,compiled.ins,std::move(compiled.exception_regions)});

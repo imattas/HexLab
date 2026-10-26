@@ -93,6 +93,10 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
     export_->SetName("strings-export");
     export_->Enable(false);
     filter_row->Add(export_, 0, wxEXPAND);
+    export_all_ = new wxButton(this, wxID_ANY, "Export all CSV...");
+    export_all_->SetName("strings-export-all");
+    export_all_->Enable(false);
+    filter_row->Add(export_all_, 0, wxEXPAND | wxLEFT, FromDIP(4));
     layout->Add(filter_row, 0, wxEXPAND | wxALL, FromDIP(4));
 
     auto *splitter = new wxSplitterWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
@@ -128,7 +132,8 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
     SetSizer(layout);
 
     filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { filter_timer_.StartOnce(120); });
-    export_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_filtered_strings(); });
+    export_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_strings(true); });
+    export_all_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_strings(false); });
     filter_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent &) {
         filter_timer_.Stop();
         refresh_strings();
@@ -219,6 +224,7 @@ void StringBrowserView::refresh_strings() {
         }
     });
     export_->Enable(document_ && !visible_strings_.empty());
+    export_all_->Enable(document_ && !document_->strings().records.empty());
     if (previous) {
         const auto visible = std::find(visible_strings_.begin(), visible_strings_.end(), *previous);
         if (visible != visible_strings_.end()) {
@@ -232,21 +238,30 @@ void StringBrowserView::refresh_strings() {
     }
 }
 
-void StringBrowserView::export_filtered_strings() {
+void StringBrowserView::export_strings(bool filtered) {
     if (!document_)
         return;
     filter_timer_.Stop();
     refresh_strings();
     const auto document = document_;
-    const auto visible = visible_strings_;
-    if (visible.empty())
+    std::vector<std::size_t> records;
+    if (filtered) {
+        records = visible_strings_;
+    } else {
+        records.resize(document->strings().records.size());
+        for (std::size_t i = 0; i < records.size(); ++i)
+            records[i] = i;
+    }
+    if (records.empty())
         return;
 
     std::vector<std::filesystem::path> protected_paths = document->project
         ? document->project->protected_paths : std::vector<std::filesystem::path>{};
     if (const auto file = std::dynamic_pointer_cast<const FileStorage>(document->input_storage))
         protected_paths.push_back(file->backing_path());
-    wxFileDialog dialog(this, "Export filtered strings and incoming references", {}, "strings.csv",
+    const auto title = filtered ? "Export filtered strings and incoming references" :
+                                  "Export all strings and incoming references";
+    wxFileDialog dialog(this, title, {}, filtered ? "strings-filtered.csv" : "strings-all.csv",
                         "CSV files (*.csv)|*.csv|All files (*.*)|*.*", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
     if (dialog.ShowModal() != wxID_OK)
         return;
@@ -283,7 +298,7 @@ void StringBrowserView::export_filtered_strings() {
         status == DerivedStatus::file_only ? "unavailable: file-only document" :
         "unavailable: reference index is not current";
     constexpr std::size_t export_page_size = 128;
-    for (const auto record_index : visible) {
+    for (const auto record_index : records) {
         if (record_index >= document->strings().records.size())
             continue;
         const auto &record = document->strings().records[record_index];
