@@ -17,8 +17,17 @@ metadata token, TypeDef or MethodDef owner token, ordinal, flags, optional name,
 and TypeDef/TypeRef/TypeSpec constraint tokens. It validates coded-index tags,
 owner and constraint row bounds, duplicate ordinals per owner, reserved flag
 bits, and the GenericParamConstraint table layout. Generic parameter ordinals
-above 1023 are rejected as a resource limit. Constraints remain metadata tokens;
-they are not resolved to display names or evaluated as C++ types.
+above 1023 are rejected as a resource limit. These records retain their
+constraint tokens. `parse_managed_type_catalog` also adds resolved identities
+to TypeDef-owned generic parameters: TypeDef and TypeRef constraints carry a
+display name and scope, while TypeSpec constraints retain their resolved
+signature tree. External TypeRefs remain explicitly unresolved until catalog
+binding, which refreshes the associated identity. These identities preserve
+metadata shape and scope; they are not evaluated as C++ types or checked for
+constraint satisfaction. The catalog also retains MethodDef-owned generic
+parameters with resolved constraint identities, and `parse_managed_methods`
+attaches those records to methods. The standalone
+`parse_managed_generic_parameters` API returns raw constraint tokens.
 
 `parse_managed_types` attaches TypeDef-owned generic rows to each
 `ManagedTypeDefinition`. `parse_managed_methods` attaches MethodDef-owned rows
@@ -66,9 +75,10 @@ otherwise unsupported field does not hide the rest of the catalog. Truncated,
 malformed, or out-of-range blobs remain hard errors. This is inspection data;
 it is not converted into editable workspace types, and external assembly or
 module TypeRefs remain unresolved. Field catalogs are capped at 250,000 rows,
-with 100,000 resolved signature nodes per catalog. Generic constraint records
-retain their tokens; they are not attached to resolved catalog names or
-semantically checked.
+with 100,000 resolved signature nodes per catalog. TypeDef- and
+MethodDef-owned generic constraint records retain their tokens and expose
+resolved identities, including full TypeSpec signature shape. Constraint
+satisfaction is not evaluated.
 
 `ManagedTypeCatalog` now retains each catalog's Assembly identity and full
 AssemblyRef identity, including version, culture, flags, and public-key bytes.

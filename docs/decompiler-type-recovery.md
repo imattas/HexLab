@@ -124,15 +124,19 @@ recovered stack references. Register names remain metadata at this stage; the
 machine-level assignment formatter still prints register destinations.
 
 For pointer variables, direct memory accesses through a base register with a
-non-negative constant displacement and no index contribute observed fields to
-the pointee type. The pass uses each access width, creates unsigned integer
-members at the observed byte offsets, and carries the layout across pointer
-copies and phi inputs when all phi inputs are pointer-classified. Constant
-pointer copies and `pointer +/- constant` assignments share field evidence in
-both directions, translating offsets between each pointer view and its
-enclosing object. A field accessed through an interior pointer therefore
-contributes its enclosing-object offset to the original pointer's recovered
-structure while retaining its local offset in the interior view. A valid
+constant displacement and no index contribute observed fields to the pointee
+type. The pass uses each access width, creates unsigned integer members at the
+observed byte offsets, and carries the layout across pointer copies and phi
+inputs when all phi inputs are pointer-classified. Constant pointer copies and
+`pointer +/- constant` assignments share field evidence in both directions,
+translating offsets between pointer views and their enclosing object. This
+includes a negative displacement through an interior pointer when the exact
+copy/offset chain proves a non-negative field offset in another pointer view.
+Alias paths with inconsistent accumulated offsets are rejected, and normalized
+offsets remain subject to the one-megabyte layout bound. A field accessed
+through an interior pointer therefore contributes its enclosing-object offset
+to the original pointer's recovered structure while retaining its local offset
+in the interior view when that offset is valid. A valid
 non-overlapping layout becomes a recovered structure. A run of at least three
 contiguous same-width fields is represented as an array member; shorter runs,
 sparse accesses, and different-width fields remain separate members. This is
@@ -161,8 +165,9 @@ constant pointer copies and offset aliases only when the same field extent is
 present in the destination layout. When a classified pointer member is loaded
 and that value is independently dereferenced at constant offsets, the member
 can point to a recovered nested structure. This follows observed pointer loads
-to a maximum of four nested pointee levels and one million combined observation,
-layout, comparison, and type-emission work items per recovery. Cycles, excess
+to a maximum of four nested pointee levels and one million combined memory
+observation, alias-graph traversal, layout, comparison, and type-emission work
+items per recovery. Cycles, excess
 depth/work, missing child layouts, and conflicting observations
 leave the affected pointer member as `void*`; these cases never create recursive
 type ownership. Dynamic, partial-width, and ambiguous pointer slots remain

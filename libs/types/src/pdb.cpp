@@ -378,6 +378,12 @@ Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database, std::stop_token s
                 ++at;
                 return name;
             };
+            const auto read_id_list = [&](std::uint32_t count) {
+                if (count > max_type_records || count > (limit - at) / 4)
+                    throw Failure{{ErrorCode::malformed, "Invalid PDB IPI reference count at stream offset " + std::to_string(pos)}};
+                record.references.reserve(count);
+                for (std::uint32_t i = 0; i < count; ++i) record.references.push_back(read_index());
+            };
             switch (leaf) {
             case 0x1601: // LF_FUNC_ID: parent ID, TPI function type, name.
                 record.kind = CodeViewIdKind::function;
@@ -390,6 +396,43 @@ Result<PdbIdStream> parse_pdb_ids(const PdbDatabase &database, std::stop_token s
                 record.class_type = read_index();
                 record.function_type = read_index();
                 record.name = read_name();
+                break;
+            case 0x1603: { // LF_BUILDINFO: count and IPI argument IDs.
+                record.kind = CodeViewIdKind::build_info;
+                if (at > limit || limit - at < 2)
+                    throw Failure{{ErrorCode::malformed, "Truncated PDB LF_BUILDINFO count at stream offset " + std::to_string(pos)}};
+                const auto count = static_cast<std::uint16_t>(std::to_integer<unsigned>(bytes[at]) |
+                    (std::to_integer<unsigned>(bytes[at + 1]) << 8));
+                at += 2;
+                if (count > 5)
+                    throw Failure{{ErrorCode::malformed, "PDB LF_BUILDINFO count exceeds the CodeView field limit at stream offset " + std::to_string(pos)}};
+                read_id_list(count);
+                break;
+            }
+            case 0x1604: { // LF_SUBSTR_LIST: count and IPI string IDs.
+                record.kind = CodeViewIdKind::substring_list;
+                const auto count = read_index();
+                read_id_list(count);
+                break;
+            }
+            case 0x1605: // LF_STRING_ID: parent string-list ID and string.
+                record.kind = CodeViewIdKind::string_id;
+                record.parent_string_id = read_index();
+                record.name = read_name();
+                break;
+            case 0x1606: // LF_UDT_SRC_LINE: TPI UDT, source string ID, line.
+            case 0x1607: // LF_UDT_MOD_SRC_LINE adds a module index.
+                record.kind = leaf == 0x1606 ? CodeViewIdKind::udt_source_line : CodeViewIdKind::udt_module_source_line;
+                record.related_type = read_index();
+                record.source_file_id = read_index();
+                record.line_number = read_index();
+                if (leaf == 0x1607) {
+                    if (at > limit || limit - at < 2)
+                        throw Failure{{ErrorCode::malformed, "Truncated PDB LF_UDT_MOD_SRC_LINE module index at stream offset " + std::to_string(pos)}};
+                    record.module_index = static_cast<std::uint16_t>(std::to_integer<unsigned>(bytes[at]) |
+                        (std::to_integer<unsigned>(bytes[at + 1]) << 8));
+                    at += 2;
+                }
                 break;
             default:
                 record.kind = CodeViewIdKind::unsupported;

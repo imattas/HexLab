@@ -9,6 +9,7 @@
 namespace hexlab {
 
 using ElfUnwindContext = std::map<std::uint64_t, std::uint64_t>; // DWARF register number -> value
+// The reader returns a scalar decoded in the ELF target's byte order.
 using ElfUnwindMemoryReader = std::function<std::optional<std::uint64_t>(std::uint64_t, std::uint8_t)>;
 
 struct ElfUnwindResult {

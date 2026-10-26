@@ -72,9 +72,9 @@ struct CodeViewTypeRecord {
 };
 struct PdbTypeStream { std::uint32_t type_index_begin = 0; std::uint32_t type_index_end = 0; std::vector<CodeViewTypeRecord> records; };
 
-// IPI records use a separate type-index namespace from TPI. Unsupported ID
-// leaves retain their original leaf and byte extent for bounded inspection.
-enum class CodeViewIdKind : std::uint8_t { function, member_function, unsupported };
+// IPI records use a separate type-index namespace from TPI. Recognized
+// compiler-generated IDs decode their references; other leaves retain extent.
+enum class CodeViewIdKind : std::uint8_t { function, member_function, build_info, substring_list, string_id, udt_source_line, udt_module_source_line, unsupported };
 struct CodeViewIdRecord {
     std::uint32_t index = 0;
     std::uint16_t leaf = 0;
@@ -82,6 +82,12 @@ struct CodeViewIdRecord {
     std::uint32_t parent_scope = 0; // LF_FUNC_ID parent ID; zero means global scope.
     std::uint32_t class_type = 0;   // LF_MFUNC_ID owner in the TPI namespace.
     std::uint32_t function_type = 0; // LF_PROCEDURE or LF_MFUNCTION in TPI.
+    std::uint32_t parent_string_id = 0; // LF_STRING_ID parent list, in IPI.
+    std::uint32_t related_type = 0; // UDT type index in TPI for source-line records.
+    std::uint32_t source_file_id = 0; // LF_UDT_SRC_LINE source LF_STRING_ID.
+    std::uint32_t line_number = 0;
+    std::uint16_t module_index = 0;
+    std::vector<std::uint32_t> references; // Build-info IDs or substring-list IDs.
     std::string name;
     std::uint32_t record_offset = 0; // Byte offset within IPI stream 4.
     std::uint32_t record_size = 0;   // Includes length, leaf, payload, and padding.

@@ -186,6 +186,9 @@ Field field(const ElfHeader &header, std::uint32_t type) {
         case 21: return {K::global_data, 4}; // R_ARM_GLOB_DAT
         case 22: return {K::jump_slot, 4}; // R_ARM_JUMP_SLOT
         case 23: return {K::base_relative, 4}; // R_ARM_RELATIVE
+        case 42: return {K::pc_relative, 4}; // R_ARM_PREL31
+        case 55: return {K::absolute, 4}; // R_ARM_ABS32_NOI
+        case 56: return {K::pc_relative, 4}; // R_ARM_REL32_NOI
         default: break;
         }
     }
@@ -242,6 +245,18 @@ bool uses_addend(ElfRelocationKind kind) {
     return kind == K::absolute || kind == K::pc_relative || kind == K::plt_relative || kind == K::plt_absolute ||
            kind == K::base_relative || kind == K::got || kind == K::symbol_size || kind == K::ifunc;
 }
+std::int64_t signed_field(std::uint64_t value, unsigned bits) {
+    const auto mask = (UINT64_C(1) << bits) - 1;
+    value &= mask;
+    if (value & (UINT64_C(1) << (bits - 1)))
+        value |= ~mask;
+    return std::bit_cast<std::int64_t>(value);
+}
+std::int64_t relocation_addend(const ElfRelocation &row, std::uint64_t value, std::size_t size) {
+    if (row.type == 42 && row.kind == ElfRelocationKind::pc_relative)
+        return signed_field(value, 31); // R_ARM_PREL31 excludes bit 31.
+    return signed_value(value, size);
+}
 void map_place(ElfRelocation &row, const ElfSection *target, const Image &image, const Reader &reader, bool implicit,
                bool implicit_global_addend = false) {
     if (row.kind == ElfRelocationKind::none)
@@ -263,8 +278,9 @@ void map_place(ElfRelocation &row, const ElfSection *target, const Image &image,
                 row.addend = 0;
             else {
                 const auto bytes = reader.bytes(row.file_place->value, static_cast<std::size_t>(extent));
-                row.addend = signed_value(reader.value(bytes.bytes, 0, static_cast<std::size_t>(extent)),
-                                          static_cast<std::size_t>(extent));
+                row.addend = relocation_addend(row,
+                    reader.value(bytes.bytes, 0, static_cast<std::size_t>(extent)),
+                    static_cast<std::size_t>(extent));
             }
         }
         return;
@@ -312,7 +328,7 @@ void map_place(ElfRelocation &row, const ElfSection *target, const Image &image,
     if (contiguous && file)
         row.file_place = FileOffset{*file};
     if (sample_addend)
-        row.addend = signed_value(raw, static_cast<std::size_t>(extent));
+        row.addend = relocation_addend(row, raw, static_cast<std::size_t>(extent));
 }
 } // namespace
 std::uint64_t read_relocation_table(const Reader &reader, const Image &image, ElfMetadata &metadata,

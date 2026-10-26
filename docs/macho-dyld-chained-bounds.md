@@ -9,7 +9,13 @@ and 11 retain their encoded target information but stay unresolved without
 the shared-cache base-pointer table. ARM64e userland24 format 12 uses a
 24-bit import index and an 8-byte chain stride. ARM64e shared-cache format
 13 retains its 34-bit cache-relative target and authentication fields, but
-stays unresolved without the shared-cache base.
+stays unresolved without the shared-cache base. ARM64e kernel format 7 uses
+an 8-byte pointer field and 4-byte chain stride; its unauthenticated targets
+are interpreted as offsets from the preferred image header. Authenticated
+pointers retain their PAC metadata and remain unresolved by the runtime
+resolver. Resolvable unauthenticated format-7 rebases and bind metadata flow
+through the same resolver and persisted-provenance checks as formats 1, 9,
+and 12.
 
 The parser applies these hard limits before allocating symbol strings or
 following chain records:

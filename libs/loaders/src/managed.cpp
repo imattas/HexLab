@@ -705,6 +705,50 @@ Result<ManagedTypeCatalog> parse_managed_type_catalog(std::span<const std::byte>
       if(auto found=definitions_by_token.find(owner_token);found!=definitions_by_token.end())found->second->interface_tokens.push_back(target_token);
     }
   }
+  // Attach resolved constraint identities after TypeSpec signatures and
+  // TypeRef names/scopes are available. Keep the original tokens untouched so
+  // callers can always trace a display identity back to its metadata row.
+  std::map<std::uint32_t,const ManagedTypeReference*> references_by_token;
+  std::map<std::uint32_t,const ManagedTypeSpecification*> specs_by_token;
+  for(const auto& reference:catalog.references)references_by_token.emplace(reference.token,&reference);
+  for(const auto& spec:catalog.specifications)specs_by_token.emplace(spec.token,&spec);
+  auto all_generic_parameters=parse_managed_generic_parameters(root);if(!all_generic_parameters)return all_generic_parameters.error();
+  for(auto& parameter:all_generic_parameters.value())if((parameter.owner_token>>24)==6)
+    catalog.method_generic_parameters.push_back(std::move(parameter));
+  const auto resolve_constraints=[&](std::vector<ManagedGenericParameter>& parameters)->Result<bool>{
+  for(auto& parameter:parameters){
+    parameter.resolved_constraints.clear();
+    for(const auto token:parameter.constraint_tokens){
+      ManagedGenericParameter::ConstraintIdentity identity;identity.token=token;
+      const auto table=token>>24;
+      if(table==2){
+        const auto rid=token&0x00ffffffu;
+        if(!rid||rid>catalog.definitions.size())return malformed("Generic constraint TypeDef token is outside the type catalog");
+        identity.name=catalog.definitions[rid-1].full_name;identity.scope="module";
+      }else if(table==1){
+        const auto found=references_by_token.find(token);
+        if(found==references_by_token.end())return malformed("Generic constraint TypeRef token is unresolved");
+        const auto& reference=*found->second;identity.name=reference.full_name;
+        identity.scope=reference.resolved_catalog_index&&reference.assembly_scope?"assembly:"+reference.assembly_scope->name:
+          reference.unresolved_scope.empty()?"module":reference.unresolved_scope;
+        identity.external_unresolved=reference.external_scope_unresolved;
+      }else if(table==27){
+        const auto found=specs_by_token.find(token);
+        if(found==specs_by_token.end())return malformed("Generic constraint TypeSpec token is unresolved");
+        identity.signature=std::make_shared<ManagedTypeSignature>(found->second->signature);
+        const auto* root_type=resolved_type_spec_root(found->second->signature);
+        if(!root_type)return Error{ErrorCode::resource_limit,"Generic constraint TypeSpec nesting exceeds limit"};
+        identity.name=root_type->metadata_type_name;
+        identity.scope=root_type->metadata_type_scope;
+        identity.external_unresolved=root_type->metadata_type_external_unresolved;
+      }else return malformed("Generic constraint token has an invalid metadata table");
+      parameter.resolved_constraints.push_back(std::move(identity));
+    }
+  }
+  return true;
+  };
+  for(auto& definition:catalog.definitions){auto resolved=resolve_constraints(definition.generic_parameters);if(!resolved)return resolved.error();}
+  {auto resolved=resolve_constraints(catalog.method_generic_parameters);if(!resolved)return resolved.error();}
   return catalog;
 }
 
@@ -813,6 +857,33 @@ Result<bool> bind_managed_type_references(std::span<ManagedTypeCatalog> catalogs
       active_specs.erase(spec.token);
       if(!refreshed)return refreshed.error();
     }
+    std::map<std::uint32_t,const ManagedTypeReference*> references;
+    std::map<std::uint32_t,const ManagedTypeSpecification*> specifications;
+    for(const auto& reference:catalog.references)references.emplace(reference.token,&reference);
+    for(const auto& spec:catalog.specifications)specifications.emplace(spec.token,&spec);
+    const auto refresh_constraints=[&](std::vector<ManagedGenericParameter>& parameters)->Result<bool>{
+    for(auto& parameter:parameters){
+      for(auto& identity:parameter.resolved_constraints){
+        if((identity.token>>24)==1){
+          const auto found=references.find(identity.token);if(found==references.end())return malformed("Bound generic constraint TypeRef token is unresolved");
+          const auto& reference=*found->second;identity.name=reference.full_name;
+          identity.scope=reference.resolved_catalog_index&&reference.assembly_scope?"assembly:"+reference.assembly_scope->name:
+            reference.unresolved_scope.empty()?"module":reference.unresolved_scope;
+          identity.external_unresolved=reference.external_scope_unresolved;
+        }else if((identity.token>>24)==27){
+          const auto found=specifications.find(identity.token);if(found==specifications.end())return malformed("Bound generic constraint TypeSpec token is unresolved");
+          identity.signature=std::make_shared<ManagedTypeSignature>(found->second->signature);
+          const auto* root_type=resolved_type_spec_root(found->second->signature);
+          if(!root_type)return Error{ErrorCode::resource_limit,"Generic constraint TypeSpec nesting exceeds limit"};
+          identity.name=root_type->metadata_type_name;identity.scope=root_type->metadata_type_scope;
+          identity.external_unresolved=root_type->metadata_type_external_unresolved;
+        }
+      }
+    }
+    return true;
+    };
+    for(auto& definition:catalog.definitions){auto refreshed=refresh_constraints(definition.generic_parameters);if(!refreshed)return refreshed.error();}
+    {auto refreshed=refresh_constraints(catalog.method_generic_parameters);if(!refreshed)return refreshed.error();}
   }
   return true;
 }
@@ -1051,10 +1122,10 @@ Result<ManagedPeInfo> parse_managed_pe(const LoadedImage& loaded){
 Result<std::vector<ManagedMethod>> parse_managed_methods(std::span<const std::byte> root){
   auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();
   auto types=parse_managed_types(root);if(!types)return types.error();
-  auto generic_parameters=parse_managed_generic_parameters(root);if(!generic_parameters)return generic_parameters.error();
+  auto type_catalog=parse_managed_type_catalog(root);if(!type_catalog)return type_catalog.error();
   std::map<std::uint32_t,const ManagedTypeDefinition*> owners;for(const auto& type:types.value())for(auto token:type.method_tokens)owners.emplace(token,&type);
   std::map<std::uint32_t,std::vector<ManagedGenericParameter>> method_generics;
-  for(const auto &parameter:generic_parameters.value())if((parameter.owner_token>>24)==6)method_generics[parameter.owner_token].push_back(parameter);
+  for(const auto &parameter:type_catalog.value().method_generic_parameters)method_generics[parameter.owner_token].push_back(parameter);
   for(auto &[token,parameters]:method_generics){(void)token;std::sort(parameters.begin(),parameters.end(),[](const auto &a,const auto &b){return a.number<b.number;});}
   const auto& metadata=parsed.value();auto table_it=metadata.streams.find("#~");if(table_it==metadata.streams.end())table_it=metadata.streams.find("#-");
   const auto strings_it=metadata.streams.find("#Strings");if(strings_it==metadata.streams.end())return malformed("CLR metadata has no #Strings heap");

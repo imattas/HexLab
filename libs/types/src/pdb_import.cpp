@@ -1019,6 +1019,12 @@ Result<PdbFunctionIdImportResult> import_pdb_function_ids(const PdbIdStream &ids
         imported_id.parent_scope = record.parent_scope;
         imported_id.class_type = record.class_type;
         imported_id.function_type = record.function_type;
+        imported_id.parent_string_id = record.parent_string_id;
+        imported_id.related_type = record.related_type;
+        imported_id.source_file_id = record.source_file_id;
+        imported_id.line_number = record.line_number;
+        imported_id.module_index = record.module_index;
+        imported_id.references = record.references;
         imported_id.name = record.name;
         imported_id.record_offset = record.record_offset;
         imported_id.record_size = record.record_size;
@@ -1027,7 +1033,31 @@ Result<PdbFunctionIdImportResult> import_pdb_function_ids(const PdbIdStream &ids
             imported_id.resolved = false;
             imported_id.diagnostic = std::move(message);
         };
-        if (record.name.empty()) {
+        if (record.kind == CodeViewIdKind::unsupported) {
+            ++result.unsupported;
+            reject("Unsupported CodeView IPI leaf retained with raw extent");
+        } else if (record.kind == CodeViewIdKind::string_id) {
+            if (!record.parent_string_id) imported_id.resolved = true;
+            else if (!id_by_index.contains(record.parent_string_id)) reject("CodeView string ID parent is outside the IPI stream");
+            else if (id_by_index.at(record.parent_string_id)->kind != CodeViewIdKind::substring_list) reject("CodeView string ID parent is not LF_SUBSTR_LIST");
+            else imported_id.resolved = true;
+        } else if (record.kind == CodeViewIdKind::substring_list || record.kind == CodeViewIdKind::build_info) {
+            bool valid = true;
+            for (const auto ref : record.references) {
+                const auto target = id_by_index.find(ref);
+                if (target == id_by_index.end() || target->second->kind != CodeViewIdKind::string_id) { valid = false; break; }
+            }
+            if (!valid) reject("CodeView IPI string reference is missing or is not LF_STRING_ID");
+            else imported_id.resolved = true;
+        } else if (record.kind == CodeViewIdKind::udt_source_line || record.kind == CodeViewIdKind::udt_module_source_line) {
+            const auto source = id_by_index.find(record.source_file_id);
+            const auto type = type_by_index.find(record.related_type);
+            if (source == id_by_index.end() || source->second->kind != CodeViewIdKind::string_id) reject("CodeView UDT source record has no LF_STRING_ID source");
+            else if (type == type_by_index.end() || (type->second->kind != CodeViewTypeKind::class_type &&
+                     type->second->kind != CodeViewTypeKind::structure && type->second->kind != CodeViewTypeKind::union_type &&
+                     type->second->kind != CodeViewTypeKind::enumeration)) reject("CodeView UDT source record type is missing or not a UDT");
+            else imported_id.resolved = true;
+        } else if (record.name.empty()) {
             reject("CodeView function ID has an empty name");
         } else if (record.kind == CodeViewIdKind::function && record.parent_scope &&
                    !id_by_index.contains(record.parent_scope)) {
@@ -1068,10 +1098,10 @@ Result<PdbFunctionIdImportResult> import_pdb_function_ids(const PdbIdStream &ids
                 }
             }
         }
-        if (imported_id.diagnostic.empty()) {
+        if (imported_id.diagnostic.empty() && (record.kind == CodeViewIdKind::function || record.kind == CodeViewIdKind::member_function)) {
             imported_id.signature = imported.function_types.at({std::uint8_t{0}, record.function_type});
             imported_id.resolved = true;
-        } else {
+        } else if (!imported_id.resolved) {
             ++result.unresolved;
         }
         result.records.push_back(std::move(imported_id));
@@ -1157,10 +1187,44 @@ Result<PdbFunctionIdImportResult> import_pdb_function_ids(const PdbIdStream &roo
             row.index = id.index; row.leaf = id.leaf; row.kind = id.kind;
             row.parent_scope = id.parent_scope; row.class_type = id.class_type;
             row.local_function_type = id.function_type; row.name = id.name;
+            row.parent_string_id = id.parent_string_id; row.related_type = id.related_type;
+            row.source_file_id = id.source_file_id; row.line_number = id.line_number;
+            row.module_index = id.module_index; row.references = id.references;
             row.record_offset = id.record_offset; row.record_size = id.record_size;
             if (id.kind == CodeViewIdKind::unsupported) {
                 ++result.unsupported;
                 row.diagnostic = "Unsupported CodeView IPI leaf retained without a function join";
+                result.records.push_back(std::move(row));
+                continue;
+            }
+            if (id.kind == CodeViewIdKind::string_id) {
+                const auto parent = id.parent_string_id ? id_index.find(id.parent_string_id) : id_index.end();
+                row.resolved = !id.parent_string_id || (parent != id_index.end() && parent->second->kind == CodeViewIdKind::substring_list);
+                if (!row.resolved) row.diagnostic = "CodeView string ID parent is missing or is not LF_SUBSTR_LIST";
+                if (!row.resolved) ++result.unresolved;
+                result.records.push_back(std::move(row));
+                continue;
+            }
+            if (id.kind == CodeViewIdKind::substring_list || id.kind == CodeViewIdKind::build_info) {
+                row.resolved = std::all_of(id.references.begin(), id.references.end(), [&](std::uint32_t ref) {
+                    const auto found = id_index.find(ref);
+                    return found != id_index.end() && found->second->kind == CodeViewIdKind::string_id;
+                });
+                if (!row.resolved) row.diagnostic = "CodeView IPI string reference is missing or is not LF_STRING_ID";
+                if (!row.resolved) ++result.unresolved;
+                result.records.push_back(std::move(row));
+                continue;
+            }
+            if (id.kind == CodeViewIdKind::udt_source_line || id.kind == CodeViewIdKind::udt_module_source_line) {
+                const auto source = id_index.find(id.source_file_id);
+                const auto type_ns = selector_map(mapping, static_cast<std::uint8_t>(id.related_type >> 24));
+                const auto type = type_ns ? types.find({*type_ns, id.related_type & 0x00ffffffu}) : types.end();
+                const bool aggregate = type != types.end() &&
+                    (type->second->kind == CodeViewTypeKind::class_type || type->second->kind == CodeViewTypeKind::structure ||
+                     type->second->kind == CodeViewTypeKind::union_type || type->second->kind == CodeViewTypeKind::enumeration);
+                row.resolved = source != id_index.end() && source->second->kind == CodeViewIdKind::string_id && aggregate;
+                if (!row.resolved) row.diagnostic = "CodeView UDT source record has a missing source string or UDT type";
+                if (!row.resolved) ++result.unresolved;
                 result.records.push_back(std::move(row));
                 continue;
             }

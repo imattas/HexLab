@@ -38,11 +38,21 @@ PE-bound symbol. Existing address assignments are preserved. The PE symbol
 view and CLI inspection output identify each available procedure type reference
 as TPI or IPI.
 
-This is a bounded IPI function-name/type join, not complete IPI decoding. It
-does not parse `LF_BUILDINFO`, `LF_SUBSTR_LIST`, `LF_STRING_ID`, UDT source-line
-records, ID records in object-file sections, or linker-generated ID forms.
-Unresolved records are reported to callers, and unresolved or ambiguous
-procedure references are left unassigned.
+The same stream parser also decodes `LF_BUILDINFO` (0x1603),
+`LF_SUBSTR_LIST` (0x1604), `LF_STRING_ID` (0x1605), `LF_UDT_SRC_LINE`
+(0x1606), and `LF_UDT_MOD_SRC_LINE` (0x1607). Their IPI references, TPI UDT
+index, line number, module index, string, and original record extent are
+retained in `CodeViewIdRecord` and `PdbImportedFunctionId`. The importer checks
+that build-info and substring-list entries refer to string IDs, string IDs
+refer only to substring lists, and UDT source records refer to both a source
+string and a supported TPI UDT. Failed joins stay visible with diagnostics.
+Build-info lists are limited to the five defined fields, record counts are
+bounded by stream extents and the parser's two-million-record cap, and all
+fixed fields and strings are read within each record boundary.
+
+This still does not decode ID records in object-file sections or linker-
+generated ID forms. Unresolved records are reported to callers, and unresolved
+or ambiguous procedure references are left unassigned.
 
 The record IDs and field layouts were cross-checked against Microsoft's
 [`cvinfo.h`](https://github.com/microsoft/microsoft-pdb/blob/master/include/cvinfo.h)
