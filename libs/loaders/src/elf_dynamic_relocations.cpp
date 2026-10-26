@@ -145,6 +145,43 @@ std::uint64_t relative_value(std::uint64_t load_bias, std::int64_t addend) {
                     ErrorCode::overflow);
     return load_bias - magnitude;
 }
+bool add_signed_to_unsigned(std::uint64_t base, std::int64_t addend, std::uint64_t &result) {
+    if (addend >= 0) {
+        const auto amount = static_cast<std::uint64_t>(addend);
+        if (base > UINT64_MAX - amount) return false;
+        result = base + amount;
+    } else {
+        const auto amount = static_cast<std::uint64_t>(-(addend + 1)) + 1;
+        if (base < amount) return false;
+        result = base - amount;
+    }
+    return true;
+}
+bool pc32_result(std::uint64_t symbol, std::int64_t addend, std::uint64_t place, std::uint32_t &encoded) {
+    bool negative = symbol < place;
+    std::uint64_t magnitude = negative ? place - symbol : symbol - place;
+    const bool addend_negative = addend < 0;
+    const auto addend_magnitude = addend_negative
+        ? static_cast<std::uint64_t>(-(addend + 1)) + 1
+        : static_cast<std::uint64_t>(addend);
+    if (!addend_magnitude) {
+        // Keep the sign of zero immaterial.
+    } else if (negative == addend_negative) {
+        const auto limit = negative ? UINT64_C(2147483648) : static_cast<std::uint64_t>(INT32_MAX);
+        if (magnitude > limit || addend_magnitude > limit - magnitude) return false;
+        magnitude += addend_magnitude;
+    } else if (magnitude >= addend_magnitude) {
+        magnitude -= addend_magnitude;
+        if (!magnitude) negative = false;
+    } else {
+        magnitude = addend_magnitude - magnitude;
+        negative = addend_negative;
+    }
+    if (negative ? magnitude > UINT64_C(2147483648) : magnitude > static_cast<std::uint64_t>(INT32_MAX))
+        return false;
+    encoded = static_cast<std::uint32_t>(negative ? std::uint64_t{0} - magnitude : magnitude);
+    return true;
+}
 void shift_address(Address &address, std::uint64_t bias, bool elf32) {
     runtime_require(address.space.value == 0, "Runtime rebasing supports only the ELF primary address domain");
     address.offset = shifted(address.offset, bias);
@@ -351,11 +388,16 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                                        relocation.kind == ElfRelocationKind::absolute;
             const bool i386_pc_relative = i386 && relocation.type == 2 &&
                                           relocation.kind == ElfRelocationKind::pc_relative;
-            if (!relative && !symbol_slot && !symbol_with_addend && !i386_absolute && !i386_pc_relative) {
+            const bool x64_64 = x64 && relocation.type == 1 && relocation.kind == ElfRelocationKind::absolute;
+            const bool x64_pc32 = x64 && relocation.type == 2 && relocation.kind == ElfRelocationKind::pc_relative;
+            const bool x64_32 = x64 && relocation.type == 10 && relocation.kind == ElfRelocationKind::absolute;
+            const bool x64_32s = x64 && relocation.type == 11 && relocation.kind == ElfRelocationKind::absolute;
+            if (!relative && !symbol_slot && !symbol_with_addend && !i386_absolute && !i386_pc_relative &&
+                !x64_64 && !x64_pc32 && !x64_32 && !x64_32s) {
                 skip(index, i386
                     ? "Supported dynamic types are R_386_32, R_386_PC32, R_386_RELATIVE, R_386_GLOB_DAT, and R_386_JMP_SLOT"
                     : x64
-                    ? "Supported dynamic types are R_X86_64_RELATIVE, GLOB_DAT, and JUMP_SLOT"
+                    ? "Supported dynamic types are R_X86_64_64, PC32, 32, 32S, RELATIVE, GLOB_DAT, and JUMP_SLOT"
                     : riscv64
                         ? "Supported dynamic types are R_RISCV_RELATIVE, R_RISCV_64, and R_RISCV_JUMP_SLOT"
                         : "Supported dynamic types are R_AARCH64_RELATIVE, GLOB_DAT, and JUMP_SLOT");
@@ -481,10 +523,68 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                         continue;
                     }
                     value += static_cast<std::uint64_t>(*relocation.addend);
+                } else if (x64_64 || x64_pc32 || x64_32 || x64_32s) {
+                    if (!relocation.addend) {
+                        skip(index, "x86-64 symbol-addend relocation addend is unavailable");
+                        continue;
+                    }
+                    const auto addend = *relocation.addend;
+                    if (x64_64) {
+                        // R_X86_64_64 stores the 64-bit S + A result.
+                        value += static_cast<std::uint64_t>(addend);
+                    } else if (x64_pc32) {
+                        if (!relocation.place) {
+                            skip(index, "R_X86_64_PC32 relocation place is unavailable");
+                            continue;
+                        }
+                        std::uint64_t place = 0;
+                        try { place = shifted(relocation.place->offset, load_bias); }
+                        catch (const RuntimeRelocationFailure &) {
+                            skip(index, "R_X86_64_PC32 runtime place overflows the address space");
+                            continue;
+                        }
+                        std::uint32_t encoded = 0;
+                        if (!pc32_result(value, addend, place, encoded)) {
+                            skip(index, "R_X86_64_PC32 result does not fit signed 32 bits");
+                            continue;
+                        }
+                        value = encoded;
+                    } else if (x64_32) {
+                        std::uint64_t sum = 0;
+                        if (!add_signed_to_unsigned(value, addend, sum) || sum > UINT32_MAX) {
+                            skip(index, "R_X86_64_32 result does not fit unsigned 32 bits");
+                            continue;
+                        }
+                        value = sum;
+                    } else {
+                        bool fits = false;
+                        std::uint32_t low = 0;
+                        if (addend >= 0) {
+                            const auto amount = static_cast<std::uint64_t>(addend);
+                            fits = value <= static_cast<std::uint64_t>(INT32_MAX) &&
+                                   amount <= static_cast<std::uint64_t>(INT32_MAX) - value;
+                            low = static_cast<std::uint32_t>(value + amount);
+                        } else {
+                            const auto amount = static_cast<std::uint64_t>(-(addend + 1)) + 1;
+                            if (value >= amount) {
+                                const auto positive = value - amount;
+                                fits = positive <= static_cast<std::uint64_t>(INT32_MAX);
+                            } else {
+                                fits = amount - value <= UINT64_C(2147483648);
+                            }
+                            low = static_cast<std::uint32_t>(value - amount);
+                        }
+                        if (!fits) {
+                            skip(index, "R_X86_64_32S result does not fit signed 32 bits");
+                            continue;
+                        }
+                        value = low;
+                    }
                 }
             }
             const auto word = metadata.header.is_64 ? UINT64_C(8) : UINT64_C(4);
-            const auto expected_width = packed_relative || i386 ? word : UINT64_C(8);
+            const auto expected_width = packed_relative || i386 ? word :
+                (x64_pc32 || x64_32 || x64_32s) ? UINT64_C(4) : UINT64_C(8);
             if (!relocation.place || !relocation.file_place || relocation.field_size != expected_width) {
                 skip(index, "Relocation target is not a complete file-backed field of the supported width");
                 continue;
