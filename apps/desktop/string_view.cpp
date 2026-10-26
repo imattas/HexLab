@@ -19,6 +19,7 @@ wxString encoding_text(StringEncoding encoding) {
     case StringEncoding::windows1252: return "Windows-1252";
     case StringEncoding::windows1251: return "Windows-1251";
     case StringEncoding::windows1250: return "Windows-1250";
+    case StringEncoding::windows1254: return "Windows-1254";
     }
     return "unknown";
 }
