@@ -3086,6 +3086,12 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.macho_objc_import_types->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         const auto doc = impl_->shown;
         if (!doc || !doc->project || !doc->project->state || !impl_->macho_objc_scan) return;
+        if (impl_->macho_objc_source.get() != doc.get()) {
+            impl_->populate_macho_objc();
+            wxMessageBox("The displayed document changed. Review the refreshed Objective-C metadata before importing.",
+                         "Import Objective-C types", wxOK | wxICON_INFORMATION, this);
+            return;
+        }
         auto plan = macho_objc_type_import_plan(*impl_->macho_objc_scan, doc->project->state->user->types);
         if (plan.definitions.empty()) {
             wxString message = "No new Objective-C types are eligible for import.";

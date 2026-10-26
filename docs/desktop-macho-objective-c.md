@@ -33,6 +33,14 @@ an incomplete `ObjC2.Meta.<name>` aggregate only when the scanner validated a
 metaclass address. The parsed method signature retains its receiver and
 selector parameters.
 
+The action accepts only a scan of the currently displayed document snapshot.
+Names above the project's 512-byte limit and method lists above the persistent
+type codec's 100,000-method limit are skipped with diagnostics. Layouts above
+the codec's 100,000-member limit retain eligible method signatures as
+incomplete aggregates. An ineligible
+record does not prevent eligible declarations from the same scan from being
+imported. The planner also respects the project's type-record limit.
+
 Types retain project provenance naming the Mach-O ObjC2 class-list or
 metaclass record, its class-list index, metadata address, and instance size
 when known. Reimporting identical definitions is a no-op. A same-name type
