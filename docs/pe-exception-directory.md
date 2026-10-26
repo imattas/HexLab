@@ -57,8 +57,12 @@ adjectives, conversions, and rethrow behavior remain ambiguous; it never calls
 cleanup or catch code. This is a metadata plan, not a runtime dispatcher.
 Because `PeMetadata` is publicly constructible, the FH3 planner repeats the
 critical bounds checks at its API boundary. It caps the runtime-function scan
-at 65,536 rows, unwind states and try blocks at 4,096 each, IP transitions at
-65,536, and total handlers at 65,536. IP transitions must be nondecreasing
+and each FH3 collection (unwind states, IP transitions, try blocks, and
+aggregate handlers) at the parser's one-million-record limit. The parser's
+1 MiB per-function payload budget can impose a lower effective count. The
+planner also caps the combined UTF-8 byte length of handler decorated names
+and the caller-supplied exception type at 1 MiB, before comparisons or output
+copies. IP transitions must be nondecreasing
 and lie in the selected runtime-function extent; duplicate
 transitions with one shared state are accepted, while conflicting duplicate
 states produce an ambiguous plan. Every IP state,
