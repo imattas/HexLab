@@ -8,7 +8,7 @@ can still be debugged through a compatible remote server.
 
 | Host platform and architecture | Native backend selection | Scope |
 | --- | --- | --- |
-| Windows | Win32 backend | x86/x64 process control; native ARM64 builds support stopped-thread GPR/FPSIMD context access and safe edits, software BRK breakpoints with PSTATE single-step, and up to two execution plus two data hardware breakpoints; ARM32 remains unsupported |
+| Windows | Win32 backend | x86/x64 process control; native ARM32 builds expose stopped-thread GPR/NEON context edits, ARM/Thumb software breakpoints and bounded sequential-instruction steps; native ARM64 builds support stopped-thread GPR/FPSIMD context access and safe edits, software BRK breakpoints with PSTATE single-step, and up to two execution plus two data hardware breakpoints |
 | Linux x86-64 | x86-64 ptrace backend | x86-64 and compat i386 targets, including register, memory, event, and breakpoint operations described in [Linux ptrace debugging](linux-ptrace-debugging.md) |
 | Linux AArch64 | AArch64 ptrace backend | AArch64 GPR/FPSIMD, process lifecycle, memory, software breakpoints, hardware execute/watchpoints, and per-thread run-state; scalable SVE state is conditional on kernel regset availability |
 | macOS x86-64 / Apple Silicon | Darwin Mach/ptrace backend | Bounded thread enumeration, task-suspended per-thread register inspection/editing, memory and module/region inspection; single-thread process execution, stepping, and software breakpoints; multi-thread stop attribution/stepping and hardware watchpoints are unsupported |
@@ -20,6 +20,41 @@ ptrace implementation. Other Linux processor names select the unsupported
 backend instead of compiling x86-64-only ptrace code and failing later with an
 architecture preprocessor error. This is a build-selection safeguard, not
 native support for those architectures.
+
+Native ARM32 builds use the Windows [Arm32 `CONTEXT`](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-context-r1)
+through `GetThreadContext`/`SetThreadContext` only while a debug event is
+pending. The selected thread must belong to the target process. Reads expose
+R0-R12, SP, LR, PC, CPSR, Q0-Q15, and FPSCR. Writes validate exact widths and
+little-endian bytes, keep SP eight-byte aligned, and check PC alignment against
+CPSR.T (two bytes in Thumb state, four in ARM state). CPSR edits are limited to
+NZCV and T; changing T requires a PC edit and a clear IT state. A failed
+context write attempts to restore the captured context.
+
+ARM32 software breakpoints patch the first Thumb halfword with `BKPT #0` or
+the four-byte ARM instruction with `BKPT #0`. ARMNT addresses default to Thumb;
+at the stopped event thread's PC, CPSR.T selects the mode. The low bit of a
+breakpoint address can explicitly tag Thumb and is cleared before patching.
+An ARM-mode breakpoint away from the stopped PC cannot be selected through the
+current address-only API. Breakpoint overlap and suspected placement in the
+second half of a wide Thumb instruction are rejected. ARM32 breakpoint and
+memory changes require a pending stop; memory writes touching an owned
+breakpoint instruction or its preceding Thumb halfword are rejected to retain
+the recorded instruction width.
+
+ARM32 has no CPSR single-step bit exposed by this API. The bounded step path
+accepts verified sequential instructions: common 16-bit Thumb scalar and
+load/store forms, 32-bit Thumb MOVW/MOVT, and ARM data-processing immediates
+that do not write PC. It rejects branches, calls, returns, interworking,
+unknown encodings, and a successor overlapping a user breakpoint. For an
+accepted step, the backend restores an owned breakpoint instruction if needed,
+patches a temporary trap at the decoded successor, suspends peer threads, and
+continues the event owner. At the next stop it rewinds a post-trap PC, restores
+the successor bytes, and rearms the owned breakpoint. Restoration failure
+keeps the event stopped and is retried before continuation; the temporary
+breakpoint exception must be continued as handled. Windows ARM32
+hardware breakpoint APIs expose BVR/BCR and WVR/WCR registers, but this
+backend has no transactional per-thread ownership and hit attribution for
+them, so hardware breakpoints and watchpoints remain explicitly unsupported.
 
 Windows ARM64 context access uses `GetThreadContext`/`SetThreadContext` with
 the ARM64 context flags ([`ARM64_NT_CONTEXT`](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-arm64_nt_context), [`GetThreadContext`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadcontext)) and is restricted to the stop window while a debug event is pending. Register reads expose X0 through X30, SP, PC, CPSR, V0 through V31, FPCR, and FPSR. Writes validate register sizes, keep PC instruction aligned and SP 16-byte aligned, restrict CPSR changes to NZCV flags, and reject X18 writes because Windows reserves it for the thread environment pointer. Vector state is the fixed 128-bit V register bank; scalable SVE/SME state is not exposed.
@@ -50,7 +85,9 @@ instruction step and can therefore produce their own stop.
 
 This matrix describes the implemented feature boundary. Darwin and Linux
 platform-specific runtime behavior still needs validation on their native
-hosts. Windows ARM64 source has been syntax-checked with clang-cl targeting
+hosts. Windows ARM32 source has been syntax-checked for `armv7-w64-windows-gnu`
+against available Windows headers; native runtime behavior remains unverified.
+Windows ARM64 source has been syntax-checked with clang-cl targeting
 `aarch64-pc-windows-msvc` against the installed Windows SDK, but runtime
 behavior still needs validation on a native ARM64 host. See
 [Darwin debugger scope](debugger-darwin.md) for the conservative macOS backend
