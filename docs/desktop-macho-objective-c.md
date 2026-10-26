@@ -38,7 +38,9 @@ metaclass record, its class-list index, metadata address, and instance size
 when known. Reimporting identical definitions is a no-op. A same-name type
 with different content or provenance is reported as a conflict and left
 untouched. The import reports records skipped because their layouts or
-addresses are not proven. It does not infer superclass storage, property
+addresses are not proven. If multiple runtime records resolve to the same
+class name, all records for that name are skipped so duplicate declarations
+cannot make the atomic project import fail. It does not infer superclass storage, property
 backing ivars, protocol conformance methods, category overrides, or a
 metaclass object layout. When an instance layout cannot be represented but
 parsed instance methods exist, the class declaration is retained as an
