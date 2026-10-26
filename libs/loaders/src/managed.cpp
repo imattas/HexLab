@@ -71,7 +71,7 @@ Result<bool> resolve_type_signature(ManagedTypeSignature& signature,const Manage
   if(!budget--)return Error{ErrorCode::resource_limit,"Resolved managed signature node limit exceeded"};
   if(signature.metadata_type_coded_index){const auto coded=signature.metadata_type_coded_index,tag=coded&3u,rid=coded>>2;if(!rid||tag==3)return malformed("Signature contains an invalid TypeDefOrRef coded index");const std::uint32_t table=tag==0?2u:tag==1?1u:27u;const auto token=(table<<24)|rid;signature.metadata_type_token=token;
     if(tag==0){if(rid>catalog.definitions.size())return malformed("Signature TypeDef token is out of range");signature.metadata_type_name=catalog.definitions[rid-1].full_name;signature.metadata_type_scope="module";}
-    else if(tag==1){if(rid>catalog.references.size())return malformed("Signature TypeRef token is out of range");const auto& ref=catalog.references[rid-1];signature.metadata_type_name=ref.full_name;signature.metadata_type_scope=ref.resolved_catalog_index&&ref.assembly_scope?"assembly:"+ref.assembly_scope->name:ref.unresolved_scope.empty()?"module":ref.unresolved_scope;signature.metadata_type_external_unresolved=ref.external_scope_unresolved;}
+    else if(tag==1){if(rid>catalog.references.size())return malformed("Signature TypeRef token is out of range");const auto& ref=catalog.references[rid-1];signature.metadata_type_name=ref.full_name;signature.metadata_type_scope=ref.resolved_catalog_index&&ref.assembly_scope?"assembly:"+ref.assembly_scope->name:ref.unresolved_scope.empty()?"module":ref.unresolved_scope;signature.metadata_type_external_unresolved=ref.external_scope_unresolved;signature.resolved_type_catalog_index=ref.resolved_catalog_index;signature.resolved_type_definition_token=ref.resolved_definition_token;}
     else {if(rid>catalog.specifications.size())return malformed("Signature TypeSpec token is out of range");const auto& spec=catalog.specifications[rid-1];if(spec.token!=token)return malformed("Signature TypeSpec token is unresolved");if(!active_specs.insert(token).second)return malformed("Recursive TypeSpec signature cycle");signature.type_spec_signature=std::make_shared<ManagedTypeSignature>(spec.signature);auto resolved=resolve_type_signature(*signature.type_spec_signature,catalog,active_specs,depth+1,budget);active_specs.erase(token);if(!resolved)return resolved.error();signature.metadata_type_name="TypeSpec";signature.metadata_type_scope="metadata";}
   }
   // A GENERICINST carries its own argument vector. If its constructor is an
@@ -793,6 +793,44 @@ std::optional<ManagedTypeNode> bound_type_node(const ManagedTypeCatalog& catalog
   if(found==catalog.references.end()||!found->resolved_catalog_index||!found->resolved_definition_token)return std::nullopt;
   return ManagedTypeNode{*found->resolved_catalog_index,*found->resolved_definition_token};
 }
+const ManagedTypeDefinition* managed_definition(std::span<const ManagedTypeCatalog> catalogs,
+                                                std::uint32_t catalog_index,std::uint32_t token){
+  if(catalog_index>=catalogs.size())return nullptr;
+  const auto& definitions=catalogs[catalog_index].definitions;
+  const auto found=std::find_if(definitions.begin(),definitions.end(),
+      [&](const auto& definition){return definition.token==token;});
+  return found==definitions.end()?nullptr:&*found;
+}
+Result<bool> refresh_generic_instance_arity(ManagedTypeSignature& signature,
+                                             std::uint32_t source_catalog,
+                                             std::span<const ManagedTypeCatalog> catalogs,
+                                             unsigned depth,std::size_t& budget){
+  if(depth>16)return Error{ErrorCode::resource_limit,"Generic TypeSpec identity nesting exceeds limit"};
+  if(!budget--)return Error{ErrorCode::resource_limit,"Generic TypeSpec identity node limit exceeded"};
+  if(signature.element_type==0x15){
+    const ManagedTypeDefinition* definition=nullptr;
+    if((signature.metadata_type_token>>24)==2)
+      definition=managed_definition(catalogs,source_catalog,signature.metadata_type_token);
+    else if((signature.metadata_type_token>>24)==1 && signature.resolved_type_catalog_index &&
+            signature.resolved_type_definition_token)
+      definition=managed_definition(catalogs,*signature.resolved_type_catalog_index,
+                                    *signature.resolved_type_definition_token);
+    if(definition){
+      signature.generic_instance_arity_valid=definition->generic_parameters.size()==signature.children.size();
+      for(std::size_t i=0;signature.generic_instance_arity_valid&&i<definition->generic_parameters.size();++i)
+        signature.generic_instance_arity_valid=definition->generic_parameters[i].number==i;
+    }
+  }
+  for(auto& child:signature.children){
+    auto result=refresh_generic_instance_arity(child,source_catalog,catalogs,depth+1,budget);
+    if(!result)return result.error();
+  }
+  if(signature.type_spec_signature){
+    auto result=refresh_generic_instance_arity(*signature.type_spec_signature,source_catalog,catalogs,depth+1,budget);
+    if(!result)return result.error();
+  }
+  return true;
+}
 }
 
 Result<bool> bind_managed_type_references(std::span<ManagedTypeCatalog> catalogs){
@@ -849,12 +887,19 @@ Result<bool> bind_managed_type_references(std::span<ManagedTypeCatalog> catalogs
   }
   // TypeSpec signatures were resolved during parsing, before cross-catalog
   // binding. Refresh their TypeRef display state after the bindings settle.
-  for(auto& catalog:catalogs){
+  for(std::size_t catalog_index=0;catalog_index<catalogs.size();++catalog_index){
+    auto& catalog=catalogs[catalog_index];
     std::set<std::uint32_t> active_specs;std::size_t budget=100000;
     for(auto& spec:catalog.specifications){
       active_specs.insert(spec.token);
       auto refreshed=resolve_type_signature(spec.signature,catalog,active_specs,0,budget);
       active_specs.erase(spec.token);
+      if(!refreshed)return refreshed.error();
+    }
+    std::size_t identity_budget=100000;
+    for(auto& spec:catalog.specifications){
+      auto refreshed=refresh_generic_instance_arity(spec.signature,static_cast<std::uint32_t>(catalog_index),
+                                                     catalogs,0,identity_budget);
       if(!refreshed)return refreshed.error();
     }
     std::map<std::uint32_t,const ManagedTypeReference*> references;

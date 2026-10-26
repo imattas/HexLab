@@ -48,6 +48,10 @@ struct ManagedTypeSignature {
   // assembly/module scopes remain explicitly marked unresolved.
   std::string metadata_type_name, metadata_type_scope;
   bool metadata_type_external_unresolved=false;
+  // When a TypeRef binds across the caller-supplied catalog set, retain the
+  // exact definition identity alongside the source TypeRef token. The local
+  // token remains authoritative provenance; these indexes are a derived link.
+  std::optional<std::uint32_t> resolved_type_catalog_index, resolved_type_definition_token;
   std::shared_ptr<ManagedTypeSignature> type_spec_signature;
   std::vector<ManagedTypeSignature> children;
 };
