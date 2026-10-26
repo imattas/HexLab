@@ -3327,7 +3327,8 @@ std::string expression_text(const Expression &expression) {
             if (value.operation == "bitnot") return "~(" + operand + ")";
             return value.operation + "(" + operand + ")";
         } else if constexpr (std::is_same_v<T, BinaryValue>) {
-            if (value.operation == "a64_udiv" || value.operation == "a64_sdiv")
+            if (value.operation == "a64_udiv" || value.operation == "a64_sdiv" ||
+                value.operation.rfind("wasm_", 0) == 0)
                 return value.operation + "(" + expression_text(*value.left) + ", " +
                        expression_text(*value.right) + ")";
             if (value.operation == "frem" || value.operation == "fcgt_un" || value.operation == "fclt_un" ||

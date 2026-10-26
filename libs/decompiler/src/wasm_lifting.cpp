@@ -16,7 +16,6 @@ using Stack = std::vector<ExpressionPtr>;
 
 ValueType integer(unsigned bits, bool sign = false) { return {TypeKind::integer, static_cast<std::uint16_t>(bits), sign}; }
 ValueType floating(unsigned bits) { return {TypeKind::floating, static_cast<std::uint16_t>(bits), false}; }
-ValueType boolean() { return {TypeKind::boolean, 1, false}; }
 std::optional<ValueType> wasm_value_type(std::uint8_t code) {
     switch (code) {
     case 0x7f: return integer(32);
@@ -42,19 +41,22 @@ std::optional<std::uint64_t> immediate(const Instruction &i, std::size_t n = 0) 
 }
 struct OpInfo { unsigned pops; ValueType input, output; std::string_view op; bool comparison = false; };
 std::optional<OpInfo> numeric(std::uint8_t op) {
-    const auto i32 = integer(32), i64 = integer(64), f32 = floating(32), f64 = floating(64), b = boolean();
-    if (op == 0x45) return OpInfo{1, i32, b, "eqz"};
-    if (op == 0x50) return OpInfo{1, i64, b, "eqz"};
-    if (op >= 0x46 && op <= 0x4f) return OpInfo{2, i32, b, std::array<std::string_view,10>{"eq","ne","lt_s","lt_u","gt_s","gt_u","le_s","le_u","ge_s","ge_u"}[op-0x46], true};
-    if (op >= 0x51 && op <= 0x5a) return OpInfo{2, i64, b, std::array<std::string_view,10>{"eq","ne","lt_s","lt_u","gt_s","gt_u","le_s","le_u","ge_s","ge_u"}[op-0x51], true};
-    if (op >= 0x5b && op <= 0x60) return OpInfo{2, f32, b, std::array<std::string_view,6>{"eq","ne","lt","gt","le","ge"}[op-0x5b], true};
-    if (op >= 0x61 && op <= 0x66) return OpInfo{2, f64, b, std::array<std::string_view,6>{"eq","ne","lt","gt","le","ge"}[op-0x61], true};
+    const auto i32 = integer(32), i64 = integer(64), f32 = floating(32), f64 = floating(64);
+    // WebAssembly comparisons produce an i32 value (0 or 1), not an abstract
+    // one-bit Boolean. Keeping that stack type is required for patterns such
+    // as `i32.eq; if`, `i32.eqz`, and integer arithmetic on comparison results.
+    if (op == 0x45) return OpInfo{1, i32, i32, "eqz"};
+    if (op == 0x50) return OpInfo{1, i64, i32, "eqz"};
+    if (op >= 0x46 && op <= 0x4f) return OpInfo{2, i32, i32, std::array<std::string_view,10>{"eq","ne","slt","ult","sgt","ugt","sle","ule","sge","uge"}[op-0x46], true};
+    if (op >= 0x51 && op <= 0x5a) return OpInfo{2, i64, i32, std::array<std::string_view,10>{"eq","ne","slt","ult","sgt","ugt","sle","ule","sge","uge"}[op-0x51], true};
+    if (op >= 0x5b && op <= 0x60) return OpInfo{2, f32, i32, std::array<std::string_view,6>{"eq","ne","lt","gt","le","ge"}[op-0x5b], true};
+    if (op >= 0x61 && op <= 0x66) return OpInfo{2, f64, i32, std::array<std::string_view,6>{"eq","ne","lt","gt","le","ge"}[op-0x61], true};
     if (op >= 0x67 && op <= 0x69) return OpInfo{1, i32, i32, std::array<std::string_view,3>{"clz","ctz","popcnt"}[op-0x67]};
-    if (op >= 0x6a && op <= 0x78) return OpInfo{2, i32, i32, std::array<std::string_view,15>{"add","sub","mul","div_s","div_u","rem_s","rem_u","and","or","xor","shl","shr_s","shr_u","rotl","rotr"}[op-0x6a]};
+    if (op >= 0x6a && op <= 0x78) return OpInfo{2, i32, i32, std::array<std::string_view,15>{"add","sub","mul","wasm_i32_div_s_trap_zero_or_overflow","wasm_i32_div_u_trap_zero","wasm_i32_rem_s_trap_zero","wasm_i32_rem_u_trap_zero","and","or","xor","shl","shr_s","shr_u","rotl","rotr"}[op-0x6a]};
     if (op >= 0x79 && op <= 0x7b) return OpInfo{1, i64, i64, std::array<std::string_view,3>{"clz","ctz","popcnt"}[op-0x79]};
-    if (op >= 0x7c && op <= 0x8a) return OpInfo{2, i64, i64, std::array<std::string_view,15>{"add","sub","mul","div_s","div_u","rem_s","rem_u","and","or","xor","shl","shr_s","shr_u","rotl","rotr"}[op-0x7c]};
-    if (op >= 0x8b && op <= 0x98) return OpInfo{(op==0x8b||op==0x8c||op==0x8d||op==0x8e||op==0x8f||op==0x90||op==0x91)?1u:2u,f32,f32,std::array<std::string_view,14>{"abs","neg","ceil","floor","trunc","nearest","sqrt","add","sub","mul","div","min","max","copysign"}[op-0x8b]};
-    if (op >= 0x99 && op <= 0xa6) return OpInfo{(op<=0x9f)?1u:2u,f64,f64,std::array<std::string_view,14>{"abs","neg","ceil","floor","trunc","nearest","sqrt","add","sub","mul","div","min","max","copysign"}[op-0x99]};
+    if (op >= 0x7c && op <= 0x8a) return OpInfo{2, i64, i64, std::array<std::string_view,15>{"add","sub","mul","wasm_i64_div_s_trap_zero_or_overflow","wasm_i64_div_u_trap_zero","wasm_i64_rem_s_trap_zero","wasm_i64_rem_u_trap_zero","and","or","xor","shl","shr_s","shr_u","rotl","rotr"}[op-0x7c]};
+    if (op >= 0x8b && op <= 0x98) return OpInfo{(op<=0x91)?1u:2u,f32,f32,std::array<std::string_view,14>{"abs","neg","ceil","floor","trunc","nearest","sqrt","add","sub","mul","div","wasm_f32_min","wasm_f32_max","copysign"}[op-0x8b]};
+    if (op >= 0x99 && op <= 0xa6) return OpInfo{(op<=0x9f)?1u:2u,f64,f64,std::array<std::string_view,14>{"abs","neg","ceil","floor","trunc","nearest","sqrt","add","sub","mul","div","wasm_f64_min","wasm_f64_max","copysign"}[op-0x99]};
     return {};
 }
 struct ConversionInfo { ValueType input, output; std::string_view operation; };
