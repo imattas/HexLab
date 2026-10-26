@@ -66,6 +66,7 @@
 #include <wx/stattext.h>
 #include <wx/statusbr.h>
 #include <wx/textctrl.h>
+#include <wx/dialog.h>
 #include <wx/valnum.h>
 #include <wx/window.h>
 #include <algorithm>
@@ -818,8 +819,8 @@ struct MainFrame::Impl {
                          "FLAIR signatures", wxOK | wxICON_INFORMATION, &frame);
             return;
         }
-        wxFileDialog picker(&frame, "Apply FLAIR text catalog", {}, {},
-                            "FLAIR text catalogs (*.pat)|*.pat|All files (*.*)|*.*",
+        wxFileDialog picker(&frame, "Scan FLAIR signature catalog", {}, {},
+                            "FLAIR catalogs (*.pat;*.pat.gz;*.sig)|*.pat;*.pat.gz;*.sig|All files (*.*)|*.*",
                             wxFD_OPEN | wxFD_FILE_MUST_EXIST);
         if (picker.ShowModal() != wxID_OK) return;
         const std::filesystem::path catalog_path(picker.GetPath().ToStdWstring());
@@ -840,7 +841,7 @@ struct MainFrame::Impl {
         const auto work = flirt_work;
         const auto project_id = *id;
         const auto u8name = catalog_path.filename().u8string();
-        const std::string provenance = "FLAIR .pat " +
+        const std::string provenance = "FLAIR " +
             std::string(reinterpret_cast<const char *>(u8name.data()), u8name.size());
         try {
             flirt_work->thread = std::jthread(
@@ -854,23 +855,35 @@ struct MainFrame::Impl {
                             throw std::runtime_error("Cannot read FLAIR catalog or file exceeds 64 MiB.");
                         std::ifstream input(catalog_path, std::ios::binary);
                         if (!input) throw std::runtime_error("Could not open FLAIR catalog.");
-                        std::string text(static_cast<std::size_t>(size), '\0');
-                        if (size && !input.read(text.data(), static_cast<std::streamsize>(size)))
+                        std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+                        if (size && !input.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(size)))
                             throw std::runtime_error("Could not read FLAIR catalog.");
+                        const char *catalog_data = bytes.empty() ? "" : reinterpret_cast<const char *>(bytes.data());
                         if (stop.stop_requested()) throw std::runtime_error("FLAIR recognition canceled.");
 
                         const auto &image = *snapshot->loaded->image;
-                        auto catalog = parse_flirt_pat(text, image.layout().architecture, image.layout().mode,
-                                                       provenance, catalog_limits, stop);
+                        Result<FlirtCatalog> catalog = Error{ErrorCode::unsupported, "Unsupported FLAIR catalog format."};
+                        const auto extension = catalog_path.extension().string();
+                        if (extension == ".sig") {
+                            catalog = parse_flirt_sig(bytes, provenance, catalog_limits, stop);
+                        } else if (extension == ".gz") {
+                            catalog = parse_flirt_pat_gz(bytes, image.layout().architecture, image.layout().mode,
+                                                         provenance, catalog_limits, stop);
+                        } else {
+                            catalog = parse_flirt_pat(std::string_view(catalog_data, bytes.size()),
+                                                      image.layout().architecture, image.layout().mode,
+                                                      provenance, catalog_limits, stop);
+                        }
                         if (!catalog) throw std::runtime_error(catalog.error().message);
                         auto recognition = recognize_flirt_catalog(image, *snapshot->effective, *snapshot->functions,
                                                                     catalog.value(), {}, stop);
                         if (!recognition) throw std::runtime_error(recognition.error().message);
 
-                        const std::string identity = std::to_string(provenance.size()) + ":" + provenance + text;
+                        const std::string identity = std::to_string(provenance.size()) + ":" + provenance +
+                            std::string(catalog_data, bytes.size());
                         Sha256 hash;
-                        const auto bytes = std::as_bytes(std::span(identity.data(), identity.size()));
-                        auto updated = hash.update(bytes);
+                        const auto identity_bytes = std::as_bytes(std::span(identity.data(), identity.size()));
+                        auto updated = hash.update(identity_bytes);
                         if (!updated) throw std::runtime_error(updated.error().message);
                         auto evidence = make_function_recognition_evidence(*snapshot->functions, hash.digest(),
                                                                            recognition.value(), stop);
@@ -882,25 +895,37 @@ struct MainFrame::Impl {
                         if (stop.stop_requested()) actor->cancel_operation(operation.id);
                         auto persisted = operation.result.get();
                         if (!persisted) throw std::runtime_error(persisted.error().message);
-                        std::ostringstream preview;
-                        const auto display_count = std::min<std::size_t>(32, recognition.value().functions.size());
+                        std::ostringstream report;
+                        report << "Catalog: " << provenance << "\nFormat: "
+                               << (extension == ".sig" ? "binary IDASGN" : extension == ".gz" ? "gzip FLAIR text" : "FLAIR text")
+                               << "\nPatterns: " << catalog.value().patterns.size()
+                               << "\nTarget: " << static_cast<unsigned>(catalog.value().target_architecture)
+                               << " / mode " << static_cast<unsigned>(catalog.value().target_mode)
+                               << "\nRecovered function matches: " << recognition.value().functions.size()
+                               << "\nCandidate checks: " << recognition.value().pattern_candidates
+                               << "\nComparisons: " << recognition.value().comparisons
+                               << "\nStatus: " << (recognition.value().complete ? "complete" : "partial; work budget reached")
+                               << "\nMatches: " << recognition.value().functions.size()
+                               << "\n\nMatches and candidate names (evidence only; no names changed):\n";
+                        const auto display_count = std::min<std::size_t>(2000, recognition.value().functions.size());
                         for (std::size_t i = 0; i < display_count; ++i) {
                             const auto &function = recognition.value().functions[i];
-                            preview << "\nva:" << std::hex << function.entry.offset << std::dec
-                                    << (function.ambiguous ? " [ambiguous] " : " ");
+                            report << "va:" << std::hex << function.entry.offset << std::dec
+                                   << (function.ambiguous ? " [AMBIGUOUS] " : " ");
                             for (std::size_t n = 0; n < function.candidates.size(); ++n) {
-                                if (n) preview << " | ";
-                                preview << function.candidates[n].name;
+                                if (n) report << " | ";
+                                report << function.candidates[n].name << " {" << function.candidates[n].provenance << "}";
                                 if (function.candidates[n].kind == FlirtSymbolKind::local_name)
-                                    preview << " [local]";
+                                    report << " [local]";
                             }
+                            report << '\n';
                         }
+                        if (recognition.value().functions.size() > display_count)
+                            report << "\nDisplay limit reached; " << (recognition.value().functions.size() - display_count)
+                                   << " additional matches remain in persisted project evidence.\n";
                         message = "Stored FLAIR evidence for " + std::to_string(recognition.value().functions.size()) +
                             " functions" + (recognition.value().complete ? "." : " (partial; work budget reached).") +
-                            preview.str();
-                        if (recognition.value().functions.size() > display_count)
-                            message += "\n...and " + std::to_string(recognition.value().functions.size() - display_count) +
-                                " more matches.";
+                            "\n" + report.str();
                     } catch (const std::exception &error) {
                         message = std::string("FLAIR recognition failed: ") + error.what();
                     } catch (...) {
@@ -916,8 +941,21 @@ struct MainFrame::Impl {
                             std::lock_guard lock(work->mutex);
                             target = work->target;
                         }
-                        if (target && target->projects().active_document() == project_id)
+                        if (target && target->projects().active_document() == project_id) {
                             target->impl_->log_to(project_id, text(message));
+                            wxDialog dialog(target, wxID_ANY, "FLAIR catalog scan results", wxDefaultPosition, wxSize(820, 620),
+                                            wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+                            auto *layout = new wxBoxSizer(wxVERTICAL);
+                            auto *details = new wxTextCtrl(&dialog, wxID_ANY, text(message), wxDefaultPosition, wxDefaultSize,
+                                                           wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2);
+                            layout->Add(details, 1, wxEXPAND | wxALL, 8);
+                            auto *close = new wxButton(&dialog, wxID_OK, "Close");
+                            layout->Add(close, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+                            dialog.SetSizerAndFit(layout);
+                            dialog.SetSize(820, 620);
+                            dialog.CentreOnParent();
+                            dialog.ShowModal();
+                        }
                     });
                 });
         } catch (const std::exception &error) {
@@ -2632,7 +2670,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     edit->Append(find_next_id, "Find &Next\tF3");
     edit->Append(find_previous_id, "Find &Previous\tShift+F3");
     auto *analysis = new wxMenu;
-    analysis->Append(flirt_apply_id, "Apply FLAIR Catalog Evidence...");
+    analysis->Append(flirt_apply_id, "Scan FLAIR Catalog and Browse Results...");
     menus->Append(analysis, "&Analysis");
     auto *view = new wxMenu;
     view->Append(reset_layout_id, "&Reset Layout\tCtrl+Shift+R");
