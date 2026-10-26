@@ -409,11 +409,97 @@ DebugOwner& debug_owner(PyObject* object){auto* ptr=static_cast<DebugOwner*>(PyC
 void debugger_destroy(PyObject* capsule){auto* ptr=static_cast<DebugOwner*>(PyCapsule_GetPointer(capsule,debugger_name));if(ptr)delete ptr;else PyErr_Clear();}
 PyObject* encode_process(const debugger::ProcessInfo& row){Object item(PyDict_New());set(item,"id",integer(row.id));set(item,"name",string(row.name));set(item,"architecture",integer(static_cast<unsigned>(row.architecture)));return item.release();}
 PyObject* encode_debug_event(const debugger::DebugEvent& row){Object item(PyDict_New()),ids(PyList_New(0));set(item,"sequence",integer(row.sequence));set(item,"kind",integer(static_cast<unsigned>(row.kind)));set(item,"process",integer(row.process));set(item,"thread",integer(row.thread));set(item,"address",integer(row.address));set(item,"message",string(row.message));set(item,"code",integer(row.code));set(item,"first_chance",row.first_chance?PyBool_FromLong(*row.first_chance):none());for(auto id:row.breakpoint_ids)append(ids,integer(id));set(item,"breakpoint_ids",ids.release());return item.release();}
+const char* memory_search_completion_name(debugger::MemorySearchCompletion value){
+    using C=debugger::MemorySearchCompletion;
+    switch(value){
+    case C::completed:return "completed";
+    case C::completed_with_read_failures:return "completed_with_read_failures";
+    case C::byte_budget_exhausted:return "byte_budget_exhausted";
+    case C::comparison_budget_exhausted:return "comparison_budget_exhausted";
+    case C::result_limit_reached:return "result_limit_reached";
+    case C::canceled:return "canceled";
+    case C::read_failed:return "read_failed";
+    case C::read_failure_limit_reached:return "read_failure_limit_reached";
+    case C::backend_protocol_error:return "backend_protocol_error";
+    }
+    return "unknown";
+}
+PyObject* encode_memory_search_report(const debugger::MemorySearchReport& report){
+    Object item(PyDict_New()),matches(PyList_New(0)),failures(PyList_New(0));
+    for(const auto address:report.matches)append(matches,integer(address));
+    for(const auto& failure:report.failures){
+        Object row(PyDict_New());
+        set(row,"start",integer(failure.range.start));set(row,"length",integer(failure.range.length));
+        set(row,"code",integer(static_cast<unsigned>(failure.error.code)));set(row,"message",string(failure.error.message));
+        append(failures,row.release());
+    }
+    set(item,"completion",string(memory_search_completion_name(report.completion)));
+    set(item,"complete",PyBool_FromLong(report.complete()));set(item,"matches",matches.release());set(item,"failures",failures.release());
+    set(item,"eligible_bytes",integer(report.eligible_bytes));set(item,"bytes_requested",integer(report.bytes_requested));
+    set(item,"bytes_read",integer(report.bytes_read));set(item,"comparisons",integer(report.comparisons));
+    set(item,"candidates_checked",integer(report.candidates_checked));return item.release();
+}
+std::uint64_t strict_unsigned(PyObject* value,const char* label){
+    if(PyBool_Check(value))invalid(label);
+    return number(value);
+}
+std::size_t strict_size(PyObject* value,const char* label){
+    const auto converted=strict_unsigned(value,label);
+    if(converted>SIZE_MAX)invalid(label);
+    return static_cast<std::size_t>(converted);
+}
+debugger::MemorySearchOptions memory_search_options(PyObject* value){
+    if(!PyDict_Check(value))invalid("memory search options must be a dictionary");
+    static constexpr std::string_view names[]{"ranges","writable","executable","alignment","chunk_size","max_bytes","max_comparisons","max_results","max_read_failures","stop_on_read_failure"};
+    PyObject *key=nullptr,*item=nullptr;Py_ssize_t position=0;
+    while(PyDict_Next(value,&position,&key,&item)){
+        const auto name=text(key);
+        bool known=false;for(const auto allowed:names)known=known||allowed==name;
+        if(!known)invalid("unknown memory search option");
+    }
+    debugger::MemorySearchOptions options;
+    auto get=[&](const char* name){return PyDict_GetItemString(value,name);};
+    if(auto* ranges=get("ranges")){
+        if(!PyList_Check(ranges)&&!PyTuple_Check(ranges))invalid("ranges must be a list or tuple");
+        const auto count=PySequence_Size(ranges);
+        if(count<0)throw PythonFailure{};
+        if(count>static_cast<Py_ssize_t>(debugger::max_memory_search_ranges))invalid("too many memory search ranges");
+        for(Py_ssize_t i=0;i<count;++i){
+            Object row(PySequence_GetItem(ranges,i));
+            if(!PyTuple_Check(row)||PyTuple_Size(row)!=2)invalid("each memory search range must be a (start, length) tuple");
+            options.ranges.push_back({strict_unsigned(argument(row,0),"range start must be an unsigned integer, not bool"),
+                                      strict_unsigned(argument(row,1),"range length must be an unsigned integer, not bool")});
+        }
+    }
+    const std::pair<const char*,std::optional<bool>*> filters[]{{"writable",&options.writable},{"executable",&options.executable}};
+    for(const auto& [name,target]:filters){
+        if(auto* field=get(name);field&&field!=Py_None){
+            if(!PyBool_Check(field))invalid("memory search permission filters must be bool or None");
+            *target=PyObject_IsTrue(field)==1;
+        }
+    }
+    if(auto* field=get("alignment"))options.alignment=strict_unsigned(field,"alignment must be an unsigned integer, not bool");
+    if(auto* field=get("chunk_size"))options.chunk_size=strict_size(field,"chunk_size must be an unsigned integer, not bool");
+    if(auto* field=get("max_bytes"))options.max_bytes=strict_unsigned(field,"max_bytes must be an unsigned integer, not bool");
+    if(auto* field=get("max_comparisons"))options.max_comparisons=strict_unsigned(field,"max_comparisons must be an unsigned integer, not bool");
+    if(auto* field=get("max_results"))options.max_results=strict_size(field,"max_results must be an unsigned integer, not bool");
+    if(auto* field=get("max_read_failures"))options.max_read_failures=strict_size(field,"max_read_failures must be an unsigned integer, not bool");
+    if(auto* field=get("stop_on_read_failure")){
+        if(!PyBool_Check(field))invalid("stop_on_read_failure must be bool");
+        options.stop_on_read_failure=field==Py_True;
+    }
+    return options;
+}
 std::vector<std::byte> bytes_value(PyObject* object){char* data=nullptr;Py_ssize_t length=0;if(PyBytes_AsStringAndSize(object,&data,&length)<0)throw PythonFailure{};if(length>static_cast<Py_ssize_t>(debugger::max_inspection_read))invalid("Debugger buffer exceeds1MiB limit");auto* begin=reinterpret_cast<const std::byte*>(data);return {begin,begin+length};}
 PyObject* create_debugger(PyObject*,PyObject* args){return guarded([&]()->PyObject*{count(args,0);auto owner=std::make_unique<DebugOwner>(debugger::make_backend_router(debugger::make_native_backend()));auto* result=PyCapsule_New(owner.get(),debugger_name,debugger_destroy);if(result)owner.release();return result;});}
 PyObject* call_debugger(PyObject*,PyObject* args){return guarded([&]()->PyObject*{
     count(args,3);auto& owner=debug_owner(argument(args,0));auto& session=owner.session;const auto method=text(argument(args,1));auto* values=argument(args,2);
     if(method=="state"){count(values,0);return integer(static_cast<unsigned>(session.state()));}
+    if(method=="processes"){
+        count(values,0);auto rows=without_gil([&]{return session.processes();});Object result(PyList_New(0));
+        for(const auto& row:take(std::move(rows)))append(result,encode_process(row));
+        return result.release();
+    }
     if(method=="launch"){
         count(values,3);debugger::Target target;target.executable=text(argument(values,0));target.working_directory=text(argument(values,2));auto* argv=argument(values,1);if(!PyList_Check(argv)&&!PyTuple_Check(argv))invalid("debugger arguments must be a sequence of strings");if(PySequence_Size(argv)>4096)invalid("too many debugger arguments");for(Py_ssize_t i=0;i<PySequence_Size(argv);++i){Object value(PySequence_GetItem(argv,i));target.arguments.push_back(text(value));}auto process=without_gil([&]{return session.launch(target);});return encode_process(take(std::move(process)));
     }
@@ -474,9 +560,25 @@ PyObject* call_debugger(PyObject*,PyObject* args){return guarded([&]()->PyObject
         return none();
     }
     if(method=="interrupt"){count(values,0);take(session.request_interrupt());return none();}
+    if(method=="terminate"){count(values,0);take(without_gil([&]{return session.terminate();}));return none();}
     if(method=="detach"){count(values,0);take(session.detach());return none();}
     if(method=="read_memory"){count(values,2);auto result=take(session.read_memory(number(argument(values,0)),size(argument(values,1))));return PyBytes_FromStringAndSize(reinterpret_cast<const char*>(result.data()),static_cast<Py_ssize_t>(result.size()));}
     if(method=="write_memory"){count(values,2);auto data=bytes_value(argument(values,1));take(session.write_memory(number(argument(values,0)),data));return none();}
+    if(method=="evaluate_expression"){
+        count(values,2);const auto thread=strict_unsigned(argument(values,0),"thread_id must be an unsigned integer, not bool");const auto expression=text(argument(values,1));
+        if(expression.size()>256)invalid("debugger expression exceeds 256 bytes");
+        return integer(take(without_gil([&]{return session.evaluate_expression(thread,expression);} )));
+    }
+    if(method=="search_memory"){
+        count(values,3);const auto source_object=argument(values,2);
+        std::stop_token cancellation;
+        if(source_object!=Py_None)cancellation=stop_source(source_object).get_token();
+        const auto pattern_text=text(argument(values,0));
+        auto pattern=take(debugger::parse_memory_search_pattern(pattern_text));
+        const auto options=memory_search_options(argument(values,1));
+        auto report=without_gil([&]{return session.search_memory(pattern,options,cancellation);});
+        return encode_memory_search_report(take(std::move(report)));
+    }
     if(method=="threads") {count(values,0);Object rows(PyList_New(0));for(const auto& row:take(session.threads())){Object item(PyDict_New());set(item,"id",integer(row.id));set(item,"name",string(row.name));set(item,"state",integer(static_cast<unsigned>(row.state)));append(rows,item.release());}return rows.release();}
     if(method=="thread_run_states") {count(values,0);Object rows(PyList_New(0));for(const auto& row:take(session.thread_run_states())){Object item(PyDict_New());set(item,"thread_id",integer(row.thread));set(item,"state",string(thread_state_name(row.state)));append(rows,item.release());}return rows.release();}
     if(method=="modules") {count(values,0);Object rows(PyList_New(0));for(const auto& row:take(session.modules())){Object item(PyDict_New());set(item,"name",string(row.name));set(item,"path",string(row.path));set(item,"base",integer(row.base));set(item,"size",integer(row.size));append(rows,item.release());}return rows.release();}

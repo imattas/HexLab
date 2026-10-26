@@ -478,8 +478,11 @@ module imports are preserved.
 GDB-remote backend through the same session object. Scripts can launch or attach
 to a process, connect to a remote target, wait for stop events, inspect threads,
 modules, memory regions and registers, read/write bounded memory, and manage
-breakpoints. A session belongs to its creating thread and can be used as a context
-manager.
+breakpoints. `processes()` returns the backend's bounded process snapshot before
+an explicit `attach(pid)`. `terminate()` permanently terminates the selected
+target when the backend supports it; `detach()` and context-manager cleanup leave
+the target running. A session belongs to its creating thread and can be used as
+a context manager.
 
 ```python
 with hexlab.DebuggerSession.native() as debugger:
@@ -516,6 +519,28 @@ progress during startup or a wait. Session operations still belong to the thread
 that created the session. The API does not silently resume a target or install
 Python-side event callbacks. Backend capability differences are reported as
 `hexlab.Error`.
+
+`evaluate_expression(thread_id, expression)` evaluates the bounded register and
+memory expression language against a stopped thread and returns an unsigned
+64-bit result. Expressions are limited to 256 UTF-8 bytes; register names and
+available memory reads depend on the selected architecture/backend. This call
+does not change target state.
+
+`search_memory(pattern, ...)` searches the backend's current readable memory map
+without writing to the target. Patterns use whitespace-separated bytes and
+nibble wildcards (for example, `"48 8B ?? A?"`). Optional `ranges` are
+`(start, length)` tuples; `writable` and `executable` select matching map
+permissions. `alignment`, `chunk_size`, byte/comparison budgets, result and
+read-failure limits bound the scan. The defaults are 64 MiB each for requested
+bytes and comparisons, a 64 KiB read chunk and 4,096 results. A cancellation
+token can stop work between backend reads and comparisons. The returned mapping
+includes `completion`, `complete`, `matches`, `failures`, and work counters; a
+canceled, capped, or partially failed scan retains its collected rows and names
+the completion state instead of presenting the partial result as complete. A
+running process can mutate memory during a scan, so results are not an atomic
+snapshot. Hard limits are 1 GiB each for bytes and comparisons, 4,096 ranges,
+4,096 pattern bytes, a 1 MiB read chunk and 65,536 matches; zero or wrapping
+ranges and zero work limits are rejected.
 
 `breakpoints()` returns each runtime record's identifier, address, kind,
 enabled state, size, hit count, ignore count, condition, logpoint flag, and
