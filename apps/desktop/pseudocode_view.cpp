@@ -1251,14 +1251,21 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
         if (frame != project_->stack_frames.end()) stack = &frame->frame;
     }
     if (stack) {
+        std::vector<std::vector<Address>> normalized_accesses;
+        normalized_accesses.reserve(stack->slots.size());
         std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> stack_origin_counts;
         for (const auto &slot : stack->slots) {
-            std::set<std::pair<std::uint32_t, std::uint64_t>> unique_accesses;
-            for (const auto address : slot.accesses)
-                if (unique_accesses.insert(address_identity(address)).second)
-                    ++stack_origin_counts[address_identity(address)];
+            auto accesses = slot.accesses;
+            std::sort(accesses.begin(), accesses.end(), [](Address left, Address right) {
+                return std::pair{left.space.value, left.offset} < std::pair{right.space.value, right.offset};
+            });
+            accesses.erase(std::unique(accesses.begin(), accesses.end()), accesses.end());
+            for (const auto address : accesses) ++stack_origin_counts[address_identity(address)];
+            normalized_accesses.push_back(std::move(accesses));
         }
-        for (const auto &slot : stack->slots) {
+        for (std::size_t slot_index = 0; slot_index < stack->slots.size(); ++slot_index) {
+            const auto &slot = stack->slots[slot_index];
+            const auto &accesses = normalized_accesses[slot_index];
             const auto row = stack_slots_->InsertItem(stack_slots_->GetItemCount(), stack_offset(slot.offset_from_entry_sp));
             stack_slots_->SetItem(row, 1, slot.width ? wxString::Format("%u", slot.width) : wxString("?"));
             wxString access_text;
@@ -1271,12 +1278,12 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
             stack_slots_->SetItem(row, 2, access_text);
             stack_slots_->SetItem(row, 3,
                                   wxString::Format("%llu", static_cast<unsigned long long>(slot.accesses.size())));
-            const auto access = slot.accesses.empty() ? match->function->entry : slot.accesses.front();
+            const auto access = accesses.empty() ? match->function->entry : accesses.front();
             stack_access_rows_.push_back(access);
-            stack_access_sites_.push_back(slot.accesses);
-            const bool unique_origin = !slot.accesses.empty() &&
+            stack_access_sites_.push_back(accesses);
+            const bool unique_origin = !accesses.empty() &&
                 access != match->function->entry &&
-                std::all_of(slot.accesses.begin(), slot.accesses.end(), [&](Address site) {
+                std::all_of(accesses.begin(), accesses.end(), [&](Address site) {
                     return site != match->function->entry &&
                            stack_origin_counts[address_identity(site)] == 1 &&
                            variable_origin_counts[address_identity(site)] == 1;
