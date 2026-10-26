@@ -864,6 +864,24 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
             if (const auto *assign = std::get_if<Assign>(&instruction.statement); assign && assign->destination_version)
                 pointer_origins.emplace(PointerValueKey{key(assign->destination), *assign->destination_version},
                                         PointerOrigin{{key(assign->destination), *assign->destination_version}, 0});
+        // Call results and ABI-clobbered registers have opaque values, but they
+        // are still stable roots when copied or adjusted later. Giving each
+        // definition its own root enables bounded accesses through that value;
+        // stores through other roots continue to invalidate it because roots
+        // from calls are not assumed disjoint.
+        for (auto block_index : reachable) for (const auto &instruction : partitioned.blocks[block_index].instructions)
+            if (const auto *call = std::get_if<Call>(&instruction.statement)) {
+                if (call->return_register && call->return_version)
+                    pointer_origins.emplace(PointerValueKey{key(*call->return_register), *call->return_version},
+                        PointerOrigin{{key(*call->return_register), *call->return_version}, 0});
+                const auto count = std::min(call->register_writes.size(), call->register_output_versions.size());
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto reg = call->register_writes[i];
+                    const auto version = call->register_output_versions[i];
+                    pointer_origins.emplace(PointerValueKey{key(reg), version},
+                        PointerOrigin{{key(reg), version}, 0});
+                }
+            }
         bool provenance_changed = true;
         for (std::size_t iteration = 0; provenance_changed && iteration < 64; ++iteration) {
             provenance_changed = false;

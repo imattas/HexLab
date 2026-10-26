@@ -201,6 +201,7 @@ using ReferenceOperandKey = std::pair<std::uint64_t, std::uint32_t>;
 struct RegisterReferenceFacts {
     std::map<ReferenceOperandKey, Address> immediate_targets;
     std::map<ReferenceOperandKey, Address> memory_targets;
+    std::set<std::uint64_t> address_definitions;
     std::map<ReferenceOperandKey, std::vector<std::uint64_t>> producer_instruction_ids;
     std::map<ReferenceOperandKey, ReferenceProducerGraph> producer_graphs;
 };
@@ -1747,7 +1748,9 @@ RegisterReferenceFacts non_x86_producer_facts(
             // evaluator has already recognized. A single-source GPR operation
             // is also safe to retain as a causal producer: consumers still
             // require an independently resolved target from that evaluator.
-            bool address_definition = false;
+            bool address_definition = std::any_of(facts.begin(), facts.end(), [&](const auto *facts_for_arch) {
+                return facts_for_arch && facts_for_arch->address_definitions.contains(fact->id);
+            });
             for (std::size_t operand = 0; operand < instruction.operands.size(); ++operand)
                 if (std::holds_alternative<ImmediateOperand>(instruction.operands[operand]) &&
                     is_address_target(fact->id, operand)) {
@@ -2509,6 +2512,36 @@ RegisterReferenceFacts powerpc_reference_facts(const Image *image, const Relocat
                     registers[dst->index] = *target;
                     if (riscv_target_segment(*image, *target, OperandAccess::address))
                         result.immediate_targets[{fact->id, 2}] = *target;
+                }
+                propagated = true;
+            } else if ((instruction.opcode == Opcode::ppc_add || instruction.opcode == Opcode::ppc_add_dot ||
+                        instruction.opcode == Opcode::ppc_subf || instruction.opcode == Opcode::ppc_subf_dot) &&
+                       instruction.operands.size() == 3) {
+                const auto *dst = architecture_register(instruction, 0, RegisterBank::ppc_gpr, width);
+                const auto *left = architecture_register(instruction, 1, RegisterBank::ppc_gpr, width);
+                const auto *right = architecture_register(instruction, 2, RegisterBank::ppc_gpr, width);
+                std::optional<Address> target;
+                if (dst && dst->width == width && left && left->width == width &&
+                    right && right->width == width) {
+                    const auto lhs = registers.find(left->index);
+                    const auto rhs = registers.find(right->index);
+                    if (lhs != registers.end() && rhs != registers.end() &&
+                        lhs->second.space == instruction.address.space &&
+                        rhs->second.space == instruction.address.space) {
+                        const bool subtract = instruction.opcode == Opcode::ppc_subf ||
+                                              instruction.opcode == Opcode::ppc_subf_dot;
+                        // SUBF computes RB - RA. PowerPC integer arithmetic
+                        // wraps at the active GPR width.
+                        const auto value = subtract ? rhs->second.offset - lhs->second.offset :
+                                                      lhs->second.offset + rhs->second.offset;
+                        target = Address{instruction.address.space,
+                                         width == 32 ? value & UINT64_C(0xffffffff) : value};
+                    }
+                }
+                erase_written();
+                if (dst && target) {
+                    registers[dst->index] = *target;
+                    result.address_definitions.insert(fact->id);
                 }
                 propagated = true;
             } else if ((instruction.opcode == Opcode::ppc_ori || instruction.opcode == Opcode::ppc_oris) &&

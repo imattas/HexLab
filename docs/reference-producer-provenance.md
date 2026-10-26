@@ -43,10 +43,12 @@ The shared non-x86 producer pass also materializes a bounded dependency chain
 for resolved AArch64, A32/Thumb, MIPS32/MIPS64, and PPC32/PPC64 operands. Each
 reference keeps its exact source instruction and operand index, while the graph
 links that consumer to the latest validated register producer and follows the
-ordered producer IDs through their causal chain. This chain is limited to 32
-producer IDs and 128 edges. It describes instruction ancestry; it does not
-claim relocation-symbol detail or represent an immediate constant as a
-separate graph node. Relocation-backed references continue to use their
+ordered producer IDs through their causal chain. Proven PPC32/PPC64 register
+`ADD` and `SUBF` definitions now participate in this chain after their
+architecture-specific evaluator proves both inputs and the result. This chain
+is limited to 32 producer IDs and 128 edges. It describes instruction ancestry;
+it does not claim relocation-symbol detail or represent an immediate constant
+as a separate graph node. Relocation-backed references continue to use their
 existing format-specific provenance.
 
 The derived-analysis fingerprint advances again for this non-x86 graph
