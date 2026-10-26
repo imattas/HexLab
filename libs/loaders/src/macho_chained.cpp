@@ -1,13 +1,17 @@
 #include "macho_dyld_internal.hpp"
+#include "miniz_tinfl.h"
 #include <queue>
 #include <map>
 #include <tuple>
+#include <algorithm>
 namespace hexlab::macho_detail {
 namespace {
 constexpr std::uint32_t max_chained_imports = 1'000'000;
 constexpr std::uint32_t max_chained_pages = 65'535;
 constexpr std::size_t max_chained_symbol_bytes = 64 * 1024;
 constexpr std::size_t max_chained_symbol_pool_bytes = 16 * 1024 * 1024;
+constexpr std::size_t chained_inflate_input_window = 64 * 1024;
+constexpr std::size_t chained_inflate_output_window = 32 * 1024;
 void extent(std::span<const std::byte> bytes, std::uint64_t offset, std::uint64_t size) {
     require(offset <= bytes.size() && size <= bytes.size() - offset, "Mach-O chained field crosses payload boundary");
 }
@@ -15,6 +19,59 @@ std::int64_t signed_field(std::uint64_t value, unsigned bits) {
     if (bits < 64 && (value & (UINT64_C(1) << (bits - 1))))
         value |= UINT64_MAX << bits;
     return std::bit_cast<std::int64_t>(value);
+}
+std::vector<std::uint8_t> inflate_symbol_pool(std::span<const std::byte> input, Budget &budget,
+                                              std::stop_token stop) {
+    require(!input.empty(), "Mach-O chained zlib symbol pool is empty");
+    budget.include(max_chained_symbol_pool_bytes);
+    std::vector<std::uint8_t> output(max_chained_symbol_pool_bytes);
+    std::uint8_t empty_output = 0;
+    std::size_t input_offset = 0;
+    std::size_t output_offset = 0;
+    tinfl_decompressor decompressor;
+    tinfl_init(&decompressor);
+    constexpr auto base_flags = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_COMPUTE_ADLER32 |
+                                TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+    for (;;) {
+        canceled(stop);
+        const auto input_remaining = input.size() - input_offset;
+        const auto input_window = std::min(chained_inflate_input_window, input_remaining);
+        const bool more_input = input_window < input_remaining;
+        const auto output_remaining = output.size() - output_offset;
+        const auto output_window = std::min(chained_inflate_output_window, output_remaining);
+        auto *output_base = output.empty() ? &empty_output : output.data();
+        auto *output_next = output_base + output_offset;
+        std::size_t input_used = input_window;
+        std::size_t output_written = output_window;
+        const auto flags = base_flags | (more_input ? TINFL_FLAG_HAS_MORE_INPUT : 0);
+        const auto status = tinfl_decompress(&decompressor,
+            reinterpret_cast<const mz_uint8 *>(input.data()) + input_offset,
+            &input_used, output_base, output_next, &output_written, flags);
+        require(input_used <= input_window && output_written <= output_window,
+                "Mach-O chained zlib decoder returned invalid window counts");
+        input_offset += input_used;
+        require(output_written <= output.size() - output_offset,
+                "Mach-O chained symbol pool exceeds 16 MiB", ErrorCode::resource_limit);
+        output_offset += output_written;
+        if (status == TINFL_STATUS_DONE) {
+            require(input_offset == input.size(), "Mach-O chained zlib symbol pool has trailing bytes");
+            break;
+        }
+        if (status == TINFL_STATUS_HAS_MORE_OUTPUT) {
+            require(output_offset < output.size(), "Mach-O chained symbol pool exceeds 16 MiB",
+                    ErrorCode::resource_limit);
+            require(output_written != 0 || input_used != 0, "Mach-O chained zlib decoder made no progress");
+            continue;
+        }
+        if (status == TINFL_STATUS_NEEDS_MORE_INPUT) {
+            require((input_used != 0 || output_written != 0) && input_offset < input.size(),
+                    "Malformed or truncated Mach-O chained zlib symbol pool");
+            continue;
+        }
+        require(false, "Malformed or truncated Mach-O chained zlib symbol pool");
+    }
+    output.resize(output_offset);
+    return output;
 }
 std::pair<std::uint8_t, std::uint8_t> layout(std::uint16_t format) {
     switch (format) {
@@ -144,10 +201,22 @@ void read_chained(const Reader &reader, const Image &image, MachOMetadata &metad
                         : header.imports_format == 2 ? 8u
                         : header.imports_format == 3 ? 16u
                                                      : 0u;
-    if (!stride || header.symbols_format != 0)
+    if (!stride || header.symbols_format > 1)
         header.complete = false;
     extent(bytes, header.imports_offset, std::uint64_t(header.imports_count) * stride);
     header.imports_available = stride != 0;
+    std::vector<std::uint8_t> decompressed_symbols;
+    std::span<const std::uint8_t> symbols;
+    if (header.symbols_format == 0) {
+        symbols = {reinterpret_cast<const std::uint8_t *>(bytes.data() + header.symbols_offset),
+                   bytes.size() - header.symbols_offset};
+    } else if (header.symbols_format == 1) {
+        const auto compressed = bytes.subspan(header.symbols_offset);
+        decompressed_symbols = inflate_symbol_pool(compressed, budget, stop);
+        symbols = decompressed_symbols;
+    }
+    require(header.imports_count == 0 || !symbols.empty(),
+            "Mach-O chained imports reference an empty symbol pool");
     std::size_t symbol_pool_bytes = 0;
     for (std::uint32_t i = 0; stride && i < header.imports_count; ++i) {
         canceled(stop);
@@ -175,12 +244,12 @@ void read_chained(const Reader &reader, const Image &image, MachOMetadata &metad
         }
         if (row.library_ordinal < -3 || (stride == 16 && ((row.raw_info >> 17) & 0x7fff)))
             row.complete = false;
-        if (header.symbols_format == 0) {
-            const auto name = add(header.symbols_offset, row.name_offset);
-            require(name <= bytes.size(), "Mach-O chained symbol offset exceeds payload");
-            const auto available = std::min<std::uint64_t>(bytes.size() - name, max_chained_symbol_bytes + 1);
+        if (header.symbols_format <= 1 && !symbols.empty()) {
+            const auto name = std::uint64_t(row.name_offset);
+            require(name < symbols.size(), "Mach-O chained symbol offset exceeds symbol pool");
+            const auto available = std::min<std::uint64_t>(symbols.size() - name, max_chained_symbol_bytes + 1);
             std::uint64_t length = 0;
-            while (length < available && bytes[static_cast<std::size_t>(name + length)] != std::byte{0}) {
+            while (length < available && symbols[static_cast<std::size_t>(name + length)] != 0) {
                 canceled(stop);
                 ++length;
             }
@@ -190,9 +259,10 @@ void read_chained(const Reader &reader, const Image &image, MachOMetadata &metad
                     "Mach-O chained symbol pool exceeds 16 MiB", ErrorCode::resource_limit);
             budget.include(length);
             symbol_pool_bytes += static_cast<std::size_t>(length);
-            row.name = std::string(reinterpret_cast<const char *>(bytes.data() + name),
+            row.name = std::string(reinterpret_cast<const char *>(symbols.data() + name),
                                    static_cast<std::size_t>(length));
-            row.name_file_offset = FileOffset{absolute(name)};
+            if (header.symbols_format == 0)
+                row.name_file_offset = FileOffset{absolute(header.symbols_offset + name)};
         } else
             row.complete = false;
         header.complete = header.complete && row.complete;
