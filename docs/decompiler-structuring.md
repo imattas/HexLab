@@ -68,15 +68,23 @@ next sequential diamond. Joins without register phis are accepted as well;
 tracing cuts both arms at their first shared block rather than requiring a phi
 or another branch to mark the continuation. A child region has one entry from
 its header and cannot absorb blocks already owned by its parent. Nested or
-overlapping child conditionals, side entries, empty arms, extra latches,
-conditional continues, or ambiguous join shapes use the state-machine/goto
-fallback. A conditional child `break` is accepted when exactly one explicit
-branch edge targets that child's exit and the other edge continues the traced
-child-body chain. The break block must have no register phi, and the child
+overlapping child conditionals, side entries, empty arms, extra latches, or
+ambiguous join shapes use the state-machine/goto fallback. A conditional child
+`break` is accepted when exactly one explicit branch edge targets that child's
+exit and the other edge continues the traced child-body chain. The break block
+must have no register phi, and the child
 exit must have no register phi because values from the header and break edges
 are not yet merged. Resolved-edge and memory-phi completeness checks still
 apply. Breaks to other blocks, multiple or ambiguous continuations, and
-unrecognized side exits retain the fallback. A
+unrecognized side exits retain the fallback. A child-body conditional
+`continue` is also accepted when exactly one explicit branch edge targets the
+child header and the other edge advances the traced straight-line body chain.
+The header's register phis must contain exactly one preheader input and one
+input for every recognized continue edge and the ordinary latch edge; each
+back-edge copy is emitted immediately before its corresponding `continue` or
+the latch transfer. Conditional continues nested inside child diamonds,
+continue paths through side blocks, and other unrecognized back edges retain
+the fallback. A
 pre-tested parent loop can also
 contain a one-level conditional diamond when each arm is a disjoint, phi-free
 straight-line chain ending at the same continuation; one arm may be empty when

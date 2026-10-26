@@ -192,6 +192,7 @@ bool mips_branch_likely(Opcode opcode) {
     switch (opcode) {
     case Opcode::mips_beql: case Opcode::mips_bnel: case Opcode::mips_blezl:
     case Opcode::mips_bgtzl: case Opcode::mips_bltzl: case Opcode::mips_bgezl:
+    case Opcode::mips64_bltzall: case Opcode::mips64_bgezall:
     case Opcode::mips64_bc1tl: case Opcode::mips64_bc1fl:
         return true;
     default:
@@ -4705,6 +4706,13 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
                 Assign{*link, constant_expr(return_address, link->width)}});
                 }
             }
+            if (decoded.context.architecture == Architecture::mips64 &&
+                (decoded.opcode == Opcode::mips64_bltzal || decoded.opcode == Opcode::mips64_bgezal ||
+                 decoded.opcode == Opcode::mips64_bltzall || decoded.opcode == Opcode::mips64_bgezall)) {
+                const RegisterOperand link{RegisterBank::mips_gpr, 31, 64, false};
+                block.instructions.push_back({{decoded.address, fact->id},
+                    Assign{link, constant_expr(decoded.address.offset + 8, 64)}});
+            }
             // W-form arithmetic defines both the 32-bit W view and the
             // architecturally zero-extended 64-bit X view. The shared SSA key
             // includes width, so represent both definitions explicitly.
@@ -6255,10 +6263,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<const LiftedBlock *> body;
             std::vector<std::pair<std::string, std::string>> initial_phi_copies;
             std::vector<std::pair<std::string, std::string>> recurrent_phi_copies;
+            std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> backedge_phi_copies;
             std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> exit_phi_copies;
             bool condition_true_enters = true;
             std::vector<LoopConditionalBody> conditional_joins;
             std::vector<std::pair<const LiftedBlock *, bool>> conditional_breaks;
+            std::vector<std::pair<const LiftedBlock *, bool>> conditional_continues;
         };
         struct LoopSwitchArm {
             Address target{};
@@ -6978,6 +6988,32 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                 }
                                 const auto *inner_condition = terminal_conditional(*inner_current);
                                 if (inner_condition) {
+                                    // A direct conditional edge to this child
+                                    // header is a continue at the child depth.
+                                    // Trace only the other edge; its statements
+                                    // still execute before the ordinary latch.
+                                    const bool true_continue = inner_condition->true_target ==
+                                        std::optional<Address>{body->begin};
+                                    const bool false_continue = inner_condition->false_target ==
+                                        std::optional<Address>{body->begin};
+                                    if (true_continue != false_continue && inner_current->phis.empty()) {
+                                        const Address continuation_address = true_continue ?
+                                            *inner_condition->false_target : *inner_condition->true_target;
+                                        const auto *continuation = find_block(continuation_address);
+                                        if (continuation && continuation != body && continuation != candidate.exit &&
+                                            continuation != entry && continuation != header &&
+                                            !loop_body_ids.contains(continuation->id.value) &&
+                                            std::none_of(candidate.conditional_continues.begin(),
+                                                candidate.conditional_continues.end(), [&](const auto &previous) {
+                                                    return previous.first == inner_current;
+                                                })) {
+                                            candidate.body.push_back(inner_current);
+                                            inner_ids.insert(inner_current->id.value);
+                                            candidate.conditional_continues.emplace_back(inner_current, true_continue);
+                                            inner_current = continuation;
+                                            continue;
+                                        }
+                                    }
                                     // A conditional edge to the child exit is a
                                     // structured break only when its other edge
                                     // continues the one traced child-body chain.
@@ -7076,7 +7112,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                     return block->id == candidate.exit->id;
                                 });
                             if (candidate_valid && (!candidate.conditional_joins.empty() ||
-                                !candidate.conditional_breaks.empty())) {
+                                !candidate.conditional_breaks.empty() ||
+                                !candidate.conditional_continues.empty())) {
                                 // Arm ownership alone is insufficient if an outside
                                 // edge can enter another block of the child body.
                                 // The sole entry is the child header's body edge.
@@ -7107,25 +7144,43 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                 // exit has its failed header condition and any
                                 // explicitly recognized conditional-break edges.
                                 const bool has_latch_predecessor = header_predecessors.contains(inner_latch->id.value);
-                                header_predecessors.erase(inner_latch->id.value);
+                                std::set<std::uint64_t> child_backedges{inner_latch->id.value};
+                                for (const auto &[branch, _] : candidate.conditional_continues)
+                                    child_backedges.insert(branch->id.value);
+                                const bool has_all_backedges = std::all_of(child_backedges.begin(), child_backedges.end(),
+                                    [&](auto predecessor) { return header_predecessors.contains(predecessor); });
+                                for (const auto predecessor : child_backedges) header_predecessors.erase(predecessor);
                                 std::set<std::uint64_t> expected_exit_predecessors{body->id.value};
                                 for (const auto &[branch, _] : candidate.conditional_breaks)
                                     expected_exit_predecessors.insert(branch->id.value);
-                                if (!has_latch_predecessor || header_predecessors.size() != 1 ||
+                                if (!has_latch_predecessor || !has_all_backedges || header_predecessors.size() != 1 ||
                                     exit_predecessors != expected_exit_predecessors) candidate_valid = false;
                                 const auto preheader_id = header_predecessors.empty() ? 0 : *header_predecessors.begin();
                                 for (const auto &phi : body->phis) {
-                                    if (phi.inputs.size() != 2) { candidate_valid = false; break; }
+                                    if (phi.inputs.size() != child_backedges.size() + 1) { candidate_valid = false; break; }
                                     const auto initial = std::find_if(phi.inputs.begin(), phi.inputs.end(), [&](const auto &input) {
                                         return input.predecessor.value == preheader_id;
                                     });
-                                    const auto recurrent = std::find_if(phi.inputs.begin(), phi.inputs.end(), [&](const auto &input) {
-                                        return input.predecessor == inner_latch->id;
-                                    });
-                                    if (initial == phi.inputs.end() || recurrent == phi.inputs.end()) { candidate_valid = false; break; }
+                                    if (initial == phi.inputs.end()) { candidate_valid = false; break; }
                                     const auto destination = register_name(phi.destination, phi.version);
                                     candidate.initial_phi_copies.emplace_back(destination, register_name(phi.destination, initial->version));
-                                    candidate.recurrent_phi_copies.emplace_back(destination, register_name(phi.destination, recurrent->version));
+                                    std::set<std::uint64_t> seen_backedges;
+                                    for (const auto &input : phi.inputs) {
+                                        if (input.predecessor.value == preheader_id) continue;
+                                        if (!child_backedges.contains(input.predecessor.value) ||
+                                            !seen_backedges.insert(input.predecessor.value).second) {
+                                            candidate_valid = false;
+                                            break;
+                                        }
+                                        auto copy = std::make_pair(destination, register_name(phi.destination, input.version));
+                                        candidate.backedge_phi_copies[input.predecessor.value].push_back(copy);
+                                        if (input.predecessor == inner_latch->id)
+                                            candidate.recurrent_phi_copies.push_back(std::move(copy));
+                                    }
+                                    if (!candidate_valid || seen_backedges != child_backedges) {
+                                        candidate_valid = false;
+                                        break;
+                                    }
                                 }
                                 for (const auto &phi : candidate.exit->phis) {
                                     if (phi.inputs.size() != exit_predecessors.size()) {
@@ -7413,9 +7468,28 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                 << "            }\n";
                             continue;
                         }
+                        const auto conditional_continue = std::find_if(region.conditional_continues.begin(),
+                            region.conditional_continues.end(), [&](const auto &candidate) {
+                                return candidate.first == inner_block;
+                            });
+                        if (conditional_continue != region.conditional_continues.end()) {
+                            const auto *branch = terminal_conditional(*inner_block);
+                            if (!branch) return fallback("nested loop continue block has no valid branch");
+                            emit_block(*inner_block, 12, true);
+                            const auto condition = branch_condition_text(*branch);
+                            out << "            if (" << (conditional_continue->second ? condition :
+                                "!(" + condition + ")") << ") {\n";
+                            if (const auto copies = region.backedge_phi_copies.find(inner_block->id.value);
+                                copies != region.backedge_phi_copies.end())
+                                emit_parallel_copies(out, copies->second, 16);
+                            out << "                continue;\n            }\n";
+                            continue;
+                        }
                         emit_block(*inner_block, 12, true);
                     }
-                    emit_parallel_copies(out, region.recurrent_phi_copies, 12);
+                    if (const auto copies = region.backedge_phi_copies.find(region.body.back()->id.value);
+                        copies != region.backedge_phi_copies.end())
+                        emit_parallel_copies(out, copies->second, 12);
                     out << "        }\n";
                     continue;
                 }

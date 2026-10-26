@@ -77,7 +77,18 @@ std::vector<FunctionStackRecord> derive_stack_frames(
         if (unchanged) {
             frames.push_back(*cached->second);
         } else {
-            frames.push_back({function->id, take(analyze_stack_frame(*function, snapshot, stop))});
+            // Stack transfer only follows blocks owned by this function. Passing
+            // the whole recovered image here made a full analysis rescan every
+            // block once per function; build a bounded per-function view instead.
+            FunctionSnapshot function_view;
+            function_view.blocks.reserve(function->blocks.size());
+            for (const auto block_id : function->blocks) {
+                canceled(stop);
+                const auto block = current_blocks.find(block_id);
+                if (block != current_blocks.end())
+                    function_view.blocks.push_back(block->second);
+            }
+            frames.push_back({function->id, take(analyze_stack_frame(*function, function_view, stop))});
         }
     }
     return frames;

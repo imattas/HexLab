@@ -37,3 +37,14 @@ Check duplicate block emission/omission, arm-to-join predecessor validation,
 phi-copy simultaneity, join execution exactly once, latch reachability, loop
 header and child-exit phi behavior, and conservative fallback for a second
 conditional or any side exit.
+
+## Follow-up implementation note
+
+The formatter now also recognizes a conditional continue directly to the
+child header when the other edge advances the traced straight-line child-body
+chain. Child-header register phis must map exactly to the preheader, the
+ordinary latch, and every recognized conditional-continue predecessor. Each
+back-edge's copies are emitted immediately before its own transfer. Continue
+edges nested inside a child diamond or routed through side blocks remain
+unsupported and use the lossless fallback; this does not expand the one-diamond
+scope above.

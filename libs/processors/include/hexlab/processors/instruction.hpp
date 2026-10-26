@@ -391,7 +391,13 @@ enum class Opcode {
     a64_ccmp, a64_ccmn,
     // EVEX packed integer compare to opmask; append to retain serialized IDs.
     vpcmpb, vpcmpw, vpcmpd, vpcmpq,
-    vpcmpub, vpcmpuw, vpcmpud, vpcmpuq
+    vpcmpub, vpcmpuw, vpcmpud, vpcmpuq,
+    // MIPS64 integer extension coverage; append to preserve serialized IDs.
+    mips64_movz, mips64_movn, mips64_bltzal, mips64_bgezal,
+    mips64_bltzall, mips64_bgezall, mips64_ll, mips64_sc,
+    mips64_add, mips64_addu, mips64_sub, mips64_subu, mips64_slt, mips64_sltu,
+    mips64_sll, mips64_srl, mips64_sra, mips64_sllv, mips64_srlv, mips64_srav,
+    mips64_addi, mips64_addiu, mips64_slti, mips64_sltiu
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

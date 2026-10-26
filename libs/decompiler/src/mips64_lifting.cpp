@@ -267,6 +267,23 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
         return Branch{"mips-fcc" + std::to_string(instruction.condition), instruction.direct_target, {}, std::move(predicate)};
     }
 
+    if (op == Opcode::mips64_movz || op == Opcode::mips64_movn) {
+        if (items.size() != 3 || !destination || destination->bank != RegisterBank::mips_gpr)
+            return std::nullopt;
+        Intrinsic effect{op == Opcode::mips64_movz ? "mips64.movz" : "mips64.movn",
+                         {operand(items[0]), operand(items[1]), operand(items[2])}, IntrinsicMemoryEffect::none};
+        effect.register_writes = instruction.register_writes;
+        effect.result_type = integer(64);
+        return effect;
+    }
+    if (op == Opcode::mips64_sc && items.size() == 2) {
+        Intrinsic effect{"mips64.sc_reservation_conditional_store", {operand(items[0]), operand(items[1])},
+                         IntrinsicMemoryEffect::write};
+        effect.register_writes = instruction.register_writes;
+        effect.result_type = integer(64);
+        return effect;
+    }
+
     if (op == Opcode::mips64_dmult || op == Opcode::mips64_dmultu ||
         op == Opcode::mips64_ddiv || op == Opcode::mips64_ddivu) {
         const char *name = op == Opcode::mips64_dmult ? "mips64.dmult.s64" :
@@ -310,8 +327,10 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
             std::string relation;
             if (op == Opcode::mips_blez || op == Opcode::mips_blezl) relation = "sle";
             if (op == Opcode::mips_bgtz || op == Opcode::mips_bgtzl) relation = "sgt";
-            if (op == Opcode::mips_bltz || op == Opcode::mips_bltzl) relation = "slt";
-            if (op == Opcode::mips_bgez || op == Opcode::mips_bgezl) relation = "sge";
+            if (op == Opcode::mips_bltz || op == Opcode::mips_bltzl ||
+                op == Opcode::mips64_bltzal || op == Opcode::mips64_bltzall) relation = "slt";
+            if (op == Opcode::mips_bgez || op == Opcode::mips_bgezl ||
+                op == Opcode::mips64_bgezal || op == Opcode::mips64_bgezall) relation = "sge";
             if (!relation.empty())
                 predicate = std::make_shared<Expression>(Expression{{TypeKind::boolean, 1, false},
                     BinaryValue{std::move(relation), left, constant(0, 64)}});
@@ -341,6 +360,27 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
             return unary("sext", std::move(narrow), 64);
         };
         switch (op) {
+        case Opcode::mips64_add:
+            return intrinsic(instruction, "mips64.add_word_overflow", IntrinsicMemoryEffect::none);
+        case Opcode::mips64_sub:
+            return intrinsic(instruction, "mips64.sub_word_overflow", IntrinsicMemoryEffect::none);
+        case Opcode::mips64_addi:
+            return intrinsic(instruction, "mips64.addi_word_overflow", IntrinsicMemoryEffect::none);
+        case Opcode::mips64_addu: case Opcode::mips64_addiu:
+            if (src2) return assign(word_result("add", src1, src2));
+            break;
+        case Opcode::mips64_subu:
+            if (src2) return assign(word_result("sub", src1, src2));
+            break;
+        case Opcode::mips64_slt: case Opcode::mips64_sltu:
+        case Opcode::mips64_slti: case Opcode::mips64_sltiu:
+            if (src2) {
+                const bool unsigned_compare = op == Opcode::mips64_sltu || op == Opcode::mips64_sltiu;
+                auto predicate = std::make_shared<Expression>(Expression{{TypeKind::boolean, 1, false},
+                    BinaryValue{unsigned_compare ? "ult" : "slt", src1, src2}});
+                return assign(unary("zext", std::move(predicate), 64));
+            }
+            break;
         case Opcode::mips64_dadd:
             return intrinsic(instruction, "mips64_dadd_overflow", IntrinsicMemoryEffect::none);
         case Opcode::mips64_daddi:
@@ -415,12 +455,29 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
                 return assign(word_result(shift, src1, src2));
             }
             break;
+        case Opcode::mips64_sll: case Opcode::mips64_srl: case Opcode::mips64_sra:
+            if (src2) {
+                const auto *amount = std::get_if<ImmediateOperand>(&items[2]);
+                if (!amount) break;
+                const char *shift = op == Opcode::mips64_sll ? "shl" : op == Opcode::mips64_sra ? "sar" : "shr";
+                return assign(word_result(shift, src1, src2));
+            }
+            break;
         case Opcode::mips_sllv: case Opcode::mips_srlv: case Opcode::mips_srav:
             if (src2) {
                 const auto value = unary("trunc32", src1, 32);
                 const auto amount = binary("and", src2, constant(31, 64), 64);
                 const char *shift = op == Opcode::mips_sllv ? "shl" :
                                     op == Opcode::mips_srlv ? "shr" : "sar";
+                return assign(unary("sext", binary(shift, value, amount, 32), 64));
+            }
+            break;
+        case Opcode::mips64_sllv: case Opcode::mips64_srlv: case Opcode::mips64_srav:
+            if (src2) {
+                const auto value = unary("trunc32", src1, 32);
+                const auto amount = binary("and", src2, constant(31, 64), 64);
+                const char *shift = op == Opcode::mips64_sllv ? "shl" :
+                                    op == Opcode::mips64_srlv ? "shr" : "sar";
                 return assign(unary("sext", binary(shift, value, amount, 32), 64));
             }
             break;
@@ -431,6 +488,10 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
     if (!items.empty() && destination && destination->bank == RegisterBank::mips_gpr) {
         const bool load = op == Opcode::mips_lb || op == Opcode::mips_lh || op == Opcode::mips_lw ||
             op == Opcode::mips_lbu || op == Opcode::mips_lhu || op == Opcode::mips64_lwu || op == Opcode::mips64_ld;
+        if (op == Opcode::mips64_ll && items.size() >= 2) {
+            auto value = operand(items[1]);
+            return assign(unary("sext", std::move(value), 64));
+        }
         if (load && items.size() >= 2) {
             const auto value = operand(items[1]);
             if (value->type.bits == destination->width) return assign(value);
