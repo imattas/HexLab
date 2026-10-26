@@ -128,6 +128,22 @@ For an offline desktop build, obtain a complete wxWidgets checkout at the commit
 
 Linux and macOS headless presets and CI jobs exercise three compiler/configuration pairs: Clang Debug on Ubuntu 24.04 (`linux-headless`), GCC Release on Ubuntu 24.04 (`linux-gcc-headless-release`), and Apple Clang Debug on macOS 14 (`macos-headless`). Each configures without wxWidgets, builds the CLI and test targets, and runs every CTest registered by that preset; tests that require the pinned LLVM oracle executables remain disabled on these hosts. The CLI uses native entry points and strict UTF-8 argument decoding; paths are converted to each host's filesystem representation. Separate `linux-desktop` and `macos-desktop` presets build the complete Release distribution, including wxWidgets and CPack TGZ packaging, on their native CI runners. Linux CI installs the GTK/X11/Wayland development dependencies required by wxWidgets. These targets have not been run in this Windows development environment, so successful CI runs are the platform verification gate. Desktop runtime launch and interactive behavior remain unverified on Linux and macOS.
 
+For a native GCC Debug build without the test-only LLVM tools or GUI dependencies:
+
+```sh
+cmake -S . -B out/build/linux-gcc-debug \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+  -DHEXLAB_BUILD_DESKTOP=OFF -DBUILD_TESTING=OFF \
+  -DHEXLAB_ENABLE_PINNED_LLVM_ORACLES=OFF
+cmake --build out/build/linux-gcc-debug --target hexlab_cli --parallel 3
+```
+
+The Linux engine libraries are shared objects; vendored static Zydis, Zycore,
+and Capstone are compiled as position-independent code so they can be linked
+into those libraries. The desktop target additionally needs wxWidgets and its
+GTK/X11/Wayland development dependencies, which headless builds do not require.
+
 ## Current functionality
 
 The application loads explicit raw mappings, PE32/PE32+ and ELF32/ELF64, parses bounded metadata, traces original x86 scalar subsets and finds ASCII/UTF-16 candidates. Use `hexlab_cli inspect <path>`, `hexlab_cli disassemble <path>`, or `hexlab_cli decompile <path>`; `--help` documents format selection, raw options and budgets. `decompile` recovers functions through the shared analysis engine, lifts them to typed IR, applies conservative SSA simplification and prints structured pseudocode where supported, retaining explicit CFG output for unsupported shapes. Desktop File > Open detects PE and ELF; File > Open Raw requests a flat mapping or segmented profile. Both frontends preserve unsupported and incomplete states. CLI exit codes are 0 for a successful command, 1 for loading/unsupported analysis errors, 2 for argument errors and 3 for incomplete analysis. Metadata-only inspect can succeed with explicit metadata warnings.

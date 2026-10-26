@@ -2,6 +2,7 @@
 
 #include <charconv>
 #include <cctype>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <optional>
