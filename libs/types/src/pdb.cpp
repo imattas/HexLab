@@ -271,6 +271,14 @@ Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &database, std::stop_tok
                     else if (member==0x150f) { // LF_METHOD: overloaded method set.
                         f.value=r16(); f.type=r32(); f.name=read_name(at,limit);
                     }
+                    else if (member==0x150c) { // LF_FRIENDFCN: function type and friend name.
+                        require(r16() == 0, "CodeView LF_FRIENDFCN has nonzero reserved padding");
+                        f.type=r32(); f.name=read_name(at,limit);
+                    }
+                    else if (member==0x140a) { // LF_FRIENDCLS: friend class type.
+                        require(r16() == 0, "CodeView LF_FRIENDCLS has nonzero reserved padding");
+                        f.type=r32();
+                    }
                     else if (member==0x1511) { // LF_ONEMETHOD.
                         f.attributes=r16(); f.type=r32();
                         const auto property = (f.attributes >> 2) & 7;
@@ -282,6 +290,9 @@ Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &database, std::stop_tok
                     }
                     else if (member==0x1510) { // LF_NESTTYPE: nested type declaration.
                         (void)r16(); f.type=r32(); f.name=read_name(at,limit);
+                    }
+                    else if (member==0x1512) { // LF_NESTTYPEEX: nested type with access attributes.
+                        f.attributes=r16(); f.type=r32(); f.name=read_name(at,limit);
                     }
                     else if (member==0x1502) { f.attributes=r16(); f.value=numeric(at,limit); f.name=read_name(at,limit); }
                     else if (member==0x1404) { // LF_INDEX continuation
@@ -812,6 +823,12 @@ Result<PdbTypeGraph> resolve_pdb_type_graph(const PdbTypeStream &stream, std::st
                     }
                     else if (field.leaf == 0x1510)
                         add_reference(record.index, field.type, PdbTypeReferenceKind::nested_type);
+                    else if (field.leaf == 0x1512)
+                        add_reference(record.index, field.type, PdbTypeReferenceKind::nested_type);
+                    else if (field.leaf == 0x140a)
+                        add_reference(record.index, field.type, PdbTypeReferenceKind::friend_class);
+                    else if (field.leaf == 0x150c)
+                        add_reference(record.index, field.type, PdbTypeReferenceKind::friend_function);
                     else if (field.leaf == 0x150f)
                         add_reference(record.index, field.type, PdbTypeReferenceKind::method_list);
                     else if (field.leaf == 0x1511)

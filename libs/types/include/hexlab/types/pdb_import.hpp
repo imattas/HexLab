@@ -9,7 +9,7 @@
 
 namespace hexlab::types {
 
-enum class PdbAggregateDeclarationKind : std::uint8_t { static_data, nested_type, method, vftable_pointer };
+enum class PdbAggregateDeclarationKind : std::uint8_t { static_data, nested_type, method, vftable_pointer, friend_class, friend_function };
 enum class PdbVirtualDispatchKind : std::uint8_t { non_virtual, virtual_method, introducing_virtual, pure_virtual, pure_introducing_virtual, unknown };
 struct PdbAggregateDeclaration {
     std::uint8_t name_space = 0;

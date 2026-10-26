@@ -98,7 +98,7 @@ struct PdbIdStream {
     std::vector<CodeViewIdRecord> records;
 };
 
-enum class PdbTypeReferenceKind : std::uint8_t { pointee, array_element, array_index, member, enum_underlying, typedef_target, qualifier_base, field_list, field_list_continuation, bitfield_underlying, nested_type, base_class, virtual_base_class, virtual_base_pointer_type, function_result, function_argument_list, argument_type, method_type, method_list, member_function_class, member_function_this, class_vtable_shape, vftable_complete_class, vftable_overridden_table, class_derivation_list, vftable_pointer_type };
+enum class PdbTypeReferenceKind : std::uint8_t { pointee, array_element, array_index, member, enum_underlying, typedef_target, qualifier_base, field_list, field_list_continuation, bitfield_underlying, nested_type, base_class, virtual_base_class, virtual_base_pointer_type, function_result, function_argument_list, argument_type, method_type, method_list, member_function_class, member_function_this, class_vtable_shape, vftable_complete_class, vftable_overridden_table, class_derivation_list, vftable_pointer_type, friend_class, friend_function };
 struct PdbTypeReference {
     std::uint32_t source_index = 0, target_index = 0;
     PdbTypeReferenceKind kind = PdbTypeReferenceKind::member;

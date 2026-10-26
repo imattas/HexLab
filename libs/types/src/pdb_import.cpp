@@ -694,6 +694,8 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             declaration.name = kind == PdbAggregateDeclarationKind::vftable_pointer
                 ? "implicit vfptr" : field.name;
             declaration.type = type.value();
+            if (kind == PdbAggregateDeclarationKind::friend_class && declaration.name.empty())
+                declaration.name = type.value()->name();
             declaration.attributes = attributes;
             switch (attributes & 3) {
             case 1: declaration.access = MemberAccess::private_; break;
@@ -760,10 +762,31 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             return true;
         };
         for (const auto &field : node.expanded_fields) {
-            if (field.leaf == 0x150e || field.leaf == 0x1510 || field.leaf == 0x1511 || field.leaf == 0x1409) {
+            if (field.leaf == 0x150e || field.leaf == 0x1510 || field.leaf == 0x1512 ||
+                field.leaf == 0x1511 || field.leaf == 0x1409 || field.leaf == 0x140a ||
+                field.leaf == 0x150c) {
+                if (field.leaf == 0x140a || field.leaf == 0x150c) {
+                    const auto encoded_namespace = static_cast<std::uint8_t>(field.type >> 24);
+                    const auto target_namespace = encoded_namespace ? encoded_namespace : node.name_space;
+                    const auto target = nodes.find({target_namespace, field.type & 0x00ffffffu});
+                    const bool class_type = target != nodes.end() &&
+                        (target->second->record.kind == CodeViewTypeKind::structure ||
+                         target->second->record.kind == CodeViewTypeKind::class_type ||
+                         target->second->record.kind == CodeViewTypeKind::union_type);
+                    const bool function_type = target != nodes.end() &&
+                        (target->second->record.kind == CodeViewTypeKind::procedure ||
+                         target->second->record.kind == CodeViewTypeKind::member_function);
+                    if ((field.leaf == 0x140a && !class_type) ||
+                        (field.leaf == 0x150c && !function_type)) {
+                        ++result.skipped_unsupported;
+                        continue;
+                    }
+                }
                 const auto kind = field.leaf == 0x150e ? PdbAggregateDeclarationKind::static_data :
-                    field.leaf == 0x1510 ? PdbAggregateDeclarationKind::nested_type :
+                    (field.leaf == 0x1510 || field.leaf == 0x1512) ? PdbAggregateDeclarationKind::nested_type :
                     field.leaf == 0x1409 ? PdbAggregateDeclarationKind::vftable_pointer :
+                    field.leaf == 0x140a ? PdbAggregateDeclarationKind::friend_class :
+                    field.leaf == 0x150c ? PdbAggregateDeclarationKind::friend_function :
                                           PdbAggregateDeclarationKind::method;
                 const auto status = append(kind, field, field.type, field.attributes,
                     kind == PdbAggregateDeclarationKind::method &&
