@@ -266,7 +266,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     };
     for (std::size_t n=0;n<code.size();++n) {
         const auto op=std::to_integer<std::uint8_t>(code[n]->instruction.bytes[0]);
-        if (op==2||op==3||op==4||op==5||op==0x0b) { boundaries.insert(n); boundaries.insert(n+1); }
+        if (op==2||op==3||op==4||op==5||op==0x0b||op==0x00) { boundaries.insert(n); boundaries.insert(n+1); }
         if (op==0x0c||op==0x0d||op==0x0e) { boundaries.insert(n); boundaries.insert(n+1); }
         for (std::size_t li=0;li<labels.size();++li) if (labels[li].opener<n&&n<labels[li].end) active_labels[n].push_back(li);
         std::sort(active_labels[n].begin(),active_labels[n].end(),[&](auto a,auto b){return labels[a].opener<labels[b].opener;});
@@ -335,7 +335,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             if(op==1||op==5)continue;
             if(op==0x0b){if(end_label[n]){if(!end_shapes[*end_label[n]]||*end_shapes[*end_label[n]]!=stack)return unsupported("block end has an incompatible operand stack");}else if(stack.size()>1)return unsupported("function end has extra stack values");continue;}
             if(op==0x0f){if(stack.size()>1)return unsupported("return has extra operand stack values");continue;}
-            if(op==0x00)return unsupported("unreachable trap semantics");
+            if(op==0x00)break;
             if(op==0x1a){auto v=shape_pop(stack,{});if(!v)return v.error();continue;}
             if(op==0x1b){auto c=shape_pop(stack,integer(32));if(!c)return c.error();auto a=shape_pop(stack,{});if(!a)return a.error();auto b=shape_pop(stack,a.value());if(!b)return b.error();stack.push_back(a.value());continue;}
             if(op==0x0c||op==0x0d){if(op==0x0d){auto c=shape_pop(stack,integer(32));if(!c)return c.error();}continue;}
@@ -396,6 +396,15 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         const BlockId id{static_cast<std::uint64_t>(bi+1)};
         LiftedBlock lifted{id,code[begin]->instruction.address,{},{}};
         for(const auto &edge:successors[bi]){const auto target_addr=code[starts[edge.target]]->instruction.address;lifted.successors.push_back({code[last]->instruction.address,target_addr,BlockId{static_cast<std::uint64_t>(edge.target+1)},edge.kind});}
+        for(std::size_t n=begin;n<finish;++n){
+            const auto op=std::to_integer<std::uint8_t>(code[n]->instruction.bytes[0]);
+            const bool integer_division_or_remainder=(op>=0x6d&&op<=0x70)||(op>=0x7f&&op<=0x82);
+            if(op==0x00)
+                lifted.trap_edges.push_back({code[n]->instruction.address,TrapEdgeKind::unconditional,"unreachable"});
+            else if(integer_division_or_remainder)
+                lifted.trap_edges.push_back({code[n]->instruction.address,TrapEdgeKind::may_trap,code[n]->instruction.mnemonic_override});
+            if(op==0x00)break;
+        }
         for(std::size_t slot=0;slot<phi_versions[bi].size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};LiftedBlock::Phi phi{reg,phi_versions[bi][slot],{}};for(const auto pred:predecessors[bi]){if(slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor has no stack value for join"};phi.inputs.push_back({BlockId{static_cast<std::uint64_t>(pred+1)},output_versions[pred][slot]});}lifted.phis.push_back(std::move(phi));}
         Stack stack;
         if(!predecessors[bi].empty())for(std::size_t slot=0;slot<entries[bi]->size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};if(predecessors[bi].size()>1)stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,phi_versions[bi][slot]}}));else{const auto pred=predecessors[bi].front();if(slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack value is unavailable"};stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,output_versions[pred][slot]}}));}}
@@ -403,7 +412,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         auto emit=[&](std::size_t n,Statement statement){const auto *fact=code[n];lifted.instructions.push_back({{fact->instruction.address,fact->id},std::move(statement)});};
         for(std::size_t n=begin;n<finish;++n){const auto *fact=code[n];const auto &i=fact->instruction;const auto op=std::to_integer<std::uint8_t>(i.bytes[0]);
             if(op==0x41||op==0x42||op==0x43||op==0x44){auto v=immediate(i);if(!v)return unsupported("constant immediate unavailable");stack.push_back(constant(*v,op==0x41?integer(32):op==0x42?integer(64):op==0x43?floating(32):floating(64)));continue;}
-            if(op==0x00)return unsupported("unreachable trap semantics");
+            if(op==0x00){emit(n,Intrinsic{"wasm_unreachable",{},IntrinsicMemoryEffect::none});break;}
             if(op==0x01)continue;
             if(op==2||op==3){continue;}
             if(op==4){auto cond=pop(integer(32));if(!cond)return cond.error();const auto li=*opener_label[n];const auto yes=code[n+1]->instruction.address;const auto target=labels[li].else_index<code.size()?labels[li].else_index+1:labels[li].end+1;emit(n,Branch{"wasm_if",yes,code[target]->instruction.address,cond.value()});continue;}
