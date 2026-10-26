@@ -54,6 +54,15 @@ bool address_less(Address left, Address right) {
     return left.offset < right.offset;
 }
 
+wxString severity_text(DiagnosticSeverity severity) {
+    switch (severity) {
+    case DiagnosticSeverity::info: return "Info";
+    case DiagnosticSeverity::warning: return "Warning";
+    case DiagnosticSeverity::error: return "Error";
+    }
+    return "Diagnostic";
+}
+
 wxString tsv_field(wxString value) {
     value.Replace("\\", "\\\\");
     value.Replace("\t", "\\t");
@@ -72,6 +81,7 @@ AnalysisIssuesView::AnalysisIssuesView(wxWindow *parent) : wxPanel(parent) {
     filter_->Append("Function stops");
     filter_->Append("Candidates");
     filter_->Append("Overlaps");
+    filter_->Append("Loader diagnostics");
     filter_->SetSelection(0);
     search_ = new wxTextCtrl(this, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
     search_->SetName("analysis-issues-search");
@@ -212,19 +222,21 @@ void AnalysisIssuesView::update(std::optional<DocumentId> document, std::shared_
             const auto found = preferences_.find(document_->value);
             if (found != preferences_.end()) preference = found->second;
         }
-        filter_->SetSelection(std::clamp(preference.filter, 0, 3));
+        filter_->SetSelection(std::clamp(preference.filter, 0, 4));
         search_->ChangeValue(preference.query);
         scope_entry_ = preference.function;
         selection_key_ = std::move(preference.selected);
         scope_error_.clear();
     }
     const auto *incoming = project && project->functions ? project->functions.get() : nullptr;
-    const bool same_source = !changed_document && source_ == incoming;
+    const auto *incoming_loader = project && project->loaded ? project->loaded.get() : nullptr;
+    const bool same_source = !changed_document && source_ == incoming && loader_source_ == incoming_loader;
     const bool same_project = project_ == project;
     project_ = std::move(project);
     cursor_ = cursor;
     if (!same_source) {
         source_ = incoming;
+        loader_source_ = incoming_loader;
         scope_error_.clear();
         rebuild_scope();
         rebuild();
@@ -309,7 +321,7 @@ bool AnalysisIssuesView::scope_contains(Address address) const {
 bool AnalysisIssuesView::matches_scope(const Row &row) const {
     if (!scope_entry_) return true;
     if (!scope_available_) return false;
-    return row.function_entry == scope_entry_ || scope_contains(row.address) ||
+    return row.function_entry == scope_entry_ || (row.address && scope_contains(*row.address)) ||
            (row.related && scope_contains(*row.related));
 }
 
@@ -388,6 +400,7 @@ wxString AnalysisIssuesView::kind_text(Kind kind) const {
     case Kind::candidate: return "Entry candidate";
     case Kind::overlap: return "Conflict";
     case Kind::incomplete_function: return "Incomplete function";
+    case Kind::loader_diagnostic: return "Loader diagnostic";
     }
     return "Finding";
 }
@@ -395,65 +408,94 @@ wxString AnalysisIssuesView::kind_text(Kind kind) const {
 void AnalysisIssuesView::rebuild() {
     rows_.clear();
     capped_ = false;
-    if (!project_ || !project_->functions) {
+    if (!project_) {
         render();
         return;
     }
 
-    const auto &snapshot = *project_->functions;
-    auto add = [this](Row row) {
-        if (rows_.size() >= max_rows) {
-            capped_ = true;
+    const auto *snapshot = project_->functions.get();
+    const auto *loaded = project_->loaded.get();
+    const auto diagnostic_count = loaded
+        ? std::min(max_loader_rows, loaded->diagnostics.size()) +
+              std::min(max_loader_rows, loaded->runtime_relocation_diagnostics.size())
+        : 0;
+    const auto diagnostic_budget = std::min(max_loader_rows, diagnostic_count);
+    const auto function_row_limit = max_rows - diagnostic_budget;
+    bool function_capped = false;
+    auto add_function = [this, &function_capped, function_row_limit](Row row) {
+        if (rows_.size() >= function_row_limit) {
+            function_capped = true;
             return false;
         }
         rows_.push_back(std::move(row));
         return true;
     };
 
-    const auto function_count = std::min(snapshot.functions.size(), max_functions_scanned);
-    for (std::size_t index = 0; index < function_count && !capped_; ++index) {
-        const auto &function = snapshot.functions[index];
+    const auto function_count = snapshot ? std::min(snapshot->functions.size(), max_functions_scanned) : 0;
+    for (std::size_t index = 0; index < function_count && !function_capped; ++index) {
+        const auto &function = snapshot->functions[index];
         if (!function)
             continue;
         if (!function->complete &&
-            !add({Kind::incomplete_function, function->entry, {}, function->entry,
+            !add_function({Kind::incomplete_function, function->entry, {}, function->entry,
                   "Function recovery did not reach a complete boundary."}))
             break;
         for (const auto &stop : function->stops) {
             if (ordinary_stop(stop.reason))
                 continue;
-            if (!add({Kind::function_stop, stop.address, function->entry, function->entry,
+            if (!add_function({Kind::function_stop, stop.address, function->entry, function->entry,
                       stop_name(stop.reason) + (stop.detail.empty() ? wxString{} : ": " + text(stop.detail))}))
                 break;
         }
     }
-    if (snapshot.functions.size() > function_count)
-        capped_ = true;
+    if (snapshot && snapshot->functions.size() > function_count)
+        function_capped = true;
 
-    for (const auto &conflict : snapshot.conflicts) {
-        if (capped_)
+    if (snapshot) for (const auto &conflict : snapshot->conflicts) {
+        if (function_capped)
             break;
         const auto kind = conflict.kind == FunctionConflictKind::instruction_overlap
                               ? "Instruction overlap" : "Decision overlap";
-        if (!add({Kind::overlap, conflict.first, conflict.second, {},
+        if (!add_function({Kind::overlap, conflict.first, conflict.second, {},
                   text(kind) + (conflict.detail.empty() ? wxString{} : ": " + text(conflict.detail))}))
             break;
     }
-    for (const auto &candidate : snapshot.candidates) {
-        if (capped_)
+    if (snapshot) for (const auto &candidate : snapshot->candidates) {
+        if (function_capped)
             break;
         auto detail = stop_name(candidate.reason);
         if (!candidate.detail.empty())
             detail += ": " + text(candidate.detail);
         if (candidate.source)
             detail += " (from " + location_text(*candidate.source, project_->loaded ? project_->loaded->image.get() : nullptr) + ")";
-        if (!add({Kind::candidate, candidate.entry, candidate.source, candidate.entry, std::move(detail)}))
+        if (!add_function({Kind::candidate, candidate.entry, candidate.source, candidate.entry, std::move(detail)}))
             break;
     }
 
+    std::size_t diagnostic_rows = 0;
+    auto add_diagnostics = [&](const std::vector<Diagnostic> &diagnostics, std::string_view source) {
+        for (const auto &diagnostic : diagnostics) {
+            if (diagnostic_rows >= diagnostic_budget) break;
+            wxString detail = text(source) + " " + severity_text(diagnostic.severity) + ": " +
+                              preview_text(diagnostic.message, 4096);
+            if (rows_.size() >= max_rows) break;
+            rows_.push_back({Kind::loader_diagnostic, diagnostic.location, {}, {}, std::move(detail)});
+            ++diagnostic_rows;
+        }
+    };
+    if (loaded) {
+        add_diagnostics(loaded->diagnostics, "Loader");
+        add_diagnostics(loaded->runtime_relocation_diagnostics, "Runtime relocation");
+    }
+    capped_ = function_capped || diagnostic_rows < diagnostic_count;
+
     std::stable_sort(rows_.begin(), rows_.end(), [](const Row &left, const Row &right) {
-        if (address_less(left.address, right.address)) return true;
-        if (address_less(right.address, left.address)) return false;
+        if (left.address && right.address) {
+            if (address_less(*left.address, *right.address)) return true;
+            if (address_less(*right.address, *left.address)) return false;
+        } else if (left.address != right.address) {
+            return !left.address;
+        }
         return static_cast<int>(left.kind) < static_cast<int>(right.kind);
     });
     render();
@@ -464,7 +506,7 @@ wxString AnalysisIssuesView::cell(std::size_t row, int column) const {
     const auto *image = project_ && project_->loaded ? project_->loaded->image.get() : nullptr;
     switch (column) {
     case 0: return kind_text(item.kind);
-    case 1: return location_text(item.address, image);
+    case 1: return item.address ? location_text(*item.address, image) : wxString{};
     case 2: return item.related ? location_text(*item.related, image) : wxString{};
     case 3: return item.function_entry ? location_text(*item.function_entry, image) : wxString{};
     default: {
@@ -543,8 +585,12 @@ void AnalysisIssuesView::render() {
             continue;
         if (selected_filter == 3 && kind != Kind::overlap)
             continue;
+        if (selected_filter == 4 && kind != Kind::loader_diagnostic)
+            continue;
         if (!query.empty()) {
-            wxString aggregate = kind_text(kind) + " " + location_text(rows_[index].address) + " " +
+            wxString aggregate = kind_text(kind) + " " +
+                                 (rows_[index].address ? location_text(*rows_[index].address)
+                                                       : wxString("not location-specific")) + " " +
                                  (rows_[index].related ? location_text(Location{*rows_[index].related}) : wxString{}) + " " +
                                  (rows_[index].function_entry ? location_text(Location{*rows_[index].function_entry}) : wxString{}) + " " +
                                  rows_[index].detail;
@@ -568,7 +614,7 @@ void AnalysisIssuesView::render() {
     table_->activate = [this](std::size_t row) { activate_row(row); };
     update_selection();
     update_scope_context();
-    if (!project_ || !project_->functions) {
+    if (!project_ || (!project_->functions && rows_.empty())) {
         status_->SetLabel("No derived function analysis is available for this document.");
     } else {
         wxString status = wxString::Format("%llu findings shown",
@@ -577,8 +623,8 @@ void AnalysisIssuesView::render() {
             status += wxString::Format(" of %llu", static_cast<unsigned long long>(rows_.size()));
         if (scope_entry_) status += "; pinned function scope";
         if (capped_)
-            status += "; view bounded to 20,000 findings and 100,000 functions";
-        if (!project_->functions->complete)
+            status += "; view bounded to 20,000 findings (at most 2,048 loader diagnostics) and 100,000 functions";
+        if (project_->functions && !project_->functions->complete)
             status += "; function analysis is incomplete";
         if (project_->status == DerivedStatus::incomplete)
             status += "; analysis is partial";
@@ -586,6 +632,10 @@ void AnalysisIssuesView::render() {
             status += "; analysis is pending";
         if (!project_->reason.empty())
             status += "; " + preview_text(project_->reason, 180);
+        if (scope_entry_ && std::any_of(rows_.begin(), rows_.end(), [](const Row &row) {
+                return row.kind == Kind::loader_diagnostic && !row.address;
+            }))
+            status += "; unlocated loader diagnostics are hidden by function scope";
         status_->SetLabel(status);
     }
     export_->Enable(!visible_rows_.empty());
@@ -600,7 +650,7 @@ void AnalysisIssuesView::activate_row(std::size_t visible) {
     update_selection();
     remember_preference();
     // Navigation can synchronously publish another snapshot and rebuild rows.
-    if (navigate) navigate(Location{destination});
+    if (destination && navigate) navigate(Location{*destination});
 }
 
 void AnalysisIssuesView::step(bool forward) {
@@ -617,7 +667,8 @@ void AnalysisIssuesView::step(bool forward) {
 
 wxString AnalysisIssuesView::finding_text(const Row &row) const {
     const auto *image = project_ && project_->loaded ? project_->loaded->image.get() : nullptr;
-    wxString report = kind_text(row.kind) + "\nAddress: " + location_text(row.address, image);
+    wxString report = kind_text(row.kind) + "\nAddress: " +
+                      (row.address ? location_text(*row.address, image) : wxString("not location-specific"));
     if (row.related) report += "\nRelated: " + location_text(*row.related, image);
     if (row.function_entry) {
         report += "\nFunction: " + location_text(*row.function_entry, image);
@@ -656,7 +707,8 @@ void AnalysisIssuesView::update_selection() {
         return;
     }
     const auto *image = project_ && project_->loaded ? project_->loaded->image.get() : nullptr;
-    wxString detail = kind_text(row->kind) + " at " + location_text(row->address, image) + ": " + row->detail;
+    wxString detail = kind_text(row->kind) + " at " +
+                      (row->address ? location_text(*row->address, image) : wxString("no address")) + ": " + row->detail;
     const auto position = selected ? *selected + 1 : 0;
     selection_detail_->SetLabel(wxString::Format("%llu / %llu: ", static_cast<unsigned long long>(position),
         static_cast<unsigned long long>(visible_rows_.size())) + kind_text(row->kind));

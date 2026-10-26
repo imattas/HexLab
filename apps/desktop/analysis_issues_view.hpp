@@ -23,10 +23,10 @@ class AnalysisIssuesView final : public wxPanel {
     std::function<void(Location)> navigate;
 
   private:
-    enum class Kind { function_stop, candidate, overlap, incomplete_function };
+    enum class Kind { function_stop, candidate, overlap, incomplete_function, loader_diagnostic };
     struct Row {
         Kind kind;
-        Address address;
+        std::optional<Address> address;
         std::optional<Address> related;
         std::optional<Address> function_entry;
         wxString detail;
@@ -41,6 +41,7 @@ class AnalysisIssuesView final : public wxPanel {
     struct ScopeRange { Address begin; std::uint64_t size; };
 
     static constexpr std::size_t max_rows = 20000;
+    static constexpr std::size_t max_loader_rows = 2048;
     static constexpr std::size_t max_functions_scanned = 100000;
     static constexpr std::size_t max_chunks_scanned = 100000;
 
@@ -61,6 +62,7 @@ class AnalysisIssuesView final : public wxPanel {
     VirtualTable *table_ = nullptr;
     std::shared_ptr<const ProjectSnapshot> project_;
     const FunctionSnapshot *source_ = nullptr;
+    const LoadedImage *loader_source_ = nullptr;
     std::vector<Row> rows_;
     std::vector<std::size_t> visible_rows_;
     bool capped_ = false;
