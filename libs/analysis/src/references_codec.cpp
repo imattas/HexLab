@@ -433,6 +433,26 @@ void validate_reg(const RegisterOperand &value) {
         require(value.index < limit && value.width == 32 && !value.high_byte, "Invalid MIPS register expression");
         return;
     }
+    if (value.bank == RegisterBank::ppc_gpr || value.bank == RegisterBank::ppc_fpr) {
+        require(value.index < 32 && (value.width == 32 || value.width == 64) && !value.high_byte,
+                "Invalid PowerPC scalar register expression");
+        return;
+    }
+    if (value.bank == RegisterBank::ppc_cr) {
+        require(!value.high_byte && ((value.width == 4 && value.index < 8) ||
+                (value.width == 32 && value.index == 0)), "Invalid PowerPC condition register expression");
+        return;
+    }
+    if (value.bank == RegisterBank::ppc_lr || value.bank == RegisterBank::ppc_ctr) {
+        require(value.index == 0 && (value.width == 32 || value.width == 64) && !value.high_byte,
+                "Invalid PowerPC control register expression");
+        return;
+    }
+    if (value.bank == RegisterBank::ppc_xer || value.bank == RegisterBank::ppc_fpscr) {
+        require(value.index == 0 && value.width == 32 && !value.high_byte,
+                "Invalid PowerPC status register expression");
+        return;
+    }
     if (value.bank >= RegisterBank::arm32_gpr && value.bank <= RegisterBank::arm_flags) {
         const bool general =
             value.bank == RegisterBank::arm64_gpr && value.index < 31 && (value.width == 32 || value.width == 64);
@@ -938,7 +958,7 @@ Result<std::vector<std::byte>> encode_reference_index(const ReferenceIndex &inde
         using namespace reference_detail;
         canceled(stop);
         Writer out;
-        out.number(13, 1);
+        out.number(14, 1);
         out.number(0, 1);
         out.number(index.key() ? 1 : 0, 1);
         if (index.key())
@@ -969,7 +989,7 @@ Result<std::shared_ptr<const ReferenceIndex>> decode_reference_index(std::span<c
         in.payload_version = static_cast<unsigned>(in.number(1));
         require((in.payload_version == 7 || in.payload_version == 8 || in.payload_version == 9 ||
                  in.payload_version == 10 || in.payload_version == 11 || in.payload_version == 12 ||
-                 in.payload_version == 13) && in.number(1) == 0,
+                 in.payload_version == 13 || in.payload_version == 14) && in.number(1) == 0,
                 "Unknown reference payload version");
         std::optional<AnalysisKey> key;
         if (in.flag())

@@ -64,6 +64,15 @@ ExpressionPtr ppc_compare_cr_field(ExpressionPtr left, ExpressionPtr right, bool
     auto eq = predicate("eq", std::move(left), std::move(right));
     return pack_ppc_cr_field(std::move(lt), std::move(gt), std::move(eq), ppc_xer_so());
 }
+ExpressionPtr ppc_compare_fp_field(ExpressionPtr left, ExpressionPtr right) {
+    // PPC floating compares write LT, GT, EQ, and unordered into the selected
+    // four-bit CR field. Keep ordered predicates distinct from NaN handling.
+    auto lt = predicate("ppc_fcmp_lt", left, right);
+    auto gt = predicate("ppc_fcmp_gt", left, right);
+    auto eq = predicate("ppc_fcmp_eq", left, right);
+    auto un = predicate("ppc_fcmp_unordered", std::move(left), std::move(right));
+    return pack_ppc_cr_field(std::move(lt), std::move(gt), std::move(eq), std::move(un));
+}
 ExpressionPtr ppc_record_cr0(ExpressionPtr result, std::uint16_t bits) {
     const auto zero = constant(0, bits);
     auto lt = predicate("slt", result, zero);
@@ -227,6 +236,40 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         if (i.opcode == Opcode::ppc_lfs || i.opcode == Opcode::ppc_lfd)
             return Assign{*dst, std::move(address)};
         return Store{std::move(address), reg(*dst)};
+    }
+    if ((i.opcode == Opcode::ppc_fcmpu || i.opcode == Opcode::ppc_fcmpo) && ops.size() == 3) {
+        const auto *field = std::get_if<R>(&ops[0]);
+        const auto *left = std::get_if<R>(&ops[1]);
+        const auto *right = std::get_if<R>(&ops[2]);
+        if (!field || field->bank != RegisterBank::ppc_cr || field->width != 4 || field->index >= 8 ||
+            !left || left->bank != RegisterBank::ppc_fpr || left->width != 64 ||
+            !right || right->bank != RegisterBank::ppc_fpr || right->width != 64 ||
+            i.register_writes != std::vector<R>{*field, {RegisterBank::ppc_fpscr, 0, 32, false}})
+            return effect(i, "ppc_malformed_fp_compare");
+        auto compare = ppc_compare_fp_field(reg(*left), reg(*right));
+        auto fpscr = std::make_shared<Expression>(Expression{integer(32),
+            UnknownValue{i.opcode == Opcode::ppc_fcmpo ? "ppc_fpscr_after_fcmpo" : "ppc_fpscr_after_fcmpu"}});
+        return effect_with_outputs(i, i.opcode == Opcode::ppc_fcmpo ? "ppc_fcmpo" : "ppc_fcmpu",
+                                   {std::move(compare), std::move(fpscr)});
+    }
+    if ((i.opcode == Opcode::ppc_fmr || i.opcode == Opcode::ppc_fneg ||
+         i.opcode == Opcode::ppc_fabs || i.opcode == Opcode::ppc_frsp) && ops.size() == 2 && dst &&
+        dst->bank == RegisterBank::ppc_fpr) {
+        const auto *source = std::get_if<R>(&ops[1]);
+        if (!source || source->bank != RegisterBank::ppc_fpr || source->width != 64 || dst->width != 64)
+            return effect(i, "ppc_malformed_fp_unary");
+        auto input = reg(*source);
+        ExpressionPtr result;
+        if (i.opcode == Opcode::ppc_fmr) result = std::move(input);
+        else if (i.opcode == Opcode::ppc_fneg)
+            result = std::make_shared<Expression>(Expression{floating(64), UnaryValue{"-", std::move(input)}});
+        else if (i.opcode == Opcode::ppc_fabs)
+            result = std::make_shared<Expression>(Expression{floating(64), UnaryValue{"fabs", std::move(input)}});
+        else
+            result = std::make_shared<Expression>(Expression{floating(64), UnaryValue{"ppc_frsp_to_f64", std::move(input)}});
+        if (i.opcode != Opcode::ppc_frsp) return Assign{*dst, std::move(result)};
+        auto fpscr = std::make_shared<Expression>(Expression{integer(32), UnknownValue{"ppc_fpscr_after_frsp"}});
+        return effect_with_outputs(i, "ppc_frsp", {std::move(result), std::move(fpscr)});
     }
     if (ops.size() == 3 && dst && dst->bank == RegisterBank::ppc_fpr &&
         (i.opcode == Opcode::ppc_fadds || i.opcode == Opcode::ppc_fsubs ||

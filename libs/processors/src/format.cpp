@@ -116,6 +116,8 @@ std::string register_name(const RegisterOperand &r) {
         return r.index == 0 && (r.width == 32 || r.width == 64) ? "ctr" : "?ppc-ctr";
     if (r.bank == RegisterBank::ppc_xer)
         return r.index == 0 && r.width == 32 ? "xer" : "?ppc-xer";
+    if (r.bank == RegisterBank::ppc_fpscr)
+        return r.index == 0 && r.width == 32 ? "fpscr" : "?ppc-fpscr";
     if (r.bank == RegisterBank::mips_hilo)
         return r.index == 0 && (r.width == 32 || r.width == 64) ? "hi" : r.index == 1 && (r.width == 32 || r.width == 64) ? "lo" : "?mips-hilo";
     if (r.bank == RegisterBank::mips_cp0) {
@@ -340,6 +342,12 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::ppc_fsub: return "fsub";
     case Opcode::ppc_fmul: return "fmul";
     case Opcode::ppc_fdiv: return "fdiv";
+    case Opcode::ppc_fcmpu: return "fcmpu";
+    case Opcode::ppc_fcmpo: return "fcmpo";
+    case Opcode::ppc_fmr: return "fmr";
+    case Opcode::ppc_fneg: return "fneg";
+    case Opcode::ppc_fabs: return "fabs";
+    case Opcode::ppc_frsp: return "frsp";
     case Opcode::vpaddb: return "vpaddb";
     case Opcode::vpaddw: return "vpaddw";
     case Opcode::vpaddsb: return "vpaddsb";
