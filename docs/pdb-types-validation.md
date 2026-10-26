@@ -68,6 +68,45 @@ Source review covered numeric sign handling, record boundaries, qualified types,
 base kind/namespace selection, pointer-width arithmetic, persistence validation,
 and fixed-layout rejection. No tests were added or run for this hardening slice.
 
+## Non-virtual interface bases
+
+`LF_BINTERFACE` (`0x151a`) is decoded as a fixed-offset base entry in an
+`LF_FIELDLIST`, using the same attributes/type-index/numeric-offset layout as
+`LF_BCLASS`. This supports interface inheritance in PDBs that use
+`LF_INTERFACE` aggregate records: the base and supported declarations following
+it are retained instead of ending field-list decoding at that leaf. For example,
+an `IDerived` record with an `IBase` entry at offset zero imports a
+`$base$IBase` member at zero, followed by its ordinary supported fields.
+That member uses the existing aggregate type representation and type-library
+codec, so it participates in persisted size validation and layout without a
+new storage version.
+
+The parsed field retains its original `LF_BINTERFACE` leaf, attributes, type
+index, and base byte offset; the enclosing TPI field-list record's byte offset
+and size remain available on the graph node. Graph construction emits a
+`base_class` reference; continuation expansion and root/nested type-server
+selector remapping preserve it through the same bounded paths as `LF_BCLASS`.
+Selector zero resolves inside the owning PDB's TPI namespace. Import resolves
+the exact namespaced target and its canonical definition rather than looking up
+a base by displayed name; existing unique-name collision handling still applies.
+
+Truncated attributes, type indices, and numeric leaves fail parsing. Negative
+signed interface-base offsets are malformed (`CodeView offset/index must be
+nonnegative`); unsupported numeric encodings retain the existing unsupported
+numeric-leaf diagnostic. Import skips a dependent aggregate and increments
+`skipped_unsupported` for missing or unnamed bases, non-class/structure targets,
+unions containing bases, incomplete base storage, duplicate generated member
+names, or base extents outside the aggregate. No placeholder zero-sized base is
+invented. The source attributes and interface-specific leaf remain inspection
+provenance in the PDB graph; the persisted member records fixed layout, not an
+interface-specific access-control or dispatch model. Virtual interface dispatch,
+runtime vftable resolution, and other unknown field-list leaves are unchanged.
+
+Format evidence: [Microsoft CodeView definitions](https://github.com/microsoft/microsoft-pdb/blob/master/include/cvinfo.h)
+alias `lfBInterface` to `lfBClass`; [LLVM BaseClassRecord](https://llvm.org/docs/doxygen/TypeRecord_8h_source.html)
+handles both leaves with the same base record. Validation for this slice is a
+Debug `hexlab_types` compile and source review; no tests were added or run.
+
 ## PDB pointer records
 
 The TPI reader decodes `LF_POINTER`'s referent index and packed attributes,
