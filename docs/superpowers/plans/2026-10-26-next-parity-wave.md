@@ -44,7 +44,7 @@ Root reviews workstream scope, failure behavior, and source/API compatibility be
 
 ## Progress
 
-- [x] Task 1 implementation and source review; `cmake -S . -B $env:TEMP/hexlab-cpp-partial-specializations-debug -G "Visual Studio 17 2022" -A x64 -DHEXLAB_BUILD_DESKTOP=OFF -DBUILD_TESTING=OFF` and `cmake --build $env:TEMP/hexlab-cpp-partial-specializations-debug --config Debug --target hexlab_types --parallel 3` passed (MSVC 19.44; no tests run).
+- [x] Task 1 implementation and source review; matching uses componentwise dominance and fixed template names use normal name resolution plus primary signature validation. `cmake --build $env:TEMP/hexlab-cpp-partial-specializations-debug --config Debug --target hexlab_types --parallel 3` passed (MSVC 19.44; no tests run).
 - [x] Task 2 audit: x86/x64 four-slot execution and write/access watchpoints were already implemented; platform docs and ledger now describe lifecycle behavior and read-only watchpoint limits. Debug `hexlab_debugger` and desktop-components builds passed; no tests/runtime validation.
 - [ ] Task 3 implementation, review, and loader/decompiler/CLI Debug builds.
 - [ ] Integrated source review, capability-ledger update, final builds, and push.

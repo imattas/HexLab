@@ -88,8 +88,12 @@ specializations, explicit alias-template specializations, forward-declared
 templates, and nested class-template definitions are unsupported. Type
 specialization patterns outside `T`, `T*`, `const T*`, and fixed types are also
 unsupported.
-Ambiguous partial-specialization matches fail rather than choosing by
-declaration order. Template argument and parameter counts are capped at 32;
+Partial-specialization patterns are compared per primary argument; a candidate
+must be at least as strong for every argument and strictly stronger for one to
+be preferred. Incomparable or equivalent matches fail as ambiguous. Fixed
+template-template names use normal namespace, using-directive, and inline-
+namespace resolution and must match the primary parameter's nested shape.
+Template argument and parameter counts are capped at 32;
 recursive alias expansion and template instantiation obey the configured parser
 nesting bound. Unsupported syntax returns an explicit error.
 
