@@ -112,6 +112,24 @@ struct X87RoundToIntegralResult {
 HEXLAB_PROCESSORS_EXPORT std::optional<X87RoundToIntegralResult>
 evaluate_x87_round_to_integral(const X87RoundToIntegralRequest &request) noexcept;
 
+struct X87MultiplyRequest {
+    X87Binary80 left, right;
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+};
+struct X87ArithmeticResult {
+    std::optional<X87Binary80> value;
+    std::uint16_t status_word = 0;
+    bool completed = true;
+    bool overflow = false;
+    bool precision = false;
+    bool operator==(const X87ArithmeticResult &) const = default;
+};
+// Evaluate finite binary80 FMUL operands with x87 precision control and RC.
+// Special operands/encodings not yet covered fail closed.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
+evaluate_x87_multiply(const X87MultiplyRequest &request) noexcept;
+
 enum class X87UnaryArithmetic : std::uint8_t { change_sign, absolute };
 struct X87UnaryResult {
     X87Binary80 value;

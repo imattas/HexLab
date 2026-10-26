@@ -350,6 +350,13 @@ bool classify_sysv_part(const types::Type &type, std::uint64_t base,
     }
     const auto size = value.size().value_or(0);
     if (value.kind() == types::Kind::floating) {
+        // The SysV AMD64 post-merge cleanup sends any aggregate containing
+        // X87/X87UP classes through memory. Binary80 has that class pair, so
+        // the aggregate is memory-class even when its object fits in 16 bytes.
+        if (size == 10) {
+            std::fill(classes.begin(), classes.end(), SysvClass::memory);
+            return true;
+        }
         if (size != 4 && size != 8) { reason = "aggregate contains an unsupported floating format"; return false; }
         merge_class(classes, base, size, SysvClass::sse);
         return true;

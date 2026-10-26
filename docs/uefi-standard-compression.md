@@ -25,9 +25,14 @@ work, and output bytes. Exceeding a limit leaves that section opaque. The
 outer parser still caps input at 512 MiB, section count at one million, and
 nested section depth at eight.
 
-Only EFI standard compression type `1` is supported. Tiano custom compression
-in GUID-defined sections, unknown compression types, compressed payload
-execution, PE/TE image loading, and extraction to disk remain unsupported.
+The PI specification defines only `EFI_NOT_COMPRESSED` (0) and
+`EFI_STANDARD_COMPRESSION` (1) for this section. HexLab also accepts the legacy
+Tiano LZHUF variant as compression type `2` in an `EFI_SECTION_COMPRESSION`
+section. It uses the same bounded decoder with Tiano's five-bit position
+alphabet and is an implementation compatibility extension, not a PI-defined
+compression type. Tiano/custom compression carried in GUID-defined sections,
+unknown compression types, compressed payload execution, PE/TE image loading,
+and extraction to disk remain unsupported.
 
 The decoder structure is adapted from TianoCore EDK II
 `BaseTools/Source/C/Common/Decompress.c` (Intel copyright, BSD-2-Clause-Patent).
@@ -35,3 +40,6 @@ The license text is retained in
 [`libs/firmware/EDK2-LICENSE.txt`](../libs/firmware/EDK2-LICENSE.txt).
 Format details follow the [UEFI PI Specification 1.9, Firmware Storage
 Formats](https://uefi.org/sites/default/files/resources/UEFI_PI_Spec_Final_Draft_1.9.pdf).
+The PI specification's compression-type values are also listed in
+[TianoCore's section definitions](https://github.com/tianocore/edk2/blob/master/MdePkg/Include/Pi/PiFirmwareFile.h); the Tiano type-2 compatibility decoder is based on the distinct
+[Tiano compression routine](https://github.com/tianocore/edk2/blob/master/BaseTools/Source/C/TianoCompress/TianoCompress.c).

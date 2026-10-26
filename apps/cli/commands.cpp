@@ -288,7 +288,7 @@ void usage(std::ostream &out) {
            "       hexlab_cli archive open <archive> --member <index> --project <project.hxproj> [--replace]\n\n"
            "       hexlab_cli jar list <package.jar>\n"
            "       hexlab_cli jar inspect <package.jar> --member <index>\n\n"
-           "       hexlab_cli firmware inspect <path> --format ihex|srec|uefi\n\n"
+           "       hexlab_cli firmware inspect <path> --format ihex|srec|uefi|uefi-capsule\n\n"
            "Input options:\n  --format auto|pe|elf|raw|macho|wasm|dex|jvm\n"
            "  --pe-runtime arm64|x64-compatible  (select an ARM64X PE process view)\n"
            "  --slice <index>  (Mach-O universal slice; zero-based, auto or macho format)\n"
@@ -716,11 +716,13 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
 }
 int firmware_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
     if (args.size() == 2 && args[1] == L"--help") {
-        out << "Usage: hexlab_cli firmware inspect <path> --format ihex|srec|uefi\n";
+        out << "Usage: hexlab_cli firmware inspect <path> --format ihex|srec|uefi|uefi-capsule\n";
         return 0;
     }
     if (args.size() == 4 && args[0] == L"inspect" && args[2] == L"--format" && args[3] == L"uefi")
         return run_uefi_firmware_cli(args, out, err);
+    if (args.size() == 4 && args[0] == L"inspect" && args[2] == L"--format" && args[3] == L"uefi-capsule")
+        return run_uefi_capsule_cli(args, out, err);
     try {
         if (args.size() != 4 || args[0] != L"inspect" || args[2] != L"--format")
             argument_error("firmware inspect requires a path and --format ihex|srec");
