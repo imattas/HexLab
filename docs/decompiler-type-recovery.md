@@ -427,5 +427,12 @@ two-to-four member HFAs through v0-v3 when the classifier's floating-register
 locations match each homogeneous element's exact size and contiguous object
 offset. The lifter's call writes must include every result register before
 those component types are propagated. This path is prototype-driven and never
-guesses aggregate returns from observed register widths. AAPCS64 X8
-hidden-result buffers remain unmodeled.
+guesses aggregate returns from observed register widths. For SysV AMD64 and
+AAPCS64, explicit function prototypes with a complete structure or array result
+classified as indirect also model the hidden result pointer. The classifier's
+single exact register location (RDI for SysV AMD64 or X8 for AAPCS64) is used to
+type the callee's incoming buffer pointer and, for known direct-call prototypes,
+the caller's matching register input as a pointer to the declared result layout.
+The call result type is retained as prototype metadata; the pass does not infer
+stores through the buffer as a materialized aggregate value. Incomplete or
+ambiguous layouts, missing register snapshots, and other ABIs remain unresolved.
