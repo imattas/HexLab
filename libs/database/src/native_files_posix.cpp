@@ -1,4 +1,5 @@
 #include "project_internal.hpp"
+#include "native_files.hpp"
 #include "testing.hpp"
 #include <cerrno>
 #include <fcntl.h>
