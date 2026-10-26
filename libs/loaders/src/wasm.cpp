@@ -1378,6 +1378,7 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
     loaded.diagnostics.insert(loaded.diagnostics.end(), wasm_diagnostics.begin(), wasm_diagnostics.end());
     auto read = loaded.metadata_reads.include({0}, bytes.size());
     if (!read) return read.error();
+    loaded.metadata_reads_complete = true;
     return loaded;
     } catch (const std::bad_alloc &) {
         return Error{ErrorCode::resource_limit, "Cannot allocate WebAssembly parser state"};

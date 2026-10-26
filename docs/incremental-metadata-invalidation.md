@@ -17,6 +17,17 @@ the supplied patch ranges avoid the known metadata reads. The refreshed parse
 feeds a full analysis, so a formerly missing root or relocation cannot remain
 silently attached to the old metadata snapshot.
 
+Metadata enumeration and byte-read tracking are separate guarantees. A loader
+sets `metadata_reads_complete` only when its `metadata_reads` set covers every
+dependency on the primary input; the default is uncertified. If that proof is
+absent, any effective-byte edit reparses the loader and forces a full derived
+rebuild, even when the known ranges do not intersect the changed bytes. This
+prevents an omitted read from being missed when the omitted byte change happens
+to leave the old mapping and metadata values unchanged. Loaders that track all
+reads at `ByteStorage` or conservatively record the whole input can certify the
+set. `metadata_complete` continues to describe semantic coverage of returned
+metadata and does not imply that read tracking is complete.
+
 When metadata is complete and the recipe and mapping are unchanged, the
 project worker compares effective bytes within the union of old and new patch
 extents. Those extents cover the complete diff between immutable project input
@@ -45,16 +56,14 @@ old scan was retained, refreshed by domain, or rescanned because its prior scan
 was incomplete. A changed source identity, recipe, mapping, or unverified byte
 diff does not qualify for this reuse.
 
-Loader reads are tracked at the `ByteStorage` boundary, so the range set is the
-merged set of exact file extents actually consumed while building a mapping or
-metadata. The minidump loader now uses this tracking boundary too; its scattered
-stream and captured-memory records therefore invalidate the mapping when an
-overlapping effective byte changes. Loaders that cannot claim complete
-interpretation must keep `metadata_complete` false, which forces reparsing and
-a full derived rebuild after any effective-byte edit. A tracking set proves
-which bytes were read, while `metadata_complete` certifies that the loader's
-supported dependency surface is complete; loader-specific validation is still
-needed to justify that flag.
+Tracked loader reads use the `ByteStorage` boundary, so the range set is the
+merged set of exact file extents consumed while building a mapping or metadata.
+The minidump loader uses this boundary too; its scattered stream and captured
+memory records invalidate the mapping when an overlapping effective byte
+changes. A tracking set records which bytes were read, while
+`metadata_reads_complete` states whether that list is exhaustive and
+`metadata_complete` states whether the supported metadata was fully interpreted.
+Each guarantee is independent and requires loader-specific validation.
 
 Workspace byte revisions are monotonic project revisions, not content hashes.
 For patch edits, the workspace compares the old and new effective bytes inside

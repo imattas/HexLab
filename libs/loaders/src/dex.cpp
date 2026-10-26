@@ -878,7 +878,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
     LoadedImage loaded;loaded.image=std::move(image.value());loaded.metadata.format="Dalvik DEX (035-040)";loaded.metadata.image_size=file_size;loaded.metadata_complete=false;
     loaded.metadata.dex = std::move(dex_metadata);
     loaded.diagnostics.push_back({DiagnosticSeverity::info,"DEX methods are mapped to method-relative address spaces; checksum/signature validation and full verifier semantics are not implemented",{}});
-    auto read=loaded.metadata_reads.include({0},file_size);if(!read)return read.error();return loaded;
+    auto read=loaded.metadata_reads.include({0},file_size);if(!read)return read.error();loaded.metadata_reads_complete=true;return loaded;
 }
 }
 

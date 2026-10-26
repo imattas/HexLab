@@ -565,6 +565,7 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
         if (!image) return image.error();
         loaded.image = std::move(image.value());
         loaded.metadata_reads = tracking.value()->reads();
+        loaded.metadata_reads_complete = true;
         if (minidump.streams.empty())
             return Error{ErrorCode::malformed, "Minidump has no stream directory entries"};
         if (!minidump.diagnostics.empty()) {

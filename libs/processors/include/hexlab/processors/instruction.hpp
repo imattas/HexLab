@@ -440,7 +440,9 @@ enum class Opcode {
     // RVV unary square-root and IEEE class mask; appended for ID stability.
     rv_vfsqrt_v, rv_vfclass_v,
     // EVEX packed floating compare-to-opmask forms; append to preserve IDs.
-    vcmpps, vcmppd
+    vcmpps, vcmppd,
+    // RVV reciprocal estimate intrinsics; append to preserve cached IDs.
+    rv_vfrsqrt7_v, rv_vfrec7_v
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
