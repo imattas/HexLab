@@ -297,10 +297,23 @@ void validate_pointer_bits(const MachODyldChainedOrigin &v) {
         else
             require(p.high8 == ((raw >> 34) & 0xff) && !p.diversity && !p.address_diversity && !p.key,
                     "Owned unauthenticated shared-cache pointer differs from original word");
+    } else if (format == 14) {
+        require(p.field_size == 8 && p.stride == 4 && !p.bind && !p.target_is_offset && !p.high8 &&
+                    p.target == (raw & UINT32_MAX) && p.next == ((raw >> 51) & 0xfff) &&
+                    p.authenticated == bool(raw >> 63) && !p.complete,
+                "Owned ARM64e segmented pointer differs from original word");
+        if (p.authenticated)
+            require(p.diversity == ((raw >> 32) & 0xffff) &&
+                        p.address_diversity == bool((raw >> 48) & 1) && p.key == ((raw >> 49) & 3),
+                    "Owned authenticated segmented pointer differs from original word");
+        else
+            require(!p.diversity && !p.address_diversity && !p.key,
+                    "Owned unauthenticated segmented pointer has authentication fields");
     } else {
-        require(format == 1 || format == 7 || format == 9 || format == 12,
+        require(format == 1 || format == 7 || format == 9 || format == 10 || format == 12,
                 "Unknown owned chained pointer layout");
-        require(p.field_size == 8 && p.stride == (format == 7 ? 4 : 8) && p.bind == bool((raw >> 62) & 1) &&
+        require(p.field_size == 8 && p.stride == (format == 7 || format == 10 ? 4 : 8) &&
+                    p.bind == bool((raw >> 62) & 1) &&
                     p.authenticated == bool(raw >> 63) && p.next == ((raw >> 51) & 0x7ff),
                 "Owned ARM64e flags differ from original word");
         if (p.authenticated)
@@ -318,7 +331,7 @@ void validate_pointer_bits(const MachODyldChainedOrigin &v) {
                     "Owned authenticated target differs from original word");
         else
             require(p.target == (raw & UINT64_C(0x7ffffffffff)) && p.high8 == ((raw >> 43) & 0xff) &&
-                        p.target_is_offset == (format != 1),
+                        p.target_is_offset == (format != 1 && format != 10),
                     "Owned ARM64e target differs from original word");
     }
     if (!p.bind)

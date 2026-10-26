@@ -67,10 +67,18 @@ of the first four positions as one shared GPR/XMM choice, stops at the first
 unobserved position, and continues into stack slots only after that prefix.
 Conflicting GPR and XMM evidence for one position suppresses the candidate.
 System V AMD64 can infer a contiguous register prefix when only one register
-class is observed. When both GPR and SSE classes are observed, their independent
-allocation does not reveal source parameter order, so the pass leaves the
-candidate prototype unresolved. This does not infer vector ABI classes,
-variadic promotions, or aggregate classification.
+class is observed. Stack reads are retained as typed unresolved input evidence,
+including alongside register evidence, because the ABI can place individual
+arguments directly on the stack while other register classes remain available.
+The evidence records offset, width, and any recoverable candidate type, but no
+parameter ordinal; mixed register/stack or GPR/SSE use therefore leaves the
+candidate prototype unresolved. Call-site inference does not use this exception.
+This follows the boundary described in Ghidra's [SysV stack-parameter analysis](https://github.com/NationalSecurityAgency/ghidra/issues/9478):
+a direct stack assignment rule affects active callee input recovery, while
+call-site stack inference remains conservative. HexLab retains unplaced type
+evidence instead of inferring an ordinal from that rule alone.
+This does not infer vector ABI classes, variadic promotions, or aggregate
+classifications.
 
 Signed integer `slt` comparisons in instruction expressions and recovered switch
 selectors add signedness evidence to direct register
@@ -230,8 +238,12 @@ overload snapshots register arguments and each configured stack-base register;
 known scalar, pointer, floating, and typed-vector return values get a new SSA
 definition at the call. Register and stack-passed argument types are propagated
 through a bounded fixed point. Stack arguments require a unique reaching store
-in the same basic block as an exact direct call, a supported callee ABI slot,
-and a stack address resolved through constant stack-pointer adjustments. The
+before an exact direct call, a supported callee ABI slot, and a stack address
+resolved through constant stack-pointer adjustments. The bounded backward CFG
+search requires every path to reach the same exact SSA register value at a
+full-width store to that slot. Calls, unknown memory writes, partial overlaps,
+missing definitions, cycles, or disagreement between paths stop propagation.
+The search is capped at 4,096 visited blocks and instructions per call. The
 caller and callee may have different register-file maps for this stack-only
 path when their stack-base register operand and pointer width are identical;
 register arguments still require a shared register file. The scan
@@ -239,11 +251,18 @@ rejects unknown memory clobbers, overlapping stores, and source values without
 a recovered type. All known non-recursive call sites for a parameter must
 agree; an unknown recursive edge waits for a concrete seed from the same call
 component. This avoids inventing a type when independent callers disagree.
+
+The call, stack-alias, exact-width, and overlap stops follow the conservative
+shape of Ghidra's [`ActionStackPtrFlow::repair`](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc),
+which traces across a block boundary only when there is a single predecessor.
+HexLab uses its own C++ analysis and extends that path rule to joins only when
+every predecessor proves the same exact SSA source value; cycles and partial
+or conflicting evidence stay unresolved.
 Indirect calls and cross-register-file register arguments are not propagated.
 Stack arguments can cross that boundary only when caller and callee use the
 same register operand for the stack base and the same pointer width; the callee
 slot offset and caller's explicit call-stack adjustment must resolve to a
-unique same-block store. Return values remain gated by the register-file map,
+unanimous exact reaching store. Return values remain gated by the register-file map,
 and aggregate return conventions without a modeled result location are not
 propagated. Register arguments from a known callee prototype can now constrain
 the caller's matching SSA value when no conflicting local type evidence exists;
@@ -267,7 +286,7 @@ establish a confirmed source declaration.
 
 Stack-passed pointer-to-structure shapes also flow from callers into an
 unprototyped callee. The existing ABI slot map, matching pointer width, exact
-same-block reaching store, and unanimous compatible caller types must prove
+all-path reaching store, and unanimous compatible caller types must prove
 the argument first. The callee must load that exact nonoverlapping entry-relative
 slot at pointer width into a full-width register. Only loads that still observe
 incoming memory (whole-memory version zero or a proven slot partition at version
@@ -301,7 +320,9 @@ are inferred only when a configured slot is read through a statically
 traceable constant stack-pointer alias, and the ordered ABI map must provide
 every preceding slot before one can be included. Dynamic stack allocation,
 stack realignment, register save/restore conventions, and red zones are not
-modeled. `AbiDescription::call_stack_adjustment` accounts for implicit call
+modeled. SysV direct-stack evidence is local to the active callee analysis and
+does not become an ordered signature or a call-site argument slot.
+`AbiDescription::call_stack_adjustment` accounts for implicit call
 stack shifts: x64 uses 8 bytes for the return address and AArch64 uses 0 for
 its link-register call. Custom ABIs default to 0 and must set this value when
 their call mechanics shift the stack. Call clobbers for other conventions and

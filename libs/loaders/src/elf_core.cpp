@@ -300,6 +300,8 @@ void read_core_notes(ElfMetadata &metadata, Budget &budget, std::stop_token stop
     }
     for (const auto &note : metadata.notes) {
         canceled(stop);
+        if (!note.program)
+            continue;
         if (!linux_core_note(note))
             continue;
         if (note.type == nt_prpsinfo)

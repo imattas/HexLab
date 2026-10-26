@@ -10,9 +10,17 @@ REL allocated sections retain separate section address domains. EXEC/DYN use
 declared PT_LOAD virtual addresses, initialized file backing and zero-filled BSS.
 Original bytes are never relocated in place. Symbol and relocation namespaces,
 REL/RELA addends, dynamic strings and supported hash bounds retain their source.
-PT_NOTE records retain their program index, file offset, type, name and raw
-description bytes; malformed extents and incomplete note headers are rejected
-within the bounded metadata budget. ELF32/ELF64 tests include GNU build IDs.
+PT_NOTE and PT_GNU_PROPERTY records retain program/file provenance, note type,
+name and raw description bytes; SHT_NOTE views are included for relocatable
+objects and deduplicated by exact note file offset. GNU property type 5 entries
+are decoded with ELF-class alignment and target byte order. Every property's
+type, raw payload and source offsets survive, including unknown types; exact
+four-byte values are also exposed as integers. The CLI identifies x86
+FEATURE_1_AND IBT/SHSTK bits and AArch64 FEATURE_1_AND BTI/PAC/GCS bits while
+showing unknown bits and bounded raw prefixes. These are file compatibility
+claims, not proof that instructions or the runtime actually enforce them.
+Malformed extents and incomplete property headers are rejected within the
+bounded metadata budget. Existing ELF32/ELF64 fixtures include GNU build IDs.
 PT_LOAD access flags retain their ELF meaning during image normalization: PF_X,
 PF_W and PF_R independently set executable, writable and readable permissions.
 The ELF image tests exercise all eight combinations for ELF32/ELF64 in both byte

@@ -1408,6 +1408,30 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         const auto byte_wrap = [&](ExpressionPtr value) {
             return binary("and", std::move(value), constant_expr(0xff, 8));
         };
+        const auto placed_flag = [&](ExpressionPtr predicate, unsigned bit) -> ExpressionPtr {
+            auto value = std::make_shared<Expression>(Expression{integer_type(8),
+                UnaryValue{"zext", std::move(predicate)}});
+            return bit == 0 ? value : binary("shl", std::move(value), constant_expr(bit, 8));
+        };
+        const auto status_with_flags = [&](ExpressionPtr before, std::uint8_t updated_mask,
+                                           std::vector<ExpressionPtr> bits) -> ExpressionPtr {
+            ExpressionPtr packed = constant_expr(0, 8);
+            for (auto &bit : bits) packed = binary("or", std::move(packed), std::move(bit));
+            return binary("or", binary("and", std::move(before),
+                constant_expr(static_cast<std::uint8_t>(~updated_mask), 8)), std::move(packed));
+        };
+        const auto nz_flags = [&](ExpressionPtr result, ExpressionPtr before,
+                                  std::optional<ExpressionPtr> carry = std::nullopt) -> ExpressionPtr {
+            std::vector<ExpressionPtr> bits{
+                placed_flag(boolean_binary("eq", result, constant_expr(0, 8)), 1),
+                placed_flag(boolean_binary("bit_extract", result, constant_expr(7, 8)), 7)};
+            std::uint8_t mask = 0x82;
+            if (carry) {
+                bits.push_back(placed_flag(std::move(*carry), 0));
+                mask |= 0x01;
+            }
+            return status_with_flags(std::move(before), mask, std::move(bits));
+        };
         if (instruction.opcode == Opcode::m6502_rts) {
             auto target = std::make_shared<Expression>(Expression{integer_type(16), UnknownValue{
                 "RTS pulls low then high return-address bytes from $0100 | ((S+1)&$ff), wraps S within page $01, and adds one"}});
@@ -1687,21 +1711,50 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         if ((op == Opcode::m6502_asl || op == Opcode::m6502_lsr ||
              op == Opcode::m6502_rol || op == Opcode::m6502_ror) && !operands.empty()) {
             const auto *target = std::get_if<RegisterOperand>(&instruction.operands.front());
-            std::vector<ExpressionPtr> inputs{operands.front(), status_value};
-            std::vector<RegisterOperand> outputs{status};
-            const auto memory_effect = is_memory(instruction.operands.front())
-                ? IntrinsicMemoryEffect::unknown : IntrinsicMemoryEffect::none;
-            if (target && target->bank == RegisterBank::mos6502 && target->index == 0)
-                outputs.insert(outputs.begin(), accumulator);
-            const auto name = op == Opcode::m6502_asl ? "m6502_asl" :
-                              op == Opcode::m6502_lsr ? "m6502_lsr" :
-                              op == Opcode::m6502_rol ? "m6502_rol" : "m6502_ror";
-            return opaque(name, std::move(inputs), std::move(outputs), memory_effect);
+            const auto input = operands.front();
+            const bool accumulator_target = target && target->bank == RegisterBank::mos6502 && target->index == 0;
+            const bool memory_target = is_memory(instruction.operands.front());
+            if (!accumulator_target && !memory_target)
+                return opaque(op == Opcode::m6502_asl ? "m6502_asl" : op == Opcode::m6502_lsr ? "m6502_lsr" :
+                              op == Opcode::m6502_rol ? "m6502_rol" : "m6502_ror",
+                              {input, status_value}, {status});
+            const auto carry_in = binary("and", status_value, constant_expr(1, 8));
+            ExpressionPtr result, carry_out;
+            if (op == Opcode::m6502_asl || op == Opcode::m6502_rol) {
+                carry_out = boolean_binary("bit_extract", input, constant_expr(7, 8));
+                result = binary("shl", input, constant_expr(1, 8));
+                if (op == Opcode::m6502_rol) result = binary("or", result, carry_in);
+            } else {
+                carry_out = boolean_binary("bit_extract", input, constant_expr(0, 8));
+                result = binary("lshr", input, constant_expr(1, 8));
+                if (op == Opcode::m6502_ror)
+                    result = binary("or", result, binary("shl", carry_in, constant_expr(7, 8)));
+            }
+            result = byte_wrap(std::move(result));
+            Intrinsic effect{op == Opcode::m6502_asl ? "m6502_asl" : op == Opcode::m6502_lsr ? "m6502_lsr" :
+                             op == Opcode::m6502_rol ? "m6502_rol" : "m6502_ror",
+                             memory_target ? std::vector<ExpressionPtr>{input, result, status_value}
+                                           : std::vector<ExpressionPtr>{input, status_value},
+                             memory_target ? IntrinsicMemoryEffect::unknown : IntrinsicMemoryEffect::none};
+            effect.register_writes = accumulator_target ? std::vector<RegisterOperand>{accumulator, status}
+                                                        : std::vector<RegisterOperand>{status};
+            const auto new_status = nz_flags(result, status_value, carry_out);
+            effect.register_output_values = accumulator_target
+                ? std::vector<ExpressionPtr>{result, new_status}
+                : std::vector<ExpressionPtr>{new_status};
+            return effect;
         }
         if ((op == Opcode::m6502_inc || op == Opcode::m6502_dec) && !operands.empty()) {
-            return opaque(op == Opcode::m6502_inc ? "m6502_inc" : "m6502_dec",
-                          {operands.front(), status_value}, {status},
-                          IntrinsicMemoryEffect::unknown);
+            if (!is_memory(instruction.operands.front()))
+                return opaque(op == Opcode::m6502_inc ? "m6502_inc" : "m6502_dec",
+                              {operands.front(), status_value}, {status}, IntrinsicMemoryEffect::unknown);
+            const auto result = byte_wrap(binary(op == Opcode::m6502_inc ? "add" : "sub",
+                                                operands.front(), constant_expr(1, 8)));
+            Intrinsic effect{op == Opcode::m6502_inc ? "m6502_inc" : "m6502_dec",
+                             {operands.front(), result}, IntrinsicMemoryEffect::unknown};
+            effect.register_writes = {status};
+            effect.register_output_values = {nz_flags(result, status_value)};
+            return effect;
         }
         switch (op) {
         case Opcode::m6502_pha: case Opcode::m6502_php: {

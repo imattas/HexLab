@@ -149,7 +149,7 @@ struct MachODyldResolver::State {
             const auto &header = metadata->chained_headers[row.header];
             const auto format = starts.pointer_format;
             const bool generic = format == 2 || format == 3 || format == 6;
-            const bool arm64e = format == 1 || format == 7 || format == 9 || format == 12;
+            const bool arm64e = format == 1 || format == 7 || format == 9 || format == 10 || format == 12;
             if (!row.complete || !starts.complete || header.version || (!generic && !arm64e) ||
                 slice.header.order != ByteOrder::little || size != (slice.header.is_64 ? 8 : 4) ||
                 (format == 3) == slice.header.is_64)
