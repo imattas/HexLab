@@ -817,12 +817,110 @@ class RemoteBackend final : public Backend {
 public:
     explicit RemoteBackend(std::unique_ptr<rsp::ByteTransport> transport = {}) : transport_(std::move(transport)) {}
     bool supports_scheduled_signal_disposition() const noexcept override { return true; }
+    bool remote_launch_available() const noexcept override { return client_ != nullptr; }
     Result<ProcessInfo> launch(const Target&) override { return unsupported("RSP targets must be connected by host and port"); }
+    Result<ProcessInfo> launch_remote(const Target& target) override {
+        if (!client_) return Error{ErrorCode::invalid_argument, "connect to a remote target before launching an inferior"};
+        if (!target.working_directory.empty())
+            return unsupported("RSP remote launch does not yet set an inferior working directory");
+        if (target.executable.empty())
+            return Error{ErrorCode::invalid_argument, "remote launch requires an executable path"};
+        if (selected_inferior_live_ || pending_stop_ || pending_event_)
+            return Error{ErrorCode::busy, "the current remote inferior must exit and its stop must be acknowledged before vRun"};
+        if (multiprocess_supported_) {
+            for (const auto& [process, inferior] : inferiors_) {
+                const bool current = remote_process_id_ && process == *remote_process_id_;
+                if (!current && inferior.known_attached)
+                    return Error{ErrorCode::busy, "detach or exit other attached remote inferiors before vRun"};
+            }
+        }
+        for (const auto& entry : thread_run_states_) {
+            if (entry.second != ThreadState::exited)
+                return Error{ErrorCode::busy, "a remote thread is still live; vRun would discard its state"};
+        }
+        if (!breakpoints_.empty())
+            return Error{ErrorCode::conflict, "remove remote breakpoints before launching a new inferior"};
+        if (!extended_mode_supported_) {
+            auto extended = client_->request("!");
+            if (!extended) return extended.error();
+            if (extended.value() != "OK")
+                return extended.value().empty()
+                    ? unsupported("remote does not support extended-remote mode required by vRun")
+                    : Error{ErrorCode::io, "remote rejected extended-remote mode: " + extended.value()};
+            extended_mode_supported_ = true;
+        }
+        auto stopped = client_->run_program(target.executable, target.arguments);
+        if (!stopped) return stopped.error();
+        const auto thread = stopped.value().fields.find("thread");
+        std::string wire_thread;
+        if (thread != stopped.value().fields.end()) {
+            if (!valid_thread_wire_id(thread->second))
+                return Error{ErrorCode::malformed, "vRun stop reply contains an invalid thread ID"};
+            wire_thread = thread->second;
+        }
+        if (non_stop_mode_ && wire_thread.empty())
+            return Error{ErrorCode::malformed, "non-stop vRun stop reply must identify its exact thread ID"};
+        const auto process = thread_process_id(wire_thread);
+        if (multiprocess_supported_ && !process)
+            return unsupported("multiprocess vRun stop reply must identify its exact pPID.TID");
+        if (!multiprocess_supported_ && process)
+            return Error{ErrorCode::malformed, "remote used a process-qualified thread ID without multiprocess negotiation"};
+
+        const auto previous_process = remote_process_id_;
+        const auto erase_process_state = [&](std::uint64_t process_id) {
+            const auto belongs = [process_id](std::string_view id) {
+                return thread_process_id(id) == std::optional<std::uint64_t>(process_id);
+            };
+            for (auto it = thread_run_states_.begin(); it != thread_run_states_.end();) {
+                if (belongs(it->first)) it = thread_run_states_.erase(it); else ++it;
+            }
+            for (auto it = remote_thread_tokens_.begin(); it != remote_thread_tokens_.end();) {
+                if (belongs(it->first)) {
+                    thread_token_ids_.erase(it->second);
+                    it = remote_thread_tokens_.erase(it);
+                } else ++it;
+            }
+            for (auto it = expected_step_threads_.begin(); it != expected_step_threads_.end();) {
+                if (belongs(*it)) it = expected_step_threads_.erase(it); else ++it;
+            }
+            inferiors_.erase(process_id);
+        };
+        if (multiprocess_supported_) {
+            if (previous_process) erase_process_state(*previous_process);
+            if (process && process != previous_process) erase_process_state(*process);
+        } else {
+            remote_thread_tokens_.clear();
+            thread_token_ids_.clear();
+            thread_run_states_.clear();
+            inferiors_.clear();
+            expected_step_threads_.clear();
+            next_thread_token_ = 1;
+        }
+        remote_process_id_ = process;
+        pending_stop_ = std::move(stopped.value());
+        pending_event_.reset();
+        pending_event_thread_.clear();
+        pending_event_signal_ = 0;
+        legacy_expected_step_ = false;
+        if (!wire_thread.empty()) thread_run_states_[wire_thread] = ThreadState::stopped;
+        if (process) {
+            auto& inferior = inferiors_[*process];
+            inferior.known_attached = true;
+            inferior.pending_stop = pending_stop_;
+            if (!wire_thread.empty()) inferior.thread_states[wire_thread] = ThreadState::stopped;
+        }
+        terminated_ = false;
+        selected_inferior_live_ = true;
+        current_process_detach_rejected_ = false;
+        const auto id = process.value_or(pending_stop_->thread ? pending_stop_->thread : 1);
+        return ProcessInfo{id, target.executable, target_ ? target_->architecture : Architecture::unknown};
+    }
     Result<ProcessInfo> attach(ProcessId) override { return unsupported("RSP attach is performed during host connection"); }
     Result<ProcessInfo> connect_remote(std::string_view host, std::uint16_t port) override {
         if (client_) return Error{ErrorCode::conflict, "remote debugger is already connected"};
         terminated_ = false;
         current_process_detach_rejected_ = false;
+        selected_inferior_live_ = false;
         remote_process_id_.reset();
         pending_event_signal_ = 0;
         if (!transport_) {
@@ -937,7 +1035,7 @@ public:
                 return unsupported("non-stop mode requires an exact thread ID in the initial stop reply");
             }
         }
-        if (multiprocess_supported_ && !remote_process_id_) {
+        if (multiprocess_supported_ && !remote_process_id_ && initial.value()) {
             client_.reset(); transport_.reset();
             return unsupported("multiprocess remote initial state must identify its exact pPID.TID");
         }
@@ -946,6 +1044,8 @@ public:
             return Error{ErrorCode::malformed, "remote used a process-qualified thread ID without multiprocess negotiation"};
         }
         pending_stop_ = std::move(initial.value());
+        selected_inferior_live_ = pending_stop_ &&
+            (pending_stop_->kind == 'T' || pending_stop_->kind == 'S');
         if (const auto thread = pending_stop_->fields.find("thread"); thread != pending_stop_->fields.end())
             thread_run_states_[thread->second] = ThreadState::stopped;
         if (remote_process_id_) {
@@ -1022,6 +1122,7 @@ public:
         }
         selected.known_attached = true;
         selected.pending_stop = pending_stop_;
+        selected_inferior_live_ = true;
         selected.thread_states = {};
         for (const auto& [wire, state] : thread_run_states_)
             if (thread_process_id(wire) == remote_process_id_) selected.thread_states[wire] = state;
@@ -1098,6 +1199,7 @@ public:
         }
         inferiors_.erase(process);
         pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
+        selected_inferior_live_ = false;
         legacy_expected_step_ = false; remote_process_id_.reset(); breakpoints_.clear();
         return std::monostate{};
     }
@@ -1126,11 +1228,13 @@ public:
                 pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
                 expected_step_threads_.clear(); legacy_expected_step_ = false;
                 breakpoints_.clear();
+                selected_inferior_live_ = false;
                 // vKill;pid affects only that inferior. Keep the negotiated
                 // connection alive so the caller can list or attach another.
                 return std::monostate{};
             }
             for (auto& [thread, state] : thread_run_states_) state = ThreadState::exited;
+            selected_inferior_live_ = false;
             client_.reset(); transport_.reset(); pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
             expected_step_threads_.clear(); legacy_expected_step_ = false; terminated_ = true; remote_process_id_.reset();
             breakpoints_.clear(); target_.reset(); target_xml_advertised_ = false; libraries_advertised_ = false;
@@ -1164,6 +1268,7 @@ public:
                     : Status{Error{ErrorCode::io, "remote rejected detach: " + result.value()}};
         }
         client_.reset(); transport_.reset(); pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
+        selected_inferior_live_ = false;
         expected_step_threads_.clear(); legacy_expected_step_ = false;
         remote_thread_tokens_.clear(); thread_token_ids_.clear(); thread_run_states_.clear(); next_thread_token_ = 1;
         inferiors_.clear();
@@ -1228,6 +1333,8 @@ public:
         event.thread = pending_event_thread_.empty() ? stopped.value().thread : thread_token(pending_event_thread_);
         if (stopped.value().kind == 'W' || stopped.value().kind == 'X') {
             event.kind = EventKind::process_exited;
+            selected_inferior_live_ = false;
+            breakpoints_.clear();
             event.code = static_cast<std::uint32_t>(stopped.value().exit_code);
             event.message = "remote process exited";
             for (auto& [thread, state] : thread_run_states_)
@@ -1294,11 +1401,15 @@ public:
         pending_event_ = event.sequence;
         if (multiprocess_supported_ && remote_process_id_) {
             auto& inferior = inferiors_[*remote_process_id_];
-            inferior.known_attached = true;
             inferior.pending_stop.reset();
             inferior.thread_states.clear();
-            for (const auto& [wire, state] : thread_run_states_)
-                if (thread_process_id(wire) == remote_process_id_) inferior.thread_states[wire] = state;
+            if (event.kind == EventKind::process_exited) {
+                inferior.known_attached = false;
+            } else {
+                inferior.known_attached = true;
+                for (const auto& [wire, state] : thread_run_states_)
+                    if (thread_process_id(wire) == remote_process_id_) inferior.thread_states[wire] = state;
+            }
         }
         return event;
     }
@@ -1780,6 +1891,7 @@ private:
     bool extended_mode_supported_ = false;
     bool non_stop_mode_ = false;
     bool terminated_ = false;
+    bool selected_inferior_live_ = false;
     bool current_process_detach_rejected_ = false;
     std::optional<std::uint64_t> remote_process_id_;
     std::map<BreakpointId, Breakpoint> breakpoints_;
@@ -1804,6 +1916,13 @@ public:
         return remote_ ? remote_->processes() : native_->processes();
     }
     Result<ProcessInfo> launch(const Target& target) override { return active().launch(target); }
+    Result<ProcessInfo> launch_remote(const Target& target) override {
+        return remote_ ? remote_->launch_remote(target)
+                       : unsupported("connect to a remote target before launching a remote inferior");
+    }
+    bool remote_launch_available() const noexcept override {
+        return remote_ && remote_->remote_launch_available();
+    }
     Result<ProcessInfo> attach(ProcessId id) override { return active().attach(id); }
     Result<ProcessInfo> attach_remote_process(ProcessId id) override {
         return remote_ ? remote_->attach_remote_process(id) : unsupported("no remote debugger session is active");

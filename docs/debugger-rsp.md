@@ -1,5 +1,28 @@
 # GDB Remote Serial Protocol packet handling
 
+## Launching on a connected remote target
+
+In a live RSP session, the existing **Launch** command can start a new remote
+inferior through `vRun`; local launch from an idle session is unchanged. The
+backend enables extended-remote mode lazily with `!` if the connection did not
+already negotiate it, then hex-encodes the executable path and each argument as
+separate `vRun` fields. This preserves spaces and packet metacharacters without
+shell quoting. The encoded request must fit the negotiated `PacketSize`, and
+the client caps argument count at 4,096 and rejects embedded NUL bytes.
+
+The remote must return an initial `T` or `S` stop reply. Non-stop sessions
+require its exact thread ID, and multiprocess sessions require `pPID.TID` so
+thread and process ownership are not guessed; successful launch replaces the
+session's previous thread identities and stop state. A
+live inferior, pending stop/event, or HexLab-owned breakpoint prevents launch,
+avoiding discarded stop context or stale breakpoint IDs. A fresh extended
+connection with no inferior can launch directly; after a `W`/`X` exit reply is
+acknowledged, the same connection can launch another inferior. If extended
+mode or `vRun` is unsupported, the request returns that error and never falls
+back to local process launch. Remote working-directory changes are not yet
+implemented, so a non-empty `Target::working_directory` is rejected before
+sending `vRun`.
+
 ## Remote process enumeration and attach
 
 When the stub advertises `qXfer:osdata:read`, HexLab reads the `processes`

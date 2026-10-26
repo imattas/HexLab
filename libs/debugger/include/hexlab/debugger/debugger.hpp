@@ -123,6 +123,13 @@ public:
         return Error{ErrorCode::unsupported, "process enumeration is not supported by this backend"};
     }
     virtual Result<ProcessInfo> launch(const Target&) = 0;
+    // Starts a new target on an already connected remote session. Native
+    // backends leave this unsupported; remote backends may require extended
+    // protocol mode and no outstanding event or owned breakpoints.
+    virtual Result<ProcessInfo> launch_remote(const Target&) {
+        return Error{ErrorCode::unsupported, "launching a target on the connected remote session is not supported"};
+    }
+    virtual bool remote_launch_available() const noexcept { return false; }
     virtual Result<ProcessInfo> attach(ProcessId) = 0;
     virtual Result<ProcessInfo> connect_remote(std::string_view, std::uint16_t) {
         return Error{ErrorCode::unsupported, "remote debugging is not supported by this backend"};
@@ -217,6 +224,8 @@ public:
     bool supports_scheduled_signal_disposition() const noexcept;
     const std::optional<std::string>& last_diagnostic() const noexcept;
     Result<std::vector<ProcessInfo>> processes();
+    // Launches locally from idle/detached state, or starts a new inferior on
+    // an active remote session when that backend supports extended mode.
     Result<ProcessInfo> launch(const Target& target);
     Result<ProcessInfo> attach(ProcessId process);
     Result<ProcessInfo> connect_remote(std::string_view host, std::uint16_t port);

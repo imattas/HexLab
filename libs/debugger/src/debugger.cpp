@@ -215,9 +215,18 @@ Result<std::vector<ProcessInfo>> DebugSession::processes() {
 }
 
 Result<ProcessInfo> DebugSession::launch(const Target& target) {
-    if ((impl_->state != SessionState::idle && impl_->state != SessionState::detached) || !impl_->backend)
+    if (!impl_->backend)
         return invalid_state("launch");
-    auto result = impl_->backend->launch(target);
+    const bool remote_active = impl_->backend->remote_launch_available();
+    const bool connected_remote_launch = remote_active && (impl_->state == SessionState::running ||
+        impl_->state == SessionState::stopped || impl_->state == SessionState::exited);
+    if (!connected_remote_launch && impl_->state != SessionState::idle && impl_->state != SessionState::detached)
+        return invalid_state("launch");
+    if (connected_remote_launch && (impl_->pending_event || impl_->notification_ack_pending))
+        return Error{ErrorCode::busy, "acknowledge the pending debug event before launching a remote target"};
+    if (connected_remote_launch && !impl_->breakpoints.empty())
+        return Error{ErrorCode::conflict, "remove session breakpoints before launching a new remote target"};
+    auto result = connected_remote_launch ? impl_->backend->launch_remote(target) : impl_->backend->launch(target);
     if (result) { impl_->resume_filter.reset(); impl_->step_resume = false; }
     if (result) { impl_->process = result.value(); impl_->state = SessionState::running; impl_->pending_event.reset(); impl_->pending_event_kind.reset(); impl_->notification_ack_pending = false; impl_->interrupt_requested = false; impl_->breakpoints.clear(); }
     return result;

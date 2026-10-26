@@ -72,6 +72,10 @@ public:
     // servers return its initial stop; non-stop servers may reply OK and report
     // subsequent stop notifications asynchronously.
     Result<std::optional<StopReply>> attach_process(std::uint64_t process, std::stop_token = {});
+    // Starts an executable in extended-remote mode. Paths and each argument
+    // are hex encoded independently according to the vRun packet grammar.
+    Result<StopReply> run_program(std::string_view executable,
+        std::span<const std::string> arguments = {}, std::stop_token = {});
     // Detaches one process without closing the multiprocess RSP connection.
     Status detach_process(std::uint64_t process, std::stop_token = {});
     Status interrupt(std::stop_token = {});

@@ -603,6 +603,45 @@ Result<std::optional<StopReply>> Client::attach_process(std::uint64_t process, s
         return Error{ErrorCode::malformed, "vAttach did not return an initial stop reply"};
     return std::optional<StopReply>{std::move(stopped.value())};
 }
+Result<StopReply> Client::run_program(std::string_view executable,
+    std::span<const std::string> arguments, std::stop_token stop) {
+    if (executable.empty() || executable.find('\0') != std::string_view::npos)
+        return Error{ErrorCode::invalid_argument, "RSP vRun executable path must be nonempty and contain no NUL"};
+    if (arguments.size() > 4096)
+        return Error{ErrorCode::resource_limit, "RSP vRun argument count exceeds 4096"};
+    std::string command = "vRun;";
+    const auto append_hex_argument = [&](std::string_view value, bool first) -> Status {
+        if (value.find('\0') != std::string_view::npos)
+            return Error{ErrorCode::invalid_argument, "RSP vRun arguments cannot contain NUL"};
+        const std::size_t separator = first ? 0 : 1;
+        if (command.size() > peer_packet_size_ || separator > peer_packet_size_ - command.size() ||
+            value.size() > (peer_packet_size_ - command.size() - separator) / 2)
+            return Error{ErrorCode::resource_limit, "RSP vRun packet exceeds the negotiated packet size"};
+        if (!first) command.push_back(';');
+        constexpr char digits[] = "0123456789abcdef";
+        for (const unsigned char byte : value) {
+            command.push_back(digits[byte >> 4]);
+            command.push_back(digits[byte & 0x0f]);
+        }
+        return std::monostate{};
+    };
+    auto path_status = append_hex_argument(executable, true);
+    if (!path_status) return path_status.error();
+    for (const auto &argument : arguments) {
+        auto argument_status = append_hex_argument(argument, false);
+        if (!argument_status) return argument_status.error();
+    }
+    auto response = transact(command, stop);
+    if (!response) return response.error();
+    if (response.value().empty())
+        return Error{ErrorCode::unsupported, "remote does not support the vRun launch packet"};
+    auto stopped = parse_stop(response.value());
+    if (!stopped) return stopped.error();
+    if (stopped.value().kind != 'T' && stopped.value().kind != 'S')
+        return Error{ErrorCode::malformed, "vRun did not return an initial stopped reply"};
+    if (non_stop_mode_) stop_reply_sequence_active_ = true;
+    return stopped;
+}
 Status Client::detach_process(std::uint64_t process, std::stop_token stop) {
     if (process == 0) return Error{ErrorCode::invalid_argument, "RSP process ID must be nonzero"};
     auto response = transact("D;" + hex_u64(process), stop);

@@ -15,9 +15,12 @@ The partitioner recognizes three bounded forms:
   partition only when its exact byte range was observed and mapped.
 - **Pointer-relative ranges:** a base register must have a proven SSA pointer
   origin through supported copies, constant offsets, and unanimous phi inputs.
-  The memory access must have no index register and a bounded byte width and
-  displacement. Ranges sharing the same root register version and overlapping
-  offsets are grouped together. Call results and call-clobbered register
+  The memory access may have no index register, or use a same-width index whose
+  exact nonnegative integer constant is proven through a literal, same-width
+  copy, or unanimous phi. Indexed scale/shift and displacement arithmetic must
+  fit the checked signed offset bounds. The access also needs a bounded byte
+  width. Ranges sharing the same root register version and overlapping offsets
+  are grouped together. Call results and call-clobbered register
   definitions are accepted as opaque roots, so accesses through a copied or
   constant-adjusted call output can use this partitioning too. These roots do
   not imply allocation freshness or disjointness: a store through a different
@@ -42,6 +45,7 @@ whole-memory SSA. If whole-function partition construction exceeds its budget,
 the function keeps only whole-memory SSA.
 
 This does not partition heap or global accesses whose address cannot be proven,
-aliases reached through unrelated roots, indexed addressing, or arbitrary
-pointer arithmetic. The IR keeps these partitions supplementary: passes that
-ignore `memory_partition` continue to use the coarser `memory_version` chain.
+aliases reached through unrelated roots, variable or signed-negative indices,
+index extensions other than the proven same-width form, or arbitrary pointer
+arithmetic. The IR keeps these partitions supplementary: passes that ignore
+`memory_partition` continue to use the coarser `memory_version` chain.
