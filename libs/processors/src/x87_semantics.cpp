@@ -337,6 +337,53 @@ evaluate_x87_to_integer(const X87IntegerConvertRequest &request) noexcept {
     return result;
 }
 
+std::optional<X87RoundToIntegralResult>
+evaluate_x87_round_to_integral(const X87RoundToIntegralRequest &request) noexcept {
+    const auto decoded = decode(request.value);
+    if (decoded.kind != Class::zero && decoded.kind != Class::finite && decoded.kind != Class::infinity)
+        return {};
+
+    constexpr std::uint16_t fsw_condition_mask = fsw_c0 | fsw_c2 | fsw_c3;
+    X87RoundToIntegralResult result;
+    result.status_word_defined_mask = static_cast<std::uint16_t>(~fsw_condition_mask);
+    result.status_word = static_cast<std::uint16_t>(request.status_word &
+        ~(fsw_condition_mask | fsw_c1));
+
+    // At unbiased exponents of 63 or greater, every finite binary80 value is
+    // already integral. Keep its original encoding (including pseudo-forms).
+    if (decoded.kind == Class::zero || decoded.kind == Class::infinity ||
+        decoded.exponent >= 16383 + 63) {
+        result.value = request.value;
+        return result;
+    }
+
+    const auto rounded = round_magnitude(decoded,
+        static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10), false);
+    if (rounded.overflow) return {};
+    result.precision = rounded.inexact;
+    if (rounded.inexact) {
+        result.status_word |= fsw_precision;
+        if (decoded.negative != rounded.incremented) result.status_word |= fsw_c1;
+    }
+    if (rounded.inexact && (request.control_word & fcw_precision_mask) == 0) {
+        result.status_word = signal_exception(result.status_word, fsw_precision);
+        result.completed = false;
+        return result;
+    }
+
+    const bool negative = decoded.negative;
+    if (rounded.value == 0) {
+        result.value = X87Binary80{0, static_cast<std::uint16_t>(negative ? sign_mask : 0)};
+        return result;
+    }
+    const auto highest_bit = 63u - static_cast<unsigned>(std::countl_zero(rounded.value));
+    const auto significand = rounded.value << (63u - highest_bit);
+    const auto exponent = static_cast<std::uint16_t>(highest_bit + 16383u);
+    result.value = X87Binary80{significand,
+        static_cast<std::uint16_t>(exponent | (negative ? sign_mask : 0))};
+    return result;
+}
+
 X87UnaryResult evaluate_x87_unary(X87Binary80 value, std::uint16_t status_word,
                                   X87UnaryArithmetic operation) noexcept {
     if (operation == X87UnaryArithmetic::change_sign)

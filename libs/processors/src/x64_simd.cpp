@@ -234,7 +234,7 @@ bool simd(State &state, std::uint8_t opcode, bool extended) {
     return true;
 }
 
-bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsigned vvvv, bool l, bool) {
+bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsigned vvvv, bool l, bool w) {
     if (map != 1 && map != 2)
         unsupported("VEX opcode map is outside the enabled AVX subset");
     const auto vector_width = static_cast<std::uint16_t>(l ? 256 : 128);
@@ -288,6 +288,9 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
         case 0x3e: integer_dataflow = Opcode::vpmaxuw; break;
         case 0x3f: integer_dataflow = Opcode::vpmaxud; break;
         case 0x40: integer_dataflow = Opcode::vpmulld; break;
+        case 0x45: integer_dataflow = w ? Opcode::vpsrlvq : Opcode::vpsrlvd; break;
+        case 0x46: integer_dataflow = Opcode::vpsravd; break; // VEX.W is ignored; qword form is EVEX-only.
+        case 0x47: integer_dataflow = w ? Opcode::vpsllvq : Opcode::vpsllvd; break;
         case 0x29: case 0x37: break; // Existing qword comparisons below.
         default: unsupported("VEX 0F38 opcode is outside the enabled AVX2 subset");
         }
