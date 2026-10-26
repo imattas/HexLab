@@ -1096,7 +1096,11 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
     if (instruction.context.architecture == Architecture::jvm && metadata.jvm &&
         !instruction.encoded_bytes().empty()) {
         const auto raw = std::to_integer<std::uint8_t>(instruction.encoded_bytes().front());
-        const bool may_throw = (raw >= 0x2e && raw <= 0x35) || (raw >= 0x4f && raw <= 0x56) ||
+        // Treat all constant-pool loads conservatively: reference and dynamic
+        // constants can trigger resolution/bootstrap behavior, and unknown
+        // constant kinds must not silently lose exceptional edges.
+        const bool may_throw = (raw >= 0x12 && raw <= 0x14) ||
+                               (raw >= 0x2e && raw <= 0x35) || (raw >= 0x4f && raw <= 0x56) ||
                                raw == 0x6c || raw == 0x6d || raw == 0x70 || raw == 0x71 ||
                                (raw >= 0xb2 && raw <= 0xc3) || raw == 0xc5 || raw == 0xbf;
         if (may_throw) {
