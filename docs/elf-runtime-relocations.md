@@ -29,6 +29,9 @@ ELF32 i386 `ET_DYN` REL records and little-endian ELF64 x86-64 or AArch64
 | AArch64 | `R_AARCH64_RELATIVE` | 1027 | `B + A` |
 | AArch64 | `R_AARCH64_GLOB_DAT` | 1025 | `S` |
 | AArch64 | `R_AARCH64_JUMP_SLOT` | 1026 | `S` |
+| PPC64 | `R_PPC64_ADDR64` | 38 | `S + A` (low 64 bits) |
+| PPC64 | `R_PPC64_GLOB_DAT` | 20 | `S + A` (low 64 bits) |
+| PPC64 | `R_PPC64_RELATIVE` | 22 | `B + A` |
 
 The AArch64 profile also supports the dynamic `R_AARCH64_ABS64` relocation. It
 applies `S + A` and writes the low 64 bits without an overflow check, as
@@ -37,6 +40,17 @@ relocations require an eight-byte aligned 64-bit target field. The ELF64
 `ABS32`, `ABS16`, and `PREL*` data relocations remain static-only and are not
 applied by this runtime overlay; the separate AArch64 P32/ELF32 profile is not
 implemented.
+
+The little-endian PPC64 ELF64 profile applies `R_PPC64_RELATIVE`,
+`R_PPC64_ADDR64`, and `R_PPC64_GLOB_DAT` from dynamic RELA tables. Relative
+records use `B + A` and require symbol index zero. `ADDR64` and `GLOB_DAT` use
+`S + A` and write the low 64 bits; `GLOB_DAT` addends are retained and applied
+as specified by the PowerPC64 ABI. Targets must be complete, writable,
+initialized eight-byte fields aligned to eight bytes. External symbols use the
+same exact caller-supplied dependency and GNU-version binding rules as other
+supported symbol relocations. `R_PPC64_JMP_SLOT` remains unapplied because its
+ABI-defined PLT entry initialization is not modeled as a scalar pointer patch;
+big-endian PPC64 and other PPC64 dynamic relocation types remain skipped.
 
 ELF64 pointer relocations and `R_X86_64_64` targets must be complete
 eight-byte fields in writable, initialized load memory. The x86-64 `PC32`,
@@ -75,8 +89,9 @@ not open dependency paths or infer addresses from filenames. Applied external
 rows retain the relocation index, caller binding index, and supplied runtime
 address in `ElfRuntimeImage::resolved_symbols`. The binding table is capped at
 65,536 rows and individual library, symbol, and version names at 4,096 bytes.
-RELA symbol-slot addends are ignored as required by these relocation formulas;
-i386 GLOB_DAT and JMP_SLOT likewise use `S` without an addend. Applied rows
+For x86-64 and AArch64 GLOB_DAT/JUMP_SLOT, RELA addends are ignored as required
+by their formulas; i386 GLOB_DAT and JMP_SLOT likewise use `S` without an
+addend. PPC64 GLOB_DAT is an explicit `S + A` relocation. Applied rows
 retain their original relocation row index in `applied_indices`; external
 symbol rows additionally identify the exact caller binding in
 `resolved_symbols`.
@@ -124,5 +139,6 @@ symbol-index, field-boundary, overlap, metadata-preservation, and load-bias
 overflow coverage.
 
 The formulas follow the [i386 System V ABI relocation table](https://refspecs.linuxfoundation.org/elf/abi386-4.pdf),
-the [x86-64 System V ABI relocation table](https://refspecs.linuxfoundation.org/elf/x86_64-SysV-psABI.pdf)
-and the [AAELF64 relocation table](https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst).
+the [x86-64 System V ABI relocation table](https://refspecs.linuxfoundation.org/elf/x86_64-SysV-psABI.pdf),
+the [AAELF64 relocation table](https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst),
+and the [64-bit PowerPC ELF ABI relocation table](https://refspecs.linuxfoundation.org/ELF/ppc64/PPC-elf64abi.pdf).
