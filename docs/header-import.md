@@ -64,7 +64,8 @@ specialization such as `template<> struct Box<int> { ... };` overrides the
 primary template for that exact argument identity. Partial specializations
 support direct type parameters (`Box<T>`), pointer parameters (`Box<T*>`),
 `const T*` patterns, integral non-type arguments that are direct parameter
-names or integer literals, and template-template arguments that are direct
+names, integer literals, or bounded constant expressions, and
+template-template arguments that are direct
 template parameter names or fixed template names. See
 [integral non-type class-template specializations](header-non-type-specializations.md)
 for examples. Specializations must follow a previously declared primary
@@ -83,16 +84,24 @@ retained in the shared type model, but does not affect imported offsets or size.
 Template-template parameters are supported in class-template specializations
 when they are matched as a direct template name or parameter. Parameter packs
 cannot be used in specializations; compound pack patterns, member/parameter pack expansions,
-arithmetic non-type specialization patterns, function-template
+function-template
 specializations, explicit alias-template specializations, forward-declared
 templates, and nested class-template definitions are unsupported. Type
 specialization patterns outside `T`, `T*`, `const T*`, and fixed types are also
 unsupported.
+Dependent integral non-type specialization expressions are supported when
+every referenced parameter is deduced by another pattern argument. Expressions
+are checked only after other pattern arguments have deduced their values; the
+importer does not invert expressions or perform general C++ template argument
+deduction. Negative results, unknown names, unsupported operators, and values
+outside the bounded signed expression range fail explicitly.
 Partial-specialization patterns are compared per primary argument; a candidate
 must be at least as strong for every argument and strictly stronger for one to
 be preferred. Incomparable or equivalent matches fail as ambiguous. Fixed
 template-template names use normal namespace, using-directive, and inline-
 namespace resolution and must match the primary parameter's nested shape.
+Dependent arithmetic patterns do not add a specificity advantage over direct
+parameter patterns, so overlapping arithmetic candidates may remain ambiguous.
 Template argument and parameter counts are capped at 32;
 recursive alias expansion and template instantiation obey the configured parser
 nesting bound. Unsupported syntax returns an explicit error.
