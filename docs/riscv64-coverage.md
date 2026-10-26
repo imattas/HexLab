@@ -69,7 +69,7 @@ evaluate IEEE-754 results, select runtime `frm`, or compute precise exception
 flags. Q-format operations, compressed floating forms, and RV32-only absent
 forms remain unsupported or invalid according to their encoding.
 
-RVV 1.0 configuration forms VSETVLI/VSETIVLI/VSETVL and an integer elementwise subset are enabled. The data subset includes VADD.VV/VX/VI, VSUB.VV/VX, VRSUB.VX/VI, and VAND/VOR/VXOR in VV/VX/VI forms. Integer mask comparisons now include VMSEQ/VMSNE in VV/VX/VI, VMSLTU/VMSLT in VV/VX, VMSLEU/VMSLE in VV/VX/VI, and VMSGTU/VMSGT in VX/VI. These forms follow the base V extension's non-orthogonal operand availability: reserved immediate less-than and vector greater-than encodings remain invalid. The decoder retains vector-register operands without assuming fixed VLEN, distinguishes scalar GPR and sign-extended five-bit immediate forms, and records whether masked operations implicitly read v0. The decompiler emits named vector intrinsics with explicit source, mask, and destination effects; it does not invent lane width, active length, mask-result shape, tail/mask policy, or vtype state semantics. Segmented, whole-register, fault-only-first, floating-point, and other vector memory forms, widening/narrowing, reductions, and other elementwise operations remain outside this subset. Unit-stride integer VLE/VSE and strided integer VLSE/VSSE forms are decoded with explicit width, scalar base and stride operands, memory effects, and masked-v0 reads. A bounded helper plans active unit/strided element addresses from caller-supplied VLEN, vtype, vl, vstart, base/stride, and predicate bytes; it rejects invalid EMUL/address wrap and does not perform memory accesses or model faults. The added shifts are VSLL/VSRL/VSRA in VV/VX/VI forms (the shift immediate is an unsigned five-bit amount); VMINU/VMIN/VMAXU/VMAX are accepted in VV/VX forms only. Masked encodings record the implicit v0 read, and unmasked encodings do not. Reserved VI min/max forms and other reserved encodings in recognized integer operation classes are invalid; operand classes and RVV operations outside this selected subset remain unsupported.
+RVV 1.0 configuration forms VSETVLI/VSETIVLI/VSETVL and an integer elementwise subset are enabled. The data subset includes VADD.VV/VX/VI, VSUB.VV/VX, VRSUB.VX/VI, and VAND/VOR/VXOR in VV/VX/VI forms. Integer mask comparisons now include VMSEQ/VMSNE in VV/VX/VI, VMSLTU/VMSLT in VV/VX, VMSLEU/VMSLE in VV/VX/VI, and VMSGTU/VMSGT in VX/VI. These forms follow the base V extension's non-orthogonal operand availability: reserved immediate less-than and vector greater-than encodings remain invalid. The decoder retains vector-register operands without assuming fixed VLEN, distinguishes scalar GPR and sign-extended five-bit immediate forms, and records whether masked operations implicitly read v0. The decompiler emits named vector intrinsics with explicit source, mask, and destination effects; it does not invent lane width, active length, mask-result shape, tail/mask policy, or vtype state semantics. Segmented, whole-register, fault-only-first, floating-point, and other vector memory forms, widening arithmetic beyond MAC, narrowing, reductions, and other elementwise operations remain outside this subset. Unit-stride integer VLE/VSE and strided integer VLSE/VSSE forms are decoded with explicit width, scalar base and stride operands, memory effects, and masked-v0 reads. A bounded helper plans active unit/strided element addresses from caller-supplied VLEN, vtype, vl, vstart, base/stride, and predicate bytes; it rejects invalid EMUL/address wrap and does not perform memory accesses or model faults. The added shifts are VSLL/VSRL/VSRA in VV/VX/VI forms (the shift immediate is an unsigned five-bit amount); VMINU/VMIN/VMAXU/VMAX are accepted in VV/VX forms only. Masked encodings record the implicit v0 read, and unmasked encodings do not. Reserved VI min/max forms and other reserved encodings in recognized integer operation classes are invalid; operand classes and RVV operations outside this selected subset remain unsupported.
 
 The single-width integer multiply family now includes VMUL, VMULH, VMULHU, and
 VMULHSU in VV/VX forms. The decoder records both vector source reads, or the
@@ -77,7 +77,7 @@ scalar GPR read for VX, the vector destination write, and an implicit v0 read
 when masked. Generic formatting and decompilation preserve the mnemonic, input
 registers, mask, and destination effects. Analysis consumes the ordinary
 register-effect records; it does not infer lane values or fixed vector width.
-VI multiply forms and widening multiply forms remain unsupported.
+VI multiply forms and non-accumulating widening multiply forms remain unsupported.
 Vector divide and remainder VV/VX forms are decoded, formatted, lifted, and
 available in the bounded integer lane evaluator.
 
@@ -89,9 +89,15 @@ and accumulation, preserves inactive and tail destination lanes, and uses the
 distinct accumulator-versus-multiplicand equations for the two instruction
 pairs. Decode forms and operand ordering follow the official RVV 1.0
 [multiply-add specification](https://docs.riscv.org/reference/isa/v20240411/unpriv/v-st-ext.html#vector-single-width-integer-multiply-add-instructions).
-Widening integer multiply-add forms remain unsupported.
+Seven widening integer multiply-accumulate forms are decoded, formatted, and
+lifted as named opaque vector operations: `VWMACCU.VV/VX`, `VWMACC.VV/VX`,
+`VWMACCSU.VV/VX`, and the VX-only `VWMACCUS.VX`. The bounded lane evaluator
+computes exact signed/unsigned products plus the old 2*SEW accumulator for
+SEW 8/16/32 when destination EMUL is at most 8. It retains masked and
+prestart lanes and reports the 16/32/64-bit result element width. SEW 64 and
+physical register-group legality remain outside that evaluator.
 
-Decompiler typing for the 77 decoded integer elementwise forms is shared across
+Decompiler typing for the 84 decoded integer elementwise forms is shared across
 arithmetic, bitwise, shift, min/max, multiply/divide/remainder, and comparison
 families. Data outputs are opaque width-independent vectors; comparison outputs
 identify predicate mask bits without assuming VLEN or a lane count. The lifter

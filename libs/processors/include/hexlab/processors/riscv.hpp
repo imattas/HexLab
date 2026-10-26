@@ -64,7 +64,10 @@ enum class RiscvOpcode {
     // Zbb scalar count operations, appended for decoder ID stability.
     clz, ctz, cpop, clzw, ctzw, cpopw,
     // Non-widening integer multiply-accumulate/subtract; destructive vd forms.
-    vmacc_vv, vmacc_vx, vnmsac_vv, vnmsac_vx, vmadd_vv, vmadd_vx, vnmsub_vv, vnmsub_vx
+    vmacc_vv, vmacc_vx, vnmsac_vv, vnmsac_vx, vmadd_vv, vmadd_vx, vnmsub_vv, vnmsub_vx,
+    // RVV widening integer multiply-accumulate; append for persisted decoder IDs.
+    vwmaccu_vv, vwmaccu_vx, vwmacc_vv, vwmacc_vx,
+    vwmaccsu_vv, vwmaccsu_vx, vwmaccus_vx
 };
 
 struct RiscvRegister {

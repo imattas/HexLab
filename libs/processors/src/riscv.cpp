@@ -246,8 +246,16 @@ bool decode_vector_multiply_add(std::uint32_t w, RiscvInstruction &i) {
     case 0x2f: op = scalar ? RiscvOpcode::vnmsac_vx : RiscvOpcode::vnmsac_vv; break;
     case 0x29: op = scalar ? RiscvOpcode::vmadd_vx : RiscvOpcode::vmadd_vv; break;
     case 0x2b: op = scalar ? RiscvOpcode::vnmsub_vx : RiscvOpcode::vnmsub_vv; break;
+    case 0x3c: op = scalar ? RiscvOpcode::vwmaccu_vx : RiscvOpcode::vwmaccu_vv; break;
+    case 0x3d: op = scalar ? RiscvOpcode::vwmacc_vx : RiscvOpcode::vwmacc_vv; break;
+    case 0x3e: if (!scalar) return false; op = RiscvOpcode::vwmaccus_vx; break;
+    case 0x3f: op = scalar ? RiscvOpcode::vwmaccsu_vx : RiscvOpcode::vwmaccsu_vv; break;
     default: return false;
     }
+    // Widening destinations use EMUL = 2*LMUL. This stateless decoder does
+    // not know vtype, so it cannot validate EMUL <= 8 or destination group
+    // alignment and overlap with source groups. The lane evaluator checks
+    // EMUL; physical register-group validation remains outside this API.
     i.opcode = op;
     operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
     read_vector_destination(i, vd);
@@ -853,6 +861,7 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
                                      funct6 == 7 || funct6 == 9 || funct6 == 10 || funct6 == 11 ||
                                      funct6 == 0x25 || funct6 == 0x28 || funct6 == 0x29 || funct6 == 0x2b ||
                                      funct6 == 0x2d || funct6 == 0x2f ||
+                                     (funct6 >= 0x3c && funct6 <= 0x3f) ||
                                      funct6 == 0x0c || funct6 == 0x0e || funct6 == 0x0f ||
                                      (funct6 >= 0x18 && funct6 <= 0x1f) || (funct6 >= 0x20 && funct6 <= 0x23);
             if (implemented && (funct3 == 0 || funct3 == 3 || funct3 == 4))

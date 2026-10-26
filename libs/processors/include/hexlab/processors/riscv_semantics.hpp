@@ -54,6 +54,7 @@ struct RiscvVectorIntegerResult {
     std::vector<std::uint64_t> lanes; // compare results are 0/1 mask bits
     std::uint64_t vlmax = 0;
     bool mask_result = false;
+    std::uint8_t element_bits = 0; // 1 for masks, SEW for ordinary results, 2*SEW for widening.
 };
 
 struct RiscvVectorMemoryElementAccess {
