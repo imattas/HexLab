@@ -447,6 +447,49 @@ hexlab::Result<std::vector<ImportedSymbol::Range>> decode_range_list(
     return ranges;
 }
 
+hexlab::Result<std::vector<ImportedSymbol::Range>> decode_legacy_range_list(
+    std::span<const std::uint8_t> section, std::uint64_t offset,
+    std::uint8_t address_size, std::optional<std::uint64_t> initial_base,
+    std::stop_token stop) {
+    constexpr std::size_t max_ranges = 4096, max_entries = 8192;
+    if (address_size != 4 && address_size != 8)
+        return malformed("DWARF .debug_ranges address size is invalid");
+    if (offset >= section.size())
+        return malformed("DW_AT_ranges offset is outside .debug_ranges");
+    Reader reader(section, static_cast<std::size_t>(offset), section.size());
+    const auto address_max = address_size == 4 ? UINT64_C(0xffffffff) : UINT64_MAX;
+    auto base = initial_base;
+    std::vector<ImportedSymbol::Range> ranges;
+    std::size_t entries = 0;
+    while (!reader.done()) {
+        if (stop.stop_requested())
+            return hexlab::Error{hexlab::ErrorCode::canceled, "DWARF import canceled"};
+        auto begin = reader.fixed(address_size); if (!begin) return begin.error();
+        auto end = reader.fixed(address_size); if (!end) return end.error();
+        if (begin.value() == 0 && end.value() == 0) return ranges;
+        if (++entries > max_entries)
+            return hexlab::Error{hexlab::ErrorCode::resource_limit,
+                                 "DWARF .debug_ranges list exceeds 8192 entries"};
+        if (begin.value() == address_max) {
+            base = end.value();
+            continue;
+        }
+        if (ranges.size() >= max_ranges)
+            return hexlab::Error{hexlab::ErrorCode::resource_limit,
+                                 "DWARF .debug_ranges list exceeds 4096 ranges"};
+        if (!base)
+            return malformed("DWARF .debug_ranges offset pair has no compilation-unit base address");
+        if (*base > address_max || begin.value() > address_max - *base ||
+            end.value() > address_max - *base)
+            return malformed("DWARF .debug_ranges offset pair overflows address width");
+        ImportedSymbol::Range range{*base + begin.value(), *base + end.value()};
+        if (range.begin >= range.end)
+            return malformed("DWARF .debug_ranges range is empty or reversed");
+        ranges.push_back(range);
+    }
+    return malformed("DWARF .debug_ranges list has no end-of-list marker");
+}
+
 hexlab::Result<std::vector<LocationRange>> decode_location_list(
     std::span<const std::uint8_t> section, std::uint64_t offset, std::uint8_t address_size,
     const std::function<hexlab::Result<std::uint64_t>(std::uint64_t)>& resolve_address_index) {
@@ -570,7 +613,7 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
     const auto canceled = [&]() -> bool { return sections.stop.stop_requested(); };
     if(sections.source_id.empty()||sections.info.empty()||sections.abbrev.empty())return hexlab::Error{hexlab::ErrorCode::invalid_argument,"DWARF source id, info, and abbrev are required"};
     if(sections.info_section_offset>UINT64_MAX-sections.info.size())return hexlab::Error{hexlab::ErrorCode::overflow,"DWARF package info contribution offset overflows"};
-    if(sections.info.size()>256u*1024u*1024u||sections.abbrev.size()>64u*1024u*1024u||sections.strings.size()>256u*1024u*1024u||sections.string_offsets.size()>256u*1024u*1024u||sections.addresses.size()>256u*1024u*1024u||sections.line_strings.size()>256u*1024u*1024u||sections.location_lists.size()>256u*1024u*1024u||sections.locations.size()>256u*1024u*1024u||sections.range_lists.size()>256u*1024u*1024u)return hexlab::Error{hexlab::ErrorCode::resource_limit,"DWARF sections exceed importer limits"};
+    if(sections.info.size()>256u*1024u*1024u||sections.abbrev.size()>64u*1024u*1024u||sections.strings.size()>256u*1024u*1024u||sections.string_offsets.size()>256u*1024u*1024u||sections.addresses.size()>256u*1024u*1024u||sections.line_strings.size()>256u*1024u*1024u||sections.location_lists.size()>256u*1024u*1024u||sections.locations.size()>256u*1024u*1024u||sections.range_lists.size()>256u*1024u*1024u||sections.ranges.size()>256u*1024u*1024u)return hexlab::Error{hexlab::ErrorCode::resource_limit,"DWARF sections exceed importer limits"};
     ImportResult output;Reader info(sections.info,0,sections.info.size());std::uint64_t die_count=0;
     std::uint64_t supplementary_bytes_used=0;std::uint32_t supplementary_requests=0;
     std::vector<DwarfSplitUnitRequest> pending_split_units;
@@ -1076,23 +1119,33 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
                 const auto*low=num(d,attr_low_pc);const auto*high=num(d,attr_high_pc);
                 auto function_ranges=std::vector<ImportedSymbol::Range>{};
                 if(const auto*ranges_value=attr(d,attr_ranges)){
-                    if(version_value!=5)return unsupported("DW_AT_ranges is currently supported only with DWARF v5 .debug_rnglists");
-                    if(sections.range_lists.empty())return unsupported("DW_AT_ranges requires the matching .debug_rnglists contribution");
                     auto ab=abbrevs.value().find(d.code);if(ab==abbrevs.value().end())return malformed("DW_AT_ranges abbreviation is absent");
                     auto spec=std::find_if(ab->second.attributes.begin(),ab->second.attributes.end(),[](const auto&a){return a.name==attr_ranges;});
                     if(spec==ab->second.attributes.end())return malformed("DW_AT_ranges has no abbreviation form");
-                    std::uint64_t list_offset=0;
-                    if(spec->form==form_sec_offset){
-                        const auto*offset=std::get_if<std::uint64_t>(ranges_value);if(!offset)return malformed("DW_FORM_sec_offset DW_AT_ranges value is not numeric");list_offset=*offset;
-                    }else if(spec->form==form_rnglistx){
-                        const auto*indexed=std::get_if<IndexedForm>(ranges_value);if(!indexed||!indexed->range_list)return malformed("DW_FORM_rnglistx DW_AT_ranges value is not an index");
-                        const auto*base=num(dies.front(),attr_rnglists_base);if(!base)return unsupported("DW_FORM_rnglistx requires DW_AT_rnglists_base");
-                        auto resolved=resolve_rnglistx(sections.range_lists,*base,indexed->index,static_cast<std::uint8_t>(as_value));if(!resolved)return resolved.error();list_offset=resolved.value();
-                    }else return unsupported("DW_AT_ranges form is not a supported DW_FORM_sec_offset or DW_FORM_rnglistx");
-                    const auto*addr_base=num(dies.front(),attr_addr_base);
-                    auto decoded=decode_range_list(sections.range_lists,list_offset,static_cast<std::uint8_t>(as_value),low?std::optional<std::uint64_t>(*low):std::nullopt,
-                        [&](std::uint64_t index)->hexlab::Result<std::uint64_t>{if(!addr_base)return unsupported("indexed DWARF range-list entries require DW_AT_addr_base");return resolve_addrx(sections.addresses,*addr_base,index,static_cast<std::uint8_t>(as_value));});
-                    if(!decoded)return decoded.error();function_ranges=std::move(decoded.value());
+                    if(version_value<=4){
+                        if(spec->form!=form_sec_offset)return unsupported("DWARF v2-v4 DW_AT_ranges requires DW_FORM_sec_offset");
+                        if(sections.ranges.empty())return unsupported("DW_AT_ranges requires .debug_ranges");
+                        const auto*offset=std::get_if<std::uint64_t>(ranges_value);
+                        if(!offset)return malformed("DW_FORM_sec_offset DW_AT_ranges value is not numeric");
+                        const auto*cu_low=num(dies.front(),attr_low_pc);
+                        auto decoded=decode_legacy_range_list(sections.ranges,*offset,static_cast<std::uint8_t>(as_value),
+                            cu_low?std::optional<std::uint64_t>(*cu_low):std::nullopt,sections.stop);
+                        if(!decoded)return decoded.error();function_ranges=std::move(decoded.value());
+                    }else{
+                        if(sections.range_lists.empty())return unsupported("DW_AT_ranges requires the matching .debug_rnglists contribution");
+                        std::uint64_t list_offset=0;
+                        if(spec->form==form_sec_offset){
+                            const auto*offset=std::get_if<std::uint64_t>(ranges_value);if(!offset)return malformed("DW_FORM_sec_offset DW_AT_ranges value is not numeric");list_offset=*offset;
+                        }else if(spec->form==form_rnglistx){
+                            const auto*indexed=std::get_if<IndexedForm>(ranges_value);if(!indexed||!indexed->range_list)return malformed("DW_FORM_rnglistx DW_AT_ranges value is not an index");
+                            const auto*base=num(dies.front(),attr_rnglists_base);if(!base)return unsupported("DW_FORM_rnglistx requires DW_AT_rnglists_base");
+                            auto resolved=resolve_rnglistx(sections.range_lists,*base,indexed->index,static_cast<std::uint8_t>(as_value));if(!resolved)return resolved.error();list_offset=resolved.value();
+                        }else return unsupported("DW_AT_ranges form is not a supported DW_FORM_sec_offset or DW_FORM_rnglistx");
+                        const auto*addr_base=num(dies.front(),attr_addr_base);
+                        auto decoded=decode_range_list(sections.range_lists,list_offset,static_cast<std::uint8_t>(as_value),low?std::optional<std::uint64_t>(*low):std::nullopt,
+                            [&](std::uint64_t index)->hexlab::Result<std::uint64_t>{if(!addr_base)return unsupported("indexed DWARF range-list entries require DW_AT_addr_base");return resolve_addrx(sections.addresses,*addr_base,index,static_cast<std::uint8_t>(as_value));});
+                        if(!decoded)return decoded.error();function_ranges=std::move(decoded.value());
+                    }
                 }else if(low&&high){
                     auto ab=abbrevs.value().find(d.code);auto hf=std::find_if(ab->second.attributes.begin(),ab->second.attributes.end(),[](const auto&a){return a.name==attr_high_pc;});if(hf==ab->second.attributes.end())continue;
                     std::uint64_t end=*high;if(hf->form!=form_addr){if(*high>UINT64_MAX-*low)return malformed("subprogram range overflows");end=*low+*high;}if(end<=*low)continue;
@@ -1189,6 +1242,7 @@ hexlab::Result<ImportResult> import_dwarf_v4(const DwarfV4Sections &sections) {
     bounded.strings = sections.strings;
     bounded.stop = sections.stop;
     bounded.locations = sections.locations;
+    bounded.ranges = sections.ranges;
     return import_dwarf(bounded);
 }
 } // namespace hexlab::symbols

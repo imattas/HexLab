@@ -24,6 +24,8 @@ struct DwarfV4Sections {
     std::stop_token stop;
     // Optional legacy .debug_loc section for DWARF v2-v4 location lists.
     std::span<const std::uint8_t> locations;
+    // Optional legacy .debug_ranges section for DW_AT_ranges on subprograms.
+    std::span<const std::uint8_t> ranges;
 };
 
 // Identity parsed from the bounded DWARF v5 .debug_sup header. `filename` is
@@ -212,6 +214,8 @@ struct DwarfSections {
     std::span<const std::uint8_t> locations;
     // Optional DWARF v5 range-list contribution section used by DW_AT_ranges.
     std::span<const std::uint8_t> range_lists;
+    // Optional legacy .debug_ranges section (DWARF v2-v4).
+    std::span<const std::uint8_t> ranges;
     // Optional identity from .debug_sup and an explicit caller-owned resolver.
     // Returned identity is compared exactly before a resolved type is used.
     DwarfSupplementaryIdentity supplementary_identity;
@@ -441,12 +445,13 @@ struct ImportResult {
 // enum constants, prototypes, subprograms, parameters, and variables. Type
 // references resolve only within the current unit. Recursive aggregate graphs
 // and unsupported location expressions/forms return an explicit error. Legacy
-// .debug_loc lists are accepted when supplied in DwarfV4Sections::locations;
+// .debug_loc and .debug_ranges lists are accepted through the matching spans;
 // this is not a complete DWARF reader. Section spans are borrowed only during
 // the call.
 HEXLAB_SYMBOLS_EXPORT hexlab::Result<ImportResult> import_dwarf_v4(const DwarfV4Sections &sections);
 // Imports the same DIE/type subset from DWARF v4 and ordinary v5 compile
-// units. Legacy v2-v4 .debug_loc and v5 .debug_loclists are optional inputs.
+// units. Legacy v2-v4 .debug_loc/.debug_ranges and v5
+// .debug_loclists/.debug_rnglists are optional inputs.
 // Indexed forms resolve only through supplied contribution sections
 // and explicit compilation-unit base attributes. Ranged subprogram DIEs may
 // inherit missing names, return types, and parameter lists through same-unit

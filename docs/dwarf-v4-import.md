@@ -15,7 +15,15 @@ from same-unit or cross-unit targets; cycles and non-subprogram targets are
 malformed. Cross-unit function inheritance is limited to complete named
 declarations whose return and parameter types resolve in the same import.
 Function ranges handle address-form `DW_AT_high_pc` and
-constant-form offsets. Direct variable addresses and raw location-expression bytes are kept
+constant-form offsets. Subprogram `DW_AT_ranges` with `DW_FORM_sec_offset`
+reads the optional legacy `.debug_ranges` section and retains every half-open
+interval in `ImportedSymbol::ranges`; the imported function root remains its
+first interval. Each address-sized offset pair uses the compile unit's
+`DW_AT_low_pc` as its initial base, or the most recent all-ones base-selection
+entry. Lists require a zero/zero terminator and are limited to 4,096 ranges
+and 8,192 nonterminal entries. Out-of-section offsets, truncated pairs,
+missing bases or terminators, reversed or empty ranges, and address-width
+overflow fail explicitly. Direct variable addresses and raw location-expression bytes are kept
 separate in the result. Embedded DWARF v4 expressions receive a bounded
 operation decode for register/base-register locations, frame-base
 and CFA references, constants, dereferences, arithmetic plus, pieces, and
@@ -33,8 +41,9 @@ expressions. Unknown opcodes fail explicitly. The ELF importer and desktop
 variable view retain decoded expressions, and live locals evaluates them using
 the selected thread's explicitly supplied registers and memory reader.
 
-The public importer can also consume an optional `.debug_loc` section through
-`DwarfV4Sections::locations` or `DwarfSections::locations`. It decodes the
+The public importer can also consume optional `.debug_loc` and `.debug_ranges`
+sections through `DwarfV4Sections::locations`/`ranges` or
+`DwarfSections::locations`/`ranges`. It decodes the
 legacy address-pair format, including base-selection entries, into half-open
 PC ranges and retains each expression and decoded operation sequence. Offset
 pairs use the compile unit's `DW_AT_low_pc` until a base-selection entry
@@ -42,7 +51,9 @@ replaces it. These ranges use the same PC-selecting evaluation API as v5
 location lists. Lists are bounded to 4096 ranges, 64 KiB of expression bytes,
 and 4096 total operations; missing terminators, empty/reversed ranges,
 overflow, and truncated expressions are rejected. This section-level API does
-not itself discover or load ELF sections.
+not itself discover or load ELF sections. The range-pair encoding dates from
+DWARF v2-v4; this DIE importer currently accepts v4 and v5 compilation units,
+so v2/v3 DIE streams remain unsupported.
 
 The importer keeps DWARF alignment uncertainty explicit. Base-type alignment
 uses a conservative value; aggregate alignment is inferred from member types.
@@ -56,15 +67,16 @@ cross-unit dependency cycles,
 recursive aggregate graphs, incomplete aggregate layouts, dynamic or
 unknown-bound arrays, nonconstant member locations, DWARF v5 default-location
 entries, and unrecognized type DIEs referenced as types are not guessed. It is not a
-complete DWARF reader: macros, ranges/location lists, call-site information,
+complete DWARF reader: other range/location-list forms, call-site information,
 inheritance, templates, and DWARF versions other than 4 remain outside the
 type/symbol subset.
 
 ELF loading locates `.debug_info`, `.debug_abbrev`, and optional `.debug_str`,
-`.debug_loc`, and `.debug_loclists` sections and retains parsed records as
+`.debug_loc`, `.debug_loclists`, `.debug_ranges`, and `.debug_rnglists` sections and retains parsed records as
 `ElfMetadata::dwarf_info`. Legacy v2-v4 `.debug_loc` ranges and v5
 `.debug_loclists` ranges use the same durable project-variable and PC-selection
-workflow. The initial
+workflow. An explicitly supplied standalone DWO can also provide
+`.debug_ranges.dwo` for a v4 split compile unit. The initial
 project workflow supports little-endian ELF DWARF v4 and a bounded v5 subset.
 Section reads and
 retained records share the ELF metadata budget; duplicate, compressed, or
