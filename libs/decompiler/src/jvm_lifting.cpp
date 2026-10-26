@@ -740,6 +740,31 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         bool consistent = true;
         Reference type;
     };
+    const auto common_catch_type = [&](const Reference &left, const Reference &right) -> Reference {
+        if (!left || !right || left->kind != JvmVerificationKind::object ||
+            right->kind != JvmVerificationKind::object) return {};
+        if (left == right) return left;
+        const auto class_name = [](const ReferenceIdentity &reference) -> std::optional<std::string> {
+            if (reference.descriptor.size() < 3 || reference.descriptor.front() != 'L' ||
+                reference.descriptor.back() != ';') return {};
+            return reference.descriptor.substr(1, reference.descriptor.size() - 2);
+        };
+        const auto left_name = class_name(*left);
+        const auto right_name = class_name(*right);
+        if (!left_name || !right_name) return {};
+        // Every catch clause (including catch-all) receives a Throwable.
+        // For named catches this relies on the classfile's catch-type contract.
+        if (*left_name == "java/lang/Throwable" || *right_name == "java/lang/Throwable")
+            return reference_class("java/lang/Throwable");
+        if (!metadata) return {};
+        const auto current = metadata->class_name;
+        const auto parent = metadata->super_name;
+        if (*left_name == current && *right_name == parent)
+            return reference_class(*right_name);
+        if (*right_name == current && *left_name == parent)
+            return reference_class(*left_name);
+        return {};
+    };
     std::map<std::pair<std::uint32_t, std::uint64_t>, HandlerCatchEvidence> handler_catch_evidence;
     if (code && metadata) for (const auto &handler : code->exception_table) {
         const auto target_address = Address{code->begin.space, code->begin.offset + handler.handler_pc};
@@ -757,9 +782,13 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         if (!evidence.seen) {
             evidence.seen = true;
             evidence.type = std::move(caught);
-        } else if (evidence.type != caught) {
-            evidence.consistent = false;
-            evidence.type.reset();
+        } else if (evidence.consistent && evidence.type != caught) {
+            const auto joined = common_catch_type(evidence.type, caught);
+            if (joined) evidence.type = joined;
+            else {
+                evidence.consistent = false;
+                evidence.type.reset();
+            }
         }
     }
     const auto verifier_value_type = [](JvmVerificationKind kind) -> std::optional<ValueType> {
