@@ -13,7 +13,11 @@ input list. The identity table marks normalized duplicate paths separately
 from distinct paths that share a basename. An edge reports an unresolved
 name, ambiguous provider IDs, a cycle, an already-expanded node, or a depth
 limit. Dependency names are ordered by case-insensitive basename and then
-exact spelling; provider identities follow input order.
+exact spelling; provider identities follow input order. Repeated normalized
+paths remain visible as separate input rows, but resolve as one provider using
+the first row's ID; only distinct normalized paths with the same basename are
+competing providers. The graph stores references to shared immutable provider
+buckets, so dependency edges do not each copy a bucket's IDs.
 
 Graph mode is bounded to 4,096 supplied images, 100,000 raw and unique
 dependency rows, 16 MiB of dependency-name bytes, and 64 recursive levels.
