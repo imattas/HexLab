@@ -29,6 +29,17 @@ set. Changing the selected thread, frame, session, active document, document rev
 or project snapshot invalidates older results. Completions also require the
 same pending stop sequence and a still-stopped target.
 
+Queued requests run in interactive priority order: register reads, memory pages,
+module and region lists, frame/local inspection, watches, then memory searches.
+Repeated queued requests of the same kind replace older queued work, while
+watches and memory searches remain independent request kinds. Starting an
+interactive inspection cancels a running memory search; its bounded scan returns
+partial results when available. Clearing inspection state on a target change
+drops all queued work from the old target, and session/request tokens still
+discard any in-flight completion that arrives later. This keeps quick inspection
+actions responsive when a large search is underway without applying snapshots
+from a previous process or selected thread.
+
 Inspection calls remain bounded: a memory page is at most 1024 bytes, module
 and process results are capped at 4096 records, and memory-region results at
 65536 records. The Windows backend uses `VirtualQueryEx`
