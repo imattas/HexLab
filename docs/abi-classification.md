@@ -7,6 +7,22 @@ accepts the existing immutable `hexlab::types::Type` function model and returns
 one placement for each declared parameter and the result. Stack offsets are
 byte offsets from the callee's stack pointer at function entry.
 
+## MIPS N32 scalar subset
+
+`CallingConvention::mips_n32` explicitly selects the N32 data model: pointers
+are 32 bits, while argument GPR containers and stack slots are 64 bits. The
+first eight argument positions use A0-A7 for integer and pointer scalars;
+single- and double-precision floating scalars use the independent F12-F19
+argument image at the same position index. Later scalar arguments use successive
+8-byte stack slots, and the stack is 16-byte aligned. Integer and pointer
+results use V0, while floating results use F0. This slice rejects aggregate,
+array, vector, unresolved, and variadic signatures rather than inferring their
+classification. It reports the scalar payload width but does not model
+endianness-dependent justification or integer sign/zero extension within the
+64-bit register container.
+
+These placements follow the published [MIPSpro N32 ABI handbook, chapter 2](https://pixelbart.net/SGI/IRIX/i/65/30/doc/usr/share/Insight/library/SGI_bookshelves/SGI_Developer/books/Mpro_n32_ABI/sgi_html/ch02.html), which specifies the N32/64 subprogram interface. That handbook is an SGI platform reference; this classifier does not claim Linux-specific extension coverage.
+
 ## AAPCS32 base PCS
 
 `CallingConvention::aapcs32` and the retained `aapcs32` function qualifier

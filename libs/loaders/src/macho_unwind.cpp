@@ -112,10 +112,14 @@ Result<std::int64_t> cfi_scale_signed(std::int64_t factor, std::int64_t alignmen
     if (factor == 0 || alignment == 0) return std::int64_t{0};
     const auto factor_magnitude = factor < 0 ? std::uint64_t(-(factor + 1)) + 1 : std::uint64_t(factor);
     const auto alignment_magnitude = alignment < 0 ? std::uint64_t(-(alignment + 1)) + 1 : std::uint64_t(alignment);
-    if (factor_magnitude > std::uint64_t(INT64_MAX) / alignment_magnitude)
+    const bool negative = (factor < 0) != (alignment < 0);
+    const auto limit = negative ? (std::uint64_t(INT64_MAX) + 1) : std::uint64_t(INT64_MAX);
+    if (factor_magnitude > limit / alignment_magnitude)
         return failure(ErrorCode::overflow, "Mach-O CFI scaled offset overflows");
-    const auto product = static_cast<std::int64_t>(factor_magnitude * alignment_magnitude);
-    return ((factor < 0) != (alignment < 0)) ? -product : product;
+    const auto magnitude = factor_magnitude * alignment_magnitude;
+    if (!negative) return static_cast<std::int64_t>(magnitude);
+    if (magnitude == std::uint64_t(INT64_MAX) + 1) return INT64_MIN;
+    return -static_cast<std::int64_t>(magnitude);
 }
 
 Result<std::int64_t> cfi_scale(std::uint64_t factor, std::int64_t alignment) {

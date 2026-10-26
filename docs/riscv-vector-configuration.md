@@ -153,4 +153,19 @@ therefore remains symbolic only. The lane API does not receive physical vector
 register group identities, so it cannot validate group alignment or overlap.
 The seven encodings and operand signedness follow the official RVV 1.0
 [widening multiply-add specification](https://docs.riscv.org/reference/isa/unpriv/v-st-ext).
-Carry/borrow and other widening operations are not included.
+The decoder and decompiler also recognize widening add/subtract `vwadd`,
+`vwaddu`, `vwsub`, and `vwsubu` in `.vv`, `.vx`, `.wv`, and `.wx` forms.
+Narrow-source forms sign- or zero-extend both narrow operands to 2*SEW;
+wide-source forms combine a 2*SEW vector operand with an extended narrow
+vector or scalar operand. The decompiler keeps each as a named vector effect,
+including the old destination, mask, and configuration dependencies.
+The lane evaluator executes these forms for SEW 8, 16, and 32, reports the
+2*SEW result width, and rejects configurations whose widened EMUL exceeds m8.
+Wide-source forms use the `vs2` lane at 2*SEW and the `vs1` lane or scalar at
+SEW; signed forms sign-extend the narrow operand and unsigned forms zero-extend
+it. The output lane count is unchanged because both EEW and EMUL double. Masked,
+prestart, and tail lanes retain the caller-supplied old destination. SEW 64
+requires 128-bit lane values and remains symbolic. Destination group alignment
+and overlap cannot be validated because the lane API receives no physical
+register group identities; implementation-specific vector limits also remain
+outside the model.

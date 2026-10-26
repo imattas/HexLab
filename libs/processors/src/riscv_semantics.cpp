@@ -311,6 +311,66 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
         return result;
     }
 
+    // Widening add/sub destinations have EEW=2*SEW and EMUL=2*LMUL.
+    // The number of lane indices stays VLEN*LMUL/SEW. The uint64_t result
+    // representation therefore supports source SEW through 32 only.
+    bool widening_add_sub = false, wide_source = false, subtract = false;
+    bool signed_operation = false, vector_source = false;
+    switch (opcode) {
+#define RV_WIDEN_CASE(op, wide, sub, sign, vec) \
+    case RiscvOpcode::op: widening_add_sub = true; wide_source = wide; subtract = sub; \
+        signed_operation = sign; vector_source = vec; break
+    RV_WIDEN_CASE(vwadd_vv, false, false, true, true);
+    RV_WIDEN_CASE(vwadd_vx, false, false, true, false);
+    RV_WIDEN_CASE(vwadd_wv, true, false, true, true);
+    RV_WIDEN_CASE(vwadd_wx, true, false, true, false);
+    RV_WIDEN_CASE(vwaddu_vv, false, false, false, true);
+    RV_WIDEN_CASE(vwaddu_vx, false, false, false, false);
+    RV_WIDEN_CASE(vwaddu_wv, true, false, false, true);
+    RV_WIDEN_CASE(vwaddu_wx, true, false, false, false);
+    RV_WIDEN_CASE(vwsub_vv, false, true, true, true);
+    RV_WIDEN_CASE(vwsub_vx, false, true, true, false);
+    RV_WIDEN_CASE(vwsub_wv, true, true, true, true);
+    RV_WIDEN_CASE(vwsub_wx, true, true, true, false);
+    RV_WIDEN_CASE(vwsubu_vv, false, true, false, true);
+    RV_WIDEN_CASE(vwsubu_vx, false, true, false, false);
+    RV_WIDEN_CASE(vwsubu_wv, true, true, false, true);
+    RV_WIDEN_CASE(vwsubu_wx, true, true, false, false);
+#undef RV_WIDEN_CASE
+    default: break;
+    }
+    if (widening_add_sub) {
+        if (sew > 32 || config.lmul_log2 > 2 || (vector_source && operands.vs1.size() != vlmax))
+            return {}; // 2*SEW must fit and widened EMUL must remain <= m8.
+        const unsigned wide_bits = wide_source ? 2 * sew : sew;
+        const auto narrow_mask = width_mask(sew);
+        const auto destination_mask = width_mask(2 * sew);
+        const auto extend = [](std::uint64_t value, unsigned from, unsigned to, bool sign) {
+            const auto from_mask = width_mask(from);
+            value &= from_mask;
+            if (sign && negative(value, from)) value |= ~from_mask;
+            return value & width_mask(to);
+        };
+        std::uint64_t scalar_narrow = operands.scalar & width_mask(xlen);
+        if (sew > xlen && (scalar_narrow & (UINT64_C(1) << (xlen - 1))))
+            scalar_narrow |= ~width_mask(xlen);
+        scalar_narrow &= narrow_mask;
+        RiscvVectorIntegerResult result;
+        result.vlmax = vlmax;
+        result.element_bits = static_cast<std::uint8_t>(2 * sew);
+        result.lanes.assign(operands.old_destination.begin(), operands.old_destination.end());
+        for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
+            if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0) continue;
+            const auto lhs_raw = operands.vs2[static_cast<std::size_t>(lane)];
+            const auto rhs_raw = vector_source ? operands.vs1[static_cast<std::size_t>(lane)] : scalar_narrow;
+            const auto lhs = extend(lhs_raw, wide_bits, 2 * sew, wide_source && signed_operation);
+            const auto rhs = extend(rhs_raw, sew, 2 * sew, signed_operation);
+            result.lanes[static_cast<std::size_t>(lane)] =
+                (subtract ? lhs - rhs : lhs + rhs) & destination_mask;
+        }
+        return result;
+    }
+
     // Widening MAC destinations have EMUL = 2*LMUL and 2*SEW-bit elements.
     // The public lane representation is uint64_t, so SEW=64 (a 128-bit
     // destination) is deliberately left to symbolic lifting.

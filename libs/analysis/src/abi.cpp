@@ -1808,6 +1808,65 @@ AbiSignatureClassification classify_mips_n64(const types::Type &function_type) {
     out.stack_argument_bytes = stack;
     return out;
 }
+
+AbiSignatureClassification classify_mips_n32(const types::Type &function_type) {
+    AbiSignatureClassification out; out.convention = CallingConvention::mips_n32;
+    out.pointer_size = 4; out.stack_alignment = 16; out.stack_slot_size = 8;
+    if (function_type.kind() != types::Kind::function || !function_type.result_type()) {
+        out.complete = false; out.result = unsupported("input type is not a function signature"); return out;
+    }
+    if (function_type.variadic()) {
+        out.complete = false; out.result = unsupported("variadic Linux MIPS N32 classification is unsupported");
+        for (std::size_t i = 0; i < function_type.parameters().size(); ++i)
+            out.arguments.push_back(unsupported("variadic MIPS N32 parameter placement is unsupported"));
+        return out;
+    }
+    struct Shape { bool ok=false, fp=false; std::uint64_t size=0; std::string why; };
+    const auto shape = [](const types::Type &source) {
+        const auto &type = unqualified(source); Shape s; s.size = type.size().value_or(0);
+        switch (type.kind()) {
+        case types::Kind::boolean: case types::Kind::integer: case types::Kind::enumeration:
+            s.ok = s.size == 1 || s.size == 2 || s.size == 4 || s.size == 8;
+            s.why = "unsupported MIPS N32 integer scalar width"; break;
+        case types::Kind::pointer:
+            s.ok = s.size == 4; s.why = "pointer size does not match N32"; break;
+        case types::Kind::floating:
+            s.fp = true; s.ok = s.size == 4 || s.size == 8;
+            s.why = "N32 floating scalar must be 32 or 64 bits"; break;
+        default:
+            s.why = "MIPS N32 aggregate, array, vector, or unresolved values are unsupported"; break;
+        }
+        if (!s.ok && !s.size) s.why = "incomplete MIPS N32 scalar";
+        return s;
+    };
+    const auto &result = unqualified(*function_type.result_type());
+    if (result.kind() == types::Kind::void_type) out.result = {};
+    else {
+        const auto s = shape(result);
+        if (!s.ok) { out.result = unsupported(s.why); out.complete = false; }
+        else out.result.locations.push_back(reg_location(s.fp ? "F0" : "V0", s.size, 0, 8));
+    }
+    std::uint64_t slot = 0, stack = 0;
+    bool placement_known = out.result.supported;
+    for (const auto &parameter : function_type.parameters()) {
+        if (!placement_known) { out.arguments.push_back(unsupported("preceding value makes MIPS N32 placement indeterminate")); continue; }
+        if (!parameter.type) { out.arguments.push_back(unsupported("parameter has no type")); out.complete = placement_known = false; continue; }
+        const auto s = shape(*parameter.type);
+        if (!s.ok) { out.arguments.push_back(unsupported(s.why)); out.complete = placement_known = false; continue; }
+        AbiValueLocation arg;
+        if (slot < 8) {
+            arg.locations.push_back(reg_location((s.fp ? "F" + std::to_string(12 + slot)
+                                                        : "A" + std::to_string(slot)), s.size, 0, 8));
+        } else {
+            if (stack > UINT64_MAX - 8) { out.arguments.push_back(unsupported("MIPS N32 stack argument extent overflows")); out.complete = placement_known = false; continue; }
+            arg.locations.push_back(stack_location(stack, s.size, 8, 0, 8)); stack += 8;
+        }
+        ++slot;
+        out.arguments.push_back(std::move(arg));
+    }
+    out.stack_argument_bytes = stack;
+    return out;
+}
 } // namespace
 
 AbiSignatureClassification classify_abi_signature(CallingConvention convention,
@@ -1816,12 +1875,14 @@ AbiSignatureClassification classify_abi_signature(CallingConvention convention,
         return classify_ppc64le_elfv2(function_type);
     if (convention == CallingConvention::mips_n64)
         return classify_mips_n64(function_type);
-    if (convention == CallingConvention::mips_o32 || convention == CallingConvention::mips_n32) {
+    if (convention == CallingConvention::mips_n32)
+        return classify_mips_n32(function_type);
+    if (convention == CallingConvention::mips_o32) {
         AbiSignatureClassification out; out.convention = convention; out.complete = false;
-        out.result = unsupported("Linux MIPS O32/N32 ABI classification is not implemented");
+        out.result = unsupported("Linux MIPS O32 ABI classification is not implemented");
         if (function_type.kind() == types::Kind::function)
             for (std::size_t i = 0; i < function_type.parameters().size(); ++i)
-                out.arguments.push_back(unsupported("MIPS O32/N32 parameter placement is unsupported"));
+                out.arguments.push_back(unsupported("MIPS O32 parameter placement is unsupported"));
         return out;
     }
     if (is_vectorcall(convention))
