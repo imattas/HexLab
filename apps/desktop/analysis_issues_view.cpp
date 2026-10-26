@@ -214,6 +214,12 @@ void AnalysisIssuesView::update(std::shared_ptr<const ProjectSnapshot> project) 
 void AnalysisIssuesView::update(std::optional<DocumentId> document, std::shared_ptr<const ProjectSnapshot> project,
                                 std::optional<Location> cursor,
                                 std::shared_ptr<const DocumentSnapshot> document_snapshot) {
+    if (document_snapshot && (!document || document_snapshot->id != *document)) {
+        // Tab selection and snapshot publication can cross during a refresh.
+        // Never attribute one document's diagnostics to another tab.
+        document_snapshot.reset();
+        project.reset();
+    }
     const bool changed_document = document_ != document;
     if (!changed_document && project_ == project && document_snapshot_ == document_snapshot && cursor_ == cursor)
         return;
