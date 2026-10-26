@@ -8,6 +8,8 @@ namespace hexlab::elf_detail {
 namespace {
 constexpr std::uint64_t shf_compressed = 0x800;
 constexpr std::uint32_t elfcompress_zlib = 1;
+constexpr std::size_t inflate_input_window = 64 * 1024;
+constexpr std::size_t inflate_output_window = 32 * 1024;
 
 std::vector<std::uint8_t> copy_bytes(const ByteView &view, std::stop_token stop) {
     std::vector<std::uint8_t> result;
@@ -37,19 +39,53 @@ std::vector<std::uint8_t> inflate_zlib(std::span<const std::uint8_t> input,
     canceled(stop);
     std::vector<std::uint8_t> output(static_cast<std::size_t>(expected_size));
     std::uint8_t empty_output = 0;
-    auto *out = output.empty() ? &empty_output : output.data();
-    std::size_t input_size = input.size();
-    std::size_t output_size = output.size();
+    std::size_t input_offset = 0;
+    std::size_t output_offset = 0;
     tinfl_decompressor decompressor;
     tinfl_init(&decompressor);
-    const auto flags = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_COMPUTE_ADLER32 |
-                       TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-    const auto status = tinfl_decompress(&decompressor, input.data(), &input_size,
-        out, out, &output_size, flags);
-    canceled(stop);
-    require(status == TINFL_STATUS_DONE, "Malformed or truncated compressed DWARF zlib stream");
-    require(input_size == input.size(), "Compressed DWARF section has trailing bytes");
-    require(output_size == output.size(), "Compressed DWARF section size does not match its header");
+    constexpr auto base_flags = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_COMPUTE_ADLER32 |
+                                TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+    for (;;) {
+        canceled(stop);
+        const auto input_remaining = input.size() - input_offset;
+        const auto input_window = std::min(inflate_input_window, input_remaining);
+        const bool more_input = input_window < input_remaining;
+        const auto output_remaining = output.size() - output_offset;
+        const auto output_window = output.empty() ? std::size_t{1}
+            : std::min(inflate_output_window, output_remaining);
+        auto *output_base = output.empty() ? &empty_output : output.data();
+        auto *output_next = output_base + output_offset;
+        std::size_t input_used = input_window;
+        std::size_t output_written = output_window;
+        const auto flags = base_flags | (more_input ? TINFL_FLAG_HAS_MORE_INPUT : 0);
+        const auto status = tinfl_decompress(&decompressor, input.data() + input_offset,
+            &input_used, output_base, output_next, &output_written, flags);
+        require(input_used <= input_window && output_written <= output_window,
+                "DWARF zlib decoder returned invalid window counts");
+        input_offset += input_used;
+        require(output_written <= output.size() - output_offset,
+                "Compressed DWARF section exceeds its declared expanded size");
+        output_offset += output_written;
+        if (status == TINFL_STATUS_DONE) {
+            require(input_offset == input.size(), "Compressed DWARF section has trailing bytes");
+            require(output_offset == output.size(),
+                    "Compressed DWARF section size does not match its header");
+            break;
+        }
+        if (status == TINFL_STATUS_HAS_MORE_OUTPUT) {
+            require(output_written != 0 || input_used != 0,
+                    "DWARF zlib decoder made no progress");
+            require(output_offset < output.size(),
+                    "Compressed DWARF section exceeds its declared expanded size");
+            continue;
+        }
+        if (status == TINFL_STATUS_NEEDS_MORE_INPUT) {
+            require((input_used != 0 || output_written != 0) && input_offset < input.size(),
+                    "Malformed or truncated compressed DWARF zlib stream");
+            continue;
+        }
+        require(false, "Malformed or truncated compressed DWARF zlib stream");
+    }
     return output;
 }
 } // namespace

@@ -10,9 +10,11 @@ standard and GNU alias for one logical section is rejected as a duplicate.
 
 The loader validates the compression header, ELF byte order, reserved word,
 algorithm identifier, alignment, GNU `ZLIB` marker, declared expanded size,
-and exact DEFLATE stream extent. Trailing compressed bytes, truncated streams,
-wrong output sizes, unsupported algorithms, malformed headers, and
-`SHT_NOBITS` sections fail closed. The compressed section and expanded bytes
+and exact DEFLATE stream extent. Inflation runs in 64 KiB input and 32 KiB
+output windows and checks cancellation between decoder calls. Trailing
+compressed bytes, truncated streams, wrong output sizes, unsupported
+algorithms, malformed headers, and `SHT_NOBITS` sections fail closed. The
+compressed section and expanded bytes
 are charged to the existing shared 64 MiB ELF metadata budget before
 allocation. The existing logical DWARF section identity and offsets remain the
 source provenance presented to DWARF import; compressed-byte-to-DWARF-offset
