@@ -117,7 +117,10 @@ arguments are compared invariantly; generic variance and constraint satisfaction
 are not inferred. Open `VAR`/`MVAR` values, unresolved or ambiguous references,
 invalid arity, TypeSpec cycles, and array signatures with explicit bounds that
 the current signature model does not retain cannot prove assignability and
-return false. The graph/signature work has fixed node and edge budgets.
+return false, including when both arguments name the same open TypeSpec token.
+Exact TypeSpec-token identity is accepted only after its signature resolves to a
+closed constructed type; matching token values do not make open arguments
+closed. The graph/signature work has fixed node and edge budgets.
 Strong-name public-key-to-token conversion is not inferred by this resolver.
 
 Method-shaped `MemberRef` signatures now carry recursively substituted

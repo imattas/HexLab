@@ -1156,10 +1156,11 @@ bool managed_type_is_assignable_across_catalogs(std::span<const ManagedTypeCatal
      !catalog_has_type_token(*indexes,target_catalog,target))return false;
   if(candidate_catalog==target_catalog&&candidate==target){
     if((candidate>>24)==27){
-      const auto found=indexes->at(candidate_catalog).specifications.find(candidate);
-      if(found==indexes->at(candidate_catalog).specifications.end())return false;
-      const auto* root=resolved_type_spec_root(found->second->signature);
-      if(!root||(root->element_type==0x15&&!root->generic_instance_arity_valid))return false;
+      // A shared TypeSpec token proves metadata identity, but an open or
+      // otherwise unresolved signature is not a closed assignability proof.
+      std::size_t identity_budget=max_assignability_signature_nodes;
+      if(!constructed_type_from_token(catalogs,*indexes,candidate_catalog,candidate,
+                                      identity_budget))return false;
     }
     return true;
   }

@@ -3145,8 +3145,17 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
             std::optional<std::pair<std::uint32_t, Address>> definition;
             const bool arm_instruction_unconditional = predicate_executes == true;
             const auto arm_register_value = [&](const RegisterOperand &reg) -> std::optional<std::uint32_t> {
-                if (reg.bank != RegisterBank::arm32_gpr || reg.width != 32 || reg.index == 15)
+                if (reg.bank != RegisterBank::arm32_gpr || reg.width != 32)
                     return {};
+                // A32 data-processing instructions read PC as the current
+                // instruction address plus eight. Thumb has instruction-form
+                // specific PC alignment rules, so keep its register reads
+                // unresolved here.
+                if (reg.index == 15) {
+                    if (mode != ExecutionMode::a32)
+                        return {};
+                    return static_cast<std::uint32_t>(instruction.address.offset + 8);
+                }
                 const auto found = registers.find({mode, reg.index});
                 if (found == registers.end() || found->second.space != instruction.address.space)
                     return {};

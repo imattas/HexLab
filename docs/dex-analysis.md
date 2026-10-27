@@ -22,6 +22,18 @@ handler for the active range without guessing runtime type matches. Bounded
 `debug_info_item` programs are also decoded into
 method-relative source rows, parameter names, and local-variable live ranges.
 
+The public `DexMetadata::classes` vocabulary retains each validated class
+definition's type ID, raw access flags, optional superclass and source-file
+string IDs, class-data file offset, and ordered interface type IDs. Encoded
+class-data members are grouped into static/instance fields and direct/virtual
+methods, preserving each field or method ID and raw access flags. Method rows
+also retain the `code_off` file offset, with zero indicating no code item.
+These are index-based records: the loader does not resolve names into shared
+symbols/types or infer verifier properties from access flags. Class rows are
+capped at 250,000; member and interface rows share a one-million-row cap, and
+the retained class records are capped at 64 MiB. Each interface index and
+member owner is validated before retention.
+
 For DEX 038 and later, method-handle entries are validated for kind, reserved
 fields, and referenced field/method indexes. Call-site entries are decoded as
 bounded encoded arrays; the required bootstrap handle, name string, and method
