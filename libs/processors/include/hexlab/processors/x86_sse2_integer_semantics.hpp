@@ -42,6 +42,8 @@ inline bool supported(Opcode opcode) noexcept {
     case Opcode::psrlw: case Opcode::psrld: case Opcode::psrlq: case Opcode::psraw: case Opcode::psrad:
     case Opcode::pcmpeqb: case Opcode::pcmpeqw: case Opcode::pcmpeqd:
     case Opcode::pcmpgtb: case Opcode::pcmpgtw: case Opcode::pcmpgtd:
+    case Opcode::phaddw: case Opcode::phaddd: case Opcode::phaddsw:
+    case Opcode::phsubw: case Opcode::phsubd: case Opcode::phsubsw:
         return true;
     default: return false;
     }
@@ -92,13 +94,45 @@ inline std::optional<X86Sse2PackedIntegerResult> evaluate_x86_sse2_packed_intege
     case Opcode::paddw: case Opcode::psubw: case Opcode::paddsw: case Opcode::paddusw:
     case Opcode::psubsw: case Opcode::psubusw: case Opcode::pcmpeqw: case Opcode::pcmpgtw:
     case Opcode::psllw: case Opcode::psrlw: case Opcode::psraw:
+    case Opcode::phaddw: case Opcode::phaddsw: case Opcode::phsubw: case Opcode::phsubsw:
         lane_bits = 16; break;
+    case Opcode::phaddd: case Opcode::phsubd:
+        lane_bits = 32; break;
     case Opcode::paddb: case Opcode::psubb: case Opcode::paddsb: case Opcode::paddusb:
     case Opcode::psubsb: case Opcode::psubusb: case Opcode::pcmpeqb: case Opcode::pcmpgtb:
         lane_bits = 8; break;
     default: break;
     }
     result.lane_bits = static_cast<std::uint8_t>(lane_bits);
+    const bool horizontal = op == Opcode::phaddw || op == Opcode::phaddd || op == Opcode::phaddsw ||
+        op == Opcode::phsubw || op == Opcode::phsubd || op == Opcode::phsubsw;
+    if (horizontal) {
+        const bool subtract = op == Opcode::phsubw || op == Opcode::phsubd || op == Opcode::phsubsw;
+        const bool saturating = op == Opcode::phaddsw || op == Opcode::phsubsw;
+        const unsigned lane_bytes = lane_bits / 8;
+        for (unsigned half = 0; half < 2; ++half) {
+            const auto &input = half == 0 ? left : right;
+            for (unsigned pair = 0; pair < 8 / lane_bytes; ++pair) {
+                const unsigned src = pair * 2 * lane_bytes;
+                const auto a = load_lane(input, src, lane_bits);
+                const auto b = load_lane(input, src + lane_bytes, lane_bits);
+                std::uint64_t value = subtract ? a - b : a + b;
+                if (saturating) {
+                    const auto sign = UINT64_C(1) << (lane_bits - 1);
+                    const auto signed_a = (a & sign) ? static_cast<std::int64_t>(a) - static_cast<std::int64_t>(sign * 2) : static_cast<std::int64_t>(a);
+                    const auto signed_b = (b & sign) ? static_cast<std::int64_t>(b) - static_cast<std::int64_t>(sign * 2) : static_cast<std::int64_t>(b);
+                    auto signed_value = subtract ? signed_a - signed_b : signed_a + signed_b;
+                    const auto minimum = -static_cast<std::int64_t>(sign);
+                    const auto maximum = static_cast<std::int64_t>(sign - 1);
+                    if (signed_value < minimum) signed_value = minimum;
+                    if (signed_value > maximum) signed_value = maximum;
+                    value = static_cast<std::uint64_t>(signed_value);
+                }
+                store_lane(result.bytes, half * 8 + pair * lane_bytes, lane_bits, value);
+            }
+        }
+        return result;
+    }
     if (lane_bits == 0) {
         for (unsigned offset = 0; offset < 16; ++offset) {
             const auto a = std::to_integer<unsigned>(left[offset]);

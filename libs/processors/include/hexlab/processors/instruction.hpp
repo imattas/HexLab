@@ -468,7 +468,11 @@ enum class Opcode {
     // NMOS 6502 undocumented decrement-and-compare family; appended for ID stability.
     m6502_dcp,
     // MIPS32 Release 2 SPECIAL3 variable bitfield operations.
-    mips_ext, mips_ins
+    mips_ext, mips_ins,
+    // Stable undocumented NMOS 6502 shift/logical RMW families.
+    m6502_slo, m6502_rla, m6502_sre,
+    // Legacy SSSE3 horizontal integer operations; append for persisted IDs.
+    phaddw, phaddd, phaddsw, phsubw, phsubd, phsubsw
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

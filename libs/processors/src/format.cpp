@@ -568,6 +568,9 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::pmaddwd: return "pmaddwd";
     case Opcode::pminub: return "pminub"; case Opcode::pmaxub: return "pmaxub";
     case Opcode::pminsw: return "pminsw"; case Opcode::pmaxsw: return "pmaxsw";
+    case Opcode::phaddw: return "phaddw"; case Opcode::phaddd: return "phaddd";
+    case Opcode::phaddsw: return "phaddsw"; case Opcode::phsubw: return "phsubw";
+    case Opcode::phsubd: return "phsubd"; case Opcode::phsubsw: return "phsubsw";
     case Opcode::pshufd: return "pshufd";
     default: break;
     }
@@ -780,6 +783,9 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op >= Opcode::m6502_lda && op <= Opcode::m6502_ror)
         return m6502_names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::m6502_lda)];
     if (op == Opcode::m6502_dcp) return "dcp";
+    if (op == Opcode::m6502_slo) return "slo";
+    if (op == Opcode::m6502_rla) return "rla";
+    if (op == Opcode::m6502_sre) return "sre";
     const auto index = static_cast<std::size_t>(op);
     return index < std::size(names) ? names[index] : "?opcode";
 }

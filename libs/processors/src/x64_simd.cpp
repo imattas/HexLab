@@ -236,6 +236,25 @@ bool simd(State &state, std::uint8_t opcode, bool extended) {
     return true;
 }
 
+bool simd_0f38(State &state, std::uint8_t opcode) {
+    Opcode operation{};
+    switch (opcode) {
+    case 0x01: operation = Opcode::phaddw; break;
+    case 0x02: operation = Opcode::phaddd; break;
+    case 0x03: operation = Opcode::phaddsw; break;
+    case 0x05: operation = Opcode::phsubw; break;
+    case 0x06: operation = Opcode::phsubd; break;
+    case 0x07: operation = Opcode::phsubsw; break;
+    default: return false;
+    }
+    require_prefix(state, PrefixForm::packed);
+    auto decoded = vector_modrm(state, 128);
+    state.i.opcode = operation;
+    state.operand(decoded.reg, OperandAccess::read_write);
+    state.operand(std::move(decoded.rm), OperandAccess::read);
+    return true;
+}
+
 bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsigned vvvv, bool l, bool w) {
     if (map == 2 || map == 3) {
         const bool bmi2_map2 = map == 2 &&
