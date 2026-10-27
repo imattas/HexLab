@@ -43,6 +43,28 @@ struct DexMethodCode {
     std::vector<DexExceptionRegion> exception_regions;
     bool operator==(const DexMethodCode &) const = default;
 };
+struct DexDeclaredField {
+    std::uint32_t field_index = 0;
+    std::uint32_t access_flags = 0;
+    bool operator==(const DexDeclaredField &) const = default;
+};
+struct DexDeclaredMethod {
+    std::uint32_t method_index = 0;
+    std::uint32_t access_flags = 0;
+    std::uint32_t code_offset = 0; // Zero for abstract, native, or otherwise code-less methods.
+    bool operator==(const DexDeclaredMethod &) const = default;
+};
+struct DexClassDefinition {
+    std::uint32_t class_index = 0; // Type ID.
+    std::uint32_t access_flags = 0;
+    std::optional<std::uint32_t> superclass_index;
+    std::optional<std::uint32_t> source_file_index;
+    std::uint32_t class_data_offset = 0;
+    std::vector<std::uint32_t> interface_indices;
+    std::vector<DexDeclaredField> static_fields, instance_fields;
+    std::vector<DexDeclaredMethod> direct_methods, virtual_methods;
+    bool operator==(const DexClassDefinition &) const = default;
+};
 // A lossless, bounded representation of DEX encoded_value. The raw payload
 // preserves the encoded scalar bits (floating point encodings are normalized
 // to their full 32/64-bit width); index-valued tags retain the referenced
@@ -101,6 +123,7 @@ struct DexHiddenApiFlag {
     bool operator==(const DexHiddenApiFlag &) const = default;
 };
 struct DexMetadata {
+    std::vector<DexClassDefinition> classes;
     std::vector<DexMethodDebug> methods;
     std::vector<DexMethodCode> code;
     std::vector<DexStaticValue> static_values;

@@ -789,6 +789,11 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         }
         return true;
     };
+    if (class_count > 250'000)
+        return Error{ErrorCode::resource_limit, "DEX class definitions exceed 250,000"};
+    std::vector<DexClassDefinition> decoded_classes;
+    decoded_classes.reserve(class_count);
+    std::uint64_t total_class_model_bytes = 0, total_class_interfaces = 0, total_class_members = 0;
     for(std::uint32_t ci=0;ci<class_count;++ci){
         if(stop.stop_requested())return Error{ErrorCode::canceled,"DEX class-data parsing canceled"};
         ids.seek(class_off+std::size_t(ci)*32);std::uint32_t class_type=0,access=0,super=0,interfaces=0,source_file=0,annotations=0,class_data=0,static_values=0;
@@ -799,6 +804,34 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
            (class_data&&(class_data<data_off||class_data>=data_end))||
            (static_values&&(static_values<data_off||static_values>=data_end)))
             return Error{ErrorCode::malformed,"DEX class_def data offset is outside the data section"};
+        DexClassDefinition class_definition;
+        class_definition.class_index = class_type;
+        class_definition.access_flags = access;
+        if (super != UINT32_MAX) class_definition.superclass_index = super;
+        if (source_file != UINT32_MAX) class_definition.source_file_index = source_file;
+        class_definition.class_data_offset = class_data;
+        if (interfaces) {
+            Reader interface_list{bytes.first(static_cast<std::size_t>(data_end))};
+            if (!interface_list.seek(interfaces)) return Error{ErrorCode::malformed, "DEX interface list offset is invalid"};
+            std::uint32_t count = 0;
+            if (!interface_list.u32(count) || count > max_items || !extent(interface_list.pos, count, 2, data_end))
+                return Error{ErrorCode::malformed, "DEX interface list extent is invalid"};
+            if (count > max_items - total_class_interfaces ||
+                std::uint64_t(count) > (64ull * 1024 * 1024 - total_class_model_bytes) / sizeof(std::uint32_t))
+                return Error{ErrorCode::resource_limit, "DEX class interface metadata exceeds one million rows or 64 MiB"};
+            total_class_interfaces += count;
+            total_class_model_bytes += std::uint64_t(count) * sizeof(std::uint32_t);
+            class_definition.interface_indices.reserve(count);
+            for (std::uint32_t i = 0; i < count; ++i) {
+                std::uint16_t type = 0;
+                if (!interface_list.u16(type) || type >= types.size())
+                    return Error{ErrorCode::malformed, "DEX interface type index is invalid"};
+                class_definition.interface_indices.push_back(type);
+            }
+        }
+        if (total_class_model_bytes > 64ull * 1024 * 1024 - sizeof(DexClassDefinition))
+            return Error{ErrorCode::resource_limit, "DEX class metadata exceeds 64 MiB"};
+        total_class_model_bytes += sizeof(DexClassDefinition);
         std::vector<std::uint32_t> static_field_indices;
         std::vector<std::uint32_t> declared_field_indices;
         std::vector<std::uint32_t> declared_method_indices;
@@ -818,6 +851,11 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
                 field_idx+=delta;
                 if(field_idx>=fields.size()||fields[field_idx].owner!=class_type)return Error{ErrorCode::malformed,"DEX encoded field index is invalid for its defining class"};
                 declared_field_indices.push_back(static_cast<std::uint32_t>(field_idx));
+                if (++total_class_members > max_items || total_class_model_bytes > 64ull * 1024 * 1024 - sizeof(DexDeclaredField))
+                    return Error{ErrorCode::resource_limit, "DEX declared member metadata exceeds one million rows or 64 MiB"};
+                total_class_model_bytes += sizeof(DexDeclaredField);
+                (group == 0 ? class_definition.static_fields : class_definition.instance_fields)
+                    .push_back({static_cast<std::uint32_t>(field_idx), flags});
                 class_member_order.push_back({DexHiddenApiMemberKind::field, static_cast<std::uint32_t>(field_idx)});
                 if(group==0)static_field_indices.push_back(static_cast<std::uint32_t>(field_idx));
             }
@@ -827,6 +865,11 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
             for(std::uint32_t n=0;n<count;++n){std::uint32_t delta=0,flags=0,code_off=0;if(!cd.uleb(delta)||!cd.uleb(flags)||!cd.uleb(code_off))return Error{ErrorCode::malformed,"Truncated DEX encoded method"};method_idx+=delta;
                 if(method_idx>=methods.size()||methods[method_idx].owner!=class_type)return Error{ErrorCode::malformed,"DEX encoded method index is invalid for its defining class"};
                 declared_method_indices.push_back(static_cast<std::uint32_t>(method_idx));
+                if (++total_class_members > max_items || total_class_model_bytes > 64ull * 1024 * 1024 - sizeof(DexDeclaredMethod))
+                    return Error{ErrorCode::resource_limit, "DEX declared member metadata exceeds one million rows or 64 MiB"};
+                total_class_model_bytes += sizeof(DexDeclaredMethod);
+                (group == 0 ? class_definition.direct_methods : class_definition.virtual_methods)
+                    .push_back({static_cast<std::uint32_t>(method_idx), flags, code_off});
                 class_member_order.push_back({DexHiddenApiMemberKind::method, static_cast<std::uint32_t>(method_idx)});
                 if(!code_off)continue;
                 if((code_off&3)||code_off<data_off||code_off>=std::uint64_t(data_off)+data_size||!extent(code_off,1,16,file_size))return Error{ErrorCode::malformed,"DEX code_item header offset is invalid"};
@@ -905,11 +948,13 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
                 hiddenapi_data_cursor = flags.pos - section_off;
             }
         }
+        decoded_classes.push_back(std::move(class_definition));
     }
     if (map.value().has_hiddenapi && hiddenapi_data_cursor != hiddenapi_size)
         return Error{ErrorCode::malformed, "DEX hidden API section size does not match its class flag streams"};
     if(code.size()>max_items)return Error{ErrorCode::resource_limit,"DEX defined method count exceeds address-space budget"};
     DexMetadata dex_metadata;
+    dex_metadata.classes = std::move(decoded_classes);
     dex_metadata.static_values = std::move(decoded_static_values);
     dex_metadata.method_handles = std::move(decoded_method_handles);
     dex_metadata.call_sites = std::move(decoded_call_sites);
