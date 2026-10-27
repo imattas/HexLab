@@ -152,6 +152,7 @@ if(HEXLAB_BUILD_NSIS_INSTALLER)
   set(CPACK_NSIS_PACKAGE_NAME "HexLab ${PROJECT_VERSION}")
   set(CPACK_NSIS_DISPLAY_NAME "HexLab ${PROJECT_VERSION}")
   set(CPACK_NSIS_MODIFY_PATH OFF)
+  set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
   set(CPACK_PACKAGE_EXECUTABLES "hexlab" "HexLab" "hexlab_cli" "HexLab CLI")
   set(CPACK_NSIS_MENU_LINKS
     "share/hexlab/docs/building.md" "Build and usage guide")

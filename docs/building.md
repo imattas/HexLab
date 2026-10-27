@@ -73,6 +73,8 @@ requires `makensis` on `PATH`; CPack creates an installable multi-file tree,
 Start Menu shortcuts for the GUI and CLI, a link to the build guide, and a
 Windows uninstall entry. The installer does not bundle the application into a
 single executable and does not launch HexLab automatically at the finish page.
+If it detects an earlier installation, it offers to uninstall that version
+before proceeding with the new install.
 The ZIP remains the default when this option is disabled.
 
 The `Windows release package` workflow builds the Release ZIP on Windows Server
