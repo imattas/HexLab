@@ -376,6 +376,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::vaddps)];
     }
     switch (op) {
+    case Opcode::ppc_mcrf: return "mcrf";
     case Opcode::ppc_ldbrx: return "ldbrx";
     case Opcode::ppc_stdbrx: return "stdbrx";
     case Opcode::ppc_rldicl: return "rldicl";
@@ -573,6 +574,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::pmaddwd: return "pmaddwd";
     case Opcode::pminub: return "pminub"; case Opcode::pmaxub: return "pmaxub";
     case Opcode::pminsw: return "pminsw"; case Opcode::pmaxsw: return "pmaxsw";
+    case Opcode::pavgb: return "pavgb"; case Opcode::pavgw: return "pavgw";
     case Opcode::phaddw: return "phaddw"; case Opcode::phaddd: return "phaddd";
     case Opcode::phaddsw: return "phaddsw"; case Opcode::phsubw: return "phsubw";
     case Opcode::phsubd: return "phsubd"; case Opcode::phsubsw: return "phsubsw";
@@ -728,6 +730,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         return "div";
     if (op == Opcode::idiv)
         return "idiv";
+    if (op == Opcode::lahf)
+        return "lahf";
     if (op == Opcode::bsf) return "bsf";
     if (op == Opcode::bsr) return "bsr";
     if (op == Opcode::bt) return "bt";

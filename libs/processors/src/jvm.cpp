@@ -69,7 +69,7 @@ DecodeResult decode_jvm(std::span<const std::byte> b, Address at) {
     std::string mnemonic(names[op]);
     if (op==0x10) { if(!need(1)) return fail(DecodeStatus::truncated,"truncated bipush"); imm(static_cast<std::uint8_t>(b[n]),8,true); ++n; }
     else if (op==0x11) { if(!need(2)) return fail(DecodeStatus::truncated,"truncated sipush"); imm(static_cast<std::uint16_t>(s16(b,n)),16,true); n+=2; }
-    else if (op>=0x12&&op<=0x14) { const auto width=op==0x12?1u:2u; if(!need(width)) return fail(DecodeStatus::truncated,"truncated ldc index"); imm(width==1?std::to_integer<std::uint8_t>(b[n]):u16(b,n),width*8); n+=width; }
+    else if (op>=0x12&&op<=0x14) { const auto width=op==0x12?1u:2u; if(!need(width)) return fail(DecodeStatus::truncated,"truncated ldc index"); const auto index=width==1?std::to_integer<std::uint8_t>(b[n]):u16(b,n); if(!index)return fail(DecodeStatus::invalid,"ldc constant-pool index must be nonzero"); imm(index,width*8); n+=width; }
     else if ((op>=0x15&&op<=0x19)||(op>=0x36&&op<=0x3a)||op==0xa9) { if(!need(1)) return fail(DecodeStatus::truncated,"truncated local index"); imm(std::to_integer<std::uint8_t>(b[n++]),8); }
     else if (op==0x84) { if(!need(2)) return fail(DecodeStatus::truncated,"truncated iinc"); imm(std::to_integer<std::uint8_t>(b[n]),8); imm(static_cast<std::uint8_t>(b[n+1]),8,true); n+=2; }
     else if (op>=0x99&&op<=0xa8) { if(!branch16()) return fail(need(2)?DecodeStatus::invalid:DecodeStatus::truncated,"invalid or truncated branch target"); flow=op==0xa7||op==0xa8?FlowKind::jump:FlowKind::conditional_branch; }
@@ -125,16 +125,16 @@ DecodeResult decode_jvm(std::span<const std::byte> b, Address at) {
         switch_table = std::move(parsed);
         direct=dest; flow=FlowKind::switch_dispatch;
     }
-    else if (op>=0xb2&&op<=0xb8) { if(!need(2)) return fail(DecodeStatus::truncated,"truncated constant-pool index"); imm(u16(b,n),16); n+=2; }
-    else if (op==0xb9||op==0xba) { if(!need(4)) return fail(DecodeStatus::truncated,"truncated invoke operand"); imm(u16(b,n),16); imm(std::to_integer<std::uint8_t>(b[n+2]),8); imm(std::to_integer<std::uint8_t>(b[n+3]),8); if(op==0xba&&(b[n+2]!=std::byte{0}||b[n+3]!=std::byte{0}))return fail(DecodeStatus::invalid,"invokedynamic reserved operands must be zero"); n+=4; }
-    else if (op==0xbb||op==0xbd||op==0xc0||op==0xc1) { if(!need(2)) return fail(DecodeStatus::truncated,"truncated type index"); imm(u16(b,n),16); n+=2; }
+    else if (op>=0xb2&&op<=0xb8) { if(!need(2)) return fail(DecodeStatus::truncated,"truncated constant-pool index"); const auto index=u16(b,n); if(!index)return fail(DecodeStatus::invalid,"field or method constant-pool index must be nonzero"); imm(index,16); n+=2; }
+    else if (op==0xb9||op==0xba) { if(!need(4)) return fail(DecodeStatus::truncated,"truncated invoke operand"); const auto index=u16(b,n); const auto count=std::to_integer<std::uint8_t>(b[n+2]); if(!index)return fail(DecodeStatus::invalid,"invoke constant-pool index must be nonzero"); if(op==0xb9&&(count==0||b[n+3]!=std::byte{0}))return fail(DecodeStatus::invalid,"invokeinterface count must be nonzero and its reserved operand must be zero"); if(op==0xba&&(b[n+2]!=std::byte{0}||b[n+3]!=std::byte{0}))return fail(DecodeStatus::invalid,"invokedynamic reserved operands must be zero"); imm(index,16); imm(count,8); imm(std::to_integer<std::uint8_t>(b[n+3]),8); n+=4; }
+    else if (op==0xbb||op==0xbd||op==0xc0||op==0xc1) { if(!need(2)) return fail(DecodeStatus::truncated,"truncated type index"); const auto index=u16(b,n); if(!index)return fail(DecodeStatus::invalid,"type constant-pool index must be nonzero"); imm(index,16); n+=2; }
     else if (op==0xbc) {
         if(!need(1)) return fail(DecodeStatus::truncated,"truncated newarray type");
         const auto type = std::to_integer<std::uint8_t>(b[n]);
         if (type < 4 || type > 11) return fail(DecodeStatus::invalid,"newarray has an invalid primitive type code");
         imm(type,8); ++n;
     }
-    else if (op==0xc5) { if(!need(3)) return fail(DecodeStatus::truncated,"truncated multianewarray"); imm(u16(b,n),16); imm(std::to_integer<std::uint8_t>(b[n+2]),8); n+=3; }
+    else if (op==0xc5) { if(!need(3)) return fail(DecodeStatus::truncated,"truncated multianewarray"); const auto index=u16(b,n); const auto dimensions=std::to_integer<std::uint8_t>(b[n+2]); if(!index||!dimensions)return fail(DecodeStatus::invalid,"multianewarray requires a nonzero class index and dimension count"); imm(index,16); imm(dimensions,8); n+=3; }
     else if(op==0xc4) {
         if(!need(1)) return fail(DecodeStatus::truncated,"truncated wide opcode");
         const auto nested=std::to_integer<std::uint8_t>(b[n++]);

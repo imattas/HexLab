@@ -31,6 +31,19 @@ This base metadata is independent of the later MiscInfo5 XSTATE feature map.
 See Microsoft's [`MINIDUMP_MISC_INFO`](https://learn.microsoft.com/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_misc_info)
 definition for field and flag semantics.
 
+The optional `ThreadInfoList` stream (type 17) retains raw dump flags/error and
+exit status, creation/exit/kernel/user times, thread start address, affinity,
+and each record's source offset. Times remain the raw 100-nanosecond values in
+the Windows structure. Entry IDs must be nonzero and unique; extensible header
+and record sizes are bounded to 4 KiB, records to 65,536, and retained rows
+share the 64 MiB metadata budget. The CLI prints at most 256 rows. The thread
+info table remains independent from `ThreadList` and `ThreadNames`; no join or
+thread-state inference is made. Unknown dump flag bits remain visible as raw
+metadata. See Microsoft's
+[`MINIDUMP_THREAD_INFO_LIST`](https://learn.microsoft.com/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_thread_info_list)
+and [`MINIDUMP_THREAD_INFO`](https://learn.microsoft.com/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_thread_info)
+definitions for field and flag semantics.
+
 Module CodeView records recognize bounded RSDS and NB10 identities. RSDS
 retains the 16-byte PDB GUID and age; NB10 retains its timestamp and age. Both
 retain the NUL-terminated PDB path as raw bytes because the format does not

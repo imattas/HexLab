@@ -222,23 +222,88 @@ RegisterReferenceFacts m6502_reference_facts(const Image *image, const Relocatio
     RegisterReferenceFacts result;
     if (!image)
         return result;
-    for (const auto &fact : functions.instructions) {
-        reference_detail::canceled(stop);
-        if (!fact || fact->instruction.context.architecture != Architecture::mos6502 ||
-            fact->instruction.context.mode != ExecutionMode::m6502 ||
-            fact->instruction.opcode != Opcode::m6502_jmp || fact->instruction.operands.size() != 1)
-            continue;
-        const auto *pointer = std::get_if<MemoryOperand>(&fact->instruction.operands.front());
-        if (!pointer || pointer->base || pointer->index || pointer->ip_relative || pointer->displacement < 0 ||
-            pointer->displacement > UINT16_MAX)
-            continue;
-        const Address slot{fact->instruction.address.space,
-                           static_cast<std::uint16_t>(pointer->displacement)};
-        const auto target = static_m6502_indirect_target(*image, relocations, slot);
-        if (!target)
-            continue;
-        result.memory_targets[{fact->id, 0}] = slot;
-        result.immediate_targets[{fact->id, 0}] = *target;
+    using KnownRegister = std::optional<std::pair<std::uint8_t, std::uint64_t>>;
+    for (const auto &block : functions.blocks) {
+        if (!block) continue;
+        KnownRegister accumulator, x, y;
+        for (const auto &fact : block->instructions) {
+            reference_detail::canceled(stop);
+            if (!fact || fact->instruction.context.architecture != Architecture::mos6502 ||
+                fact->instruction.context.mode != ExecutionMode::m6502)
+                continue;
+            const auto &instruction = fact->instruction;
+            const auto assign = [&](KnownRegister &destination, const KnownRegister &source) {
+                if (source) destination = std::pair{source->first, fact->id};
+                else destination.reset();
+            };
+            const auto immediate = [&]() -> std::optional<std::uint8_t> {
+                if (instruction.operands.size() != 1) return {};
+                const auto *value = std::get_if<ImmediateOperand>(&instruction.operands.front());
+                if (!value || value->encoded_width != 8 || value->effective_width != 8 || value->is_signed ||
+                    value->value > UINT8_MAX)
+                    return {};
+                return static_cast<std::uint8_t>(value->value);
+            };
+            if (instruction.opcode == Opcode::m6502_jmp && instruction.operands.size() == 1) {
+                const auto *pointer = std::get_if<MemoryOperand>(&instruction.operands.front());
+                if (pointer && !pointer->base && !pointer->index && !pointer->ip_relative &&
+                    pointer->displacement >= 0 && pointer->displacement <= UINT16_MAX) {
+                    const Address slot{instruction.address.space, static_cast<std::uint16_t>(pointer->displacement)};
+                    if (const auto target = static_m6502_indirect_target(*image, relocations, slot)) {
+                        result.memory_targets[{fact->id, 0}] = slot;
+                        result.immediate_targets[{fact->id, 0}] = *target;
+                    }
+                }
+            }
+            // Resolve absolute,X/Y operands only when the index register is
+            // known inside this basic block. Indirect zero-page forms have a
+            // one-byte encoded operand and are intentionally left unresolved.
+            for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
+                const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[i]);
+                if (!memory || memory->base || !memory->index || memory->ip_relative ||
+                    memory->displacement < 0 || memory->displacement > UINT16_MAX || !memory->displacement_encoding ||
+                    memory->displacement_encoding->size != 2 || memory->displacement_encoding->offset != 1)
+                    continue;
+                const auto &index = *memory->index;
+                if (index.bank != RegisterBank::mos6502 || index.width != 8 || index.index > 2 || index.index == 0)
+                    continue;
+                const auto &known = index.index == 1 ? x : y;
+                if (!known) continue;
+                const auto effective = static_cast<std::uint16_t>(
+                    (static_cast<std::uint16_t>(memory->displacement) + known->first) & UINT16_MAX);
+                result.memory_targets[{fact->id, static_cast<std::uint32_t>(i)}] =
+                    Address{instruction.address.space, effective};
+                result.producer_instruction_ids[{fact->id, static_cast<std::uint32_t>(i)}] = {known->second};
+            }
+            const auto value = immediate();
+            if (instruction.opcode == Opcode::m6502_lda && value) accumulator = std::pair{*value, fact->id};
+            else if (instruction.opcode == Opcode::m6502_ldx && value) x = std::pair{*value, fact->id};
+            else if (instruction.opcode == Opcode::m6502_ldy && value) y = std::pair{*value, fact->id};
+            else if (instruction.opcode == Opcode::m6502_tax) assign(x, accumulator);
+            else if (instruction.opcode == Opcode::m6502_tay) assign(y, accumulator);
+            else if (instruction.opcode == Opcode::m6502_txa) assign(accumulator, x);
+            else if (instruction.opcode == Opcode::m6502_tya) assign(accumulator, y);
+            else if (instruction.opcode == Opcode::m6502_inx || instruction.opcode == Opcode::m6502_dex ||
+                     instruction.opcode == Opcode::m6502_iny || instruction.opcode == Opcode::m6502_dey) {
+                auto &tracked = instruction.opcode == Opcode::m6502_inx || instruction.opcode == Opcode::m6502_dex ? x : y;
+                if (tracked) {
+                    tracked->first = static_cast<std::uint8_t>(tracked->first +
+                        (instruction.opcode == Opcode::m6502_inx || instruction.opcode == Opcode::m6502_iny ? 1 : -1));
+                    tracked->second = fact->id;
+                }
+            } else {
+                const auto invalidates = [&](const KnownRegister &tracked, KnownRegister &state) {
+                    if (!tracked) return;
+                    const RegisterOperand reg{RegisterBank::mos6502,
+                        static_cast<std::uint8_t>(&state == &accumulator ? 0 : &state == &x ? 1 : 2), 8, false};
+                    if (std::find(instruction.register_writes.begin(), instruction.register_writes.end(), reg) !=
+                        instruction.register_writes.end()) state.reset();
+                };
+                invalidates(accumulator, accumulator);
+                invalidates(x, x);
+                invalidates(y, y);
+            }
+        }
     }
     return result;
 }
@@ -4128,8 +4193,11 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                         }
                         else if (const auto m6502_target =
                                      m6502_facts.memory_targets.find({fact->id, static_cast<std::uint32_t>(i)});
-                                 m6502_target != m6502_facts.memory_targets.end())
+                                 m6502_target != m6502_facts.memory_targets.end()) {
                             expression.resolved_address = m6502_target->second;
+                            dataflow_target = m6502_facts.producer_instruction_ids.contains(
+                                {fact->id, static_cast<std::uint32_t>(i)});
+                        }
                         else if (const auto target = checked_ip_memory_target(instruction, *memory))
                             expression.resolved_address = target;
                         else if (memory->ip_relative)

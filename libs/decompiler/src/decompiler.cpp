@@ -707,6 +707,8 @@ std::string operation_name(Opcode opcode) {
     case Opcode::pmaxub: return "pmaxub";
     case Opcode::pminsw: return "pminsw";
     case Opcode::pmaxsw: return "pmaxsw";
+    case Opcode::pavgb: return "pavgb";
+    case Opcode::pavgw: return "pavgw";
     case Opcode::pshufd: return "pshufd";
     case Opcode::pshufb: return "pshufb";
     case Opcode::pcmpeqb: return "pcmpeqb";
@@ -1035,6 +1037,21 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
 
     const bool x86_context = instruction.context.architecture == Architecture::x86 ||
                              instruction.context.architecture == Architecture::x86_64;
+    if (x86_context && instruction.opcode == Opcode::lahf) {
+        const auto flags = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        const auto ah = std::find_if(instruction.register_writes.begin(), instruction.register_writes.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::gpr && reg.index == 0 &&
+                                             reg.width == 8 && reg.high_byte; });
+        if (flags != instruction.register_reads.end() && ah != instruction.register_writes.end()) {
+            auto value = std::make_shared<Expression>(Expression{integer_type(8),
+                UnaryValue{"x86_lahf", reg_expr(*flags)}});
+            Intrinsic effect{"lahf", {reg_expr(*flags)}, IntrinsicMemoryEffect::none};
+            effect.register_writes = {*ah};
+            effect.register_output_values = {std::move(value)};
+            return effect;
+        }
+    }
     if (x86_context && instruction.opcode == Opcode::bswap && operands.size() == 1) {
         const auto destination = as_register(instruction.operands.front());
         if (destination && destination->bank == RegisterBank::gpr &&
@@ -4125,11 +4142,11 @@ a64_unhandled:
         switch (opcode) {
         case Opcode::paddb: case Opcode::psubb: case Opcode::paddsb: case Opcode::paddusb:
         case Opcode::psubsb: case Opcode::psubusb: case Opcode::pcmpeqb: case Opcode::pcmpgtb:
-        case Opcode::pminub: case Opcode::pmaxub: case Opcode::pshufb: return 8;
+        case Opcode::pminub: case Opcode::pmaxub: case Opcode::pavgb: case Opcode::pshufb: return 8;
         case Opcode::paddw: case Opcode::psubw: case Opcode::paddsw: case Opcode::paddusw:
         case Opcode::psubsw: case Opcode::psubusw: case Opcode::pcmpeqw: case Opcode::pcmpgtw:
         case Opcode::psllw: case Opcode::psrlw: case Opcode::psraw: case Opcode::pmullw:
-        case Opcode::pmulhw: case Opcode::pmulhuw: case Opcode::pminsw: case Opcode::pmaxsw:
+        case Opcode::pmulhw: case Opcode::pmulhuw: case Opcode::pminsw: case Opcode::pmaxsw: case Opcode::pavgw:
         case Opcode::phaddw: case Opcode::phaddsw: case Opcode::phsubw: case Opcode::phsubsw: return 16;
         case Opcode::paddd: case Opcode::psubd: case Opcode::pcmpeqd: case Opcode::pcmpgtd:
         case Opcode::pslld: case Opcode::psrld: case Opcode::psrad: case Opcode::pmaddwd:
@@ -4152,7 +4169,7 @@ a64_unhandled:
         case Opcode::pcmpgtb: case Opcode::pcmpgtw: case Opcode::pcmpgtd:
         case Opcode::pmullw: case Opcode::pmulhw: case Opcode::pmulhuw: case Opcode::pmuludq:
         case Opcode::pmaddwd: case Opcode::pminub: case Opcode::pmaxub: case Opcode::pminsw:
-        case Opcode::pmaxsw: case Opcode::phaddw: case Opcode::phaddd: case Opcode::phaddsw:
+        case Opcode::pmaxsw: case Opcode::pavgb: case Opcode::pavgw: case Opcode::phaddw: case Opcode::phaddd: case Opcode::phaddsw:
         case Opcode::phsubw: case Opcode::phsubd: case Opcode::phsubsw: case Opcode::pshufb: return true;
         default: return false;
         }

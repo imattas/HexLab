@@ -142,6 +142,8 @@ bool simd(State &state, std::uint8_t opcode, bool extended) {
     case 0xde: operation = Opcode::pmaxub; prefix = PrefixForm::packed; break;
     case 0xea: operation = Opcode::pminsw; prefix = PrefixForm::packed; break;
     case 0xee: operation = Opcode::pmaxsw; prefix = PrefixForm::packed; break;
+    case 0xe0: operation = Opcode::pavgb; prefix = PrefixForm::packed; break;
+    case 0xe3: operation = Opcode::pavgw; prefix = PrefixForm::packed; break;
     case 0xd5: operation = Opcode::pmullw; prefix = PrefixForm::packed; break;
     case 0xe5: operation = Opcode::pmulhw; prefix = PrefixForm::packed; break;
     case 0xe4: operation = Opcode::pmulhuw; prefix = PrefixForm::packed; break;

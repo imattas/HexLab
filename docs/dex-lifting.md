@@ -32,10 +32,13 @@ lifts `iget`/`iput`, `sget`/`sput`, array loads/stores and `array-length`, the f
 invoke kinds and their `/range` forms, `move-result` variants, `new-instance`,
 `new-array`, `filled-new-array`, and `filled-new-array/range` as conservative
 memory-effect intrinsics. Filled-array instructions retain their type index and
-all encoded source registers; the following `move-result-object` remains an
-unknown reference because allocation result flow is not yet linked across
-instructions. `fill-array-data` retains the checked method-relative payload
-target and array reference as an opaque memory write; the array-data payload
+all encoded source registers. When `move-result-object` immediately follows in
+the same basic block, its destination is linked as an unknown 32-bit reference
+output of the allocation intrinsic; the element type and resulting array
+descriptor remain unresolved. `move-result` and `move-result-wide` after a
+filled-array instruction are rejected as malformed. `fill-array-data` retains
+the checked method-relative payload target and array reference as an opaque
+memory write; the array-data payload
 contents, element width, and range effects are not yet imported into the lifter.
 Object moves/returns,
 string/class constants, casts, instance tests, monitor operations, throws, and
@@ -66,10 +69,13 @@ The loader retains each prototype's compact return kind and each method ID's
 prototype index. A method-index invoke followed immediately in the same basic
 block by the matching `move-result`, `move-result-wide`, or
 `move-result-object` now writes a typed unknown call output to the destination
-register; the result-copy instruction becomes a no-op in the lifted IR.
+register; the result-copy instruction becomes a no-op in the lifted IR. The
+`filled-new-array` family also links an immediately following
+`move-result-object` to its unknown array-reference output without claiming an
+element type.
 Polymorphic calls use their encoded prototype index, and custom calls use the
 method-type value from a retained call-site array when available. Known void
-or incompatible return variants, non-invoke predecessors, noncontiguous
+or incompatible return variants, unrelated non-invoke predecessors, noncontiguous
 addresses, and block-split result copies fail closed. If return metadata is
 unavailable, the move-result destination remains an unknown value. This DEX
 subset does not yet resolve method/field identifiers to names or full

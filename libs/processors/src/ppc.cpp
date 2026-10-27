@@ -308,24 +308,35 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         const unsigned xo = (w >> 1) & 0x3ff;
         const unsigned bo = (w >> 21) & 31, bi = (w >> 16) & 31;
         const bool link = (w & 1) != 0;
-        if (xo != 16 && xo != 528)
+        if (xo == 0) {
+            const unsigned bf = rt >> 2, bfa = ra >> 2;
+            if ((rt & 3) || (ra & 3) || rb || rc)
+                return fail(DecodeStatus::invalid, "PowerPC MCRF has a reserved field set");
+            i.opcode = Opcode::ppc_mcrf;
+            i.operands = {cr(bf), cr(bfa)};
+            i.access = {OperandAccess::write, OperandAccess::read};
+            i.register_writes.push_back(cr(bf));
+            i.register_reads.push_back(cr(bfa));
+        } else if (xo != 16 && xo != 528)
             return fail(DecodeStatus::unsupported, "PowerPC opcode-19 instruction is outside the enabled branch subset");
-        const bool is_lr = xo == 16;
-        i.opcode = is_lr ? Opcode::ppc_bclr : Opcode::ppc_bcctr;
-        i.operands.emplace_back(ImmediateOperand{bo, 5, 5, false, {}});
-        i.operands.emplace_back(ImmediateOperand{bi, 5, 5, false, {}});
-        i.access = {OperandAccess::read, OperandAccess::read};
-        const bool ignore_cr = (bo & 0x10) != 0, ignore_ctr = (bo & 0x04) != 0;
-        if (!ignore_cr) { i.register_reads.push_back(cr(bi / 4)); i.operands.emplace_back(cr(bi / 4)); i.access.push_back(OperandAccess::read); }
-        if (is_lr) i.register_reads.push_back(lr(width));
-        else i.register_reads.push_back(ctr(width));
-        if (!ignore_ctr && is_lr) i.register_writes.push_back(ctr(width));
-        else if (!ignore_ctr && !is_lr)
-            return fail(DecodeStatus::invalid, "PowerPC BCCTR cannot decrement and test CTR");
-        i.flow = (!ignore_cr || !ignore_ctr) ? FlowKind::conditional_branch : (link ? FlowKind::call : FlowKind::jump);
-        if (is_lr && !link && ignore_cr && ignore_ctr && bi == 0)
-            i.flow = FlowKind::ret;
-        branch_link(i, link);
+        else {
+            const bool is_lr = xo == 16;
+            i.opcode = is_lr ? Opcode::ppc_bclr : Opcode::ppc_bcctr;
+            i.operands.emplace_back(ImmediateOperand{bo, 5, 5, false, {}});
+            i.operands.emplace_back(ImmediateOperand{bi, 5, 5, false, {}});
+            i.access = {OperandAccess::read, OperandAccess::read};
+            const bool ignore_cr = (bo & 0x10) != 0, ignore_ctr = (bo & 0x04) != 0;
+            if (!ignore_cr) { i.register_reads.push_back(cr(bi / 4)); i.operands.emplace_back(cr(bi / 4)); i.access.push_back(OperandAccess::read); }
+            if (is_lr) i.register_reads.push_back(lr(width));
+            else i.register_reads.push_back(ctr(width));
+            if (!ignore_ctr && is_lr) i.register_writes.push_back(ctr(width));
+            else if (!ignore_ctr && !is_lr)
+                return fail(DecodeStatus::invalid, "PowerPC BCCTR cannot decrement and test CTR");
+            i.flow = (!ignore_cr || !ignore_ctr) ? FlowKind::conditional_branch : (link ? FlowKind::call : FlowKind::jump);
+            if (is_lr && !link && ignore_cr && ignore_ctr && bi == 0)
+                i.flow = FlowKind::ret;
+            branch_link(i, link);
+        }
     } else if (op == 30) {
         if (!ppc64)
             return fail(DecodeStatus::unsupported, "PowerPC doubleword rotate requires PPC64 mode");

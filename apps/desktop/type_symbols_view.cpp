@@ -23,7 +23,6 @@
 #include <filesystem>
 #include <set>
 #include <system_error>
-#include <unordered_set>
 #include "hexlab/types/types.hpp"
 #include "hexlab/types/type_library.hpp"
 #include "hexlab/types/header_import.hpp"
@@ -135,35 +134,20 @@ Result<types::LibrarySourceIdentity> portable_source_identity(const ProjectSnaps
 }
 
 Result<bool> validate_portable_type_references(const types::LibraryBundle &bundle,
-                                              const database::UserState &destination) {
+                                              const database::UserState &destination,
+                                              bool validate_assignments) {
     std::set<std::string, std::less<>> available;
     for (const auto &row : destination.types) available.insert(row.name);
     for (const auto &entry : bundle.entries) available.insert(entry.name);
-    std::vector<const types::Type *> pending;
-    for (const auto &entry : bundle.entries) {
-        if (!entry.type) return Error{ErrorCode::malformed, "Type library contains an empty definition"};
-        pending.push_back(entry.type.get());
-    }
-    std::unordered_set<const types::Type *> visited;
-    while (!pending.empty()) {
-        const auto *type = pending.back();
-        pending.pop_back();
-        if (!type || !visited.insert(type).second) continue;
-        if (visited.size() > 262144)
-            return Error{ErrorCode::resource_limit, "Type library graph exceeds the 262,144-node limit"};
-        if (type->kind() == types::Kind::named_reference && !available.contains(type->name()))
-            return Error{ErrorCode::malformed, "Type library refers to missing definition " + type->name()};
-        if (type->element()) pending.push_back(type->element().get());
-        if (type->result_type()) pending.push_back(type->result_type().get());
-        for (const auto &member : type->members()) if (member.type) pending.push_back(member.type.get());
-        for (const auto &parameter : type->parameters()) if (parameter.type) pending.push_back(parameter.type.get());
-        for (const auto &method : type->methods()) {
-            if (method.signature) pending.push_back(method.signature.get());
-            if (method.this_type) pending.push_back(method.this_type.get());
-        }
-        for (const auto &member : type->static_data_members()) if (member.type) pending.push_back(member.type.get());
-    }
-    for (const auto &assignment : bundle.assignments)
+    // Keep the desktop import path on the same graph walker as the CLI. This
+    // includes less common nested edges such as virtual-base vbptr types and
+    // applies both node and edge budgets before the command is constructed.
+    auto graph = types::validate_library_references(bundle, available, 262144);
+    if (!graph) return graph.error();
+    // Assignments are ignored when the input/recipe identity differs. In that
+    // case definitions remain importable even if an old assignment names a
+    // type absent from the destination.
+    if (validate_assignments) for (const auto &assignment : bundle.assignments)
         if (assignment.type_name.empty() || !available.contains(assignment.type_name))
             return Error{ErrorCode::malformed, "Type assignment refers to missing definition " + assignment.type_name};
     return true;
@@ -222,10 +206,10 @@ void TypeSymbolsView::portable_type_library() {
     auto decoded = types::decode_library_bundle(bytes.value(), portable_type_library_limit);
     if (!decoded) { wxMessageBox(wxString::FromUTF8(decoded.error().message), "Type Library", wxOK | wxICON_ERROR, this); return; }
     auto &bundle = decoded.value();
-    auto graph = validate_portable_type_references(bundle, *project_->state->user);
-    if (!graph) { wxMessageBox(wxString::FromUTF8(graph.error().message), "Type Library", wxOK | wxICON_ERROR, this); return; }
     const auto current_identity = portable_source_identity(*project_);
     const bool identity_matches = current_identity && bundle.source_identity && *bundle.source_identity == current_identity.value();
+    auto graph = validate_portable_type_references(bundle, *project_->state->user, identity_matches);
+    if (!graph) { wxMessageBox(wxString::FromUTF8(graph.error().message), "Type Library", wxOK | wxICON_ERROR, this); return; }
     const std::size_t skipped_assignments = identity_matches ? 0 : bundle.assignments.size();
     std::map<std::string, const database::TypeDefinition *, std::less<>> existing;
     for (const auto &row : project_->state->user->types) existing.emplace(row.name, &row);

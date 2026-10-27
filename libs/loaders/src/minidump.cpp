@@ -9,7 +9,8 @@ namespace {
 constexpr std::uint32_t stream_thread_list = 3, stream_module_list = 4,
     stream_memory_list = 5, stream_exception = 6, stream_system_info = 7,
     stream_memory64_list = 9, stream_unloaded_module_list = 14,
-    stream_misc_info = 15, stream_memory_info = 16, stream_thread_names = 24;
+    stream_misc_info = 15, stream_memory_info = 16, stream_thread_info = 17,
+    stream_thread_names = 24;
 constexpr std::uint64_t max_streams = 4096, max_memory_regions = 131072,
     max_modules = 65536, max_threads = 65536, max_metadata_bytes = 64u * 1024u * 1024u;
 constexpr std::uint64_t max_decoded_contexts = 4096;
@@ -165,7 +166,8 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                     return existing.type == row.type && (row.type == stream_thread_list || row.type == stream_module_list ||
                         row.type == stream_memory_list || row.type == stream_exception || row.type == stream_system_info ||
                         row.type == stream_memory64_list || row.type == stream_unloaded_module_list ||
-                        row.type == stream_misc_info || row.type == stream_memory_info || row.type == stream_thread_names);
+                        row.type == stream_misc_info || row.type == stream_memory_info ||
+                        row.type == stream_thread_info || row.type == stream_thread_names);
                 }) != streams.end())
                 return Error{ErrorCode::malformed, "Minidump contains duplicate standard streams"};
             streams.push_back(row);
@@ -587,6 +589,62 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
             std::sort(metadata.thread_names.begin(), metadata.thread_names.end(), [](const auto &left, const auto &right) {
                 return left.thread_id < right.thread_id;
             });
+            budget += count * row_cost;
+        }
+
+        if (auto info = stream(stream_thread_info)) {
+            constexpr std::size_t header_size_min = 12;
+            constexpr std::size_t entry_size_min = 64;
+            constexpr std::size_t max_record_size = 4096;
+            if (info->size < header_size_min)
+                return Error{ErrorCode::malformed, "Minidump ThreadInfoList stream header is truncated"};
+            auto header = read(*storage, info->rva, header_size_min);
+            if (!header) return header.error();
+            const auto header_size = u(header.value().bytes, 0, 4);
+            const auto entry_size = u(header.value().bytes, 4, 4);
+            const auto count = u(header.value().bytes, 8, 4);
+            if (header_size < header_size_min || header_size > max_record_size || header_size > info->size ||
+                entry_size < entry_size_min || entry_size > max_record_size ||
+                count > (info->size - header_size) / entry_size)
+                return Error{ErrorCode::malformed, "Minidump ThreadInfoList header or entries are invalid"};
+            if (count > max_threads)
+                return Error{ErrorCode::resource_limit, "Minidump thread-info count exceeds its limit"};
+            constexpr std::size_t row_cost = sizeof(MinidumpThreadInfo) + sizeof(std::uint32_t);
+            if (budget > max_metadata_bytes || count > (max_metadata_bytes - budget) / row_cost)
+                return Error{ErrorCode::resource_limit, "Minidump thread-info metadata exceeds its byte budget"};
+            const auto table_size = header_size + count * entry_size;
+            if (table_size > max_metadata_bytes)
+                return Error{ErrorCode::resource_limit, "Minidump ThreadInfoList byte extent exceeds its validation budget"};
+            auto bytes = read(*storage, info->rva, static_cast<std::size_t>(table_size));
+            if (!bytes) return bytes.error();
+            metadata.thread_info.reserve(static_cast<std::size_t>(count));
+            std::vector<std::uint32_t> thread_ids;
+            thread_ids.reserve(static_cast<std::size_t>(count));
+            for (std::uint64_t i = 0; i < count; ++i) {
+                if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump thread-info decoding canceled"};
+                const auto at = static_cast<std::size_t>(header_size + i * entry_size);
+                MinidumpThreadInfo row;
+                row.thread_id = static_cast<std::uint32_t>(u(bytes.value().bytes, at, 4));
+                row.dump_flags = static_cast<std::uint32_t>(u(bytes.value().bytes, at + 4, 4));
+                row.dump_error = static_cast<std::uint32_t>(u(bytes.value().bytes, at + 8, 4));
+                row.exit_status = static_cast<std::uint32_t>(u(bytes.value().bytes, at + 12, 4));
+                row.create_time = u(bytes.value().bytes, at + 16, 8);
+                row.exit_time = u(bytes.value().bytes, at + 24, 8);
+                row.kernel_time = u(bytes.value().bytes, at + 32, 8);
+                row.user_time = u(bytes.value().bytes, at + 40, 8);
+                row.start_address = u(bytes.value().bytes, at + 48, 8);
+                row.affinity = u(bytes.value().bytes, at + 56, 8);
+                row.record_file_offset = FileOffset{std::uint64_t{info->rva} + at};
+                if (!row.thread_id)
+                    return Error{ErrorCode::malformed, "Minidump ThreadInfoList has a zero thread ID"};
+                thread_ids.push_back(row.thread_id);
+                metadata.thread_info.push_back(std::move(row));
+            }
+            std::sort(thread_ids.begin(), thread_ids.end());
+            if (std::adjacent_find(thread_ids.begin(), thread_ids.end()) != thread_ids.end())
+                return Error{ErrorCode::malformed, "Minidump ThreadInfoList has duplicate thread IDs"};
+            std::sort(metadata.thread_info.begin(), metadata.thread_info.end(),
+                      [](const auto &a, const auto &b) { return a.thread_id < b.thread_id; });
             budget += count * row_cost;
         }
 

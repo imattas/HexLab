@@ -797,34 +797,55 @@ Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const F
             if (op >= 0x0a && op <= 0x0c) {
                 if (!previous_instruction || previous_instruction->address.space.value != instruction.address.space.value ||
                     previous_instruction->address.offset > UINT64_MAX - previous_instruction->length ||
-                    previous_instruction->address.offset + previous_instruction->length != instruction.address.offset ||
-                    !dex_invoke_opcode(static_cast<std::uint8_t>(unit(*previous_instruction, 0) & 0xff)))
-                    return Error{ErrorCode::malformed, "DEX move-result is not immediately adjacent to an invoke in the same basic block"};
-                auto shape = call_result_shape(*previous_instruction, metadata);
-                if (!shape) return shape.error();
-                if (shape.value().known) {
-                    const bool matches = op == 0x0a
-                        ? (shape.value().type.kind == TypeKind::integer || shape.value().type.kind == TypeKind::floating) &&
-                          shape.value().type.bits == 32
-                        : op == 0x0b ? shape.value().type.bits == 64
-                        : shape.value().type.kind == TypeKind::pointer && shape.value().type.bits == 32;
-                    if (shape.value().is_void || !matches)
-                        return Error{ErrorCode::malformed, "DEX move-result variant does not match the invoked prototype return type"};
+                    previous_instruction->address.offset + previous_instruction->length != instruction.address.offset)
+                    return Error{ErrorCode::malformed, "DEX move-result is not immediately adjacent to a result producer in the same basic block"};
+                const auto previous_op = static_cast<std::uint8_t>(unit(*previous_instruction, 0) & 0xff);
+                const bool filled_array = previous_op == 0x24 || previous_op == 0x25;
+                if (filled_array) {
+                    if (op != 0x0c)
+                        return Error{ErrorCode::malformed, "DEX filled-new-array must be followed by move-result-object"};
                     if (block.instructions.empty() || block.instructions.back().origin.address != previous_instruction->address)
-                        return Error{ErrorCode::malformed, "DEX move-result cannot be linked to the preceding invoke statement"};
-                    auto *call = std::get_if<Intrinsic>(&block.instructions.back().statement);
-                    if (!call)
-                        return Error{ErrorCode::malformed, "DEX invoke did not lift to a result-bearing intrinsic"};
+                        return Error{ErrorCode::malformed, "DEX move-result-object cannot be linked to the preceding filled-new-array"};
+                    auto *allocation = std::get_if<Intrinsic>(&block.instructions.back().statement);
+                    if (!allocation || !allocation->name.starts_with("dex_filled_new_array_type@"))
+                        return Error{ErrorCode::malformed, "DEX filled-new-array did not lift to a result-bearing intrinsic"};
                     const auto destination_index = static_cast<std::uint16_t>(first >> 8);
-                    if (shape.value().type.bits == 64 && destination_index >= 255)
-                        return Error{ErrorCode::malformed, "DEX wide move-result register pair exceeds the typed register model"};
                     const RegisterOperand destination{RegisterBank::dex_vreg,
-                        static_cast<std::uint8_t>(destination_index), shape.value().type.bits, false};
-                    call->register_writes.push_back(destination);
-                    call->register_output_values.push_back(unknown_value(shape.value().type,
-                        "DEX invocation result for immediately following move-result"));
-                    call->result_type = shape.value().type;
+                        static_cast<std::uint8_t>(destination_index), 32, false};
+                    allocation->register_writes.push_back(destination);
+                    allocation->register_output_values.push_back(unknown_value(pointer32(),
+                        "DEX filled-new-array result with unresolved element type"));
+                    allocation->result_type = pointer32();
                     statement.value() = Statement{Intrinsic{"dex_move_result_link", {}, IntrinsicMemoryEffect::none}};
+                } else if (dex_invoke_opcode(previous_op)) {
+                    auto shape = call_result_shape(*previous_instruction, metadata);
+                    if (!shape) return shape.error();
+                    if (shape.value().known) {
+                        const bool matches = op == 0x0a
+                            ? (shape.value().type.kind == TypeKind::integer || shape.value().type.kind == TypeKind::floating) &&
+                              shape.value().type.bits == 32
+                            : op == 0x0b ? shape.value().type.bits == 64
+                            : shape.value().type.kind == TypeKind::pointer && shape.value().type.bits == 32;
+                        if (shape.value().is_void || !matches)
+                            return Error{ErrorCode::malformed, "DEX move-result variant does not match the invoked prototype return type"};
+                        if (block.instructions.empty() || block.instructions.back().origin.address != previous_instruction->address)
+                            return Error{ErrorCode::malformed, "DEX move-result cannot be linked to the preceding invoke statement"};
+                        auto *call = std::get_if<Intrinsic>(&block.instructions.back().statement);
+                        if (!call)
+                            return Error{ErrorCode::malformed, "DEX invoke did not lift to a result-bearing intrinsic"};
+                        const auto destination_index = static_cast<std::uint16_t>(first >> 8);
+                        if (shape.value().type.bits == 64 && destination_index >= 255)
+                            return Error{ErrorCode::malformed, "DEX wide move-result register pair exceeds the typed register model"};
+                        const RegisterOperand destination{RegisterBank::dex_vreg,
+                            static_cast<std::uint8_t>(destination_index), shape.value().type.bits, false};
+                        call->register_writes.push_back(destination);
+                        call->register_output_values.push_back(unknown_value(shape.value().type,
+                            "DEX invocation result for immediately following move-result"));
+                        call->result_type = shape.value().type;
+                        statement.value() = Statement{Intrinsic{"dex_move_result_link", {}, IntrinsicMemoryEffect::none}};
+                    }
+                } else {
+                    return Error{ErrorCode::malformed, "DEX move-result is not immediately adjacent to an invoke or filled-new-array in the same basic block"};
                 }
             }
             ExpressionPtr divisor;

@@ -2,6 +2,7 @@
 
 #include "hexlab/processors/instruction.hpp"
 #include "hexlab/processors/x64_semantics.hpp"
+#include <algorithm>
 #include <optional>
 #include <bit>
 #include <type_traits>
@@ -26,6 +27,25 @@ inline bool x86_context(const Instruction &instruction) noexcept {
            instruction.context.architecture == Architecture::x86_64;
 }
 } // namespace x64_instruction_semantics_detail
+
+// LAHF copies the defined arithmetic-status subset into AH, forces bit 1,
+// and clears bits 3 and 5. Other FLAGS bits are not represented in AH.
+inline std::uint8_t evaluate_x86_lahf(std::uint64_t flags) noexcept {
+    return static_cast<std::uint8_t>(0x02u | (flags & 0xd5u));
+}
+
+inline std::optional<std::uint8_t> evaluate_x86_lahf_instruction(const Instruction &instruction,
+                                                                 std::uint64_t flags) noexcept {
+    if (!x64_instruction_semantics_detail::x86_context(instruction) || instruction.opcode != Opcode::lahf)
+        return std::nullopt;
+    const bool reads_flags = std::any_of(instruction.register_reads.begin(), instruction.register_reads.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+    const bool writes_ah = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::gpr && reg.index == 0 &&
+                                         reg.width == 8 && reg.high_byte; });
+    if (!reads_flags || !writes_ah) return std::nullopt;
+    return evaluate_x86_lahf(flags);
+}
 
 // Evaluate LOOP/LOOPE/LOOPNE/JCXZ-family control flow using a decoded
 // instruction. `counter` is the pre-instruction CX/ECX/RCX value.

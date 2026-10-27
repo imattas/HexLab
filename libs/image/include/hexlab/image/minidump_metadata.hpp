@@ -47,6 +47,14 @@ struct MinidumpThreadName {
     FileOffset record_file_offset{}, string_file_offset{};
     bool operator==(const MinidumpThreadName &) const = default;
 };
+struct MinidumpThreadInfo {
+    std::uint32_t thread_id = 0, dump_flags = 0, dump_error = 0, exit_status = 0;
+    std::uint64_t create_time = 0, exit_time = 0, kernel_time = 0, user_time = 0;
+    std::uint64_t start_address = 0, affinity = 0;
+    // File offset of the extensible MINIDUMP_THREAD_INFO row.
+    FileOffset record_file_offset{};
+    bool operator==(const MinidumpThreadInfo &) const = default;
+};
 struct MinidumpRegister {
     std::string name;
     std::uint64_t value = 0;
@@ -115,6 +123,7 @@ struct MinidumpMetadata {
     std::vector<MinidumpUnloadedModule> unloaded_modules;
     std::vector<MinidumpThread> threads;
     std::vector<MinidumpThreadName> thread_names;
+    std::vector<MinidumpThreadInfo> thread_info;
     std::optional<MinidumpException> exception;
     std::optional<MinidumpProcessInfo> process_info;
     std::vector<std::string> diagnostics;
