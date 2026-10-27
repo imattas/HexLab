@@ -276,11 +276,8 @@ DwarfEmbeddedPackageResolvers read_dwp_resolvers(const ByteStorage &storage, con
         std::sort(package->type_signatures.begin(), package->type_signatures.end());
     }
 
-    if (package->index && package->type_index && package->index->version != package->type_index->version)
-        throw Failure{{ErrorCode::unsupported, "DWARF CU and TU package indexes use different versions"}};
-
     const auto package_version = package->index ? package->index->version : package->type_index->version;
-    const std::vector<std::pair<std::uint32_t, std::string_view>> names = package_version == 2
+    std::vector<std::pair<std::uint32_t, std::string_view>> names = package_version == 2
         ? std::vector<std::pair<std::uint32_t, std::string_view>>{
             {1, ".debug_info.dwo"}, {2, ".debug_types.dwo"}, {3, ".debug_abbrev.dwo"},
             {4, ".debug_line.dwo"}, {5, ".debug_loc.dwo"}, {6, ".debug_str_offsets.dwo"},
@@ -289,6 +286,37 @@ DwarfEmbeddedPackageResolvers read_dwp_resolvers(const ByteStorage &storage, con
             {1, ".debug_info.dwo"}, {3, ".debug_abbrev.dwo"}, {4, ".debug_line.dwo"},
             {5, ".debug_loclists.dwo"}, {6, ".debug_str_offsets.dwo"}, {7, ".debug_macro.dwo"},
             {8, ".debug_rnglists.dwo"}, {9, ".debug_addr.dwo"}};
+    const auto indexed_section_name=[](std::uint32_t version,std::uint32_t id)->std::optional<std::string_view>{
+        if(version==2){
+            switch(id){
+            case 1:return ".debug_info.dwo"; case 2:return ".debug_types.dwo";
+            case 3:return ".debug_abbrev.dwo"; case 4:return ".debug_line.dwo";
+            case 5:return ".debug_loc.dwo"; case 6:return ".debug_str_offsets.dwo";
+            case 7:return ".debug_macinfo.dwo"; case 8:return ".debug_macro.dwo";
+            default:return {};
+            }
+        }
+        if(version==5){
+            switch(id){
+            case 1:return ".debug_info.dwo"; case 3:return ".debug_abbrev.dwo";
+            case 4:return ".debug_line.dwo"; case 5:return ".debug_loclists.dwo";
+            case 6:return ".debug_str_offsets.dwo"; case 7:return ".debug_macro.dwo";
+            case 8:return ".debug_rnglists.dwo"; case 9:return ".debug_addr.dwo";
+            default:return {};
+            }
+        }
+        return {};
+    };
+    if (package->type_index) {
+        for(const auto id:package->type_index->section_ids){
+            const auto type_name=indexed_section_name(package->type_index->version,id);
+            const auto selected_name=package->index?indexed_section_name(package_version,id):type_name;
+            require(type_name.has_value(),"DWP TU index uses an unsupported section ID",ErrorCode::unsupported);
+            if(selected_name&&*selected_name!=*type_name)
+                throw Failure{{ErrorCode::unsupported,"Mixed-version DWP indexes assign different meanings to a shared section ID"}};
+            if(!selected_name)names.emplace_back(id,*type_name);
+        }
+    }
     // RELA offsets in a DWP refer to the containing ELF section, not to an
     // individual CU/TU contribution. Keep full package-section buffers and
     // apply relocations before the package resolver slices contributions.

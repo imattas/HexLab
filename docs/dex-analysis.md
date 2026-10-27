@@ -26,8 +26,15 @@ For DEX 038 and later, method-handle entries are validated for kind, reserved
 fields, and referenced field/method indexes. Call-site entries are decoded as
 bounded encoded arrays; the required bootstrap handle, name string, and method
 type values are checked in order, along with every encoded value's table
-references. Bootstrap execution, linking semantics, and dynamic call-site
-resolution are not performed.
+references. `DexMetadata::method_handles` retains kind, member index, and item
+file offset. `DexMetadata::call_sites` retains each item's file offset and all
+ordered encoded values, including the bootstrap tuple and trailing arguments.
+The tables are capped at one million rows; encoded values share the loader's
+250,000-node and 64 MiB limits. Bootstrap execution, linking semantics, and
+dynamic call-site resolution are not performed. These records are available
+through the public loaded-image metadata model; there is no separate database
+serializer for DEX metadata, so project reopen reparses the source through its
+loader recipe rather than restoring these records from a metadata blob.
 The interpreter validates register, string, type, and code-address references,
 requires an `end_sequence`, and caps each program at two million opcodes and
 the aggregate retained debug metadata at two million rows/64 MiB. Multi-member

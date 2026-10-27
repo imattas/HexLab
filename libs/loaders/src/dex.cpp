@@ -372,6 +372,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         if(!ids.u16(m.owner)||!ids.u16(m.proto)||!ids.u32(m.name)||m.owner>=types.size()||m.proto>=protos.size()||m.name>=strings.size())return Error{ErrorCode::malformed,"DEX method_id contains an invalid index"};
         methods.push_back(m);
     }
+    std::vector<DexMethodHandle> decoded_method_handles;
+    decoded_method_handles.reserve(map.value().method_handle_count);
     for (std::uint32_t i = 0; i < map.value().method_handle_count; ++i) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX method-handle parsing canceled"};
         Reader handle{bytes};
@@ -382,6 +384,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
             kind > 8 || unused0 || unused1 ||
             (kind <= 3 ? member >= fields.size() : member >= methods.size()))
             return Error{ErrorCode::malformed, "DEX method_handle_item has invalid reserved fields, kind, or member index"};
+        decoded_method_handles.push_back({kind, member,
+            std::uint64_t(map.value().method_handle_off) + std::uint64_t(i) * 8});
     }
     auto method_name=[&](std::uint32_t idx){
         const auto&m=methods[idx]; const auto&p=protos[m.proto]; std::string out=types[m.owner]+"->"+strings[m.name]+"(";
@@ -389,6 +393,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
     };
     std::vector<Code> code;
     std::vector<DexStaticValue> decoded_static_values;
+    std::vector<DexCallSite> decoded_call_sites;
+    decoded_call_sites.reserve(map.value().call_site_count);
     std::vector<DexAnnotationItem> decoded_annotations;
     std::vector<DexAnnotationLink> annotation_links;
     std::unordered_map<std::uint32_t, std::uint32_t> annotation_item_indices;
@@ -535,13 +541,18 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
             return Error{ErrorCode::malformed, "DEX call_site_item must contain its bootstrap handle, name, and method type"};
         if (value_count > 250'000 || value_count > 250'000 - total_encoded_value_nodes)
             return Error{ErrorCode::resource_limit, "DEX call_site_item values exceed the encoded-value budget"};
+        DexCallSite call_site;
+        call_site.file_offset = item_off;
+        call_site.values.reserve(value_count);
         for (std::uint32_t value_index=0; value_index<value_count; ++value_index) {
             auto value = decode_encoded_value(item, UINT32_MAX, 0);
             if (!value) return value.error();
             const auto expected_type = value_index == 0 ? 0x16 : value_index == 1 ? 0x17 : value_index == 2 ? 0x15 : 0xff;
             if (value_index < 3 && value.value().type != expected_type)
                 return Error{ErrorCode::malformed, "DEX call_site_item bootstrap arguments have invalid encoded_value types"};
+            call_site.values.push_back(std::move(value.value()));
         }
+        decoded_call_sites.push_back(std::move(call_site));
     }
     std::function<Result<std::uint32_t>(std::uint32_t)> read_annotation_item;
     read_annotation_item = [&](std::uint32_t offset) -> Result<std::uint32_t> {
@@ -832,6 +843,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
     if(code.size()>max_items)return Error{ErrorCode::resource_limit,"DEX defined method count exceeds address-space budget"};
     DexMetadata dex_metadata;
     dex_metadata.static_values = std::move(decoded_static_values);
+    dex_metadata.method_handles = std::move(decoded_method_handles);
+    dex_metadata.call_sites = std::move(decoded_call_sites);
     dex_metadata.annotations = std::move(decoded_annotations);
     dex_metadata.annotation_links = std::move(annotation_links);
     dex_metadata.code.reserve(code.size());

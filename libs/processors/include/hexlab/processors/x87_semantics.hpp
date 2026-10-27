@@ -143,8 +143,8 @@ struct X87AddSubtractRequest {
     std::uint16_t status_word = 0;
 };
 // Evaluate binary80 FADD/FSUB finite, signed-zero, infinity, and NaN operands
-// with x87 precision control and exception masks. Reserved PC and gradual-
-// underflow results fail closed.
+// with x87 precision control, gradual underflow, and exception masks. Reserved
+// PC settings or unrepresentable rounding cases fail closed.
 HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
 evaluate_x87_add_subtract(const X87AddSubtractRequest &request) noexcept;
 

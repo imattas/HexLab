@@ -477,7 +477,7 @@ std::optional<X87ArithmeticResult> round_add_sub_result(
 
     X87ArithmeticResult result;
     result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
-    if (inexact && increment) result.status_word |= fsw_c1;
+    if (inexact && (negative != increment)) result.status_word |= fsw_c1;
     const bool overflow = exponent >= 0x7fff;
     if (overflow) {
         result.overflow = true;
@@ -498,7 +498,58 @@ std::optional<X87ArithmeticResult> round_add_sub_result(
         }
         return result;
     }
-    if (exponent <= 0) return {}; // gradual-underflow rounding is deliberately unsupported for now
+    if (exponent <= 0) {
+        // `extended` carries the normalized significand plus three low GRS
+        // bits. Shift it directly to the binary80 subnormal quantum, then
+        // account for PC by discarding additional low bits in the same single
+        // rounding operation. Earlier operand alignment already jams every
+        // bit below the GRS window into bit zero, which remains in `sticky`.
+        const int precision_shift = exponent + 63 - static_cast<int>(precision);
+        const unsigned subnormal_discard = precision_shift > 0
+            ? static_cast<unsigned>(precision_shift) : 0;
+        const int signed_shift = 4 - exponent + static_cast<int>(subnormal_discard);
+        if (signed_shift <= 0 || signed_shift >= 128) return {};
+        const auto shift = static_cast<unsigned>(signed_shift);
+        std::uint64_t subnormal_retained = 0;
+        if (shift < 64)
+            subnormal_retained = (extended.lo >> shift) | (extended.hi << (64 - shift));
+        else if (shift == 64)
+            subnormal_retained = extended.hi;
+        else
+            subnormal_retained = extended.hi >> (shift - 64);
+        const bool subnormal_guard = wide_bit(extended, shift - 1);
+        const bool subnormal_sticky = shift > 1 && wide_any_below(extended, shift - 1);
+        const bool subnormal_inexact = subnormal_guard || subnormal_sticky;
+        const bool subnormal_increment = round_up(negative,
+            static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10),
+            subnormal_retained, subnormal_guard, subnormal_sticky);
+        if (subnormal_increment) ++subnormal_retained;
+        const auto fraction = subnormal_retained << subnormal_discard;
+        const bool rounded_to_normal = (fraction & integer_bit) != 0;
+        const bool tiny = !rounded_to_normal;
+
+        result.status_word &= static_cast<std::uint16_t>(~fsw_c1);
+        result.precision = subnormal_inexact;
+        result.underflow = tiny && (subnormal_inexact ||
+            (request.control_word & fcw_underflow_mask) == 0);
+        if (subnormal_inexact) result.status_word |= fsw_precision;
+        if (subnormal_inexact && (negative != subnormal_increment)) result.status_word |= fsw_c1;
+        if (result.underflow) result.status_word |= fsw_underflow;
+
+        if (result.underflow && (request.control_word & fcw_underflow_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_underflow);
+            result.completed = false;
+            return result;
+        }
+        result.value = rounded_to_normal
+            ? X87Binary80{integer_bit, static_cast<std::uint16_t>(1 | (negative ? sign_mask : 0))}
+            : X87Binary80{fraction, static_cast<std::uint16_t>(negative ? sign_mask : 0)};
+        if (subnormal_inexact && (request.control_word & fcw_precision_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_precision);
+            result.completed = false;
+        }
+        return result;
+    }
     if (inexact) result.status_word |= fsw_precision;
     result.precision = inexact;
     result.value = X87Binary80{rounded_significand,
