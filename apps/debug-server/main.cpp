@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -393,6 +394,8 @@ struct ServerState {
     bool target_exited = false;
     bool libraries_supported = false;
     std::optional<std::string> libraries_snapshot;
+    bool threads_xml_supported = false;
+    std::optional<std::string> threads_xml_snapshot;
     bool memory_map_supported = false;
     std::optional<std::string> memory_map_snapshot;
 };
@@ -525,6 +528,23 @@ std::string libraries_xml(const std::vector<hexlab::debugger::ModuleInfo>& modul
     }
     xml += "</library-list>";
     return xml.size() <= 1024 * 1024 ? xml : std::string{};
+}
+std::string threads_xml(const std::vector<hexlab::debugger::ThreadInfo>& threads) {
+    if (threads.size() > hexlab::debugger::max_inspection_threads) return {};
+    std::string xml = "<?xml version=\"1.0\"?><threads>";
+    std::set<ThreadId> seen;
+    for (const auto& thread : threads) {
+        if (!thread.id || !seen.insert(thread.id).second || thread.name.size() > 32 * 1024) return {};
+        if (std::any_of(thread.name.begin(), thread.name.end(), [](unsigned char c) {
+                return c < 0x20 && c != '\t' && c != '\r' && c != '\n';
+            })) return {};
+        xml += "<thread id=\"" + hex_u64(thread.id) + "\"";
+        if (!thread.name.empty()) xml += " name=\"" + xml_escape(thread.name) + "\"";
+        xml += "/>";
+        if (xml.size() > max_memory_map_xml) return {};
+    }
+    xml += "</threads>";
+    return xml.size() <= max_memory_map_xml ? xml : std::string{};
 }
 std::string memory_map_xml(std::vector<hexlab::debugger::MemoryRegion> regions) {
     if (regions.empty() || regions.size() > hexlab::debugger::max_inspection_memory_regions) return {};
@@ -815,6 +835,14 @@ std::string handle_command(ServerState& state, std::string_view command, bool& c
             modules.value().size() <= hexlab::debugger::max_inspection_modules;
         state.libraries_snapshot.reset();
         if (state.libraries_supported) features += ";qXfer:libraries:read+";
+        auto threads = state.session.threads();
+        state.threads_xml_snapshot.reset();
+        if (threads) {
+            auto xml = threads_xml(threads.value());
+            if (!xml.empty()) state.threads_xml_snapshot = std::move(xml);
+        }
+        state.threads_xml_supported = state.threads_xml_snapshot.has_value();
+        if (state.threads_xml_supported) features += ";qXfer:threads:read+";
         auto regions = state.session.memory_regions();
         state.memory_map_snapshot.reset();
         if (regions) {
@@ -898,6 +926,31 @@ std::string handle_command(ServerState& state, std::string_view command, bool& c
         const bool more = offset + amount < xml.size();
         if (!more) state.libraries_snapshot.reset();
         return std::string(more ? "m" : "l") + xml.substr(static_cast<std::size_t>(offset), static_cast<std::size_t>(amount));
+    }
+    if (command.starts_with("qXfer:threads:read::")) {
+        if (!state.threads_xml_supported) return {};
+        const auto range = command.substr(std::string_view("qXfer:threads:read::").size());
+        const auto comma = range.find(','); std::uint64_t offset{}, length{};
+        if (comma == std::string_view::npos || !parse_u64(range.substr(0, comma), offset) ||
+            !parse_u64(range.substr(comma + 1), length) || !length || length > max_packet - 2 ||
+            offset > max_memory_map_xml) return "E01";
+        if (offset == 0 || !state.threads_xml_snapshot) {
+            auto threads = state.session.threads();
+            if (!threads) return "E01";
+            auto xml = threads_xml(threads.value());
+            if (xml.empty()) return "E01";
+            state.threads_xml_snapshot = std::move(xml);
+        }
+        const auto& xml = *state.threads_xml_snapshot;
+        if (offset >= xml.size()) return "l";
+        // PacketSize=2000 is 8 KiB. Reserve a marker and worst-case escaping
+        // for every XML byte returned to the peer.
+        const auto amount = std::min<std::uint64_t>({length, max_memory - 1,
+            xml.size() - static_cast<std::size_t>(offset)});
+        const bool more = offset + amount < xml.size();
+        if (!more) state.threads_xml_snapshot.reset();
+        return std::string(more ? "m" : "l") +
+            xml.substr(static_cast<std::size_t>(offset), static_cast<std::size_t>(amount));
     }
     if (command.starts_with("qXfer:memory-map:read::")) {
         if (!state.memory_map_supported) return {};

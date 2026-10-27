@@ -78,6 +78,19 @@ inline void minidump_description(std::ostream &out, const ImageMetadata &metadat
     }
     if (dump.threads.size() > count)
         out << "  (" << dump.threads.size() - count << " additional threads omitted from CLI summary)\n";
+    constexpr std::size_t max_thread_info = 256;
+    const auto thread_info_count = std::min(dump.thread_info.size(), max_thread_info);
+    for (std::size_t i = 0; i < thread_info_count; ++i) {
+        const auto &thread = dump.thread_info[i];
+        out << "  Thread info " << thread.thread_id << " flags=0x" << std::hex << thread.dump_flags
+            << " error=0x" << thread.dump_error << " exit-status=0x" << thread.exit_status
+            << " start=0x" << thread.start_address << " affinity=0x" << thread.affinity << std::dec
+            << " create-100ns=" << thread.create_time << " exit-100ns=" << thread.exit_time
+            << " kernel-100ns=" << thread.kernel_time << " user-100ns=" << thread.user_time
+            << " record-file=0x" << std::hex << thread.record_file_offset.value << std::dec << '\n';
+    }
+    if (dump.thread_info.size() > thread_info_count)
+        out << "  (" << dump.thread_info.size() - thread_info_count << " additional thread-info records omitted from CLI summary)\n";
     constexpr std::size_t max_modules = 256;
     const auto module_count = std::min(dump.modules.size(), max_modules);
     for (std::size_t i = 0; i < module_count; ++i) {

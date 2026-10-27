@@ -53,7 +53,7 @@ inline bool supported(Opcode opcode) noexcept {
     case Opcode::pshufb:
     case Opcode::pminub: case Opcode::pmaxub: case Opcode::pminsw: case Opcode::pmaxsw:
     case Opcode::pmullw: case Opcode::pmulhw: case Opcode::pmulhuw:
-    case Opcode::pmuludq: case Opcode::pmaddwd:
+    case Opcode::pmuludq: case Opcode::pmaddwd: case Opcode::pavgb: case Opcode::pavgw:
         return true;
     default: return false;
     }
@@ -113,7 +113,7 @@ inline std::optional<X86Sse2PackedIntegerResult> evaluate_x86_sse2_packed_intege
     case Opcode::psubsw: case Opcode::psubusw: case Opcode::pcmpeqw: case Opcode::pcmpgtw:
     case Opcode::psllw: case Opcode::psrlw: case Opcode::psraw:
     case Opcode::pminsw: case Opcode::pmaxsw: case Opcode::pmullw: case Opcode::pmulhw:
-    case Opcode::pmulhuw:
+    case Opcode::pmulhuw: case Opcode::pavgw:
     case Opcode::phaddw: case Opcode::phaddsw: case Opcode::phsubw: case Opcode::phsubsw:
         lane_bits = 16; break;
     case Opcode::phaddd: case Opcode::phsubd:
@@ -122,7 +122,7 @@ inline std::optional<X86Sse2PackedIntegerResult> evaluate_x86_sse2_packed_intege
     case Opcode::pmaddwd: lane_bits = 32; break;
     case Opcode::paddb: case Opcode::psubb: case Opcode::paddsb: case Opcode::paddusb:
     case Opcode::psubsb: case Opcode::psubusb: case Opcode::pcmpeqb: case Opcode::pcmpgtb:
-    case Opcode::pminub: case Opcode::pmaxub:
+    case Opcode::pminub: case Opcode::pmaxub: case Opcode::pavgb:
         lane_bits = 8; break;
     default: break;
     }
@@ -218,6 +218,7 @@ inline std::optional<X86Sse2PackedIntegerResult> evaluate_x86_sse2_packed_intege
             value = (a - b) & lane_mask;
         else if (op == Opcode::pminub) value = std::min(a, b);
         else if (op == Opcode::pmaxub) value = std::max(a, b);
+        else if (op == Opcode::pavgb || op == Opcode::pavgw) value = (a + b + 1) >> 1;
         else if (op == Opcode::pminsw || op == Opcode::pmaxsw) {
             const auto signed_a = signed_lane(a, 16);
             const auto signed_b = signed_lane(b, 16);

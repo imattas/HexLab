@@ -35,6 +35,13 @@ and held stable across continuation chunks. Paths are XML-escaped, the module
 count is capped at 4,096, and the total annex is capped at 1 MiB; the RSP client
 decodes predefined and numeric XML entities in library attributes. Backends
 without module enumeration omit this feature from `qSupported`.
+When thread enumeration returns a representable snapshot, the server also
+advertises `qXfer:threads:read` and returns the standard `<threads>` XML object
+with each thread's hexadecimal ID and optional XML-escaped name. The snapshot
+uses the same 4,096-thread and 1 MiB bounds, stays stable across continuation
+chunks, and rejects duplicate/zero IDs or XML control characters. Thread
+enumeration remains available through `qfThreadInfo`/`qsThreadInfo` regardless
+of whether the XML form can be advertised.
 The server supports `Z1` hardware execute breakpoints on Windows x86/x64 and
 Linux x86-64 targets, and advertises `hwbreak+` only for those combinations.
 It also routes `Z2`/`Z3`/`Z4` write/read/access watchpoints through the native

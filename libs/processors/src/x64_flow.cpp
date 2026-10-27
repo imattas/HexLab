@@ -97,6 +97,11 @@ bool stack_flow(State &s, std::uint8_t opcode, bool extended) {
         s.i.mnemonic_override = "sahf";
         s.i.register_reads.push_back({RegisterBank::gpr, 0, 8, true});
         s.i.register_writes.push_back({RegisterBank::flags, 0, s.rules.pointer_width(), false});
+    } else if (opcode == 0x9f) {
+        // LAHF copies SF/ZF/AF/PF/CF to AH and leaves FLAGS unchanged.
+        s.i.opcode = Opcode::lahf;
+        s.i.register_reads.push_back({RegisterBank::flags, 0, s.rules.pointer_width(), false});
+        s.i.register_writes.push_back({RegisterBank::gpr, 0, 8, true});
     } else if (opcode == 0xc8) {
         const auto width = s.stack_width();
         std::optional<EncodedField> allocation_field, level_field;

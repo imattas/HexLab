@@ -14,6 +14,13 @@ The accumulator sign-extension encodings `98` and `99` now expose their implicit
 
 `66` selects the legacy alternate width; in long mode the default is 32 bits, `66` selects 16 bits, and `REX.W` selects 64 bits. These instructions do not write flags.
 
+`LAHF` (`9F`) is decoded as a typed status transfer in 16-, 32-, and 64-bit
+contexts. It reads the mode-width FLAGS value and writes only AH. The decoded
+instruction evaluator returns SF/ZF/AF/PF/CF in their matching AH bit positions,
+forces bit 1, and clears bits 3 and 5; all other FLAGS bits are ignored. The
+decompiler retains the transfer as an `lahf` intrinsic with an explicit AH
+output value. Runtime CPU-feature availability for LAHF/SAHF is not checked.
+
 The regression suites check rendered operands, mode-dependent widths and addresses, typed register and memory effects, REX/high-byte interactions, LOCK validity, and every truncation of each fixture. Invalid, truncated, unsupported, and display-only results remain distinct. This coverage addition does not imply complete x86 ISA coverage; vector, system, privileged, and other unimplemented forms still require separate decoder work.
 
 The typed stack-frame family now includes `PUSHF`/`POPF`, `PUSHA`/`POPA` (and 32-bit `PUSHAD`/`POPAD`), and `ENTER`. Stack value width follows each execution mode's operand-size rules independently of stack-address width. PUSHA/POPA retain their eight-slot effects and the architecturally discarded saved-SP slot; ENTER retains both encoded immediates and records nested frame-chain reads while masking the nesting level to five bits. PUSHA/POPA are rejected in long mode. These are decoded facts; privileged flag filtering and full runtime stack/memory execution remain outside this decoder slice.

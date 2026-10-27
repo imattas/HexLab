@@ -11,6 +11,7 @@ families:
 | Packed integer shifts | Variable-count and immediate-count `psllw/d/q`, `psrlw/d/q`, `psraw/d` |
 | Packed integer compare | `pcmpeqb/w/d`, `pcmpgtb/w/d` |
 | Packed integer multiply/min/max | `pmullw`, `pmulhw`, `pmulhuw`, `pmuludq`, `pmaddwd`, `pminub`, `pmaxub`, `pminsw`, `pmaxsw` |
+| Packed integer rounded average | `pavgb`, `pavgw` |
 | SSSE3 horizontal integer arithmetic | `phaddw/d/sw`, `phsubw/d/sw` |
 | Packed integer shuffle | `pshufd` with its encoded byte selector; SSSE3 `pshufb` |
 | Scalar moves | `movss`, `movsd` |
@@ -103,6 +104,14 @@ multiply-add to dwords, signed/unsigned byte/word min/max, and `pshufd` lane
 selection. `pmaddwd` and `pmuludq` retain distinct input and output lane shapes;
 `pshufd` keeps the unsigned selector as an 8-bit scalar. These new forms have
 compile-only evidence and no fixture coverage yet.
+
+Legacy SSE2 `PAVGB` and `PAVGW` compute `(a + b + 1) >> 1` independently for
+unsigned byte and word lanes. They use destructive XMM destinations with a
+register or 128-bit memory source, do not change EFLAGS, and lift to unsigned
+8-bit or 16-bit lane intrinsics. The pure packed-integer evaluator also
+computes the exact rounded lane results; CPU feature gating remains outside
+the decoder. The encoding and rounding operation follow Intel's `PAVGB/PAVGW`
+instruction reference ([Intel SDM](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf)).
 
 The currently decoded AVX subset lifts VEX.128 and VEX.256 `vmovups`,
 `vaddps/pd`, `vsubps/pd`, `vmulps/pd`, `vdivps/pd`, `vxorps/pd`, and `vandps/pd` into typed

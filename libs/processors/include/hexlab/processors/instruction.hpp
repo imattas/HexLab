@@ -492,7 +492,13 @@ enum class Opcode {
     // NMOS 6502 undocumented AND-immediate aliases; appended for stable IDs.
     m6502_anc,
     // RISC-V Zifencei instruction-cache synchronization.
-    rv_fence_i
+    rv_fence_i,
+    // x86 LAHF copies the architecturally selected status flags into AH.
+    lahf,
+    // SSE2 unsigned rounded averages; append to preserve persisted opcode IDs.
+    pavgb, pavgw,
+    // PowerPC condition-register field copy; append for persisted IDs.
+    ppc_mcrf
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

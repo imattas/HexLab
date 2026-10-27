@@ -253,6 +253,20 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         i.opcode == Opcode::ppc_bclr || i.opcode == Opcode::ppc_bcctr)
         return lift_control(i, width, before);
 
+    if (i.opcode == Opcode::ppc_mcrf) {
+        const auto *destination = ops.size() == 2 ? std::get_if<R>(&ops[0]) : nullptr;
+        const auto *source = ops.size() == 2 ? std::get_if<R>(&ops[1]) : nullptr;
+        const auto valid_field = [](const R *field) {
+            return field && field->bank == RegisterBank::ppc_cr && field->width == 4 && field->index < 8;
+        };
+        if (!valid_field(destination) || !valid_field(source) ||
+            i.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read} ||
+            i.register_writes != std::vector<R>{*destination} ||
+            i.register_reads != std::vector<R>{*source} || i.memory_read || i.memory_write)
+            return effect(i, "ppc_malformed_mcrf");
+        return Assign{*destination, reg(*source)};
+    }
+
     if (const auto vmx = vmx_operation(i.opcode)) {
         const auto *left = ops.size() == 3 ? std::get_if<R>(&ops[1]) : nullptr;
         const auto *right = ops.size() == 3 ? std::get_if<R>(&ops[2]) : nullptr;

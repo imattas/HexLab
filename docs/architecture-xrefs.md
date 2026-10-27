@@ -50,6 +50,8 @@ PPC32/PPC64 facts use the active mode's exact GPR and address width. `ADDI`/`ADD
 
 Absolute unindexed memory operands produce read, write, or read/write references according to the instruction effect. Indexed expressions remain unresolved when the effective address depends on runtime register values. `JMP ($addr)` reads its two-byte pointer from readable, file-backed memory only when neither byte overlaps relocation data; the decoded reference points to the pointer slot, while the jump reference points to the destination only when it is mapped executable code. The NMOS page-boundary behavior is modeled: a pointer at `$xxFF` reads its high byte from `$xx00`. `JMP` and `JSR` absolute forms retain their decoded direct targets. Runtime-written pointers, relocation-covered pointer bytes, unmapped operands, and non-executable destinations remain unresolved.
 
+Within a recovered basic block, immediate `LDX`/`LDY` values and known `TAX`/`TAY`/`TXA`/`TYA` transfers propagate through `INX`/`DEX`/`INY`/`DEY`. Absolute indexed memory operands resolve when the corresponding X or Y value is known; 16-bit effective-address wrap is applied, and the target still has to pass the ordinary mapping and permission checks. Facts reset at block boundaries, and memory-loaded indexes, zero-page indexed operands, and indexed-indirect pointer modes remain unresolved.
+
 ## Conservative boundaries
 
 For all supported architecture families, permission failures and incomplete target ranges remain unresolved. Unsupported addressing modes, runtime-dependent registers, and unresolved pointer values retain their expression where available instead of generating speculative incoming references.
