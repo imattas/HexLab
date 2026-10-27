@@ -814,28 +814,34 @@ Result<std::optional<std::string>> Client::read_feature_annex(std::string_view a
 Result<std::optional<std::string>> Client::read_libraries_annex(std::size_t limit, std::size_t chunk, std::stop_token stop) {
     if (limit == 0 || limit > 1024 * 1024 || chunk == 0 || chunk > 64 * 1024 || chunk > max_packet_ / 2)
         return Error{ErrorCode::invalid_argument, "invalid RSP libraries annex bounds"};
-    std::string result;
-    for (std::size_t offset = 0; offset <= limit;) {
-        const auto request_size = std::min(chunk, limit - std::min(offset, limit));
-        if (offset == limit && request_size == 0) return Error{ErrorCode::resource_limit, "RSP libraries annex exceeds configured limit"};
-        auto response = transact("qXfer:libraries:read::" + hex_u64(offset) + "," + hex_u64(request_size), stop);
-        if (!response) return response.error();
-        if (response.value().empty()) {
-            if (offset == 0) return std::optional<std::string>{};
-            return Error{ErrorCode::malformed, "RSP libraries annex ended without final marker"};
+    auto read_object = [&](std::string_view object) -> Result<std::optional<std::string>> {
+        std::string result;
+        for (std::size_t offset = 0; offset <= limit;) {
+            const auto request_size = std::min(chunk, limit - std::min(offset, limit));
+            if (offset == limit && request_size == 0)
+                return Error{ErrorCode::resource_limit, "RSP libraries annex exceeds configured limit"};
+            auto response = transact("qXfer:" + std::string(object) + ":read::" + hex_u64(offset) + "," + hex_u64(request_size), stop);
+            if (!response) return response.error();
+            if (response.value().empty()) {
+                if (offset == 0) return std::optional<std::string>{};
+                return Error{ErrorCode::malformed, "RSP libraries annex ended without final marker"};
+            }
+            const char marker = response.value().front();
+            if (marker != 'm' && marker != 'l') return Error{ErrorCode::malformed, "invalid RSP libraries annex marker"};
+            const auto count = response.value().size() - 1;
+            if (count > request_size || count > limit - result.size())
+                return Error{ErrorCode::resource_limit, "RSP libraries annex chunk exceeds configured limit"};
+            result.append(response.value().data() + 1, count);
+            if (marker == 'l') return std::optional<std::string>(std::move(result));
+            if (count == 0 || offset > std::numeric_limits<std::size_t>::max() - count)
+                return Error{ErrorCode::malformed, "RSP libraries annex made no progress"};
+            offset += count;
         }
-        const char marker = response.value().front();
-        if (marker != 'm' && marker != 'l') return Error{ErrorCode::malformed, "invalid RSP libraries annex marker"};
-        const auto count = response.value().size() - 1;
-        if (count > request_size || count > limit - result.size())
-            return Error{ErrorCode::resource_limit, "RSP libraries annex chunk exceeds configured limit"};
-        result.append(response.value().data() + 1, count);
-        if (marker == 'l') return std::optional<std::string>(std::move(result));
-        if (count == 0 || offset > std::numeric_limits<std::size_t>::max() - count)
-            return Error{ErrorCode::malformed, "RSP libraries annex made no progress"};
-        offset += count;
-    }
-    return Error{ErrorCode::resource_limit, "RSP libraries annex exceeds configured limit"};
+        return Error{ErrorCode::resource_limit, "RSP libraries annex exceeds configured limit"};
+    };
+    auto standard = read_object("libraries");
+    if (!standard || standard.value()) return standard;
+    return read_object("libraries-svr4");
 }
 Result<std::optional<std::string>> Client::read_memory_map_annex(std::size_t limit, std::size_t chunk, std::stop_token stop) {
     if (limit == 0 || limit > 1024 * 1024 || chunk == 0 || chunk > 64 * 1024 || chunk > max_packet_ / 2)

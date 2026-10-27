@@ -735,8 +735,11 @@ Result<std::vector<ModuleInfo>> parse_libraries_xml(std::string_view xml) {
             if (modules.size() >= max_inspection_modules) return Error{ErrorCode::resource_limit, "remote module count exceeds limit"};
             const auto path = attrs.find("name"); if (path == attrs.end() || path->second.empty()) return Error{ErrorCode::malformed, "library has no name"};
             auto base = std::uint64_t{};
-            if (const auto addr = attrs.find("text_addr"); addr != attrs.end() && !parse_hex_value(addr->second, base))
-                return Error{ErrorCode::malformed, "invalid library text_addr"};
+            const auto text_addr = attrs.find("text_addr");
+            const auto load_addr = attrs.find("l_addr");
+            const auto address = text_addr != attrs.end() ? text_addr : load_addr;
+            if (address != attrs.end() && !parse_hex_value(address->second, base))
+                return Error{ErrorCode::malformed, "invalid library load address"};
             auto display = path->second;
             const auto slash = display.find_last_of("/\\"); if (slash != std::string::npos) display.erase(0, slash + 1);
             modules.push_back({std::move(display), path->second, base, 0});
@@ -1133,7 +1136,9 @@ public:
             }
         }
         const auto libraries = features.value().features.find("qXfer:libraries:read");
-        libraries_advertised_ = libraries != features.value().features.end() && libraries->second != "-";
+        const auto libraries_svr4 = features.value().features.find("qXfer:libraries-svr4:read");
+        libraries_advertised_ = (libraries != features.value().features.end() && libraries->second != "-") ||
+                                (libraries_svr4 != features.value().features.end() && libraries_svr4->second != "-");
         const auto memory_map = features.value().features.find("qXfer:memory-map:read");
         memory_map_advertised_ = memory_map != features.value().features.end() && memory_map->second != "-";
         const auto threads_xml = features.value().features.find("qXfer:threads:read");
@@ -1799,9 +1804,9 @@ public:
     }
     Result<std::vector<ModuleInfo>> modules() override {
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
-        if (!libraries_advertised_) return unsupported("remote did not advertise qXfer:libraries:read");
+        if (!libraries_advertised_) return unsupported("remote did not advertise a shared-library qXfer object");
         auto xml = client_->read_libraries_annex(); if (!xml) return xml.error();
-        if (!xml.value()) return unsupported("remote advertised qXfer:libraries:read but returned no libraries annex");
+        if (!xml.value()) return unsupported("remote advertised shared-library transfer but returned no libraries annex");
         return parse_libraries_xml(*xml.value());
     }
     Result<std::vector<ProcessInfo>> processes() override {

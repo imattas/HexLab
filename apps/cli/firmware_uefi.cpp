@@ -324,6 +324,12 @@ int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &
                         << " vendor-code-offset=" << hex_value(item.vendor_code_offset);
                     if (item.image_header_version >= 2) out << " hardware-instance=" << hex_value(item.hardware_instance);
                     if (item.image_header_version >= 3) out << " image-capsule-support=" << hex_value(item.image_capsule_support);
+                    if (item.authentication_present)
+                        out << " authentication=pkcs7 monotonic-count=" << hex_value(item.authentication_monotonic_count)
+                            << " certificate-offset=" << hex_value(item.authentication_certificate_offset)
+                            << " certificate-size=" << hex_value(item.authentication_certificate_size)
+                            << " certificate-data-offset=" << hex_value(item.authentication_certificate_data_offset)
+                            << " certificate-data-size=" << hex_value(item.authentication_certificate_data_size);
                 }
                 out << '\n';
                 write_embedded_volumes(out, item, "    ");
@@ -360,6 +366,12 @@ int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &
                             << " vendor-code-offset=" << hex_value(item.vendor_code_offset);
                         if (item.image_header_version >= 2) out << " hardware-instance=" << hex_value(item.hardware_instance);
                         if (item.image_header_version >= 3) out << " image-capsule-support=" << hex_value(item.image_capsule_support);
+                        if (item.authentication_present)
+                            out << " authentication=pkcs7 monotonic-count=" << hex_value(item.authentication_monotonic_count)
+                                << " certificate-offset=" << hex_value(item.authentication_certificate_offset)
+                                << " certificate-size=" << hex_value(item.authentication_certificate_size)
+                                << " certificate-data-offset=" << hex_value(item.authentication_certificate_data_offset)
+                                << " certificate-data-size=" << hex_value(item.authentication_certificate_data_size);
                     }
                     out << '\n';
                     write_embedded_volumes(out, item, "    ");

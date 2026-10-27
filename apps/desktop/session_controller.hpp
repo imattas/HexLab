@@ -40,6 +40,8 @@ class SessionController final : public wxEvtHandler {
     Result<bool> prune_backups(DocumentId, std::size_t retain);
     Result<bool> restore_backup(std::filesystem::path source, std::filesystem::path destination,
                                 bool replace = false, AnalysisOptions = {});
+    Result<bool> restore_backup_in_place(std::filesystem::path source, std::filesystem::path target,
+                                         AnalysisOptions = {});
     Result<ProjectOperationId> export_binary(DocumentId, std::filesystem::path, bool replace = false);
     Result<bool> find(DocumentId, SearchQuery, const SearchLimits & = {});
     Result<bool> find_all(SearchQuery, const SearchLimits & = {});
@@ -88,6 +90,7 @@ class SessionController final : public wxEvtHandler {
         AnalysisOptions options;
         std::shared_ptr<std::stop_source> cancellation;
         std::future<Result<database::SavedProject>> result;
+        bool in_place = false;
     };
     std::optional<BackupRestore> backup_restore_;
     using BackupManagementResult = std::variant<database::BackupRotationResult, database::BackupListing,

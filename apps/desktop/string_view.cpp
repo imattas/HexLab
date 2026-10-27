@@ -36,6 +36,9 @@ wxString encoding_text(StringEncoding encoding) {
     case StringEncoding::windows1258: return "Windows-1258";
     case StringEncoding::iso8859_2: return "ISO-8859-2";
     case StringEncoding::iso8859_5: return "ISO-8859-5";
+    case StringEncoding::dos437: return "DOS-437";
+    case StringEncoding::dos850: return "DOS-850";
+    case StringEncoding::iso8859_15: return "ISO-8859-15";
     }
     return "unknown";
 }

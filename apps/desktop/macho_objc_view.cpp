@@ -75,7 +75,15 @@ void add_property(std::vector<MachOObjCViewRow> &rows, const MachOObjCProperty &
     add(rows, std::move(kind), owner, value(property.name),
         "name=" + property.name_status + "; attributes=" + property.attributes_status + "; type=" + property.type_status,
         "property entry " + number(property.entry.offset),
-        "attributes=" + value(property.attributes) + "; encoding=" + value(property.type_encoding), property.entry);
+        "attributes=" + value(property.attributes) + "; encoding=" + value(property.type_encoding) +
+            "; semantics=" + property.attribute_semantics_status +
+            "; readonly=" + (property.readonly ? "yes" : "no") +
+            "; memory=" + (property.copy ? "copy" : property.strong ? "strong" : property.weak ? "weak" : "default") +
+            "; atomicity=" + (property.nonatomic ? "nonatomic" : "atomic/default") +
+            "; dynamic=" + (property.dynamic ? "yes" : "no") +
+            "; getter=" + property.custom_getter.value_or("default") +
+            "; setter=" + property.custom_setter.value_or("default") +
+            "; backing-ivar=" + property.backing_ivar.value_or("unspecified"), property.entry);
 }
 
 void add_ivar(std::vector<MachOObjCViewRow> &rows, const MachOObjCIvar &ivar, const std::string &owner) {

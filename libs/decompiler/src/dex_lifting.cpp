@@ -101,6 +101,42 @@ Result<DexCallResultShape> call_result_shape(const Instruction &instruction, con
     return Error{ErrorCode::malformed, "DEX prototype has an invalid retained return kind"};
 }
 
+Result<std::optional<std::uint32_t>> call_parameter_word_count(const Instruction &instruction,
+                                                               const DexMetadata *metadata) {
+    if (!metadata || metadata->prototype_parameter_word_counts.empty()) return std::optional<std::uint32_t>{};
+    const auto first = unit(instruction, 0);
+    const auto op = static_cast<std::uint8_t>(first & 0xff);
+    std::optional<std::uint32_t> proto_index;
+    bool receiver = false;
+    if ((op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78)) {
+        const auto method_index = unit(instruction, 1);
+        if (method_index >= metadata->method_prototype_indices.size())
+            return Error{ErrorCode::malformed, "DEX invoke method index is outside retained method metadata"};
+        proto_index = metadata->method_prototype_indices[method_index];
+        receiver = op != 0x71 && op != 0x77;
+    } else if (op == 0xfa || op == 0xfb) {
+        proto_index = unit(instruction, 3);
+        receiver = true;
+    } else if (op == 0xfc || op == 0xfd) {
+        const auto call_site_index = unit(instruction, 1);
+        if (call_site_index >= metadata->call_sites.size())
+            return Error{ErrorCode::malformed, "DEX invoke-custom call-site index is outside retained metadata"};
+        const auto &site = metadata->call_sites[call_site_index];
+        if (site.values.size() < 3 || site.values[2].type != 0x15 || site.values[2].payload > UINT32_MAX)
+            return std::optional<std::uint32_t>{};
+        proto_index = static_cast<std::uint32_t>(site.values[2].payload);
+    } else return std::optional<std::uint32_t>{};
+    if (*proto_index >= metadata->prototype_parameter_word_counts.size())
+        return Error{ErrorCode::malformed, "DEX invoke prototype index is outside retained metadata"};
+    auto expected = metadata->prototype_parameter_word_counts[*proto_index];
+    if (receiver) {
+        if (expected == UINT32_MAX)
+            return Error{ErrorCode::malformed, "DEX invoke argument word count overflows"};
+        ++expected;
+    }
+    return std::optional<std::uint32_t>{expected};
+}
+
 bool dex_invoke_opcode(std::uint8_t op) {
     return (op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78) ||
            (op >= 0xfa && op <= 0xfd);
@@ -747,6 +783,17 @@ Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const F
             // alongside the normal arithmetic result in the lifted block.
             const auto first = unit(instruction, 0);
             const auto op = static_cast<std::uint8_t>(first & 0xff);
+            if ((op >= 0x6e && op <= 0x78) || (op >= 0xfa && op <= 0xfd)) {
+                auto expected_words = call_parameter_word_count(instruction, metadata);
+                if (!expected_words) return expected_words.error();
+                if (expected_words.value()) {
+                    const auto encoded_words = (op == 0xfb || op == 0xfd || (op >= 0x74 && op <= 0x78))
+                        ? static_cast<std::uint32_t>(first >> 8)
+                        : static_cast<std::uint32_t>((first >> 12) & 15);
+                    if (encoded_words != *expected_words.value())
+                        return Error{ErrorCode::malformed, "DEX invoke register-word count does not match the retained prototype"};
+                }
+            }
             if (op >= 0x0a && op <= 0x0c) {
                 if (!previous_instruction || previous_instruction->address.space.value != instruction.address.space.value ||
                     previous_instruction->address.offset > UINT64_MAX - previous_instruction->length ||

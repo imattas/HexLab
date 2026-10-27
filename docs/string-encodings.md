@@ -79,10 +79,22 @@ persisted encoding value is 16, and derived-cache version 31 recomputes older
 payloads. These are heuristic byte interpretations rather than language
 classification.
 
+DOS code pages 437 and 850 add fixed OEM candidates for text originating in
+legacy PC software. Their high-byte mappings use the Unicode Consortium's
+[CP437 mapping table](https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/PC/CP437.TXT)
+and [CP850 mapping table](https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/PC/CP850.TXT).
+ISO-8859-15 adds the Latin-9 repertoire, including the euro and replacement
+characters, using the Unicode Consortium's
+[8859-15 mapping table](https://www.unicode.org/Public/MAPPINGS/ISO8859/8859-15.TXT).
+All three use the same printable-scalar splitter and require at least one
+non-ASCII scalar. The DOS and ISO mappings are heuristic, can overlap other
+candidates, and do not classify a file's locale. Their persisted encoding
+values are 17, 18, and 19; derived-cache version 32 recomputes older payloads.
+
 `hexlab_cli disassemble <path> --show-strings` lists candidate encoding names,
 file offsets, extents, and previews. The desktop Strings view uses the same
 Windows-1253, Windows-1255, Windows-1256, Windows-1257, Windows-1258,
-ISO-8859-2, and ISO-8859-5 labels.
+ISO-8859-2, ISO-8859-5, DOS-437, DOS-850, and ISO-8859-15 labels.
 
 All encoding passes use the same file-backed scan domains, string-record budget,
 and cancellation checks. Returned previews are UTF-8, while each record retains

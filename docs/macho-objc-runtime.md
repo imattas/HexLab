@@ -103,6 +103,17 @@ aggregates because the encoding alone does not provide reliable field layout.
 Bitfields, long double, vectors, unknown codes, malformed strings, and any
 encoding exceeding a budget remain raw and do not produce a partial signature.
 
+Property records retain their complete raw attribute string and also decode
+the standard single-letter flags `R`, `C`, `&`, `W`, `N`, and `D` as read-only,
+copy, strong, weak, nonatomic, and dynamic metadata. Explicit `G`/`S` accessor
+selectors and `V` backing-ivar names are retained or recognized; unrecognized
+attributes remain available in the raw string and produce a
+`parsed-with-unknown-attributes` status. Duplicate flags/accessors, empty
+custom selectors, and conflicting ownership flags are reported as malformed.
+The scanner does not infer default accessor names, synthesize declarations, or
+infer backing storage from these attributes. CLI and desktop property rows show
+the recognized semantics together with raw attributes for review.
+
 The class, method, ivar, property, protocol, and category record layouts follow
 Apple's open-source Objective-C runtime definitions:
 [Apple objc4](https://github.com/apple-oss-distributions/objc4).

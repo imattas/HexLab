@@ -27,7 +27,8 @@ enum ProjectActionId {
     restore_backup_id,
     rotate_backups_id,
     list_backups_id,
-    prune_backups_id
+    prune_backups_id,
+    restore_backup_in_place_id
 };
 class ProjectActions {
   public:

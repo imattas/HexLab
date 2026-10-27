@@ -339,6 +339,34 @@ Result<bool> SessionController::restore_backup(std::filesystem::path source, std
         return Error{ErrorCode::resource_limit, "Cannot start backup restore"};
     }
 }
+Result<bool> SessionController::restore_backup_in_place(std::filesystem::path source,
+                                                        std::filesystem::path target,
+                                                        AnalysisOptions options) {
+    if (backup_restore_)
+        return Error{ErrorCode::busy, "A backup restore is already running"};
+    if (source.empty() || target.empty())
+        return Error{ErrorCode::invalid_argument, "Choose both a backup and a target project"};
+    if (aliases_open_project(*manager_, target))
+        return Error{ErrorCode::conflict, "Close every open view of the target project before restoring it in place"};
+    if (aliases_open_project(*manager_, source))
+        return Error{ErrorCode::conflict, "Close the backup project before restoring it in place"};
+    try {
+        auto cancellation = std::make_shared<std::stop_source>();
+        const auto token = cancellation->get_token();
+        auto result = std::async(std::launch::async,
+            [source = std::move(source), target = std::move(target), token]()
+                -> Result<database::SavedProject> {
+                return database::ProjectStore::restore_backup_in_place(source, target, token);
+            });
+        backup_restore_.emplace(BackupRestore{std::move(options), std::move(cancellation), std::move(result), true});
+        changed_();
+        return true;
+    } catch (const std::system_error &error) {
+        return Error{ErrorCode::resource_limit, error.what()};
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot start in-place backup restore"};
+    }
+}
 Result<ProjectOperationId> SessionController::export_binary(DocumentId id, std::filesystem::path path, bool replace) {
     return observe(id, [path = std::move(path), replace](ProjectActor &actor) {
         return actor.export_binary(path, replace ? database::ReplacePolicy::replace_existing
@@ -400,6 +428,7 @@ void SessionController::poll() {
             }
         }();
         auto options = std::move(backup_restore_->options);
+        const bool in_place = backup_restore_->in_place;
         backup_restore_.reset();
         if (!restored) {
             manager_->report_error(restored.error());
@@ -408,7 +437,8 @@ void SessionController::poll() {
             if (!opened)
                 manager_->report_error(opened.error());
             else if (message)
-                message(opened.value(), "Restored backup as a new project: " + wxString(restored.value().path.wstring()));
+                message(opened.value(), (in_place ? "Restored backup in place: " : "Restored backup as a new project: ") +
+                                         wxString(restored.value().path.wstring()));
         }
         changed = true;
     }

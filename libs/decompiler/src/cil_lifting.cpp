@@ -319,6 +319,24 @@ bool proven_exception_match(const ManagedMethodAnalysis &method, std::uint32_t t
     return method.resolved_exception_types &&
            managed_type_is_assignable(*method.resolved_exception_types, thrown_type, catch_type);
 }
+std::optional<std::uint32_t> rethrown_exception_lower_bound(
+    const ManagedMethodAnalysis &method, std::size_t instruction_index) {
+    if (!method.body || instruction_index >= method.instructions.size() ||
+        std::string_view(method.instructions[instruction_index].mnemonic) != "rethrow") return {};
+    const auto offset = method.instructions[instruction_index].offset;
+    const CilExceptionClause *innermost = nullptr;
+    for (const auto &clause : method.body->exception_clauses) {
+        const auto handler_end = std::uint64_t{clause.handler_offset} + clause.handler_length;
+        if (clause.kind != CilExceptionKind::catch_clause || offset < clause.handler_offset ||
+            std::uint64_t{offset} >= handler_end) continue;
+        if (!innermost || clause.handler_length < innermost->handler_length) innermost = &clause;
+    }
+    // A rethrow preserves the original object. Selection by this catch already
+    // proves its runtime type is assignable to the catch token, which is a
+    // lower bound useful for proving matches against base catches.
+    if (!innermost || !valid_type_token(std::optional<std::uint32_t>{innermost->class_token})) return {};
+    return innermost->class_token;
+}
 Address il_address(std::uint32_t offset) { return Address{{0}, offset}; }
 std::string token_name(std::uint32_t token) {
     std::ostringstream out;
@@ -1011,9 +1029,13 @@ Result<ManagedCilDecompilation> decompile_managed_method(
         if (inside_filter_code) continue;
         if (!inside_protected_try && !inside_handler && !explicit_throw) continue;
         const auto direct_thrown_type = directly_constructed_throw_type(method, ii, resolved_signatures, leaders);
+        const auto rethrow_type_lower_bound = rethrown_exception_lower_bound(method, ii);
+        const auto dispatch_type_proof = direct_thrown_type ? direct_thrown_type : rethrow_type_lower_bound;
         auto key = active_clause_key;
         if (direct_thrown_type)
             key += "|newobj:" + std::to_string(*direct_thrown_type);
+        else if (rethrow_type_lower_bound)
+            key += "|rethrow-at-least:" + std::to_string(*rethrow_type_lower_bound);
         auto existing = exception_profile_entries.find(key);
         if (existing != exception_profile_entries.end()) {
             instruction_exception_entries.emplace_back(ii, existing->second);
@@ -1033,10 +1055,11 @@ Result<ManagedCilDecompilation> decompile_managed_method(
             const auto &clause = method.body->exception_clauses[clause_index];
             auto match_route = route_through_finally(profile.finalies_before_catch[catch_slot], il_address(clause.handler_offset));
             if (!match_route) return match_route.error();
-            if (direct_thrown_type && clause.kind == CilExceptionKind::catch_clause &&
-                proven_exception_match(method, *direct_thrown_type, clause.class_token)) {
-                // This dispatcher profile is unique to the proven constructed
-                // type, so later clauses cannot be reached for this throw.
+            if (dispatch_type_proof && clause.kind == CilExceptionKind::catch_clause &&
+                proven_exception_match(method, *dispatch_type_proof, clause.class_token)) {
+                // For `newobj; throw`, the token is exact. For `rethrow`, it is
+                // a proven lower bound: every possible runtime type also
+                // matches this catch. The profile key keeps those proofs apart.
                 next_test = match_route.value();
                 continue;
             }
