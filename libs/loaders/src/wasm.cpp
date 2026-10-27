@@ -1079,7 +1079,14 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
             std::uint32_t subopcode = 0, first = 0, second = 0;
             if (!code.uleb(subopcode)) return fail("invalid bulk-memory subopcode");
             const auto memory_count = metadata.imported_memories + metadata.defined_memories;
-            if (subopcode == 8) {
+            if (subopcode <= 7) {
+                static constexpr std::array<std::uint8_t, 8> inputs{
+                    0x7d, 0x7d, 0x7c, 0x7c, 0x7d, 0x7d, 0x7c, 0x7c};
+                static constexpr std::array<std::uint8_t, 8> outputs{
+                    0x7f, 0x7f, 0x7f, 0x7f, 0x7e, 0x7e, 0x7e, 0x7e};
+                if (!pop(inputs[subopcode]) || !push(outputs[subopcode]))
+                    return fail("trunc_sat operand type mismatch");
+            } else if (subopcode == 8) {
                 if (!code.uleb(first) || !code.uleb(second)) return fail("truncated memory.init immediates");
                 if (!metadata.declared_data_count || first >= *metadata.declared_data_count ||
                     memory_count != 1 || second != 0)

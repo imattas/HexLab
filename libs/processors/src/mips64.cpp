@@ -298,10 +298,14 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
             break;
         case 0x00: case 0x02: case 0x03: case 0x38: case 0x3a: case 0x3b:
         case 0x3c: case 0x3e: case 0x3f: {
-            if (rs) return invalid("Reserved MIPS64 fixed-shift encoding");
+            const bool rotate = (funct == 0x3a || funct == 0x3e) && rs == 1;
+            if (rs && !rotate) return invalid("Reserved MIPS64 fixed-shift encoding");
             unsigned amount = shamt;
             Opcode opcode;
-            if (funct == 0x00) opcode = Opcode::mips64_sll;
+            if (rotate) {
+                opcode = funct == 0x3a ? Opcode::mips64_drotr : Opcode::mips64_drotr32;
+                if (funct == 0x3e) amount += 32;
+            } else if (funct == 0x00) opcode = Opcode::mips64_sll;
             else if (funct == 0x02) opcode = Opcode::mips64_srl;
             else if (funct == 0x03) opcode = Opcode::mips64_sra;
             else if (funct == 0x38) opcode = Opcode::mips64_dsll;
@@ -320,8 +324,11 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
             break;
         }
         case 0x14: case 0x16: case 0x17:
-            if (shamt) return invalid("Reserved MIPS64 variable-shift encoding");
-            i.opcode = funct == 0x14 ? Opcode::mips64_dsllv : funct == 0x16 ? Opcode::mips64_dsrlv : Opcode::mips64_dsrav;
+            if (funct == 0x16 && shamt == 1) i.opcode = Opcode::mips64_drotrv;
+            else {
+                if (shamt) return invalid("Reserved MIPS64 variable-shift encoding");
+                i.opcode = funct == 0x14 ? Opcode::mips64_dsllv : funct == 0x16 ? Opcode::mips64_dsrlv : Opcode::mips64_dsrav;
+            }
             i.operands = {reg(rd), reg(rt), reg(rs)};
             i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
             i.register_reads = {reg(rt), reg(rs)};

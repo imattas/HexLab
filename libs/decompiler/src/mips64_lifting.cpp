@@ -617,6 +617,16 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
                 return assign(binary(shift, src1, amount, 64));
             }
             break;
+        case Opcode::mips64_drotr: case Opcode::mips64_drotr32: case Opcode::mips64_drotrv:
+            if (src2) {
+                const auto amount = binary("and", src2, constant(63, 64), 64);
+                const auto reverse_amount = binary("and",
+                    binary("sub", constant(64, 64), amount, 64), constant(63, 64), 64);
+                const auto right = binary("shr", src1, amount, 64);
+                const auto left = binary("shl", src1, reverse_amount, 64);
+                return assign(binary("or", right, left, 64));
+            }
+            break;
         case Opcode::mips_sll: case Opcode::mips_srl: case Opcode::mips_sra:
             if (src2) {
                 const auto *amount = std::get_if<ImmediateOperand>(&items[2]);

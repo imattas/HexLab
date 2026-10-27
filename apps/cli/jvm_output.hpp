@@ -37,6 +37,12 @@ inline void jvm_description(std::ostream &out, const ImageMetadata &metadata) {
         if (component.signature) out << " signature=" << *component.signature;
         out << '\n';
     }
+    for (const auto &inner : j.inner_classes) {
+        out << "Inner class: " << jvm_safe(inner.inner_class);
+        if (inner.outer_class) out << " outer=" << jvm_safe(*inner.outer_class);
+        if (inner.inner_name) out << " name=" << jvm_safe(*inner.inner_name);
+        out << " access=" << inner.access_flags << '\n';
+    }
     for (const auto &method : j.methods) {
         out << "  " << method.name << method.descriptor << " access=" << method.access_flags;
         if (method.signature) out << " signature=" << jvm_safe(*method.signature);

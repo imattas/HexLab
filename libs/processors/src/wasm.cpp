@@ -151,13 +151,18 @@ DecodeResult decode_wasm(std::span<const std::byte> bytes, Address at) {
         std::uint64_t subopcode = 0;
         const auto result = uleb(bytes, position, 32, subopcode);
         if (result != LebResult::ok) return decode_leb_result(result);
-        if (subopcode < 8 || subopcode > 11)
-            return fail(DecodeStatus::unsupported, "WebAssembly 0xfc subopcode is outside the supported bulk-memory subset");
-        mnemonic = subopcode == 8 ? "memory.init" : subopcode == 9 ? "data.drop" :
-                   subopcode == 10 ? "memory.copy" : "memory.fill";
-        const unsigned immediate_count = subopcode == 8 || subopcode == 10 ? 2 : 1;
-        for (unsigned n = 0; n < immediate_count; ++n)
-            if (!require_u(32)) return decode_leb_result(last_leb_result);
+        if (subopcode > 11)
+            return fail(DecodeStatus::unsupported, "WebAssembly 0xfc subopcode is outside the enabled scalar-conversion and bulk-memory subset");
+        static constexpr std::array<std::string_view, 12> names{
+            "i32.trunc_sat_f32_s", "i32.trunc_sat_f32_u", "i32.trunc_sat_f64_s", "i32.trunc_sat_f64_u",
+            "i64.trunc_sat_f32_s", "i64.trunc_sat_f32_u", "i64.trunc_sat_f64_s", "i64.trunc_sat_f64_u",
+            "memory.init", "data.drop", "memory.copy", "memory.fill"};
+        mnemonic = names[static_cast<std::size_t>(subopcode)];
+        if (subopcode >= 8) {
+            const unsigned immediate_count = subopcode == 8 || subopcode == 10 ? 2 : 1;
+            for (unsigned n = 0; n < immediate_count; ++n)
+                if (!require_u(32)) return decode_leb_result(last_leb_result);
+        }
     } else if (op == 0xd0) {
         mnemonic = "ref.null";
         std::int64_t heap_type = 0;

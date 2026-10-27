@@ -98,6 +98,13 @@ struct JvmRecordComponent {
     std::optional<std::string> signature;
     bool operator==(const JvmRecordComponent &) const = default;
 };
+struct JvmInnerClass {
+    std::string inner_class;
+    std::optional<std::string> outer_class;
+    std::optional<std::string> inner_name;
+    std::uint16_t access_flags = 0;
+    bool operator==(const JvmInnerClass &) const = default;
+};
 struct JvmModuleRequire {
     std::string module;
     std::uint16_t flags = 0;
@@ -151,6 +158,7 @@ struct JvmMetadata {
     std::vector<JvmConstant> constant_pool; // JVM's one-based indices; unusable slots are tag 0.
     std::vector<std::string> interfaces;
     std::vector<JvmRecordComponent> record_components;
+    std::vector<JvmInnerClass> inner_classes;
     std::optional<std::string> nest_host;
     std::vector<std::string> nest_members, permitted_subclasses;
     std::optional<JvmModule> module;
