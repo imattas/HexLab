@@ -63,5 +63,10 @@ complete project snapshot and refuses to merge if more than 4096 annotations
 or bookmarks exist, because omitted rows cannot safely be treated as absent.
 Pass `expected_revision` to pin that snapshot; if all requested fields are
 already populated, preserve mode returns the unchanged snapshot without adding
-a history step. Use `Project.apply_batch()` for references, types, patches,
+a history step. Pass `return_report=True` to receive
+`{"snapshot": ..., "applied": N, "skipped": N}` instead of the snapshot
+alone. The counts are per requested name/comment/bookmark field; preserve mode
+counts empty values, attempted removals, occupied values, and names already in
+use elsewhere as skipped. The default return value remains the snapshot. Use
+`Project.apply_batch()` for references, types, patches,
 regions, functions, and other mixed project edits.

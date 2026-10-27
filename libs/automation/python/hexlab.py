@@ -1205,7 +1205,7 @@ class Project:
     def bookmark(self, location, label="", *, remove=False, group=0):
         return self._call("bookmark", _location(location), label, remove, group)
 
-    def apply_annotations(self, rows, *, group=0, expected_revision=None, merge="replace"):
+    def apply_annotations(self, rows, *, group=0, expected_revision=None, merge="replace", return_report=False):
         """Atomically import a bounded batch of names, comments, and bookmarks.
 
         Each row is a mapping with ``location`` and any of ``name``,
@@ -1218,6 +1218,10 @@ class Project:
         empty name/comment fields and absent bookmarks. Preserve mode requires
         a complete snapshot of no more than 4096 existing annotations and
         bookmarks, so it never treats truncated state as absent.
+        When ``return_report=True``, return a mapping containing the resulting
+        ``snapshot`` plus the number of requested annotation fields that were
+        ``applied`` and ``skipped``. The default return value remains the
+        snapshot for compatibility.
         """
         if merge not in ("replace", "preserve"):
             raise ValueError("merge must be 'replace' or 'preserve'")
@@ -1254,6 +1258,7 @@ class Project:
         commands = []
         text_bytes = 0
         row_count = 0
+        skipped_fields = 0
         allowed = {"location", "name", "comment", "bookmark"}
         for row in rows:
             row_count += 1
@@ -1293,14 +1298,18 @@ class Project:
                     field, _, value, *extra = command
                     if field == "bookmark":
                         if location_key in existing_bookmarks or extra[0]:
+                            skipped_fields += 1
                             continue
                     elif current_annotation.get(field):
+                        skipped_fields += 1
                         continue
                     elif value == "":
+                        skipped_fields += 1
                         continue
                     elif field == "name" and isinstance(row["location"], Address):
                         previous = existing_names.get((row["location"].space, value))
                         if previous is not None and previous != location_key:
+                            skipped_fields += 1
                             continue
                     commands.append(command)
             else:
@@ -1315,6 +1324,8 @@ class Project:
             _unsigned(expected_revision, "expected_revision")
             if expected_revision != current["edit_revision"]:
                 raise ValueError("expected_revision does not match the preserve snapshot")
+            if return_report:
+                return {"snapshot": current, "applied": 0, "skipped": skipped_fields}
             return current
         if not commands:
             raise ValueError("annotation import contains no edits")
@@ -1326,7 +1337,10 @@ class Project:
         if (merge == "preserve" and
                 expected_revision != current["edit_revision"]):
             raise ValueError("expected_revision does not match the preserve snapshot")
-        return self._call("apply_annotations", commands, group, expected_revision)
+        result = self._call("apply_annotations", commands, group, expected_revision)
+        if return_report:
+            return {"snapshot": result, "applied": len(commands), "skipped": skipped_fields}
+        return result
 
     def apply_batch(self, operations, *, group=0, expected_revision=None, cancel=None):
         """Apply diverse project edits as one bounded, revision-pinned action.

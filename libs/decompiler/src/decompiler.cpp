@@ -10308,7 +10308,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
     }
     if (!found_join) return fallback("conditional arms do not converge at a common post-dominator");
     const auto *join = (*true_path)[true_join_index];
-    if (join == entry || true_join_index == 0 || false_join_index == 0 || !join->successors.empty() ||
+    if (join == entry || !join->successors.empty() ||
         contains_branch(*join))
         return fallback("join block is empty of successors and control transfers only");
     std::vector<const LiftedBlock *> true_arm(true_path->begin(), true_path->begin() + true_join_index);
@@ -10341,8 +10341,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
     if (!validate_arm(true_arm) || !validate_arm(false_arm))
         return fallback("conditional arm contains a non-linear or unsupported control transfer");
 
-    const auto *true_tail = true_arm.back();
-    const auto *false_tail = false_arm.back();
+    const auto *true_tail = true_arm.empty() ? entry : true_arm.back();
+    const auto *false_tail = false_arm.empty() ? entry : false_arm.back();
     std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> edge_copies;
     for (const auto &phi : join->phis) {
         if (phi.inputs.size() != 2)

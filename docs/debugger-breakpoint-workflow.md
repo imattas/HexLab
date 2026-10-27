@@ -13,3 +13,8 @@ The expression subset accepts register names (case-insensitive), decimal or `0x`
 Logpoint and diagnostic text is aggregated to at most 4096 bytes per event. Events with more than 4096 matching breakpoint IDs stop with a diagnostic and skip automatic condition/logpoint processing, avoiding an unbounded scan. The plugin ABI retains its 256-byte event message field and therefore returns a marked, UTF-8-safe prefix when the core event message is longer.
 
 Invalid persisted fields are rejected while loading a project. Invalid conditions encountered at runtime surface a stopping event with an error; they never cause automatic continue. Applying a project breakpoint restores its condition, logpoint message and ignore threshold, while runtime hit counts remain fresh.
+
+
+## Desktop breakpoint columns
+
+The desktop Debugger pane shows each owned breakpoint's enabled state, runtime hit count, configured ignore threshold, and condition/logpoint rule beside its address and kind. It refreshes the inventory after a target event so hit counts remain visible while debugging. The table does not include breakpoints created outside the HexLab session.

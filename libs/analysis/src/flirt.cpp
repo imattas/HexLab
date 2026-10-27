@@ -315,8 +315,8 @@ Result<FlirtCatalog> parse_flirt_sig(std::span<const std::byte> input, std::stri
         require(input.size() >= 6 && std::memcmp(input.data(), "IDASGN", 6)==0, "Invalid FLIRT .sig magic"); at=6;
         const auto version=byte(); require(version>=5 && version<=10,"Unsupported FLIRT .sig version",ErrorCode::unsupported);
         const auto arch=byte(); const auto file_types=le(4); (void)file_types; const auto os=le(2); (void)os; const auto app=le(2);
-        const auto features=le(2); (void)le(2); (void)le(2); at+=12;
-        const auto liblen=byte(); (void)le(2);
+        const auto features=le(2); (void)le(2); const auto header_crc16=le(2); (void)header_crc16; at+=12;
+        const auto liblen=byte(); const auto alternate_compiler_type_crc16=static_cast<std::uint16_t>(le(2));
         const auto valid_features=version>=10?0x3fu:0x1fu;
         require((features & ~valid_features)==0,"Unsupported FLIRT .sig feature flags",ErrorCode::unsupported);
         require(version != 5 || !(features & 0x10),"Compressed FLIRT .sig version 5 bodies are unsupported",ErrorCode::unsupported);
@@ -325,7 +325,9 @@ Result<FlirtCatalog> parse_flirt_sig(std::span<const std::byte> input, std::stri
         if(version>=8) head_size=static_cast<std::uint16_t>(le(2));
         if(version>=10) (void)le(2);
         require(head_size>=1 && head_size<=64,"Unsupported FLIRT .sig pattern size");
-        require(at+liblen<=input.size(),"Truncated FLIRT .sig library name"); at+=liblen;
+        require(at+liblen<=input.size(),"Truncated FLIRT .sig library name");
+        const std::string library_name_bytes(reinterpret_cast<const char *>(input.data() + at), liblen);
+        at+=liblen;
         std::vector<std::byte> inflated_body;
         if (features & 0x10) {
             require(at < input.size(), "Compressed FLIRT .sig body is empty");
@@ -377,7 +379,8 @@ Result<FlirtCatalog> parse_flirt_sig(std::span<const std::byte> input, std::stri
         else if(arch==72 && b32&&!b16&&!b64){architecture=Architecture::riscv32;mode=ExecutionMode::rv32;}
         else if(arch==72 && b64&&!b16&&!b32){architecture=Architecture::riscv64;mode=ExecutionMode::rv64;}
         require(valid_target(architecture,mode),"Unsupported FLIRT .sig architecture/application combination",ErrorCode::unsupported);
-        FlirtCatalog catalog{1,version,architecture,mode,std::move(provenance),{},inflated_body.size()};
+        FlirtCatalog catalog{1,version,architecture,mode,std::move(provenance),{},inflated_body.size(),
+                             static_cast<std::uint16_t>(alternate_compiler_type_crc16), library_name_bytes};
         std::vector<SignatureByte> prefix;
         std::uint64_t work=0;
         auto word=[&](){return version<9?vint16():vint32();};

@@ -432,3 +432,11 @@ against the cleanup tail and ordinary latch edges, and their parallel copies
 are emitted after the guarded cleanup statements immediately before `continue`.
 Direct conditional continues remain the zero-block case; ambiguous or
 side-entered cleanup paths retain the existing fallback.
+
+Structured acyclic two-arm conditionals also accept a direct edge from either
+arm to the common join. The other arm may contain the existing bounded linear
+region. Join phis must still have exactly one input for each actual predecessor;
+copies for a direct arm are emitted inside that conditional arm. This covers
+guarded straight-line work without inventing an SSA predecessor or hoisting
+edge-specific copies across the branch. More general branching arms keep the
+state-machine or label/goto fallback.

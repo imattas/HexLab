@@ -24,7 +24,8 @@ enum class SwitchEntryEncoding {
     signed_offset_from_table,
     thumb_scaled_pc_relative,
     signed_offset_from_target_base,
-    unsigned_byte_offset_scaled_from_target_base
+    unsigned_byte_offset_scaled_from_target_base,
+    a32_branch_instruction
 };
 
 struct SwitchSite {

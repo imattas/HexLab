@@ -187,8 +187,11 @@ per pattern, and 256-byte names and tails. `parse_flirt_sig` also accepts
 uncompressed IDA binary signature catalogs, versions 5 through 10, including
 sparse tail bytes, public/local names, reference names, and CRC collision
 modules. Its catalog API version stays at 1 while `source_format_version`
-retains the original IDASGN version. The CLI selects `.sig` by its `IDASGN`
-magic and otherwise uses `.pat`.
+retains the original IDASGN version. For `.sig` inputs the catalog also retains
+the raw library-name bytes and alternate compiler-type CRC16 from the file header; `.pat`
+inputs leave those fields empty/zero because that format does not carry them.
+The CLI reports this embedded identity alongside caller-supplied provenance.
+The CLI selects `.sig` by its `IDASGN` magic and otherwise uses `.pat`.
 Supported catalog targets are x86 16/32/64, 6502, MIPS32/64, ARM32/64,
 PowerPC32/64, and RISC-V32/64. Architecture IDs follow the public IDA SDK
 processor constants; application-width flags follow the `idasgn_header_t`

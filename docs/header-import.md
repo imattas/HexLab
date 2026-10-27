@@ -275,11 +275,12 @@ unsupported scalar/declarator syntax remain unsupported.
 These errors are returned explicitly; no partial symbol table is returned.
 
 Enum assignments accept bounded integer constant expressions using the
-supported evaluator above, including references to earlier non-negative
+supported evaluator above, including references to earlier
 enumerators in an unscoped enum. For example, `Read = 1 << 2` and `Write = Read
-| 1` are retained as exact values. References to earlier negative values,
-qualified enumerator references, and expressions outside the evaluator subset
-remain unsupported. The enum type graph retains every enumerator name and its exact numeric value,
+| 1` are retained as exact values. Later unscoped enumerators may refer to
+earlier negative values as well. Qualified enumerator references and
+expressions outside the evaluator subset remain unsupported. The enum type
+graph retains every enumerator name and its exact numeric value,
 including negative signed values and the full signed 64-bit minimum. The same
 values are also returned in the ordered
 `HeaderImportResult::enum_constants`

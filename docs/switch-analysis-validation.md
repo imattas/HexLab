@@ -398,6 +398,15 @@ context cannot be represented by this A32-only recovery path. Other A32
 indexed-load forms, conditional loads, and PC-relative setup sequences are
 unsupported.
 
+The A32 `ADD pc, pc, Rm, LSL #2` dispatch is also recognized when a contiguous
+`CMP Rm, #limit` plus `BHS default`/`BHI default` proves the exact number of
+inline branch entries. The table starts at the architectural PC value
+(`dispatch + 8`); each entry must be an unconditional A32 `B` instruction whose
+direct target is executable and decodable. Entry traversal is bounded by the
+proven count and 4096-entry cap. Unguarded forms are left unresolved because
+the inline branch array has no independent length marker. Other ADD shifts,
+conditional branches in the table, and interworking targets remain unsupported.
+
 ## AArch64 unsigned byte-offset tables
 
 The separate-code-base recognizer also accepts this exact compact form:
