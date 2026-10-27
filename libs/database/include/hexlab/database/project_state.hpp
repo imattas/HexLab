@@ -123,6 +123,11 @@ struct ProjectState {
 enum class ProjectMode {read_write,read_only,collaborative};
 enum class ReplacePolicy {fail_if_exists,replace_existing};
 struct SavedProject {std::filesystem::path path;ProjectUuid uuid;};
+struct BackupVerification {
+    SavedProject backup;
+    std::uint64_t history_count=0,history_steps_verified=0,history_bytes_verified=0;
+    bool history_complete=false;
+};
 struct BackupRotationResult { SavedProject backup; std::size_t removed_generations=0; bool retention_satisfied=true; };
 struct RotatedBackup { SavedProject backup; std::uint64_t created_unix_ms=0; };
 struct BackupListing { std::vector<RotatedBackup> backups; bool complete=true; };
@@ -233,6 +238,11 @@ public:
     // logical project UUID and edit history. Unlike save_as(), this is a
     // restore point, not a new independent project identity.
     HEXLAB_DATABASE_EXPORT Result<SavedProject> backup_to(const std::filesystem::path&,ReplacePolicy,std::stop_token);
+    // Validates project/schema/input/patch integrity and audits bounded history
+    // payload pages. history_complete is false when the caller's budget ends.
+    HEXLAB_DATABASE_EXPORT static Result<BackupVerification> verify_backup(
+        const std::filesystem::path&,std::size_t max_history_steps,
+        std::size_t max_history_delta_bytes,std::stop_token);
     // Creates a timestamped sibling backup and prunes only validated backups
     // matching this base filename and project UUID. Retention is best-effort
     // when the directory exceeds the bounded scan/validation budget.

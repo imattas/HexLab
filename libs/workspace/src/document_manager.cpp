@@ -484,6 +484,10 @@ std::shared_ptr<const ProjectSnapshot> DocumentManager::project(DocumentId id) c
     auto entry = impl_->find(id);
     return entry ? entry->project : nullptr;
 }
+std::optional<Location> DocumentManager::selection(DocumentId id) const {
+    auto entry = impl_->find(id);
+    return entry ? entry->navigation.selection() : std::nullopt;
+}
 std::shared_ptr<ProjectActor> DocumentManager::actor(DocumentId id) const {
     auto entry = impl_->find(id);
     return entry ? entry->actor : nullptr;

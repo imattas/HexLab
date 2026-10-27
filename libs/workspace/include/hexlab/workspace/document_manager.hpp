@@ -35,6 +35,8 @@ public:
     HEXLAB_WORKSPACE_EXPORT std::optional<DocumentId> active_document()const;
     HEXLAB_WORKSPACE_EXPORT std::vector<DocumentInfo> documents()const;
     HEXLAB_WORKSPACE_EXPORT std::shared_ptr<const ProjectSnapshot> project(DocumentId)const;
+    // Retained owner-thread cursor for any open document, including inactive tabs.
+    HEXLAB_WORKSPACE_EXPORT std::optional<Location> selection(DocumentId)const;
     HEXLAB_WORKSPACE_EXPORT std::shared_ptr<ProjectActor> actor(DocumentId)const;
     HEXLAB_WORKSPACE_EXPORT Result<ProjectOperationId> watch(DocumentId,Result<ProjectSubmission>);
     HEXLAB_WORKSPACE_EXPORT SearchHistory* search_history(DocumentId);
