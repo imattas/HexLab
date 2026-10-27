@@ -1190,6 +1190,52 @@ class Project:
             raise ValueError("encoding must be ascii, utf8, utf16le, utf16be, utf32le, or utf32be") from None
         return self._search(("text", text, selected), cursor, max_results, cancel)
 
+    def _iterate_search(self, method, *args, page_size=256, max_rows=None, cancel=None, **kwargs):
+        self._check_page_size(page_size)
+        if max_rows is not None:
+            _unsigned(max_rows, "max_rows")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        if max_rows == 0:
+            return
+        cursor = None
+        yielded = 0
+        while max_rows is None or yielded < max_rows:
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("search iteration canceled")
+            amount = page_size if max_rows is None else min(page_size, max_rows - yielded)
+            try:
+                page = getattr(self, method)(*args, cursor=cursor, max_results=amount,
+                                             cancel=cancel, **kwargs)
+            except Error as error:
+                if error.code == _hexlab.CONFLICT_ERROR_CODE:
+                    raise ProjectChangedDuringQuery("project changed during search iteration") from None
+                raise
+            for match in page.matches:
+                if cancel is not None and cancel.cancelled:
+                    raise AnalysisCancelled("search iteration canceled")
+                yield match
+                yielded += 1
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("search iteration canceled")
+            if page.complete:
+                return
+            if page.next is None:
+                raise RuntimeError("search stopped before completion: " + page.reason)
+            cursor = page.next
+
+    def iter_search_bytes(self, pattern, *, page_size=256, max_rows=None, cancel=None):
+        """Yield effective-byte matches across revision-bound pages."""
+        return self._iterate_search("search_bytes", pattern, page_size=page_size,
+                                    max_rows=max_rows, cancel=cancel)
+
+    def iter_search_text(self, text, *, encoding="utf8", page_size=256, max_rows=None, cancel=None):
+        """Yield encoded-text matches across revision-bound pages."""
+        return self._iterate_search("search_text", text, encoding=encoding, page_size=page_size,
+                                    max_rows=max_rows, cancel=cancel)
+
     def search_immediate(self, value, *, width=64, signed=False, cursor=None, max_results=256, cancel=None):
         """Search decoded instructions for an immediate; cancel may be a CancellationToken."""
         if not isinstance(width, int) or isinstance(width, bool) or width not in (8, 16, 32, 64):

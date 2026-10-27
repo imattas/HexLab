@@ -21,6 +21,17 @@ std::string opt_number(const std::optional<std::uint32_t> &value) {
     return value ? std::to_string(*value) : "unavailable";
 }
 
+std::string class_ro_flag_names(std::uint32_t flags) {
+    const auto names = macho_objc_class_ro_flag_names(flags);
+    if (names.empty()) return "none recognized";
+    std::string result;
+    for (const auto &name : names) {
+        if (!result.empty()) result += ',';
+        result += name;
+    }
+    return result;
+}
+
 void mark_limit(std::vector<MachOObjCViewRow> &rows) {
     if (rows.empty()) return;
     rows.back() = {"Display limit", "", "Additional records omitted", "bounded", "desktop row cap",
@@ -147,7 +158,8 @@ std::vector<MachOObjCViewRow> macho_objc_view_rows(const MachOObjCScan &scan) {
             (c.complete ? "; record=complete" : "; record=partial"), origin,
             "class=" + (c.class_address ? number(c.class_address->offset) : "unavailable") +
             "; superclass=" + value(c.superclass_name) + " (" + c.superclass_pointer_status + ")" +
-            "; instance-size=" + opt_number(c.instance_size) + "; flags=" + opt_number(c.flags),
+            "; instance-size=" + opt_number(c.instance_size) + "; flags=" + opt_number(c.flags) +
+            "; flag-semantics=" + (c.flags ? class_ro_flag_names(*c.flags) : "unavailable"),
             c.class_address ? c.class_address : std::optional<Address>{c.classlist_slot});
         add(rows, "Metaclass", owner, value(c.metaclass_name), c.metaclass_name_status +
             "; pointer=" + c.metaclass_pointer_status + "; ro-pointer=" + c.metaclass_ro_pointer_status,

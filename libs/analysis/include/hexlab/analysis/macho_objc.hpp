@@ -160,6 +160,12 @@ struct MachOObjCScan {
     std::uint8_t pointer_bytes = 0;
 };
 
+// Names only compiler-emitted class_ro_t flag bits from Apple's ObjC2 ABI.
+// Unknown bits are intentionally omitted; callers should retain/display the
+// original raw flags separately.
+HEXLAB_ANALYSIS_EXPORT std::vector<std::string>
+macho_objc_class_ro_flag_names(std::uint32_t flags);
+
 // Parses 32-bit and 64-bit little-endian Objective-C class-list, class_ro_t,
 // protocol, and category ObjC2 metadata from mapped Mach-O images. Both widths
 // accept validated absolute and 32-bit field-relative method entries; ObjC1
