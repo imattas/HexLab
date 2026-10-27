@@ -591,6 +591,7 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
             bool exclusive_upper_bound = false;
             bool signed_upper_bound = false;
             bool mips_strict_upper_bound = false;
+            bool ppc_strict_upper_bound = false;
             const RegisterOperand *compared_register = nullptr;
             const ImmediateOperand *immediate = nullptr;
             if (x86_mode(context) && compare.opcode == Opcode::cmp && compare.operands.size() == 2 &&
@@ -676,6 +677,29 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                 // [0, bound) for the table. The classic delay slot executes
                 // on both paths and must be a known, side-effect-free op.
                 mips_strict_upper_bound = true;
+            } else if (context.architecture == Architecture::powerpc && context.mode == ExecutionMode::ppc32 &&
+                       compare.opcode == Opcode::ppc_cmpli && compare.operands.size() == 3 &&
+                       branch.opcode == Opcode::ppc_bc && branch.operands.size() == 4) {
+                // CMPLWI CRf, rSelector, bound; BGE CRf, default. BO=4
+                // branches when the selected CR bit is clear; BI=4*f selects
+                // the LT bit set by CMPLI in CR field f, so fallthrough proves
+                // the unsigned interval [0, bound).
+                const auto *field = register_operand(compare, 0);
+                compared_register = register_operand(compare, 1);
+                immediate = std::get_if<ImmediateOperand>(&compare.operands[2]);
+                const auto *bo = std::get_if<ImmediateOperand>(&branch.operands[0]);
+                const auto *bi = std::get_if<ImmediateOperand>(&branch.operands[1]);
+                const auto *branch_field = register_operand(branch, 2);
+                if (!field || field->bank != RegisterBank::ppc_cr || field->width != 4 ||
+                    !compared_register || compared_register->bank != RegisterBank::ppc_gpr ||
+                    compared_register->width != 32 || !immediate || immediate->encoded_width != 16 ||
+                    immediate->effective_width != 32 || immediate->is_signed || immediate->value == 0 ||
+                    immediate->value > max_entries || !bo || bo->value != 4 || !bi ||
+                    bi->value != static_cast<std::uint64_t>(field->index) * 4 ||
+                    !branch_field || branch_field->bank != RegisterBank::ppc_cr ||
+                    branch_field->index != field->index || branch_field->width != field->width)
+                    continue;
+                ppc_strict_upper_bound = true;
             } else {
                 continue;
             }
@@ -698,7 +722,8 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
 
             if (*branch.direct_target == sequence_begin || *branch.direct_target == branch_end.value())
                 continue;
-            if (!signed_upper_bound && branch_end.value() != sequence_begin) {
+            if (!signed_upper_bound &&
+                (branch_end.value() != sequence_begin || ppc_strict_upper_bound)) {
                 if (!guards.graph_attempted) {
                     guards.graph = switch_guard_graph(function, snapshot, guards, stop);
                     guards.graph_attempted = true;
@@ -754,6 +779,10 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                 (context.architecture == Architecture::riscv64 &&
                  (selector.bank != RegisterBank::riscv_gpr || selector.width != 64 || selector.index == 0 ||
                   !compared_register || compared_register->width != 64)) ||
+                (context.architecture == Architecture::powerpc &&
+                 (selector.bank != RegisterBank::ppc_gpr || selector.width != 32 || selector.index == 0 ||
+                  !compared_register || compared_register->bank != RegisterBank::ppc_gpr ||
+                  compared_register->width != 32)) ||
                 !immediate || immediate->effective_width != (x86_zero_extend_index ? compared_register->width : selector.width) ||
                 immediate->effective_width > 64 || immediate->encoded_width == 0 ||
                 immediate->encoded_width > immediate->effective_width ||
@@ -2653,10 +2682,14 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
     site.table = *loaded->second.table_base;
     site.selector = *loaded->second.selector;
     site.scale = 4;
-    (void)function;
-    (void)snapshot;
-    (void)guards;
-    const auto scan_limit = max_entries;
+    const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
+                                           loaded->second.scale_instruction, dispatch.address,
+                                           dispatch.context, guards, stop);
+    if (!bound || bound->case_count == 0 || bound->case_count > max_entries)
+        return {};
+    site.case_count = bound->case_count;
+    site.default_target = bound->default_target;
+    const auto scan_limit = static_cast<std::size_t>(bound->case_count);
     for (std::size_t index = 0; index < scan_limit; ++index) {
         if (stop.stop_requested())
             return {};
@@ -2669,9 +2702,7 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
         site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
                               target->relocation_rows, target->dyld_classic_rows, target->dyld_chained_rows});
     }
-    if (site.cases.size() == max_entries)
-        site.complete = false;
-    return site.cases.size() >= 2 ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
+    return !site.cases.empty() ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
 std::optional<SwitchSite> riscv_indexed_relative_switch(
