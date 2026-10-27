@@ -31,6 +31,31 @@ inline std::string wasm_escape_name(const std::string &value) {
     }
     return escaped;
 }
+inline const char *wasm_external_kind_name(WasmExternalKind kind) {
+    switch (kind) {
+    case WasmExternalKind::function: return "function";
+    case WasmExternalKind::table: return "table";
+    case WasmExternalKind::memory: return "memory";
+    case WasmExternalKind::global: return "global";
+    }
+    return "unknown";
+}
+inline const char *wasm_value_type_name(std::uint8_t type) {
+    switch (type) {
+    case 0x7f: return "i32";
+    case 0x7e: return "i64";
+    case 0x7d: return "f32";
+    case 0x7c: return "f64";
+    case 0x70: return "funcref";
+    default: return "unknown";
+    }
+}
+inline void wasm_limits(std::ostream &out, const WasmLimits &limits) {
+    out << " minimum=" << limits.minimum;
+    if (limits.maximum) out << " maximum=" << *limits.maximum;
+    else out << " maximum=unbounded";
+    if (limits.shared) out << " shared=true";
+}
 inline void wasm_description(std::ostream &out, const ImageMetadata &metadata) {
     if (!metadata.wasm) return;
     const auto &wasm = *metadata.wasm;
@@ -65,6 +90,38 @@ inline void wasm_description(std::ostream &out, const ImageMetadata &metadata) {
             << " section-file=" << wasm_hex(start.section_file_offset.value)
             << " entry-file=" << wasm_hex(start.entry_file_offset.value) << '\n';
     }
+    constexpr std::size_t external_display_limit = 128;
+    for (std::size_t i = 0; i < std::min(external_display_limit, wasm.imports.size()); ++i) {
+        const auto &entry = wasm.imports[i];
+        out << "Import: module=\"" << wasm_escape_name(entry.module) << "\" name=\""
+            << wasm_escape_name(entry.name) << "\" kind=" << wasm_external_kind_name(entry.kind)
+            << " index=" << entry.index;
+        if (entry.function_type_index) out << " type=" << *entry.function_type_index;
+        if (entry.limits) wasm_limits(out, *entry.limits);
+        if (entry.global_value_type)
+            out << " value-type=" << wasm_value_type_name(*entry.global_value_type)
+                << " mutable=" << (entry.global_mutable ? "true" : "false");
+        out << " entry=" << entry.entry_index
+            << " section-file=" << wasm_hex(entry.section_file_offset.value)
+            << " entry-file=" << wasm_hex(entry.entry_file_offset.value) << '\n';
+    }
+    if (wasm.imports.size() > external_display_limit)
+        out << "Imports omitted: " << (wasm.imports.size() - external_display_limit) << '\n';
+    for (std::size_t i = 0; i < std::min(external_display_limit, wasm.exports.size()); ++i) {
+        const auto &entry = wasm.exports[i];
+        out << "Export: name=\"" << wasm_escape_name(entry.name) << "\" kind="
+            << wasm_external_kind_name(entry.kind) << " index=" << entry.index;
+        if (entry.function_type_index) out << " type=" << *entry.function_type_index;
+        if (entry.limits) wasm_limits(out, *entry.limits);
+        if (entry.global_value_type)
+            out << " value-type=" << wasm_value_type_name(*entry.global_value_type)
+                << " mutable=" << (entry.global_mutable ? "true" : "false");
+        out << " entry=" << entry.entry_index
+            << " section-file=" << wasm_hex(entry.section_file_offset.value)
+            << " entry-file=" << wasm_hex(entry.entry_file_offset.value) << '\n';
+    }
+    if (wasm.exports.size() > external_display_limit)
+        out << "Exports omitted: " << (wasm.exports.size() - external_display_limit) << '\n';
     constexpr std::size_t display_limit = 128;
     for (std::size_t i = 0; i < std::min(display_limit, wasm.function_names.size()); ++i) {
         const auto &name = wasm.function_names[i];
