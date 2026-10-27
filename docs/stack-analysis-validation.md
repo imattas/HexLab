@@ -108,7 +108,10 @@ the frame relation. Incompatible incoming frame-pointer relations are joined as
 unknown, so x29-based accesses do not guess slot offsets. Derived-cache version
 18 persists per-site read/write/address-taken provenance, bounded to one
 million sites per function and four million across a cached proposal, and
-rejects older payloads for recomputation. Dynamic ARM32
+rejects older payloads for recomputation. When unknown-width address-taken
+slots coalesce with typed slots, duplicate per-site provenance is deduplicated
+and removed from the budget count, so the limit applies to unique records.
+Dynamic ARM32
 offsets, ARM register-derived SP changes, and frame-pointer conventions outside
 r7/r11 remain unsupported and mark analysis partial. Slots are persisted in
 the source-keyed derived cache; ABI type assignment and propagation into

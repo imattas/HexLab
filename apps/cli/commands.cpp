@@ -1418,10 +1418,6 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
             return result.error().code == ErrorCode::invalid_argument ? 2 : 1;
         }
         const auto &document = *result.value();
-        if (decompile && document.image->decode_context().architecture == Architecture::wasm) {
-            err << "Unsupported decompilation: WebAssembly stack and structured-control lifting is not implemented\n";
-            return 1;
-        }
         auto analysis = document.analysis;
         if (disassemble && analysis && !plugin_paths.empty()) {
             for (auto& instruction : analysis->instructions) {
