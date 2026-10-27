@@ -235,6 +235,62 @@ bool simd(State &state, std::uint8_t opcode, bool extended) {
 }
 
 bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsigned vvvv, bool l, bool w) {
+    if (map == 2 || map == 3) {
+        const bool bmi2_map2 = map == 2 &&
+            ((opcode == 0xf5 && (pp == 0 || pp == 2 || pp == 3)) ||
+             (opcode == 0xf6 && pp == 3) || (opcode == 0xf7 && (pp == 1 || pp == 2 || pp == 3)));
+        const bool bmi2_rorx = map == 3 && opcode == 0xf0 && pp == 3;
+        if (bmi2_map2 || bmi2_rorx) {
+            if (l)
+                invalid("BMI2 integer forms require VEX.L=0");
+        }
+        const std::uint16_t width = w ? 64 : 32;
+        if (bmi2_map2) {
+            auto decoded = modrm(state, width, width);
+            const RegisterOperand vreg = gpr(static_cast<std::uint8_t>(vvvv), width);
+            if (opcode == 0xf6 && pp == 3) {
+                state.i.opcode = Opcode::mulx;
+                state.i.register_reads.push_back(gpr(2, width));
+                state.operand(decoded.reg, OperandAccess::write);
+                state.operand(vreg, OperandAccess::write);
+                state.operand(std::move(decoded.rm), OperandAccess::read);
+                return true;
+            }
+            if (opcode == 0xf5 && pp == 0) {
+                state.i.opcode = Opcode::bzhi;
+                state.operand(decoded.reg, OperandAccess::write);
+                state.operand(std::move(decoded.rm), OperandAccess::read);
+                state.operand(vreg, OperandAccess::read);
+                state.flags_write = true;
+                return true;
+            }
+            if (opcode == 0xf5 && (pp == 2 || pp == 3)) {
+                state.i.opcode = pp == 3 ? Opcode::pdep : Opcode::pext;
+                state.operand(decoded.reg, OperandAccess::write);
+                state.operand(vreg, OperandAccess::read);
+                state.operand(std::move(decoded.rm), OperandAccess::read);
+                return true;
+            }
+            if (opcode == 0xf7 && (pp == 1 || pp == 2 || pp == 3)) {
+                state.i.opcode = pp == 1 ? Opcode::shlx : pp == 2 ? Opcode::sarx : Opcode::shrx;
+                state.operand(decoded.reg, OperandAccess::write);
+                state.operand(std::move(decoded.rm), OperandAccess::read);
+                state.operand(vreg, OperandAccess::read);
+                return true;
+            }
+        }
+        if (map == 3 && opcode == 0xf0 && pp == 3) {
+            if (vvvv != 0)
+                invalid("RORX requires the reserved VEX.vvvv encoding");
+            auto decoded = modrm(state, width, width);
+            state.i.opcode = Opcode::rorx;
+            state.operand(decoded.reg, OperandAccess::write);
+            state.operand(std::move(decoded.rm), OperandAccess::read);
+            state.operand(state.immediate(8, 8, false), OperandAccess::read);
+            return true;
+        }
+        // Let the established SIMD dispatcher handle its maps and reject other BMI2 encodings.
+    }
     if (map != 1 && map != 2)
         unsupported("VEX opcode map is outside the enabled AVX subset");
     const auto vector_width = static_cast<std::uint16_t>(l ? 256 : 128);

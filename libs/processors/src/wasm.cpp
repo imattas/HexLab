@@ -147,6 +147,17 @@ DecodeResult decode_wasm(std::span<const std::byte> bytes, Address at) {
     } else if (op == 0x3f || op == 0x40) {
         mnemonic = op == 0x3f ? "memory.size" : "memory.grow";
         if (!require_u(32)) return decode_leb_result(last_leb_result);
+    } else if (op == 0xfc) {
+        std::uint64_t subopcode = 0;
+        const auto result = uleb(bytes, position, 32, subopcode);
+        if (result != LebResult::ok) return decode_leb_result(result);
+        if (subopcode < 8 || subopcode > 11)
+            return fail(DecodeStatus::unsupported, "WebAssembly 0xfc subopcode is outside the supported bulk-memory subset");
+        mnemonic = subopcode == 8 ? "memory.init" : subopcode == 9 ? "data.drop" :
+                   subopcode == 10 ? "memory.copy" : "memory.fill";
+        const unsigned immediate_count = subopcode == 8 || subopcode == 10 ? 2 : 1;
+        for (unsigned n = 0; n < immediate_count; ++n)
+            if (!require_u(32)) return decode_leb_result(last_leb_result);
     } else if (op == 0x41 || op == 0x42) {
         mnemonic = op == 0x41 ? "i32.const" : "i64.const";
         const auto result = add_s(op == 0x41 ? 32 : 64, op == 0x41 ? 32 : 64);

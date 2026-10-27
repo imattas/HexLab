@@ -17,6 +17,24 @@ void binary(State &s, Opcode opcode, Operand destination, Operand source) {
 bool arithmetic(State &s, std::uint8_t opcode, bool extended) {
     const auto wide = s.width();
     if (extended) {
+        if (opcode == 0xc7) {
+            auto m = modrm(s, s.rules.long_mode() && (s.rex & 8) ? 128 : 64);
+            if (m.group != 1)
+                return false;
+            if (m.mod == 3)
+                invalid("CMPXCHG8B/16B requires a memory operand");
+            const bool wide_exchange = s.rules.long_mode() && (s.rex & 8);
+            const std::uint16_t pair_width = wide_exchange ? 64 : 32;
+            s.i.opcode = wide_exchange ? Opcode::cmpxchg16b : Opcode::cmpxchg8b;
+            s.lock_allowed = true;
+            s.operand(std::move(m.rm), OperandAccess::read_write);
+            for (const std::uint8_t index : {std::uint8_t{0}, std::uint8_t{2}, std::uint8_t{3}, std::uint8_t{1}})
+                s.i.register_reads.push_back(gpr(index, pair_width));
+            s.i.register_writes.push_back(gpr(0, pair_width));
+            s.i.register_writes.push_back(gpr(2, pair_width));
+            s.flags_write = true;
+            return true;
+        }
         if (opcode == 0xb0 || opcode == 0xb1 || opcode == 0xc0 || opcode == 0xc1) {
             const auto width = static_cast<std::uint16_t>((opcode == 0xb0 || opcode == 0xc0) ? 8 : wide);
             auto m = modrm(s, width);

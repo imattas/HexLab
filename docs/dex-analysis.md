@@ -1,8 +1,14 @@
 # Android DEX analysis
 
-HexLab recognizes standard little-endian DEX versions 035 through 040. The
-bounded loader verifies the SHA-1 signature over bytes `[0x20, file_size)` and
-the Adler-32 checksum over `[0x0c, file_size)` before interpreting tables.
+HexLab parses standard little-endian DEX versions 035 through 040 and single-
+member DEX 041 containers whose logical file occupies the whole physical
+container and whose header starts at offset zero. The loader validates the
+041 extended header and derives the data bounds from the fixed header and ID
+tables because the v41 `data_size` and `data_off` fields are unused. Multi-
+member containers are recognized but unsupported; their members may share
+later physical data and need per-member boundary handling. The bounded loader
+verifies the SHA-1 signature over bytes `[0x20, file_size)` and the Adler-32
+checksum over `[0x0c, file_size)` before interpreting tables.
 Integrity mismatches are rejected with the DEX header field offset (`0x0c` for
 the signature or `0x08` for the checksum) in the diagnostic. Both passes check
 cancellation in bounded chunks. The loader validates the header and map-list bounds, string/type/prototype/
@@ -15,11 +21,18 @@ from Dalvik opcodes with observable exception behavior; it preserves every
 handler for the active range without guessing runtime type matches. Bounded
 `debug_info_item` programs are also decoded into
 method-relative source rows, parameter names, and local-variable live ranges.
+
+For DEX 038 and later, method-handle entries are validated for kind, reserved
+fields, and referenced field/method indexes. Call-site entries are decoded as
+bounded encoded arrays; the required bootstrap handle, name string, and method
+type values are checked in order, along with every encoded value's table
+references. Bootstrap execution, linking semantics, and dynamic call-site
+resolution are not performed.
 The interpreter validates register, string, type, and code-address references,
 requires an `end_sequence`, and caps each program at two million opcodes and
-the aggregate retained debug metadata at two million rows/64 MiB. DEX 041
-containers, reverse-endian files, checksum/signature verification, annotation
-visibility interpretation, and verifier semantics are not implemented. Class
+the aggregate retained debug metadata at two million rows/64 MiB. Multi-member
+DEX 041 parsing, reverse-endian files, annotation visibility
+interpretation, and verifier semantics are not implemented. Class
 static initializers are retained as class/field-linked `encoded_value` trees.
 Scalar payloads retain their DEX tag, encoded width, normalized payload bits, and exact
 file offset; index-valued tags are checked against their identifier table.

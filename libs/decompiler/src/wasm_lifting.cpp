@@ -39,6 +39,36 @@ std::optional<std::uint64_t> immediate(const Instruction &i, std::size_t n = 0) 
     if (const auto *v = std::get_if<ImmediateOperand>(&i.operands[n])) return v->value;
     return {};
 }
+std::optional<std::uint8_t> bulk_memory_subopcode(const Instruction &i) {
+    if (i.length < 2 || std::to_integer<std::uint8_t>(i.bytes[0]) != 0xfc) return {};
+    std::uint32_t subopcode = 0;
+    for (std::size_t position = 1; position < i.length && position < i.bytes.size() && position <= 5; ++position) {
+        const auto byte = std::to_integer<std::uint8_t>(i.bytes[position]);
+        subopcode |= std::uint32_t(byte & 0x7f) << ((position - 1) * 7);
+        if (!(byte & 0x80))
+            return subopcode >= 8 && subopcode <= 11 ? std::optional<std::uint8_t>{static_cast<std::uint8_t>(subopcode)} : std::nullopt;
+    }
+    return {};
+}
+bool valid_bulk_memory_indices(const Instruction &i, const WasmMetadata *metadata, std::uint8_t subopcode) {
+    if (!metadata) return false;
+    const auto memory_count = static_cast<std::uint64_t>(metadata->imported_memories) + metadata->defined_memories;
+    if (subopcode == 9) {
+        const auto data = immediate(i, 0);
+        return data && *data < metadata->data_segments.size();
+    }
+    if (memory_count != 1) return false;
+    if (subopcode == 8) {
+        const auto data = immediate(i, 0), memory = immediate(i, 1);
+        return data && *data < metadata->data_segments.size() && memory && *memory == 0;
+    }
+    if (subopcode == 10) {
+        const auto destination = immediate(i, 0), source = immediate(i, 1);
+        return destination && *destination == 0 && source && *source == 0;
+    }
+    const auto memory = immediate(i, 0);
+    return memory && *memory == 0;
+}
 struct OpInfo { unsigned pops; ValueType input, output; std::string_view op; bool comparison = false; };
 std::optional<OpInfo> numeric(std::uint8_t op) {
     const auto i32 = integer(32), i64 = integer(64), f32 = floating(32), f64 = floating(64);
@@ -88,6 +118,17 @@ std::optional<ConversionInfo> conversion(std::uint8_t op) {
     case 0xbd: return ConversionInfo{f64,i64,"wasm_i64_reinterpret_f64"};
     case 0xbe: return ConversionInfo{i32,f32,"wasm_f32_reinterpret_i32"};
     case 0xbf: return ConversionInfo{i64,f64,"wasm_f64_reinterpret_i64"};
+    default: return {};
+    }
+}
+struct SignExtensionInfo { ValueType type; unsigned source_bits; };
+std::optional<SignExtensionInfo> sign_extension(std::uint8_t op) {
+    switch (op) {
+    case 0xc0: return SignExtensionInfo{integer(32), 8};
+    case 0xc1: return SignExtensionInfo{integer(32), 16};
+    case 0xc2: return SignExtensionInfo{integer(64), 8};
+    case 0xc3: return SignExtensionInfo{integer(64), 16};
+    case 0xc4: return SignExtensionInfo{integer(64), 32};
     default: return {};
     }
 }
@@ -580,9 +621,22 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 stack.push_back(integer(32));
                 continue;
             }
+            if (op == 0xfc) {
+                const auto subopcode = bulk_memory_subopcode(code[n]->instruction);
+                if (!subopcode || !valid_bulk_memory_indices(code[n]->instruction, metadata, *subopcode))
+                    return unsupported("bulk-memory instruction requires validated segment and single-memory indices");
+                if (*subopcode == 8 || *subopcode == 10 || *subopcode == 11) {
+                    for (unsigned operand = 0; operand < 3; ++operand) {
+                        auto value = shape_pop(stack, integer(32));
+                        if (!value) return value.error();
+                    }
+                }
+                continue;
+            }
             if(op==0x41||op==0x42||op==0x43||op==0x44){stack.push_back(op==0x41?integer(32):op==0x42?integer(64):op==0x43?floating(32):floating(64));}
             else if(auto info=numeric(op)){for(unsigned p=0;p<info->pops;++p){auto v=shape_pop(stack,info->input);if(!v)return v.error();}stack.push_back(info->output);}
             else if(auto cv=conversion(op)){auto v=shape_pop(stack,cv->input);if(!v)return v.error();stack.push_back(cv->output);}
+            else if(auto ext=sign_extension(op)){auto v=shape_pop(stack,ext->type);if(!v)return v.error();stack.push_back(ext->type);}
             else if(op>=0xa7&&op<=0xbf)return unsupported("numeric conversion or reinterpret opcode is not modeled");
             else return unsupported("opcode/effect is not in the typed scalar subset: "+code[n]->instruction.mnemonic_override);
             if(stack.size()>max_stack)return Error{ErrorCode::resource_limit,"WebAssembly operand stack exceeds 128 values"};
@@ -870,6 +924,34 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 emit(n, std::move(effect));
                 continue;
             }
+            if (op == 0xfc) {
+                const auto subopcode = bulk_memory_subopcode(i);
+                if (!subopcode || !valid_bulk_memory_indices(i, metadata, *subopcode))
+                    return unsupported("bulk-memory instruction requires validated segment and single-memory indices");
+                Intrinsic effect;
+                if (*subopcode == 9) {
+                    effect.name = "wasm_data_drop_segment_" + std::to_string(*immediate(i, 0));
+                    effect.memory_effect = IntrinsicMemoryEffect::none;
+                } else {
+                    const char *name = *subopcode == 8 ? "wasm_memory_init_data_" :
+                                       *subopcode == 10 ? "wasm_memory_copy" : "wasm_memory_fill";
+                    effect.name = name;
+                    if (*subopcode == 8) effect.name += std::to_string(*immediate(i, 0));
+                    // Stack order is destination, source/value, then length.
+                    // Intrinsic operands retain the source-level order.
+                    auto length = pop(integer(32));
+                    auto source_or_value = pop(integer(32));
+                    auto destination = pop(integer(32));
+                    if (!length) return length.error();
+                    if (!source_or_value) return source_or_value.error();
+                    if (!destination) return destination.error();
+                    effect.operands = {destination.value(), source_or_value.value(), length.value()};
+                    effect.memory_effect = *subopcode == 11 ? IntrinsicMemoryEffect::write
+                                                            : IntrinsicMemoryEffect::unknown;
+                }
+                emit(n, std::move(effect));
+                continue;
+            }
             if (auto info = numeric(op)) {
                 if (info->pops == 1) {
                     auto operand = pop(info->input);
@@ -896,6 +978,13 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
                         std::string(cv->operation), float_to_integer_trap_condition(op, operand.value())});
                 stack.push_back(unary(std::string(cv->operation), operand.value(), cv->output));
+                continue;
+            }
+            if (const auto ext = sign_extension(op)) {
+                auto operand = pop(ext->type);
+                if (!operand) return operand.error();
+                stack.push_back(unary("sext" + std::to_string(ext->source_bits),
+                                      operand.value(), ext->type));
                 continue;
             }
             if(op>=0xa7&&op<=0xbf)return unsupported("numeric conversion or reinterpret opcode is not modeled");

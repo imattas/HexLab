@@ -18,6 +18,7 @@ namespace {
 constexpr std::uint64_t max_file_size = UINT64_C(512) * 1024 * 1024;
 constexpr std::uint32_t max_items = 1'000'000;
 constexpr std::uint32_t header_bytes = 0x70;
+constexpr std::uint32_t dex041_header_bytes = 0x78;
 
 struct Reader {
     std::span<const std::byte> bytes;
@@ -184,7 +185,12 @@ bool decode_mutf8(std::span<const std::byte> raw, std::uint32_t expected_units, 
     return true;
 }
 
-struct MapData { std::vector<std::uint32_t> offsets; std::uint32_t method_handle_count = 0; };
+struct MapData {
+    std::vector<std::uint32_t> offsets;
+    std::uint32_t method_handle_count = 0, method_handle_off = 0;
+    std::uint32_t call_site_count = 0, call_site_off = 0;
+    bool has_method_handles = false, has_call_sites = false;
+};
 Result<MapData> parse_map(std::span<const std::byte> bytes, std::uint32_t offset) {
     if (!offset || (offset & 3) || !extent(offset, 1, 4, bytes.size()))
         return Error{ErrorCode::malformed, "DEX map_list offset is invalid"};
@@ -202,7 +208,8 @@ Result<MapData> parse_map(std::span<const std::byte> bytes, std::uint32_t offset
             item_off > bytes.size() || (i && item_off < previous))
             return Error{ErrorCode::malformed, "DEX map entry is invalid, duplicated, or out of order"};
         seen[type] = true; previous = item_off; result.offsets.push_back(item_off);
-        if (type == 0x0008) result.method_handle_count = size;
+        if (type == 0x0007) { result.has_call_sites = true; result.call_site_count = size; result.call_site_off = item_off; }
+        if (type == 0x0008) { result.has_method_handles = true; result.method_handle_count = size; result.method_handle_off = item_off; }
         if (size && item_off == bytes.size()) return Error{ErrorCode::malformed, "DEX map entry starts at end of file"};
     }
     return result;
@@ -225,8 +232,30 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
     const auto version = (std::to_integer<unsigned>(bytes[4]) - '0') * 100 +
                          (std::to_integer<unsigned>(bytes[5]) - '0') * 10 +
                          (std::to_integer<unsigned>(bytes[6]) - '0');
-    if (version < 35 || version > 40)
-        return Error{ErrorCode::unsupported, "DEX versions 035 through 040 are supported; 041 containers are not"};
+    bool dex041_single_member = false;
+    std::uint32_t dex041_logical_size = 0;
+    if (version == 41) {
+        if (file_size < dex041_header_bytes)
+            return Error{ErrorCode::malformed, "Truncated DEX 041 header"};
+        Reader container_header{bytes}; container_header.seek(32);
+        std::uint32_t declared_header=0, endian=0;
+        if (!container_header.u32(dex041_logical_size) || !container_header.u32(declared_header) ||
+            !container_header.u32(endian) || !container_header.seek(0x70))
+            return Error{ErrorCode::malformed, "Truncated DEX 041 container header fields"};
+        std::uint32_t container_size=0, header_offset=0;
+        if (!container_header.u32(container_size) || !container_header.u32(header_offset))
+            return Error{ErrorCode::malformed, "Truncated DEX 041 container bounds"};
+        if (declared_header != dex041_header_bytes || endian != 0x12345678 ||
+            container_size != file_size || header_offset != 0 || dex041_logical_size < dex041_header_bytes ||
+            dex041_logical_size > container_size)
+            return Error{ErrorCode::malformed, "DEX 041 header or container bounds are inconsistent with the physical input"};
+        if (dex041_logical_size != container_size)
+            return Error{ErrorCode::unsupported,
+                         "DEX 041 multi-member containers are recognized, but only single-member containers are supported"};
+        dex041_single_member = true;
+    }
+    if (version < 35 || (version > 40 && !dex041_single_member))
+        return Error{ErrorCode::unsupported, "DEX versions 035 through 040 and single-member 041 containers are supported"};
     Reader h{bytes}; h.seek(32);
     std::uint32_t stored_file_size=0, header_size=0, endian=0, link_size=0, link_off=0, map_off=0;
     std::uint32_t string_count=0,string_off=0,type_count=0,type_off=0,proto_count=0,proto_off=0;
@@ -235,7 +264,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         !h.u32(string_count)||!h.u32(string_off)||!h.u32(type_count)||!h.u32(type_off)||!h.u32(proto_count)||!h.u32(proto_off)||
         !h.u32(field_count)||!h.u32(field_off)||!h.u32(method_count)||!h.u32(method_off)||!h.u32(class_count)||!h.u32(class_off)||!h.u32(data_size)||!h.u32(data_off))
         return Error{ErrorCode::malformed, "Truncated DEX header fields"};
-    if (stored_file_size != file_size || header_size != header_bytes || endian != 0x12345678)
+    if (stored_file_size != (dex041_single_member ? dex041_logical_size : file_size) ||
+        header_size != (dex041_single_member ? dex041_header_bytes : header_bytes) || endian != 0x12345678)
         return Error{ErrorCode::malformed, "DEX header size, file size, or endian tag is unsupported"};
     bool hash_canceled = false;
     const auto signature = sha1(bytes.subspan(32), stop, hash_canceled);
@@ -252,6 +282,22 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         return Error{ErrorCode::malformed, "DEX Adler-32 checksum mismatch at file offset 0x08"};
     if (string_count > max_items || type_count > max_items || proto_count > max_items || method_count > max_items || class_count > max_items || field_count > max_items)
         return Error{ErrorCode::resource_limit, "DEX identifier table exceeds one million items"};
+    if (dex041_single_member) {
+        // In v41 data_size/data_off are unused. For the single-member case all
+        // offsets still address this physical file, so bound data by the end of
+        // the fixed header and identifier tables through the container end.
+        std::uint64_t fixed_end = dex041_header_bytes;
+        const auto include_table = [&](std::uint32_t off, std::uint32_t count, std::uint32_t stride) {
+            if (count) fixed_end = std::max(fixed_end, std::uint64_t(off) + std::uint64_t(count) * stride);
+        };
+        include_table(string_off, string_count, 4); include_table(type_off, type_count, 4);
+        include_table(proto_off, proto_count, 12); include_table(field_off, field_count, 8);
+        include_table(method_off, method_count, 8); include_table(class_off, class_count, 32);
+        fixed_end = (fixed_end + 3) & ~std::uint64_t{3};
+        if (fixed_end > file_size) return Error{ErrorCode::malformed, "DEX 041 fixed tables exceed the container"};
+        data_off = static_cast<std::uint32_t>(fixed_end);
+        data_size = static_cast<std::uint32_t>(file_size - fixed_end);
+    }
     if ((string_count && (string_off & 3)) || (type_count && (type_off & 3)) ||
         (proto_count && (proto_off & 3)) || (field_count && (field_off & 3)) ||
         (method_count && (method_off & 3)) || (class_count && (class_off & 3)) ||
@@ -261,6 +307,17 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         !extent(data_off,data_size,1,file_size) || (link_size && !extent(link_off,link_size,1,file_size)))
         return Error{ErrorCode::malformed, "DEX table or data section exceeds the input"};
     auto map = parse_map(bytes,map_off); if (!map) return map.error();
+    if (dex041_single_member && map_off < data_off)
+        return Error{ErrorCode::malformed, "DEX 041 map_list overlaps the fixed header or identifier tables"};
+    if (version < 38 && (map.value().has_call_sites || map.value().has_method_handles))
+        return Error{ErrorCode::malformed, "DEX call-site and method-handle sections require version 038 or later"};
+    if (map.value().call_site_count > max_items || map.value().method_handle_count > max_items)
+        return Error{ErrorCode::resource_limit, "DEX call-site or method-handle table exceeds one million items"};
+    if ((map.value().call_site_count && ((map.value().call_site_off & 3) ||
+         !extent(map.value().call_site_off, map.value().call_site_count, 4, file_size))) ||
+        (map.value().method_handle_count && ((map.value().method_handle_off & 3) ||
+         !extent(map.value().method_handle_off, map.value().method_handle_count, 8, file_size))))
+        return Error{ErrorCode::malformed, "DEX call-site or method-handle table exceeds the input"};
     if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX loading canceled"};
 
     std::vector<std::string> strings; strings.reserve(string_count);
@@ -314,6 +371,17 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         ids.seek(method_off+std::size_t(i)*8);Method m;
         if(!ids.u16(m.owner)||!ids.u16(m.proto)||!ids.u32(m.name)||m.owner>=types.size()||m.proto>=protos.size()||m.name>=strings.size())return Error{ErrorCode::malformed,"DEX method_id contains an invalid index"};
         methods.push_back(m);
+    }
+    for (std::uint32_t i = 0; i < map.value().method_handle_count; ++i) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX method-handle parsing canceled"};
+        Reader handle{bytes};
+        if (!handle.seek(map.value().method_handle_off + std::size_t(i) * 8))
+            return Error{ErrorCode::malformed, "DEX method_handle_item offset is invalid"};
+        std::uint16_t kind=0, unused0=0, member=0, unused1=0;
+        if (!handle.u16(kind) || !handle.u16(unused0) || !handle.u16(member) || !handle.u16(unused1) ||
+            kind > 8 || unused0 || unused1 ||
+            (kind <= 3 ? member >= fields.size() : member >= methods.size()))
+            return Error{ErrorCode::malformed, "DEX method_handle_item has invalid reserved fields, kind, or member index"};
     }
     auto method_name=[&](std::uint32_t idx){
         const auto&m=methods[idx]; const auto&p=protos[m.proto]; std::string out=types[m.owner]+"->"+strings[m.name]+"(";
@@ -452,6 +520,29 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         return value;
     };
     const auto dex_data_end = static_cast<std::size_t>(std::uint64_t(data_off) + data_size);
+    for (std::uint32_t i = 0; i < map.value().call_site_count; ++i) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX call-site parsing canceled"};
+        Reader call_site_id{bytes};
+        if (!call_site_id.seek(map.value().call_site_off + std::size_t(i) * 4))
+            return Error{ErrorCode::malformed, "DEX call_site_id_item offset is invalid"};
+        std::uint32_t item_off=0;
+        if (!call_site_id.u32(item_off) || item_off < data_off || item_off >= dex_data_end)
+            return Error{ErrorCode::malformed, "DEX call_site_item offset is outside the data section"};
+        Reader item{bytes.first(dex_data_end)};
+        if (!item.seek(item_off)) return Error{ErrorCode::malformed, "DEX call_site_item offset is invalid"};
+        std::uint32_t value_count=0;
+        if (!item.uleb(value_count) || value_count < 3)
+            return Error{ErrorCode::malformed, "DEX call_site_item must contain its bootstrap handle, name, and method type"};
+        if (value_count > 250'000 || value_count > 250'000 - total_encoded_value_nodes)
+            return Error{ErrorCode::resource_limit, "DEX call_site_item values exceed the encoded-value budget"};
+        for (std::uint32_t value_index=0; value_index<value_count; ++value_index) {
+            auto value = decode_encoded_value(item, UINT32_MAX, 0);
+            if (!value) return value.error();
+            const auto expected_type = value_index == 0 ? 0x16 : value_index == 1 ? 0x17 : value_index == 2 ? 0x15 : 0xff;
+            if (value_index < 3 && value.value().type != expected_type)
+                return Error{ErrorCode::malformed, "DEX call_site_item bootstrap arguments have invalid encoded_value types"};
+        }
+    }
     std::function<Result<std::uint32_t>(std::uint32_t)> read_annotation_item;
     read_annotation_item = [&](std::uint32_t offset) -> Result<std::uint32_t> {
         constexpr std::uint64_t max_annotation_items = 250'000;
@@ -875,7 +966,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         layout.entries.push_back(begin);
     }
     auto image=Image::create(std::move(storage),std::move(layout));if(!image)return image.error();
-    LoadedImage loaded;loaded.image=std::move(image.value());loaded.metadata.format="Dalvik DEX (035-040)";loaded.metadata.image_size=file_size;loaded.metadata_complete=false;
+    LoadedImage loaded;loaded.image=std::move(image.value());loaded.metadata.format=dex041_single_member?"Dalvik DEX 041 (single-member)":"Dalvik DEX (035-040)";loaded.metadata.image_size=file_size;loaded.metadata_complete=false;
     loaded.metadata.dex = std::move(dex_metadata);
     loaded.diagnostics.push_back({DiagnosticSeverity::info,"DEX methods are mapped to method-relative address spaces; checksum/signature validation and full verifier semantics are not implemented",{}});
     auto read=loaded.metadata_reads.include({0},file_size);if(!read)return read.error();loaded.metadata_reads_complete=true;return loaded;

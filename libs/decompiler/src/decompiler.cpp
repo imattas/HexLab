@@ -624,6 +624,16 @@ std::string operation_name(Opcode opcode) {
     case Opcode::bsr: return "bsr";
     case Opcode::tzcnt: return "tzcnt";
     case Opcode::lzcnt: return "lzcnt";
+    case Opcode::cmpxchg8b: return "cmpxchg8b";
+    case Opcode::cmpxchg16b: return "cmpxchg16b";
+    case Opcode::bzhi: return "bzhi";
+    case Opcode::mulx: return "mulx";
+    case Opcode::pdep: return "pdep";
+    case Opcode::pext: return "pext";
+    case Opcode::rorx: return "rorx";
+    case Opcode::sarx: return "sarx";
+    case Opcode::shlx: return "shlx";
+    case Opcode::shrx: return "shrx";
     case Opcode::shld: return "shld";
     case Opcode::shrd: return "shrd";
     case Opcode::cmp: case Opcode::a32_cmp: return "cmp";
@@ -3945,6 +3955,43 @@ a64_unhandled:
     const bool x86_shift_rotate = instruction.opcode == Opcode::rol || instruction.opcode == Opcode::ror ||
         instruction.opcode == Opcode::rcl || instruction.opcode == Opcode::rcr ||
         instruction.opcode == Opcode::shl || instruction.opcode == Opcode::shr || instruction.opcode == Opcode::sar;
+    const bool x86_bmi2 = instruction.opcode == Opcode::bzhi || instruction.opcode == Opcode::mulx ||
+        instruction.opcode == Opcode::pdep || instruction.opcode == Opcode::pext ||
+        instruction.opcode == Opcode::rorx || instruction.opcode == Opcode::sarx ||
+        instruction.opcode == Opcode::shlx || instruction.opcode == Opcode::shrx;
+    if (x86 && (instruction.opcode == Opcode::cmpxchg8b || instruction.opcode == Opcode::cmpxchg16b) &&
+        instruction.operands.size() == 1 && is_memory(instruction.operands.front())) {
+        auto intrinsic_operands = operands;
+        const auto pair_width = instruction.opcode == Opcode::cmpxchg16b ? 64 : 32;
+        for (const std::uint8_t index : {std::uint8_t{0}, std::uint8_t{2}, std::uint8_t{3}, std::uint8_t{1}})
+            intrinsic_operands.push_back(reg_expr(RegisterOperand{RegisterBank::gpr, index,
+                static_cast<std::uint16_t>(pair_width), false}));
+        Intrinsic effect{"x86_" + operation_name(instruction.opcode), std::move(intrinsic_operands),
+                         IntrinsicMemoryEffect::unknown};
+        effect.register_writes = instruction.register_writes;
+        return effect;
+    }
+    if (x86 && x86_bmi2 && !operands.empty()) {
+        // Preserve the architecture-specific bit operation and its precise register effects
+        // as an intrinsic until the C-like expression model grows these operations.
+        auto intrinsic_operands = operands;
+        if (instruction.opcode == Opcode::mulx) {
+            const auto implicit_rdx = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::gpr && reg.index == 2; });
+            if (implicit_rdx != instruction.register_reads.end())
+                intrinsic_operands.push_back(reg_expr(*implicit_rdx));
+        }
+        Intrinsic effect{"x86_" + operation_name(instruction.opcode), std::move(intrinsic_operands),
+            std::any_of(instruction.operands.begin(), instruction.operands.end(),
+                [](const Operand &operand) { return is_memory(operand); })
+                ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+        effect.register_writes = instruction.register_writes;
+        if (instruction.opcode != Opcode::mulx) {
+            if (const auto destination = as_register(instruction.operands.front()))
+                effect.result_type = integer_type(destination->width);
+        }
+        return effect;
+    }
     if (x86 && x86_shift_rotate && instruction.operands.size() == 2) {
         // Keep x86 count masking, rotate-through-carry, zero-count flag
         // preservation, and width-dependent undefined flags explicit. The
