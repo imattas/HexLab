@@ -5,8 +5,9 @@
 namespace hexlab {
 struct FunctionId {std::uint64_t value;auto operator<=>(const FunctionId&)const=default;};
 struct BlockId {std::uint64_t value;auto operator<=>(const BlockId&)const=default;};
-enum class FunctionSeedKind {entry,export_symbol,direct_call,user_function,user_code,symbol,unwind,arm_context_root,tls_callback,initializer,guard_cf,dex_method,safe_seh};
+enum class FunctionSeedKind {entry,export_symbol,direct_call,user_function,user_code,symbol,unwind,arm_context_root,tls_callback,initializer,guard_cf,dex_method,safe_seh,pogo};
 struct FunctionSeedUnwindEvidence {std::uint32_t section=0;std::uint64_t file_offset=0,record_size=0;bool operator==(const FunctionSeedUnwindEvidence&)const=default;};
+struct FunctionSeedPogoEvidence {std::uint32_t profile_index=0,entry_index=0;std::uint64_t file_offset=0,record_size=0;bool operator==(const FunctionSeedPogoEvidence&)const=default;};
 enum class FunctionInitializerSource : std::uint8_t { elf_init, elf_fini, elf_preinit_array, elf_init_array, elf_fini_array, macho_mod_init_func, macho_routines };
 struct FunctionSeedInitializerEvidence {
     FunctionInitializerSource source = FunctionInitializerSource::elf_init_array;
@@ -16,7 +17,7 @@ struct FunctionSeedInitializerEvidence {
     std::vector<std::uint64_t> relocation_rows, dyld_classic_rows, dyld_chained_rows;
     bool operator==(const FunctionSeedInitializerEvidence &) const = default;
 };
-struct FunctionSeed {FunctionSeedKind kind;Address entry;std::optional<Address> source;std::optional<std::uint64_t> decision;std::optional<FunctionSeedUnwindEvidence> unwind_evidence;std::optional<FunctionSeedInitializerEvidence> initializer_evidence;bool operator==(const FunctionSeed&)const=default;};
+struct FunctionSeed {FunctionSeedKind kind;Address entry;std::optional<Address> source;std::optional<std::uint64_t> decision;std::optional<FunctionSeedUnwindEvidence> unwind_evidence;std::optional<FunctionSeedInitializerEvidence> initializer_evidence;std::optional<FunctionSeedPogoEvidence> pogo_evidence;bool operator==(const FunctionSeed&)const=default;};
 enum class FunctionStopReason {ret,trap,unsupported,invalid,truncated,unmapped,uninitialized,non_executable,manual_data,overlap,indirect,budget,target_overflow,chunk_boundary,tail_candidate,elf_relocation,macho_relocation,macho_dyld,image_exclusion};
 struct FunctionStop {Address address;FunctionStopReason reason;std::string detail;bool operator==(const FunctionStop&)const=default;};
 struct InstructionFact {std::uint64_t id;Instruction instruction;ReadSet reads;};

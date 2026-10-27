@@ -117,6 +117,8 @@ std::optional<decompiler::Intrinsic> convert_scalar_ir(const HexLabInstructionIR
                 case HEXLAB_SCALAR_IR_SHL:operation="shl";break;
                 case HEXLAB_SCALAR_IR_LSHR:operation="shr";break;
                 case HEXLAB_SCALAR_IR_ASHR:operation="sar";break;
+                case HEXLAB_SCALAR_IR_ROL:operation="rotl";break;
+                case HEXLAB_SCALAR_IR_ROR:operation="rotr";break;
                 default:return {};
                 }
                 costs[i]+=costs[node.right];depths[i]=1+std::max(depths[node.left],depths[node.right]);

@@ -650,13 +650,14 @@ if (project.open(project_path, true) == 0 && project.analyze() == 0) {
 }
 ```
 
-## Pure scalar instruction IR (ABI 1.22–1.24)
+## Pure scalar instruction IR (ABI 1.22–1.25)
 
 `HexLabProcessorExtension` now has a size-gated, append-only `decode_ir` callback.
-The `processor.ir.scalar` v1.24 host capability accepts bounded typed integer
+The `processor.ir.scalar` v1.25 host capability accepts bounded typed integer
 DAGs with exact register effects and parallel outputs. ABI 1.23 adds exact
 equality and signed/unsigned ordering predicates; ABI 1.24 adds logical and
-arithmetic shifts, without changing the record layout. Existing modules
+arithmetic shifts, and ABI 1.25 adds modulo-width rotates, without changing the
+record layout. Existing modules
 requiring v1.22 remain compatible and can use the original operation set; a
 module requiring newer operations is rejected by a host that only implements
 an earlier capability minor. Hosts opt into common-IR lifting through

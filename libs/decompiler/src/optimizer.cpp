@@ -181,7 +181,8 @@ std::optional<ConstantValue> fold_binary(const BinaryValue &binary, ValueType re
     }
     const auto result_bits = result_type.bits;
     const bool is_shift = binary.operation == "shl" || binary.operation == "shr" || binary.operation == "sar";
-    if ((!is_shift && (left->type.bits != result_bits || right->type.bits != result_bits)) ||
+    const bool is_rotate = binary.operation == "rotl" || binary.operation == "rotr";
+    if ((!is_shift && !is_rotate && (left->type.bits != result_bits || right->type.bits != result_bits)) ||
         (is_shift && left->type.bits != result_bits)) return {};
     const auto mask = width_mask(result_bits);
     // Unsigned division and remainder are defined for every nonzero divisor.
@@ -217,6 +218,12 @@ std::optional<ConstantValue> fold_binary(const BinaryValue &binary, ValueType re
             value >>= shift;
             if (negative && shift) value |= mask ^ (mask >> shift);
         }
+    } else if (is_rotate) {
+        if (left->type.bits != result_bits || right->type.bits != result_bits) return {};
+        const auto shift = static_cast<unsigned>(b % result_bits);
+        if (!shift) value = a;
+        else if (binary.operation == "rotl") value = (a << shift) | (a >> (result_bits - shift));
+        else value = (a >> shift) | (a << (result_bits - shift));
     } else return {};
     return ConstantValue{value & mask, result_type};
 }

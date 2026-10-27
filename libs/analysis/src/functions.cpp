@@ -27,6 +27,7 @@ const char *seed_kind_name(FunctionSeedKind kind) {
     case FunctionSeedKind::guard_cf: return "Guard CF metadata";
     case FunctionSeedKind::dex_method: return "DEX defined method";
     case FunctionSeedKind::safe_seh: return "PE SafeSEH handler";
+    case FunctionSeedKind::pogo: return "PE POGO function profile";
     }
     return "unknown function evidence";
 }
@@ -35,6 +36,10 @@ std::string seed_provenance_text(const FunctionSeed &seed) {
     if (seed.unwind_evidence)
         text += " (section " + std::to_string(seed.unwind_evidence->section) + ", record @ file offset " +
                 std::to_string(seed.unwind_evidence->file_offset) + ")";
+    if (seed.pogo_evidence)
+        text += " (profile " + std::to_string(seed.pogo_evidence->profile_index) + ", row " +
+                std::to_string(seed.pogo_evidence->entry_index) + " @ file offset " +
+                std::to_string(seed.pogo_evidence->file_offset) + ")";
     if (seed.initializer_evidence) {
         const auto &evidence = *seed.initializer_evidence;
         text += " (initializer slot";
@@ -889,6 +894,112 @@ void Recovery::seed_roots() {
             if (function.function_length)
                 metadata_chunks[entry].push_back({entry, function.function_length, {}});
             root(std::move(seed), false);
+        }
+    }
+    // Linker POGO profile rows name function starts and code lengths. Treat
+    // those starts as symbol-like roots, but only use their extent when the
+    // complete range is initialized executable input and no stronger
+    // user/unwind boundary already owns the entry.
+    if (metadata.pe && !metadata.pe->pogo_data.empty()) {
+        auto load_base = metadata.preferred_base;
+        for (const auto &segment : image.layout().segments)
+            if (segment.name == "headers") {
+                load_base = segment.begin.offset;
+                break;
+            }
+        AddressMap<std::uint64_t> extents;
+        AddressMap<FunctionSeedPogoEvidence> evidence;
+        AddressSet conflicting_extents;
+        for (std::size_t profile_index = 0; profile_index < metadata.pe->pogo_data.size(); ++profile_index) {
+            const auto &profile = metadata.pe->pogo_data[profile_index];
+            if (profile_index > UINT32_MAX) {
+                output->complete = false;
+                break;
+            }
+            for (std::size_t entry_index = 0; entry_index < profile.entries.size(); ++entry_index) {
+                const auto &function = profile.entries[entry_index];
+                if (entry_index > UINT32_MAX) {
+                    output->complete = false;
+                    break;
+                }
+                canceled();
+                if (function.size == 0 || function.source.spans.empty()) {
+                    output->complete = false;
+                    continue;
+                }
+                const auto offset = checked_add(load_base, function.rva);
+                if (!offset) {
+                    output->complete = false;
+                    continue;
+                }
+                const Address entry{image.layout().space.id, offset.value()};
+                if (!AddressRange::create(entry, function.size)) {
+                    output->complete = false;
+                    continue;
+                }
+                const auto *segment = image.segment_at(entry);
+                if (!segment || !segment->executable || entry.offset < segment->begin.offset) {
+                    output->complete = false;
+                    continue;
+                }
+                const auto relative = entry.offset - segment->begin.offset;
+                if (relative >= segment->file_size || function.size > segment->file_size - relative ||
+                    relative >= segment->size || function.size > segment->size - relative ||
+                    image.code_window(entry, function.size) != function.size) {
+                    output->complete = false;
+                    continue;
+                }
+                bool valid_source = true;
+                for (const auto &span : function.source.spans) {
+                    if (span.size == 0) {
+                        valid_source = false;
+                        break;
+                    }
+                }
+                if (!valid_source) {
+                    output->complete = false;
+                    continue;
+                }
+                auto [found, inserted] = extents.emplace(entry, function.size);
+                if (!inserted && found->second != function.size) {
+                    conflicting_extents.insert(entry);
+                    output->complete = false;
+                }
+                if (inserted)
+                    evidence.emplace(entry, FunctionSeedPogoEvidence{static_cast<std::uint32_t>(profile_index),
+                        function.source.index, function.source.spans.front().offset.value,
+                        function.source.spans.front().size});
+            }
+        }
+        // POGO entries can describe identical roots in multiple profiles. If
+        // distinct entries overlap, retain their roots but avoid choosing
+        // either extent as an ownership boundary.
+        std::optional<std::pair<Address, std::uint64_t>> active_extent;
+        for (const auto &[entry, size] : extents) {
+            if (active_extent && active_extent->first.space == entry.space &&
+                entry.offset < active_extent->first.offset + active_extent->second) {
+                conflicting_extents.insert(active_extent->first);
+                conflicting_extents.insert(entry);
+                output->complete = false;
+                const auto end = entry.offset + size;
+                if (end > active_extent->first.offset + active_extent->second)
+                    active_extent = std::pair{entry, size};
+            } else {
+                active_extent = std::pair{entry, size};
+            }
+        }
+        for (const auto &[entry, size] : extents) {
+            FunctionSeed seed{FunctionSeedKind::pogo, entry, {}, {}};
+            if (const auto found = evidence.find(entry); found != evidence.end())
+                seed.pogo_evidence = found->second;
+            if (!seed.pogo_evidence) {
+                output->complete = false;
+                continue;
+            }
+            root(std::move(seed), false);
+            if (!conflicting_extents.contains(entry) && !definitions.contains(entry) &&
+                !metadata_chunks.contains(entry))
+                metadata_chunks[entry].push_back({entry, size, {}});
         }
     }
     // Use a symbol-table extent only as a conservative ownership bound when
@@ -1836,7 +1947,7 @@ namespace hexlab {
 Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     Sha256 hash;
     constexpr std::string_view version =
-        "hexlab-functions-v61/mips64-eh-frame-roots-v1/pe-x86-fpo-roots-and-extents-v1/riscv-bitwise-immediate-addresses-v1/dex-method-roots-call-edges-v2/dex-relative-control-operands-v1/dex-payload-data-v1/riscv-vfrsqrt7-vfrec7-v1/a64-preserving-bitfield-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/mips64-special-conditional-traps-v1/evex-packed-fp-broadcast-v1/evex-packed-fp-compare-mask-v1/wasm-br-table-12-case-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v2/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v4/guard-multiblock-v1/unicode-strings-v2/windows1253-1255-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
+        "hexlab-functions-v62/mips64-eh-frame-roots-v1/pe-x86-fpo-roots-and-extents-v1/riscv-bitwise-immediate-addresses-v1/dex-method-roots-call-edges-v2/dex-relative-control-operands-v1/dex-payload-data-v1/riscv-vfrsqrt7-vfrec7-v1/a64-preserving-bitfield-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/mips64-special-conditional-traps-v1/evex-packed-fp-broadcast-v1/evex-packed-fp-compare-mask-v1/wasm-br-table-12-case-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v2/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v4/guard-multiblock-v1/unicode-strings-v2/windows1253-1255-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/pe-pogo-function-roots-v1"
         "elf-reference-provenance-v1/elf-arithmetic-v2/macho-symbol-roots-v1/macho-relocation-flow-v1/"
         "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/riscv-vfclass-vfsqrt-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1/pe-safe-seh-function-roots-v1";
     (void)hash.update(std::as_bytes(std::span(version)));

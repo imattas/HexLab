@@ -164,6 +164,13 @@ std::vector<std::byte> payload(const DerivedProposal &proposal, std::stop_token 
                     for (const auto row : *rows) out.number(row);
                 }
             }
+            out.flag(seed.pogo_evidence.has_value());
+            if (seed.pogo_evidence) {
+                out.number(seed.pogo_evidence->profile_index, 4);
+                out.number(seed.pogo_evidence->entry_index, 4);
+                out.number(seed.pogo_evidence->file_offset);
+                out.number(seed.pogo_evidence->record_size);
+            }
         }
         out.count(function->stops.size());
         for (auto &record : function->stops)
@@ -410,7 +417,7 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
         auto seeds = in.count(16);
         for (size_t j = 0; j < seeds; ++j) {
             auto kind = in.number(1);
-            require(kind <= static_cast<unsigned>(FunctionSeedKind::safe_seh), "Unknown cached function seed kind");
+            require(kind <= static_cast<unsigned>(FunctionSeedKind::pogo), "Unknown cached function seed kind");
             FunctionSeed seed{static_cast<FunctionSeedKind>(kind), in.address(), in.optional_address(), {}};
             if (in.flag())
                 seed.decision = in.number();
@@ -437,9 +444,15 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
                 read_rows(evidence.dyld_chained_rows);
                 seed.initializer_evidence = std::move(evidence);
             }
+            if (in.flag())
+                seed.pogo_evidence = FunctionSeedPogoEvidence{static_cast<std::uint32_t>(in.number(4)),
+                                                               static_cast<std::uint32_t>(in.number(4)),
+                                                               in.number(), in.number()};
             require((seed.kind == FunctionSeedKind::unwind) == seed.unwind_evidence.has_value() &&
                         (!seed.unwind_evidence || seed.unwind_evidence->record_size > 0) &&
-                        ((seed.kind == FunctionSeedKind::initializer) == seed.initializer_evidence.has_value()),
+                        ((seed.kind == FunctionSeedKind::initializer) == seed.initializer_evidence.has_value()) &&
+                        ((seed.kind == FunctionSeedKind::pogo) == seed.pogo_evidence.has_value()) &&
+                        (!seed.pogo_evidence || seed.pogo_evidence->record_size > 0),
                     "Invalid cached function seed evidence");
             function->seeds.push_back(std::move(seed));
         }
