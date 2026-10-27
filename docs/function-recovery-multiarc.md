@@ -150,3 +150,12 @@ predict which implementation it returns. The ordinary executable, initialized
 byte, context, relocation, and budget checks still apply. This does not
 discover implementations selected only at runtime, and undefined IFUNC
 symbols do not create roots.
+
+For PE32 images, validated SafeSEH handler RVAs also seed function entries.
+The loader checks table bounds, strict ordering, initialized executable
+backing, and source spans. Analysis translates each RVA against the mapped
+image base and reapplies its normal executable-code/root checks. SafeSEH
+entries establish handler roots only; they do not imply a function extent or
+claim that every handler is reached in ordinary control flow. The
+function-engine fingerprint includes this root source so persisted recovery
+is recomputed when upgrading.

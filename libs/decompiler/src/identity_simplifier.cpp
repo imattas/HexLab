@@ -1,8 +1,10 @@
 #include "hexlab/decompiler/decompiler.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <functional>
 #include <map>
+#include <optional>
 #include <queue>
 #include <set>
 #include <string_view>
@@ -521,6 +523,22 @@ ExpressionPtr simplify(const ExpressionPtr &input) {
             return constant(0, result->type);
         if (lc && (lc->value & all) == 1) return right;
         if (rc && (rc->value & all) == 1) return left;
+        if (result->type.kind == TypeKind::integer) {
+            const auto shift_for = [&](const ConstantValue *value) -> std::optional<unsigned> {
+                if (!value || value->type != result->type) return {};
+                const auto factor = value->value & all;
+                if (!factor || (factor & (factor - 1)) != 0) return {};
+                const auto amount = static_cast<unsigned>(std::countr_zero(factor));
+                return amount > 0 && amount < result->type.bits
+                    ? std::optional<unsigned>{amount} : std::nullopt;
+            };
+            if (const auto amount = shift_for(rc); amount && pure_bitvector(left))
+                return std::make_shared<Expression>(Expression{result->type,
+                    BinaryValue{"shl", left, constant(*amount, result->type)}});
+            if (const auto amount = shift_for(lc); amount && pure_bitvector(right))
+                return std::make_shared<Expression>(Expression{result->type,
+                    BinaryValue{"shl", right, constant(*amount, result->type)}});
+        }
     }
     if ((binary->operation == "sub" || binary->operation == "xor") &&
         structurally_equal(left, right) && pure(left)) return constant(0, result->type);

@@ -22,6 +22,14 @@ values, unversioned registers, and opaque effects are left alone. These rules
 operate on the shared typed IR, so they apply to any architecture that lifts to
 the same fixed-width operations.
 
+Same-width pure integer multiplication by a nonzero power-of-two constant is
+rewritten to a left shift when the shift amount is less than the value width.
+The rewrite works for either operand order and uses the same fixed-width result
+type, so signed and unsigned multiplication retain their modulo-2^width result.
+It requires every register input to have an SSA version; unknown values and
+effectful expressions remain untouched. A zero factor and factor one continue
+to use their existing identities.
+
 For call-free lifted functions, the constant pass also resolves loop-carried
 phis whose concrete incoming values prove the same typed constant and whose
 remaining back-edges are exact SSA register copies. This handles invariant
