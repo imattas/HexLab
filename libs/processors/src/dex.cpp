@@ -333,6 +333,55 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
             text = std::string(names[op - 0xd8]) + " " + vr(hi) + ", " +
                    vr(operands & 255) + ", " + std::to_string(literal);
         }
+    } else if (op >= 0xe3 && op <= 0xeb) {
+        static constexpr std::array<std::string_view, 9> names{
+            "iget-volatile", "iput-volatile", "sget-volatile", "sput-volatile",
+            "iget-object-volatile", "iget-wide-volatile", "iput-wide-volatile",
+            "sget-wide-volatile", "sput-wide-volatile"};
+        words = 2;
+        if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated optimized DEX volatile field access");
+        const bool instance = op == 0xe3 || op == 0xe4 || op == 0xe7 || op == 0xe8 || op == 0xe9;
+        if (instance)
+            text = std::string(names[op - 0xe3]) + " " + vr(hi & 15) + ", " + vr(hi >> 4) +
+                   ", field@" + std::to_string(word(1));
+        else
+            text = std::string(names[op - 0xe3]) + " " + vr(hi) + ", field@" + std::to_string(word(1));
+    } else if (op == 0xf1) {
+        text = "return-void-barrier";
+        flow = FlowKind::ret;
+    } else if (op >= 0xf2 && op <= 0xf7) {
+        static constexpr std::array<std::string_view, 6> names{
+            "iget-quick", "iget-wide-quick", "iget-object-quick",
+            "iput-quick", "iput-wide-quick", "iput-object-quick"};
+        words = 2;
+        if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated optimized DEX quick field access");
+        text = std::string(names[op - 0xf2]) + " " + vr(hi & 15) + ", " + vr(hi >> 4) +
+               ", fieldoff@" + std::to_string(word(1));
+    } else if (op == 0xee || op == 0xef || op == 0xf8 || op == 0xf9) {
+        const bool range = op == 0xef || op == 0xf9;
+        words = 3;
+        if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated optimized DEX invoke");
+        const unsigned count = range ? hi : ((first >> 12) & 15);
+        if ((range && count > 15) || (!range && count > 5))
+            return fail(DecodeStatus::invalid, "optimized DEX invoke register count exceeds its encoding");
+        const auto index = word(1);
+        if (range) {
+            const auto start = static_cast<unsigned>(word(2));
+            if (count && start > UINT16_MAX - (count - 1))
+                return fail(DecodeStatus::invalid, "optimized DEX invoke register range overflows 16-bit indexes");
+            text = std::string(op == 0xef ? "execute-inline/range {" : "invoke-virtual-quick/range {");
+            if (count) text += vr(start) + " .. " + vr(start + count - 1);
+        } else {
+            const auto packed = word(2);
+            const std::array<unsigned, 5> regs{unsigned(packed & 15), unsigned((packed >> 4) & 15),
+                unsigned((packed >> 8) & 15), unsigned((packed >> 12) & 15), unsigned((hi >> 4) & 15)};
+            text = std::string(op == 0xee ? "execute-inline {" : "invoke-virtual-quick {");
+            for (unsigned n = 0; n < count; ++n) { if (n) text += ", "; text += vr(regs[n]); }
+        }
+        text += "}";
+        if (op == 0xee || op == 0xef) text += ", inline@" + std::to_string(index);
+        else text += ", vtable@" + std::to_string(index);
+        flow = FlowKind::call;
     } else if ((op >= 0x32 && op <= 0x37) || (op >= 0x38 && op <= 0x3d)) {
         words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX conditional branch");
         const auto offset = static_cast<std::int16_t>(word(1));
@@ -424,11 +473,15 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         std::copy_n(bytes.begin(), length, instruction.bytes.begin());
     instruction.opcode = dex_switch ? Opcode::dex_switch : Opcode::dex;
     instruction.memory_read = op == 0x21 || op == 0x26 || op == 0x2b || op == 0x2c || (op >= 0x44 && op <= 0x4a) ||
-                              (op >= 0x52 && op <= 0x58) || (op >= 0x60 && op <= 0x66);
+                              (op >= 0x52 && op <= 0x58) || (op >= 0x60 && op <= 0x66) ||
+                              op == 0xe3 || op == 0xe5 || (op >= 0xe7 && op <= 0xe8) || op == 0xea ||
+                              (op >= 0xf2 && op <= 0xf4);
     instruction.memory_write = (op >= 0x4b && op <= 0x51) || (op >= 0x59 && op <= 0x5f) ||
-                               (op >= 0x67 && op <= 0x6d) || op == 0x26;
+                               (op >= 0x67 && op <= 0x6d) || op == 0x26 || op == 0xe4 || op == 0xe6 ||
+                               op == 0xe9 || op == 0xeb || (op >= 0xf5 && op <= 0xf7);
     if (op == 0x22 || op == 0x23 || op == 0x24 || op == 0x25 ||
-        (op >= 0x6e && op <= 0x78) || (op >= 0xfa && op <= 0xfd))
+        (op >= 0x6e && op <= 0x78) || (op >= 0xfa && op <= 0xfd) ||
+        op == 0xee || op == 0xef || op == 0xf8 || op == 0xf9)
         instruction.memory_read = instruction.memory_write = true;
     instruction.mnemonic_override = std::move(text); instruction.flow = flow; instruction.direct_target = target;
     instruction.dex_switch = std::move(dex_switch);
@@ -511,6 +564,23 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         // arguments. Prototype/type resolution belongs to method analysis.
         imm(word(1), 16, 16);
         if (invoke_ext && (op == 0xfa || op == 0xfb)) imm(word(3), 16, 16);
+    } else if (op == 0xee || op == 0xef || op == 0xf8 || op == 0xf9) {
+        const bool range = op == 0xef || op == 0xf9;
+        const unsigned count = range ? hi : ((first >> 12) & 15);
+        if ((range && count > 15) || (!range && count > 5))
+            return fail(DecodeStatus::invalid, "optimized DEX invoke register count exceeds its encoding");
+        if (range) {
+            const unsigned start = word(2);
+            if (count && start > UINT16_MAX - (count - 1))
+                return fail(DecodeStatus::invalid, "optimized DEX invoke register range overflows 16-bit indexes");
+            for (unsigned i = 0; i < count; ++i) reg(start + i, read);
+        } else {
+            const auto packed = word(2);
+            const std::array<unsigned, 5> regs{unsigned(packed & 15), unsigned((packed >> 4) & 15),
+                unsigned((packed >> 8) & 15), unsigned((packed >> 12) & 15), unsigned((hi >> 4) & 15)};
+            for (unsigned i = 0; i < count; ++i) reg(regs[i], read);
+        }
+        imm(word(1), 16, 16);
     } else if (op >= 0x2d && op <= 0x31) {
         reg(hi, write);
         reg(word(1) & 255, read, op >= 0x2f ? 64 : 32);
@@ -526,6 +596,19 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         const bool wide = op == 0x53 || op == 0x5a || op == 0x61 || op == 0x68;
         reg(instance ? a : hi, get ? write : read, wide ? 64 : 32);
         if (instance) reg(b, read);
+        imm(word(1), 16, 16);
+    } else if (op >= 0xe3 && op <= 0xeb) {
+        const bool instance = op == 0xe3 || op == 0xe4 || op == 0xe7 || op == 0xe8 || op == 0xe9;
+        const bool get = op == 0xe3 || op == 0xe5 || op == 0xe7 || op == 0xe8 || op == 0xea;
+        const bool wide = op == 0xe8 || op == 0xe9 || op == 0xea || op == 0xeb;
+        reg(instance ? a : hi, get ? write : read, wide ? 64 : 32);
+        if (instance) reg(b, read);
+        imm(word(1), 16, 16);
+    } else if (op >= 0xf2 && op <= 0xf7) {
+        const bool get = op <= 0xf4;
+        const bool wide = op == 0xf3 || op == 0xf6;
+        reg(a, get ? write : read, wide ? 64 : 32);
+        reg(b, read);
         imm(word(1), 16, 16);
     } else if (op >= 0x7b && op <= 0x8f) {
         const bool wide_dest = op == 0x7d || op == 0x7e || op == 0x80 || op == 0x81 ||
