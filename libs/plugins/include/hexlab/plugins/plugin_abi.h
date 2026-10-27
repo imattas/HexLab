@@ -187,7 +187,7 @@ typedef int32_t (*HexLabProcessorSemanticDecodeV3)(void* extension_context, uint
    host-owned; conversion finishes under the module lock after callback return.
    No plugin pointers survive. Integer arithmetic wraps to width bits (8/16/32/64).
    is_signed is 0 or 1 and must agree across an operation and its inputs. ABI
-   1.23 appends operations only; the record API version and layout stay fixed,
+   1.23 and 1.24 append operations only; the record API version and layout stay fixed,
    and the host capability minor negotiates the expanded operation set. */
 #define HEXLAB_SCALAR_IR_API_VERSION 1u
 #define HEXLAB_SCALAR_IR_MAX_NODES 32u
@@ -217,7 +217,11 @@ typedef enum HexLabScalarIROperation {
     HEXLAB_SCALAR_IR_SLT = 16,
     HEXLAB_SCALAR_IR_SGE = 17,
     HEXLAB_SCALAR_IR_SLE = 18,
-    HEXLAB_SCALAR_IR_SGT = 19
+    HEXLAB_SCALAR_IR_SGT = 19,
+    /* ABI 1.24: logical left/right and arithmetic right shifts. */
+    HEXLAB_SCALAR_IR_SHL = 20,
+    HEXLAB_SCALAR_IR_LSHR = 21,
+    HEXLAB_SCALAR_IR_ASHR = 22
 } HexLabScalarIROperation;
 
 typedef struct HexLabScalarIRNode {

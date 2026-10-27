@@ -92,6 +92,10 @@ std::optional<decompiler::Intrinsic> convert_scalar_ir(const HexLabInstructionIR
                 values[i]=std::make_shared<Expression>(Expression{type,UnaryValue{"bitnot",values[node.left]}});
             }else{
                 if(node.right>=i||values[node.right]->type!=type)return {};
+                const bool is_shift=node.operation==HEXLAB_SCALAR_IR_SHL||
+                    node.operation==HEXLAB_SCALAR_IR_LSHR||node.operation==HEXLAB_SCALAR_IR_ASHR;
+                if(is_shift&&record.nodes[node.right].operation==HEXLAB_SCALAR_IR_CONSTANT&&
+                   record.nodes[node.right].value>=node.width)return {};
                 const char *operation=nullptr;
                 switch(node.operation){
                 case HEXLAB_SCALAR_IR_ADD:operation="add";break;
@@ -110,6 +114,9 @@ std::optional<decompiler::Intrinsic> convert_scalar_ir(const HexLabInstructionIR
                 case HEXLAB_SCALAR_IR_SGE:operation="sge";break;
                 case HEXLAB_SCALAR_IR_SLE:operation="sle";break;
                 case HEXLAB_SCALAR_IR_SGT:operation="sgt";break;
+                case HEXLAB_SCALAR_IR_SHL:operation="shl";break;
+                case HEXLAB_SCALAR_IR_LSHR:operation="shr";break;
+                case HEXLAB_SCALAR_IR_ASHR:operation="sar";break;
                 default:return {};
                 }
                 costs[i]+=costs[node.right];depths[i]=1+std::max(depths[node.left],depths[node.right]);
