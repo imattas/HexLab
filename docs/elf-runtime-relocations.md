@@ -48,7 +48,7 @@ with these types:
 | AArch64 | `R_AARCH64_RELATIVE` | 1027 | `B + A` |
 | AArch64 | `R_AARCH64_GLOB_DAT` | 1025 | `S` |
 | AArch64 | `R_AARCH64_JUMP_SLOT` | 1026 | `S` |
-| PPC64 | `R_PPC64_ADDR32` | 1 | `S + A` (unsigned 32-bit field) |
+| PPC64 | `R_PPC64_ADDR32` | 1 | `S + A` (signed-or-unsigned 32-bit field) |
 | PPC64 | `R_PPC64_ADDR64` | 38 | `S + A` (low 64 bits) |
 | PPC64 | `R_PPC64_GLOB_DAT` | 20 | `S + A` (low 64 bits) |
 | PPC64 | `R_PPC64_JMP_SLOT` | 21 | `S` |
@@ -113,7 +113,7 @@ follow the [AAELF64 data relocation table](https://github.com/ARM-software/abi-a
 The little-endian PPC64 ELF64 profile applies `R_PPC64_RELATIVE`,
 `R_PPC64_ADDR32`, `R_PPC64_ADDR64`, `R_PPC64_GLOB_DAT`, and `R_PPC64_JMP_SLOT` from dynamic RELA tables. Relative
 records use `B + A` and require symbol index zero. `ADDR32` and `ADDR64` use
-`S + A`; `ADDR32` must fit its unsigned 32-bit field and `ADDR64` writes the
+`S + A`; `ADDR32` must fit `[-2^31, 2^32-1]` and writes the low 32 bits; `ADDR64` writes the
 low 64 bits. `GLOB_DAT` also uses `S + A` and writes the low 64 bits; its
 addend is retained and applied as specified by the PowerPC64 ABI. Targets must
 be complete, writable, initialized fields aligned to their width. `JMP_SLOT` writes the

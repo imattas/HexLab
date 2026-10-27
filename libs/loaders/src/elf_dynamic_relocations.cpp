@@ -158,6 +158,27 @@ bool add_signed_to_unsigned(std::uint64_t base, std::int64_t addend, std::uint64
     }
     return true;
 }
+bool ppc64_addr32_result(std::uint64_t symbol, std::int64_t addend, std::uint32_t &result) {
+    if (addend >= 0) {
+        const auto amount = static_cast<std::uint64_t>(addend);
+        if (symbol > UINT64_MAX - amount) return false;
+        const auto sum = symbol + amount;
+        if (sum > UINT32_MAX) return false;
+        result = static_cast<std::uint32_t>(sum);
+        return true;
+    }
+    const auto magnitude = static_cast<std::uint64_t>(-(addend + 1)) + 1;
+    if (symbol >= magnitude) {
+        const auto sum = symbol - magnitude;
+        if (sum > UINT32_MAX) return false;
+        result = static_cast<std::uint32_t>(sum);
+        return true;
+    }
+    const auto negative_magnitude = magnitude - symbol;
+    if (negative_magnitude > UINT64_C(0x80000000)) return false;
+    result = static_cast<std::uint32_t>(0u - static_cast<std::uint32_t>(negative_magnitude));
+    return true;
+}
 bool pc32_result(std::uint64_t symbol, std::int64_t addend, std::uint64_t place, std::uint32_t &encoded) {
     bool negative = symbol < place;
     std::uint64_t magnitude = negative ? place - symbol : symbol - place;
@@ -748,12 +769,12 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                         }
                         value = sum;
                     } else if (ppc64_abs32) {
-                        std::uint64_t sum = 0;
-                        if (!add_signed_to_unsigned(value, *relocation.addend, sum) || sum > UINT32_MAX) {
-                            skip(index, "R_PPC64_ADDR32 result does not fit unsigned 32 bits");
+                        std::uint32_t encoded = 0;
+                        if (!ppc64_addr32_result(value, *relocation.addend, encoded)) {
+                            skip(index, "R_PPC64_ADDR32 result does not fit signed-or-unsigned 32 bits");
                             continue;
                         }
-                        value = sum;
+                        value = encoded;
                     } else if (s390x_pc32) {
                         if (!relocation.place) {
                             skip(index, "R_390_PC32 relocation place is unavailable");

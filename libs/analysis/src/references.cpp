@@ -2215,16 +2215,47 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
                 }
                 propagated = true;
             } else if ((instruction.opcode == Opcode::rv_slli || instruction.opcode == Opcode::rv_srli ||
-                        instruction.opcode == Opcode::rv_srai) && instruction.operands.size() == 3) {
+                        instruction.opcode == Opcode::rv_srai || instruction.opcode == Opcode::rv_slliw ||
+                        instruction.opcode == Opcode::rv_srliw || instruction.opcode == Opcode::rv_sraiw ||
+                        instruction.opcode == Opcode::rv_sll || instruction.opcode == Opcode::rv_srl ||
+                        instruction.opcode == Opcode::rv_sra || instruction.opcode == Opcode::rv_sllw ||
+                        instruction.opcode == Opcode::rv_srlw || instruction.opcode == Opcode::rv_sraw) &&
+                       instruction.operands.size() == 3) {
                 const auto *dst = riscv_register(instruction, 0);
                 const auto *src = riscv_register(instruction, 1);
-                const auto shift = riscv_unsigned_immediate(instruction, 2,
-                    instruction.opcode == Opcode::rv_slli || width == 64 ? 6 : 5);
+                const bool word_operation = instruction.opcode == Opcode::rv_slliw ||
+                    instruction.opcode == Opcode::rv_srliw || instruction.opcode == Opcode::rv_sraiw ||
+                    instruction.opcode == Opcode::rv_sllw || instruction.opcode == Opcode::rv_srlw ||
+                    instruction.opcode == Opcode::rv_sraw;
+                const bool register_shift = instruction.opcode == Opcode::rv_sll ||
+                    instruction.opcode == Opcode::rv_srl || instruction.opcode == Opcode::rv_sra ||
+                    instruction.opcode == Opcode::rv_sllw || instruction.opcode == Opcode::rv_srlw ||
+                    instruction.opcode == Opcode::rv_sraw;
+                const bool left_shift = instruction.opcode == Opcode::rv_slli || instruction.opcode == Opcode::rv_slliw ||
+                    instruction.opcode == Opcode::rv_sll || instruction.opcode == Opcode::rv_sllw;
+                const bool arithmetic_shift = instruction.opcode == Opcode::rv_srai || instruction.opcode == Opcode::rv_sraiw ||
+                    instruction.opcode == Opcode::rv_sra || instruction.opcode == Opcode::rv_sraw;
+                std::optional<RiscvAddressValue> shift_value;
+                std::optional<std::uint64_t> shift;
+                if (register_shift) {
+                    const auto *amount_register = riscv_register(instruction, 2);
+                    if (amount_register && amount_register->width == width) {
+                        if (!amount_register->index) shift = 0;
+                        else if (const auto found = registers.find(amount_register->index);
+                                 found != registers.end() && found->second.address.space == instruction.address.space) {
+                            shift_value = found->second;
+                            shift = found->second.address.offset & (word_operation ? 31u : width - 1u);
+                        }
+                    }
+                } else {
+                    const auto shift_bits = static_cast<std::uint8_t>(word_operation ? 5 : (width == 64 ? 6 : 5));
+                    shift = riscv_unsigned_immediate(instruction, 2, shift_bits);
+                }
                 std::optional<RiscvAddressValue> definition;
                 std::uint64_t value = 0;
                 bool known = false;
                 const auto mask = width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
-                if (src && src->width == width && shift && *shift < width) {
+                if (src && src->width == width && shift && *shift < (word_operation ? 32u : width)) {
                     const RiscvAddressValue *base = nullptr;
                     if (!src->index) {
                         base = nullptr;
@@ -2236,8 +2267,16 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
                     }
                     if (known) {
                         const auto input = base ? base->address.offset & mask : 0;
-                        if (instruction.opcode == Opcode::rv_slli) value = (input << *shift) & mask;
-                        else if (instruction.opcode == Opcode::rv_srli) value = input >> *shift;
+                        if (word_operation) {
+                            const auto input32 = static_cast<std::uint32_t>(input);
+                            std::uint32_t result32 = 0;
+                            if (left_shift) result32 = static_cast<std::uint32_t>(input32 << *shift);
+                            else if (arithmetic_shift)
+                                result32 = static_cast<std::uint32_t>(std::bit_cast<std::int32_t>(input32) >> *shift);
+                            else result32 = input32 >> *shift;
+                            value = static_cast<std::uint64_t>(static_cast<std::int64_t>(std::bit_cast<std::int32_t>(result32)));
+                        } else if (left_shift) value = (input << *shift) & mask;
+                        else if (!arithmetic_shift) value = input >> *shift;
                         else if (width == 32) {
                             const auto signed_input = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(input));
                             value = static_cast<std::uint32_t>(signed_input >> *shift);
@@ -2246,10 +2285,20 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
                             value = static_cast<std::uint64_t>(signed_input >> *shift);
                         }
                         const Address target{base ? base->address.space : instruction.address.space, value & mask};
-                        definition = riscv_definition(target, fact->id, base);
+                        if (base && shift_value)
+                            definition = riscv_binary_definition(target, fact->id, *base, *shift_value);
+                        else
+                            definition = riscv_definition(target, fact->id, base);
                         if (dst && dst->index && dst->width == width && base &&
-                            riscv_target_segment(*image, target, OperandAccess::address))
-                            record_producers({fact->id, 2}, fact->id, *base);
+                            riscv_target_segment(*image, target, OperandAccess::address)) {
+                            if (shift_value && definition) {
+                                auto combined = *definition;
+                                combined.tails.clear();
+                                record_producers({fact->id, 2}, fact->id, combined);
+                            } else {
+                                record_producers({fact->id, 2}, fact->id, *base);
+                            }
+                        }
                     }
                 }
                 erase_written();
