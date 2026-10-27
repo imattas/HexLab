@@ -27,6 +27,12 @@ case-insensitively. Filtering is debounced while typing and preserves each
 visible row's original address target. The filter affects only the displayed
 rows; it does not change the scan or type-import plan.
 
+Use **Copy selected row** to copy the selected visible record as labeled text,
+including its full kind, owner, name, address, status, provenance, and details
+fields. This preserves long metadata values that may be clipped in the table.
+After copying, the status line reports the clipboard result; the filter and
+underlying scan remain unchanged.
+
 Selecting a method row with a validated implementation enables **Pseudocode at
 implementation**. It navigates through the existing document/revision guard,
 selects that implementation, and opens the synchronized pseudocode page. Rows

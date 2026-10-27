@@ -756,7 +756,8 @@ struct MainFrame::Impl {
     wxTextCtrl *macho_objc_filter = nullptr;
     wxStaticText *macho_objc_filter_status = nullptr;
     wxTimer macho_objc_filter_timer;
-    wxButton *macho_objc_import_types = nullptr, *macho_objc_pseudocode = nullptr;
+    wxButton *macho_objc_import_types = nullptr, *macho_objc_pseudocode = nullptr,
+             *macho_objc_copy_row = nullptr;
     std::shared_ptr<const std::vector<MachOObjCViewRow>> macho_objc_rows;
     std::shared_ptr<const std::vector<std::size_t>> macho_objc_visible_rows;
     std::shared_ptr<const MachOObjCScan> macho_objc_scan;
@@ -2082,6 +2083,7 @@ struct MainFrame::Impl {
         });
         if (macho_objc_filter_status) macho_objc_filter_status->SetLabel("No runtime records loaded");
         if (macho_objc_pseudocode) macho_objc_pseudocode->Enable(false);
+        if (macho_objc_copy_row) macho_objc_copy_row->Enable(false);
         macho_objc->activate = {};
     }
     bool navigate_from_document(const std::shared_ptr<const DocumentSnapshot> &source, Location destination) {
@@ -2135,6 +2137,8 @@ struct MainFrame::Impl {
         macho_objc_visible_rows = visible;
         if (macho_objc_filter_status)
             macho_objc_filter_status->SetLabel(wxString::Format("%zu of %zu rows", visible->size(), rows->size()));
+        if (macho_objc_copy_row)
+            macho_objc_copy_row->Enable(macho_objc->selected_row().has_value());
         macho_objc->activate = [this, doc, rows, visible](std::size_t row) {
             if (row < visible->size() && (*rows)[(*visible)[row]].address)
                 navigate_from_document(doc, *(*rows)[(*visible)[row]].address);
@@ -3378,6 +3382,53 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
             impl_->sync();
         }
     });
+    ui.macho_objc_copy_row = new wxButton(metadata, wxID_ANY, "Copy selected row");
+    ui.macho_objc_copy_row->SetName("macho-objc-copy-row");
+    ui.macho_objc_copy_row->Enable(false);
+    ui.macho_objc_copy_row->SetToolTip("Copy all visible fields for the selected Objective-C runtime record.");
+    ui.macho_objc_copy_row->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        const auto doc = impl_->macho_objc_source;
+        const auto selected = impl_->macho_objc ? impl_->macho_objc->selected_row()
+                                                : std::optional<std::size_t>{};
+        if (!doc || !selected || !impl_->macho_objc_rows || !impl_->macho_objc_visible_rows ||
+            *selected >= impl_->macho_objc_visible_rows->size())
+            return;
+        const auto original = (*impl_->macho_objc_visible_rows)[*selected];
+        if (original >= impl_->macho_objc_rows->size())
+            return;
+        const auto &row = (*impl_->macho_objc_rows)[original];
+        static constexpr const char *labels[] = {
+            "Kind", "Owner", "Name", "Address", "Status", "Provenance", "Details"};
+        wxString text;
+        for (int column = 0; column < 7; ++column) {
+            if (column) text += "\n";
+            text += wxString::FromUTF8(labels[column]);
+            text += ": ";
+            text += macho_objc_view_cell(row, column, doc->image.get());
+        }
+        bool stored = false;
+        {
+            wxLogNull quiet;
+            for (int attempt = 0; attempt < 20 && !stored; ++attempt) {
+                if (wxTheClipboard->Open()) {
+                    auto data = std::make_unique<wxTextDataObject>(text);
+                    if (wxTheClipboard->SetData(data.get())) {
+                        data.release();
+                        stored = wxTheClipboard->Flush();
+                    }
+                    wxTheClipboard->Close();
+                }
+                if (!stored && attempt != 19)
+                    wxMilliSleep(10);
+            }
+        }
+        if (impl_->macho_objc_filter_status) {
+            impl_->macho_objc_filter_status->SetLabel(stored
+                ? wxString::Format("Copied selected record (%zu of %zu rows)", *selected + 1,
+                                   impl_->macho_objc_visible_rows->size())
+                : wxString("Clipboard unavailable"));
+        }
+    });
     ui.macho_objc_import_types->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         const auto doc = impl_->shown;
         if (!doc || !doc->project || !doc->project->state || !impl_->macho_objc_scan) return;
@@ -3418,17 +3469,24 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     macho_objc_layout->Add(macho_objc_filter_row, 0, wxEXPAND);
     macho_objc_layout->Add(ui.macho_objc_import_types, 0, wxALL, FromDIP(3));
     macho_objc_layout->Add(ui.macho_objc_pseudocode, 0, wxALL, FromDIP(3));
+    macho_objc_layout->Add(ui.macho_objc_copy_row, 0, wxALL, FromDIP(3));
     macho_objc_layout->Add(ui.macho_objc, 1, wxEXPAND);
     auto *macho_objc_panel = new wxPanel(metadata);
     macho_objc_panel->SetSizer(macho_objc_layout);
     ui.macho_objc->Reparent(macho_objc_panel);
     ui.macho_objc_filter->Reparent(macho_objc_panel);
     ui.macho_objc_filter_status->Reparent(macho_objc_panel);
+    ui.macho_objc_copy_row->Reparent(macho_objc_panel);
     const auto update_objc_pseudocode_action = [this, button = ui.macho_objc_pseudocode](wxListEvent &) {
         if (button) button->Enable(impl_->selected_macho_objc_implementation().has_value());
     };
     ui.macho_objc->Bind(wxEVT_LIST_ITEM_SELECTED, update_objc_pseudocode_action);
     ui.macho_objc->Bind(wxEVT_LIST_ITEM_DESELECTED, update_objc_pseudocode_action);
+    const auto update_objc_copy_action = [this, button = ui.macho_objc_copy_row](wxListEvent &) {
+        if (button) button->Enable(impl_->macho_objc->selected_row().has_value());
+    };
+    ui.macho_objc->Bind(wxEVT_LIST_ITEM_SELECTED, update_objc_copy_action);
+    ui.macho_objc->Bind(wxEVT_LIST_ITEM_DESELECTED, update_objc_copy_action);
     ui.macho_objc_filter->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
         impl_->macho_objc_filter_timer.Stop();
         if (impl_->macho_objc_filter_status) impl_->macho_objc_filter_status->SetLabel("Filtering...");
