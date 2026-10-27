@@ -466,6 +466,26 @@ std::optional<Arm32StepDestination> arm32_branch_destination(
             if (target < 0 || target > UINT32_MAX || (target & 1)) return {};
             return Arm32StepDestination{static_cast<DWORD>(target), true};
         };
+        // Thumb-2 B.W (encoding T4). Bounded to the unconditional form; BL,
+        // BLX, and conditional wide branches remain unsupported here.
+        if (bytes.size() >= 4 && (half & 0xf800u) == 0xf000u) {
+            const auto second = static_cast<std::uint16_t>(std::to_integer<unsigned>(bytes[2]) |
+                (std::to_integer<unsigned>(bytes[3]) << 8));
+            if ((second & 0xd000u) == 0x9000u) {
+                if (!it_executes) return Arm32StepDestination{static_cast<DWORD>(pc + 4u), true};
+                const auto s = static_cast<std::uint32_t>((half >> 10) & 1u);
+                const auto j1 = static_cast<std::uint32_t>((second >> 13) & 1u);
+                const auto j2 = static_cast<std::uint32_t>((second >> 11) & 1u);
+                const auto i1 = (~(j1 ^ s)) & 1u;
+                const auto i2 = (~(j2 ^ s)) & 1u;
+                const auto encoded = (s << 24) | (i1 << 23) | (i2 << 22) |
+                    (static_cast<std::uint32_t>(half & 0x03ffu) << 12) |
+                    (static_cast<std::uint32_t>(second & 0x07ffu) << 1);
+                const auto target = static_cast<std::int64_t>(pc) + 4 + arm32_sign_extend(encoded, 25);
+                if (target < 0 || target > UINT32_MAX || (target & 1)) return {};
+                return Arm32StepDestination{static_cast<DWORD>(target), true};
+            }
+        }
         if ((half & 0xf000u) == 0xd000u) { // B<cond> T1.
             const auto condition = static_cast<unsigned>((half >> 8) & 0xfu);
             if (condition >= 14) return {};
@@ -2221,7 +2241,9 @@ private:
         std::optional<std::size_t> width;
         Arm32StepDestination next{};
         if (branch) {
-            width = thumb ? 2u : 4u;
+            const auto first_half = static_cast<std::uint16_t>(std::to_integer<unsigned>(instruction[0]) |
+                (std::to_integer<unsigned>(instruction[1]) << 8));
+            width = thumb ? (arm32_thumb_wide_prefix(first_half) ? 4u : 2u) : 4u;
             next = *branch;
         } else {
             width = arm32_linear_instruction_width(instruction, thumb);
