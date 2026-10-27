@@ -2848,6 +2848,17 @@ a64_unhandled:
             effect.register_writes = instruction.register_writes;
             return effect;
         }
+        if (op >= Opcode::rv_fminm_s && op <= Opcode::rv_fmaxm_d) {
+            std::vector<ExpressionPtr> inputs(operands.begin() + 1, operands.end());
+            for (const auto &reg : instruction.register_reads)
+                if (reg.bank == RegisterBank::riscv_fstatus) inputs.push_back(reg_expr(reg));
+            const auto name = op == Opcode::rv_fminm_s ? "fminm.s" : op == Opcode::rv_fmaxm_s ? "fmaxm.s" :
+                              op == Opcode::rv_fminm_d ? "fminm.d" : "fmaxm.d";
+            Intrinsic effect{name, std::move(inputs), IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = floating_type((op == Opcode::rv_fminm_s || op == Opcode::rv_fmaxm_s) ? 32 : 64);
+            return effect;
+        }
         if ((op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) || op == Opcode::rv_fcvtmod_w_d ||
             op == Opcode::rv_fli_s || op == Opcode::rv_fli_d ||
             (op >= Opcode::rv_fround_s && op <= Opcode::rv_froundnx_d)) {

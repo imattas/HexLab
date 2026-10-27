@@ -460,6 +460,8 @@ enum class Opcode {
     rv_fli_s, rv_fli_d,
     // Zfa round-to-integral forms; appended for cache stability.
     rv_fround_s, rv_froundnx_s, rv_fround_d, rv_froundnx_d,
+    // Zfa minimum/maximum-number variants; appended for cache stability.
+    rv_fminm_s, rv_fmaxm_s, rv_fminm_d, rv_fmaxm_d,
     // MIPS64 COP1 conditional floating-register moves; append for cache stability.
     mips64_movf_s, mips64_movt_s, mips64_movz_s, mips64_movn_s,
     mips64_movf_d, mips64_movt_d, mips64_movz_d, mips64_movn_d,

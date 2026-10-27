@@ -790,7 +790,10 @@ bool decode_fp_op(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
     else if (operation == 0x0c) { ok=s(d?RiscvOpcode::fdiv_d:RiscvOpcode::fdiv_s); }
     else if (operation == 0x2c && rs2==0) { ok=s(d?RiscvOpcode::fsqrt_d:RiscvOpcode::fsqrt_s); unary=true; }
     else if (operation == 0x10) { static constexpr RiscvOpcode ops[2][3]{{RiscvOpcode::fsgnj_s,RiscvOpcode::fsgnjn_s,RiscvOpcode::fsgnjx_s},{RiscvOpcode::fsgnj_d,RiscvOpcode::fsgnjn_d,RiscvOpcode::fsgnjx_d}}; if(f3<3) ok=plain(ops[d][f3]); }
-    else if (operation == 0x14) { if(f3<2) ok=plain(d?(f3?RiscvOpcode::fmax_d:RiscvOpcode::fmin_d):(f3?RiscvOpcode::fmax_s:RiscvOpcode::fmin_s),true); }
+    else if (operation == 0x14) {
+        if(f3<2) ok=plain(d?(f3?RiscvOpcode::fmax_d:RiscvOpcode::fmin_d):(f3?RiscvOpcode::fmax_s:RiscvOpcode::fmin_s),true);
+        else if(f3<4) ok=plain(d?(f3==3?RiscvOpcode::fmaxm_d:RiscvOpcode::fminm_d):(f3==3?RiscvOpcode::fmaxm_s:RiscvOpcode::fminm_s),true);
+    }
     else if (operation == 0x50) { if(f3>=1 && f3<=2) { ok=plain(d?(f3==2?RiscvOpcode::feq_d:RiscvOpcode::flt_d):(f3==2?RiscvOpcode::feq_s:RiscvOpcode::flt_s),true); dst_fp=false; src1_fp=src2_fp=true; } else if(f3==0){ok=plain(d?RiscvOpcode::fle_d:RiscvOpcode::fle_s,true);dst_fp=false;} }
     else if (operation == 0x60 && d && rs2 == 8 && f3 == 1) {
         ok = set(RiscvOpcode::fcvtmod_w_d, true, true, false);

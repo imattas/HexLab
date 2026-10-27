@@ -149,4 +149,10 @@ The scalar Zba forms `sh1add`, `sh2add`, `sh3add`, `add.uw`, their supported
 and addition expressions. The shift amount and 32-bit truncation are explicit;
 the lifter does not treat an unknown register index as a constant address.
 
+Scalar Zfa `fminm.s/d` and `fmaxm.s/d` decode with their exact OP-FP forms and
+carry typed floating results, both FPR input dependencies, accrued `fflags`
+reads, and `fflags` writes into named intrinsics. Their minimum/maximum-number
+NaN behavior remains intrinsic semantics; no floating constant evaluation is
+performed for these operations.
+
 Focused validation is provided by `decompiler_riscv_lifting`; it exercises RV64 scalar and M operations, x0 semantics, signed and unsigned byte loads, branch predicates, SSA versions, constant M folding, signed RV64 word results, and typed F/D effects.
