@@ -2,8 +2,10 @@
 
 The Metadata notebook's **Analysis issues** page provides a review queue for
 incomplete functions, unusual recovery stops, entry candidates and overlaps.
-The kind selector and text filter narrow the loaded findings without starting
-analysis or changing project decisions.
+The kind selector, severity selector and text filter narrow the loaded findings
+without starting analysis or changing project decisions. The severity column
+keeps producer-reported error, warning and info levels visible in the queue; the
+severity filter combines with the kind filter, search and function scope.
 
 Select a row to navigate the linked listing, bytes and graph views. **Previous**
 and **Next** move through the visible queue and navigate to each finding's
@@ -13,8 +15,10 @@ page, **Alt+Up/Down** perform the same actions, **Ctrl+L** focuses and selects t
 filter text, and Enter in the filter advances to the next visible finding.
 **Go to related** and **Go to function** retain their separate endpoints.
 
-The details box below the table shows the finding's address, related location,
-function name and diagnostic text. Unlike the abbreviated table cell, it shows
+The details box below the table shows the finding's severity, address, related
+location, function name and diagnostic text. Function-recovery findings use the
+view's warning default; loader, type-import and decompiler diagnostics retain
+the severity supplied by their producer. Unlike the abbreviated table cell, it shows
 up to 64 KiB of diagnostic text, with the existing preview truncation marker when
 needed. Text can be selected and copied directly; **Copy finding** copies a
 report bounded to 64 KiB. **Export visible TSV** retains the original diagnostic
@@ -36,7 +40,7 @@ are sorted and merged, and support binary-search containment. A cursor with
 multiple recovered owners, an unmapped cursor, or an incomplete bounded owner
 lookup leaves the current scope unchanged and explains why.
 
-Kind filter, query, pinned function and selected finding are remembered
+Kind filter, severity filter, query, pinned function and selected finding are remembered
 independently for each open document for the lifetime of the desktop session.
 Closing a document releases its state. A refresh restores a selection only when
 the same finding kind, addresses, function association and diagnostic text remain

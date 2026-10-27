@@ -40,6 +40,7 @@ class AnalysisIssuesView final : public wxPanel {
     };
     struct Preference {
         int filter = 0;
+        int severity = 0;
         wxString query;
         std::optional<Address> function;
         std::optional<Row> selected;
@@ -52,6 +53,7 @@ class AnalysisIssuesView final : public wxPanel {
     static constexpr std::size_t max_chunks_scanned = 100000;
 
     wxChoice *filter_ = nullptr;
+    wxChoice *severity_ = nullptr;
     wxTextCtrl *search_ = nullptr;
     wxStaticText *status_ = nullptr;
     wxStaticText *selection_detail_ = nullptr;

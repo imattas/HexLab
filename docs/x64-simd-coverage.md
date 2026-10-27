@@ -165,8 +165,15 @@ EVEX packed floating compare-to-mask now decodes `VCMPPS` and `VCMPPD` at
 optional execution masks, vector or memory sources, and 32/64-bit memory
 broadcast. The decoder records MXCSR status effects and the typed decompiler
 retains the predicate, source shapes, mask, broadcast marker, and K result.
-Predicate evaluation and exception-flag calculation remain symbolic. Register
-source EVEX.b (SAE), destination zeroing, and invalid encodings are rejected.
+The pure lane evaluator implements all 32 predicate truth tables directly from
+binary32/binary64 bit patterns, including signed-zero equivalence, ordered and
+unordered NaN results, signaling-NaN behavior, and predicate-dependent quiet-
+NaN invalid exceptions. It honors MXCSR.DAZ for subnormal inputs and reports
+denormal/invalid exceptions plus whether an unmasked exception suppresses the K
+result; sticky MXCSR flag updates remain the caller's responsibility. Masked-off
+lanes are neither compared nor allowed to raise exceptions, and the output is
+limited to the active low K bits. Register-source EVEX.b (SAE), destination
+zeroing, and invalid encodings are rejected.
 The opcode forms and predicate width follow Intel SDM Vol. 2's `VCMPPS` and
 `VCMPPD` entries (same [manual](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developers-manual.pdf)).
 

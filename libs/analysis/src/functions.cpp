@@ -699,6 +699,52 @@ void Recovery::seed_roots() {
             root({FunctionSeedKind::tls_callback, {image.layout().space.id, offset.value()}, {}, {}}, false);
         }
     }
+    // Legacy x86 IMAGE_DEBUG_TYPE_FPO records identify function starts and
+    // exact code extents. The loader has already validated their record
+    // encoding and executable image-relative range; translate against the
+    // mapped base here and recheck initialized executable backing before they
+    // constrain ownership.
+    if (metadata.pe && metadata.machine == 0x14c && !metadata.pe->fpo_records.empty()) {
+        auto load_base = metadata.preferred_base;
+        for (const auto &segment : image.layout().segments)
+            if (segment.name == "headers") {
+                load_base = segment.begin.offset;
+                break;
+            }
+        for (const auto &record : metadata.pe->fpo_records) {
+            canceled();
+            const auto offset = checked_add(load_base, record.begin_rva);
+            if (!offset || record.code_size == 0) {
+                output->complete = false;
+                continue;
+            }
+            const Address entry{image.layout().space.id, offset.value()};
+            if (!AddressRange::create(entry, record.code_size)) {
+                output->complete = false;
+                continue;
+            }
+            const auto *segment = image.segment_at(entry);
+            if (!segment || !segment->executable || entry.offset < segment->begin.offset) {
+                output->complete = false;
+                continue;
+            }
+            const auto relative = entry.offset - segment->begin.offset;
+            if (relative >= segment->file_size || record.code_size > segment->file_size - relative ||
+                image.code_window(entry, record.code_size) != record.code_size) {
+                output->complete = false;
+                continue;
+            }
+            if (record.source.spans.size() != 1 || record.source.spans.front().size != 16) {
+                output->complete = false;
+                continue;
+            }
+            metadata_chunks[entry].push_back({entry, record.code_size, {}});
+            FunctionSeed seed{FunctionSeedKind::unwind, entry, {}, {}};
+            seed.unwind_evidence = FunctionSeedUnwindEvidence{record.source.index,
+                record.source.spans.front().offset.value, record.source.spans.front().size};
+            root(std::move(seed), false);
+        }
+    }
     // The validated Guard CF function table is linker-provided evidence for
     // address-taken entry points. Treat these RVAs as roots so functions that
     // are only reached through indirect calls are still analyzed. The normal
@@ -1763,7 +1809,7 @@ namespace hexlab {
 Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     Sha256 hash;
     constexpr std::string_view version =
-        "hexlab-functions-v59/dex-method-roots-call-edges-v2/dex-relative-control-operands-v1/dex-payload-data-v1/riscv-vfrsqrt7-vfrec7-v1/a64-preserving-bitfield-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/mips64-special-conditional-traps-v1/evex-packed-fp-broadcast-v1/evex-packed-fp-compare-mask-v1/wasm-br-table-12-case-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v2/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v4/guard-multiblock-v1/unicode-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
+        "hexlab-functions-v60/pe-x86-fpo-roots-and-extents-v1/dex-method-roots-call-edges-v2/dex-relative-control-operands-v1/dex-payload-data-v1/riscv-vfrsqrt7-vfrec7-v1/a64-preserving-bitfield-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/mips64-special-conditional-traps-v1/evex-packed-fp-broadcast-v1/evex-packed-fp-compare-mask-v1/wasm-br-table-12-case-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v2/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v4/guard-multiblock-v1/unicode-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/"
         "elf-reference-provenance-v1/elf-arithmetic-v2/macho-symbol-roots-v1/macho-relocation-flow-v1/"
         "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/riscv-vfclass-vfsqrt-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1";
     (void)hash.update(std::as_bytes(std::span(version)));
