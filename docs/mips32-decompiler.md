@@ -47,6 +47,12 @@ The bounded COP1 S/D/W scalar subset lifts to floating-typed FPR values.
 `LWC1`/`SWC1` and `LDC1`/`SDC1` retain 32-/64-bit floating memory types; S and
 D arithmetic, comparisons, conversions, and W rounding forms remain named
 `mips.*` intrinsics with decoded FPR/FCSR effects and conversion result types.
+For all 16 classic S/D `C.<cond>` predicates, the intrinsic retains the
+predicate and selected FCC effect, while the FCC output is also expressed as
+symbolic SSA from ordered equal/less/less-equal and unordered terms. This
+allows `BC1T`/`BC1F` and downstream condition flow to consume the predicate
+without relying on host floating-point evaluation. Signaling-NaN exception
+details and FCSR Cause/Flag updates remain unevaluated.
 `BC1T` and `BC1F` produce branches over the selected `mips.fccN` predicate.
 `MFC1` and `MTC1` are typed 32-bit bitcasts between GPR and FPR values;
 `CFC1` and `CTC1` on aggregate FCSR31 are exact 32-bit copies, and a write
@@ -58,6 +64,6 @@ The decoder records one delay slot; MIPS analysis owns and orders the slot
 through its explicit CFG edge. COP1 operations remain symbolic in decompiled
 functions; the standalone processor semantic helper evaluates binary32 `DIV.S`
 with FCSR rounding, Cause, Flags, and enabled-exception behavior when
-`FCSR.FS=0`. Other IEEE arithmetic/conversions, compare-result truth, and
-flush-subnormal mode remain abstract. See the evaluator limits in
+`FCSR.FS=0`. Other IEEE arithmetic/conversions and flush-subnormal mode remain
+abstract. See the evaluator limits in
 [`mips32.md`](mips32.md).

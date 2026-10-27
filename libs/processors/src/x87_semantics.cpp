@@ -13,9 +13,11 @@ constexpr std::uint16_t fsw_c0 = 1u << 8, fsw_c1 = 1u << 9, fsw_c2 = 1u << 10;
 constexpr std::uint16_t fsw_c3 = 1u << 14, fsw_busy = 1u << 15;
 constexpr std::uint16_t fcw_invalid_mask = 1u << 0;
 constexpr std::uint16_t fcw_denormal_mask = 1u << 1;
+constexpr std::uint16_t fcw_zero_divide_mask = 1u << 2;
 constexpr std::uint16_t fsw_precision = 1u << 5;
 constexpr std::uint16_t fsw_overflow = 1u << 3;
 constexpr std::uint16_t fsw_denormal = 1u << 1;
+constexpr std::uint16_t fsw_zero_divide = 1u << 2;
 constexpr std::uint16_t fsw_underflow = 1u << 4;
 constexpr std::uint16_t fcw_underflow_mask = 1u << 4;
 constexpr std::uint16_t fcw_precision_mask = 1u << 5;
@@ -1128,7 +1130,46 @@ std::optional<X87ArithmeticResult> evaluate_x87_divide(const X87DivideRequest &r
          request.operation != X87DivisionOperation::reverse))
         return {};
     auto left = decode(request.left), right = decode(request.right);
-    if (request.operation == X87DivisionOperation::reverse) std::swap(left, right);
+    auto left_value = request.left, right_value = request.right;
+    if (request.operation == X87DivisionOperation::reverse) {
+        std::swap(left, right);
+        std::swap(left_value, right_value);
+    }
+    const auto initial_status = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
+    X87ArithmeticResult special;
+    if (handle_special_operands(left_value, right_value, left, right,
+                                request.control_word, initial_status, special))
+        return special;
+    const bool negative = left.negative != right.negative;
+    const auto special_result = [&](X87Binary80 value) {
+        X87ArithmeticResult result;
+        result.status_word = initial_status;
+        result.value = value;
+        return result;
+    };
+    if (left.kind == Class::zero && right.kind == Class::zero)
+        return invalid_arithmetic(initial_status, request.control_word, x87_indefinite());
+    if (left.kind == Class::infinity && right.kind == Class::infinity)
+        return invalid_arithmetic(initial_status, request.control_word, x87_indefinite());
+    if (left.kind == Class::infinity)
+        return special_result({integer_bit, static_cast<std::uint16_t>(exponent_mask |
+            (negative ? sign_mask : 0))});
+    if (right.kind == Class::infinity)
+        return special_result({0, static_cast<std::uint16_t>(negative ? sign_mask : 0)});
+    if (left.kind == Class::zero)
+        return special_result({0, static_cast<std::uint16_t>(negative ? sign_mask : 0)});
+    if (right.kind == Class::zero) {
+        X87ArithmeticResult result;
+        result.status_word = static_cast<std::uint16_t>(initial_status | fsw_zero_divide);
+        if ((request.control_word & fcw_zero_divide_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_zero_divide);
+            result.completed = false;
+            return result;
+        }
+        result.value = X87Binary80{integer_bit,
+            static_cast<std::uint16_t>(exponent_mask | (negative ? sign_mask : 0))};
+        return result;
+    }
     if (left.kind != Class::finite || right.kind != Class::finite) return {};
 
     const auto denormal_operand = [](const Decoded &operand) noexcept {
@@ -1145,7 +1186,6 @@ std::optional<X87ArithmeticResult> evaluate_x87_divide(const X87DivideRequest &r
 
     const auto numerator = normalize_finite(left);
     const auto denominator = normalize_finite(right);
-    const bool negative = left.negative != right.negative;
     std::uint64_t remainder = 0;
     int exponent = numerator.exponent - denominator.exponent + 16383;
     std::uint64_t significand = integer_bit;

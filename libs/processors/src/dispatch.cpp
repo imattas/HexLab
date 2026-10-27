@@ -142,6 +142,9 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
         opcode = std::array{Opcode::rv_vfsqrt_v, Opcode::rv_vfclass_v}[opcode_index - 337];
     else if (opcode_index == 339 || opcode_index == 340)
         opcode = std::array{Opcode::rv_vfrsqrt7_v, Opcode::rv_vfrec7_v}[opcode_index - 339];
+    else if (opcode_index >= 341 && opcode_index <= 348)
+        opcode = std::array{Opcode::rv_vredsum, Opcode::rv_vredand, Opcode::rv_vredor, Opcode::rv_vredxor,
+            Opcode::rv_vredminu, Opcode::rv_vredmin, Opcode::rv_vredmaxu, Opcode::rv_vredmax}[opcode_index - 341];
     else
         return {DecodeStatus::invalid, {}, "RV64 opcode has no generic representation"};
 

@@ -582,6 +582,11 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         static constexpr const char *names[]{"vsetvli", "vsetivli", "vsetvl"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vsetvli)];
     }
+    if (op >= Opcode::rv_vredsum && op <= Opcode::rv_vredmax) {
+        static constexpr const char *names[]{"vredsum.vs", "vredand.vs", "vredor.vs", "vredxor.vs",
+            "vredminu.vs", "vredmin.vs", "vredmaxu.vs", "vredmax.vs"};
+        return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vredsum)];
+    }
     if (op >= Opcode::rv_vadd_vv && op <= Opcode::rv_vxor_vi) {
         static constexpr const char *names[]{"vadd.vv","vadd.vx","vadd.vi","vsub.vv","vsub.vx",
             "vand.vv","vand.vx","vand.vi","vor.vv","vor.vx","vor.vi","vxor.vv","vxor.vx","vxor.vi"};

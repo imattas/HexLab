@@ -167,6 +167,14 @@ std::optional<RiscvVectorEffect> riscv_vector_effect(Opcode opcode) {
     RVV_TRIPLE(vand, false);
     RVV_TRIPLE(vor, false);
     RVV_TRIPLE(vxor, false);
+    case Opcode::rv_vredsum: return RiscvVectorEffect{"vredsum.vs", false};
+    case Opcode::rv_vredand: return RiscvVectorEffect{"vredand.vs", false};
+    case Opcode::rv_vredor: return RiscvVectorEffect{"vredor.vs", false};
+    case Opcode::rv_vredxor: return RiscvVectorEffect{"vredxor.vs", false};
+    case Opcode::rv_vredminu: return RiscvVectorEffect{"vredminu.vs", false};
+    case Opcode::rv_vredmin: return RiscvVectorEffect{"vredmin.vs", false};
+    case Opcode::rv_vredmaxu: return RiscvVectorEffect{"vredmaxu.vs", false};
+    case Opcode::rv_vredmax: return RiscvVectorEffect{"vredmax.vs", false};
     RVV_TRIPLE(vsll, false);
     RVV_TRIPLE(vsrl, false);
     RVV_TRIPLE(vsra, false);
@@ -2352,6 +2360,38 @@ a64_unhandled:
                 const auto condition_code = static_cast<std::uint8_t>((instruction.condition >> 4) & 7);
                 intrinsic_name = std::string("mips.c.") + conditions[predicate] +
                     (op == Opcode::mips64_c_cond_s ? ".s.fcc" : ".d.fcc") + std::to_string(condition_code);
+                // The classic COP1 condition field is a four-bit truth table:
+                // unordered, equal, less-than, and signaling. Keep signaling
+                // exception behavior in the intrinsic, but expose the exact
+                // FCC truth value as ordinary symbolic SSA.
+                if (operands.size() >= 2) {
+                    const auto unordered = boolean_binary("fp_unordered", operands[0], operands[1]);
+                    const auto equal = boolean_binary("fp_eq", operands[0], operands[1]);
+                    const auto less = boolean_binary("fp_lt", operands[0], operands[1]);
+                    const auto less_equal = boolean_binary("fp_le", operands[0], operands[1]);
+                    const auto unordered_bit = (predicate & 1u) != 0;
+                    const auto equal_bit = (predicate & 2u) != 0;
+                    const auto less_bit = (predicate & 4u) != 0;
+                    ExpressionPtr truth = boolean_constant(false);
+                    if (unordered_bit) truth = unordered;
+                    if (equal_bit) truth = boolean_binary("bool_or", truth, equal);
+                    if (less_bit) {
+                        const auto less_condition = (predicate & 2u)
+                            ? less_equal : less;
+                        truth = boolean_binary("bool_or", truth, less_condition);
+                    }
+                    auto fcc_value = std::make_shared<Expression>(Expression{
+                        integer_type(32), UnaryValue{"zext", std::move(truth)}});
+                    // The compare intrinsic still represents FCSR Cause/Flag
+                    // side effects for signaling operands; only FCC is made
+                    // explicit here.
+                    const RegisterOperand fcc{RegisterBank::mips_fcsr,
+                        static_cast<std::uint8_t>(condition_code + 1), 32, false};
+                    Intrinsic effect{intrinsic_name, operands, IntrinsicMemoryEffect::none};
+                    effect.register_writes = {fcc};
+                    effect.register_output_values = {std::move(fcc_value)};
+                    return effect;
+                }
             }
             if (!intrinsic_name.empty()) {
                 Intrinsic effect{intrinsic_name, operands, IntrinsicMemoryEffect::none};
