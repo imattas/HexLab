@@ -1630,11 +1630,14 @@ std::optional<SwitchSite> a64_separate_base_signed_offset_switch(
         dispatch.opcode != Opcode::a64_br || dispatch.flow != FlowKind::jump ||
         table_address.opcode != (page_form ? Opcode::a64_adrp : Opcode::a64_adr) ||
         (page_form && table_add.opcode != Opcode::a64_add) ||
-        load.opcode != Opcode::a64_ldrsw || code_address.opcode != Opcode::a64_adr ||
+        (load.opcode != Opcode::a64_ldrsw && load.opcode != Opcode::a64_ldrb) || code_address.opcode != Opcode::a64_adr ||
         target_add.opcode != Opcode::a64_add ||
         table_address.operands.size() != 2 || (page_form && table_add.operands.size() != 3) ||
         load.operands.size() != 2 || code_address.operands.size() != 2 ||
-        target_add.operands.size() != 3 || dispatch.operands.size() != 1)
+        (target_add.operands.size() != 3 && target_add.operands.size() != 4) || dispatch.operands.size() != 1)
+        return {};
+    const bool byte_offset_form = load.opcode == Opcode::a64_ldrb;
+    if (byte_offset_form != (target_add.operands.size() == 4))
         return {};
     for (std::size_t index = first; index < dispatch_index; ++index) {
         if (!facts[index] || facts[index]->instruction.context != dispatch.context ||
@@ -1688,7 +1691,7 @@ std::optional<SwitchSite> a64_separate_base_signed_offset_switch(
         table = relocated_operand_address(table_address, 1, table_operand->resolved_address,
                                           relocations, stop);
     }
-    if (!table || table->space != dispatch.address.space || !file_backed_range(image, *table, 4, false))
+    if (!table || table->space != dispatch.address.space || !file_backed_range(image, *table, byte_offset_form ? 1 : 4, false))
         return {};
 
     const auto *loaded = register_operand(load, 0);
@@ -1702,13 +1705,13 @@ std::optional<SwitchSite> a64_separate_base_signed_offset_switch(
     const auto *left = register_operand(target_add, 1);
     const auto *right = register_operand(target_add, 2);
     const auto *branch = register_operand(dispatch, 0);
-    if (!loaded || loaded->bank != RegisterBank::arm64_gpr || loaded->width != 64 || loaded->index == 31 ||
+    if (!loaded || loaded->bank != RegisterBank::arm64_gpr || loaded->width != (byte_offset_form ? 32 : 64) || loaded->index == 31 ||
         !entries || !entries->base || !same_register(&*entries->base, table_reg) ||
         entries->base->width != 64 || !entries->index ||
         entries->index->bank != RegisterBank::arm64_gpr || entries->index->width != 32 ||
-        entries->index->index == 31 || entries->data_width != 32 || entries->address_width != 64 ||
+        entries->index->index == 31 || entries->data_width != (byte_offset_form ? 8 : 32) || entries->address_width != 64 ||
         entries->displacement != 0 || entries->scale != 1 || entries->segment ||
-        entries->index_extend != "uxtw" || entries->index_shift_amount != 2 ||
+        entries->index_extend != "uxtw" || entries->index_shift_amount != (byte_offset_form ? 0 : 2) ||
         same_register(loaded, table_reg) || same_register(loaded, &*entries->index) ||
         !code_reg || code_reg->bank != RegisterBank::arm64_gpr || code_reg->width != 64 ||
         code_reg->index == 31 || !code_operand || !code_operand->ip_relative ||
@@ -1718,24 +1721,33 @@ std::optional<SwitchSite> a64_separate_base_signed_offset_switch(
         !target || target->bank != RegisterBank::arm64_gpr || target->width != 64 ||
         target->index == 31 || !left || !right || left->bank != RegisterBank::arm64_gpr ||
         right->bank != RegisterBank::arm64_gpr || left->width != 64 || right->width != 64 ||
-        !((same_register(left, code_reg) && same_register(right, loaded)) ||
-          (same_register(right, code_reg) && same_register(left, loaded))) ||
+        (byte_offset_form ?
+          !(same_register(left, code_reg) && same_register(right, loaded)) :
+          !((same_register(left, code_reg) && same_register(right, loaded)) ||
+            (same_register(right, code_reg) && same_register(left, loaded)))) ||
         same_register(target, &*entries->index) || !branch || !same_register(target, branch) ||
         branch->bank != RegisterBank::arm64_gpr || branch->width != 64 || target_add.bytes.size() != 4)
         return {};
+    if (byte_offset_form) {
+        const auto *shift = std::get_if<ImmediateOperand>(&target_add.operands[3]);
+        if (!shift || shift->value != 2 || shift->encoded_width != 6 || shift->effective_width != 64 || shift->is_signed)
+            return {};
+    }
     const auto add_word = std::to_integer<std::uint32_t>(target_add.bytes[0]) |
                           (std::to_integer<std::uint32_t>(target_add.bytes[1]) << 8) |
                           (std::to_integer<std::uint32_t>(target_add.bytes[2]) << 16) |
                           (std::to_integer<std::uint32_t>(target_add.bytes[3]) << 24);
-    if (((add_word >> 22) & 3u) != 0 || ((add_word >> 10) & 63u) != 0)
+    if (((add_word >> 22) & 3u) != 0 || (!byte_offset_form && ((add_word >> 10) & 63u) != 0) ||
+        (byte_offset_form && ((add_word >> 10) & 63u) != 2))
         return {}; // Offset is added without a hidden shift or extension.
 
     SwitchSite site;
     site.dispatch = dispatch.address;
     site.table = *table;
     site.selector = *entries->index;
-    site.scale = 4;
-    site.entry_encoding = SwitchEntryEncoding::signed_offset_from_target_base;
+    site.scale = byte_offset_form ? 1 : 4;
+    site.entry_encoding = byte_offset_form ? SwitchEntryEncoding::unsigned_byte_offset_scaled_from_target_base
+                                           : SwitchEntryEncoding::signed_offset_from_target_base;
     site.target_base = *code_base;
     if (!table_relocation_rows.empty()) {
         site.table_base_source = SwitchSite::TableBaseSource::elf_relocation_pair;
@@ -1751,8 +1763,21 @@ std::optional<SwitchSite> a64_separate_base_signed_offset_switch(
     for (std::size_t index = 0; index < scan_limit; ++index) {
         if (stop.stop_requested())
             return {};
-        const auto candidate = table_target(image, site.table, index, 4, true,
-                                            relocations, stop, site.target_base);
+        std::optional<TableTarget> candidate;
+        if (byte_offset_form) {
+            const auto entry = add_offset(site.table, index, image);
+            if (entry && file_backed_range(image, *entry, 1, false)) {
+                const auto byte = image.read(*entry, 1);
+                if (byte && byte.value().size() == 1) {
+                    const auto delta = static_cast<std::uint64_t>(std::to_integer<unsigned char>(byte.value()[0])) * 4;
+                    const auto address = add_offset(site.target_base.value(), delta, image);
+                    if (address) candidate = TableTarget{*address};
+                }
+            }
+        } else {
+            candidate = table_target(image, site.table, index, 4, true,
+                                     relocations, stop, site.target_base);
+        }
         if (!candidate) {
             site.complete = false;
             site.incomplete_reason = "table entry unreadable or unresolved relocation/fixup";

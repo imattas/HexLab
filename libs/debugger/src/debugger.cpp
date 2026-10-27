@@ -1,6 +1,7 @@
 #include "hexlab/debugger/debugger.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cctype>
 #include <functional>
@@ -177,6 +178,65 @@ private:
         return syntax("expected a register, integer, !, or parenthesized expression");
     }
 };
+
+Result<std::string> expand_logpoint_message(
+    std::string_view source, const std::vector<RegisterValue>& registers,
+    ConditionParser::MemoryRead memory_read) {
+    constexpr std::size_t max_fields = 64;
+    constexpr std::size_t max_output = 1024;
+    if (source.size() > max_output)
+        return Error{ErrorCode::resource_limit, "logpoint message exceeds 1024 bytes"};
+    std::string output;
+    output.reserve(source.size());
+    std::size_t fields = 0;
+    auto append = [&](std::string_view value) -> bool {
+        if (value.size() > max_output - std::min(max_output, output.size())) return false;
+        output.append(value);
+        return true;
+    };
+    for (std::size_t at = 0; at < source.size();) {
+        if (source.substr(at, 2) == "$$") {
+            if (!append("$")) return Error{ErrorCode::resource_limit, "expanded logpoint exceeds 1024 bytes"};
+            at += 2;
+            continue;
+        }
+        if (source.substr(at, 2) != "${") {
+            if (!append(source.substr(at, 1)))
+                return Error{ErrorCode::resource_limit, "expanded logpoint exceeds 1024 bytes"};
+            ++at;
+            continue;
+        }
+        if (++fields > max_fields)
+            return Error{ErrorCode::resource_limit, "logpoint exceeds 64 expression fields"};
+        const auto close = source.find('}', at + 2);
+        if (close == std::string_view::npos)
+            return Error{ErrorCode::invalid_argument, "logpoint has an unterminated ${expression} field"};
+        auto field = source.substr(at + 2, close - at - 2);
+        char format = 'x';
+        if (const auto colon = field.rfind(':'); colon != std::string_view::npos) {
+            const auto spelling = field.substr(colon + 1);
+            if (spelling.size() != 1 || (spelling[0] != 'x' && spelling[0] != 'd'))
+                return Error{ErrorCode::invalid_argument, "logpoint field format must be :x or :d"};
+            format = spelling[0];
+            field = field.substr(0, colon);
+        }
+        if (field.empty()) return Error{ErrorCode::invalid_argument, "logpoint expression field is empty"};
+        ConditionParser parser(field, registers, memory_read, "logpoint expression");
+        auto value = parser.evaluate();
+        if (!value) return value.error();
+        char digits[32]{};
+        const auto converted = std::to_chars(digits, digits + sizeof(digits), value.value(),
+                                             format == 'x' ? 16 : 10);
+        if (converted.ec != std::errc{})
+            return Error{ErrorCode::resource_limit, "cannot format logpoint expression result"};
+        if (format == 'x' && !append("0x"))
+            return Error{ErrorCode::resource_limit, "expanded logpoint exceeds 1024 bytes"};
+        if (!append(std::string_view(digits, static_cast<std::size_t>(converted.ptr - digits))))
+            return Error{ErrorCode::resource_limit, "expanded logpoint exceeds 1024 bytes"};
+        at = close + 1;
+    }
+    return output;
+}
 }
 
 struct DebugSession::Impl {
@@ -427,10 +487,44 @@ Result<DebugEvent> DebugSession::wait_event(std::chrono::milliseconds timeout) {
                     passes = value.value() != 0;
                 }
                 if (passes && found->logpoint) {
+                    std::string message = found->log_message;
+                    if (message.find("${") != std::string::npos) {
+                        auto regs = impl_->backend->read_registers(event.thread);
+                        if (!regs) {
+                            append_bounded(event.message, " [logpoint unavailable: " + regs.error().message + "]");
+                            suppress = false;
+                            continue;
+                        }
+                        const auto byte_order_register = std::find_if(regs.value().begin(), regs.value().end(),
+                            [](const auto& reg) { return reg.byte_order.has_value(); });
+                        const auto target_byte_order = byte_order_register == regs.value().end()
+                            ? std::optional<ByteOrder>{} : byte_order_register->byte_order;
+                        auto expanded = expand_logpoint_message(message, regs.value(),
+                            [this, target_byte_order](std::uint64_t address, std::size_t width) -> Result<std::uint64_t> {
+                                if (!target_byte_order)
+                                    return Error{ErrorCode::unsupported, "logpoint expression: target byte order is unknown for memory reads"};
+                                auto bytes = impl_->backend->read_memory(address, width);
+                                if (!bytes) return Error{bytes.error().code, "logpoint memory read failed: " + bytes.error().message};
+                                if (bytes.value().size() != width)
+                                    return Error{ErrorCode::io, "logpoint memory read returned fewer bytes than requested"};
+                                std::uint64_t result = 0;
+                                for (std::size_t i = 0; i < width; ++i) {
+                                    const auto index = *target_byte_order == ByteOrder::little ? width - 1 - i : i;
+                                    result = (result << 8) | std::to_integer<unsigned>(bytes.value()[index]);
+                                }
+                                return result;
+                            });
+                        if (!expanded) {
+                            append_bounded(event.message, " [logpoint expression error: " + expanded.error().message + "]");
+                            suppress = false;
+                            continue;
+                        }
+                        message = std::move(expanded.value());
+                    }
                     matched_logpoint = true;
-                    if (!found->log_message.empty()) {
+                    if (!message.empty()) {
                         if (!log_message.empty()) append_bounded(log_message, " | ");
-                        append_bounded(log_message, found->log_message);
+                        append_bounded(log_message, message);
                     }
                 }
                 else if (passes) suppress = false;
