@@ -20,12 +20,13 @@ bool repeatable_string_tag(std::int64_t tag) {
 }
 bool understood(std::int64_t tag) {
     return tag == 0 || tag == 2 || tag == 4 || tag == 5 || tag == 6 || tag == 7 || tag == 8 || tag == 9 || tag == 10 ||
-           tag == 11 || tag == 17 || tag == 18 || tag == 19 || tag == 20 || tag == 23 || tag == 34 || tag == 35 ||
+           tag == 11 || tag == 17 || tag == 18 || tag == 19 || tag == 20 || tag == 23 || tag == 30 || tag == 34 ||
+           tag == 35 ||
            tag == 36 || tag == 37 || tag == 39 ||
            tag == 0x6000000f || tag == 0x60000010 || tag == 0x60000011 || tag == 0x60000012 ||
            tag == 0x6ffffef5 || tag == 0x6ffffefa || tag == 0x6ffffefb || tag == 0x6ffffefc ||
            tag == 0x6ffffff0 || tag == 0x6ffffffc || tag == 0x6ffffffd ||
-           tag == 0x6ffffffe || tag == 0x6fffffff || string_tag(tag);
+           tag == 0x6ffffffe || tag == 0x6fffffff || tag == 0x6ffffffb || string_tag(tag);
 }
 std::string text(ByteView view, std::uint64_t index, Budget &budget) {
     if (index == 0)

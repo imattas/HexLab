@@ -124,6 +124,10 @@ public:
     Result<std::vector<std::byte>> read_register(std::uint64_t number, std::stop_token = {});
     Status write_register(std::uint64_t number, std::span<const std::byte>, std::stop_token = {});
     Result<std::vector<std::byte>> read_memory(std::uint64_t address, std::size_t size, std::stop_token = {});
+    // Searches a bounded target memory range. Empty optional means no match;
+    // an unsupported remote reports ErrorCode::unsupported.
+    Result<std::optional<std::uint64_t>> search_memory(std::uint64_t address,
+        std::uint64_t length, std::span<const std::byte> pattern, std::stop_token = {});
     // Requests the remote CRC-32 of a non-empty, non-overflowing memory range.
     // Empty reply means qCRC is unsupported.
     Result<std::uint32_t> memory_crc32(std::uint64_t address, std::uint64_t length,
