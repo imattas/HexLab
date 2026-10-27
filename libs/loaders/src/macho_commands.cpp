@@ -180,6 +180,70 @@ void build_version(const Reader &reader, const MachOLoadCommand &command, MachOM
     }
     metadata.build_versions.push_back(std::move(row));
 }
+void fileset_entry(const Reader &reader, const MachOLoadCommand &command, const MachOSlice &slice,
+                   MachOMetadata &metadata, Budget &budget, std::stop_token stop) {
+    require(slice.header.is_64 && slice.header.file_type == 0xc,
+            "LC_FILESET_ENTRY requires a 64-bit MH_FILESET parent");
+    require(command.size >= 32, "Truncated Mach-O fileset entry command");
+    const auto fixed = reader.bytes(command.file_offset - slice.offset, 32);
+    const auto u32 = [&](std::size_t at) { return static_cast<std::uint32_t>(reader.value(fixed.bytes, at, 4)); };
+    MachOFileSetEntry row;
+    row.command_index = command.index;
+    row.record_file_offset = command.file_offset;
+    row.vm_address = reader.value(fixed.bytes, 8, 8);
+    row.raw_file_offset = reader.value(fixed.bytes, 16, 8);
+    row.entry_id_offset = u32(24);
+    row.reserved = u32(28);
+    require(row.reserved == 0, "Mach-O fileset entry reserved field is nonzero");
+    row.entry_id = command_string(reader, command, slice.offset, row.entry_id_offset, 32, budget);
+    require(!row.entry_id.empty(), "Mach-O fileset entry has an empty identifier");
+
+    // fileset file offsets are relative to the containing Mach-O slice. Validate
+    // each embedded image's fixed header and command envelope without mapping
+    // its segments or recursively importing its metadata into the parent.
+    require(row.raw_file_offset >= std::uint64_t{32} + slice.header.command_bytes &&
+                row.raw_file_offset <= slice.size && 32 <= slice.size - row.raw_file_offset,
+            "Mach-O fileset child header overlaps the parent commands or exceeds the slice");
+    const auto child_header = reader.bytes(row.raw_file_offset, 32);
+    require(reader.value(child_header.bytes, 0, 4) == 0xfeedfacf,
+            "Mach-O fileset child is not a 64-bit image with the parent byte order");
+    row.child_is_64 = true;
+    row.child_cpu_type = static_cast<std::uint32_t>(reader.value(child_header.bytes, 4, 4));
+    row.child_cpu_subtype = static_cast<std::uint32_t>(reader.value(child_header.bytes, 8, 4));
+    row.child_file_type = static_cast<std::uint32_t>(reader.value(child_header.bytes, 12, 4));
+    row.child_command_count = static_cast<std::uint32_t>(reader.value(child_header.bytes, 16, 4));
+    row.child_command_bytes = static_cast<std::uint32_t>(reader.value(child_header.bytes, 20, 4));
+    require(row.child_command_count <= 65536 &&
+                row.child_command_bytes <= slice.size - row.raw_file_offset - 32 &&
+                row.child_command_count <= row.child_command_bytes / 8,
+            "Mach-O fileset child command extent exceeds the containing slice", ErrorCode::resource_limit);
+    budget.include(row.child_command_bytes);
+    std::uint64_t cursor = 0;
+    for (std::uint32_t index = 0; index < row.child_command_count; ++index) {
+        canceled(stop);
+        require(cursor <= row.child_command_bytes && 8 <= row.child_command_bytes - cursor,
+                "Truncated Mach-O fileset child load-command envelope");
+        const auto envelope = reader.bytes(row.raw_file_offset + 32 + cursor, 8);
+        const auto size = static_cast<std::uint32_t>(reader.value(envelope.bytes, 4, 4));
+        require(size >= 8 && size % 8 == 0 && size <= row.child_command_bytes - cursor,
+                "Invalid Mach-O fileset child load-command size or alignment");
+        cursor += size;
+    }
+    require(cursor == row.child_command_bytes,
+            "Mach-O fileset child command count does not consume sizeofcmds");
+    row.child_commands_valid = row.child_cpu_type == slice.header.cpu_type &&
+                               row.child_cpu_subtype == slice.header.cpu_subtype;
+    if (!row.child_commands_valid)
+        metadata.commands_complete = false;
+    for (const auto &previous : metadata.fileset_entries)
+        if (previous.entry_id == row.entry_id || previous.raw_file_offset == row.raw_file_offset ||
+            previous.vm_address == row.vm_address) {
+            metadata.commands_complete = false;
+            break;
+        }
+    budget.include(sizeof(MachOFileSetEntry));
+    metadata.fileset_entries.push_back(std::move(row));
+}
 void thread(const Reader &reader, const MachOLoadCommand &command, const MachOSlice &slice, const Image &image,
             MachOMetadata &metadata, Budget &budget, std::stop_token stop) {
     std::uint64_t cursor = 8;
@@ -1027,7 +1091,8 @@ bool supported_command(std::uint32_t command) {
            command == 0xf || command == 0x8000001c || command == 0x80000028 || command == 4 || command == 5 ||
            command == 0x11 || command == 0x1a || command == 0x26 || command == 0x22 || command == 0x80000022 || command == 0x80000033 ||
            command == 0x80000034 || command == 0x29 || command == 0x1d || command == 0x21 || command == 0x2c ||
-           command == 0x32 || command == 0x24 || command == 0x25 || command == 0x2f || command == 0x30;
+           command == 0x32 || command == 0x24 || command == 0x25 || command == 0x2f || command == 0x30 ||
+           command == 0x35;
 }
 void read_commands(const ByteStorage &storage, const Image &image, MachOMetadata &metadata, Budget &budget,
                    std::stop_token stop) {
@@ -1131,6 +1196,8 @@ void read_commands(const ByteStorage &storage, const Image &image, MachOMetadata
             build_version(reader, command, metadata, budget, stop);
         } else if (command.command == 0x26) {
             function_starts(reader, command, slice, image, metadata, text_base, budget, stop);
+        } else if (command.command == 0x35) {
+            fileset_entry(reader, command, slice, metadata, budget, stop);
         }
     }
     compact_unwind(reader, slice, image, metadata, text_base, budget, stop);

@@ -2070,7 +2070,8 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
                         result.immediate_targets[{fact->id, 1}] = resolved;
                 }
                 propagated = true;
-            } else if ((instruction.opcode == Opcode::rv_addi || instruction.opcode == Opcode::rv_ori) &&
+            } else if ((instruction.opcode == Opcode::rv_addi || instruction.opcode == Opcode::rv_ori ||
+                        instruction.opcode == Opcode::rv_xori || instruction.opcode == Opcode::rv_andi) &&
                        instruction.operands.size() == 3) {
                 const auto *dst = riscv_register(instruction, 0);
                 const auto *src = riscv_register(instruction, 1);
@@ -2084,9 +2085,21 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
                                          width == 32 ? value & UINT64_C(0xffffffff) : value};
                         definition = riscv_definition(*target, fact->id);
                     } else if (const auto base = registers.find(src->index); base != registers.end()) {
-                        const auto value = instruction.opcode == Opcode::rv_ori
-                                               ? (base->second.address.offset | static_cast<std::uint64_t>(*immediate))
-                                               : riscv_add(base->second.address.offset, *immediate, width);
+                        std::uint64_t value = 0;
+                        switch (instruction.opcode) {
+                        case Opcode::rv_ori:
+                            value = base->second.address.offset | static_cast<std::uint64_t>(*immediate);
+                            break;
+                        case Opcode::rv_xori:
+                            value = base->second.address.offset ^ static_cast<std::uint64_t>(*immediate);
+                            break;
+                        case Opcode::rv_andi:
+                            value = base->second.address.offset & static_cast<std::uint64_t>(*immediate);
+                            break;
+                        default:
+                            value = riscv_add(base->second.address.offset, *immediate, width);
+                            break;
+                        }
                         target = Address{base->second.address.space,
                                          width == 32 ? value & UINT64_C(0xffffffff) : value};
                         definition = riscv_definition(*target, fact->id, &base->second);
