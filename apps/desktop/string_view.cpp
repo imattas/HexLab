@@ -195,6 +195,15 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
         if (row < visible_strings_.size())
             choose_string(visible_strings_[row], true);
     };
+    strings_->SetToolTip("Discovered strings. Up/Down selects a row; Enter opens its references. Ctrl+C copies the selected row.");
+    strings_->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &event) {
+        if (event.ControlDown() && !event.AltDown() && !event.ShiftDown() &&
+            (event.GetKeyCode() == 'C' || event.GetKeyCode() == 'c') && copy_->IsEnabled()) {
+            copy_selected_row();
+            return;
+        }
+        event.Skip();
+    });
     references_->activate = [this](std::size_t row) {
         if (!document_ || !reference_page_ || row >= reference_page_->rows.size())
             return;

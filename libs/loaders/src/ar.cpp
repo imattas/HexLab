@@ -66,6 +66,40 @@ std::uint64_t be64(std::span<const std::byte> bytes, std::size_t at) {
     return value;
 }
 struct PendingSymbol { std::string name; std::uint64_t header = 0; };
+std::optional<std::vector<PendingSymbol>> decode_gnu_index(std::span<const std::byte> bytes,
+                                                           std::size_t width,
+                                                           std::size_t max_symbols,
+                                                           std::size_t max_name_bytes,
+                                                           std::stop_token stop) {
+    try {
+        require(width == 4 || width == 8, "invalid GNU ar symbol-index word width");
+        require(bytes.size() >= width, "truncated GNU ar symbol index");
+        const auto count = width == 4 ? static_cast<std::uint64_t>(be32(bytes, 0)) : be64(bytes, 0);
+        require(count <= max_symbols, "GNU ar symbol count limit exceeded", ErrorCode::resource_limit);
+        require(count <= (bytes.size() - width) / width, "truncated GNU ar member-offset array");
+        std::size_t names_at = width + static_cast<std::size_t>(count) * width;
+        std::vector<PendingSymbol> result;
+        result.reserve(static_cast<std::size_t>(count));
+        for (std::uint64_t i = 0; i < count; ++i) {
+            canceled(stop);
+            const auto offset_at = width + static_cast<std::size_t>(i) * width;
+            const auto offset = width == 4 ? static_cast<std::uint64_t>(be32(bytes, offset_at)) : be64(bytes, offset_at);
+            const auto names_begin = bytes.begin() + static_cast<std::ptrdiff_t>(names_at);
+            const auto terminator = std::find(names_begin, bytes.end(), std::byte{0});
+            require(terminator != bytes.end(), "unterminated GNU ar symbol name");
+            const auto length = static_cast<std::size_t>(terminator - names_begin);
+            require(length > 0 && length <= max_name_bytes, "invalid GNU ar symbol name length", ErrorCode::resource_limit);
+            result.push_back({field(bytes.subspan(names_at, length)), offset});
+            names_at += length + 1;
+        }
+        require(names_at == bytes.size(), "unexpected trailing bytes in GNU ar symbol index");
+        return result;
+    } catch (const Failure &failure) {
+        if (failure.error.code == ErrorCode::malformed || failure.error.code == ErrorCode::resource_limit)
+            return {};
+        throw;
+    }
+}
 std::uint64_t bsd_word(std::span<const std::byte> bytes, std::size_t at, std::size_t width, bool little_endian) {
     require(width == 4 || width == 8, "invalid BSD ranlib word width");
     require(at <= bytes.size() && bytes.size() - at >= width, "truncated BSD ranlib index");
@@ -208,42 +242,38 @@ Result<ArArchive> read_ar_archive(const ByteStorage &storage, std::stop_token st
                 long_names = reader.read(data_start, raw_size);
             } else if (kind == ArMemberKind::symbol_index && raw_name == "/") {
                 archive.has_symbol_index = true;
-                require(raw_size <= 256ULL * 1024 * 1024, "GNU ar symbol index exceeds metadata budget", ErrorCode::resource_limit);
-                const auto bytes = reader.read(data_start, raw_size);
-                const auto count = be32(bytes, 0);
-                require(count <= limits.max_symbols, "GNU ar symbol count limit exceeded", ErrorCode::resource_limit);
-                require(count <= (bytes.size() - 4) / 4, "truncated GNU ar member-offset array");
-                std::size_t names_at = 4 + static_cast<std::size_t>(count) * 4;
-                for (std::uint32_t i = 0; i < count; ++i) {
-                    canceled(stop);
-                    const auto offset = be32(bytes, 4 + static_cast<std::size_t>(i) * 4);
-                    const auto terminator = std::find(bytes.begin() + static_cast<std::ptrdiff_t>(names_at), bytes.end(), std::byte{0});
-                    require(terminator != bytes.end(), "unterminated GNU ar symbol name");
-                    const auto length = static_cast<std::size_t>(terminator - (bytes.begin() + static_cast<std::ptrdiff_t>(names_at)));
-                    require(length > 0 && length <= limits.max_name_bytes, "invalid GNU ar symbol name length", ErrorCode::resource_limit);
-                    pending_symbols.push_back({field(std::span(bytes).subspan(names_at, length)), offset});
-                    names_at += length + 1;
+                if (raw_size > 256ULL * 1024 * 1024) {
+                    archive.symbol_index_complete = false;
+                    archive.diagnostics.emplace_back("GNU ar symbol index exceeds its metadata budget; member listing and extraction remain available");
+                } else {
+                    const auto bytes = reader.read(data_start, raw_size);
+                    auto decoded = decode_gnu_index(bytes, 4, limits.max_symbols, limits.max_name_bytes, stop);
+                    if (decoded) {
+                        pending_symbols.insert(pending_symbols.end(),
+                                               std::make_move_iterator(decoded->begin()),
+                                               std::make_move_iterator(decoded->end()));
+                    } else {
+                        archive.symbol_index_complete = false;
+                        archive.diagnostics.emplace_back("GNU ar symbol index has a malformed or unsupported layout; member listing and extraction remain available");
+                    }
                 }
-                require(names_at == bytes.size(), "unexpected trailing bytes in GNU ar symbol index");
             } else if (kind == ArMemberKind::symbol_index && raw_name == "/SYM64/") {
                 archive.has_symbol_index = true;
-                require(raw_size <= 256ULL * 1024 * 1024, "GNU ar symbol index exceeds metadata budget", ErrorCode::resource_limit);
-                const auto bytes = reader.read(data_start, raw_size);
-                const auto count = be64(bytes, 0);
-                require(count <= limits.max_symbols, "GNU ar symbol count limit exceeded", ErrorCode::resource_limit);
-                require(count <= (bytes.size() - 8) / 8, "truncated GNU ar 64-bit member-offset array");
-                std::size_t names_at = 8 + static_cast<std::size_t>(count) * 8;
-                for (std::uint64_t i = 0; i < count; ++i) {
-                    canceled(stop);
-                    const auto offset = be64(bytes, 8 + static_cast<std::size_t>(i) * 8);
-                    const auto terminator = std::find(bytes.begin() + static_cast<std::ptrdiff_t>(names_at), bytes.end(), std::byte{0});
-                    require(terminator != bytes.end(), "unterminated GNU ar symbol name");
-                    const auto length = static_cast<std::size_t>(terminator - (bytes.begin() + static_cast<std::ptrdiff_t>(names_at)));
-                    require(length > 0 && length <= limits.max_name_bytes, "invalid GNU ar symbol name length", ErrorCode::resource_limit);
-                    pending_symbols.push_back({field(std::span(bytes).subspan(names_at, length)), offset});
-                    names_at += length + 1;
+                if (raw_size > 256ULL * 1024 * 1024) {
+                    archive.symbol_index_complete = false;
+                    archive.diagnostics.emplace_back("GNU ar 64-bit symbol index exceeds its metadata budget; member listing and extraction remain available");
+                } else {
+                    const auto bytes = reader.read(data_start, raw_size);
+                    auto decoded = decode_gnu_index(bytes, 8, limits.max_symbols, limits.max_name_bytes, stop);
+                    if (decoded) {
+                        pending_symbols.insert(pending_symbols.end(),
+                                               std::make_move_iterator(decoded->begin()),
+                                               std::make_move_iterator(decoded->end()));
+                    } else {
+                        archive.symbol_index_complete = false;
+                        archive.diagnostics.emplace_back("GNU ar 64-bit symbol index has a malformed or unsupported layout; member listing and extraction remain available");
+                    }
                 }
-                require(names_at == bytes.size(), "unexpected trailing bytes in GNU ar symbol index");
             } else if (kind == ArMemberKind::symbol_index && raw_name.starts_with("__.SYMDEF")) {
                 archive.has_symbol_index = true;
                 require(raw_size <= 256ULL * 1024 * 1024, "BSD ranlib index exceeds metadata budget", ErrorCode::resource_limit);
@@ -269,11 +299,18 @@ Result<ArArchive> read_ar_archive(const ByteStorage &storage, std::stop_token st
             }
         }
         require(cursor == storage.size(), "ar archive has trailing partial member");
+        bool invalid_symbol_reference_reported = false;
         for (auto &symbol : pending_symbols) {
             canceled(stop);
             const auto found = member_by_header.find(symbol.header);
-            require(found != member_by_header.end() && archive.members[found->second].kind == ArMemberKind::regular,
-                    "ar symbol index references unknown or special member");
+            if (found == member_by_header.end() || archive.members[found->second].kind != ArMemberKind::regular) {
+                archive.symbol_index_complete = false;
+                if (!invalid_symbol_reference_reported) {
+                    archive.diagnostics.emplace_back("ar symbol index references an unknown or special member; member listing and extraction remain available");
+                    invalid_symbol_reference_reported = true;
+                }
+                continue;
+            }
             archive.symbols.push_back({std::move(symbol.name), found->second});
         }
         return archive;
