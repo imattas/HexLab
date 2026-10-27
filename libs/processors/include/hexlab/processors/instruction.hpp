@@ -498,7 +498,9 @@ enum class Opcode {
     // SSE2 unsigned rounded averages; append to preserve persisted opcode IDs.
     pavgb, pavgw,
     // PowerPC condition-register field copy; append for persisted IDs.
-    ppc_mcrf
+    ppc_mcrf,
+    // MIPS32 COP1 branch-likely forms; append to preserve persisted IDs.
+    mips_bc1tl, mips_bc1fl
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

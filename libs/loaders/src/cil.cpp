@@ -133,6 +133,12 @@ Result<std::vector<ManagedField>> inspect_managed_fields(const LoadedImage &load
 } catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR field catalog"};}
   catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR field catalog exceeds container limits"};}
 
+Result<ManagedUserStringCatalog> inspect_managed_user_strings(const LoadedImage &loaded) try {
+  auto metadata=read_managed_metadata_root(loaded);if(!metadata)return metadata.error();
+  return parse_managed_user_strings(metadata.value());
+} catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR user-string catalog"};}
+  catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR user-string catalog exceeds container limits"};}
+
 Result<std::vector<ManagedMethodAnalysis>> inspect_managed_methods(const LoadedImage& loaded,std::stop_token stop) try {
   auto metadata_bytes=read_managed_metadata_root(loaded);if(!metadata_bytes)return metadata_bytes.error();
   const auto base=loaded.load_base.value_or(loaded.metadata.preferred_base);

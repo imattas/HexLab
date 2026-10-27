@@ -891,6 +891,25 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     auto *layout = new wxBoxSizer(wxVERTICAL);
     status_ = new wxStaticText(this, wxID_ANY, "Select an address inside a recovered function");
     status_->SetName("pseudocode-status");
+    auto *find_layout = new wxBoxSizer(wxHORIZONTAL);
+    find_layout->Add(new wxStaticText(this, wxID_ANY, "Find in pseudocode:"), 0,
+                     wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+    find_query_ = new wxTextCtrl(this, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize);
+    find_query_->SetName("pseudocode-find-query");
+    find_query_->SetMaxLength(256);
+    find_previous_ = new wxButton(this, wxID_ANY, "Previous");
+    find_previous_->SetName("pseudocode-find-previous");
+    find_next_ = new wxButton(this, wxID_ANY, "Next");
+    find_next_->SetName("pseudocode-find-next");
+    find_status_ = new wxStaticText(this, wxID_ANY, "Rendered function only", wxDefaultPosition,
+                                    wxDefaultSize, wxST_ELLIPSIZE_END);
+    find_status_->SetName("pseudocode-find-status");
+    find_layout->Add(find_query_, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+    find_layout->Add(find_previous_, 0, wxRIGHT, FromDIP(4));
+    find_layout->Add(find_next_, 0, wxRIGHT, FromDIP(4));
+    find_layout->Add(find_status_, 0, wxALIGN_CENTER_VERTICAL);
+    layout->Add(status_, 0, wxEXPAND | wxALL, FromDIP(4));
+    layout->Add(find_layout, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
     auto *content = new wxBoxSizer(wxHORIZONTAL);
     addresses_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                 wxLC_REPORT | wxLC_SINGLE_SEL);
@@ -902,7 +921,6 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     source_->SetName("pseudocode-source");
     content->Add(addresses_, 0, wxEXPAND | wxALL, FromDIP(4));
     content->Add(source_, 1, wxEXPAND | wxALL, FromDIP(4));
-    layout->Add(status_, 0, wxEXPAND | wxALL, FromDIP(4));
     layout->Add(content, 1, wxEXPAND);
     auto *navigation = new wxBoxSizer(wxHORIZONTAL);
     definition_ = new wxButton(this, wxID_ANY, "Go to definition");
@@ -1007,6 +1025,25 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     copy_pseudocode_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_pseudocode(); });
     copy_excerpt_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_addressed_excerpt(); });
     save_pseudocode_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { save_pseudocode(); });
+    find_previous_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { find_source(false); });
+    find_next_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { find_source(true); });
+    find_query_->Bind(wxEVT_TEXT, [this](wxCommandEvent &event) {
+        const bool available = model_ready_ && !source_->GetValue().empty() && !find_query_->GetValue().empty();
+        find_previous_->Enable(available);
+        find_next_->Enable(available);
+        event.Skip();
+    });
+    find_query_->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &event) {
+        if (event.GetKeyCode() == WXK_RETURN) {
+            find_source(!event.ShiftDown());
+            return;
+        }
+        if (event.GetKeyCode() == WXK_ESCAPE) {
+            source_->SetFocus();
+            return;
+        }
+        event.Skip();
+    });
     const auto deferred_selection = [this] {
         const auto id = document_;
         const auto serial = render_serial_;
@@ -1018,6 +1055,12 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     source_->Bind(wxEVT_LEFT_UP, [deferred_selection](wxMouseEvent &event) { event.Skip(); deferred_selection(); });
     source_->Bind(wxEVT_KEY_UP, [deferred_selection](wxKeyEvent &event) { event.Skip(); deferred_selection(); });
     source_->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &event) {
+        if (event.ControlDown() && !event.ShiftDown() && !event.AltDown() &&
+            (event.GetKeyCode() == 'F' || event.GetKeyCode() == 'f')) {
+            find_query_->SetFocus();
+            find_query_->SelectAll();
+            return;
+        }
         if (event.ControlDown() && event.ShiftDown() && !event.AltDown() &&
             (event.GetKeyCode() == 'C' || event.GetKeyCode() == 'c')) {
             copy_addressed_excerpt();
@@ -1035,6 +1078,58 @@ void PseudocodeView::copy_pseudocode() {
     if (!model_ready_ || source_->GetValue().empty() || !wxTheClipboard->Open()) return;
     wxTheClipboard->SetData(new wxTextDataObject(source_->GetValue()));
     wxTheClipboard->Close();
+}
+
+void PseudocodeView::find_source(bool next) {
+    if (!model_ready_ || source_->GetValue().empty()) {
+        find_status_->SetLabel("Search unavailable until pseudocode is rendered");
+        return;
+    }
+    const auto needle = find_query_->GetValue();
+    if (needle.empty()) {
+        find_status_->SetLabel("Enter text to search");
+        return;
+    }
+    constexpr std::size_t max_search_characters = 1024 * 1024;
+    auto haystack = source_->GetValue();
+    const bool truncated = haystack.length() > max_search_characters;
+    if (truncated) haystack = haystack.Left(max_search_characters);
+    if (needle.length() > haystack.length()) {
+        find_status_->SetLabel(truncated ? "No match in the first 1 MiB" : "No match in this function");
+        return;
+    }
+
+    long selection_begin = 0, selection_end = 0;
+    source_->GetSelection(&selection_begin, &selection_end);
+    const auto cursor = static_cast<std::size_t>(std::clamp<long>(
+        next ? selection_end : selection_begin, 0, static_cast<long>(haystack.length())));
+    auto match = wxString::npos;
+    bool wrapped = false;
+    if (next) {
+        match = haystack.find(needle, cursor);
+        if (match == wxString::npos) {
+            match = haystack.find(needle, 0);
+            wrapped = match != wxString::npos;
+        }
+    } else {
+        if (cursor > 0) match = haystack.rfind(needle, cursor - 1);
+        if (match == wxString::npos) {
+            match = haystack.rfind(needle);
+            wrapped = match != wxString::npos;
+        }
+    }
+    if (match == wxString::npos) {
+        find_status_->SetLabel(truncated ? "No match in the first 1 MiB" : "No match in this function");
+        return;
+    }
+    const auto begin = static_cast<long>(match);
+    const auto end = static_cast<long>(match + needle.length());
+    source_->SetSelection(begin, end);
+    source_->ShowPosition(begin);
+    source_selection_changed();
+    wxString status = wrapped ? "Match found (wrapped)" : "Match found";
+    if (truncated) status += "; searched first 1 MiB";
+    find_status_->SetLabel(status);
 }
 
 void PseudocodeView::copy_addressed_excerpt() {
@@ -1761,6 +1856,9 @@ void PseudocodeView::update_variable_actions() {
     const bool pseudocode_available = model_ready_ && !source_->GetValue().empty();
     copy_pseudocode_->Enable(pseudocode_available);
     save_pseudocode_->Enable(pseudocode_available);
+    const bool search_available = pseudocode_available && !find_query_->GetValue().empty();
+    find_previous_->Enable(search_available);
+    find_next_->Enable(search_available);
     long selection_begin = 0, selection_end = 0;
     source_->GetSelection(&selection_begin, &selection_end);
     copy_excerpt_->Enable(pseudocode_available && selection_end > selection_begin);

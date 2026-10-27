@@ -321,6 +321,22 @@ void print_inspection(std::ostream &out, const ProjectSnapshot &snapshot) {
         out << "Patch: " << location(patch.begin) << " size=" << patch.replacement.size() << '\n';
 }
 int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapshot &snapshot,ProjectActor& actor) {
+    if (args.action == L"user-strings") {
+        if (!snapshot.loaded)
+            throw Failure{{ErrorCode::unsupported, "Managed user-string query requires a loaded PE image"}};
+        const auto strings = take(inspect_managed_user_strings(*snapshot.loaded));
+        for (const auto &[token, text] : strings) {
+            out << "UserString: token=0x" << std::hex << token << std::dec << " utf16=";
+            for (std::size_t i = 0; i < text.size(); ++i) {
+                if (i) out << ',';
+                out << "0x" << std::hex << std::setw(4) << std::setfill('0')
+                    << static_cast<std::uint16_t>(text[i]) << std::dec << std::setfill(' ');
+            }
+            out << '\n';
+        }
+        out << "User strings: " << strings.size() << "\nAnalysis: complete\n";
+        return 0;
+    }
     if (args.action == L"fields") {
         if (!snapshot.loaded)
             throw Failure{{ErrorCode::unsupported, "Managed field query requires a loaded PE image"}};

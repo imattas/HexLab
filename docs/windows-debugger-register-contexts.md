@@ -34,7 +34,12 @@ syntax validation so far.
 
 Windows ARM64 builds expose `x0`-`x30` and their `w0`-`w30` low-word aliases,
 `sp`/`wsp`, `pc`, `cpsr`, `fp`/`lr` aliases for `x29`/`x30`, `v0`-`v31`,
-`fpcr`, and `fpsr`. Writing a W register zero-extends into its X register;
+`q0`-`q31` aliases for the full 128-bit vectors, `b0`-`b31`, `h0`-`h31`,
+`s0`-`s31`, `d0`-`d31` aliases for their low 8, 16, 32, and 64 bits,
+`fpcr`, and `fpsr`. Scalar vector edits replace only the named low bytes and
+preserve the rest of the 128-bit register. A batch may name a vector register
+through only one of its `v`/`q`/`b`/`h`/`s`/`d` aliases; duplicate aliases for
+the same vector are rejected. Writing a W register zero-extends into its X register;
 writing either FP/LR alias updates the matching X register. Writes that name
 the same underlying register through two aliases are rejected. `x18` and
 `w18` remain read-only because Windows reserves them as the thread environment

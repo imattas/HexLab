@@ -21,6 +21,7 @@ inline bool is_mips_branch_likely(const Instruction &instruction) {
     switch (instruction.opcode) {
     case Opcode::mips_beql: case Opcode::mips_bnel: case Opcode::mips_blezl:
     case Opcode::mips_bgtzl: case Opcode::mips_bltzl: case Opcode::mips_bgezl:
+    case Opcode::mips_bc1tl: case Opcode::mips_bc1fl:
     case Opcode::mips64_bc1tl: case Opcode::mips64_bc1fl:
         return true;
     default:
