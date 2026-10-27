@@ -16,6 +16,15 @@ invalidates all eight logical stack registers in SSA; this prevents values
 from being incorrectly carried across a stack rotation. The concrete
 ST(i)-to-physical-register permutation and TOP/tag values remain opaque.
 
+The processor semantic API has a separate finite-operand FDIV/FDIVR evaluator.
+It generates quotient guard/round/sticky bits directly, honors x87 precision
+and rounding control, and reuses the arithmetic exception path for gradual
+underflow, overflow, and unmasked precision/underflow retirement. It accepts
+only finite, nonzero operands; division by zero and infinity/NaN cases remain
+outside this evaluator. The decompiler does not yet fold symbolic FDIV
+expressions through this concrete helper, so lifted arithmetic still leaves
+rounding and exception outputs unknown.
+
 The IR includes exact binary80 literals for `FLD1` and `FLDZ` when their
 logical stack output is known. A same-block `FCHS` or `FABS` over one of these
 proven literals is folded through the exact processor semantic helper; inputs

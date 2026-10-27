@@ -33,6 +33,10 @@ Result<UefiCapsule> parse_uefi_fmp_capsule(std::span<const std::byte> bytes,
     result.image_size = u32(bytes, 24);
     if (result.header_size < 28 || result.header_size > result.image_size || result.image_size > bytes.size())
         return malformed("EFI capsule header or declared image size is inconsistent with the input");
+    // UEFI 2.10 §23.3.3 requires POPULATE_SYSTEM_TABLE to be clear for FMP
+    // capsules. Keep the other capsule flags intact for metadata presentation.
+    if (result.flags & 0x00020000u)
+        return malformed("FMP capsule sets CAPSULE_FLAGS_POPULATE_SYSTEM_TABLE");
     const std::size_t base = result.header_size;
     if (result.image_size - base < 8) return malformed("FMP capsule header is truncated");
     result.fmp_version = u32(bytes, base);
@@ -74,6 +78,8 @@ Result<UefiCapsule> parse_uefi_fmp_capsule(std::span<const std::byte> bytes,
             if (item.size < item.image_header_size) return malformed("versioned FMP image header is truncated");
             for (std::size_t j = 0; j < 16; ++j) item.image_type_guid[j] = u8(bytes, p + 4 + j);
             item.image_index = u8(bytes, p + 20);
+            if (u8(bytes, p + 21) != 0 || u8(bytes, p + 22) != 0 || u8(bytes, p + 23) != 0)
+                return malformed("FMP image header reserved bytes are nonzero");
             item.update_image_size = u32(bytes, p + 24);
             item.vendor_code_size = u32(bytes, p + 28);
             if (item.image_header_version >= 2) item.hardware_instance = u64(bytes, p + 32);

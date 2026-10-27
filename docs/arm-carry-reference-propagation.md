@@ -16,7 +16,12 @@ HI/LS, and signed GE/LT/GT/LE conditions, including Thumb IT predicates only
 when the decoder identifies an exact condition.
 
 Proven C feeds immediate RRX operand2 and memory offsets, plus ADC, SBC, and
-RSC address calculations. Arithmetic remains 32-bit wrapping. A resulting
-address is published only when the target is mapped. CFG edge facts are not
-refined by branch outcomes; PC writes/interworking, unresolved registers,
-relocation ambiguity, and unsupported operand forms remain conservative.
+RSC address calculations. Arithmetic remains 32-bit wrapping. Register facts
+are published only when the destination write is proven to execute and the
+result is mapped. A data-processing write to PC may still produce a control
+target xref under an unknown condition when its pre-instruction operands and
+carry uniquely determine the target; no register state is propagated through
+that uncertain instruction. Conditional CFG edges refine NZCV only when the
+branch condition and incoming flag facts make the refinement exact. Other PC
+writes with unresolved operands or interworking mode, relocation ambiguity,
+and unsupported operand forms remain conservative.

@@ -88,4 +88,4 @@ slots. The type system also accepts an explicit `mips_n32` function
 convention. N32-specific relocation, unwind, and core-register integration
 remain incomplete. Variadic N32 classification remains unsupported.
 
-Register-register conditional traps TGE/TGEU/TLT/TLTU/TEQ/TNE are decoded with both 64-bit GPR inputs and the encoded 10-bit software trap code. They lift as named conditional-trap effects. The shared IR does not model the resulting exception edge or evaluate the comparison into a CFG branch.
+Register-register conditional traps TGE/TGEU/TLT/TLTU/TEQ/TNE are decoded with both 64-bit GPR inputs and the encoded 10-bit software trap code. The REGIMM immediate forms TGEI/TGEIU/TLTI/TLTIU/TEQI/TNEI are also decoded with a 64-bit source register and a sign-extended 16-bit immediate; the `u` suffix controls unsigned comparison and does not change immediate extension. Both forms lift as named conditional-trap effects. The shared IR does not model the resulting exception edge or evaluate the comparison into a CFG branch.

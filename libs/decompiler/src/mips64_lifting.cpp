@@ -75,12 +75,21 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
     }
     if (op == Opcode::mips64_tge || op == Opcode::mips64_tgeu ||
         op == Opcode::mips64_tlt || op == Opcode::mips64_tltu ||
-        op == Opcode::mips64_teq || op == Opcode::mips64_tne) {
+        op == Opcode::mips64_teq || op == Opcode::mips64_tne ||
+        op == Opcode::mips64_tgei || op == Opcode::mips64_tgeiu ||
+        op == Opcode::mips64_tlti || op == Opcode::mips64_tltiu ||
+        op == Opcode::mips64_teqi || op == Opcode::mips64_tnei) {
         const char *name = op == Opcode::mips64_tge ? "mips64_tge_conditional_trap" :
             op == Opcode::mips64_tgeu ? "mips64_tgeu_conditional_trap" :
             op == Opcode::mips64_tlt ? "mips64_tlt_conditional_trap" :
             op == Opcode::mips64_tltu ? "mips64_tltu_conditional_trap" :
-            op == Opcode::mips64_teq ? "mips64_teq_conditional_trap" : "mips64_tne_conditional_trap";
+            op == Opcode::mips64_teq ? "mips64_teq_conditional_trap" :
+            op == Opcode::mips64_tne ? "mips64_tne_conditional_trap" :
+            op == Opcode::mips64_tgei ? "mips64_tgei_conditional_trap" :
+            op == Opcode::mips64_tgeiu ? "mips64_tgeiu_conditional_trap" :
+            op == Opcode::mips64_tlti ? "mips64_tlti_conditional_trap" :
+            op == Opcode::mips64_tltiu ? "mips64_tltiu_conditional_trap" :
+            op == Opcode::mips64_teqi ? "mips64_teqi_conditional_trap" : "mips64_tnei_conditional_trap";
         return intrinsic(instruction, name, IntrinsicMemoryEffect::none);
     }
 

@@ -224,6 +224,12 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips64_tltu: return "tltu";
     case Opcode::mips64_teq: return "teq";
     case Opcode::mips64_tne: return "tne";
+    case Opcode::mips64_tgei: return "tgei";
+    case Opcode::mips64_tgeiu: return "tgeiu";
+    case Opcode::mips64_tlti: return "tlti";
+    case Opcode::mips64_tltiu: return "tltiu";
+    case Opcode::mips64_teqi: return "teqi";
+    case Opcode::mips64_tnei: return "tnei";
     case Opcode::mips64_ll: return "ll";
     case Opcode::mips64_sc: return "sc";
     case Opcode::mips64_add: return "add";

@@ -446,7 +446,9 @@ enum class Opcode {
     // x86 wide memory compare-exchange; appended to retain persisted IDs.
     cmpxchg8b, cmpxchg16b,
     // BMI2 scalar integer operations; append to preserve serialized opcode IDs.
-    bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx
+    bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx,
+    // MIPS64 REGIMM immediate traps; appended to preserve serialized opcode IDs.
+    mips64_tgei, mips64_tgeiu, mips64_tlti, mips64_tltiu, mips64_teqi, mips64_tnei
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
