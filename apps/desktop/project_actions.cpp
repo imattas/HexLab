@@ -26,7 +26,7 @@ constexpr int actions[] = {wxID_SAVE,  wxID_SAVEAS,  wxID_UNDO,        wxID_REDO
                            wxID_FIND,  find_next_id, find_previous_id, reanalyze_id,
                            exchange_export_id, exchange_import_id, patch_manager_id,
                            backup_project_id, restore_backup_id, rotate_backups_id, list_backups_id,
-                           prune_backups_id};
+                           prune_backups_id, restore_backup_in_place_id};
 ProjectActionKind kind(int id) {
     switch (id) {
     case reanalyze_id:
@@ -200,6 +200,7 @@ void ProjectActions::add_menus(wxMenu &file, wxMenu &edit) {
     file.Insert(position++, list_backups_id, "List Rotated Backups");
     file.Insert(position++, prune_backups_id, "Prune Rotated Backups...");
     file.Insert(position++, restore_backup_id, "Restore Backup as New Project...");
+    file.Insert(position++, restore_backup_in_place_id, "Restore Backup In Place...");
     file.Insert(position, export_id, "Export Patched &Binary...");
     file.InsertSeparator(position++);
     file.Insert(position++, exchange_export_id, "Export Project Metadata...");
@@ -226,7 +227,7 @@ void ProjectActions::add_menus(wxMenu &file, wxMenu &edit) {
 void ProjectActions::update(wxUpdateUIEvent &event) {
     auto id = controller_.documents().active_document();
     auto project = id ? controller_.documents().project(*id) : nullptr;
-    if (event.GetId() == restore_backup_id) {
+    if (event.GetId() == restore_backup_id || event.GetId() == restore_backup_in_place_id) {
         event.Enable(true);
         return;
     }
@@ -275,6 +276,38 @@ void ProjectActions::update(wxUpdateUIEvent &event) {
         item->SetHelp(availability.enabled ? wxString{} : text(availability.reason));
 }
 void ProjectActions::command(wxCommandEvent &event) {
+    if (event.GetId() == restore_backup_in_place_id) {
+        wxFileDialog source_dialog(&frame_, "Choose project backup", {}, {},
+                                   "HexLab project backups (*.hxproj)|*.hxproj|All files (*.*)|*.*",
+                                   wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+        if (source_dialog.ShowModal() != wxID_OK)
+            return;
+        wxFileDialog target_dialog(&frame_, "Choose the existing project to replace", {}, {},
+                                   "HexLab projects (*.hxproj)|*.hxproj|All files (*.*)|*.*",
+                                   wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+        if (target_dialog.ShowModal() != wxID_OK)
+            return;
+        const auto source = std::filesystem::path(source_dialog.GetPath().ToStdWstring());
+        const auto target = std::filesystem::path(target_dialog.GetPath().ToStdWstring());
+        if (wxMessageBox("This replaces the selected project with the backup. The backup and target must belong to the same project. Close all open views of both files first. The current target will be retained as a recovery artifact.",
+                         "Confirm In-Place Project Restore", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
+                         &frame_) != wxYES)
+            return;
+        auto active = controller_.documents().active_document();
+        auto active_project = active ? controller_.documents().project(*active) : nullptr;
+        const auto options = active_project ? active_project->analysis_options : AnalysisOptions{};
+        auto started = controller_.restore_backup_in_place(source, target, options);
+        if (!started) {
+            if (active)
+                controller_.documents().report_error(*active, started.error());
+            else
+                controller_.documents().report_error(started.error());
+            return;
+        }
+        if (active && controller_.message)
+            controller_.message(*active, "Restoring backup in place...");
+        return;
+    }
     if (event.GetId() == restore_backup_id) {
         wxFileDialog source_dialog(&frame_, "Choose project backup", {}, {},
                                    "HexLab project backups (*.hxproj)|*.hxproj|All files (*.*)|*.*",

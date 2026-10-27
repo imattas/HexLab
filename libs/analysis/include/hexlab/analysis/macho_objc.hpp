@@ -43,6 +43,13 @@ struct MachOObjCProperty {
     std::optional<std::string> type_encoding;
     types::TypePtr type;
     std::string type_status = "not-read";
+    // Recognized Objective-C property attribute semantics. The raw attribute
+    // string remains authoritative; unknown or malformed suffixes are retained
+    // through attributes and reported by attribute_semantics_status.
+    std::optional<std::string> custom_getter, custom_setter, backing_ivar;
+    std::string attribute_semantics_status = "not-read";
+    bool readonly = false, copy = false, strong = false, weak = false;
+    bool nonatomic = false, dynamic = false;
 };
 
 struct MachOObjCProtocolReference {

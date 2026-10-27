@@ -135,6 +135,9 @@ struct DexMetadata {
     std::vector<DexMapItem> map_items;
     // proto_id and method_id order is the DEX table index order.
     std::vector<DexReturnKind> prototype_return_kinds;
+    // Number of Dalvik register words occupied by each prototype's parameters.
+    // Wide primitive parameters count as two; the implicit receiver is excluded.
+    std::vector<std::uint32_t> prototype_parameter_word_counts;
     std::vector<std::uint32_t> method_prototype_indices;
     std::vector<DexClassDefinition> classes;
     std::vector<DexMethodDebug> methods;

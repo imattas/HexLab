@@ -13,6 +13,13 @@ struct JvmConstant {
     std::string text;
     bool operator==(const JvmConstant &) const = default;
 };
+// BootstrapMethods entries retain constant-pool indices after loader validation.
+// The indices address JvmMetadata::constant_pool and preserve argument order.
+struct JvmBootstrapMethod {
+    std::uint16_t method_handle_index = 0;
+    std::vector<std::uint16_t> argument_indices;
+    bool operator==(const JvmBootstrapMethod &) const = default;
+};
 struct JvmExceptionHandler {
     std::uint16_t start_pc = 0, end_pc = 0, handler_pc = 0, catch_type = 0;
     bool operator==(const JvmExceptionHandler &) const = default;
@@ -177,6 +184,7 @@ struct JvmMetadata {
     std::string defining_loader;
     std::vector<JvmHierarchyClass> known_hierarchy;
     std::vector<JvmConstant> constant_pool; // JVM's one-based indices; unusable slots are tag 0.
+    std::optional<std::vector<JvmBootstrapMethod>> bootstrap_methods;
     std::vector<std::string> interfaces;
     std::vector<JvmRecordComponent> record_components;
     std::vector<JvmInnerClass> inner_classes;

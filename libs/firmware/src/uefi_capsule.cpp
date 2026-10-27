@@ -20,6 +20,9 @@ constexpr std::array<std::uint8_t, 16> fmp_guid{
     0xed,0xd5,0xcb,0x6d,0x2d,0xe8,0x44,0x4c,0xbd,0xa1,0x71,0x94,0x19,0x9a,0xd9,0x2a};
 constexpr std::array<std::uint8_t, 16> json_guid{
     0xcd,0xf4,0xd6,0x67,0xb8,0xd6,0x73,0x45,0xbf,0x4a,0xde,0x5e,0x25,0x2d,0x61,0xae};
+// EFI_CERT_TYPE_PKCS7_GUID as it appears in the little-endian UEFI structure.
+constexpr std::array<std::uint8_t, 16> pkcs7_guid{
+    0x9d,0xd2,0xaf,0x4a,0xdf,0x68,0xee,0x49,0x8a,0xa9,0x34,0x7d,0x37,0x56,0x65,0xa7};
 Error malformed(const char *message) { return {ErrorCode::malformed, message}; }
 }
 
@@ -99,14 +102,41 @@ Result<UefiCapsule> parse_uefi_fmp_capsule(std::span<const std::byte> bytes,
             item.payload_offset = item.file_offset + item.image_header_size;
             item.vendor_code_offset = item.payload_offset + item.update_image_size;
 
-            if (item.update_image_size >= 56 && embedded_scans_used < options.max_embedded_payload_scans &&
+            // IMAGE_AUTHENTICATION_REQUIRED images start UpdateImage with
+            // EFI_FIRMWARE_IMAGE_AUTHENTICATION (UINT64 count + a 24-byte
+            // WIN_CERTIFICATE_UEFI_GUID header + PKCS#7 bytes). Recognize only
+            // the specified certificate kind; other payloads stay opaque.
+            if (item.update_image_size >= 32) {
+                const auto auth = static_cast<std::size_t>(item.payload_offset);
+                const auto certificate_size = u32(bytes, auth + 8);
+                const bool is_pkcs7_auth = u16(bytes, auth + 12) == 0x0200 &&
+                    u16(bytes, auth + 14) == 0x0ef1 &&
+                    std::equal(pkcs7_guid.begin(), pkcs7_guid.end(),
+                               reinterpret_cast<const std::uint8_t *>(bytes.data() + auth + 16));
+                if (is_pkcs7_auth) {
+                    if (certificate_size < 24 || certificate_size > item.update_image_size - 8)
+                        return malformed("FMP authentication certificate extent is invalid");
+                    item.authentication_present = true;
+                    item.authentication_monotonic_count = u64(bytes, auth);
+                    item.authentication_certificate_size = certificate_size;
+                    std::copy_n(pkcs7_guid.begin(), pkcs7_guid.size(), item.authentication_certificate_guid.begin());
+                    item.authentication_certificate_offset = item.payload_offset + 8;
+                    item.authentication_certificate_data_offset = item.payload_offset + 32;
+                    item.authentication_certificate_data_size = certificate_size - 24;
+                    item.authentication_header_size = 8 + certificate_size;
+                    item.payload_offset += item.authentication_header_size;
+                }
+            }
+
+            const auto image_payload_size = std::uint64_t(item.update_image_size) - item.authentication_header_size;
+            if (image_payload_size >= 56 && embedded_scans_used < options.max_embedded_payload_scans &&
                 embedded_volumes_used < options.max_embedded_volumes &&
                 embedded_files_used < options.max_embedded_files &&
                 embedded_sections_used < options.max_embedded_sections &&
                 embedded_decompressed_used < options.max_embedded_decompressed_bytes) {
                 const auto scan_limit = options.max_embedded_decompressed_bytes / options.max_embedded_payload_scans;
                 const auto payload = bytes.subspan(static_cast<std::size_t>(item.payload_offset),
-                                                   item.update_image_size);
+                                                   static_cast<std::size_t>(image_payload_size));
                 UefiVolumeParseOptions volume_options;
                 volume_options.max_input_bytes = options.max_input_bytes;
                 volume_options.max_volumes = options.max_embedded_volumes - embedded_volumes_used;
@@ -158,7 +188,7 @@ Result<UefiCapsule> parse_uefi_fmp_capsule(std::span<const std::byte> bytes,
                         embedded_decompressed_used += decompressed_bytes;
                     }
                 }
-            } else if (item.update_image_size >= 56) {
+            } else if (image_payload_size >= 56) {
                 item.embedded_volume_scan_complete = false;
                 item.embedded_volume_diagnostic = embedded_scans_used >= options.max_embedded_payload_scans
                     ? "embedded firmware-volume payload scan count limit reached"

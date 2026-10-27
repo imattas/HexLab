@@ -28,7 +28,9 @@ class AnalysisIssuesView final : public wxPanel {
     std::function<void(Location)> navigate;
 
   private:
-    enum class Kind { function_stop, candidate, overlap, incomplete_function, loader_diagnostic, type_import_diagnostic, decompiler_diagnostic };
+    enum class Kind { function_stop, candidate, overlap, incomplete_function, loader_diagnostic,
+                      runtime_relocation_diagnostic, file_inspection_diagnostic,
+                      type_import_diagnostic, decompiler_diagnostic };
     struct Row {
         Kind kind;
         std::optional<Address> address;

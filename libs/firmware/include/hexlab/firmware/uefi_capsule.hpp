@@ -31,6 +31,16 @@ struct UefiCapsuleItem {
     std::uint32_t update_image_size = 0;
     std::uint32_t vendor_code_size = 0;
     std::uint64_t image_header_size = 0;
+    // Optional EFI_FIRMWARE_IMAGE_AUTHENTICATION prefix at the beginning of
+    // UpdateImage. Signature bytes are inventoried but never verified.
+    bool authentication_present = false;
+    std::uint64_t authentication_monotonic_count = 0;
+    std::uint32_t authentication_certificate_size = 0;
+    std::array<std::uint8_t, 16> authentication_certificate_guid{};
+    std::uint64_t authentication_certificate_offset = 0;
+    std::uint64_t authentication_certificate_data_offset = 0;
+    std::uint64_t authentication_certificate_data_size = 0;
+    std::uint64_t authentication_header_size = 0;
     std::uint64_t payload_offset = 0;
     std::uint64_t vendor_code_offset = 0;
     std::uint64_t hardware_instance = 0;

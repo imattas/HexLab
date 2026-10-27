@@ -84,6 +84,8 @@ AnalysisIssuesView::AnalysisIssuesView(wxWindow *parent) : wxPanel(parent) {
     filter_->Append("Loader diagnostics");
     filter_->Append("Type import diagnostics");
     filter_->Append("Decompiler diagnostics");
+    filter_->Append("Runtime relocation diagnostics");
+    filter_->Append("File inspection diagnostics");
     filter_->SetSelection(0);
     severity_ = new wxChoice(this, wxID_ANY);
     severity_->SetName("analysis-issues-severity");
@@ -241,7 +243,7 @@ void AnalysisIssuesView::update(std::optional<DocumentId> document, std::shared_
             const auto found = preferences_.find(document_->value);
             if (found != preferences_.end()) preference = found->second;
         }
-        filter_->SetSelection(std::clamp(preference.filter, 0, 6));
+        filter_->SetSelection(std::clamp(preference.filter, 0, 8));
         severity_->SetSelection(std::clamp(preference.severity, 0, 3));
         search_->ChangeValue(preference.query);
         scope_entry_ = preference.function;
@@ -465,6 +467,8 @@ wxString AnalysisIssuesView::kind_text(Kind kind) const {
     case Kind::overlap: return "Conflict";
     case Kind::incomplete_function: return "Incomplete function";
     case Kind::loader_diagnostic: return "Loader diagnostic";
+    case Kind::runtime_relocation_diagnostic: return "Runtime relocation diagnostic";
+    case Kind::file_inspection_diagnostic: return "File inspection diagnostic";
     case Kind::type_import_diagnostic: return "Type import diagnostic";
     case Kind::decompiler_diagnostic: return "Decompiler diagnostic";
     }
@@ -560,21 +564,21 @@ void AnalysisIssuesView::rebuild() {
     }
 
     std::size_t diagnostic_rows = 0;
-    auto add_diagnostics = [&](const std::vector<Diagnostic> &diagnostics, std::string_view source) {
+    auto add_diagnostics = [&](const std::vector<Diagnostic> &diagnostics, std::string_view source, Kind kind) {
         for (const auto &diagnostic : diagnostics) {
             if (diagnostic_rows >= diagnostic_budget) break;
             wxString detail = text(source) + " " + severity_text(diagnostic.severity) + ": " +
                               preview_text(diagnostic.message, 4096);
             if (rows_.size() >= max_rows) break;
-            Row row{Kind::loader_diagnostic, diagnostic.location, {}, {}, std::move(detail)};
+            Row row{kind, diagnostic.location, {}, {}, std::move(detail)};
             row.severity = diagnostic.severity;
             rows_.push_back(std::move(row));
             ++diagnostic_rows;
         }
     };
     if (project_) {
-        if (loader_items) add_diagnostics(*loader_items, "Loader");
-        if (runtime_items) add_diagnostics(*runtime_items, "Runtime relocation");
+        if (loader_items) add_diagnostics(*loader_items, "Loader", Kind::loader_diagnostic);
+        if (runtime_items) add_diagnostics(*runtime_items, "Runtime relocation", Kind::runtime_relocation_diagnostic);
         if (!active_type && durable_type_import) {
             for (std::size_t i = 0; i < std::min(max_loader_rows, durable_type_import->size()) && diagnostic_rows < diagnostic_budget; ++i) {
                 const auto &item = (*durable_type_import)[i];
@@ -586,7 +590,7 @@ void AnalysisIssuesView::rebuild() {
             }
         }
     } else if (file_diagnostics) {
-        add_diagnostics(*file_diagnostics, "File inspection");
+        add_diagnostics(*file_diagnostics, "File inspection", Kind::file_inspection_diagnostic);
     }
     const auto add_producer = [&](const std::vector<AnalysisIssueDiagnostic> *items, Kind kind) {
         if (!items) return;
@@ -703,10 +707,14 @@ void AnalysisIssuesView::render() {
             continue;
         if (selected_filter == 3 && kind != Kind::overlap)
             continue;
-        if (selected_filter == 4 && kind != Kind::loader_diagnostic)
-            continue;
+        const bool any_loader_diagnostic = kind == Kind::loader_diagnostic ||
+                                           kind == Kind::runtime_relocation_diagnostic ||
+                                           kind == Kind::file_inspection_diagnostic;
+        if (selected_filter == 4 && !any_loader_diagnostic) continue;
         if (selected_filter == 5 && kind != Kind::type_import_diagnostic) continue;
         if (selected_filter == 6 && kind != Kind::decompiler_diagnostic) continue;
+        if (selected_filter == 7 && kind != Kind::runtime_relocation_diagnostic) continue;
+        if (selected_filter == 8 && kind != Kind::file_inspection_diagnostic) continue;
         if ((selected_severity == 1 && rows_[index].severity != DiagnosticSeverity::error) ||
             (selected_severity == 2 && rows_[index].severity != DiagnosticSeverity::warning) ||
             (selected_severity == 3 && rows_[index].severity != DiagnosticSeverity::info))

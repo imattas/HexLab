@@ -77,6 +77,37 @@ Result<DynamicCallSite> cp_dynamic_call_site(const JvmMetadata &metadata, std::u
     if (!descriptor) return descriptor.error();
     return DynamicCallSite{std::move(name.value()), std::move(descriptor.value()), dynamic.first};
 }
+std::optional<std::string> string_concat_recipe(const JvmMetadata &metadata,const DynamicCallSite &site) {
+    if(!metadata.bootstrap_methods||site.bootstrap_index>=metadata.bootstrap_methods->size())return{};
+    const auto &bootstrap=(*metadata.bootstrap_methods)[site.bootstrap_index];
+    const auto handle_index=bootstrap.method_handle_index;
+    if(!handle_index||handle_index>=metadata.constant_pool.size())return{};
+    const auto &handle=metadata.constant_pool[handle_index];
+    if(handle.tag!=15||handle.second==0||handle.second>=metadata.constant_pool.size())return{};
+    const auto &reference=metadata.constant_pool[handle.second];
+    if((reference.tag!=10&&reference.tag!=11)||reference.first==0||reference.first>=metadata.constant_pool.size()||
+       reference.second==0||reference.second>=metadata.constant_pool.size())return{};
+    const auto &owner=metadata.constant_pool[reference.first];const auto &nat=metadata.constant_pool[reference.second];
+    if(owner.tag!=7||nat.tag!=12)return{};
+    auto owner_name=cp_utf8(metadata,owner.first),method_name=cp_utf8(metadata,nat.first);
+    if(!owner_name||!method_name||owner_name.value()!="java/lang/invoke/StringConcatFactory"||
+       method_name.value()!="makeConcatWithConstants"||bootstrap.argument_indices.empty())return{};
+    const auto recipe_index=bootstrap.argument_indices.front();
+    if(!recipe_index||recipe_index>=metadata.constant_pool.size())return{};
+    const auto &constant=metadata.constant_pool[recipe_index];
+    if(constant.tag!=8)return{};
+    auto recipe=cp_utf8(metadata,constant.first);if(!recipe)return{};
+    // Escape for a stable, single-line symbolic intrinsic name; \\u0001 and \\u0002
+    // retain the JVM recipe's dynamic-argument and bootstrap-constant markers.
+    std::string encoded;encoded.reserve(recipe.value().size());
+    for(unsigned char c:recipe.value()){
+        if(c=='\\')encoded+="\\\\";else if(c=='\"')encoded+="\\\"";
+        else if(c=='\n')encoded+="\\n";else if(c=='\r')encoded+="\\r";else if(c=='\t')encoded+="\\t";
+        else if(c<0x20){constexpr char hex[]="0123456789abcdef";encoded+="\\x";encoded+=hex[c>>4];encoded+=hex[c&15];}
+        else encoded+=static_cast<char>(c);
+    }
+    return encoded;
+}
 Result<DynamicCallSite> cp_dynamic_constant(const JvmMetadata &metadata, std::uint64_t index) {
     if (index == 0 || index >= metadata.constant_pool.size() || metadata.constant_pool[index].tag != 17)
         return no("dynamic constant-pool entry is invalid");
@@ -813,6 +844,18 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 call.name="jvm_invokedynamic "+site.value().name+site.value().descriptor+
                           " bootstrap#"+std::to_string(site.value().bootstrap_index)+
                           " cp#"+std::to_string(*index);
+                if(metadata->bootstrap_methods&&site.value().bootstrap_index<metadata->bootstrap_methods->size()){
+                    const auto &bootstrap=(*metadata->bootstrap_methods)[site.value().bootstrap_index];
+                    call.name+=" bsm_handle#"+std::to_string(bootstrap.method_handle_index)+" bsm_args=";
+                    for(std::size_t n=0;n<bootstrap.argument_indices.size();++n){if(n)call.name+=",";call.name+="#"+std::to_string(bootstrap.argument_indices[n]);}
+                    if(auto recipe=string_concat_recipe(*metadata,site.value())){
+                        const auto marker_count=[&](std::string_view marker){std::size_t count=0,pos=0;while((pos=recipe->find(marker,pos))!=std::string::npos){++count;pos+=marker.size();}return count;};
+                        const auto dynamic_markers=marker_count("\\x01");
+                        const auto constant_markers=marker_count("\\x02");
+                        if(dynamic_markers==signature.value().parameters.size()&&constant_markers+1==bootstrap.argument_indices.size())
+                            call.name+=" concat_recipe=\""+*recipe+"\"";
+                    }
+                }
                 call.operands=std::move(arguments);call.memory_effect=IntrinsicMemoryEffect::unknown;
                 if(signature.value().result)call.result_type=*signature.value().result;
                 const auto result_name=call.name;const auto result_type=signature.value().result;

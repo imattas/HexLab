@@ -10,6 +10,14 @@ error stops further optional queries for that refresh. Malformed hex and
 embedded NUL descriptions are rejected; other ASCII control bytes are replaced
 with spaces before the label reaches the UI.
 
+Shared-library enumeration accepts either `qXfer:libraries:read` or the
+Solaris/GDB `qXfer:libraries-svr4:read` object. The client tries the standard
+object first and falls back to the svr4 object only when the first request is
+explicitly unsupported. Both objects use the same bounded chunk, progress,
+marker, and 1 MiB aggregate checks; returned `<library>` names and segment
+addresses flow through the existing XML validation and module model. A malformed
+standard object is reported as malformed rather than hidden by a fallback.
+
 ## Launching on a connected remote target
 
 In a live RSP session, the existing **Launch** command can start a new remote

@@ -6,6 +6,10 @@ The kind selector, severity selector and text filter narrow the loaded findings
 without starting analysis or changing project decisions. The severity column
 keeps producer-reported error, warning and info levels visible in the queue; the
 severity filter combines with the kind filter, search and function scope.
+The kind selector separates runtime relocation and file-inspection diagnostics
+from the general loader diagnostic queue. **Loader diagnostics** keeps the full
+diagnostic set together; the two additional choices isolate each source class
+when a binary reports many unrelated loader findings.
 
 Select a row to navigate the linked listing, bytes and graph views. **Previous**
 and **Next** move through the visible queue and navigate to each finding's

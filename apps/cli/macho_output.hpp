@@ -90,7 +90,13 @@ inline void macho_objc_property_line(std::ostream &out, const MachOObjCProperty 
         << " type-encoding=" << (property.type_encoding ? macho_text(*property.type_encoding) : "-")
         << " type=" << (property.type ? macho_text(types::format(*property.type)) : "-")
         << " status=" << macho_text(property.name_status) << '/' << macho_text(property.attributes_status)
-        << '/' << macho_text(property.type_status) << '\n';
+        << '/' << macho_text(property.type_status) << '/' << macho_text(property.attribute_semantics_status)
+        << " flags=" << (property.readonly ? "readonly," : "") << (property.copy ? "copy," : "")
+        << (property.strong ? "strong," : "") << (property.weak ? "weak," : "")
+        << (property.nonatomic ? "nonatomic," : "") << (property.dynamic ? "dynamic," : "")
+        << " getter=" << (property.custom_getter ? macho_text(*property.custom_getter) : "default")
+        << " setter=" << (property.custom_setter ? macho_text(*property.custom_setter) : "default")
+        << " backing-ivar=" << (property.backing_ivar ? macho_text(*property.backing_ivar) : "unspecified") << '\n';
 }
 inline void macho_description(std::ostream &out, const ImageMetadata &metadata, const Image *image) {
     if (!metadata.macho)

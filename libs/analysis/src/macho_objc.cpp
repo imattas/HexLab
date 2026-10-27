@@ -386,6 +386,68 @@ std::optional<std::string> property_type_encoding(std::string_view attributes, s
     return std::string(attributes.substr(1));
 }
 
+void decode_property_attribute_semantics(MachOObjCProperty &property) {
+    if (!property.attributes) {
+        property.attribute_semantics_status = "attributes-unavailable";
+        return;
+    }
+    const auto &raw = *property.attributes;
+    if (raw.empty() || raw.front() != 'T' || !property.type_encoding) {
+        property.attribute_semantics_status = "type-attribute-invalid";
+        return;
+    }
+    const auto suffix_begin = std::size_t{1} + property.type_encoding->size();
+    if (suffix_begin >= raw.size()) {
+        property.attribute_semantics_status = "parsed";
+        return;
+    }
+    if (raw[suffix_begin] != ',') {
+        property.attribute_semantics_status = "type-attribute-invalid";
+        return;
+    }
+    unsigned seen = 0;
+    bool unknown = false, malformed = false;
+    auto mark = [&](unsigned bit) {
+        if (seen & bit) malformed = true;
+        seen |= bit;
+    };
+    std::size_t at = suffix_begin + 1;
+    while (at <= raw.size()) {
+        const auto end = raw.find(',', at);
+        const auto part = std::string_view(raw).substr(at, end == std::string::npos ? raw.size() - at : end - at);
+        if (part.empty()) { malformed = true; break; }
+        switch (part.front()) {
+        case 'R': mark(1u << 0); property.readonly = part.size() == 1; if (part.size() != 1) malformed = true; break;
+        case 'C': mark(1u << 1); property.copy = part.size() == 1; if (part.size() != 1) malformed = true; break;
+        case '&': mark(1u << 2); property.strong = part.size() == 1; if (part.size() != 1) malformed = true; break;
+        case 'W': mark(1u << 3); property.weak = part.size() == 1; if (part.size() != 1) malformed = true; break;
+        case 'N': mark(1u << 4); property.nonatomic = part.size() == 1; if (part.size() != 1) malformed = true; break;
+        case 'D': mark(1u << 5); property.dynamic = part.size() == 1; if (part.size() != 1) malformed = true; break;
+        case 'G':
+            mark(1u << 6);
+            if (part.size() == 1) malformed = true;
+            else property.custom_getter = std::string(part.substr(1));
+            break;
+        case 'S':
+            mark(1u << 7);
+            if (part.size() == 1) malformed = true;
+            else property.custom_setter = std::string(part.substr(1));
+            break;
+        case 'V': // Runtime backing-ivar name; retained in the raw record.
+            if (part.size() == 1) malformed = true;
+            else property.backing_ivar = std::string(part.substr(1));
+            break;
+        default: unknown = true; break;
+        }
+        if (end == std::string::npos) break;
+        at = end + 1;
+    }
+    if ((property.copy && property.strong) || (property.copy && property.weak) ||
+        (property.strong && property.weak)) malformed = true;
+    property.attribute_semantics_status = malformed ? "malformed-attributes" :
+        unknown ? "parsed-with-unknown-attributes" : "parsed";
+}
+
 bool decode_methods(const Image &image, const RelocationResolver &resolver, MachOObjCList &list,
                     Budget &budget, MachOObjCScan &scan, bool &owner_complete) {
     if (!list.address || !list.count || !list.stride) return true;
@@ -549,6 +611,7 @@ bool decode_properties(const Image &image, const RelocationResolver &resolver, M
         row.attributes = direct_string_pointer(image, resolver, *attributes_slot, budget, row.attributes_status);
         if (row.attributes) {
             row.type_encoding = property_type_encoding(*row.attributes, row.type_status);
+            decode_property_attribute_semantics(row);
             if (row.type_encoding) {
                 MachOObjCEncodingLimits encoding_limits;
                 encoding_limits.pointer_bytes = budget.pointer_bytes;
@@ -561,6 +624,7 @@ bool decode_properties(const Image &image, const RelocationResolver &resolver, M
             }
         } else {
             row.type_status = "attributes-unavailable";
+            decode_property_attribute_semantics(row);
         }
         if (!row.name || !row.attributes)
             mark_incomplete(scan, owner_complete, "Objective-C property entry contains unresolved strings");

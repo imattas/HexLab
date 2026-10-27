@@ -959,6 +959,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
     DexMetadata dex_metadata;
     dex_metadata.map_items = std::move(map.value().items);
     dex_metadata.prototype_return_kinds.reserve(protos.size());
+    dex_metadata.prototype_parameter_word_counts.reserve(protos.size());
     for (const auto &proto : protos) {
         const auto &descriptor = types[proto.return_type];
         const auto kind = descriptor == "V" ? DexReturnKind::void_value :
@@ -970,6 +971,15 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
             !descriptor.empty() && (descriptor.front() == 'L' || descriptor.front() == '[')
                 ? DexReturnKind::reference : DexReturnKind::unknown;
         dex_metadata.prototype_return_kinds.push_back(kind);
+        std::uint32_t parameter_words = 0;
+        for (const auto parameter : proto.parameters) {
+            const auto &parameter_descriptor = types[parameter];
+            const std::uint32_t width = parameter_descriptor == "J" || parameter_descriptor == "D" ? 2u : 1u;
+            if (parameter_words > UINT32_MAX - width)
+                return Error{ErrorCode::resource_limit, "DEX prototype parameter word count overflows"};
+            parameter_words += width;
+        }
+        dex_metadata.prototype_parameter_word_counts.push_back(parameter_words);
     }
     dex_metadata.method_prototype_indices.reserve(methods.size());
     for (const auto &method : methods)

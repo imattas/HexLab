@@ -311,7 +311,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     std::uint64_t attribute_bytes=0;bool metadata_complete=true;
     std::size_t expanded_verification_entries=0,stack_map_frames=0;
     bool have_record=false,have_inner_classes=false,have_nest_host=false,have_nest_members=false,have_permitted_subclasses=false;
-    bool have_module_packages=false,have_module_main_class=false;
+    bool have_module_packages=false,have_module_main_class=false,have_bootstrap_methods=false;
     bool have_class_visible_annotations=false,have_class_invisible_annotations=false;
     bool have_class_visible_type_annotations=false,have_class_invisible_type_annotations=false;
     std::unordered_set<const JvmMember *> visible_annotations_seen,invisible_annotations_seen;
@@ -370,7 +370,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             if(len>64*1024*1024||attribute_bytes>max_total_attributes-len)return Error{ErrorCode::resource_limit,"classfile attribute data exceeds bounded size limits"};attribute_bytes+=len;
             auto an=utf8(name_ix);if(!an)return an.error();const auto start=r.p;if(len>r.b.size()-r.p)return malformed("attribute extent exceeds its enclosing owner");
             ReaderExtent extent{r,r.b};r.b=r.b.first(start+len);
-            if(!class_level&&(an.value()=="NestHost"||an.value()=="NestMembers"||an.value()=="PermittedSubclasses"||an.value()=="Record"||an.value()=="InnerClasses"||an.value()=="Module"||an.value()=="ModulePackages"||an.value()=="ModuleMainClass"||an.value()=="SourceFile"))return malformed("class-level attribute appears on a member or Code attribute list");
+            if(!class_level&&(an.value()=="NestHost"||an.value()=="NestMembers"||an.value()=="PermittedSubclasses"||an.value()=="Record"||an.value()=="InnerClasses"||an.value()=="Module"||an.value()=="ModulePackages"||an.value()=="ModuleMainClass"||an.value()=="BootstrapMethods"||an.value()=="SourceFile"))return malformed("class-level attribute appears on a member or Code attribute list");
             if(an.value()=="Signature"){
                 if(code_owner)return malformed("Signature attribute appears inside Code");
                 if(len!=2)return malformed("Signature attribute must contain one UTF-8 index");
@@ -678,6 +678,28 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                     module.provides.push_back(std::move(entry));
                 }
                 md.module=std::move(module);
+            }else if(class_level&&an.value()=="BootstrapMethods"){
+                if(have_bootstrap_methods)return malformed("duplicate BootstrapMethods attribute");
+                if(md.major_version<51)return malformed("BootstrapMethods requires classfile version 51 or later");
+                std::uint16_t count=0;if(!r.u2(count)||count>8192)return malformed("invalid BootstrapMethods count");
+                std::vector<JvmBootstrapMethod> methods;methods.reserve(count);
+                std::size_t retained_arguments=0;
+                for(unsigned i=0;i<count;++i){
+                    JvmBootstrapMethod entry;std::uint16_t argument_count=0;
+                    if(!r.u2(entry.method_handle_index)||!r.u2(argument_count))return malformed("truncated BootstrapMethods entry");
+                    if(!entry.method_handle_index||entry.method_handle_index>=md.constant_pool.size()||md.constant_pool[entry.method_handle_index].tag!=15)
+                        return malformed("BootstrapMethods entry does not reference a CONSTANT_MethodHandle");
+                    if(argument_count>8192-retained_arguments)return Error{ErrorCode::resource_limit,"BootstrapMethods argument count exceeds the 8192-entry limit"};
+                    retained_arguments+=argument_count;entry.argument_indices.reserve(argument_count);
+                    for(unsigned j=0;j<argument_count;++j){std::uint16_t index=0;if(!r.u2(index)||!index||index>=md.constant_pool.size())return malformed("invalid BootstrapMethods argument index");
+                        const auto tag=md.constant_pool[index].tag;
+                        if(tag!=3&&tag!=4&&tag!=5&&tag!=6&&tag!=7&&tag!=8&&tag!=15&&tag!=16&&tag!=17)
+                            return malformed("BootstrapMethods argument has an unsupported constant kind");
+                        entry.argument_indices.push_back(index);
+                    }
+                    methods.push_back(std::move(entry));
+                }
+                md.bootstrap_methods=std::move(methods);have_bootstrap_methods=true;
             }else if(class_level&&an.value()=="ModulePackages"){
                 if(have_module_packages)return malformed("duplicate ModulePackages attribute");
                 if(md.major_version<53||md.class_name!="module-info"||(md.access_flags&0x8000)==0||len<2)return malformed("ModulePackages requires a Java 9 module-info class");
@@ -690,7 +712,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 if(md.major_version<53||md.class_name!="module-info"||(md.access_flags&0x8000)==0||len!=2)return malformed("ModuleMainClass requires one class index in a Java 9 module-info class");
                 std::uint16_t index=0;if(!r.u2(index))return malformed("truncated ModuleMainClass attribute");auto name=class_name(index);if(!name)return name.error();md.module_main_class=std::move(name.value());have_module_main_class=true;
             }else{
-                if(an.value()!="ConstantValue"&&an.value()!="Exceptions"&&an.value()!="Signature"&&an.value()!="SourceFile"&&an.value()!="Synthetic"&&an.value()!="Deprecated"&&an.value()!="LineNumberTable"&&an.value()!="LocalVariableTable")metadata_complete=false;
+                if(an.value()!="ConstantValue"&&an.value()!="Exceptions"&&an.value()!="Signature"&&an.value()!="SourceFile"&&an.value()!="Synthetic"&&an.value()!="Deprecated"&&an.value()!="LineNumberTable"&&an.value()!="LocalVariableTable"&&an.value()!="BootstrapMethods")metadata_complete=false;
                 if(!r.skip(len))return malformed("truncated attribute payload");
             }
             if(r.p!=start+len)return malformed("attribute parser did not consume its declared extent");
@@ -704,6 +726,10 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     };
     auto f=members(md.fields,false);if(!f)return f.error();auto m=members(md.methods,true);if(!m)return m.error();
     auto class_attrs=attributes(false,nullptr,true,nullptr);if(!class_attrs)return class_attrs.error();if(r.p!=bytes.size())return malformed("trailing bytes after classfile attributes");
+    for(std::size_t i=1;i<md.constant_pool.size();++i)if(md.constant_pool[i].tag==17||md.constant_pool[i].tag==18){
+        const auto bootstrap_index=md.constant_pool[i].first;
+        if(!md.bootstrap_methods||bootstrap_index>=md.bootstrap_methods->size())return malformed("dynamic constant references a missing BootstrapMethods entry");
+    }
     if((have_module_packages||have_module_main_class)&&!md.module)return malformed("ModulePackages and ModuleMainClass require a Module attribute");
     if(md.access_flags&0x8000){
         if(md.major_version<53||md.class_name!="module-info"||!md.module||md.super_class||!md.interfaces.empty()||!md.fields.empty()||!md.methods.empty())

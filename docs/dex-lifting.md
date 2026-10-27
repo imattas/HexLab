@@ -85,13 +85,18 @@ DEX 038+ `invoke-polymorphic` (including `/range`) and `invoke-custom` (includin
 and prototype indexes; custom instructions retain the call-site index. Their
 encoded argument words are lifted as unknown 32-bit register reads, and the
 call-like intrinsic invalidates memory. Custom-call result shapes are resolved
-from the retained call-site method type when that metadata is present. DEX 039+ `const-method-handle` and
+from the retained call-site method type when that metadata is present. When prototype metadata is
+available, invocation lifting checks the encoded register-word count against the prototype's
+parameter word count, including the implicit receiver for non-static and polymorphic calls;
+`long` and `double` parameters count as two words. A mismatch is rejected as malformed instead
+of producing a misleading call intrinsic. DEX 039+ `const-method-handle` and
 `const-method-type` decode and lift as unknown reference constants while
 preserving the method-handle or prototype index. The bytecode decoder does not
 currently validate that the file version permits these opcodes, and the
 analysis layer does not resolve call-site arrays or method handles to names,
-nor retain full parameter/return descriptors. Register arguments therefore do
-not have recovered types; result linkage uses only the retained return shape
+nor retain full parameter/return descriptors. Parameter word counts are retained
+to validate invoke arity, but register arguments do not have recovered types;
+result linkage uses only the retained return shape
 and is limited to immediate same-block move-result pairs. These opcode
 encodings follow the [Android Dalvik bytecode reference](https://source.android.google.cn/docs/core/runtime/dalvik-bytecode?hl=en).
 

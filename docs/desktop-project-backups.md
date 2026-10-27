@@ -1,7 +1,8 @@
 # Desktop project backups
 
 The File menu provides **Create Project Backup...** for a saved project and
-**Restore Backup as New Project...** for an existing `.hxproj` backup.
+**Restore Backup as New Project...** or **Restore Backup In Place...** for an
+existing `.hxproj` backup.
 
 Creating a backup runs through the active project's serialized writer. The
 writer publishes a validated SQLite online backup atomically, keeps the
@@ -18,9 +19,15 @@ unchanged. Publication is atomic; a failed validation or copy does not replace
 the destination. Restore work runs off the UI thread and only one restore may
 run at a time.
 
+In-place restore asks for the backup and existing target, then shows a
+destructive-operation confirmation before starting. Both files must have the
+same project UUID. Close every open view of the backup and target first; the UI
+rejects paths that are open in the current application. Restore runs off the UI
+thread, retains the replaced target as a recovery artifact, and reopens the
+restored project when it completes.
+
 An unsaved, untitled document must be saved before it can be backed up. The
-restore command does not rotate or retain older backup generations, and it
-does not restore in place.
+restore commands do not rotate or retain older backup generations.
 
 ## Rotating backups in the desktop
 
