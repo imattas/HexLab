@@ -199,7 +199,9 @@ The decoder also recognizes legacy optimized Dalvik code units listed in the
 for volatile field access (`0xe3`–`0xeb`), inline invokes (`0xee`–`0xef`),
 `return-void-barrier` (`0xf1`), quick field access (`0xf2`–`0xf7`), and quick
 virtual invokes (`0xf8`–`0xf9`). These forms retain their register effects,
-field/vtable/inline indexes, and memory or call classification. Quick indexes
+field/vtable/inline indexes, and memory or call classification. Range invokes
+accept their full encoded 8-bit word count and validate the 16-bit register
+range; typed register operands remain limited to v0..v255. Quick indexes
 remain unresolved; no dequickening, inline-method expansion, runtime-version
 selection, or optimized-container validation is performed. Standard DEX
 `invoke-polymorphic` and `invoke-custom` opcodes at `0xfa`–`0xfd` keep their

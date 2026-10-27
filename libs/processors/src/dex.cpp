@@ -362,7 +362,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         words = 3;
         if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated optimized DEX invoke");
         const unsigned count = range ? hi : ((first >> 12) & 15);
-        if ((range && count > 15) || (!range && count > 5))
+        if (!range && count > 5)
             return fail(DecodeStatus::invalid, "optimized DEX invoke register count exceeds its encoding");
         const auto index = word(1);
         if (range) {
@@ -419,7 +419,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         words = (op == 0xfa || op == 0xfb) ? 4 : 3;
         if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX polymorphic/custom invoke");
         const unsigned count = range ? hi : ((first >> 12) & 15);
-        if (count > 15 || (!range && count > 5))
+        if (!range && count > 5)
             return fail(DecodeStatus::unsupported, "DEX invoke argument words exceed the typed instruction operand budget");
         text = polymorphic ? (range ? "invoke-polymorphic/range {" : "invoke-polymorphic {")
                            : (range ? "invoke-custom/range {" : "invoke-custom {");
@@ -546,7 +546,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         const bool invoke_ext = op >= 0xfa;
         const bool range = op == 0x25 || op >= 0x74 || op == 0xfb || op == 0xfd;
         const unsigned count = invoke_ext ? (range ? hi : ((first >> 12) & 15)) : (range ? hi : b);
-        if (count > 15)
+        if (!range && count > 5)
             return fail(DecodeStatus::unsupported, "DEX register list exceeds the typed instruction operand budget");
         if (range) {
             const unsigned start = word(2);
@@ -567,7 +567,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
     } else if (op == 0xee || op == 0xef || op == 0xf8 || op == 0xf9) {
         const bool range = op == 0xef || op == 0xf9;
         const unsigned count = range ? hi : ((first >> 12) & 15);
-        if ((range && count > 15) || (!range && count > 5))
+        if (!range && count > 5)
             return fail(DecodeStatus::invalid, "optimized DEX invoke register count exceeds its encoding");
         if (range) {
             const unsigned start = word(2);
