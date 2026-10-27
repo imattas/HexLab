@@ -80,6 +80,16 @@ See the [32-bit layout and validation contract](../libs/analysis/docs/macho-objc
 for exact supported offsets, pointer checks and remaining runtime forms.
 This hardening slice has source-review evidence only; no builds or tests were run.
 
+The Objective-C type import plan also persists complete categories whose name
+and target link resolve to a scanned class. Parsed instance and class method
+signatures are stored together in a separate incomplete aggregate named
+`ObjC2.Category.<class>.<category>`. This keeps category declarations and
+their metadata provenance separate from the target class's instance layout.
+Duplicate target/category names, partial records, unlinked targets, and
+categories without parsed method signatures are skipped. The source origin
+records the category-list section ordinal, list index, and category record
+address, so the imported type can be traced to the metadata that supplied it.
+
 Method type parsing is separately bounded to 4,096 input bytes, 32 nested
 types, and 256 encoded type nodes by default. It accepts the primitive codes
 `v c C s S i I l L q Q B f d`, object (`@`, including quoted class annotations

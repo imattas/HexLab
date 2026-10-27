@@ -201,6 +201,15 @@ Field field(const ElfHeader &header, std::uint32_t type) {
         default: break;
         }
     }
+    if (header.machine == 22 && header.is_64) {
+        switch (type) {
+        case 10: return {K::global_data, 8}; // R_390_GLOB_DAT
+        case 11: return {K::jump_slot, 8}; // R_390_JMP_SLOT
+        case 12: return {K::base_relative, 8}; // R_390_RELATIVE
+        case 22: return {K::absolute, 8}; // R_390_64
+        default: break;
+        }
+    }
     if (header.machine == 243) {
         switch (type) {
         case 1: return {K::absolute, 4}; // R_RISCV_32
@@ -228,6 +237,7 @@ std::uint32_t relative_type(const ElfHeader &header) {
     case 8: return 3;       // EM_MIPS: R_MIPS_REL32
     case 20: return 22;     // EM_PPC: R_PPC_RELATIVE
     case 21: return 22;     // EM_PPC64: R_PPC64_RELATIVE
+    case 22: return 12;     // EM_S390: R_390_RELATIVE
     case 40: return 23;     // EM_ARM: R_ARM_RELATIVE
     case 62: return 8;      // EM_X86_64: R_X86_64_RELATIVE
     case 183: return 1027;  // EM_AARCH64: R_AARCH64_RELATIVE

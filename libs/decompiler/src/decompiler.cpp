@@ -5473,6 +5473,20 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
                 block.instructions.push_back({origin, std::move(statement)});
                 continue;
             }
+            if (decoded.context.architecture == Architecture::mips64 &&
+                (decoded.opcode == Opcode::mips64_tge || decoded.opcode == Opcode::mips64_tgeu ||
+                 decoded.opcode == Opcode::mips64_tlt || decoded.opcode == Opcode::mips64_tltu ||
+                 decoded.opcode == Opcode::mips64_teq || decoded.opcode == Opcode::mips64_tne ||
+                 decoded.opcode == Opcode::mips64_tgei || decoded.opcode == Opcode::mips64_tgeiu ||
+                 decoded.opcode == Opcode::mips64_tlti || decoded.opcode == Opcode::mips64_tltiu ||
+                 decoded.opcode == Opcode::mips64_teqi || decoded.opcode == Opcode::mips64_tnei)) {
+                if (const auto *trap = std::get_if<Intrinsic>(&statement);
+                    trap && !trap->operands.empty() &&
+                    trap->name.find("_conditional_trap") != std::string::npos) {
+                    block.trap_edges.push_back({decoded.address, TrapEdgeKind::may_trap,
+                                                trap->name, trap->operands.front()});
+                }
+            }
             block.instructions.push_back({{decoded.address, fact->id}, std::move(statement)});
         }
         result.blocks.push_back(std::move(block));

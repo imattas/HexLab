@@ -110,7 +110,7 @@ struct ElfRuntimeRelocationLimits {
 };
 // Applies packed RELR pointer-relative entries for ELF32/ELF64 ET_DYN images
 // in either byte order, plus little-endian ELF32 i386/ARM/RISC-V and ELF64
-// x86-64/AArch64/PPC64/RISC-V ordinary REL/RELA subsets. RELATIVE uses B + A;
+// x86-64/AArch64/PPC64/RISC-V and big-endian s390x ordinary REL/RELA subsets. RELATIVE uses B + A;
 // supported symbol relocations use
 // the architecture-specific S/A formulas described in elf-runtime-relocations.md.
 // ELF32 i386 RELATIVE uses an unsigned implicit 32-bit addend; ELF64 REL
