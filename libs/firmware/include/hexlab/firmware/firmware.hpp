@@ -24,6 +24,11 @@ struct DataSegment {
 struct FirmwareImage {
     Format format = Format::intel_hex;
     std::vector<DataSegment> segments;
+    // Raw S0 payload is metadata, not addressable data. Retain its provenance
+    // so inspectors can report it without projecting it into image memory.
+    std::vector<std::byte> s_record_header;
+    RecordProvenance s_record_header_provenance;
+    bool has_s_record_header = false;
     std::uint64_t total_data_bytes = 0;
     std::uint64_t data_record_count = 0;
     Termination termination = Termination::eof;

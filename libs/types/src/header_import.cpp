@@ -1966,7 +1966,9 @@ private:
                 ++declaration_ordinal;
                 continue;
             }
+            const bool virtual_specifier = take("virtual");
             auto b=parse_base(true);
+            if(virtual_specifier&&b.is_static)fail(ErrorCode::malformed,"static member functions cannot be virtual");
             if(b.is_typedef&&(b.is_static||b.is_inline))syntax("member typedef cannot have static or inline storage");
             if(take(";"))syntax("anonymous aggregate members are unsupported");
             bool declaration_packed = prefix_packed_;
@@ -1986,6 +1988,7 @@ private:
                 if(pending_aggregate_alignment_){member_alignment=std::max(member_alignment.value_or(0),*pending_aggregate_alignment_);pending_aggregate_alignment_.reset();}
                 d.type=apply_pending_vector_size(std::move(d.type),b.is_typedef);
                 d.type=apply_pending_function_convention(std::move(d.type));
+                if(virtual_specifier&&!d.function)fail(ErrorCode::malformed,"virtual specifier requires a member function declaration");
                 if(b.is_typedef){
                     cpp_declarations=true;
                     if(packed_member)fail(ErrorCode::unsupported,"packed member typedefs are unsupported");
@@ -1997,15 +2000,22 @@ private:
                 }
                 if(d.function) {
                     if(packed_member||member_alignment)fail(ErrorCode::unsupported,"layout attributes cannot be applied to method declarations");
+                    bool pure_virtual = false;
                     if(take("=")) {
                         if(next().text!="0")fail(ErrorCode::unsupported,"only pure-virtual '= 0' method declarations are supported");
-                        fail(ErrorCode::unsupported,"pure-virtual methods are not yet retained by the header importer");
+                        if(!virtual_specifier)fail(ErrorCode::malformed,"pure-specifier requires the virtual keyword");
+                        if(b.is_static)fail(ErrorCode::malformed,"static member functions cannot be pure virtual");
+                        need("0");
+                        need(";");
+                        pure_virtual = true;
                     }
-                    if(at("{"))fail(ErrorCode::unsupported,"C++ method definitions and bodies are unsupported");
+                    else if(virtual_specifier)fail(ErrorCode::unsupported,"only pure virtual methods are supported");
+                    else if(at("{"))fail(ErrorCode::unsupported,"C++ method definitions and bodies are unsupported");
                     if(member_names.contains(d.name))fail(ErrorCode::conflict,"duplicate aggregate field or method '"+d.name+"'");
                     method_names.insert(d.name);
                     cpp_declarations=true;
                     Method method;method.name=d.name;method.signature=d.type;method.access=access;method.is_static=b.is_static;
+                    if(pure_virtual)method.dispatch=MemberDispatch::pure_virtual;
                     method.declaration_ordinal=source_ordinal;
                     if(!method.is_static) {
                         auto owner=Type::named_reference(key);if(!owner)fail(owner.error().code,owner.error().message);

@@ -4,7 +4,9 @@
 
 Intel HEX supports data (00), EOF (01), extended segment address (02), start segment address (03), extended linear address (04), and start linear address (05) records. It verifies each byte checksum, requires a well-formed EOF record, and rejects any later nonblank record.
 
-Motorola S-record supports S0 headers, S1/S2/S3 data, S5/S6 data-record counts, and matching S9/S8/S7 termination records. It validates byte counts and one's-complement checksums, validates an optional data-record count, requires a termination record, and rejects records after termination. S0 payload is metadata and is not emitted as memory.
+Motorola S-record supports S0 headers, S1/S2/S3 data, S5/S6 data-record counts, and matching S9/S8/S7 termination records. It validates byte counts and one's-complement checksums, validates an optional data-record count, requires a termination record, and rejects records after termination. The unique optional S0 payload is retained as raw metadata with its source line and record index, must precede data/count records, and is never emitted as memory. A count record must follow all data records; subsequent data records are rejected rather than invalidating the declared count.
+
+Intel HEX permits at most one type-03/type-05 start-address record. Duplicate start metadata is rejected instead of silently replacing the earlier entry point.
 
 Both parsers reject overlapping data records, malformed/unsupported record types, out-of-bound addresses, and configured record/data limits. `ParseOptions` defaults to at most 512 MiB of data, addresses through `0xffffffff`, and four million records. A `std::stop_token` supports cancellation between records. Errors include a one-based source line when a line is available and use the shared `ErrorCode` taxonomy.
 
