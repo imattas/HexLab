@@ -12,6 +12,11 @@ The binary `HXTL` format is versioned, little-endian, and length-prefixed. Versi
 
 The complete file is limited to 16 MiB, names to 512 bytes, definitions to 4096, and assignments to 262144. Every record is decoded and validated before the workspace import command runs. A graph-aware resolver validates named references across every nested type edge, including member, parameter, method, virtual-base, static-data, result, and element types. It accepts only exact names present in the bundle or destination and stops after one million unique type nodes or four million reference edges. Imports are one atomic, undoable project command. Matching names update in place; new names receive destination-local IDs. References remain symbolic by name, so nested types and forward references work when their targets are included in the bundle or already exist in the destination. Unknown references are rejected before workspace commit. Version 1 bundles contain definitions only.
 
+Bundle-level definition names, assignment names, and source-origin strings must
+be valid UTF-8 without embedded NUL bytes. Both encoding and decoding enforce
+the same rule, including for legacy version-1 bundles; binary type records and
+SHA-256 identity fields remain byte-oriented.
+
 This workflow handles the project type model, including aggregate layout, function types, enum values, qualifiers, methods and static data attached to declarations. It is not a compiler header/library importer and does not transfer project-local IDs or debug-variable records. Use native PDB/DWARF import for debug variables.
 
 `project types verify <file>` validates a portable bundle without opening a

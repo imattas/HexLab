@@ -6,6 +6,7 @@
 #include <functional>
 #include <limits>
 #include <span>
+#include <string_view>
 
 namespace hexlab {
 struct AnalysisOptions {
@@ -20,6 +21,11 @@ struct AnalysisOptions {
     using SemanticDecoder = std::function<Result<std::optional<Instruction>>(
         DecodeContext, Address, std::span<const std::byte>)>;
     using DecoderIdentity = std::function<std::vector<std::byte>()>;
+    // Optional coarse function-recovery progress. Stages are currently
+    // "instruction-discovery" and "complete"; returning false cancels the
+    // operation. This runtime callback is excluded from analysis cache keys.
+    using Progress = std::function<bool(std::string_view, std::uint64_t, std::uint64_t)>;
+    Progress progress;
     // Optional host-provided decoder. It is consulted only after the built-in
     // decoder reports unsupported, and its identity participates in cache keys.
     SemanticDecoder semantic_decoder;

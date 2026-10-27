@@ -1438,6 +1438,10 @@ void Recovery::discover() {
                 break;
             }
             auto &current = node(address, incoming_it);
+            if (attempts - last_progress_attempts >= 1024) {
+                last_progress_attempts = attempts;
+                report_progress("instruction-discovery", attempts, options.instruction_budget);
+            }
             if (!current.fact || !within_chunks(entry, address, current.fact->instruction.length))
                 continue;
             const auto &dispatch = current.fact->instruction;
@@ -1805,6 +1809,7 @@ void Recovery::prune_unowned_seeds() {
 }
 std::shared_ptr<const FunctionSnapshot> Recovery::run() {
     canceled();
+    report_progress("instruction-discovery", 0, options.instruction_budget);
     require(analysis_detail::supports_automatic_flow(image),
             "Function recovery requires a supported processor mode");
     validate_decisions();
@@ -1822,6 +1827,7 @@ std::shared_ptr<const FunctionSnapshot> Recovery::run() {
                        output->omitted_functions == 0 && output->omitted_blocks == 0;
     for (const auto &function : output->functions)
         output->complete = output->complete && function->complete;
+    report_progress("complete", 1, 1);
     canceled();
     return output;
 }
