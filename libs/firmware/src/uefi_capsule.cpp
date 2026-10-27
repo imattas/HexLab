@@ -17,6 +17,8 @@ std::uint64_t u64(std::span<const std::byte> b, std::size_t at) {
 }
 constexpr std::array<std::uint8_t, 16> fmp_guid{
     0xed,0xd5,0xcb,0x6d,0x2d,0xe8,0x44,0x4c,0xbd,0xa1,0x71,0x94,0x19,0x9a,0xd9,0x2a};
+constexpr std::array<std::uint8_t, 16> json_guid{
+    0xcd,0xf4,0xd6,0x67,0xb8,0xd6,0x73,0x45,0xbf,0x4a,0xde,0x5e,0x25,0x2d,0x61,0xae};
 Error malformed(const char *message) { return {ErrorCode::malformed, message}; }
 }
 
@@ -124,6 +126,37 @@ Result<UefiCapsuleList> parse_uefi_fmp_capsule_list(
         result.total_item_count += parsed.value().items.size();
         result.capsules.push_back(std::move(parsed.value()));
     }
+    return result;
+}
+
+Result<UefiJsonCapsule> parse_uefi_json_capsule(std::span<const std::byte> bytes,
+                                               UefiCapsuleParseOptions options, std::stop_token stop) {
+    if (stop.stop_requested()) return Error{ErrorCode::canceled, "UEFI capsule parsing canceled"};
+    if (bytes.size() > options.max_input_bytes) return Error{ErrorCode::resource_limit, "UEFI capsule exceeds input-size limit"};
+    if (bytes.size() < 40) return malformed("EFI JSON capsule header is truncated");
+    UefiJsonCapsule result;
+    for (std::size_t i = 0; i < 16; ++i) result.capsule_guid[i] = u8(bytes, i);
+    if (result.capsule_guid != json_guid) return Error{ErrorCode::unsupported, "capsule GUID is not EFI JSON"};
+    result.header_size = u32(bytes, 16);
+    result.flags = u32(bytes, 20);
+    result.image_size = u32(bytes, 24);
+    if (result.header_size < 28 || result.header_size > result.image_size || result.image_size > bytes.size())
+        return malformed("EFI JSON capsule header or declared image size is inconsistent with the input");
+    result.header_extension_size = result.header_size - 28;
+    result.trailing_size = bytes.size() - result.image_size;
+    if (result.flags & 0x00020000u)
+        return malformed("JSON capsule sets CAPSULE_FLAGS_POPULATE_SYSTEM_TABLE");
+    if (std::uint64_t(result.header_size) + 12 > result.image_size)
+        return malformed("EFI JSON capsule body header is truncated");
+    const auto body = static_cast<std::size_t>(result.header_size);
+    result.json_header_version = u32(bytes, body);
+    result.capsule_id = u32(bytes, body + 4);
+    result.payload_size = u32(bytes, body + 8);
+    if (result.json_header_version != 1)
+        return Error{ErrorCode::unsupported, "unsupported EFI JSON capsule header version"};
+    if (result.payload_size == 0 || std::uint64_t(body) + 12 + result.payload_size != result.image_size)
+        return malformed("EFI JSON capsule payload length does not match the declared capsule extent");
+    result.payload_offset = body + 12;
     return result;
 }
 } // namespace hexlab::firmware

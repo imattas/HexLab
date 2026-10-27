@@ -4,6 +4,9 @@
 #include "hexlab/firmware/uefi_volume.hpp"
 #include "hexlab/firmware/uefi_capsule.hpp"
 #include "hexlab/image/image.hpp"
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <iomanip>
 #include <limits>
 #include <ostream>
@@ -255,6 +258,31 @@ int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &
             buffers.push_back(views.back().bytes);
         }
         if (input_count == 1) {
+            static constexpr std::array<std::uint8_t, 16> json_guid{
+                0xcd,0xf4,0xd6,0x67,0xb8,0xd6,0x73,0x45,0xbf,0x4a,0xde,0x5e,0x25,0x2d,0x61,0xae};
+            bool is_json = buffers.front().size() >= json_guid.size();
+            for (std::size_t i = 0; is_json && i < json_guid.size(); ++i)
+                is_json = std::to_integer<std::uint8_t>(buffers.front()[i]) == json_guid[i];
+            if (is_json) {
+                auto parsed = firmware::parse_uefi_json_capsule(buffers.front());
+                if (!parsed) { err << "UEFI capsule: " << parsed.error().message << '\n'; return 1; }
+                const auto &capsule = parsed.value();
+                out << "Format: UEFI JSON Capsule\n"
+                    << "Capsule: guid=" << firmware::uefi_guid_string(capsule.capsule_guid)
+                    << " header-size=" << hex_value(capsule.header_size)
+                    << " header-extension-offset=" << hex_value(capsule.header_extension_offset)
+                    << " header-extension-size=" << hex_value(capsule.header_extension_size)
+                    << " flags=" << hex_value(capsule.flags)
+                    << " image-size=" << hex_value(capsule.image_size) << '\n'
+                    << "JSON: version=" << capsule.json_header_version
+                    << " capsule-id=" << capsule.capsule_id
+                    << " payload-size=" << capsule.payload_size
+                    << " payload-offset=" << hex_value(capsule.payload_offset) << '\n';
+                if (capsule.trailing_size != 0)
+                    out << "Trailing bytes: " << capsule.trailing_size << '\n';
+                out << "JSON payload contents were not parsed or executed.\n";
+                return 0;
+            }
             auto parsed = firmware::parse_uefi_fmp_capsule(buffers.front());
             if (!parsed) { err << "UEFI capsule: " << parsed.error().message << '\n'; return 1; }
             const auto &capsule = parsed.value();

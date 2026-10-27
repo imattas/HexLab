@@ -3521,7 +3521,8 @@ a64_unhandled:
                 "x" + std::to_string(width / lane_bits) + "_predicate" + std::to_string(predicate->value) +
                 "_to_k" + std::to_string(destination->index) +
                 (instruction.x86_evex_broadcast ? "_broadcast" : "") +
-                (instruction.x86_opmask ? "_masked_zero" : "_unmasked") + "_mxcsr_control_status",
+                (instruction.x86_opmask ? "_masked_zero" : "_unmasked") +
+                (instruction.x86_evex_sae ? "_mxcsr_control_sae" : "_mxcsr_control_status"),
                 std::move(inputs), memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
             effect.register_writes = instruction.register_writes;
             effect.result_type = integer_type(64);

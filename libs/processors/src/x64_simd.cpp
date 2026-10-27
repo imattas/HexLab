@@ -689,8 +689,8 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
                              static_cast<std::uint16_t>(vector_bits));
         if (reg_high || decoded.reg.index >= 8)
             invalid("EVEX VCMP destination must encode K0-K7 without register extension");
-        if (broadcast && std::holds_alternative<RegisterOperand>(decoded.rm))
-            unsupported("EVEX VCMP embedded SAE is not modeled");
+        const bool embedded_sae = broadcast && std::holds_alternative<RegisterOperand>(decoded.rm);
+        const bool memory_broadcast = broadcast && std::holds_alternative<MemoryOperand>(decoded.rm);
         const auto vector_bank = vector_bits == 128 ? RegisterBank::xmm :
                                  vector_bits == 256 ? RegisterBank::ymm : RegisterBank::zmm;
         Operand rm = std::move(decoded.rm);
@@ -700,25 +700,29 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
             reg->high_byte = false;
             if (rm_high) reg->index = static_cast<std::uint8_t>(reg->index + 16);
         } else if (auto *memory = std::get_if<MemoryOperand>(&rm)) {
-            memory->data_width = static_cast<std::uint16_t>(broadcast ? element_bits : vector_bits);
+            memory->data_width = static_cast<std::uint16_t>(memory_broadcast ? element_bits : vector_bits);
             if (memory->displacement_encoding && memory->displacement_encoding->size == 1)
-                memory->displacement *= static_cast<std::int64_t>((broadcast ? element_bits : vector_bits) / 8);
+                memory->displacement *= static_cast<std::int64_t>((memory_broadcast ? element_bits : vector_bits) / 8);
         }
         const auto predicate = state.immediate(8, 8, false);
         if (predicate.value > 31)
             invalid("EVEX VCMP immediate has reserved upper predicate bits");
         state.i.opcode = packed_single ? Opcode::vcmpps : Opcode::vcmppd;
         state.i.x86_evex = true;
-        state.i.x86_evex_broadcast = broadcast;
+        state.i.x86_evex_broadcast = memory_broadcast;
+        state.i.x86_evex_sae = embedded_sae;
         state.i.vector_bits = static_cast<std::uint16_t>(vector_bits);
         state.i.vector_element_bits = element_bits;
         if (mask) {
             state.i.x86_opmask = static_cast<std::uint8_t>(mask);
             state.i.register_reads.push_back({RegisterBank::opmask, static_cast<std::uint8_t>(mask), 64, false});
         }
-        constexpr RegisterOperand mxcsr{RegisterBank::mxcsr, 0, 32, false};
-        state.i.register_reads.push_back(mxcsr);
-        state.i.register_writes.push_back(mxcsr);
+        {
+            constexpr RegisterOperand mxcsr{RegisterBank::mxcsr, 0, 32, false};
+            state.i.register_reads.push_back(mxcsr);
+            if (!embedded_sae)
+                state.i.register_writes.push_back(mxcsr);
+        }
         state.operand(RegisterOperand{RegisterBank::opmask, decoded.reg.index, 64, false}, OperandAccess::write);
         state.operand(RegisterOperand{vector_bank, static_cast<std::uint8_t>(vvvv),
                                       static_cast<std::uint16_t>(vector_bits), false}, OperandAccess::read);
