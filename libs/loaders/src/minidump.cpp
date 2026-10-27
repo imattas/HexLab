@@ -511,9 +511,11 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
             bool read_access = true, write_access = false, execute = !permission_known;
             if (permission_known) {
                 const auto access = protect & 0xff;
-                read_access = access == 0x02 || access == 0x04 || access == 0x08 || access == 0x20 || access == 0x40 || access == 0x80;
-                write_access = access == 0x04 || access == 0x08 || access == 0x40 || access == 0x80;
-                execute = access == 0x10 || access == 0x20 || access == 0x40 || access == 0x80;
+                const bool committed = state == 0x1000; // MEM_COMMIT
+                read_access = committed && (access == 0x02 || access == 0x04 || access == 0x08 ||
+                                             access == 0x20 || access == 0x40 || access == 0x80);
+                write_access = committed && (access == 0x04 || access == 0x08 || access == 0x40 || access == 0x80);
+                execute = committed && (access == 0x10 || access == 0x20 || access == 0x40 || access == 0x80);
                 if (access == 0x01 || (protect & 0x100)) read_access = write_access = execute = false;
             } else write_access = true;
             const auto index = minidump.memory.size();

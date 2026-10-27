@@ -67,11 +67,14 @@ also described as `CONTEXT_ARM64_OLD` by [minidump-common](https://docs.rs/minid
 When `MemoryInfoList` is present, captured regions are split at protection
 boundaries and retain read, write, and execute permissions. If protection data
 is absent, mapped bytes receive provisional read/write/execute permissions so
-code remains inspectable, and metadata is marked incomplete. The architecture
-map recognizes x86, AMD64, ARM, and ARM64. x86, AMD64 and ARM64 receive their
-corresponding decode modes; ARM remains mode-unknown because module records do
-not establish ARM versus Thumb state. A mapped exception address becomes the
-image entry.
+code remains inspectable, and metadata is marked incomplete. Known
+permissions are granted only for `MEM_COMMIT` ranges; reserved or free ranges
+remain mapped for captured-byte inspection but carry no read, write, or execute
+access. `PAGE_NOACCESS` and `PAGE_GUARD` also suppress all access bits. The
+architecture map recognizes x86, AMD64, ARM, and ARM64. x86, AMD64 and ARM64
+receive their corresponding decode modes; ARM remains mode-unknown because
+module records do not establish ARM versus Thumb state. A mapped exception
+address becomes the image entry.
 
 XSTATE/AVX/AVX-512, CET, ARM scalable state, ARM64EC alternate context layouts,
 WOW64 context-family substitution, architecture inference from bytes, and other
