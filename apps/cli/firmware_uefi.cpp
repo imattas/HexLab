@@ -23,6 +23,19 @@ std::string hex_value(std::uint64_t value) {
     out << "0x" << std::hex << std::uppercase << value;
     return out.str();
 }
+void write_embedded_volumes(std::ostream &out, const firmware::UefiCapsuleItem &item, std::string_view indent) {
+    for (std::size_t i = 0; i < item.embedded_volumes.size(); ++i) {
+        const auto &volume = item.embedded_volumes[i];
+        out << indent << "EmbeddedFV[" << i << "] file-offset=" << hex_value(volume.file_offset)
+            << " size=" << hex_value(volume.size)
+            << " fs-guid=" << firmware::uefi_guid_string(volume.file_system_guid)
+            << " revision=" << static_cast<unsigned>(volume.revision)
+            << " header-checksum=" << (volume.header_checksum_valid ? "valid" : "not-valid")
+            << " files=" << volume.file_count << " sections=" << volume.section_count << '\n';
+    }
+    if (!item.embedded_volume_scan_complete)
+        out << indent << "Embedded firmware-volume scan incomplete: " << item.embedded_volume_diagnostic << '\n';
+}
 const char *section_type_name(std::uint8_t value) {
     switch (value) {
     case 0x01: return "compression";
@@ -313,6 +326,7 @@ int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &
                     if (item.image_header_version >= 3) out << " image-capsule-support=" << hex_value(item.image_capsule_support);
                 }
                 out << '\n';
+                write_embedded_volumes(out, item, "    ");
             }
             if (capsule.trailing_size != 0)
                 out << "Trailing bytes: " << capsule.trailing_size << '\n';
@@ -348,6 +362,7 @@ int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &
                         if (item.image_header_version >= 3) out << " image-capsule-support=" << hex_value(item.image_capsule_support);
                     }
                     out << '\n';
+                    write_embedded_volumes(out, item, "    ");
                 }
                 if (capsule.trailing_size != 0)
                     out << "  Trailing bytes: " << capsule.trailing_size << '\n';

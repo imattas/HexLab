@@ -6,10 +6,21 @@
 #include <cstdint>
 #include <span>
 #include <stop_token>
+#include <string>
 #include <vector>
 
 namespace hexlab::firmware {
 enum class UefiCapsuleItemKind : std::uint8_t { embedded_driver, fmp_payload };
+struct UefiCapsuleEmbeddedVolume {
+    std::uint64_t file_offset = 0;
+    std::uint64_t size = 0;
+    std::array<std::uint8_t, 16> file_system_guid{};
+    std::uint8_t revision = 0;
+    std::size_t file_count = 0;
+    std::size_t section_count = 0;
+    std::uint64_t decompressed_bytes = 0;
+    bool header_checksum_valid = false;
+};
 struct UefiCapsuleItem {
     UefiCapsuleItemKind kind = UefiCapsuleItemKind::embedded_driver;
     std::uint64_t file_offset = 0;
@@ -24,6 +35,11 @@ struct UefiCapsuleItem {
     std::uint64_t vendor_code_offset = 0;
     std::uint64_t hardware_instance = 0;
     std::uint64_t image_capsule_support = 0;
+    // Bounded PI firmware volumes discovered inside the update image payload.
+    std::vector<UefiCapsuleEmbeddedVolume> embedded_volumes;
+    bool embedded_volume_scan_attempted = false;
+    bool embedded_volume_scan_complete = true;
+    std::string embedded_volume_diagnostic;
 };
 struct UefiCapsule {
     std::array<std::uint8_t, 16> capsule_guid{};
@@ -63,6 +79,11 @@ struct UefiCapsuleParseOptions {
     std::uint64_t max_input_bytes = 512ull * 1024 * 1024;
     std::size_t max_items = 4096;
     std::size_t max_capsules = 256;
+    std::size_t max_embedded_volumes = 64;
+    std::size_t max_embedded_files = 65536;
+    std::size_t max_embedded_sections = 65536;
+    std::size_t max_embedded_payload_scans = 64;
+    std::uint64_t max_embedded_decompressed_bytes = 128ull * 1024 * 1024;
 };
 // Parses one contiguous EFI FMP capsule beginning at file offset zero. Payloads
 // remain opaque; returned offsets are absolute offsets into the input file.
