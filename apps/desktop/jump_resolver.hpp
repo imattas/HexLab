@@ -78,10 +78,19 @@ inline std::vector<std::pair<wxString, Location>> image_symbol_locations(const I
         else if (symbol.ordinal)
             append("ordinal " + std::to_string(*symbol.ordinal), symbol.iat);
     }
-    if (metadata.elf)
+    if (metadata.elf) {
         for (const auto &symbol : metadata.elf->symbols)
             if (symbol.state == ElfSymbolState::defined && symbol.address)
                 append(symbol.name, *symbol.address);
+        // Keep DWARF-only subprogram names available even when the ELF symbol
+        // table is stripped. Imported subprograms retain exact code ranges;
+        // require that range provenance so declarations without code do not
+        // become jumps to a fabricated zero address.
+        if (metadata.elf->dwarf_info)
+            for (const auto &symbol : metadata.elf->dwarf_info->symbols)
+                if (symbol.kind == symbols::SymbolKind::function && !symbol.ranges.empty())
+                    append(symbol.name, Address{AddressSpaceId{}, symbol.ranges.front().begin});
+    }
     if (metadata.macho) {
         for (const auto &symbol : metadata.macho->symbols)
             if (symbol.state == MachOSymbolState::defined && symbol.address)

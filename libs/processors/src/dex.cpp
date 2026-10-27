@@ -243,6 +243,28 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         if (count) text += vr(start) + " .. " + vr(start + count - 1);
         dex_type_index = word(1);
         text += "}, type@" + std::to_string(*dex_type_index);
+    } else if (op == 0x26) {
+        words = 3;
+        if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX fill-array-data");
+        if (at.offset > UINT32_MAX)
+            return fail(DecodeStatus::invalid, "DEX array-data instruction exceeds the method address space");
+        const auto units = std::bit_cast<std::int32_t>(le32(word(1), word(2)));
+        const auto delta = static_cast<std::int64_t>(units) * 2;
+        std::uint64_t payload_offset = 0;
+        if (delta >= 0) {
+            const auto amount = static_cast<std::uint64_t>(delta);
+            if (at.offset > UINT32_MAX || amount > UINT32_MAX - at.offset)
+                return fail(DecodeStatus::invalid, "DEX array-data payload target exceeds the method address space");
+            payload_offset = at.offset + amount;
+        } else {
+            const auto amount = static_cast<std::uint64_t>(-(delta + 1)) + 1;
+            if (amount > at.offset)
+                return fail(DecodeStatus::invalid, "DEX array-data payload target precedes the method address space");
+            payload_offset = at.offset - amount;
+        }
+        if (payload_offset & 3)
+            return fail(DecodeStatus::invalid, "DEX array-data payload is not four-byte aligned");
+        text = "fill-array-data " + vr(hi) + ", payload " + std::to_string(payload_offset);
     } else if (op >= 0x44 && op <= 0x51) {
         words = 2; if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated DEX array access");
         static constexpr std::array<std::string_view, 14> names{
@@ -401,10 +423,10 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
     else
         std::copy_n(bytes.begin(), length, instruction.bytes.begin());
     instruction.opcode = dex_switch ? Opcode::dex_switch : Opcode::dex;
-    instruction.memory_read = op == 0x21 || op == 0x2b || op == 0x2c || (op >= 0x44 && op <= 0x4a) ||
+    instruction.memory_read = op == 0x21 || op == 0x26 || op == 0x2b || op == 0x2c || (op >= 0x44 && op <= 0x4a) ||
                               (op >= 0x52 && op <= 0x58) || (op >= 0x60 && op <= 0x66);
     instruction.memory_write = (op >= 0x4b && op <= 0x51) || (op >= 0x59 && op <= 0x5f) ||
-                               (op >= 0x67 && op <= 0x6d);
+                               (op >= 0x67 && op <= 0x6d) || op == 0x26;
     if (op == 0x22 || op == 0x23 || op == 0x24 || op == 0x25 ||
         (op >= 0x6e && op <= 0x78) || (op >= 0xfa && op <= 0xfd))
         instruction.memory_read = instruction.memory_write = true;
@@ -462,7 +484,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         // check-cast refines a reference's verifier type without defining a vreg.
         reg(hi, op == 0x1f ? read : write);
         imm(op == 0x1b ? le32(word(1), word(2)) : word(1), op == 0x1b ? 32 : 16, op == 0x1b ? 32 : 16);
-    } else if (op == 0x1d || op == 0x1e || op == 0x27 || op == 0x2b || op == 0x2c) reg(hi, read);
+    } else if (op == 0x1d || op == 0x1e || op == 0x26 || op == 0x27 || op == 0x2b || op == 0x2c) reg(hi, read);
     else if (op == 0x20 || op == 0x21 || op == 0x23) {
         reg(a, write); reg(b, read);
         if (op != 0x21) imm(word(1), 16, 16);
@@ -530,6 +552,11 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
     if (instruction.dex_switch) {
         instruction.operands.emplace_back(RelativeOperand{static_cast<std::int64_t>(instruction.dex_switch->payload.offset) -
             static_cast<std::int64_t>(at.offset), 32, 32, {}});
+        instruction.access.push_back(OperandAccess::read);
+    }
+    if (op == 0x26) {
+        const auto units = std::bit_cast<std::int32_t>(le32(word(1), word(2)));
+        instruction.operands.emplace_back(RelativeOperand{static_cast<std::int64_t>(units) * 2, 32, 32, {}});
         instruction.access.push_back(OperandAccess::read);
     }
     if ((op >= 0x28 && op <= 0x2a) || (op >= 0x32 && op <= 0x3d)) {

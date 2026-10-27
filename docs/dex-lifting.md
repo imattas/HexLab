@@ -27,7 +27,14 @@ divide-by-zero exception edges are not modeled. Floating constants are kept
 as exact bit patterns until a typed use provides floating context. It also
 lifts `iget`/`iput`, `sget`/`sput`, array loads/stores and `array-length`, the five
 invoke kinds and their `/range` forms, `move-result` variants, `new-instance`,
-and `new-array` as conservative memory-effect intrinsics. Object moves/returns,
+`new-array`, `filled-new-array`, and `filled-new-array/range` as conservative
+memory-effect intrinsics. Filled-array instructions retain their type index and
+all encoded source registers; the following `move-result-object` remains an
+unknown reference because allocation result flow is not yet linked across
+instructions. `fill-array-data` retains the checked method-relative payload
+target and array reference as an opaque memory write; the array-data payload
+contents, element width, and range effects are not yet imported into the lifter.
+Object moves/returns,
 string/class constants, casts, instance tests, monitor operations, throws, and
 `move-exception` are described in [Dalvik object-operation lifting](dex-object-lifting.md).
 Packed and sparse
