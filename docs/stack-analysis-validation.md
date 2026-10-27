@@ -75,6 +75,15 @@ register through the `ADDU`/`ADD`/`OR` move idioms. For MIPS64, it also tracks
 model. Other writes to `$sp` or the tracked `$fp` invalidate the affected
 relation and keep the result partial rather than guessing.
 
+For NMOS 6502, `PHA`/`PHP` decrement the page-one stack pointer after writing
+one byte; `PLA`/`PLP` increment it before reading. The analyzer records those
+implicit accesses as one-byte slots relative to the function-entry S value and
+coalesces balanced push/pull pairs. `TXS` invalidates the known depth, and `BRK`
+marks it unknown because its interrupt-frame writes are not represented as
+ordinary local slots. `JSR`/`RTS` and `RTI` remain atomic control transfers, so
+the inferred extent describes explicit in-function stack use and excludes the
+call/interrupt return frame.
+
 For RV32/RV64, constant `ADDI sp,sp,imm` adjustments, recognized
 `ANDI sp,sp,-A` alignments for A = 2, 4, 8 or 16, `ADDI` relations between
 `sp` and `s0/fp` (`x8`), and `ADD`/`ADDW` zero-register move idioms are tracked.

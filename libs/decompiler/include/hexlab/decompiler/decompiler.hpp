@@ -3,6 +3,7 @@
 #include "hexlab/analysis/functions.hpp"
 #include "hexlab/analysis/switches.hpp"
 #include "hexlab/decompiler/decompiler_export.hpp"
+#include "hexlab/image/dex_metadata.hpp"
 #include "hexlab/image/jvm_metadata.hpp"
 #include "hexlab/image/wasm_metadata.hpp"
 #include "hexlab/loaders/managed.hpp"
@@ -301,6 +302,9 @@ lift_function(const FunctionRecord &, const FunctionSnapshot &, const JvmMetadat
 HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction>
 lift_function(const FunctionRecord &, const FunctionSnapshot &, const JvmMetadata *jvm_metadata,
               const WasmMetadata *wasm_metadata);
+HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction>
+lift_function(const FunctionRecord &, const FunctionSnapshot &, const JvmMetadata *jvm_metadata,
+              const WasmMetadata *wasm_metadata, const DexMetadata *dex_metadata);
 // Optional host-only hook for validated opaque instruction semantics. The
 // callback is consulted only for Opcode::opaque; it cannot alter decoded CFG.
 // Decline preserves the existing opaque fallback. Errors abort the lift.
@@ -308,6 +312,11 @@ using OpaqueInstructionLifter = std::function<Result<std::optional<Intrinsic>>(c
 HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction>
 lift_function(const FunctionRecord &, const FunctionSnapshot &, const JvmMetadata *, const WasmMetadata *,
               const OpaqueInstructionLifter &);
+// DEX invoke results use validated method/prototype return shapes retained by
+// the loader. Other architectures ignore this optional metadata pointer.
+HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction>
+lift_function(const FunctionRecord &, const FunctionSnapshot &, const JvmMetadata *, const WasmMetadata *,
+              const DexMetadata *, const OpaqueInstructionLifter &);
 // Attaches recovered switch selectors and case indexes to matching lifted
 // dispatch blocks. A default is populated only when a complete analysis and
 // CFG identify exactly one additional successor beyond the table targets.

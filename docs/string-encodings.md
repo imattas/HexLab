@@ -62,9 +62,18 @@ into precomposed Vietnamese letters. The persisted encoding value is 14, and
 derived-cache version 29 causes older payloads to recompute. This remains a
 heuristic mapping, not locale classification.
 
+ISO-8859-2 (Latin-2) adds Central European single-byte candidates using the
+Unicode Consortium's [8859-2 mapping table](https://www.unicode.org/Public/MAPPINGS/ISO8859/8859-2.TXT).
+The scanner maps all bytes through a fixed table, lets the printable-scalar
+filter split control characters, and emits candidates only when they contain a
+non-ASCII scalar. Its persisted encoding value is 15, and derived-cache version
+30 causes older payloads to recompute. As with other legacy encodings, these
+are heuristic interpretations and can overlap.
+
 `hexlab_cli disassemble <path> --show-strings` lists candidate encoding names,
 file offsets, extents, and previews. The desktop Strings view uses the same
-Windows-1253, Windows-1255, Windows-1256, Windows-1257, and Windows-1258 labels.
+Windows-1253, Windows-1255, Windows-1256, Windows-1257, Windows-1258, and
+ISO-8859-2 labels.
 
 All encoding passes use the same file-backed scan domains, string-record budget,
 and cancellation checks. Returned previews are UTF-8, while each record retains

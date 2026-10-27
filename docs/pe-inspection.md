@@ -7,6 +7,11 @@ are printed with their module timestamp and source file offset; forwarder
 references are indented beneath the owning module and retain their own source
 offset and timestamp. Absent bound-import data produces no section.
 
+The Global Ptr directory entry (index 8) is retained as an RVA when present.
+Its `Size` field must be zero; the CLI reports its RVA and preferred-base VA.
+HexLab does not initialize an architecture's global-pointer register or
+interpret architecture-specific small-data addressing.
+
 When the COFF header supplies both a symbol-table file offset and a nonzero
 record count, the loader parses the bounded COFF symbol table and following
 string table. Primary symbols retain their name, raw value, section number,

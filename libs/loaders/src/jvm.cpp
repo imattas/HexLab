@@ -38,6 +38,40 @@ bool valid_field_descriptor(std::string_view descriptor){
     }else if(type!='B'&&type!='C'&&type!='D'&&type!='F'&&type!='I'&&type!='J'&&type!='S'&&type!='Z')return false;
     return position==descriptor.size();
 }
+Result<std::size_t> method_descriptor_parameter_count(std::string_view descriptor,bool include_this){
+    if(descriptor.empty()||descriptor.front()!='(')return malformed("invalid method descriptor for MethodParameters");
+    std::size_t position=1,count=0,slots=0;const std::size_t slot_limit=include_this?254:255;
+    const auto parse_type=[&](bool allow_void)->Result<unsigned>{
+        std::size_t dimensions=0;
+        while(position<descriptor.size()&&descriptor[position]=='['){++position;if(++dimensions>255)return malformed("method descriptor array dimension exceeds 255");}
+        if(position>=descriptor.size())return malformed("truncated method descriptor");
+        const auto tag=descriptor[position++];
+        if(tag=='V'&&allow_void&&dimensions==0)return 0u;
+        if(tag=='L'){
+            const auto begin=position;const auto end=descriptor.find(';',position);
+            if(end==std::string_view::npos||end==begin)return malformed("invalid object type in method descriptor");
+            const auto name=descriptor.substr(begin,end-begin);
+            if(name.find_first_of(".;[")!=std::string_view::npos||name.front()=='/'||name.back()=='/'||name.find("//")!=std::string_view::npos)
+                return malformed("invalid object name in method descriptor");
+            position=end+1;return 1u;
+        }
+        if(dimensions)return tag=='B'||tag=='C'||tag=='D'||tag=='F'||tag=='I'||tag=='J'||tag=='S'||tag=='Z' ? Result<unsigned>(1u) : Result<unsigned>(malformed("invalid array component in method descriptor"));
+        if(tag=='B'||tag=='C'||tag=='F'||tag=='I'||tag=='S'||tag=='Z')return 1u;
+        if(tag=='J'||tag=='D')return 2u;
+        return malformed("invalid parameter type in method descriptor");
+    };
+    while(position<descriptor.size()&&descriptor[position]!=')'){
+        auto width=parse_type(false);if(!width)return width.error();
+        if(++count>255||slots>slot_limit-width.value())return malformed("method descriptor exceeds 255 parameter slots");
+        slots+=width.value();
+    }
+    if(position>=descriptor.size()||descriptor[position++]!=')')return malformed("method descriptor has no parameter terminator");
+    if(position>=descriptor.size())return malformed("method descriptor has no return type");
+    if(descriptor[position]=='V')++position;
+    else {auto result=parse_type(false);if(!result)return result.error();}
+    if(position!=descriptor.size())return malformed("trailing bytes in method descriptor");
+    return count;
+}
 // Restrict every nested attribute parser to its declared enclosing extent.
 // Reader positions remain absolute class-file offsets.
 struct ReaderExtent {
@@ -347,6 +381,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             }else if(an.value()=="ConstantValue"){
                 if(!member||method||class_level||code_owner)
                     return malformed("ConstantValue attribute appears outside a field attribute list");
+                if((member->access_flags&0x0008u)==0)
+                    return malformed("ConstantValue attribute appears on a non-static field");
                 if(!fields_with_constant_value.insert(member).second)
                     return malformed("duplicate ConstantValue attribute on a field");
                 std::uint16_t index=0;
@@ -377,6 +413,27 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 if(duplicate)return malformed("duplicate annotation attribute");
                 auto &target=class_level?(an.value()=="RuntimeVisibleAnnotations"?md.visible_annotations:md.invisible_annotations):(an.value()=="RuntimeVisibleAnnotations"?member->visible_annotations:member->invisible_annotations);
                 auto parsed=read_annotations(target);if(!parsed)return parsed.error();
+            }else if(an.value()=="MethodParameters"){
+                if(major<52)return malformed("MethodParameters attribute requires class-file version 52 or newer");
+                if(class_level||!member||!method||code_owner)return malformed("MethodParameters appears outside a method declaration");
+                if(member->method_parameters)return malformed("duplicate MethodParameters attribute");
+                std::uint8_t count=0;if(len<1||!r.u1(count)||std::uint64_t(count)*4+1!=len)
+                    return malformed("MethodParameters length does not match its entries");
+                auto descriptor_count=method_descriptor_parameter_count(member->descriptor,(member->access_flags&0x0008u)==0);
+                if(!descriptor_count)return descriptor_count.error();
+                if(descriptor_count.value()!=count)return malformed("MethodParameters count does not match the method descriptor");
+                std::vector<JvmMethodParameter> parameters;parameters.reserve(count);
+                for(unsigned i=0;i<count;++i){
+                    JvmMethodParameter parameter;
+                    if(!r.u2(parameter.name_index)||!r.u2(parameter.access_flags))return malformed("truncated MethodParameters entry");
+                    if(parameter.name_index){auto name=utf8(parameter.name_index);if(!name)return name.error();
+                        if(name.value().empty()||name.value().find_first_of(".;[/")!=std::string::npos)
+                            return malformed("MethodParameters name is not a valid unqualified name");
+                        parameter.name=std::move(name.value());}
+                    if(parameter.access_flags&~std::uint16_t{0x9010})return malformed("MethodParameters entry has reserved access flags");
+                    parameters.push_back(std::move(parameter));
+                }
+                member->method_parameters=std::move(parameters);
             }else if(an.value()=="RuntimeVisibleTypeAnnotations"||an.value()=="RuntimeInvisibleTypeAnnotations"){
                 if(major<52)return malformed("type-annotation attribute requires class-file version 52 or newer");
                 const bool visible=an.value()=="RuntimeVisibleTypeAnnotations";

@@ -30,6 +30,13 @@ relationships remain explicit rather than inferred from arbitrary scans or host
 libraries. Full DWARF/types, runtime dynamic linking, core dumps, more machine
 psABIs and Linux/macOS delivery remain future work.
 
+Dynamic string metadata retains bounded `DT_NEEDED`, `DT_SONAME`, `DT_RPATH`,
+`DT_RUNPATH`, `DT_CONFIG`, `DT_DEPAUDIT`, `DT_AUDIT`, `DT_AUXILIARY`, and
+`DT_FILTER` values from the validated dynamic string table. Repeated dependency,
+filter, and audit entries preserve their original order. The CLI labels these
+rows, but does not search paths, load filtees, read configuration files, or run
+audit callbacks; see [ELF dynamic string tags](elf-dynamic-string-tags.md).
+
 The CLI accepts `--format auto|pe|elf|raw`. `inspect`, `disassemble` and persistent
 `project create` share the loader/recipe services. Native Symbols and ELF metadata
 tabs use immutable worker results; symbol record and dynamic-row indexes avoid

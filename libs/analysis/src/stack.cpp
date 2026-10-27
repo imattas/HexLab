@@ -245,6 +245,26 @@ bool record_stack_slot(StackFrameAnalysis &result, std::int64_t offset, std::uin
 bool transfer(const Instruction &instruction, FlowState &state) {
     const auto first = register_at(instruction, 0);
     const auto second = register_at(instruction, 1);
+    if (instruction.context.architecture == Architecture::mos6502) {
+        switch (instruction.opcode) {
+        case Opcode::m6502_rts:
+        case Opcode::m6502_rti:
+        case Opcode::m6502_tsx:
+            return true;
+        case Opcode::m6502_txs:
+            state.stack_depth = {};
+            state.supported = false;
+            return true;
+        case Opcode::m6502_pha:
+        case Opcode::m6502_php:
+            return add(state.stack_depth, 1);
+        case Opcode::m6502_pla:
+        case Opcode::m6502_plp:
+            return add(state.stack_depth, -1);
+        default:
+            break;
+        }
+    }
     if ((instruction.context.architecture == Architecture::x86 ||
          instruction.context.architecture == Architecture::x86_64) &&
         instruction.flow == FlowKind::ret)
@@ -845,6 +865,7 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
             const auto &instruction = fact->instruction;
             const bool stack_architecture = instruction.context.architecture == Architecture::x86 ||
                 instruction.context.architecture == Architecture::x86_64 ||
+                instruction.context.architecture == Architecture::mos6502 ||
                 instruction.context.architecture == Architecture::arm64 ||
                 instruction.context.architecture == Architecture::arm ||
                 instruction.context.architecture == Architecture::mips32 ||
@@ -1067,6 +1088,31 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                     }
                 }
             }
+            // NMOS 6502 pushes write at the current page-one stack address and
+            // then decrement S; pulls increment S before reading. Map both
+            // sides to the same entry-SP-relative cell for balanced pairs.
+            if (instruction.context.architecture == Architecture::mos6502 &&
+                (instruction.opcode == Opcode::m6502_pha || instruction.opcode == Opcode::m6502_php ||
+                 instruction.opcode == Opcode::m6502_pla || instruction.opcode == Opcode::m6502_plp)) {
+                if (!state.stack_depth.known) {
+                    result.complete = false;
+                } else {
+                    const bool push = instruction.opcode == Opcode::m6502_pha ||
+                                      instruction.opcode == Opcode::m6502_php;
+                    std::int64_t cell_depth = state.stack_depth.value;
+                    if (!push && !add_checked(cell_depth, -1, cell_depth)) {
+                        result.complete = false;
+                    } else {
+                        std::int64_t offset = 0;
+                        if (!subtract_checked(0, cell_depth, offset)) {
+                            result.complete = false;
+                        } else if (!record_stack_slot(result, offset, 8, !push, push, false,
+                                                      instruction.address, access_detail_count)) {
+                            return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
+                        }
+                    }
+                }
+            }
             for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
                 if (arm64_pair && i == 2)
                     continue; // Both cells were recorded above.
@@ -1276,7 +1322,11 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                     }
                 }
             }
-            if (!transfer(instruction, state)) {
+            if (instruction.context.architecture == Architecture::mos6502 &&
+                instruction.opcode == Opcode::m6502_brk) {
+                state.stack_depth = {};
+                state.supported = false;
+            } else if (!transfer(instruction, state)) {
                 state.stack_depth = {};
                 state.supported = false;
             }

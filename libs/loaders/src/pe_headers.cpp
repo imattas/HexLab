@@ -234,7 +234,18 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
             if (directory.location==0 && directory.size==0) continue;
             Result<std::size_t> parsed=Error{ErrorCode::unsupported,"Directory contents are not yet interpreted"};
             const auto directory_end=std::uint64_t{directory.location}+directory.size;
-            if (directory.location==0 || directory.size==0)
+            // Unlike other data-directory entries, GlobalPtr stores an RVA
+            // directly and its Size field is required to be zero.
+            if (directory.index==8) {
+                if (directory.size!=0 || directory.location==0)
+                    parsed=Error{ErrorCode::malformed,"PE global-pointer directory must contain a nonzero RVA and zero size"};
+                else if (directory.location>=loaded.metadata.image_size)
+                    parsed=Error{ErrorCode::malformed,"PE global-pointer RVA exceeds image"};
+                else {
+                    loaded.metadata.pe->global_pointer_rva=directory.location;
+                    parsed=std::size_t{0};
+                }
+            } else if (directory.location==0 || directory.size==0)
                 parsed=Error{ErrorCode::malformed,"Directory has an empty location or size"};
             else if (directory.file_offset) {
                 const auto view=loaded.image->storage()->read_at({directory.location},directory.size);

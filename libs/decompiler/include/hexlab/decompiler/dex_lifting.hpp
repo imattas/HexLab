@@ -8,6 +8,6 @@ namespace hexlab::decompiler {
 // memory references retain conservative effects; unsupported opcodes return
 // ErrorCode::unsupported.
 HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction> lift_dex_function(
-    const FunctionRecord &, const FunctionSnapshot &);
+    const FunctionRecord &, const FunctionSnapshot &, const DexMetadata *metadata = nullptr);
 
 } // namespace hexlab::decompiler

@@ -17,7 +17,8 @@ bounded to 512 MiB of archive bytes and 100,000 entries. Names are limited to
 content is capped at 4 GiB. Class extraction verifies the output length and
 CRC before parsing.
 
-The class-file parser validates `ConstantValue` attribute placement, uniqueness,
+The class-file parser validates that `ConstantValue` appears only on static
+fields, as well as attribute placement, uniqueness,
 exact length, constant-pool kind, and compatibility with the field descriptor.
 Field metadata retains the constant-pool tag and raw numeric bits; string
 constants retain their resolved modified-UTF-8 text. The CLI reports these

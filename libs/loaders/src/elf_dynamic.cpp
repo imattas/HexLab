@@ -10,13 +10,21 @@ struct Source {
     std::uint64_t size = 0, stride = 0;
     const ElfSection *strings = nullptr;
 };
-bool string_tag(std::int64_t tag) { return tag == 1 || tag == 14 || tag == 15 || tag == 29; }
+bool string_tag(std::int64_t tag) {
+    return tag == 1 || tag == 14 || tag == 15 || tag == 29 || tag == 0x6ffffefa || tag == 0x6ffffefb ||
+           tag == 0x6ffffefc || tag == 0x7ffffffd || tag == 0x7fffffff;
+}
+bool repeatable_string_tag(std::int64_t tag) {
+    // DT_NEEDED and the GNU/Solaris filter/audit lists may have multiple rows.
+    return tag == 1 || tag == 0x6ffffefb || tag == 0x6ffffefc || tag == 0x7ffffffd || tag == 0x7fffffff;
+}
 bool understood(std::int64_t tag) {
     return tag == 0 || tag == 2 || tag == 4 || tag == 5 || tag == 6 || tag == 7 || tag == 8 || tag == 9 || tag == 10 ||
            tag == 11 || tag == 17 || tag == 18 || tag == 19 || tag == 20 || tag == 23 || tag == 34 || tag == 35 ||
            tag == 36 || tag == 37 || tag == 39 ||
            tag == 0x6000000f || tag == 0x60000010 || tag == 0x60000011 || tag == 0x60000012 ||
-           tag == 0x6ffffef5 || tag == 0x6ffffff0 || tag == 0x6ffffffc || tag == 0x6ffffffd ||
+           tag == 0x6ffffef5 || tag == 0x6ffffefa || tag == 0x6ffffefb || tag == 0x6ffffefc ||
+           tag == 0x6ffffff0 || tag == 0x6ffffffc || tag == 0x6ffffffd ||
            tag == 0x6ffffffe || tag == 0x6fffffff || string_tag(tag);
 }
 std::string text(ByteView view, std::uint64_t index, Budget &budget) {
@@ -106,7 +114,7 @@ void read_dynamic(const ByteStorage &storage, const Image &image, ElfMetadata &m
                 raw |= UINT64_C(0xffffffff00000000);
             ElfDynamicEntry entry{index, std::bit_cast<std::int64_t>(raw), reader.value(bytes.bytes, word, word), {}};
             budget.include(sizeof(ElfDynamicEntry));
-            if (entry.tag != 0 && entry.tag != 1 && understood(entry.tag))
+            if (entry.tag != 0 && !repeatable_string_tag(entry.tag) && understood(entry.tag))
                 require(values.emplace(entry.tag, entry.value).second, "Duplicate singleton ELF dynamic tag");
             if (!understood(entry.tag))
                 metadata.dynamic_complete = false;

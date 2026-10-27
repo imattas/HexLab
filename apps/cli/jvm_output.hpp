@@ -74,6 +74,15 @@ inline void jvm_description(std::ostream &out, const ImageMetadata &metadata) {
         };
         parameter_annotations(method.visible_parameter_annotations,"visible");
         parameter_annotations(method.invisible_parameter_annotations,"invisible");
+        if(method.method_parameters){
+            for(std::size_t i=0;i<method.method_parameters->size();++i){
+                const auto &parameter=(*method.method_parameters)[i];
+                const auto flags=out.flags();
+                out<<"    parameter["<<i<<"] "<<(parameter.name?jvm_safe(*parameter.name):"<unnamed>")
+                   <<" flags=0x"<<std::hex<<parameter.access_flags<<std::dec<<'\n';
+                out.flags(flags);
+            }
+        }
         if(method.annotation_default)out<<"    annotation default: "<<*method.annotation_default<<'\n';
     }
     for(const auto &field:j.fields){

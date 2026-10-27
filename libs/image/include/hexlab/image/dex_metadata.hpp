@@ -102,6 +102,9 @@ struct DexCallSite {
     std::vector<DexEncodedValue> values;
     bool operator==(const DexCallSite &) const = default;
 };
+// Compact return-value shape retained from each DEX proto_id. It is enough to
+// type invoke results without duplicating potentially large type descriptors.
+enum class DexReturnKind : std::uint8_t { unknown, void_value, integer32, float32, integer64, float64, reference };
 struct DexAnnotationItem {
     std::uint8_t visibility = 0; // DEX build, runtime, or system visibility.
     std::uint32_t type_index = 0;
@@ -130,6 +133,9 @@ struct DexHiddenApiFlag {
 };
 struct DexMetadata {
     std::vector<DexMapItem> map_items;
+    // proto_id and method_id order is the DEX table index order.
+    std::vector<DexReturnKind> prototype_return_kinds;
+    std::vector<std::uint32_t> method_prototype_indices;
     std::vector<DexClassDefinition> classes;
     std::vector<DexMethodDebug> methods;
     std::vector<DexMethodCode> code;

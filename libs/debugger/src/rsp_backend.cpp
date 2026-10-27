@@ -36,6 +36,10 @@ struct TargetDescription {
 };
 struct RemoteThreadDescription { std::string id, name; ThreadState state = ThreadState::unknown; };
 struct RemoteProcessDescription { std::uint64_t id = 0; std::string command; };
+struct RemoteOsDataDescription {
+    std::string type;
+    std::vector<std::map<std::string, std::string, std::less<>>> rows;
+};
 Architecture target_architecture(std::string_view name) {
     std::string normalized(name);
     std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
@@ -161,11 +165,10 @@ Result<std::string> decode_xml_text(std::string_view value) {
     }
     return decoded;
 }
-Result<std::vector<RemoteProcessDescription>> parse_processes_xml(std::string_view xml) {
+Result<RemoteOsDataDescription> parse_osdata_xml(std::string_view xml, std::string_view expected_type) {
     if (xml.empty() || xml.size() > 1024 * 1024)
-        return Error{ErrorCode::resource_limit, "RSP process XML is empty or exceeds 1 MiB"};
-    std::vector<RemoteProcessDescription> processes;
-    std::set<std::uint64_t> seen;
+        return Error{ErrorCode::resource_limit, "RSP OS-data XML is empty or exceeds 1 MiB"};
+    RemoteOsDataDescription data{std::string(expected_type), {}};
     std::vector<std::string> stack;
     std::map<std::string, std::string, std::less<>> fields;
     std::string column_name, column_text;
@@ -178,22 +181,22 @@ Result<std::vector<RemoteProcessDescription>> parse_processes_xml(std::string_vi
             if (body.empty()) break;
             std::size_t key_size = 0;
             while (key_size < body.size() && xml_name_char(body[key_size])) ++key_size;
-            if (!key_size) return Error{ErrorCode::malformed, "invalid RSP process XML attribute"};
+            if (!key_size) return Error{ErrorCode::malformed, "invalid RSP OS-data XML attribute"};
             std::string key(body.substr(0, key_size)); body.remove_prefix(key_size);
             while (!body.empty() && std::isspace(static_cast<unsigned char>(body.front()))) body.remove_prefix(1);
-            if (body.empty() || body.front() != '=') return Error{ErrorCode::malformed, "invalid RSP process XML attribute"};
+            if (body.empty() || body.front() != '=') return Error{ErrorCode::malformed, "invalid RSP OS-data XML attribute"};
             body.remove_prefix(1);
             while (!body.empty() && std::isspace(static_cast<unsigned char>(body.front()))) body.remove_prefix(1);
             if (body.empty() || (body.front() != '\'' && body.front() != '"'))
-                return Error{ErrorCode::malformed, "invalid RSP process XML attribute value"};
+                return Error{ErrorCode::malformed, "invalid RSP OS-data XML attribute value"};
             const char quote = body.front(); body.remove_prefix(1);
             const auto value_end = body.find(quote);
             if (value_end == std::string_view::npos)
-                return Error{ErrorCode::malformed, "unterminated RSP process XML attribute"};
+                return Error{ErrorCode::malformed, "unterminated RSP OS-data XML attribute"};
             auto value = decode_xml_text(body.substr(0, value_end));
             if (!value) return value.error();
             if (!attributes.emplace(std::move(key), std::move(value.value())).second)
-                return Error{ErrorCode::malformed, "duplicate RSP process XML attribute"};
+                return Error{ErrorCode::malformed, "duplicate RSP OS-data XML attribute"};
             body.remove_prefix(value_end + 1);
         }
         return std::monostate{};
@@ -206,25 +209,25 @@ Result<std::vector<RemoteProcessDescription>> parse_processes_xml(std::string_vi
             auto decoded = decode_xml_text(text);
             if (!decoded) return decoded.error();
             if (decoded.value().size() > 4096 - std::min<std::size_t>(column_text.size(), 4096))
-                return Error{ErrorCode::resource_limit, "RSP process column exceeds 4096 bytes"};
+                return Error{ErrorCode::resource_limit, "RSP OS-data column exceeds 4096 bytes"};
             column_text += decoded.value();
         } else if (text.find_first_not_of(" \t\r\n") != std::string_view::npos) {
-            return Error{ErrorCode::malformed, "unexpected text in RSP process XML"};
+            return Error{ErrorCode::malformed, "unexpected text in RSP OS-data XML"};
         }
         if (open == std::string_view::npos) { position = xml.size(); break; }
         position = open;
         if (xml.substr(position).starts_with("<!--")) {
             const auto end = xml.find("-->", position + 4);
-            if (end == std::string_view::npos) return Error{ErrorCode::malformed, "unterminated RSP process XML comment"};
+            if (end == std::string_view::npos) return Error{ErrorCode::malformed, "unterminated RSP OS-data XML comment"};
             position = end + 3; continue;
         }
         if (xml.substr(position).starts_with("<?")) {
             const auto end = xml.find("?>", position + 2);
-            if (end == std::string_view::npos) return Error{ErrorCode::malformed, "unterminated RSP process XML declaration"};
+            if (end == std::string_view::npos) return Error{ErrorCode::malformed, "unterminated RSP OS-data XML declaration"};
             position = end + 2; continue;
         }
         const auto close = xml.find('>', position + 1);
-        if (close == std::string_view::npos) return Error{ErrorCode::malformed, "unterminated RSP process XML tag"};
+        if (close == std::string_view::npos) return Error{ErrorCode::malformed, "unterminated RSP OS-data XML tag"};
         auto body = xml.substr(position + 1, close - position - 1);
         position = close + 1;
         if (body.starts_with("!DOCTYPE")) {
@@ -235,23 +238,23 @@ Result<std::vector<RemoteProcessDescription>> parse_processes_xml(std::string_vi
                                    declaration != "target SYSTEM 'osdata.dtd'" &&
                                    declaration != "osdata SYSTEM \"osdata.dtd\"" &&
                                    declaration != "osdata SYSTEM 'osdata.dtd'"))
-                return Error{ErrorCode::unsupported, "unsupported RSP process XML document type"};
+                return Error{ErrorCode::unsupported, "unsupported RSP OS-data XML document type"};
             continue;
         }
         if (body.empty() || body.front() == '!')
-            return Error{ErrorCode::unsupported, "unsupported RSP process XML declaration"};
+            return Error{ErrorCode::unsupported, "unsupported RSP OS-data XML declaration"};
         const bool closing = body.front() == '/';
         if (closing) body.remove_prefix(1);
         while (!body.empty() && std::isspace(static_cast<unsigned char>(body.front()))) body.remove_prefix(1);
         std::size_t name_size = 0;
         while (name_size < body.size() && xml_name_char(body[name_size])) ++name_size;
-        if (!name_size) return Error{ErrorCode::malformed, "invalid RSP process XML tag name"};
+        if (!name_size) return Error{ErrorCode::malformed, "invalid RSP OS-data XML tag name"};
         const std::string tag(body.substr(0, name_size));
         body.remove_prefix(name_size);
         if (closing) {
             while (!body.empty() && std::isspace(static_cast<unsigned char>(body.back()))) body.remove_suffix(1);
             if (!body.empty() || stack.empty() || stack.back() != tag)
-                return Error{ErrorCode::malformed, "mismatched RSP process XML closing tag"};
+                return Error{ErrorCode::malformed, "mismatched RSP OS-data XML closing tag"};
             stack.pop_back();
             if (tag == "column") {
                 column_open = false;
@@ -259,20 +262,12 @@ Result<std::vector<RemoteProcessDescription>> parse_processes_xml(std::string_vi
                 while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
                 while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
                 if (!fields.emplace(column_name, std::move(value)).second)
-                    return Error{ErrorCode::malformed, "duplicate RSP process column"};
+                    return Error{ErrorCode::malformed, "duplicate RSP OS-data column"};
             } else if (tag == "item") {
                 item_open = false;
-                const auto pid = fields.find("pid");
-                if (pid == fields.end() || pid->second.empty())
-                    return Error{ErrorCode::malformed, "RSP process item has no PID column"};
-                std::uint64_t id = 0;
-                const auto [end, error] = std::from_chars(pid->second.data(), pid->second.data() + pid->second.size(), id, 10);
-                if (error != std::errc{} || end != pid->second.data() + pid->second.size() || id == 0)
-                    return Error{ErrorCode::malformed, "invalid RSP process PID"};
-                if (!seen.insert(id).second) return Error{ErrorCode::malformed, "duplicate RSP process PID"};
-                if (processes.size() >= max_inspection_processes)
-                    return Error{ErrorCode::resource_limit, "RSP process count exceeds limit"};
-                processes.push_back({id, fields.contains("command") ? fields.at("command") : std::string{}});
+                if (data.rows.size() >= max_inspection_processes)
+                    return Error{ErrorCode::resource_limit, "RSP OS-data row count exceeds limit"};
+                data.rows.push_back(std::move(fields));
                 fields.clear();
             } else if (tag == "osdata") root_closed = true;
             continue;
@@ -286,38 +281,59 @@ Result<std::vector<RemoteProcessDescription>> parse_processes_xml(std::string_vi
         if (!parsed) return parsed.error();
         if (tag == "osdata") {
             const auto type = attributes.find("type");
-            if (root_seen || !stack.empty() || type == attributes.end() || type->second != "processes")
-                return Error{ErrorCode::malformed, "invalid RSP process XML root"};
+            if (root_seen || !stack.empty() || type == attributes.end() || type->second != expected_type)
+                return Error{ErrorCode::malformed, "invalid RSP OS-data XML root"};
             root_seen = true;
         } else if (tag == "item") {
             if (!root_seen || root_closed || stack.size() != 1 || stack.back() != "osdata" ||
-                item_open || processes.size() >= max_inspection_processes)
-                return Error{ErrorCode::malformed, "RSP process item is outside its root"};
+                item_open || data.rows.size() >= max_inspection_processes)
+                return Error{ErrorCode::malformed, "RSP OS-data item is outside its root"};
             item_open = true; fields.clear();
         } else if (tag == "column") {
             if (!item_open || column_open || stack.size() != 2 || stack.back() != "item")
-                return Error{ErrorCode::malformed, "RSP process column is outside an item"};
+                return Error{ErrorCode::malformed, "RSP OS-data column is outside an item"};
             if (fields.size() >= 64)
-                return Error{ErrorCode::resource_limit, "RSP process item has too many columns"};
+                return Error{ErrorCode::resource_limit, "RSP OS-data item has too many columns"};
             const auto name = attributes.find("name");
             if (name == attributes.end() || name->second.empty())
-                return Error{ErrorCode::malformed, "RSP process column has no name"};
+                return Error{ErrorCode::malformed, "RSP OS-data column has no name"};
             column_name = name->second; column_text.clear(); column_open = true;
-        } else return Error{ErrorCode::unsupported, "unsupported RSP process XML element"};
+        } else return Error{ErrorCode::unsupported, "unsupported RSP OS-data XML element"};
         if (!self_closing) stack.push_back(tag);
         else if (tag == "osdata") root_closed = true;
         else if (tag == "item") {
             // A self-closing item cannot provide the mandatory PID column.
-            return Error{ErrorCode::malformed, "empty RSP process item has no PID column"};
+            return Error{ErrorCode::malformed, "empty RSP OS-data item has no columns"};
         } else if (tag == "column") {
             column_open = false;
             if (!fields.emplace(column_name, std::string{}).second)
-                return Error{ErrorCode::malformed, "duplicate RSP process column"};
+                return Error{ErrorCode::malformed, "duplicate RSP OS-data column"};
         }
     }
     if (!root_seen || !root_closed || !stack.empty() || item_open || column_open)
-        return Error{ErrorCode::malformed, "incomplete RSP process XML document"};
-    if (processes.empty()) return Error{ErrorCode::malformed, "RSP process XML contains no process items"};
+        return Error{ErrorCode::malformed, "incomplete RSP OS-data XML document"};
+    return data;
+}
+Result<std::vector<RemoteProcessDescription>> parse_processes_xml(std::string_view xml) {
+    auto parsed = parse_osdata_xml(xml, "processes");
+    if (!parsed) return parsed.error();
+    if (parsed.value().rows.empty())
+        return Error{ErrorCode::malformed, "RSP process XML contains no process items"};
+    std::vector<RemoteProcessDescription> processes;
+    std::set<std::uint64_t> seen;
+    processes.reserve(parsed.value().rows.size());
+    for (const auto &row : parsed.value().rows) {
+        const auto pid = row.find("pid");
+        if (pid == row.end() || pid->second.empty())
+            return Error{ErrorCode::malformed, "RSP process item has no PID column"};
+        std::uint64_t id = 0;
+        const auto [end, error] = std::from_chars(pid->second.data(), pid->second.data() + pid->second.size(), id, 10);
+        if (error != std::errc{} || end != pid->second.data() + pid->second.size() || id == 0)
+            return Error{ErrorCode::malformed, "invalid RSP process PID"};
+        if (!seen.insert(id).second) return Error{ErrorCode::malformed, "duplicate RSP process PID"};
+        const auto command = row.find("command");
+        processes.push_back({id, command == row.end() ? std::string{} : command->second});
+    }
     return processes;
 }
 Result<std::vector<RemoteThreadDescription>> parse_threads_xml(std::string_view xml) {
@@ -1103,6 +1119,7 @@ public:
         threads_xml_advertised_ = false;
         osdata_advertised_ = false;
         auxv_advertised_ = false;
+        siginfo_advertised_ = false;
         exec_file_advertised_ = false;
         const auto xml_feature = features.value().features.find("qXfer:features:read");
         if (xml_feature != features.value().features.end() && xml_feature->second != "-") {
@@ -1125,6 +1142,8 @@ public:
         osdata_advertised_ = osdata != features.value().features.end() && osdata->second != "-";
         const auto auxv = features.value().features.find("qXfer:auxv:read");
         auxv_advertised_ = auxv != features.value().features.end() && auxv->second != "-";
+        const auto siginfo = features.value().features.find("qXfer:siginfo:read");
+        siginfo_advertised_ = siginfo != features.value().features.end() && siginfo->second != "-";
         const auto exec_file = features.value().features.find("qXfer:exec-file:read");
         exec_file_advertised_ = exec_file != features.value().features.end() && exec_file->second != "-";
         auto initial = client_->read_stop_reply_optional();
@@ -1347,7 +1366,7 @@ public:
             client_.reset(); transport_.reset(); pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
             expected_step_threads_.clear(); legacy_expected_step_ = false; terminated_ = true; remote_process_id_.reset();
             breakpoints_.clear(); target_.reset(); target_xml_advertised_ = false; libraries_advertised_ = false;
-            memory_map_advertised_ = false; threads_xml_advertised_ = false; auxv_advertised_ = false;
+            memory_map_advertised_ = false; threads_xml_advertised_ = false; auxv_advertised_ = false; siginfo_advertised_ = false;
             exec_file_advertised_ = false; multiprocess_supported_ = false;
             extended_mode_supported_ = false;
             non_stop_mode_ = false;
@@ -1383,7 +1402,7 @@ public:
         remote_thread_tokens_.clear(); thread_token_ids_.clear(); thread_run_states_.clear(); next_thread_token_ = 1;
         inferiors_.clear();
         breakpoints_.clear(); target_.reset(); target_xml_advertised_ = false; libraries_advertised_ = false;
-        memory_map_advertised_ = false; threads_xml_advertised_ = false; auxv_advertised_ = false;
+        memory_map_advertised_ = false; threads_xml_advertised_ = false; auxv_advertised_ = false; siginfo_advertised_ = false;
         exec_file_advertised_ = false; multiprocess_supported_ = false;
         extended_mode_supported_ = false;
         non_stop_mode_ = false;
@@ -1793,6 +1812,25 @@ public:
         }
         return result;
     }
+    Result<OsDataTable> os_data(std::string_view type) override {
+        if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
+        if (!osdata_advertised_) return unsupported("remote did not advertise qXfer:osdata:read");
+        auto xml = client_->read_osdata_annex(type);
+        if (!xml) return xml.error();
+        if (!xml.value()) return unsupported("remote advertised qXfer:osdata:read but returned no OS-data annex");
+        auto parsed = parse_osdata_xml(*xml.value(), type);
+        if (!parsed) return parsed.error();
+        OsDataTable table;
+        table.type = std::move(parsed.value().type);
+        table.rows.reserve(parsed.value().rows.size());
+        for (const auto &row : parsed.value().rows) {
+            OsDataRow output;
+            output.columns.reserve(row.size());
+            for (const auto &[name, value] : row) output.columns.emplace_back(name, value);
+            table.rows.push_back(std::move(output));
+        }
+        return table;
+    }
     Result<std::vector<MemoryRegion>> memory_regions() override {
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
         if (!memory_map_advertised_) return unsupported("remote did not advertise qXfer:memory-map:read");
@@ -1832,6 +1870,14 @@ public:
             }
         }
         return Error{ErrorCode::malformed, "remote auxiliary vector is missing AT_NULL terminator"};
+    }
+    Result<std::vector<std::byte>> signal_info() override {
+        if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
+        if (!siginfo_advertised_) return unsupported("remote did not advertise qXfer:siginfo:read");
+        auto raw = client_->read_siginfo_annex();
+        if (!raw) return raw.error();
+        if (!raw.value()) return unsupported("remote advertised qXfer:siginfo:read but returned no signal information");
+        return std::move(*raw.value());
     }
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread) override {
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
@@ -2040,6 +2086,7 @@ private:
     bool threads_xml_advertised_ = false;
     bool osdata_advertised_ = false;
     bool auxv_advertised_ = false;
+    bool siginfo_advertised_ = false;
     bool exec_file_advertised_ = false;
     bool multiprocess_supported_ = false;
     bool extended_mode_supported_ = false;
@@ -2069,6 +2116,7 @@ public:
     Result<std::vector<ProcessInfo>> processes() override {
         return remote_ ? remote_->processes() : native_->processes();
     }
+    Result<OsDataTable> os_data(std::string_view type) override { return active().os_data(type); }
     Result<ProcessInfo> launch(const Target& target) override { return active().launch(target); }
     Result<ProcessInfo> launch_remote(const Target& target) override {
         return remote_ ? remote_->launch_remote(target)
@@ -2119,6 +2167,7 @@ public:
     Result<std::vector<ModuleInfo>> modules() override { return active().modules(); }
     Result<std::vector<MemoryRegion>> memory_regions() override { return active().memory_regions(); }
     Result<std::vector<AuxiliaryVectorEntry>> auxiliary_vector() override { return active().auxiliary_vector(); }
+    Result<std::vector<std::byte>> signal_info() override { return active().signal_info(); }
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread) override { return active().read_registers(thread); }
     Status write_registers(ThreadId thread, std::span<const RegisterValue> registers) override { return active().write_registers(thread, registers); }
     Result<Breakpoint> add_breakpoint(std::uint64_t address, BreakpointKind kind) override { return active().add_breakpoint(address, kind); }

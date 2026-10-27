@@ -39,6 +39,11 @@ struct JvmTypeAnnotation {
     JvmAnnotation annotation;
     bool operator==(const JvmTypeAnnotation &) const = default;
 };
+struct JvmMethodParameter {
+    std::uint16_t name_index = 0, access_flags = 0;
+    std::optional<std::string> name;
+    bool operator==(const JvmMethodParameter &) const = default;
+};
 // Values retain the class-file verification_type_info tag. Long/double are
 // one logical entry occupying two JVM local/operand locations.
 enum class JvmVerificationKind : std::uint8_t {
@@ -92,6 +97,7 @@ struct JvmMember {
     std::uint16_t access_flags = 0, name_index = 0, descriptor_index = 0;
     std::string name, descriptor;
     std::optional<std::string> signature;
+    std::optional<std::vector<JvmMethodParameter>> method_parameters;
     // ConstantValue payload: numeric entries preserve their class-file bits;
     // strings contain the resolved CONSTANT_Utf8 text.
     std::optional<JvmConstant> constant_value;

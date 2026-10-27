@@ -38,6 +38,11 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata) {
             << "0x" << std::hex << directory.location << " size=0x" << directory.size << std::dec << '\n';
     }
     if (metadata.pe) {
+        if (metadata.pe->global_pointer_rva) {
+            out << "PE global pointer: RVA=0x" << std::hex << *metadata.pe->global_pointer_rva
+                << " VA=0x" << (metadata.preferred_base + *metadata.pe->global_pointer_rva)
+                << std::dec << '\n';
+        }
         if (!metadata.pe->coff_symbols.empty()) {
             constexpr std::size_t coff_symbol_output_limit = 4096;
             out << "PE COFF symbols: " << metadata.pe->coff_symbols.size() << '\n';
@@ -258,6 +263,31 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata) {
         }
         if (emitted >= pe_exception_output_limit)
             out << "  ... exception metadata output limited to " << pe_exception_output_limit << " rows\n";
+    }
+    if (metadata.pe && metadata.pe->tls) {
+        const auto &tls = *metadata.pe->tls;
+        out << "PE TLS: template-start-RVA=0x" << std::hex << tls.template_rva
+            << " template-end-RVA=0x" << (tls.template_rva + tls.template_size)
+            << " index-RVA=0x" << tls.index_rva
+            << " callbacks-RVA=0x" << tls.callbacks_rva
+            << " zero-fill=0x" << tls.zero_fill
+            << " characteristics=0x" << tls.characteristics << std::dec
+            << " callbacks=" << tls.callbacks.size() << '\n';
+        constexpr std::size_t tls_callback_output_limit = 4096;
+        const auto callback_count = std::min(tls.callbacks.size(), tls_callback_output_limit);
+        for (std::size_t i = 0; i < callback_count; ++i) {
+            const auto &callback = tls.callbacks[i];
+            out << "  callback[" << i << "] RVA=0x" << std::hex << callback.rva
+                << " VA=0x" << (metadata.preferred_base + callback.rva) << std::dec;
+            if (!callback.source.spans.empty())
+                out << " file=0x" << std::hex << callback.source.spans.front().offset.value << std::dec;
+            out << '\n';
+        }
+        if (callback_count != tls.callbacks.size())
+            out << "  ... TLS callback output limited to " << tls_callback_output_limit << " rows\n";
+        if (tls.callback_terminator && !tls.callback_terminator->spans.empty())
+            out << "  callback terminator file=0x" << std::hex
+                << tls.callback_terminator->spans.front().offset.value << std::dec << '\n';
     }
     if (metadata.pe && metadata.pe->load_configuration) {
         const auto &config = *metadata.pe->load_configuration;

@@ -62,14 +62,21 @@ unknown references and an unknown memory effect.
 
 The five invoke kinds and their `/range` forms lower to call-like intrinsics
 that read every encoded argument register and conservatively invalidate memory.
-`move-result`, `move-result-wide`, and `move-result-object` define an explicit
-unknown value. This DEX subset does not yet resolve method/field identifiers to
-names or descriptors, link invoke results to call signatures, model exceptions,
-or distinguish static initialization and allocation effects. Unknown effects
-are preserved instead of inventing signatures or values. Signed
-division/remainder (whose exception behavior is not modeled), literals outside
-the implemented constant forms, exception handlers, and all other unmodeled
-opcodes still return `ErrorCode::unsupported` with the method-relative
+The loader retains each prototype's compact return kind and each method ID's
+prototype index. A method-index invoke followed immediately in the same basic
+block by the matching `move-result`, `move-result-wide`, or
+`move-result-object` now writes a typed unknown call output to the destination
+register; the result-copy instruction becomes a no-op in the lifted IR.
+Polymorphic calls use their encoded prototype index, and custom calls use the
+method-type value from a retained call-site array when available. Known void
+or incompatible return variants, non-invoke predecessors, noncontiguous
+addresses, and block-split result copies fail closed. If return metadata is
+unavailable, the move-result destination remains an unknown value. This DEX
+subset does not yet resolve method/field identifiers to names or full
+descriptors, model exceptions, or distinguish static initialization and
+allocation effects. Unknown effects are preserved instead of inventing values.
+Literals outside the implemented constant forms, exception handlers, and all
+other unmodeled opcodes still return `ErrorCode::unsupported` with the method-relative
 instruction address. It does not produce a partial function when an instruction
 has unknown effects.
 
@@ -77,14 +84,16 @@ DEX 038+ `invoke-polymorphic` (including `/range`) and `invoke-custom` (includin
 `/range`) are decoded as calls. Polymorphic instructions retain both the method
 and prototype indexes; custom instructions retain the call-site index. Their
 encoded argument words are lifted as unknown 32-bit register reads, and the
-call-like intrinsic invalidates memory. DEX 039+ `const-method-handle` and
+call-like intrinsic invalidates memory. Custom-call result shapes are resolved
+from the retained call-site method type when that metadata is present. DEX 039+ `const-method-handle` and
 `const-method-type` decode and lift as unknown reference constants while
 preserving the method-handle or prototype index. The bytecode decoder does not
 currently validate that the file version permits these opcodes, and the
-analysis layer does not resolve call-site arrays, method handles, prototypes,
-or descriptors. Register arguments therefore do not have recovered types or a
-linked return value; `move-result` remains an independent unknown value. These
-opcode encodings follow the [Android Dalvik bytecode reference](https://source.android.google.cn/docs/core/runtime/dalvik-bytecode?hl=en).
+analysis layer does not resolve call-site arrays or method handles to names,
+nor retain full parameter/return descriptors. Register arguments therefore do
+not have recovered types; result linkage uses only the retained return shape
+and is limited to immediate same-block move-result pairs. These opcode
+encodings follow the [Android Dalvik bytecode reference](https://source.android.google.cn/docs/core/runtime/dalvik-bytecode?hl=en).
 
 Function and block boundaries come from the existing analysis snapshot. This
 first slice does not independently verify Dalvik register typing, reconstruct

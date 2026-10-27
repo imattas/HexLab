@@ -213,6 +213,27 @@ Result<std::vector<ProcessInfo>> DebugSession::processes() {
         return Error{ErrorCode::resource_limit, "process enumeration exceeds the inspection limit"};
     return result;
 }
+Result<OsDataTable> DebugSession::os_data(std::string_view type) {
+    if (!impl_->backend) return invalid_state("OS-data inspection");
+    if (type.empty() || type.size() > 64 ||
+        !std::all_of(type.begin(), type.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '-' || c == '_';
+        }))
+        return Error{ErrorCode::invalid_argument, "OS-data type must be 1-64 ASCII letters, digits, '-' or '_'"};
+    auto result = impl_->backend->os_data(type);
+    if (!result) return result.error();
+    if (result.value().type != type || result.value().rows.size() > max_inspection_osdata_rows)
+        return Error{ErrorCode::resource_limit, "backend returned inconsistent or excessive OS-data rows"};
+    for (const auto &row : result.value().rows) {
+        if (row.columns.size() > max_inspection_osdata_columns)
+            return Error{ErrorCode::resource_limit, "OS-data row exceeds the 64-column inspection limit"};
+        for (const auto &[name, value] : row.columns)
+            if (name.empty() || name.size() > 4096 || value.size() > 4096)
+                return Error{ErrorCode::resource_limit, "OS-data column exceeds the 4096-byte inspection limit"};
+    }
+    return result;
+}
 
 Result<ProcessInfo> DebugSession::launch(const Target& target) {
     if (!impl_->backend)
@@ -609,6 +630,14 @@ Result<std::vector<AuxiliaryVectorEntry>> DebugSession::auxiliary_vector() {
     auto result = impl_->backend->auxiliary_vector();
     if (result && result.value().size() > 4096)
         return Error{ErrorCode::resource_limit, "auxiliary vector exceeds the 4096-entry inspection limit"};
+    return result;
+}
+Result<std::vector<std::byte>> DebugSession::signal_info() {
+    if (!impl_->backend || !impl_->process || impl_->state != SessionState::stopped)
+        return invalid_state("signal info");
+    auto result = impl_->backend->signal_info();
+    if (result && result.value().size() > max_inspection_signal_info_bytes)
+        return Error{ErrorCode::resource_limit, "signal-info object exceeds the 65536-byte inspection limit"};
     return result;
 }
 Result<std::vector<RegisterValue>> DebugSession::read_registers(ThreadId thread) {
