@@ -992,6 +992,32 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     effect.operands = {destination.value(), source_or_value.value(), length.value()};
                     effect.memory_effect = *subopcode == 11 ? IntrinsicMemoryEffect::write
                                                             : IntrinsicMemoryEffect::unknown;
+                    const auto memory_range_oob = [&](const ExpressionPtr &address) {
+                        return binary("wasm_memory_range_out_of_bounds", address, length.value(), integer(32));
+                    };
+                    ExpressionPtr trap_condition;
+                    if (*subopcode == 8) {
+                        const auto data_index = *immediate(i, 0);
+                        const auto &segment = metadata->data_segments[static_cast<std::size_t>(data_index)];
+                        const auto source_oob = binary(
+                            "wasm_data_segment_" + std::to_string(data_index) +
+                                "_source_range_out_of_bounds_size_" + std::to_string(segment.byte_count),
+                            source_or_value.value(), length.value(), integer(32));
+                        const auto segment_dropped = unary(
+                            "wasm_data_segment_" + std::to_string(data_index) +
+                                "_dropped_and_length_nonzero",
+                            length.value(), integer(32));
+                        trap_condition = binary("or", memory_range_oob(destination.value()),
+                            binary("or", source_oob, segment_dropped, integer(32)), integer(32));
+                    } else if (*subopcode == 10) {
+                        trap_condition = binary("or", memory_range_oob(destination.value()),
+                            memory_range_oob(source_or_value.value()), integer(32));
+                    } else {
+                        trap_condition = memory_range_oob(destination.value());
+                    }
+                    lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
+                        effect.name + (*subopcode == 8 ? " bounds or dropped-segment trap" : " out of bounds"),
+                        std::move(trap_condition)});
                 }
                 emit(n, std::move(effect));
                 continue;
