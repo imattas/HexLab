@@ -603,6 +603,7 @@ std::string operation_name(Opcode opcode) {
     case Opcode::add: case Opcode::a64_add: case Opcode::a32_add: return "add";
     case Opcode::sub: case Opcode::a64_sub: case Opcode::a32_sub: return "sub";
     case Opcode::a64_bfm: return "a64_bfm";
+    case Opcode::a64_extr: return "extr";
     case Opcode::a32_rsb: return "rsb";
     case Opcode::a32_adc: return "adc";
     case Opcode::a32_sbc: return "sbc";
@@ -2228,6 +2229,26 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             auto value = std::make_shared<Expression>(Expression{integer_type(width),
                 BinaryValue{"or", std::move(preserved), std::move(inserted)}});
             return Assign{*destination, std::move(value)};
+        }
+        if (instruction.opcode == Opcode::a64_extr) {
+            if (instruction.operands.size() != 4) goto a64_unhandled;
+            const auto *dst = std::get_if<RegisterOperand>(&instruction.operands[0]);
+            const auto *lsb = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+            if (!dst || !lsb || (dst->width != 32 && dst->width != 64) || lsb->value >= dst->width)
+                goto a64_unhandled;
+            if (dst->bank == RegisterBank::arm64_zero) return ignored_write();
+            const auto width = static_cast<unsigned>(dst->width);
+            // EXTR forms the concatenation Rn:Rm, with Rm occupying the
+            // low half; lsb zero therefore returns Rm unchanged.
+            ExpressionPtr value = operand_expr(instruction.operands[2]);
+            if (lsb->value) {
+                auto upper = std::make_shared<Expression>(Expression{integer_type(width),
+                    BinaryValue{"shl", operand_expr(instruction.operands[1]), constant_expr(width - static_cast<unsigned>(lsb->value), width)}});
+                auto lower = std::make_shared<Expression>(Expression{integer_type(width),
+                    BinaryValue{"shr", std::move(value), constant_expr(static_cast<unsigned>(lsb->value), width)}});
+                value = std::make_shared<Expression>(Expression{integer_type(width), BinaryValue{"or", std::move(upper), std::move(lower)}});
+            }
+            return Assign{*dst, std::move(value)};
         }
         if (destination_operand && instruction.operands.size() >= 3 &&
             (instruction.opcode == Opcode::a64_ubfm || instruction.opcode == Opcode::a64_sbfm)) {
@@ -5778,6 +5799,7 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             // architecturally zero-extended 64-bit X view. The shared SSA key
             // includes width, so represent both definitions explicitly.
             if (a64_context && (decoded.opcode == Opcode::a64_madd || decoded.opcode == Opcode::a64_msub ||
+                                decoded.opcode == Opcode::a64_extr ||
                                 decoded.opcode == Opcode::a64_bfm ||
                                 decoded.opcode == Opcode::a64_udiv || decoded.opcode == Opcode::a64_sdiv ||
                                 decoded.opcode == Opcode::a64_csel || decoded.opcode == Opcode::a64_csinc ||

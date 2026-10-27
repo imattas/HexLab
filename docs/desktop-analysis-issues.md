@@ -56,8 +56,12 @@ reflect the current pseudocode render and clear when no recovered function
 is selected. Transient type-import rows and decompiler rows are scoped to an open
 document. A file-only tab has no recovered-function scope; its addressed
 diagnostics still navigate within that binary. TSV export is available for
-projects, whose protected paths prevent overwriting the source. Transient UI
-results are kept per open document and are not persisted. Debugger output has no structured
+projects, whose protected paths prevent overwriting the source. Export captures
+the visible rows and active filters before the save dialog opens, then checks
+that the same document, project snapshot, and file-only document snapshot are
+still active before writing. If they changed while the dialog was open, export
+is canceled with a retry prompt so a report from an older view is not saved by
+mistake. Transient UI results are kept per open document and are not persisted. Debugger output has no structured
 diagnostic model and is not included. The page does not re-run analysis,
 classify every candidate as a defect, or resolve conflicts; use the normal
 project edit commands after navigating to a finding when an analysis decision

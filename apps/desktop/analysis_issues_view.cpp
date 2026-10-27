@@ -670,11 +670,23 @@ void AnalysisIssuesView::export_visible() {
         return;
     // Capture the current filtered rows before the modal picker is shown.
     const auto output = export_text();
-    const auto protected_paths = project_ ? project_->protected_paths : std::vector<std::filesystem::path>{};
+    const auto export_document = document_;
+    const auto export_project = project_;
+    const auto export_document_snapshot = document_snapshot_;
+    const auto protected_paths = export_project ? export_project->protected_paths : std::vector<std::filesystem::path>{};
     wxFileDialog dialog(this, "Export visible analysis findings", "", "analysis-findings.tsv",
                         "TSV files (*.tsv)|*.tsv|All files (*.*)|*.*", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
     if (dialog.ShowModal() != wxID_OK)
         return;
+    // Snapshot publication and tab changes can occur while the native save
+    // dialog is open. Do not write a report for a view that is no longer active.
+    if (document_ != export_document || project_ != export_project ||
+        document_snapshot_ != export_document_snapshot) {
+        wxMessageBox("The active document or analysis changed while the save dialog was open. "
+                     "No findings were exported; review the current findings and try again.",
+                     "Export analysis findings", wxOK | wxICON_WARNING, this);
+        return;
+    }
     auto publication = FilePublication::create(std::filesystem::path(dialog.GetPath().ToStdWstring()),
                                                ExistingFilePolicy::replace, protected_paths, {});
     if (!publication) {

@@ -1,5 +1,6 @@
 #include "macho_internal.hpp"
 #include <algorithm>
+#include <utility>
 namespace hexlab::macho_detail {
 void read_protections(const ByteStorage &storage, const Image &image, MachOMetadata &metadata, ImageLayout &layout,
                       Budget &budget, std::stop_token stop) {
@@ -59,9 +60,83 @@ void read_protections(const ByteStorage &storage, const Image &image, MachOMetad
         budget.include(sizeof(MachOLinkeditDeclaration));
         MachOLinkeditDeclaration declaration{command.index, type, offset, size, file, metadata.data_in_code.size()};
         if (type == 0x1d) {
-            if (size)
-                metadata.protections_complete = false;
             declaration.first_row = 0;
+            if (size) {
+                // Signature parsing is deliberately bounded independently of
+                // the file extent so a large CMS payload cannot consume the
+                // loader's entire metadata budget.
+                constexpr std::uint32_t signature_parse_limit = 16 * 1024 * 1024;
+                if (size > signature_parse_limit) {
+                    metadata.protections_complete = false;
+                } else {
+                    budget.include(size);
+                    const auto payload = reader.bytes(offset, size);
+                    const auto be32 = [&](std::size_t at) {
+                        require(at <= payload.bytes.size() && 4 <= payload.bytes.size() - at,
+                                "Truncated Mach-O code-signing blob scalar");
+                        return (std::to_integer<std::uint32_t>(payload.bytes[at]) << 24) |
+                               (std::to_integer<std::uint32_t>(payload.bytes[at + 1]) << 16) |
+                               (std::to_integer<std::uint32_t>(payload.bytes[at + 2]) << 8) |
+                               std::to_integer<std::uint32_t>(payload.bytes[at + 3]);
+                    };
+                    constexpr std::uint32_t superblob_magic = 0xfade0cc0;
+                    constexpr std::uint32_t code_directory_magic = 0xfade0c02;
+                    if (size < 12 || be32(0) != superblob_magic) {
+                        metadata.protections_complete = false;
+                    } else {
+                        const auto declared_size = be32(4);
+                        const auto count = be32(8);
+                        require(declared_size >= 12 && declared_size <= size,
+                                "Mach-O code-signing SuperBlob length exceeds its declaration");
+                        require(count <= 4096 && count <= (declared_size - 12) / 8,
+                                "Mach-O code-signing SuperBlob index count exceeds bounds", ErrorCode::resource_limit);
+                        const auto index_end = std::uint64_t{12} + std::uint64_t(count) * 8;
+                        if (declared_size != size)
+                            metadata.protections_complete = false;
+                        budget.include(std::uint64_t(count) * sizeof(MachOCodeSignatureBlob));
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>> blob_ranges;
+                        blob_ranges.reserve(count);
+                        for (std::uint32_t index = 0; index < count; ++index) {
+                            canceled(stop);
+                            const auto at = std::size_t{12} + std::size_t(index) * 8;
+                            MachOCodeSignatureBlob blob;
+                            blob.signature = static_cast<std::uint32_t>(metadata.code_signatures.size());
+                            blob.index = index;
+                            blob.slot_type = be32(at);
+                            blob.raw_offset = be32(at + 4);
+                            require(blob.raw_offset >= index_end && blob.raw_offset <= declared_size &&
+                                        8 <= declared_size - blob.raw_offset,
+                                    "Mach-O code-signing blob header overlaps index or exceeds SuperBlob");
+                            blob.magic = be32(static_cast<std::size_t>(blob.raw_offset));
+                            blob.size = be32(static_cast<std::size_t>(blob.raw_offset) + 4);
+                            require(blob.size >= 8 && blob.size <= declared_size - blob.raw_offset,
+                                    "Mach-O code-signing blob exceeds SuperBlob");
+                            blob.record_file_offset = add(file.value, blob.raw_offset);
+                            blob_ranges.emplace_back(blob.raw_offset, blob.raw_offset + blob.size);
+                            if (blob.magic == code_directory_magic) {
+                                require(blob.size >= 44, "Truncated Mach-O CodeDirectory header");
+                                const auto base = static_cast<std::size_t>(blob.raw_offset);
+                                blob.code_directory = true;
+                                blob.code_directory_version = be32(base + 8);
+                                blob.code_directory_flags = be32(base + 12);
+                                blob.code_limit = be32(base + 32);
+                                blob.code_slots = be32(base + 28);
+                                blob.hash_size = std::to_integer<std::uint8_t>(payload.bytes[base + 36]);
+                                blob.hash_type = std::to_integer<std::uint8_t>(payload.bytes[base + 37]);
+                                blob.platform = std::to_integer<std::uint8_t>(payload.bytes[base + 38]);
+                                blob.page_size_exponent = std::to_integer<std::uint8_t>(payload.bytes[base + 39]);
+                            } else {
+                                metadata.protections_complete = false;
+                            }
+                            metadata.code_signature_blobs.push_back(std::move(blob));
+                        }
+                        std::sort(blob_ranges.begin(), blob_ranges.end());
+                        for (std::size_t index = 1; index < blob_ranges.size(); ++index)
+                            if (blob_ranges[index - 1].second > blob_ranges[index].first)
+                                metadata.protections_complete = false;
+                    }
+                }
+            }
             metadata.code_signatures.push_back(declaration);
             continue;
         }

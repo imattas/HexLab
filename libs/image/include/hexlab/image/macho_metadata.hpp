@@ -383,6 +383,16 @@ struct MachOLinkeditDeclaration {
     std::uint64_t first_row = 0;
     bool operator==(const MachOLinkeditDeclaration &) const = default;
 };
+// A bounded code-signing blob inventory row. CodeDirectory fields describe
+// encoded values only; no hashes, CMS signatures, or trust are verified.
+struct MachOCodeSignatureBlob {
+    std::uint32_t signature = 0, index = 0, slot_type = 0, magic = 0, size = 0;
+    std::uint64_t raw_offset = 0, record_file_offset = 0;
+    std::optional<std::uint32_t> code_directory_version, code_directory_flags, code_limit, code_slots;
+    std::uint8_t hash_size = 0, hash_type = 0, platform = 0, page_size_exponent = 0;
+    bool code_directory = false;
+    bool operator==(const MachOCodeSignatureBlob &) const = default;
+};
 struct MachODataInCode {
     std::uint32_t table = 0, index = 0, raw_offset = 0;
     std::uint16_t length = 0, kind = 0;
@@ -433,6 +443,7 @@ struct MachOMetadata {
     bool dyld_complete = true;
     // Signature bytes are declared, never authenticated by this parser.
     std::vector<MachOLinkeditDeclaration> data_in_code_tables, code_signatures;
+    std::vector<MachOCodeSignatureBlob> code_signature_blobs;
     std::vector<MachODataInCode> data_in_code;
     std::vector<MachOEncryption> encryption;
     bool protections_complete = true;
