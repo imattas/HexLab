@@ -41,10 +41,12 @@ enum class ThreadResumeKind { continue_execution, single_step, stop };
 struct ThreadResumeAction {
     ThreadId thread = 0;
     ThreadResumeKind kind = ThreadResumeKind::continue_execution;
-    // For a thread with a pending signal-delivery stop, absent preserves and
-    // redelivers the signal when the thread runs. `handled` suppresses it;
-    // `not_handled` explicitly redelivers it. A stop action preserves the
-    // signal unless `handled` is requested.
+    // On Linux, for a thread with a pending signal-delivery stop, absent
+    // preserves/redelivers the signal when it runs; `handled` suppresses it.
+    // On Windows, only the pending event owner may set this: `handled` uses
+    // DBG_CONTINUE and `not_handled` passes an exception to the debuggee. A
+    // stop action retains the signal (Linux) or suspends the event owner
+    // (Windows) after the event disposition is applied.
     std::optional<ContinueStatus> signal_disposition;
 };
 

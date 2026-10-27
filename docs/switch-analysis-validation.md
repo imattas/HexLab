@@ -267,11 +267,16 @@ from `MULLI scaledIndex, selector, 4` or the exact `RLWINM` `SLWI selector, 2`
 mask form; the table base must come from decoded
 `ADDIS`/`ADDI`/`ORI` immediate facts in the same block. Table entries are
 four-byte pointers and each accepted destination must decode as executable
-PPC32 code. Instruction immediates covered by relocations are left unresolved,
-and entry relocations are resolved through the existing relocation-aware table
-reader. The scan is capped at 4096 entries and stops at the first unreadable,
-unresolved, or invalid target; without a separately proven bound, the table is
-reported as a verified prefix with unknown case count/default. PPC64, HA/LO
+PPC32 code. Recovery requires an adjacent `CMPLI CRf, selector, bound` and
+`BC` proof that branches to the default when CRf.LT is clear (BO=4, BI=4*f),
+so fallthrough proves the exact unsigned range `[0,bound)`. A complete
+dominance/flow proof must connect that guard's fallthrough to the table setup
+and dispatch without alternate entries or selector writes. Bounds must be in
+`[1,4096]`; recovery declines the site when the proof is absent. Instruction
+immediates covered by relocations are left unresolved, and entry relocations
+are resolved through the existing relocation-aware table reader. The scan
+reads exactly the proven number of entries and preserves a partial prefix if
+an entry is unreadable, unresolved, or invalid. PPC64, HA/LO
 relocation-paired bases, other index scaling instructions, and cross-block
 register propagation are not recognized by this variant.
 

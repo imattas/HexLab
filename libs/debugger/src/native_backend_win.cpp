@@ -984,17 +984,34 @@ public:
         }
         if (!includes_owner || !owner_action)
             return Error{ErrorCode::invalid_argument, "resume schedule must include the thread that owns the pending event"};
+        for (const auto &action : actions) {
+            if (action.signal_disposition && action.thread != owner)
+                return Error{ErrorCode::invalid_argument,
+                             "Windows exception disposition may only be set for the event-owning thread"};
+        }
+        if (owner_action->signal_disposition &&
+            *owner_action->signal_disposition != ContinueStatus::handled &&
+            *owner_action->signal_disposition != ContinueStatus::not_handled)
+            return Error{ErrorCode::invalid_argument, "resume schedule contains an unknown exception disposition"};
+        const auto disposition = owner_action->signal_disposition.value_or(ContinueStatus::handled);
+        if (disposition == ContinueStatus::not_handled &&
+            pending_->dwDebugEventCode != EXCEPTION_DEBUG_EVENT)
+            return Error{ErrorCode::invalid_argument,
+                         "DBG_EXCEPTION_NOT_HANDLED is valid only for a pending exception event"};
         if (runnable.empty())
             return Error{ErrorCode::invalid_argument, "Windows schedule cannot resume with stop-only actions"};
         if (steps && (steps != 1 || runnable.size() != 1 || owner_action->kind != ThreadResumeKind::single_step))
             return Error{ErrorCode::unsupported, "Windows schedules support one event-thread step or a continue-only thread subset"};
+        if (steps && disposition == ContinueStatus::not_handled)
+            return Error{ErrorCode::unsupported,
+                         "a Windows single-step cannot both pass an exception to the debuggee and execute an instruction"};
         if (steps)
-            return single_step_event(sequence, ContinueStatus::handled);
+            return single_step_event(sequence, disposition);
         // ContinueDebugEvent always releases the event-owning thread. When its
         // requested action is stop, continue_selected_threads acquires our
         // suspend count for that owner (along with every omitted peer) before
         // acknowledging the event, so the selected peers can run alone.
-        return continue_selected_threads(sequence, runnable, ContinueStatus::handled);
+        return continue_selected_threads(sequence, runnable, disposition);
     }
 
     Status continue_selected_threads(std::uint64_t sequence, std::span<const ThreadId> selected, ContinueStatus status) {
