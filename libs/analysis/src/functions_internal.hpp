@@ -5,6 +5,7 @@
 #include <array>
 #include <deque>
 #include <map>
+#include <new>
 #include <set>
 #include <tuple>
 namespace hexlab::function_detail {
@@ -105,6 +106,7 @@ class Recovery {
     AddressMap<std::shared_ptr<const InstructionFact>> reusable_instructions;
     std::size_t decoded_instructions = 0, reused_instructions = 0;
     std::size_t attempts = 0, owner_steps = 0;
+    std::size_t last_progress_attempts = 0;
     bool discovery_exhausted = false;
     Recovery(const Image &i, const ImageMetadata &m, const AnalysisDecisions &d, const AnalysisOptions &o,
              std::stop_token s)
@@ -113,6 +115,22 @@ class Recovery {
     void canceled() const {
         if (stop.stop_requested())
             throw Failure{{ErrorCode::canceled, "Function recovery canceled"}};
+    }
+    void report_progress(std::string_view stage, std::uint64_t completed, std::uint64_t total) {
+        canceled();
+        if (options.progress) {
+            bool keep_going = false;
+            try {
+                keep_going = options.progress(stage, completed, total);
+            } catch (const std::bad_alloc &) {
+                throw Failure{{ErrorCode::resource_limit, "Function progress callback allocation failed"}};
+            } catch (...) {
+                throw Failure{{ErrorCode::invalid_argument, "Function progress callback threw"}};
+            }
+            if (!keep_going)
+                throw Failure{{ErrorCode::canceled, "Function recovery canceled by progress callback"}};
+        }
+        canceled();
     }
     std::optional<FunctionStopReason> permission(Address, bool instruction_start = true) const;
     const RegionDecision *region_at(Address) const;

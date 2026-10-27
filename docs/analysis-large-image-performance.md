@@ -52,3 +52,15 @@ annotation rather than processor mode or code policy.
 
 
 String extraction now has an optional cumulative work budget, `AnalysisOptions::string_scan_work_budget`. It counts byte inspections across encoding passes, so one byte revisited by ASCII, UTF-8, Windows-1252, UTF-16, and UTF-32 passes consumes work for each inspection. The default is `size_t` maximum and preserves exhaustive behavior. A smaller budget ends scanning with a partial result (`complete=false`) and a warning diagnostic; cancellation remains independently available through the stop token. The option participates in the function-engine fingerprint so cached derived results cannot cross different work budgets.
+
+Function recovery also accepts an optional `AnalysisOptions::progress` callback.
+It receives `("instruction-discovery", completed_attempts, instruction_budget)`
+at start and after each 1024 new/reused instruction attempts, then
+`("complete", 1, 1)` after facts and dependencies are finalized. The budget is
+a hard ceiling, not an estimate of remaining total work; discovery may end
+before it. Returning `false` cancels recovery without publishing a partial
+snapshot, and a thrown callback is returned as an error. When analysis runs in
+a project worker the callback runs on that worker thread, so callers should
+keep it short and marshal UI updates to the owner thread. The callback does not
+participate in cache fingerprints. This gives hosts bounded coarse progress
+and cancellation control without claiming a corpus-wide ETA.

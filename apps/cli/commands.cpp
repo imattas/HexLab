@@ -244,10 +244,73 @@ std::string_view processor_mode_label(ExecutionMode mode) {
     return "unknown";
 }
 
+std::string processor_inventory_json_string(std::string_view value) {
+    std::ostringstream out;
+    out << '"';
+    constexpr char hex_digits[] = "0123456789abcdef";
+    for (const unsigned char byte : value) {
+        switch (byte) {
+        case '"': out << "\\\""; break;
+        case '\\': out << "\\\\"; break;
+        case '\b': out << "\\b"; break;
+        case '\f': out << "\\f"; break;
+        case '\n': out << "\\n"; break;
+        case '\r': out << "\\r"; break;
+        case '\t': out << "\\t"; break;
+        default:
+            if (byte < 0x20) {
+                out << "\\u00" << hex_digits[byte >> 4] << hex_digits[byte & 0xf];
+            } else {
+                out << static_cast<char>(byte);
+            }
+        }
+    }
+    out << '"';
+    return out.str();
+}
+
 int processors_command(std::span<const std::wstring_view> arguments, std::ostream &out, std::ostream &err) {
-    if (!arguments.empty()) {
-        err << "Usage: hexlab_cli processors\n";
+    const bool json = arguments.size() == 1 && arguments.front() == L"--json";
+    if (!arguments.empty() && !json) {
+        err << "Usage: hexlab_cli processors [--json]\n";
         return 2;
+    }
+    if (json) {
+        out << "{\"schema\":\"hexlab.processor-inventory.v1\",\"scope\":\"decoder\",\"variants\":[";
+        bool first = true;
+        for (const auto &variant : processor_variant_inventory()) {
+            if (!first) out << ',';
+            first = false;
+            const auto &capability = variant.capabilities;
+            out << "{\"id\":" << processor_inventory_json_string(variant.id)
+                << ",\"architecture\":" << processor_inventory_json_string(
+                    processor_architecture_label(variant.context.architecture))
+                << ",\"mode\":" << processor_inventory_json_string(processor_mode_label(variant.context.mode))
+                << ",\"byte_order\":";
+            if (variant.byte_order_applicable)
+                out << processor_inventory_json_string(variant.context.order == ByteOrder::little ? "little" : "big");
+            else
+                out << "null";
+            out << ",\"can_decode\":" << (capability.can_decode ? "true" : "false")
+                << ",\"max_instruction_bytes\":";
+            if (capability.can_decode)
+                out << static_cast<unsigned>(capability.max_instruction_bytes);
+            else
+                out << "null";
+            out << ",\"display_name\":";
+            if (capability.can_decode)
+                out << processor_inventory_json_string(capability.display_name);
+            else
+                out << "null";
+            out << ",\"reason\":";
+            if (!capability.can_decode && !capability.reason.empty())
+                out << processor_inventory_json_string(capability.reason);
+            else
+                out << "null";
+            out << '}';
+        }
+        out << "]}\n";
+        return 0;
     }
     out << "Decoder variants (bounded subsets; later-layer coverage varies):\n";
     for (const auto &variant : processor_variant_inventory()) {
@@ -278,7 +341,7 @@ void usage(std::ostream &out) {
            "       hexlab_cli modules [--graph] <binary>...  (graph mode traverses dependencies from the first file)\n\n"
            "       hexlab_cli project --help  (persistent projects and editing)\n\n"
            "       hexlab_cli plugins scan <directory> [--json] [--strict]  (data-only native plugin discovery)\n\n"
-           "       hexlab_cli processors  (supported decoder variants)\n\n"
+           "       hexlab_cli processors [--json]  (supported decoder variants)\n\n"
            "       hexlab_cli archive list <archive>\n"
            "       hexlab_cli archive link-select <archive> --root-object <ET_REL>\n"
            "       hexlab_cli archive link-exec <archive> --root-object <ET_REL> --entry <symbol> --output <ET_EXEC>\n"
