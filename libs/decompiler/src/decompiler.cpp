@@ -576,6 +576,7 @@ std::string operation_name(Opcode opcode) {
     case Opcode::m6502_rra: return "RRA";
     case Opcode::m6502_isc: return "ISC";
     case Opcode::m6502_las: return "LAS";
+    case Opcode::m6502_anc: return "ANC";
     case Opcode::m6502_cpx: return "CPX"; case Opcode::m6502_cpy: return "CPY";
     case Opcode::m6502_bit: return "BIT"; case Opcode::m6502_inc: return "INC";
     case Opcode::m6502_dec: return "DEC"; case Opcode::m6502_inx: return "INX";
@@ -1611,8 +1612,8 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 if (op == Opcode::m6502_sty) source.index = 2;
                 return Store{operands.front(), reg_expr(source)};
             }
-            if (op == Opcode::m6502_and || op == Opcode::m6502_ora || op == Opcode::m6502_eor) {
-                const char *operation = op == Opcode::m6502_and ? "and" :
+            if (op == Opcode::m6502_and || op == Opcode::m6502_anc || op == Opcode::m6502_ora || op == Opcode::m6502_eor) {
+                const char *operation = (op == Opcode::m6502_and || op == Opcode::m6502_anc) ? "and" :
                                         op == Opcode::m6502_ora ? "or" : "xor";
                 const auto result = binary(operation, reg_expr(accumulator), operands.front());
                 const auto bool_byte = [](ExpressionPtr value) -> ExpressionPtr {
@@ -1623,9 +1624,11 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 };
                 const auto zero = boolean_binary("eq", result, constant_expr(0, 8));
                 const auto negative = boolean_binary("bit_extract", result, constant_expr(7, 8));
-                const auto preserved = binary("and", status_value, constant_expr(0x7d, 8));
-                const auto new_status = binary("or", binary("or", preserved, bit(zero, 1)), bit(negative, 7));
-                Intrinsic effect{op == Opcode::m6502_and ? "m6502_and" :
+                const auto preserved = binary("and", status_value, constant_expr(op == Opcode::m6502_anc ? 0x7c : 0x7d, 8));
+                auto new_status = binary("or", binary("or", preserved, bit(zero, 1)), bit(negative, 7));
+                if (op == Opcode::m6502_anc)
+                    new_status = binary("or", new_status, bit(negative, 0));
+                Intrinsic effect{op == Opcode::m6502_anc ? "m6502_anc" : op == Opcode::m6502_and ? "m6502_and" :
                                  op == Opcode::m6502_ora ? "m6502_ora" : "m6502_eor",
                                  {}, instruction.memory_read ? IntrinsicMemoryEffect::read
                                                              : IntrinsicMemoryEffect::none};

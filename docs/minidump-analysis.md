@@ -21,6 +21,16 @@ remain in metadata and are not attached to another thread. Duplicate standard
 An exception context is retained independently of the thread context; neither
 is substituted for the other.
 
+The optional `MiscInfo` stream exposes the base process ID and process timing
+fields. `Flags1` gates each field group: the process ID bit controls the ID,
+and the process-times bit controls creation, user, and kernel times. Only fields
+whose validity bit is set and whose complete extent is present are exposed;
+inconsistent declarations produce diagnostics. Times remain the raw 32-bit
+seconds values defined by Windows. The CLI summary prints available values.
+This base metadata is independent of the later MiscInfo5 XSTATE feature map.
+See Microsoft's [`MINIDUMP_MISC_INFO`](https://learn.microsoft.com/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_misc_info)
+definition for field and flag semantics.
+
 Module CodeView records recognize bounded RSDS and NB10 identities. RSDS
 retains the 16-byte PDB GUID and age; NB10 retains its timestamp and age. Both
 retain the NUL-terminated PDB path as raw bytes because the format does not

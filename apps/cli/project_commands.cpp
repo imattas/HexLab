@@ -398,11 +398,19 @@ int run_history_preview(const project_detail::Arguments &args, std::ostream &out
     require(bool(preview.user), "History preview returned no user state");
     const auto before = history_counts(*snapshot->user);
     const auto after = history_counts(*preview.user);
+    const bool matches_current = args.history_target_step == preview.source_cursor;
+    const char *cursor_relation = matches_current ? "current"
+        : args.history_target_step < preview.source_cursor ? "earlier" : "later";
+    const auto cursor_distance = args.history_target_step > preview.source_cursor
+        ? args.history_target_step - preview.source_cursor
+        : preview.source_cursor - args.history_target_step;
     if (args.history_json) {
-        out << "{\"schema_version\":1,\"project_uuid\":\"" << uuid_text(snapshot->uuid)
+        out << "{\"schema_version\":2,\"project_uuid\":\"" << uuid_text(snapshot->uuid)
             << "\",\"source_edit\":" << preview.source_revisions.edit
             << ",\"source_cursor\":" << preview.source_cursor
             << ",\"target_step\":" << preview.target_step
+            << ",\"cursor_relation\":\"" << cursor_relation << "\",\"cursor_distance_steps\":"
+            << cursor_distance
             << ",\"history_count\":" << preview.history_count
             << ",\"replayed_steps\":" << preview.replayed_steps
             << ",\"delta_bytes\":" << preview.delta_bytes
@@ -420,7 +428,8 @@ int run_history_preview(const project_detail::Arguments &args, std::ostream &out
     } else {
         out << "History preview: project=" << uuid_text(snapshot->uuid)
             << " edit=" << preview.source_revisions.edit << " cursor=" << preview.source_cursor << '/' << preview.history_count
-            << " target=" << preview.target_step << " replayed=" << preview.replayed_steps
+            << " target=" << preview.target_step << " relation=" << cursor_relation
+            << " distance-steps=" << cursor_distance << " replayed=" << preview.replayed_steps
             << " delta-bytes=" << preview.delta_bytes << '\n'
             << "Current: annotations=" << before.annotations << " bookmarks=" << before.bookmarks
             << " breakpoints=" << before.breakpoints << " regions=" << before.regions << " functions=" << before.functions
@@ -431,7 +440,7 @@ int run_history_preview(const project_detail::Arguments &args, std::ostream &out
             << " references=" << after.references << " types=" << after.types << " assignments=" << after.assignments
             << " debug-variables=" << after.debug_variables << " patches=" << after.patch_spans << '/' << after.patch_bytes << "B\n";
     }
-    return args.history_target_step == preview.source_cursor ? 0 : 3;
+    return matches_current ? 0 : 3;
 }
 } // namespace
 

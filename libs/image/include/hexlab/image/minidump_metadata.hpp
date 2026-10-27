@@ -95,6 +95,15 @@ struct MinidumpException {
     FileOffset record_file_offset{};
     bool operator==(const MinidumpException &) const = default;
 };
+struct MinidumpProcessInfo {
+    // MINIDUMP_MISC_INFO Flags1 bits gate which base process fields are valid.
+    std::uint32_t flags = 0;
+    std::optional<std::uint32_t> process_id;
+    std::optional<std::uint32_t> process_create_time;
+    std::optional<std::uint32_t> process_user_time;
+    std::optional<std::uint32_t> process_kernel_time;
+    bool operator==(const MinidumpProcessInfo &) const = default;
+};
 struct MinidumpMetadata {
     std::uint16_t processor_architecture = 0xffff;
     std::uint8_t processor_count = 0;
@@ -107,6 +116,7 @@ struct MinidumpMetadata {
     std::vector<MinidumpThread> threads;
     std::vector<MinidumpThreadName> thread_names;
     std::optional<MinidumpException> exception;
+    std::optional<MinidumpProcessInfo> process_info;
     std::vector<std::string> diagnostics;
     bool operator==(const MinidumpMetadata &) const = default;
 };

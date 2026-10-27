@@ -87,13 +87,13 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
         const bool uses_value = opcode == Opcode::m6502_dcp || opcode == Opcode::m6502_isc || opcode == Opcode::m6502_slo ||
             opcode == Opcode::m6502_rla || opcode == Opcode::m6502_sre || opcode == Opcode::m6502_rra ||
             opcode == Opcode::m6502_adc || opcode == Opcode::m6502_sbc ||
-            opcode == Opcode::m6502_and || opcode == Opcode::m6502_ora || opcode == Opcode::m6502_eor ||
+            opcode == Opcode::m6502_and || opcode == Opcode::m6502_anc || opcode == Opcode::m6502_ora || opcode == Opcode::m6502_eor ||
             opcode == Opcode::m6502_cmp || opcode == Opcode::m6502_cpx || opcode == Opcode::m6502_cpy ||
             opcode == Opcode::m6502_bit;
         if (uses_value) i.register_reads.push_back(value);
         const bool writes_value = opcode == Opcode::m6502_slo || opcode == Opcode::m6502_rla ||
             opcode == Opcode::m6502_sre || opcode == Opcode::m6502_rra || opcode == Opcode::m6502_adc || opcode == Opcode::m6502_sbc ||
-            opcode == Opcode::m6502_and || opcode == Opcode::m6502_ora || opcode == Opcode::m6502_eor ||
+            opcode == Opcode::m6502_and || opcode == Opcode::m6502_anc || opcode == Opcode::m6502_ora || opcode == Opcode::m6502_eor ||
             opcode == Opcode::m6502_lda || opcode == Opcode::m6502_ldx || opcode == Opcode::m6502_ldy;
         if (writes_value) i.register_writes.push_back(value);
         if (writes_flags) i.register_writes.push_back(p);
@@ -149,6 +149,7 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     }
 
     switch (op) {
+    case 0x0b: case 0x2b: return data_op(Opcode::m6502_anc, Mode::immediate, a, false);
     // Undocumented NMOS decrement-then-compare family. These byte forms are
     // stable on the NMOS 6502; the decoder records their combined effects.
     case 0xc7: return dcp(Mode::zero_page);
