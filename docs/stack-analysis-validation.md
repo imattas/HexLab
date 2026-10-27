@@ -27,7 +27,10 @@ from SP or adjust an already tracked frame register. SP restoration from those
 frame registers, immediate SP-based load/store operands, and writeback address
 modes are also tracked. A32 `STM/LDM` stack saves and
 restores with SP writeback map their listed registers to individual four-byte
-slots using the decoded IA/IB/DA/DB mode. Direct memory operands based on SP or BP become slots identified by
+slots using the decoded IA/IB/DA/DB mode. Register-list transfers through an
+established r7/r11 frame pointer also recover each four-byte slot when the
+frame base is not written back; frame-base writeback remains conservative.
+Direct memory operands based on SP or BP become slots identified by
 their bit width and signed offset from the entry stack pointer. Frame-pointer
 and stack-pointer references to the same byte range coalesce. Each slot retains
 its unique instruction addresses and aggregate read/write use, plus per-site

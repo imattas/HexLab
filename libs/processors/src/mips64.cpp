@@ -98,6 +98,37 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         }
         if (rs != 16 && rs != 17 && rs != 20 && rs != 21)
             return {DecodeStatus::unsupported, {}, "MIPS64 COP1 format is outside the S/D/W/L subset"};
+        if ((rs == 16 || rs == 17) && (funct == 0x11 || funct == 0x12 || funct == 0x13)) {
+            const bool is_double = rs == 17;
+            const auto width = static_cast<std::uint16_t>(is_double ? 64 : 32);
+            const bool fcc_move = funct == 0x11;
+            if (fcc_move && (rt & 2))
+                return invalid("Reserved MIPS64 MOVF/MOVT condition field");
+            i.opcode = is_double
+                ? (funct == 0x11 ? ((rt & 1) ? Opcode::mips64_movt_d : Opcode::mips64_movf_d) :
+                   funct == 0x12 ? Opcode::mips64_movz_d : Opcode::mips64_movn_d)
+                : (funct == 0x11 ? ((rt & 1) ? Opcode::mips64_movt_s : Opcode::mips64_movf_s) :
+                   funct == 0x12 ? Opcode::mips64_movz_s : Opcode::mips64_movn_s);
+            const RegisterOperand destination{RegisterBank::mips_fpr, static_cast<std::uint8_t>(shamt), width, false};
+            const RegisterOperand source{RegisterBank::mips_fpr, static_cast<std::uint8_t>(rd), width, false};
+            i.operands = {destination, source};
+            i.access = {OperandAccess::read_write, OperandAccess::read};
+            i.register_reads = {destination, source};
+            i.register_writes = {destination};
+            if (fcc_move) {
+                const auto cc = static_cast<std::uint8_t>((rt >> 2) & 7);
+                i.operands.emplace_back(ImmediateOperand{cc, 3, 32, false, {}});
+                i.access.push_back(OperandAccess::read);
+                i.register_reads.push_back(fcsr);
+                i.condition = cc;
+            } else {
+                const auto condition = reg(rt);
+                i.operands.emplace_back(condition);
+                i.access.push_back(OperandAccess::read);
+                if (rt) i.register_reads.push_back(condition);
+            }
+            return {DecodeStatus::decoded, std::move(i), {}};
+        }
         const bool double_format = rs == 17;
         const auto ft = static_cast<unsigned>(rt), fs = static_cast<unsigned>(rd), fd = static_cast<unsigned>(shamt);
         const std::uint16_t source_width = rs == 17 || rs == 21 ? 64 : 32;

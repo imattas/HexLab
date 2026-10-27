@@ -457,7 +457,10 @@ enum class Opcode {
     ppc_fmadd, ppc_fmsub, ppc_fnmadd, ppc_fnmsub,
     ppc_fmadds, ppc_fmsubs, ppc_fnmadds, ppc_fnmsubs,
     // Scalar Zfa load-immediate floating constants; append for cache stability.
-    rv_fli_s, rv_fli_d
+    rv_fli_s, rv_fli_d,
+    // MIPS64 COP1 conditional floating-register moves; append for cache stability.
+    mips64_movf_s, mips64_movt_s, mips64_movz_s, mips64_movn_s,
+    mips64_movf_d, mips64_movt_d, mips64_movz_d, mips64_movn_d
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

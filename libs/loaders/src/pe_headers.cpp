@@ -5,7 +5,6 @@
 namespace hexlab {
 namespace {
 constexpr std::uint64_t arm64x_apply_limit = 1'000'000;
-
 struct Arm64xRange {
     std::uint64_t begin = 0, end = 0;
 };
@@ -206,6 +205,29 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
         auto image=Image::create(std::move(storage),std::move(layout));
         if (!image) return image.error();
         LoadedImage loaded{image.value(),std::move(metadata),{},true};
+        auto coff_symbols=read_pe_coff_symbols(loaded,stop);
+        if (!coff_symbols) {
+            if (coff_symbols.error().code==ErrorCode::canceled) return coff_symbols.error();
+            loaded.metadata_complete=false;
+            loaded.diagnostics.push_back({DiagnosticSeverity::warning,"PE COFF symbol table: "+coff_symbols.error().message,{}});
+        } else {
+            for (const auto &source_symbol : coff_symbols.value().symbols) {
+                PeImageCoffSymbol symbol;
+                symbol.table_index=source_symbol.raw_index;
+                symbol.name=source_symbol.name;
+                symbol.value=source_symbol.value;
+                symbol.section_number=source_symbol.section_number;
+                symbol.type=source_symbol.type;
+                symbol.storage_class=source_symbol.storage_class;
+                symbol.auxiliary_count=static_cast<std::uint8_t>(source_symbol.auxiliary_records.size());
+                symbol.source_file_offset=source_symbol.source_file_offset;
+                if (source_symbol.section_rva) {
+                    const auto address=checked_add(loaded.metadata.preferred_base,*source_symbol.section_rva);
+                    if (address) symbol.address=Address{{0},address.value()};
+                }
+                loaded.metadata.pe->coff_symbols.push_back(std::move(symbol));
+            }
+        }
         bool relocation_directory_valid = true;
         for (const auto& directory:loaded.metadata.directories) {
             canceled(stop);

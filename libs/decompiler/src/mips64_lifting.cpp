@@ -378,6 +378,40 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
         effect.register_writes = instruction.register_writes;
         return effect;
     }
+    if (op >= Opcode::mips64_movf_s && op <= Opcode::mips64_movn_d) {
+        const bool is_double = op >= Opcode::mips64_movf_d;
+        const bool fcc_move = op == Opcode::mips64_movf_s || op == Opcode::mips64_movt_s ||
+                              op == Opcode::mips64_movf_d || op == Opcode::mips64_movt_d;
+        const std::uint16_t width = is_double ? 64 : 32;
+        const auto *source = items.size() == 3 ? std::get_if<RegisterOperand>(&items[1]) : nullptr;
+        const auto *condition = items.size() == 3 ? std::get_if<RegisterOperand>(&items[2]) : nullptr;
+        const auto *cc = items.size() == 3 ? std::get_if<ImmediateOperand>(&items[2]) : nullptr;
+        const RegisterOperand fcsr{RegisterBank::mips_fcsr, 0, 32, false};
+        if (!destination || destination->bank != RegisterBank::mips_fpr || destination->width != width ||
+            !source || source->bank != RegisterBank::mips_fpr || source->width != width ||
+            (fcc_move ? (!cc || cc->value > 7 || cc->is_signed || condition != nullptr)
+                      : (!condition || condition->bank != RegisterBank::mips_gpr || cc != nullptr)))
+            return intrinsic(instruction, "mips64_malformed_conditional_fp_move", IntrinsicMemoryEffect::none);
+        std::vector<RegisterOperand> expected_reads{*destination, *source};
+        if (fcc_move) expected_reads.push_back(fcsr);
+        else if (condition->index != 0) expected_reads.push_back(*condition);
+        if (instruction.register_reads != expected_reads ||
+            instruction.register_writes != std::vector<RegisterOperand>{*destination} ||
+            instruction.access != std::vector<OperandAccess>{OperandAccess::read_write,
+                OperandAccess::read, OperandAccess::read})
+            return intrinsic(instruction, "mips64_malformed_conditional_fp_move_effects", IntrinsicMemoryEffect::none);
+        const char *name = op == Opcode::mips64_movf_s || op == Opcode::mips64_movf_d ? "movf" :
+                           op == Opcode::mips64_movt_s || op == Opcode::mips64_movt_d ? "movt" :
+                           op == Opcode::mips64_movz_s || op == Opcode::mips64_movz_d ? "movz" : "movn";
+        Intrinsic effect{std::string("mips64.") + name + (is_double ? ".d" : ".s"),
+                         {reg(*destination), reg(*source), operand(items[2])}, IntrinsicMemoryEffect::none};
+        if (fcc_move) effect.operands.push_back(reg(fcsr));
+        effect.register_writes = {*destination};
+        effect.result_type = floating(width);
+        effect.register_output_values = {std::make_shared<Expression>(Expression{floating(width),
+            UnknownValue{std::string("mips64_conditional_fp_move_") + name}})};
+        return effect;
+    }
     if (op == Opcode::mips64_c_cond_s || op == Opcode::mips64_c_cond_d) {
         static constexpr const char *conditions[]{"f", "un", "eq", "ueq", "olt", "ult", "ole", "ule",
             "sf", "ngle", "seq", "ngl", "lt", "nge", "le", "ngt"};

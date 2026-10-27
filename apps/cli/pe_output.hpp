@@ -38,6 +38,20 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata) {
             << "0x" << std::hex << directory.location << " size=0x" << directory.size << std::dec << '\n';
     }
     if (metadata.pe) {
+        if (!metadata.pe->coff_symbols.empty()) {
+            constexpr std::size_t coff_symbol_output_limit = 4096;
+            out << "PE COFF symbols: " << metadata.pe->coff_symbols.size() << '\n';
+            const auto shown=std::min(coff_symbol_output_limit,metadata.pe->coff_symbols.size());
+            for(std::size_t i=0;i<shown;++i){
+                const auto &symbol=metadata.pe->coff_symbols[i];
+                out<<"  #"<<symbol.table_index<<" "<<symbol.name<<" section="<<symbol.section_number
+                   <<" value=0x"<<std::hex<<symbol.value<<std::dec<<" class="<<unsigned(symbol.storage_class)
+                   <<" aux="<<unsigned(symbol.auxiliary_count)<<" file=0x"<<std::hex<<symbol.source_file_offset.value<<std::dec;
+                if(symbol.address)out<<" VA=0x"<<std::hex<<symbol.address->offset<<std::dec;
+                out<<'\n';
+            }
+            if(shown<metadata.pe->coff_symbols.size())out<<"  output limited to 4096 rows\n";
+        }
         const auto render_version = [](const std::array<std::uint16_t, 4> &version) {
             return std::to_string(version[0]) + "." + std::to_string(version[1]) + "." +
                    std::to_string(version[2]) + "." + std::to_string(version[3]);
