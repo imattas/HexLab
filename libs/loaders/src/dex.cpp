@@ -67,6 +67,7 @@ struct Reader {
 struct Proto { std::uint32_t return_type = 0; std::vector<std::uint16_t> parameters; };
 struct Method { std::uint16_t owner = 0, proto = 0; std::uint32_t name = 0; };
 struct Field { std::uint16_t owner = 0, type = 0; std::uint32_t name = 0; };
+struct HiddenApiMemberRef { DexHiddenApiMemberKind kind; std::uint32_t index; };
 struct Code { std::uint32_t method = 0; std::uint64_t file_offset = 0; std::uint32_t byte_size = 0, debug = 0, registers = 0, ins = 0; std::vector<DexExceptionRegion> exception_regions; };
 
 bool extent(std::uint64_t off, std::uint64_t count, std::uint64_t stride, std::uint64_t size) {
@@ -189,7 +190,9 @@ struct MapData {
     std::vector<std::uint32_t> offsets;
     std::uint32_t method_handle_count = 0, method_handle_off = 0;
     std::uint32_t call_site_count = 0, call_site_off = 0;
+    std::uint32_t hiddenapi_count = 0, hiddenapi_off = 0;
     bool has_method_handles = false, has_call_sites = false;
+    bool has_hiddenapi = false;
 };
 Result<MapData> parse_map(std::span<const std::byte> bytes, std::uint32_t offset) {
     if (!offset || (offset & 3) || !extent(offset, 1, 4, bytes.size()))
@@ -210,6 +213,7 @@ Result<MapData> parse_map(std::span<const std::byte> bytes, std::uint32_t offset
         seen[type] = true; previous = item_off; result.offsets.push_back(item_off);
         if (type == 0x0007) { result.has_call_sites = true; result.call_site_count = size; result.call_site_off = item_off; }
         if (type == 0x0008) { result.has_method_handles = true; result.method_handle_count = size; result.method_handle_off = item_off; }
+        if (type == 0xf000) { result.has_hiddenapi = true; result.hiddenapi_count = size; result.hiddenapi_off = item_off; }
         if (size && item_off == bytes.size()) return Error{ErrorCode::malformed, "DEX map entry starts at end of file"};
     }
     return result;
@@ -311,6 +315,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         return Error{ErrorCode::malformed, "DEX 041 map_list overlaps the fixed header or identifier tables"};
     if (version < 38 && (map.value().has_call_sites || map.value().has_method_handles))
         return Error{ErrorCode::malformed, "DEX call-site and method-handle sections require version 038 or later"};
+    if (version < 39 && map.value().has_hiddenapi)
+        return Error{ErrorCode::malformed, "DEX hidden API data requires version 039 or later"};
     if (map.value().call_site_count > max_items || map.value().method_handle_count > max_items)
         return Error{ErrorCode::resource_limit, "DEX call-site or method-handle table exceeds one million items"};
     if ((map.value().call_site_count && ((map.value().call_site_off & 3) ||
@@ -318,6 +324,35 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         (map.value().method_handle_count && ((map.value().method_handle_off & 3) ||
          !extent(map.value().method_handle_off, map.value().method_handle_count, 8, file_size))))
         return Error{ErrorCode::malformed, "DEX call-site or method-handle table exceeds the input"};
+    if (map.value().has_hiddenapi && map.value().hiddenapi_count != 1)
+        return Error{ErrorCode::malformed, "DEX hiddenapi_class_data map entry must describe one section"};
+    std::uint32_t hiddenapi_size = 0;
+    std::vector<std::uint32_t> hiddenapi_offsets;
+    std::uint64_t hiddenapi_data_cursor = 0;
+    if (map.value().has_hiddenapi) {
+        const auto section_off = map.value().hiddenapi_off;
+        if ((section_off & 3) || section_off < data_off || section_off >= std::uint64_t(data_off) + data_size ||
+            !extent(section_off, 1, 4, file_size))
+            return Error{ErrorCode::malformed, "DEX hiddenapi_class_data section offset is invalid"};
+        Reader hidden{bytes}; hidden.seek(section_off);
+        if (!hidden.u32(hiddenapi_size) || hiddenapi_size < 4ull + std::uint64_t(class_count) * 4 ||
+            !extent(section_off, hiddenapi_size, 1, std::uint64_t(data_off) + data_size))
+            return Error{ErrorCode::malformed, "DEX hiddenapi_class_data size or offsets table is invalid"};
+        const auto next_section = std::upper_bound(map.value().offsets.begin(), map.value().offsets.end(), section_off);
+        const auto section_limit = next_section == map.value().offsets.end()
+            ? std::uint64_t(data_off) + data_size : std::uint64_t(*next_section);
+        if (std::uint64_t(section_off) + hiddenapi_size > section_limit)
+            return Error{ErrorCode::malformed, "DEX hiddenapi_class_data section overlaps the next mapped section"};
+        hiddenapi_offsets.reserve(class_count);
+        for (std::uint32_t class_index = 0; class_index < class_count; ++class_index) {
+            std::uint32_t relative = 0;
+            if (!hidden.u32(relative)) return Error{ErrorCode::malformed, "Truncated DEX hidden API offsets table"};
+            if (relative && (relative < 4ull + std::uint64_t(class_count) * 4 || relative >= hiddenapi_size))
+                return Error{ErrorCode::malformed, "DEX hidden API class offset is outside the flag payload"};
+            hiddenapi_offsets.push_back(relative);
+        }
+        hiddenapi_data_cursor = 4ull + std::uint64_t(class_count) * 4;
+    }
     if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX loading canceled"};
 
     std::vector<std::string> strings; strings.reserve(string_count);
@@ -393,6 +428,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
     };
     std::vector<Code> code;
     std::vector<DexStaticValue> decoded_static_values;
+    std::vector<DexHiddenApiFlag> decoded_hiddenapi_flags;
     std::vector<DexCallSite> decoded_call_sites;
     decoded_call_sites.reserve(map.value().call_site_count);
     std::vector<DexAnnotationItem> decoded_annotations;
@@ -405,6 +441,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
     std::uint64_t total_annotation_parameter_slots = 0;
     std::uint64_t total_annotation_links = 0;
     std::uint64_t total_annotation_model_bytes = 0;
+    std::uint64_t total_hiddenapi_model_bytes = 0;
     std::unordered_set<std::uint32_t> class_data_offsets;
     std::uint64_t total_code_units=0;
     std::uint64_t total_try_items=0, total_catch_handlers=0;
@@ -765,6 +802,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         std::vector<std::uint32_t> static_field_indices;
         std::vector<std::uint32_t> declared_field_indices;
         std::vector<std::uint32_t> declared_method_indices;
+        std::vector<HiddenApiMemberRef> class_member_order;
         if(class_data){
         if(!class_data_offsets.insert(class_data).second)return Error{ErrorCode::malformed,"DEX classes share a class_data_item offset"};
         if(class_data_offsets.size()>max_items)return Error{ErrorCode::resource_limit,"DEX class-data count exceeds item budget"};
@@ -780,6 +818,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
                 field_idx+=delta;
                 if(field_idx>=fields.size()||fields[field_idx].owner!=class_type)return Error{ErrorCode::malformed,"DEX encoded field index is invalid for its defining class"};
                 declared_field_indices.push_back(static_cast<std::uint32_t>(field_idx));
+                class_member_order.push_back({DexHiddenApiMemberKind::field, static_cast<std::uint32_t>(field_idx)});
                 if(group==0)static_field_indices.push_back(static_cast<std::uint32_t>(field_idx));
             }
         }
@@ -788,6 +827,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
             for(std::uint32_t n=0;n<count;++n){std::uint32_t delta=0,flags=0,code_off=0;if(!cd.uleb(delta)||!cd.uleb(flags)||!cd.uleb(code_off))return Error{ErrorCode::malformed,"Truncated DEX encoded method"};method_idx+=delta;
                 if(method_idx>=methods.size()||methods[method_idx].owner!=class_type)return Error{ErrorCode::malformed,"DEX encoded method index is invalid for its defining class"};
                 declared_method_indices.push_back(static_cast<std::uint32_t>(method_idx));
+                class_member_order.push_back({DexHiddenApiMemberKind::method, static_cast<std::uint32_t>(method_idx)});
                 if(!code_off)continue;
                 if((code_off&3)||code_off<data_off||code_off>=std::uint64_t(data_off)+data_size||!extent(code_off,1,16,file_size))return Error{ErrorCode::malformed,"DEX code_item header offset is invalid"};
                 Reader cr{bytes};cr.seek(code_off);std::uint16_t registers=0,ins=0,outs=0,tries=0;std::uint32_t debug=0,insns=0;
@@ -839,7 +879,35 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
                                                                   declared_field_indices, declared_method_indices);
             if(!parsed_annotations)return parsed_annotations.error();
         }
+        if (map.value().has_hiddenapi) {
+            const auto relative = hiddenapi_offsets[ci];
+            if (relative != 0) {
+                if (!class_data || class_member_order.empty())
+                    return Error{ErrorCode::malformed, "DEX hidden API flags are present for a class with no encoded members"};
+                if (relative != hiddenapi_data_cursor)
+                    return Error{ErrorCode::malformed, "DEX hidden API class flag streams are not contiguous and ordered"};
+                const auto section_off = map.value().hiddenapi_off;
+                Reader flags{bytes.first(std::size_t(section_off) + hiddenapi_size)};
+                if (!flags.seek(std::size_t(section_off) + relative))
+                    return Error{ErrorCode::malformed, "DEX hidden API class flag offset is invalid"};
+                for (const auto &member : class_member_order) {
+                    if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX hidden API flag parsing canceled"};
+                    if (decoded_hiddenapi_flags.size() >= 2'000'000 ||
+                        total_hiddenapi_model_bytes > 64ull * 1024 * 1024 - sizeof(DexHiddenApiFlag))
+                        return Error{ErrorCode::resource_limit, "DEX hidden API metadata exceeds two million flags or 64 MiB"};
+                    const auto flag_offset = flags.pos;
+                    std::uint32_t value = 0;
+                    if (!flags.uleb(value))
+                        return Error{ErrorCode::malformed, "Truncated DEX hidden API member flag"};
+                    decoded_hiddenapi_flags.push_back({ci, member.kind, member.index, value, flag_offset});
+                    total_hiddenapi_model_bytes += sizeof(DexHiddenApiFlag);
+                }
+                hiddenapi_data_cursor = flags.pos - section_off;
+            }
+        }
     }
+    if (map.value().has_hiddenapi && hiddenapi_data_cursor != hiddenapi_size)
+        return Error{ErrorCode::malformed, "DEX hidden API section size does not match its class flag streams"};
     if(code.size()>max_items)return Error{ErrorCode::resource_limit,"DEX defined method count exceeds address-space budget"};
     DexMetadata dex_metadata;
     dex_metadata.static_values = std::move(decoded_static_values);
@@ -847,6 +915,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
     dex_metadata.call_sites = std::move(decoded_call_sites);
     dex_metadata.annotations = std::move(decoded_annotations);
     dex_metadata.annotation_links = std::move(annotation_links);
+    dex_metadata.hidden_api_flags = std::move(decoded_hiddenapi_flags);
     dex_metadata.code.reserve(code.size());
     for (auto &compiled : code)
         dex_metadata.code.push_back({compiled.method,compiled.registers,compiled.ins,std::move(compiled.exception_regions)});

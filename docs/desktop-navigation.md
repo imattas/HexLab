@@ -14,7 +14,10 @@ navigates there, while canceling leaves the current selection unchanged.
 The named-navigation candidate model used by **Jump** also accepts address-bearing image
 symbols: PE imports resolve to their IAT slots, PE exports and PDB symbols
 resolve to their virtual addresses, and defined ELF and Mach-O symbols resolve
-to their image addresses. Unresolved or addressless records are omitted;
+to their image addresses. ELF names imported from DWARF subprogram DIEs are
+also candidates when they retain at least one concrete code range, which makes
+functions in stripped ELF files reachable by name. Unresolved or addressless
+records are omitted;
 ordinal imports and exports use labels such as `ordinal 7`. Repeated records
 for one name and address produce one choice, while the same name at distinct
 addresses remains ambiguous and opens the destination chooser. Headless tests

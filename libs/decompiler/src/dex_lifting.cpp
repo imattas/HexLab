@@ -72,6 +72,7 @@ Result<Statement> lift_one(const Instruction &instruction) {
         if (op == 0x18) return 10;
         if (op == 0x1a || op == 0x1c || op == 0x1f || op == 0x20) return 4;
         if (op == 0x1b) return 6;
+        if (op == 0x24 || op == 0x25 || op == 0x26) return 6;
         if (op == 0xfe || op == 0xff) return 4;
         if (op == 0xfa || op == 0xfb) return 8;
         if (op == 0xfc || op == 0xfd) return 6;
@@ -478,6 +479,62 @@ Result<Statement> lift_one(const Instruction &instruction) {
             allocation.operands.push_back(reg(size.value()));
         }
         return Statement{std::move(allocation)};
+    }
+    if (op == 0x24 || op == 0x25) {
+        const bool range = op == 0x25;
+        const auto count = static_cast<unsigned>(range ? hi : ((first >> 12) & 15));
+        const auto type_index = unit(instruction, 1);
+        std::vector<ExpressionPtr> elements;
+        elements.reserve(count + 1);
+        elements.push_back(constant(type_index));
+        if (range) {
+            const auto start = static_cast<unsigned>(unit(instruction, 2));
+            if (count && start + count > 256)
+                return Error{ErrorCode::unsupported, "DEX filled-new-array/range exceeds the common IR register-key width"};
+            for (unsigned i = 0; i < count; ++i) {
+                auto element = require_reg(static_cast<std::uint16_t>(start + i));
+                if (!element) return element.error();
+                elements.push_back(typed_reg(element.value(), unknown_type(32)));
+            }
+        } else {
+            const auto packed = unit(instruction, 2);
+            const std::array<unsigned, 5> registers{unsigned(packed & 15), unsigned((packed >> 4) & 15),
+                unsigned((packed >> 8) & 15), unsigned((packed >> 12) & 15), unsigned((first >> 8) & 15)};
+            if (count > registers.size())
+                return Error{ErrorCode::malformed, "DEX filled-new-array register count exceeds five"};
+            for (unsigned i = 0; i < count; ++i) {
+                auto element = require_reg(static_cast<std::uint16_t>(registers[i]));
+                if (!element) return element.error();
+                elements.push_back(typed_reg(element.value(), unknown_type(32)));
+            }
+        }
+        return Statement{Intrinsic{"dex_filled_new_array_type@" + std::to_string(type_index),
+            std::move(elements), IntrinsicMemoryEffect::unknown}};
+    }
+    if (op == 0x26) {
+        if (instruction.address.offset > UINT32_MAX)
+            return Error{ErrorCode::malformed, "DEX array-data instruction exceeds the method address space"};
+        auto array = require_reg(hi);
+        if (!array) return array.error();
+        const auto units = std::bit_cast<std::int32_t>(std::uint32_t(unit(instruction, 1)) |
+            (std::uint32_t(unit(instruction, 2)) << 16));
+        const auto delta = static_cast<std::int64_t>(units) * 2;
+        std::uint64_t payload_offset = 0;
+        if (delta >= 0) {
+            const auto amount = static_cast<std::uint64_t>(delta);
+            if (instruction.address.offset > UINT32_MAX || amount > UINT32_MAX - instruction.address.offset)
+                return Error{ErrorCode::malformed, "DEX array-data payload target exceeds the method address space"};
+            payload_offset = instruction.address.offset + amount;
+        } else {
+            const auto amount = static_cast<std::uint64_t>(-(delta + 1)) + 1;
+            if (amount > instruction.address.offset)
+                return Error{ErrorCode::malformed, "DEX array-data payload target precedes the method address space"};
+            payload_offset = instruction.address.offset - amount;
+        }
+        if (payload_offset & 3)
+            return Error{ErrorCode::malformed, "DEX array-data payload is not four-byte aligned"};
+        return Statement{Intrinsic{"dex_fill_array_data_payload@" + std::to_string(payload_offset),
+            {typed_reg(array.value(), pointer32())}, IntrinsicMemoryEffect::write}};
     }
     if ((op >= 0x44 && op <= 0x51) || (op >= 0x52 && op <= 0x6d)) {
         const bool array = op <= 0x51;

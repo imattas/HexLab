@@ -91,6 +91,15 @@ struct DexAnnotationLink {
     std::uint64_t file_offset = 0; // Exact file location of the annotation-set offset reference.
     bool operator==(const DexAnnotationLink &) const = default;
 };
+enum class DexHiddenApiMemberKind : std::uint8_t { field, method };
+struct DexHiddenApiFlag {
+    std::uint32_t class_def_index = 0;
+    DexHiddenApiMemberKind kind = DexHiddenApiMemberKind::field;
+    std::uint32_t member_index = 0;
+    std::uint32_t flags = 0; // Retained raw ULEB128 value; interpretation varies by Android release.
+    std::uint64_t file_offset = 0; // Exact source offset of the encoded flag.
+    bool operator==(const DexHiddenApiFlag &) const = default;
+};
 struct DexMetadata {
     std::vector<DexMethodDebug> methods;
     std::vector<DexMethodCode> code;
@@ -99,6 +108,7 @@ struct DexMetadata {
     std::vector<DexCallSite> call_sites;
     std::vector<DexAnnotationItem> annotations;
     std::vector<DexAnnotationLink> annotation_links;
+    std::vector<DexHiddenApiFlag> hidden_api_flags;
     bool operator==(const DexMetadata &) const = default;
 };
 }

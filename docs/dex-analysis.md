@@ -65,6 +65,18 @@ accounting at 64 MiB. These counts share the encoded-value 250,000-node,
 interpret build/runtime/system visibility, resolve annotation names, apply
 retention policy, or validate annotation declarations against class semantics.
 
+For DEX 039 and later, the optional `hiddenapi_class_data_item` is parsed as a
+single bounded map section. Its per-class offset table must fit the declared
+section size, and nonzero flag streams must follow class-definition order and
+match the fields and methods in each class's encoded class-data order. Each
+ULEB128 value is retained with its class definition, field or method ID, and
+source offset; the raw flag value is preserved without assigning a policy or
+interpreting Android-release-specific bit meanings. Missing per-class streams
+remain implicit zero flags. Parsing is bounded to two million retained flags
+and 64 MiB of model records. The loader does not apply hidden-API access policy
+or verify boot-class-path applicability. This structure was added to DEX in
+Android 10; see the [AOSP DEX format reference](https://source.android.com/docs/core/runtime/dex-format#hiddenapi_class_data_item).
+
 DEX catch edges are conservative metadata: the analysis does not resolve class
 hierarchies to prune handlers or prove which typed catch receives a thrown
 object. Handler targets are still validated against the method code extent, and
