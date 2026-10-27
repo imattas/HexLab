@@ -657,6 +657,22 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         const bool single = op == 59;
         const unsigned bits = single ? 32u : 64u;
         const unsigned frc = (w >> 6) & 31;
+        // A-form fused multiply-add/subtract uses all three source FPRs:
+        // FRA, FRC, and FRB. The fused operation rounds once.
+        if (xo == 28 || xo == 29 || xo == 30 || xo == 31) {
+            const auto destination = fpr(rt, bits);
+            const auto left = fpr(ra, bits), multiplier = fpr(frc, bits), addend = fpr(rb, bits);
+            i.opcode = xo == 29 ? (single ? Opcode::ppc_fmadds : Opcode::ppc_fmadd) :
+                       xo == 28 ? (single ? Opcode::ppc_fmsubs : Opcode::ppc_fmsub) :
+                       xo == 31 ? (single ? Opcode::ppc_fnmadds : Opcode::ppc_fnmadd) :
+                                  (single ? Opcode::ppc_fnmsubs : Opcode::ppc_fnmsub);
+            i.operands = {destination, left, multiplier, addend};
+            i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read, OperandAccess::read};
+            i.register_writes = {destination, fpscr()};
+            i.register_reads = {left, multiplier, addend, fpscr()};
+            if (rc) i.register_writes.push_back(cr1());
+            return {DecodeStatus::decoded, std::move(i), {}};
+        }
         Opcode opcode;
         const char *unsupported = "PowerPC floating-point XO is outside the enabled scalar arithmetic subset";
         if (xo == 18) opcode = single ? Opcode::ppc_fdivs : Opcode::ppc_fdiv;

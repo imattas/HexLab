@@ -72,6 +72,11 @@ struct JvmMember {
     // Exceptions attribute class names, in class-file declaration order.
     std::optional<std::vector<std::string>> declared_exceptions;
     std::vector<JvmAnnotation> visible_annotations, invisible_annotations;
+    // Parameter annotation vectors preserve the classfile's parameter order;
+    // empty inner vectors represent parameters with no annotations.
+    std::optional<std::vector<std::vector<JvmAnnotation>>> visible_parameter_annotations, invisible_parameter_annotations;
+    // AnnotationDefault uses the same validated textual encoding as element values.
+    std::optional<std::string> annotation_default;
     std::optional<JvmCode> code;
     bool operator==(const JvmMember &) const = default;
 };

@@ -384,6 +384,14 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::ppc_fsub: return "fsub";
     case Opcode::ppc_fmul: return "fmul";
     case Opcode::ppc_fdiv: return "fdiv";
+    case Opcode::ppc_fmadd: return "fmadd";
+    case Opcode::ppc_fmsub: return "fmsub";
+    case Opcode::ppc_fnmadd: return "fnmadd";
+    case Opcode::ppc_fnmsub: return "fnmsub";
+    case Opcode::ppc_fmadds: return "fmadds";
+    case Opcode::ppc_fmsubs: return "fmsubs";
+    case Opcode::ppc_fnmadds: return "fnmadds";
+    case Opcode::ppc_fnmsubs: return "fnmsubs";
     case Opcode::ppc_fcmpu: return "fcmpu";
     case Opcode::ppc_fcmpo: return "fcmpo";
     case Opcode::ppc_fmr: return "fmr";
@@ -824,7 +832,11 @@ std::string format_instruction(const Instruction &i) {
              i.opcode == Opcode::ppc_fcfid || i.opcode == Opcode::ppc_fctiwu ||
              i.opcode == Opcode::ppc_fctiwuz || i.opcode == Opcode::ppc_fctidu ||
              i.opcode == Opcode::ppc_fctiduz || i.opcode == Opcode::ppc_fcfidu ||
-             i.opcode == Opcode::ppc_fcfids) &&
+             i.opcode == Opcode::ppc_fcfids ||
+             i.opcode == Opcode::ppc_fmadd || i.opcode == Opcode::ppc_fmsub ||
+             i.opcode == Opcode::ppc_fnmadd || i.opcode == Opcode::ppc_fnmsub ||
+             i.opcode == Opcode::ppc_fmadds || i.opcode == Opcode::ppc_fmsubs ||
+             i.opcode == Opcode::ppc_fnmadds || i.opcode == Opcode::ppc_fnmsubs) &&
             std::find(i.register_writes.begin(), i.register_writes.end(),
                       RegisterOperand{RegisterBank::ppc_cr, 1, 4, false}) != i.register_writes.end())
             out += ".";
