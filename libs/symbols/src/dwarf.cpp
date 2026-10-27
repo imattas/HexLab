@@ -938,11 +938,12 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
                     }
                     if(m.tag!=tag_member)continue;
                     const auto*mn=str(m,attr_name);const auto*mr=ref(m,attr_type);
-                    if(!mn||mn->empty()||!mr)return malformed("member DIE lacks name or type reference");
-                    if(!member_names.insert(*mn).second)return malformed("aggregate contains duplicate member names");
+                    const auto*width=num(m,attr_bit_size);const auto*data_bits=num(m,attr_data_bit_offset);const auto*legacy_bits=num(m,attr_bit_offset);
+                    const bool has_bitfield_metadata=width||data_bits||legacy_bits;
+                    if(!mr||((!mn||mn->empty())&&!has_bitfield_metadata))return malformed("member DIE lacks a name or type reference");
+                    if(mn&&!mn->empty()&&!member_names.insert(*mn).second)return malformed("aggregate contains duplicate member names");
                     auto mt=resolve_type_reference(*mr);if(!mt)return mt.error();
                     std::uint64_t off=0;std::optional<std::uint32_t> bit_width,bit_position;
-                    const auto*width=num(m,attr_bit_size);const auto*data_bits=num(m,attr_data_bit_offset);const auto*legacy_bits=num(m,attr_bit_offset);
                     if(width||data_bits||legacy_bits){
                         if(!width||(!data_bits&&!legacy_bits))return unsupported("DWARF bitfield is missing its bit size or bit offset");
                         if(!width||!*width||!mt.value()->size()||*mt.value()->size()>UINT32_MAX/8)
@@ -977,7 +978,7 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
                         if(member_spec==member_abbrev->second.attributes.end())return malformed("member location attribute is absent from its abbreviation");
                         auto member_offset=constant_member_offset(*mv,member_spec->form,static_cast<std::uint8_t>(as_value));if(!member_offset)return member_offset.error();off=member_offset.value();
                     }
-                    members.push_back({*mn,mt.value(),off,bit_width,bit_position});align=std::max(align,mt.value()->alignment());
+                    members.push_back({mn&&!mn->empty()?*mn:std::string{},mt.value(),off,bit_width,bit_position});align=std::max(align,mt.value()->alignment());
                 }
                 align=std::max(align,declared_alignment);auto t=d.tag==tag_structure_type?types::Type::structure(*name,std::move(members),*size,align):types::Type::union_type(*name,std::move(members),*size,align);
                 if(!t)return t.error();result=t.value();break;

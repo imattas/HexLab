@@ -139,9 +139,8 @@ void pointer_bits(MachOChainedPointer &row, const MachOChainedStarts &starts) {
         row.target_is_offset = true;
         row.complete = false;
     } else if (format == 5) {
-        // Unlike the cache-relative format 4, format 5 stores a VM address.
-        // Retain it as a direct target; the chain is fully decoded even when
-        // a later resolver cannot map that target in this image.
+        // Firmware pointers store the target VM address directly, with a
+        // six-bit next field measured in four-byte units.
         row.next = static_cast<std::uint16_t>((raw >> 26) & 0x3f);
         row.target = raw & UINT64_C(0x03ffffff);
     } else if (format == 14) {

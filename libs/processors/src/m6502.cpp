@@ -84,7 +84,7 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
                 if (rmw) i.memory_write = true;
             }
         }
-        const bool uses_value = opcode == Opcode::m6502_dcp || opcode == Opcode::m6502_slo ||
+        const bool uses_value = opcode == Opcode::m6502_dcp || opcode == Opcode::m6502_isc || opcode == Opcode::m6502_slo ||
             opcode == Opcode::m6502_rla || opcode == Opcode::m6502_sre || opcode == Opcode::m6502_rra ||
             opcode == Opcode::m6502_adc || opcode == Opcode::m6502_sbc ||
             opcode == Opcode::m6502_and || opcode == Opcode::m6502_ora || opcode == Opcode::m6502_eor ||
@@ -117,7 +117,7 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     };
     auto undocumented_rmw = [&](Opcode opcode, Mode mode) {
         return data_op(opcode, mode, a, false, true, true,
-                       opcode == Opcode::m6502_rla || opcode == Opcode::m6502_rra);
+                       opcode == Opcode::m6502_rla || opcode == Opcode::m6502_rra || opcode == Opcode::m6502_isc);
     };
 
     // Regular ALU family: xx01 encodes the operation in bits 7..5 and the
@@ -147,6 +147,14 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     case 0xdb: return dcp(Mode::absolute_y);
     case 0xc3: return dcp(Mode::indexed_indirect);
     case 0xd3: return dcp(Mode::indirect_indexed);
+    // Stable undocumented NMOS increment-then-subtract family.
+    case 0xe3: return undocumented_rmw(Opcode::m6502_isc, Mode::indexed_indirect);
+    case 0xe7: return undocumented_rmw(Opcode::m6502_isc, Mode::zero_page);
+    case 0xef: return undocumented_rmw(Opcode::m6502_isc, Mode::absolute);
+    case 0xf3: return undocumented_rmw(Opcode::m6502_isc, Mode::indirect_indexed);
+    case 0xf7: return undocumented_rmw(Opcode::m6502_isc, Mode::zero_page_x);
+    case 0xfb: return undocumented_rmw(Opcode::m6502_isc, Mode::absolute_y);
+    case 0xff: return undocumented_rmw(Opcode::m6502_isc, Mode::absolute_x);
     // Stable undocumented NMOS shift/logic combinations, seven forms each.
     case 0x03: return undocumented_rmw(Opcode::m6502_slo, Mode::indexed_indirect);
     case 0x07: return undocumented_rmw(Opcode::m6502_slo, Mode::zero_page);

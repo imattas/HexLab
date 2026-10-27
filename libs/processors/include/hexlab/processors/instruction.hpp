@@ -473,6 +473,8 @@ enum class Opcode {
     m6502_slo, m6502_rla, m6502_sre,
     // Stable undocumented NMOS 6502 rotate-then-add family.
     m6502_rra,
+    // Stable undocumented NMOS 6502 increment-then-subtract family.
+    m6502_isc,
     // Legacy SSSE3 horizontal integer operations; append for persisted IDs.
     phaddw, phaddd, phaddsw, phsubw, phsubd, phsubsw,
     // SSSE3 byte shuffle; appended to preserve persisted opcode IDs.

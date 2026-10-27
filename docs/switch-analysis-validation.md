@@ -261,6 +261,20 @@ prefix. Unsupported base construction, signed-offset tables, cross-block
 values, and delay-slot control flow remain outside this recognizer. No test or
 build was run for this extension; runtime recognition remains unverified.
 
+PPC32 recognizes a straight-line indexed absolute-pointer form ending in
+`LWZX target, tableBase, scaledIndex; MTCTR target; BCTR`. The index must come
+from `MULLI scaledIndex, selector, 4` or the exact `RLWINM` `SLWI selector, 2`
+mask form; the table base must come from decoded
+`ADDIS`/`ADDI`/`ORI` immediate facts in the same block. Table entries are
+four-byte pointers and each accepted destination must decode as executable
+PPC32 code. Instruction immediates covered by relocations are left unresolved,
+and entry relocations are resolved through the existing relocation-aware table
+reader. The scan is capped at 4096 entries and stops at the first unreadable,
+unresolved, or invalid target; without a separately proven bound, the table is
+reported as a verified prefix with unknown case count/default. PPC64, HA/LO
+relocation-paired bases, other index scaling instructions, and cross-block
+register propagation are not recognized by this variant.
+
 For project users, `hexlab_cli project switches <project> --at va:<entry>`
 prints deterministic JSON containing the dispatch/table addresses, selector,
 scale, entry encoding, case indices and targets, optional `case_count` and `default_target`
