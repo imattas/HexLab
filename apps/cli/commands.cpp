@@ -277,7 +277,7 @@ void usage(std::ostream &out) {
            "       hexlab_cli compare <old-image> <new-image> [--window <bytes>] [--anchor <bytes>] [--limit <runs>] [--functions]\n\n"
            "       hexlab_cli modules [--graph] <binary>...  (graph mode traverses dependencies from the first file)\n\n"
            "       hexlab_cli project --help  (persistent projects and editing)\n\n"
-           "       hexlab_cli plugins scan <directory> [--json]  (data-only native plugin discovery)\n\n"
+           "       hexlab_cli plugins scan <directory> [--json] [--strict]  (data-only native plugin discovery)\n\n"
            "       hexlab_cli processors  (supported decoder variants)\n\n"
            "       hexlab_cli archive list <archive>\n"
            "       hexlab_cli archive link-select <archive> --root-object <ET_REL>\n"
@@ -527,17 +527,27 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
 }
 int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
     if (args.size() == 1 && args[0] == L"--help") {
-        out << "Usage: hexlab_cli plugins scan <directory> [--json]\n"
-               "       hexlab_cli plugins dependencies <directory> [--json]\n"
+        out << "Usage: hexlab_cli plugins scan <directory> [--json] [--strict]\n"
+               "       hexlab_cli plugins dependencies <directory> [--json] [--strict]\n"
                "Scans direct native plugin candidates and bounded .hexlab-plugin sidecars without loading modules.\n"
-               "dependencies also reports advisory host/candidate/missing/ambiguous requirement providers.\n";
+               "dependencies also reports advisory host/candidate/missing/ambiguous requirement providers.\n"
+               "--strict returns status 3 after reporting malformed manifests or unresolved requirements.\n";
         return 0;
     }
     const bool dependency_report = !args.empty() && args[0] == L"dependencies";
-    if (args.size() < 2 || (args[0] != L"scan" && !dependency_report) || args.size() > 3 ||
-        (args.size() == 3 && args[2] != L"--json")) {
-        err << "Usage: hexlab_cli plugins scan|dependencies <directory> [--json]\n";
+    if (args.size() < 2 || (args[0] != L"scan" && !dependency_report) || args.size() > 4) {
+        err << "Usage: hexlab_cli plugins scan|dependencies <directory> [--json] [--strict]\n";
         return 2;
+    }
+    bool json = false;
+    bool strict = false;
+    for (std::size_t index = 2; index < args.size(); ++index) {
+        if (args[index] == L"--json" && !json) json = true;
+        else if (args[index] == L"--strict" && !strict) strict = true;
+        else {
+            err << "Plugin scan: unknown or duplicate option\n";
+            return 2;
+        }
     }
     try {
         const auto directory = path_from_wide(args[1]);
@@ -547,7 +557,6 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
             err << "Plugin scan: " << scanned.error().message << '\n';
             return 1;
         }
-        const bool json = args.size() == 3;
         if (dependency_report) {
             struct RequirementRow {
                 plugins::PluginInfo::VersionedCapability capability;
@@ -597,9 +606,22 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
                 }
                 report.push_back(std::move(row));
             }
+            std::size_t failure_count = 0;
+            for (const auto &row : report) {
+                if (!row.candidate->manifest) {
+                    // Without a readable manifest, the dependency set is
+                    // unknown, so a strict preflight cannot call it clean.
+                    ++failure_count;
+                    continue;
+                }
+                for (const auto &requirement : row.requirements)
+                    if (requirement.resolution == "unavailable" || requirement.resolution == "ambiguous")
+                        ++failure_count;
+            }
             if (json) {
                 out << "{\"directory\":" << json_quote(path_text(directory))
-                    << ",\"loaded\":false,\"advisory\":true,\"count\":" << report.size()
+                    << ",\"loaded\":false,\"advisory\":true,\"strict\":" << (strict ? "true" : "false")
+                    << ",\"failure_count\":" << failure_count << ",\"count\":" << report.size()
                     << ",\"candidates\":[";
                 for (std::size_t i = 0; i < report.size(); ++i) {
                     const auto &row = report[i];
@@ -627,7 +649,7 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
                     out << "]}";
                 }
                 out << "]}\n";
-                return 0;
+                return strict && failure_count ? 3 : 0;
             }
             out << "Dependency preflight for " << path_text(directory) << " (advisory; no modules loaded)\n";
             for (const auto &row : report) {
@@ -648,11 +670,18 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
                 }
                 out << '\n';
             }
-            return 0;
+            if (strict) out << "Strict failures: " << failure_count << '\n';
+            return strict && failure_count ? 3 : 0;
         }
+        const auto invalid_manifest_count = static_cast<std::size_t>(std::count_if(
+            scanned.value().begin(), scanned.value().end(), [](const auto &candidate) {
+                return !candidate.manifest && !candidate.manifest_error.empty();
+            }));
         if (json) {
             out << "{\"directory\":" << json_quote(path_text(directory))
-                << ",\"loaded\":false,\"count\":" << scanned.value().size() << ",\"candidates\":[";
+                << ",\"loaded\":false,\"strict\":" << (strict ? "true" : "false")
+                << ",\"invalid_manifest_count\":" << invalid_manifest_count
+                << ",\"count\":" << scanned.value().size() << ",\"candidates\":[";
             for (std::size_t i = 0; i < scanned.value().size(); ++i) {
                 const auto &candidate = scanned.value()[i];
                 if (i) out << ',';
@@ -684,10 +713,11 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
                 out << ",\"manifest_error\":" << json_quote(candidate.manifest_error) << '}';
             }
             out << "]}\n";
-            return 0;
+            return strict && invalid_manifest_count ? 3 : 0;
         }
         out << "Scanned " << scanned.value().size() << " candidate(s) in " << path_text(directory)
             << ". No plugin modules were loaded.\n";
+        if (strict) out << "Invalid manifests: " << invalid_manifest_count << '\n';
         for (const auto &candidate : scanned.value()) {
             out << candidate.path;
             if (candidate.manifest) {
@@ -708,7 +738,7 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
             else out << "\n  No manifest";
             out << '\n';
         }
-        return 0;
+        return strict && invalid_manifest_count ? 3 : 0;
     } catch (const std::exception &error) {
         err << "Plugin scan: " << error.what() << '\n';
         return 1;

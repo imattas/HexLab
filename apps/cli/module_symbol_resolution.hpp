@@ -39,6 +39,21 @@ inline std::optional<std::string> elf_abi_incompatibility(const ElfHeader &impor
     // strong evidence that these objects target different runtime ABIs.
     if (importer.os_abi != 0 && provider.os_abi != 0 && importer.os_abi != provider.os_abi)
         return "conflicting concrete OSABI tags";
+    // The RISC-V psABI requires matching FLOAT_ABI, RVE, and RV64ILP32
+    // fields when objects are combined. RVC and TSO are mergeable fields,
+    // so differing values there do not make supplied modules incompatible.
+    constexpr std::uint16_t em_riscv = 243;
+    if (importer.machine == em_riscv) {
+        constexpr std::uint32_t float_abi_mask = 0x0006;
+        constexpr std::uint32_t rve_mask = 0x0008;
+        constexpr std::uint32_t rv64ilp32_mask = 0x0020;
+        if ((importer.flags & float_abi_mask) != (provider.flags & float_abi_mask))
+            return "conflicting RISC-V floating-point ABI flags";
+        if ((importer.flags & rve_mask) != (provider.flags & rve_mask))
+            return "conflicting RISC-V RVE ABI flags";
+        if ((importer.flags & rv64ilp32_mask) != (provider.flags & rv64ilp32_mask))
+            return "conflicting RISC-V RV64ILP32 ABI flags";
+    }
     return std::nullopt;
 }
 

@@ -35,6 +35,7 @@ private:
     void request_audit_page(std::uint64_t after_step);
     void begin_audit();
     void stop_audit();
+    void record_audit_result(const wxString&);
     void compare_with_previous();
     void save_selected_history();
     void poll_history_save();
@@ -54,6 +55,7 @@ private:
     wxButton* initial_state_ = nullptr;
     wxButton* compare_previous_ = nullptr;
     wxButton* audit_ = nullptr;
+    wxButton* copy_audit_ = nullptr;
     wxButton* navigate_patch_ = nullptr;
     wxButton* save_copy_ = nullptr;
     wxButton* cancel_save_ = nullptr;
@@ -83,6 +85,7 @@ private:
     bool audit_in_progress_ = false;
     std::size_t audit_verified_ = 0;
     std::size_t audit_bytes_ = 0;
+    wxString audit_report_;
 };
 
 } // namespace hexlab::desktop

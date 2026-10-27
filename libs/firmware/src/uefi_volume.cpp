@@ -797,6 +797,7 @@ Result<UefiFirmwareVolume> parse_volume(std::span<const std::byte> bytes, std::s
         if (std::uint64_t(count) > (UINT64_MAX - mapped_bytes) / block_size)
             return Error{ErrorCode::overflow, "UEFI firmware volume block map overflows"};
         mapped_bytes += std::uint64_t(count) * block_size;
+        volume.block_map.push_back({count, block_size});
     }
     if (!map_terminated || mapped_bytes != fv_length)
         return Error{ErrorCode::malformed, "UEFI firmware volume block map does not match its declared length"};

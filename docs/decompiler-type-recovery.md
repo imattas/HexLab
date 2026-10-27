@@ -93,6 +93,14 @@ can still leave an unconstrained variable unknown. This currently covers typed
 IR comparison operators, not architecture flag predicates or register values
 nested inside other arithmetic expressions.
 
+An explicitly signed integer annotation on a register expression or memory
+load also supplies positive signedness evidence and propagates through the
+existing assignment data flow. The IR's default `is_signed == false` is not
+treated as unsigned evidence because most lifted integer expressions use that
+default without classifying signedness. A later unsigned comparison that
+conflicts with already-proven signed evidence suppresses the scalar type rather
+than allowing one interpretation to silently take precedence.
+
 Signedness-aware integer division and remainder operators (`sdiv`, `srem`,
 `udiv`, `urem`, and the AArch64 `a64_sdiv`/`a64_udiv` forms) now provide the
 same evidence for direct register operands. Evidence follows proven

@@ -19,3 +19,9 @@ modules are not queried to confirm that their native descriptors match the
 sidecars. A later explicit load still validates the native descriptor and
 required capabilities against plugins that are actually loaded. Directory
 scanning never loads code.
+
+With `--strict`, the command still emits the complete report but exits with
+status 3 if a candidate has no readable manifest or any requirement is
+unavailable or ambiguous. A unique candidate provider counts as resolved for
+this status check; it is not proof that the module will load or satisfy the
+ABI.
