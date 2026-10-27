@@ -25,6 +25,16 @@ I/O, treats an empty reply as unsupported, and accepts only a `C`-prefixed
 hexadecimal value that fits in 32 bits. The API does not inspect the target
 memory map, so callers remain responsible for selecting a readable range.
 
+`rsp::Client::search_memory(address, length, pattern)` uses the standard
+`qSearch:memory` packet to locate the first exact byte sequence in a target
+range. The range and pattern must be non-empty and must fit the configured and
+negotiated packet limits; packet escaping is included in that limit. A match is
+returned as an address, no match as an empty optional, and an empty remote reply
+as `unsupported`. Replies with malformed addresses or a match outside the
+requested range are rejected. This API does not fall back to downloading the
+range, so it does not add network traffic proportional to the searched size.
+See the [GDB qSearch:memory packet reference](https://sourceware.org/gdb/current/onlinedocs/gdb.html/General-Query-Packets.html).
+
 ## Launching on a connected remote target
 
 In a live RSP session, the existing **Launch** command can start a new remote

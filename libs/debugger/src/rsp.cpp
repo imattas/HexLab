@@ -1056,6 +1056,40 @@ Result<std::vector<std::byte>> Client::read_memory(std::uint64_t address, std::s
     if (bytes.value().size() != size) return Error{ErrorCode::malformed, "RSP memory reply has unexpected length"};
     return bytes;
 }
+Result<std::optional<std::uint64_t>> Client::search_memory(std::uint64_t address,
+    std::uint64_t length, std::span<const std::byte> pattern, std::stop_token stop) {
+    if (length == 0 || address > UINT64_MAX - length || pattern.empty())
+        return Error{ErrorCode::invalid_argument, "RSP memory search range or pattern is empty or overflows"};
+    std::string command = "qSearch:memory:" + hex_u64(address) + ";" + hex_u64(length) + ";";
+    command.append(reinterpret_cast<const char*>(pattern.data()), pattern.size());
+    const auto packet_limit = std::min(max_packet_, peer_packet_size_);
+    // RSP escaping can double every pattern byte ($, #, }, *).
+    std::size_t wire_size = command.size();
+    for (const auto byte : pattern) {
+        const auto value = std::to_integer<unsigned char>(byte);
+        if (value == '$' || value == '#' || value == '}' || value == '*') {
+            if (wire_size == std::numeric_limits<std::size_t>::max())
+                return Error{ErrorCode::resource_limit, "RSP memory search packet exceeds limit"};
+            ++wire_size;
+        }
+    }
+    if (wire_size > packet_limit)
+        return Error{ErrorCode::resource_limit, "RSP memory search packet exceeds negotiated limit"};
+    auto response = transact(command, stop);
+    if (!response) return response.error();
+    if (response.value().empty())
+        return Error{ErrorCode::unsupported, "remote does not support qSearch:memory"};
+    if (response.value() == "0") return std::optional<std::uint64_t>{};
+    constexpr std::string_view found = "1,";
+    std::uint64_t match = 0;
+    if (!std::string_view(response.value()).starts_with(found) ||
+        !parse_hex(std::string_view(response.value()).substr(found.size()), match))
+        return Error{ErrorCode::malformed, "invalid RSP qSearch:memory reply"};
+    const auto last_start = address + length - std::min<std::uint64_t>(length, pattern.size());
+    if (pattern.size() > length || match < address || match > last_start)
+        return Error{ErrorCode::malformed, "RSP qSearch:memory returned an address outside the range"};
+    return std::optional<std::uint64_t>(match);
+}
 Result<std::uint32_t> Client::memory_crc32(std::uint64_t address, std::uint64_t length, std::stop_token stop) {
     if (length == 0 || address > UINT64_MAX - length)
         return Error{ErrorCode::invalid_argument, "RSP CRC range is empty or overflows the address space"};

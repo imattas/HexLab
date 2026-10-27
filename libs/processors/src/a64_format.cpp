@@ -65,10 +65,22 @@ std::string format(const Instruction &i) {
          i.opcode == Opcode::a64_csinv || i.opcode == Opcode::a64_csneg) && i.operands.size() == 3) {
         static constexpr const char *conditions[]{"eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc",
                                                    "hi", "ls", "ge", "lt", "gt", "le", "al", "nv"};
+        const auto *destination = std::get_if<RegisterOperand>(&i.operands[0]);
+        const auto *left = std::get_if<RegisterOperand>(&i.operands[1]);
+        const auto *right = std::get_if<RegisterOperand>(&i.operands[2]);
+        if (!destination || !left || !right) return "?a64-csel";
+        // CSET/CSETM are aliases for CSINC/CSINV with both sources ZR and
+        // the condition inverted. Restrict the alias to real predicates;
+        // AL/NV are retained in their architectural instruction spelling.
+        if (i.condition < 14 && left->bank == RegisterBank::arm64_zero &&
+            right->bank == RegisterBank::arm64_zero &&
+            (i.opcode == Opcode::a64_csinc || i.opcode == Opcode::a64_csinv)) {
+            const auto alias = i.opcode == Opcode::a64_csinc ? "cset " : "csetm ";
+            return std::string(alias) + register_name(*destination) + ", " +
+                   conditions[i.condition ^ 1];
+        }
         std::string result = mnemonic(i.opcode, i.condition);
-        for (const auto &operand : i.operands) {
-            const auto *reg = std::get_if<RegisterOperand>(&operand);
-            if (!reg) return "?a64-csel";
+        for (const auto *reg : {destination, left, right}) {
             result += result.find(' ') == std::string::npos ? " " : ", ";
             result += register_name(*reg);
         }
