@@ -445,3 +445,12 @@ emits a typed unary intrinsic with signed input and unsigned result lane types.
 These forms follow Intel's [packed absolute-value instruction definition](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf)
 and Ghidra's [AVX](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/x86/data/languages/avx.sinc#L1397-L1417)
 and [AVX2 SLEIGH definitions](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/x86/data/languages/avx2.sinc#L17-L36).
+
+The original 128-bit packed-integer evaluator now covers the already-decoded
+`PMINUB`, `PMAXUB`, `PMINSW`, `PMAXSW`, `PMULLW`, `PMULHW`, `PMULHUW`,
+`PMULUDQ`, and `PMADDWD` forms. It computes byte/word min/max, low or high
+word-product halves, the even-dword unsigned products, and adjacent signed
+word-product sums with architectural lane ordering and widths. The API remains
+fail-closed on unsupported opcodes and malformed/non-128-bit operand shapes;
+callers supply memory bytes. See [SSE2 packed integer semantics](x86-sse2-integer-semantics.md)
+for the precise subset.

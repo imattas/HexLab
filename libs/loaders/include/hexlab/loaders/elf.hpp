@@ -104,6 +104,34 @@ struct ElfRuntimeSymbolBinding {
     // is marked as the default version in the dependency's versym table.
     bool default_version = false;
 };
+// One caller-owned dependency-manifest entry. Names and aliases are compared
+// byte-for-byte with DT_NEEDED; this API never searches directories or opens
+// paths named by the input image.
+struct ElfLibraryManifestEntry {
+    std::string library_name;
+    std::vector<std::string> aliases;
+};
+enum class ElfLibraryResolutionState { resolved, missing, ambiguous };
+struct ElfLibraryResolution {
+    std::string needed_name;
+    ElfLibraryResolutionState state = ElfLibraryResolutionState::missing;
+    // Index into the caller's manifest when state is resolved.
+    std::optional<std::size_t> manifest_index;
+    // Sorted manifest indexes, retained to explain ambiguous matches.
+    std::vector<std::size_t> candidates;
+};
+struct ElfLibraryResolutionLimits {
+    std::size_t max_needed = 4096;
+    std::size_t max_manifest_entries = 16384;
+    std::size_t max_manifest_names = 65536;
+    std::size_t max_name_bytes = 4096;
+};
+// Resolves the image's ordered DT_NEEDED entries against a caller-provided
+// manifest using exact canonical-name/alias matches. Duplicate declarations
+// are reported once in DT_NEEDED order. No filesystem access occurs.
+HEXLAB_LOADERS_EXPORT Result<std::vector<ElfLibraryResolution>> resolve_elf_needed_libraries(
+    const LoadedImage &, std::span<const ElfLibraryManifestEntry>, std::stop_token = {},
+    ElfLibraryResolutionLimits = {});
 struct ElfRuntimeRelocationLimits {
     std::size_t max_records = 4'000'000;
     std::size_t max_symbol_bindings = 65'536;

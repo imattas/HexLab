@@ -445,11 +445,11 @@ void ProjectActions::command(wxCommandEvent &event) {
             controller_.documents().report_error(*id, result.error());
     };
     if (event.GetId() == find_next_id) {
-        accepted(controller_.find_next(*id));
+        accepted(controller_.all_search_scope() ? controller_.find_next_all(*id) : controller_.find_next(*id));
         return;
     }
     if (event.GetId() == find_previous_id) {
-        accepted(controller_.find_previous(*id));
+        accepted(controller_.all_search_scope() ? controller_.find_previous_all(*id) : controller_.find_previous(*id));
         return;
     }
     auto availability = action_availability(

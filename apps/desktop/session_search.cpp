@@ -137,6 +137,58 @@ Result<bool> SessionController::find_previous(DocumentId id) {
     }
     return Error{ErrorCode::out_of_bounds, "No previous search result"};
 }
+Result<bool> SessionController::find_next_all(DocumentId id) {
+    auto current = find_next(id);
+    if (current || current.error().code != ErrorCode::out_of_bounds)
+        return current;
+    bool saw_pending = false;
+    for (const auto &document : manager_->documents()) {
+        if (document.id == id || !manager_->project(document.id))
+            continue;
+        if (search_pending(document.id)) {
+            saw_pending = true;
+            continue;
+        }
+        auto history = manager_->search_history(document.id);
+        if (!history || !history->query())
+            continue;
+        if (auto match = history->next()) {
+            auto moved = manager_->navigate(document.id, hit_location(*match));
+            if (!moved)
+                return moved.error();
+            changed_();
+            return true;
+        }
+        if (history->continuation())
+            return more_results(document.id, true);
+    }
+    return saw_pending ? Result<bool>(Error{ErrorCode::busy, "Waiting for another document's search page"})
+                       : Result<bool>(Error{ErrorCode::out_of_bounds, "No next search result in open documents"});
+}
+Result<bool> SessionController::find_previous_all(DocumentId id) {
+    auto current = find_previous(id);
+    if (current || current.error().code != ErrorCode::out_of_bounds)
+        return current;
+    const auto documents = manager_->documents();
+    for (auto it = documents.rbegin(); it != documents.rend(); ++it) {
+        if (it->id == id || !manager_->project(it->id))
+            continue;
+        auto history = manager_->search_history(it->id);
+        if (!history || !history->query())
+            continue;
+        auto match = history->size() ? (history->selected_index() ? history->previous()
+                                                                  : history->select(history->size() - 1))
+                                     : std::optional<SearchMatch>{};
+        if (match) {
+            auto moved = manager_->navigate(it->id, hit_location(*match));
+            if (!moved)
+                return moved.error();
+            changed_();
+            return true;
+        }
+    }
+    return Error{ErrorCode::out_of_bounds, "No previous loaded search result in open documents"};
+}
 bool SessionController::search_pending(DocumentId id) const {
     auto found = searches_.find(id.value);
     return found != searches_.end() && found->second.pending;

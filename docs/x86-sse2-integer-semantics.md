@@ -18,4 +18,15 @@ until the IR has a native vector type and vector-expression operators.
 The evaluator does not fetch memory, model XMM register state, update flags, or
 implement floating-point SIMD. Those remain responsibilities of the caller or
 future subsystems. This slice covers the currently decoded packed integer
-arithmetic, logic, and comparison forms only.
+arithmetic, logic, comparison, horizontal arithmetic, byte shuffle, min/max,
+and multiply forms.
+
+The evaluator also handles decoded `PMINUB`, `PMAXUB`, `PMINSW`, `PMAXSW`,
+`PMULLW`, `PMULHW`, `PMULHUW`, `PMULUDQ`, and `PMADDWD`. The first four
+operate independently on eight byte or word lanes; the word multiplies return
+the low, signed high, or unsigned high half of each 16-by-16-bit product.
+`PMULUDQ` multiplies source dwords 0 and 2 into two qword results, while
+`PMADDWD` sums adjacent signed word products into four wrapping dword results.
+The evaluator still rejects any opcode outside its closed list and requires
+the decoded 128-bit XMM/memory operand shape; it does not infer an operation
+from a mnemonic or fetch memory itself.
