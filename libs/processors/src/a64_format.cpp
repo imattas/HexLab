@@ -183,6 +183,14 @@ std::string format(const Instruction &i) {
                                                            : static_cast<std::uint64_t>(memory->displacement));
                 continue;
             }
+            if (memory->ip_relative) {
+                result += memory->resolved_address ? "[" + hex(memory->resolved_address->offset) + "]"
+                                                   : "[pc" + std::string(memory->displacement < 0 ? " - #" : " + #") +
+                                                         hex(memory->displacement < 0
+                                                                 ? static_cast<std::uint64_t>(-(memory->displacement + 1)) + 1
+                                                                 : static_cast<std::uint64_t>(memory->displacement)) + "]";
+                continue;
+            }
             result += "[" + (memory->base ? register_name(*memory->base) : std::string("?base"));
             if (memory->index) {
                 result += ", ";

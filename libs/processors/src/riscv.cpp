@@ -818,6 +818,12 @@ bool decode_fp_op(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
         const bool to_double = (f7 & 1) != 0;
         ok=set(to_double ? RiscvOpcode::fcvt_d_s : RiscvOpcode::fcvt_s_d, true, true, !to_double);
     }
+    else if (operation == 0x20 && (rs2 == 4 || rs2 == 5)) {
+        const bool exact = rs2 == 5;
+        ok = set(d ? (exact ? RiscvOpcode::froundnx_d : RiscvOpcode::fround_d)
+                   : (exact ? RiscvOpcode::froundnx_s : RiscvOpcode::fround_s), true, true);
+        unary = true;
+    }
     if (!ok) return false;
     if (dst_fp) fp_rd(); else gpr_rd();
     if (src1_fp) fp_rs1(); else gpr_rs1();

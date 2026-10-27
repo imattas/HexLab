@@ -70,6 +70,11 @@ status register effect. FCVT.D.W/WU are exact and leave flags untouched.
 FCVT and FCLASS lifting preserves integer signedness, low-word truncation,
 RV64 W/WU result sign extension, rounding inputs only where the ISA uses them, and separate
 conservative exception formulas; see `riscv-decompiler.md` for encodings.
+The Zfa FROUND.S/D and FROUNDNX.S/D round-to-integral forms are decoded with
+their selected rounding mode and lifted as typed floating-point intrinsics.
+FROUND accounts for invalid on signaling NaN; FROUNDNX also accounts for
+inexact when the input changes. These remain symbolic because this slice does
+not evaluate IEEE-754 values or NaN payloads.
 RV64F NaN-boxing is not modeled. The decoder does not
 evaluate IEEE-754 results, select runtime `frm`, or compute precise exception
 flags. Q-format operations, compressed floating forms, and RV32-only absent

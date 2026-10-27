@@ -92,7 +92,9 @@ enum class RiscvOpcode {
     // Scalar Zfa conversion appended to preserve existing opcode IDs.
     fcvtmod_w_d,
     // Scalar Zfa immediate floating constants; appended for numeric ID stability.
-    fli_s, fli_d
+    fli_s, fli_d,
+    // Zfa round-to-integral forms, appended for stable decoder IDs.
+    fround_s, froundnx_s, fround_d, froundnx_d
 };
 
 struct RiscvRegister {

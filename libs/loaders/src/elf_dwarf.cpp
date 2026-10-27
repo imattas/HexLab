@@ -120,17 +120,21 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
             require(rel.addend.has_value(), "DWARF RELA relocation has no explicit addend");
             addend = *rel.addend;
         } else {
-            // These ELF32 absolute REL forms encode an unsigned word addend
-            // directly in the target section. Keep the implicit-addend
-            // support limited to forms whose field semantics are unambiguous.
+            // These absolute REL forms encode an addend directly in the
+            // target section. Keep implicit-addend support limited to forms
+            // whose field signedness is unambiguous.
             const bool unsigned_word_rel = width == 4 &&
                 ((i386 && rel.type == 1) || (arm32 && rel.type == 2) ||
                  (riscv && !metadata.header.is_64 && rel.type == 1));
-            require(unsigned_word_rel, "unsupported implicit-addend DWARF relocation", ErrorCode::unsupported);
+            const bool signed_x64_32s_rel = x64 && rel.type == 11 && width == 4;
+            require(unsigned_word_rel || signed_x64_32s_rel,
+                    "unsupported implicit-addend DWARF relocation", ErrorCode::unsupported);
             std::uint32_t value = 0;
             for (std::uint8_t i = 0; i < width; ++i)
                 value |= std::uint32_t(target[static_cast<std::size_t>(rel.offset) + i]) << (8 * i);
-            addend = value;
+            addend = signed_x64_32s_rel && value > INT32_MAX
+                         ? -1 - static_cast<std::int64_t>(UINT32_MAX - value)
+                         : static_cast<std::int64_t>(value);
         }
         const auto max_value = width == 8 ? UINT64_MAX : std::uint64_t(UINT32_MAX);
         std::uint64_t sum = symbol->value;
