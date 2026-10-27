@@ -53,11 +53,13 @@ load/store forms, 32-bit Thumb MOVW/MOVT, and ARM data-processing immediates
 that do not write PC. It also follows A32 B/BL (including known NZCV
 conditions), A32 BX/BLX register, Thumb 16-bit B/B<cond>, and Thumb BX/BLX
 register. Branch targets and ARM/Thumb interworking are derived from the
-stopped context; unconditional Thumb-2 B.W is also decoded with its T4
-J1/J2-immediate transformation and 25-bit signed displacement. BL/BLX,
-conditional wide branches, PC-relative register branches, other PC-writing
-instructions, unknown encodings, and a successor overlapping a user breakpoint
-remain unsupported. A Thumb branch in an active IT block is
+stopped context; unconditional Thumb-2 B.W is decoded with its T4
+J1/J2-immediate transformation and 25-bit signed displacement, and conditional
+Thumb-2 B<cond>.W uses the T3 direct J1/J2 fields and signed 21-bit
+displacement. Conditional wide branches require a valid condition and, inside
+an IT block, a matching final-slot predicate. BL/BLX, PC-relative register
+branches, other PC-writing instructions, unknown encodings, and a successor
+overlapping a user breakpoint remain unsupported. A Thumb branch in an active IT block is
 accepted only in the final slot, and the IT predicate is applied before
 choosing its destination; conditional branches in IT must match the active IT
 condition. Sequential instructions may be stepped from any IT

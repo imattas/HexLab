@@ -2610,6 +2610,45 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                         result.immediate_targets[{fact->id, 2}] = *target;
                 }
                 propagated = true;
+            } else if (instruction.opcode == Opcode::a64_ubfm && instruction.operands.size() == 4) {
+                // Recover the common UBFM aliases used to make a known value
+                // address-sized: LSR and UBFX. Other wrapped bitfield forms
+                // have distinct placement semantics and remain conservative.
+                const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+                const auto *source = std::get_if<RegisterOperand>(&instruction.operands[1]);
+                const auto rotate = immediate_value(instruction, 2);
+                const auto most_significant = immediate_value(instruction, 3);
+                const auto width = destination ? destination->width : 0;
+                const bool valid = destination && destination->bank == RegisterBank::arm64_gpr &&
+                    destination->index != 31 && (width == 32 || width == 64) && source &&
+                    source->width == width &&
+                    ((source->bank == RegisterBank::arm64_gpr && source->index != 31) ||
+                     (source->bank == RegisterBank::arm64_zero && source->index == 31)) &&
+                    rotate && most_significant && *rotate >= 0 && *most_significant >= 0 &&
+                    *rotate < width && *most_significant < width && *most_significant >= *rotate;
+                std::optional<Address> value;
+                if (valid) {
+                    std::optional<std::uint64_t> input;
+                    if (source->bank == RegisterBank::arm64_zero) input = 0;
+                    else if (const auto found = registers.find(source->index);
+                             found != registers.end() && found->second.space == instruction.address.space)
+                        input = found->second.offset;
+                    if (input) {
+                        const auto field_width = static_cast<unsigned>(*most_significant - *rotate + 1);
+                        const auto mask = field_width == 64 ? UINT64_MAX :
+                            ((UINT64_C(1) << field_width) - 1);
+                        auto result_value = (*input >> static_cast<unsigned>(*rotate)) & mask;
+                        if (width == 32) result_value &= UINT64_C(0xffffffff);
+                        value = Address{instruction.address.space, result_value};
+                    }
+                }
+                erase_written();
+                if (valid && value) {
+                    registers[destination->index] = *value;
+                    if (riscv_target_segment(*image, *value, OperandAccess::address))
+                        result.immediate_targets[{fact->id, 3}] = *value;
+                }
+                propagated = true;
             } else if ((instruction.opcode == Opcode::a64_and || instruction.opcode == Opcode::a64_orr ||
                         instruction.opcode == Opcode::a64_eor || instruction.opcode == Opcode::a64_ands) &&
                        instruction.operands.size() == 3) {

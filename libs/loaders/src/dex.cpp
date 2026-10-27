@@ -878,6 +878,15 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
                 if((code_off&3)||code_off<data_off||code_off>=std::uint64_t(data_off)+data_size||!extent(code_off,1,16,file_size))return Error{ErrorCode::malformed,"DEX code_item header offset is invalid"};
                 Reader cr{bytes};cr.seek(code_off);std::uint16_t registers=0,ins=0,outs=0,tries=0;std::uint32_t debug=0,insns=0;
                 if(!cr.u16(registers)||!cr.u16(ins)||!cr.u16(outs)||!cr.u16(tries)||!cr.u32(debug)||!cr.u32(insns)||ins>registers||!extent(cr.pos,insns,2,file_size))return Error{ErrorCode::malformed,"DEX code_item header or instruction extent is invalid"};
+                const auto &method = methods[method_idx];
+                const auto &prototype = protos[method.proto];
+                std::uint32_t expected_ins = (flags & 0x8u) ? 0u : 1u;
+                for (const auto parameter_type : prototype.parameters) {
+                    const auto &descriptor = types[parameter_type];
+                    expected_ins += (descriptor == "J" || descriptor == "D") ? 2u : 1u;
+                }
+                if (ins != expected_ins)
+                    return Error{ErrorCode::malformed, "DEX code_item ins_size does not match the method prototype and static flag"};
                 if(debug&&(debug<data_off||debug>=std::uint64_t(data_off)+data_size))return Error{ErrorCode::malformed,"DEX debug_info offset is outside data section"};
                 total_code_units+=insns;if(total_code_units>UINT32_MAX/2)return Error{ErrorCode::resource_limit,"DEX mapped code exceeds the method address-space budget"};
                 const auto insns_off=cr.pos; cr.skip(std::size_t(insns)*2);
