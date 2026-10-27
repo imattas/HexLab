@@ -1,4 +1,5 @@
 #include "hexlab/firmware/uefi_capsule.hpp"
+#include "hexlab/firmware/uefi_volume.hpp"
 #include <algorithm>
 #include <limits>
 #include <utility>
@@ -62,6 +63,11 @@ Result<UefiCapsule> parse_uefi_fmp_capsule(std::span<const std::byte> bytes,
         offsets.push_back(offset);
     }
     result.items.reserve(count);
+    std::size_t embedded_volumes_used = 0;
+    std::size_t embedded_files_used = 0;
+    std::size_t embedded_sections_used = 0;
+    std::size_t embedded_scans_used = 0;
+    std::uint64_t embedded_decompressed_used = 0;
     for (std::size_t i = 0; i < count; ++i) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "UEFI capsule parsing canceled"};
         const std::uint64_t item_start = offsets[i];
@@ -92,6 +98,72 @@ Result<UefiCapsule> parse_uefi_fmp_capsule(std::span<const std::byte> bytes,
             if (content_size != item.size) return malformed("FMP image and vendor-code sizes do not match item extent");
             item.payload_offset = item.file_offset + item.image_header_size;
             item.vendor_code_offset = item.payload_offset + item.update_image_size;
+
+            if (item.update_image_size >= 56 && embedded_scans_used < options.max_embedded_payload_scans &&
+                embedded_volumes_used < options.max_embedded_volumes &&
+                embedded_files_used < options.max_embedded_files &&
+                embedded_sections_used < options.max_embedded_sections &&
+                embedded_decompressed_used < options.max_embedded_decompressed_bytes) {
+                const auto scan_limit = options.max_embedded_decompressed_bytes / options.max_embedded_payload_scans;
+                const auto payload = bytes.subspan(static_cast<std::size_t>(item.payload_offset),
+                                                   item.update_image_size);
+                UefiVolumeParseOptions volume_options;
+                volume_options.max_input_bytes = options.max_input_bytes;
+                volume_options.max_volumes = options.max_embedded_volumes - embedded_volumes_used;
+                volume_options.max_files = options.max_embedded_files - embedded_files_used;
+                volume_options.max_sections = options.max_embedded_sections - embedded_sections_used;
+                volume_options.max_total_decompressed_bytes = std::min(
+                    scan_limit, options.max_embedded_decompressed_bytes - embedded_decompressed_used);
+                ++embedded_scans_used;
+                item.embedded_volume_scan_attempted = true;
+                auto volumes = parse_uefi_firmware_volumes(payload, volume_options, stop);
+                if (!volumes) {
+                    if (volumes.error().code == ErrorCode::canceled) return volumes.error();
+                    if (volumes.error().code != ErrorCode::unsupported) {
+                        item.embedded_volume_scan_complete = false;
+                        item.embedded_volume_diagnostic = volumes.error().message;
+                    }
+                } else {
+                    for (const auto &volume : volumes.value()) {
+                        std::size_t sections = 0;
+                        std::uint64_t decompressed_bytes = 0;
+                        for (const auto &file : volume.files) {
+                            sections += file.sections.size();
+                            for (const auto &section : file.sections) {
+                                if (section.decompression_succeeded && section.uncompressed_size)
+                                    decompressed_bytes += *section.uncompressed_size;
+                            }
+                        }
+                        if (embedded_volumes_used == options.max_embedded_volumes ||
+                            volume.files.size() > options.max_embedded_files - embedded_files_used ||
+                            sections > options.max_embedded_sections - embedded_sections_used ||
+                            decompressed_bytes > options.max_embedded_decompressed_bytes - embedded_decompressed_used) {
+                            item.embedded_volume_scan_complete = false;
+                            item.embedded_volume_diagnostic = "embedded firmware-volume inventory budget exceeded";
+                            break;
+                        }
+                        UefiCapsuleEmbeddedVolume embedded;
+                        embedded.file_offset = item.payload_offset + volume.file_offset;
+                        embedded.size = volume.length;
+                        embedded.file_system_guid = volume.file_system_guid;
+                        embedded.revision = volume.revision;
+                        embedded.file_count = volume.files.size();
+                        embedded.section_count = sections;
+                        embedded.decompressed_bytes = decompressed_bytes;
+                        embedded.header_checksum_valid = volume.header_checksum_valid;
+                        item.embedded_volumes.push_back(embedded);
+                        ++embedded_volumes_used;
+                        embedded_files_used += volume.files.size();
+                        embedded_sections_used += sections;
+                        embedded_decompressed_used += decompressed_bytes;
+                    }
+                }
+            } else if (item.update_image_size >= 56) {
+                item.embedded_volume_scan_complete = false;
+                item.embedded_volume_diagnostic = embedded_scans_used >= options.max_embedded_payload_scans
+                    ? "embedded firmware-volume payload scan count limit reached"
+                    : "embedded firmware-volume inventory budget exhausted";
+            }
         }
         result.items.push_back(item);
     }
@@ -108,6 +180,11 @@ Result<UefiCapsuleList> parse_uefi_fmp_capsule_list(
 
     UefiCapsuleList result;
     result.capsules.reserve(capsules.size());
+    std::size_t embedded_volumes_used = 0;
+    std::size_t embedded_files_used = 0;
+    std::size_t embedded_sections_used = 0;
+    std::size_t embedded_scans_used = 0;
+    std::uint64_t embedded_decompressed_used = 0;
     for (const auto capsule_bytes : capsules) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "UEFI capsule-list parsing canceled"};
         if (result.total_input_bytes > options.max_input_bytes ||
@@ -119,11 +196,25 @@ Result<UefiCapsuleList> parse_uefi_fmp_capsule_list(
         auto capsule_options = options;
         capsule_options.max_input_bytes = options.max_input_bytes - result.total_input_bytes;
         capsule_options.max_items = options.max_items - result.total_item_count;
+        capsule_options.max_embedded_volumes = options.max_embedded_volumes - embedded_volumes_used;
+        capsule_options.max_embedded_files = options.max_embedded_files - embedded_files_used;
+        capsule_options.max_embedded_sections = options.max_embedded_sections - embedded_sections_used;
+        capsule_options.max_embedded_payload_scans = options.max_embedded_payload_scans - embedded_scans_used;
+        capsule_options.max_embedded_decompressed_bytes = options.max_embedded_decompressed_bytes - embedded_decompressed_used;
         auto parsed = parse_uefi_fmp_capsule(capsule_bytes, capsule_options, stop);
         if (!parsed) return parsed.error();
         if (result.capsules.empty()) result.capsule_guid = parsed.value().capsule_guid;
         result.total_input_bytes += capsule_bytes.size();
         result.total_item_count += parsed.value().items.size();
+        for (const auto &item : parsed.value().items) {
+            embedded_volumes_used += item.embedded_volumes.size();
+            if (item.embedded_volume_scan_attempted) ++embedded_scans_used;
+            for (const auto &volume : item.embedded_volumes) {
+                embedded_files_used += volume.file_count;
+                embedded_sections_used += volume.section_count;
+                embedded_decompressed_used += volume.decompressed_bytes;
+            }
+        }
         result.capsules.push_back(std::move(parsed.value()));
     }
     return result;

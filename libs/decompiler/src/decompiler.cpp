@@ -8348,7 +8348,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                                cursor != header && cursor != entry && cursor != exit_block &&
                                                !loop_body_ids.contains(cursor->id.value) &&
                                                !inner_ids.contains(cursor->id.value) &&
-                                               path.size() < 128 && seen.insert(cursor->id.value).second) {
+                                               path.size() < 256 && seen.insert(cursor->id.value).second) {
                                             if (!cursor->phis.empty() || cursor->switch_dispatch ||
                                                 contains_return(*cursor) || !has_only_simple_statements(*cursor) ||
                                                 cursor->memory_phi || !cursor->memory_partition_phis.empty() ||
