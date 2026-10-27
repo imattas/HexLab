@@ -19,3 +19,7 @@ metadata are unchanged and the invalidation plan does not require a full
 rebuild. A nonempty dirty set, changed decisions, changed mapping/metadata, or
 an unverified byte revision follows the existing reanalysis path. Re-indexing
 reference rows still costs time and memory proportional to the reference count.
+
+Dependency-index construction and invalidation closure expansion check the
+stop token while traversing each prerequisite or dependent edge. This keeps
+cancellation responsive even when a single fact has unusually high fan-out.

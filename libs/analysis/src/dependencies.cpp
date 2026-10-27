@@ -13,7 +13,7 @@ Result<std::shared_ptr<const DependencyIndex>> DependencyIndex::create(std::span
         for(auto& fact:index->facts_){
             if(stop.stop_requested())return Error{ErrorCode::canceled,"Dependency indexing canceled"};
             std::sort(fact.prerequisites.begin(),fact.prerequisites.end());fact.prerequisites.erase(std::unique(fact.prerequisites.begin(),fact.prerequisites.end()),fact.prerequisites.end());
-            for(auto key:fact.prerequisites){if(!keys.contains(key))return Error{ErrorCode::invalid_argument,"Dependency references an unknown fact"};index->dependents_[key].push_back(fact.fact);}
+            for(auto key:fact.prerequisites){if(stop.stop_requested())return Error{ErrorCode::canceled,"Dependency indexing canceled"};if(!keys.contains(key))return Error{ErrorCode::invalid_argument,"Dependency references an unknown fact"};index->dependents_[key].push_back(fact.fact);}
             for(auto range:fact.reads.ranges()){
                 if(stop.stop_requested())return Error{ErrorCode::canceled,"Dependency indexing canceled"};
                 auto end=checked_add(range.begin.value,range.size);if(!end)return end.error();
@@ -53,7 +53,7 @@ Result<std::vector<FactKey>> DependencyIndex::affected(const ReadSet& ranges,std
                 if(interval.end>changed.begin.value && visited.insert(interval.fact).second)pending.push_back(interval.fact);
             }
         }
-        while(!pending.empty()){if(stop.stop_requested())return Error{ErrorCode::canceled,"Dependency invalidation canceled"};const auto key=pending.front();pending.pop_front();auto found=dependents_.find(key);if(found==dependents_.end())continue;for(auto dependent:found->second)if(visited.insert(dependent).second)pending.push_back(dependent);}
+        while(!pending.empty()){if(stop.stop_requested())return Error{ErrorCode::canceled,"Dependency invalidation canceled"};const auto key=pending.front();pending.pop_front();auto found=dependents_.find(key);if(found==dependents_.end())continue;for(auto dependent:found->second){if(stop.stop_requested())return Error{ErrorCode::canceled,"Dependency invalidation canceled"};if(visited.insert(dependent).second)pending.push_back(dependent);}}
         return std::vector<FactKey>{visited.begin(),visited.end()};
     }catch(const std::bad_alloc&){return Error{ErrorCode::resource_limit,"Cannot allocate dependency closure"};}
 }

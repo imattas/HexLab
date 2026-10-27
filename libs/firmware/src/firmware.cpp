@@ -115,6 +115,8 @@ Result<FirmwareImage> parse_intel_hex(std::string_view text, ParseOptions option
             base = type == 2 ? value << 4 : value << 16;
         } else if (type == 3 || type == 5) {
             if (b[0] != 4 || offset != 0) return fail(ErrorCode::malformed, lines.number, "start-address record must contain four bytes at address zero");
+            if (builder.image.has_start_address)
+                return fail(ErrorCode::malformed, lines.number, "multiple Intel HEX start-address records");
             std::uint64_t entry = 0; for (auto v : data) entry = (entry << 8) | v;
             if (type == 3) entry = ((entry >> 16) << 4) + (entry & 0xffff);
             builder.image.start_address = entry; builder.image.has_start_address = true;
@@ -155,6 +157,8 @@ Result<FirmwareImage> parse_s_record(std::string_view text, ParseOptions options
         const std::size_t data_size = b[0] - address_bytes - 1;
         const std::span<const std::uint8_t> data(b.data() + 1 + address_bytes, data_size);
         if (type >= 1 && type <= 3) {
+            if (count_seen)
+                return fail(ErrorCode::malformed, lines.number, "data record appears after S-record count");
             auto added = builder.add(address, data, lines.number, records); if (!added) return added.error();
             ++data_records; last_data_type = type;
         } else if (type == 5 || type == 6) {
@@ -168,7 +172,15 @@ Result<FirmwareImage> parse_s_record(std::string_view text, ParseOptions options
             builder.image.start_address = address; builder.image.has_start_address = true;
             builder.image.termination = Termination::start_record; terminated = true;
         } else if (type == 0) {
-            // S0 carries optional text metadata; it contributes no program bytes.
+            // S0 is optional metadata and must lead the data sequence. Preserve
+            // its raw bytes and source identity, but never map it as data.
+            if (builder.image.has_s_record_header || data_records || count_seen)
+                return fail(ErrorCode::malformed, lines.number, "S0 header must be unique and precede data/count records");
+            builder.image.has_s_record_header = true;
+            builder.image.s_record_header_provenance = {lines.number, records};
+            builder.image.s_record_header.reserve(data.size());
+            for (const auto byte : data)
+                builder.image.s_record_header.push_back(static_cast<std::byte>(byte));
         }
     }
     if (canceled(stop)) return Error{ErrorCode::canceled, "firmware parsing canceled"};
