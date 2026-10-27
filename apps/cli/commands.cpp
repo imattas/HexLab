@@ -298,7 +298,7 @@ void usage(std::ostream &out) {
            "  --plugin <module>  (load a native plugin for detection and display decoding; repeatable)\n"
            "  --pdb <file> --pdb-search <directory>  (local PE PDB binding; no network lookup)\n"
            "  --dwarf-supplementary-package <file>  (explicit ELF DWARF v5 supplementary DWP; no filename lookup)\n"
-           "Analysis options:\n  --instruction-budget <count> --string-budget <count>\n"
+           "Analysis options:\n  --instruction-budget <count> --string-budget <count> --show-strings\n"
            "  --min-string-length <count>\n"
            "Addresses use decimal or 0x-prefixed hexadecimal. Use -- before an option-like path.\n";
 }
@@ -1102,8 +1102,25 @@ std::uint64_t number(std::wstring_view text) {
         argument_error(value.error().message);
     return value.value();
 }
+std::string_view string_encoding_label(StringEncoding encoding) {
+    switch (encoding) {
+    case StringEncoding::ascii: return "ASCII";
+    case StringEncoding::utf16le: return "UTF-16LE";
+    case StringEncoding::utf8: return "UTF-8";
+    case StringEncoding::utf16be: return "UTF-16BE";
+    case StringEncoding::utf32le: return "UTF-32LE";
+    case StringEncoding::utf32be: return "UTF-32BE";
+    case StringEncoding::windows1252: return "Windows-1252";
+    case StringEncoding::windows1251: return "Windows-1251";
+    case StringEncoding::windows1250: return "Windows-1250";
+    case StringEncoding::windows1254: return "Windows-1254";
+    case StringEncoding::windows1253: return "Windows-1253";
+    case StringEncoding::windows1255: return "Windows-1255";
+    }
+    return "unknown";
+}
 OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
-                  std::vector<std::filesystem::path>& plugin_paths) {
+                  std::vector<std::filesystem::path>& plugin_paths, bool &show_strings) {
     OpenRequest request;
     request.run_analysis = disassemble;
     std::optional<Format> format;
@@ -1120,6 +1137,10 @@ OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
         const auto item = args[n];
         if (!end_options && item == L"--") {
             end_options = true;
+            continue;
+        }
+        if (!end_options && item == L"--show-strings") {
+            show_strings = true;
             continue;
         }
         if (!end_options && item.starts_with(L"--")) {
@@ -1247,7 +1268,7 @@ OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
         argument_error("Raw profile/architecture/base/entry options require --format raw");
     if (pe_runtime_architecture && request.format != Format::pe && request.format != Format::automatic)
         argument_error("--pe-runtime requires --format pe or auto");
-    if (!disassemble && (instructions || strings || minimum))
+    if (!disassemble && (instructions || strings || minimum || show_strings))
         argument_error("Analysis options require disassemble");
     if (minimum && *minimum == 0)
         argument_error("Minimum string length must be positive");
@@ -1367,7 +1388,8 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
         const bool decompile = arguments[0] == L"decompile";
         const bool disassemble = arguments[0] == L"disassemble" || decompile;
         std::vector<std::filesystem::path> plugin_paths;
-        auto request = parse(arguments.subspan(1), disassemble, plugin_paths);
+        bool show_strings = false;
+        auto request = parse(arguments.subspan(1), disassemble, plugin_paths, show_strings);
         plugins::PluginManager plugin_manager(plugins::make_native_module_provider());
         for (const auto& plugin_path : plugin_paths) {
             auto loaded = plugin_manager.load(path_text(plugin_path));
@@ -1439,6 +1461,17 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
         diagnostics(err, document.diagnostics, document.image.get());
         if (!disassemble)
             return 0;
+        if (show_strings) {
+            out << "Strings:\n";
+            for (const auto &candidate : analysis->strings.records) {
+                out << "  " << string_encoding_label(candidate.encoding)
+                    << " file=" << hex(candidate.file_offset.value)
+                    << " bytes=" << candidate.byte_length
+                    << " characters=" << candidate.characters
+                    << (candidate.terminated ? " terminated" : "")
+                    << " preview=" << candidate.preview << '\n';
+            }
+        }
         if (decompile) {
             auto functions = recover_functions(*document.image, document.metadata, {}, request.analysis_options, {});
             if (!functions) {

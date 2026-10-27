@@ -18,6 +18,23 @@ constexpr const char* history_capsule_name="hexlab.automation.HistoricalState.v1
 constexpr const char* search_cursor_name="hexlab.automation.SearchCursor.v1";
 constexpr const char* stop_source_name="hexlab.automation.StopSource.v1";
 constexpr const char* debugger_name="hexlab.automation.Debugger.v1";
+const char* string_encoding_name(StringEncoding encoding){
+    switch(encoding){
+    case StringEncoding::ascii:return "ASCII";
+    case StringEncoding::utf16le:return "UTF-16LE";
+    case StringEncoding::utf8:return "UTF-8";
+    case StringEncoding::utf16be:return "UTF-16BE";
+    case StringEncoding::utf32le:return "UTF-32LE";
+    case StringEncoding::utf32be:return "UTF-32BE";
+    case StringEncoding::windows1252:return "Windows-1252";
+    case StringEncoding::windows1251:return "Windows-1251";
+    case StringEncoding::windows1250:return "Windows-1250";
+    case StringEncoding::windows1254:return "Windows-1254";
+    case StringEncoding::windows1253:return "Windows-1253";
+    case StringEncoding::windows1255:return "Windows-1255";
+    }
+    return "unknown";
+}
 PyObject* error_type=nullptr; // module-owned; this executable owns one interpreter
 struct PythonFailure {};
 struct NativeFailure {Error error;};
@@ -956,7 +973,7 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
     }
     if(method=="strings"){
         count(values,2);auto rows=take(p.strings(size(argument(values,0)),size(argument(values,1))));Object list(PyList_New(0));
-        for(const auto& row:rows){Object item(PyDict_New());set(item,"encoding",integer(static_cast<unsigned>(row.encoding)));set(item,"preview",string(row.preview));
+        for(const auto& row:rows){Object item(PyDict_New());set(item,"encoding",integer(static_cast<unsigned>(row.encoding)));set(item,"encoding_name",string(string_encoding_name(row.encoding)));set(item,"preview",string(row.preview));
             set(item,"characters",integer(row.characters));set(item,"byte_length",integer(row.byte_length));set(item,"file_offset",encode(Location{row.file_offset}));
             set(item,"address",row.address?encode(Location{*row.address}):none());set(item,"terminated",PyBool_FromLong(row.terminated));append(list,item.release());}
         return list.release();
