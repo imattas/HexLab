@@ -76,6 +76,33 @@ struct JvmRecordComponent {
     std::optional<std::string> signature;
     bool operator==(const JvmRecordComponent &) const = default;
 };
+struct JvmModuleRequire {
+    std::string module;
+    std::uint16_t flags = 0;
+    std::optional<std::string> version;
+    bool operator==(const JvmModuleRequire &) const = default;
+};
+struct JvmModuleExport {
+    std::string package_name;
+    std::uint16_t flags = 0;
+    std::vector<std::string> to_modules;
+    bool operator==(const JvmModuleExport &) const = default;
+};
+struct JvmModuleProvide {
+    std::string service;
+    std::vector<std::string> implementations;
+    bool operator==(const JvmModuleProvide &) const = default;
+};
+struct JvmModule {
+    std::string name;
+    std::uint16_t flags = 0;
+    std::optional<std::string> version;
+    std::vector<JvmModuleRequire> required_modules;
+    std::vector<JvmModuleExport> exports, opens;
+    std::vector<std::string> uses;
+    std::vector<JvmModuleProvide> provides;
+    bool operator==(const JvmModule &) const = default;
+};
 // Optional class-path facts supplied by a linker or project loader. Names alone
 // are not JVM type identities: defining loader identity is part of every node
 // and edge. Missing nodes/edges remain unresolved rather than guessed.
@@ -102,6 +129,9 @@ struct JvmMetadata {
     std::vector<JvmRecordComponent> record_components;
     std::optional<std::string> nest_host;
     std::vector<std::string> nest_members, permitted_subclasses;
+    std::optional<JvmModule> module;
+    std::vector<std::string> module_packages;
+    std::optional<std::string> module_main_class;
     std::vector<JvmMember> fields, methods;
     bool operator==(const JvmMetadata &) const = default;
 };

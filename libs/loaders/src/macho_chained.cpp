@@ -236,6 +236,7 @@ void read_chained(const Reader &reader, const Image &image, MachOMetadata &metad
     metadata.chained_headers.push_back(declaration);
     auto &header = metadata.chained_headers.back();
     const auto &slice = metadata.container.slices[metadata.selected_slice];
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> metadata_ranges{{0, 28}};
     if (header.version != 0 || slice.header.order != ByteOrder::little) {
         header.complete = stream.complete = metadata.dyld_complete = false;
         return;
@@ -251,6 +252,11 @@ void read_chained(const Reader &reader, const Image &image, MachOMetadata &metad
     if (!stride || header.symbols_format > 1)
         header.complete = false;
     extent(bytes, header.imports_offset, std::uint64_t(header.imports_count) * stride);
+    if (header.imports_count && stride != 0) {
+        require(header.imports_offset >= 28, "Mach-O chained imports overlap the fixed header");
+        metadata_ranges.emplace_back(header.imports_offset,
+                                     std::uint64_t(header.imports_offset) + std::uint64_t(header.imports_count) * stride);
+    }
     header.imports_available = stride != 0;
     std::vector<std::uint8_t> decompressed_symbols;
     std::span<const std::uint8_t> symbols;
@@ -266,6 +272,11 @@ void read_chained(const Reader &reader, const Image &image, MachOMetadata &metad
     }
     require(header.imports_count == 0 || !symbols.empty(),
             "Mach-O chained imports reference an empty symbol pool");
+    if (header.imports_count) {
+        require(header.symbols_offset >= 28 && header.symbols_offset < bytes.size(),
+                "Mach-O chained symbol pool overlaps the fixed header or is empty");
+        metadata_ranges.emplace_back(header.symbols_offset, bytes.size());
+    }
     std::size_t symbol_pool_bytes = 0;
     for (std::uint32_t i = 0; stride && i < header.imports_count; ++i) {
         canceled(stop);
@@ -354,6 +365,8 @@ void read_chained(const Reader &reader, const Image &image, MachOMetadata &metad
         const auto count = number(header.starts_offset, 4);
         require(count <= metadata.segments.size(), "Mach-O chained segment count exceeds original commands");
         extent(bytes, std::uint64_t(header.starts_offset) + 4, count * 4);
+        metadata_ranges.emplace_back(header.starts_offset,
+                                     std::uint64_t(header.starts_offset) + 4 + count * 4);
         for (std::uint32_t segment_index = 0; segment_index < count; ++segment_index) {
             canceled(stop);
             const auto entry = std::uint64_t(header.starts_offset) + 4 + std::uint64_t(segment_index) * 4;
@@ -379,6 +392,7 @@ void read_chained(const Reader &reader, const Image &image, MachOMetadata &metad
             require(row.size >= 22 && !(row.size & 1) && std::uint64_t(row.page_count) * 2 <= row.size - 22,
                     "Mach-O chained page array exceeds segment-start record");
             extent(bytes, at, row.size);
+            metadata_ranges.emplace_back(at, at + row.size);
             const auto slots = (row.size - 22) / 2;
             budget.include(sizeof(row) + std::uint64_t(slots) * 2);
             for (std::uint32_t slot = 0; slot < slots; ++slot) {
@@ -429,6 +443,10 @@ void read_chained(const Reader &reader, const Image &image, MachOMetadata &metad
             }
         }
     }
+    std::sort(metadata_ranges.begin(), metadata_ranges.end());
+    for (std::size_t i = 1; i < metadata_ranges.size(); ++i)
+        require(metadata_ranges[i].first >= metadata_ranges[i - 1].second,
+                "Mach-O chained header, imports, symbols, or starts records overlap");
     std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> visited;
     while (!pending.empty()) {
         canceled(stop);

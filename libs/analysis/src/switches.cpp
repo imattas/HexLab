@@ -821,7 +821,11 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                 ((encoded_width < 64 && (immediate->value & (UINT64_C(1) << (encoded_width - 1)))) ||
                  (encoded_width == 64 && immediate->value > static_cast<std::uint64_t>(INT64_MAX))))
                 continue;
-            if (immediate->value > max_entries)
+            // For signed normalized ranges the encoded upper endpoint may be
+            // numerically larger than the entry cap while the interval itself
+            // remains small (for example 10000..10003). Bound the derived
+            // span below; retain this cheap early check for ordinary bounds.
+            if (!signed_range_max && immediate->value > max_entries)
                 continue;
             if (signed_range_max) {
                 if (!guards.graph_attempted) {

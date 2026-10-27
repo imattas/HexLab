@@ -26,6 +26,23 @@ selector remains unchanged between that LEA and the indexed load. The backward
 base-definition search is capped at 4096 instruction facts. Otherwise the
 existing verified-prefix and 4096-entry limit rules apply.
 
+For x86, a signed nonzero interval can bound a normalized selector only for
+this exact local sequence: `CMP selector, low; JL default; CMP selector,
+high; JG default; SUB selector, low; ... indexed dispatch`. Both comparisons
+must use the same register width and selector, and both branches must name the
+same decodable default target. Bounds must be nonnegative signed immediates,
+`high` must be at least `low`, and the computed inclusive span
+`high - low + 1` must be between 1 and 4096. The table index must be the same
+register after the in-place subtraction. On x86-64 only, a 32-bit compared and
+subtracted register may feed a 64-bit table index when it is the same physical
+GPR, because the 32-bit write zero-extends it. The shared predecessor graph
+requires the upper compare to follow the lower in-range edge and proves that
+the normalized value reaches dispatch without a bypass, ambiguous entry, or
+intervening selector write. Unknown or incomplete graph evidence does not
+publish a count or default; normal verified-prefix scanning remains available.
+Other conditions, negative bounds, out-of-place subtraction, and general
+selector arithmetic do not establish this proof.
+
 For AArch64 it recognizes a contiguous `ADR` / indexed `LDR` / `BR` form for nearby pointer tables, as well as the `ADRP` / `ADD` / indexed `LDR` /
 `BR` dispatch where `ADRP` supplies a resolved page address, `ADD` uses the
 same register and a low immediate to form the table base, and `LDR` loads an absolute 64-bit pointer from `[base + selector, LSL #3]`. The `ADR` form does not propagate its base across intervening instructions. The base, selector,
