@@ -578,6 +578,7 @@ std::string operation_name(Opcode opcode) {
     case Opcode::m6502_isc: return "ISC";
     case Opcode::m6502_las: return "LAS";
     case Opcode::m6502_anc: return "ANC";
+    case Opcode::m6502_axs: return "AXS";
     case Opcode::m6502_cpx: return "CPX"; case Opcode::m6502_cpy: return "CPY";
     case Opcode::m6502_bit: return "BIT"; case Opcode::m6502_inc: return "INC";
     case Opcode::m6502_dec: return "DEC"; case Opcode::m6502_inx: return "INX";
@@ -1596,6 +1597,29 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         }
         const auto op = instruction.opcode;
         if (!operands.empty()) {
+            if (op == Opcode::m6502_axs && std::holds_alternative<ImmediateOperand>(instruction.operands.front())) {
+                const auto source = binary("and", reg_expr(accumulator), reg_expr(index_x));
+                const auto difference = binary("sub", source, operands.front());
+                const auto result = binary("and", difference, constant_expr(0xff, 8));
+                const auto as_byte = [](ExpressionPtr predicate) -> ExpressionPtr {
+                    return std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", std::move(predicate)}});
+                };
+                const auto flag_bit = [&](ExpressionPtr predicate, unsigned bit) -> ExpressionPtr {
+                    auto value = as_byte(std::move(predicate));
+                    return bit ? binary("shl", std::move(value), constant_expr(bit, 8)) : value;
+                };
+                const auto carry = boolean_binary("uge", source, operands.front());
+                const auto zero = boolean_binary("eq", result, constant_expr(0, 8));
+                const auto negative = boolean_unary("signbit", result);
+                const auto preserved = binary("and", status_value, constant_expr(0x7c, 8));
+                const auto flags = binary("or", preserved, binary("or", flag_bit(carry, 0),
+                    binary("or", flag_bit(zero, 1), flag_bit(negative, 7))));
+                Intrinsic effect{"m6502_axs_and_then_subtract", {source, operands.front(), difference},
+                    IntrinsicMemoryEffect::none};
+                effect.register_writes = {index_x, status};
+                effect.register_output_values = {result, flags};
+                return effect;
+            }
             if (op == Opcode::m6502_las && is_memory(instruction.operands.front())) {
                 const auto value = binary("and", operands.front(), reg_expr(stack_pointer));
                 const auto zero = boolean_binary("eq", value, constant_expr(0, 8));
