@@ -1371,6 +1371,20 @@ RiscvAddressValue riscv_definition(Address address, std::uint64_t instruction,
     return result;
 }
 
+RiscvAddressValue riscv_binary_definition(Address address, std::uint64_t instruction,
+                                           const RiscvAddressValue &left,
+                                           const RiscvAddressValue &right) {
+    auto result = riscv_definition(address, instruction, &left);
+    result.graph.ambiguous = result.graph.ambiguous || right.graph.ambiguous;
+    result.graph.truncated = result.graph.truncated || right.graph.truncated;
+    result.graph.cycle = result.graph.cycle || right.graph.cycle;
+    for (const auto &edge : right.graph.dependencies)
+        riscv_add_dependency(result.graph, edge.consumer_instruction_id, edge.producer_instruction_id);
+    for (const auto parent : right.tails)
+        riscv_add_dependency(result.graph, instruction, parent);
+    return result;
+}
+
 bool merge_register_value(RiscvAddressValue &into, const RiscvAddressValue &other) {
     if (into.address != other.address) return false;
     into.graph.ambiguous = into.graph.ambiguous || other.graph.ambiguous ||
@@ -2125,6 +2139,79 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
                     registers[dst->index] = std::move(*definition);
                     if (riscv_target_segment(*image, *target, OperandAccess::address))
                         result.immediate_targets[{fact->id, 2}] = *target;
+                }
+                propagated = true;
+            } else if ((instruction.opcode == Opcode::rv_add || instruction.opcode == Opcode::rv_sub ||
+                        instruction.opcode == Opcode::rv_xor || instruction.opcode == Opcode::rv_or ||
+                        instruction.opcode == Opcode::rv_and || instruction.opcode == Opcode::rv_addw ||
+                        instruction.opcode == Opcode::rv_subw) && instruction.operands.size() == 3) {
+                // Register-register integer operations can preserve exact
+                // address constants just like their immediate counterparts.
+                // Keep the two input provenance chains so references derived
+                // from the result remain explainable in the UI.
+                const auto *dst = riscv_register(instruction, 0);
+                const auto *lhs = riscv_register(instruction, 1);
+                const auto *rhs = riscv_register(instruction, 2);
+                std::optional<RiscvAddressValue> left;
+                std::optional<RiscvAddressValue> right;
+                if (lhs && lhs->width == width) {
+                    if (!lhs->index)
+                        left = RiscvAddressValue{Address{instruction.address.space, 0}};
+                    else if (const auto found = registers.find(lhs->index); found != registers.end() &&
+                             found->second.address.space == instruction.address.space)
+                        left = found->second;
+                }
+                if (rhs && rhs->width == width) {
+                    if (!rhs->index)
+                        right = RiscvAddressValue{Address{instruction.address.space, 0}};
+                    else if (const auto found = registers.find(rhs->index); found != registers.end() &&
+                             found->second.address.space == instruction.address.space)
+                        right = found->second;
+                }
+                std::optional<RiscvAddressValue> definition;
+                if (left && right && dst && dst->index && dst->width == width) {
+                    const auto mask = width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
+                    const auto a = left->address.offset & mask;
+                    const auto b = right->address.offset & mask;
+                    std::uint64_t value = 0;
+                    switch (instruction.opcode) {
+                    case Opcode::rv_sub:
+                        value = (a - b) & mask;
+                        break;
+                    case Opcode::rv_xor:
+                        value = a ^ b;
+                        break;
+                    case Opcode::rv_or:
+                        value = a | b;
+                        break;
+                    case Opcode::rv_and:
+                        value = a & b;
+                        break;
+                    case Opcode::rv_addw:
+                        value = static_cast<std::uint64_t>(static_cast<std::int64_t>(
+                            std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(a + b))));
+                        break;
+                    case Opcode::rv_subw:
+                        value = static_cast<std::uint64_t>(static_cast<std::int64_t>(
+                            std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(a - b))));
+                        break;
+                    default:
+                        value = (a + b) & mask;
+                        break;
+                    }
+                    const Address target{instruction.address.space, value};
+                    definition = riscv_binary_definition(target, fact->id, *left, *right);
+                }
+                erase_written();
+                if (dst && dst->index && dst->width == width && definition) {
+                    registers[dst->index] = std::move(*definition);
+                    const auto &target = registers[dst->index].address;
+                    if (riscv_target_segment(*image, target, OperandAccess::address)) {
+                        result.immediate_targets[{fact->id, 2}] = target;
+                        auto result_value = registers[dst->index];
+                        result_value.tails.clear();
+                        record_producers({fact->id, 2}, fact->id, result_value);
+                    }
                 }
                 propagated = true;
             } else if ((instruction.opcode == Opcode::rv_slli || instruction.opcode == Opcode::rv_srli ||

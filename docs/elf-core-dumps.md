@@ -102,10 +102,17 @@ enforce the shared record and metadata budgets.
 Unsupported register architectures, byte orders and ABI variants remain generic
 notes with an explicit per-thread diagnostic. A truncated process or thread
 record is retained as malformed metadata and marks the loaded image incomplete;
-it does not discard other core mappings. The loader does not decode
-floating-point/SIMD regsets, OS-specific notes, or architecture-specific
-signal frames. It does not reconstruct missing pages or infer a live process
-state from absent core data.
+it does not discard other core mappings. Floating-point/SIMD regsets remain in
+the generic note list. CLI `inspect` recognizes little-endian x86-64
+`NT_FPREGSET` payloads of exactly 512 bytes and prints the x87 control/address
+fields, eight 128-bit x87 storage slots, and sixteen XMM registers with source
+offsets. It recognizes little-endian AArch64 payloads of exactly 528 bytes
+and prints `v0`-`v31`, `fpsr`, and `fpcr`, also with source offsets. Other
+lengths and byte orders are shown as unsupported rather than interpreted using
+a guessed layout. Rendering is capped at 64 FPREGSET notes. The loader does
+not associate these notes with a particular thread. OS-specific notes and
+architecture-specific signal frames are not decoded. Missing pages are not
+reconstructed and absent core data is not treated as a live process state.
 
 The Linux note layouts follow the kernel's [`elfcore.h`](https://github.com/torvalds/linux/blob/master/include/linux/elfcore.h)
 and AArch64 [`user_pt_regs`](https://github.com/torvalds/linux/blob/master/arch/arm64/include/uapi/asm/ptrace.h)

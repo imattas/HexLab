@@ -200,6 +200,65 @@ inline void elf_description(std::ostream &out, const ImageMetadata &metadata, co
         }
         if (thread_count < elf.core->threads.size())
             out << "  thread-output-capped=true omitted=" << elf.core->threads.size() - thread_count << '\n';
+        // Linux NT_FPREGSET payloads are retained in the original notes. Decode
+        // the two common 64-bit layouts here without making unsupported or
+        // extended register-set sizes look authoritative.
+        std::size_t fp_rows = 0;
+        for (const auto &note : elf.notes) {
+            if (note.type != 2 || (note.name != "CORE" && note.name != "LINUX")) continue;
+            if (fp_rows >= 64) { out << "  FPREGSET output capped at 64 notes\n"; break; }
+            ++fp_rows;
+            if (elf.header.machine != 62 && elf.header.machine != 183) continue;
+            const auto &bytes = note.description;
+            const auto layout = elf.header.machine == 62 ? "linux-x86_64-fpregs" : "linux-aarch64-fpsimd";
+            const auto expected = elf.header.machine == 62 ? 512u : 528u;
+            out << "ELF core FPREGSET: layout=" << layout << " note-file=" << elf_hex(note.file_offset)
+                << " payload-file=" << elf_hex(note.description_file_offset) << " bytes=" << bytes.size();
+            if (bytes.size() != expected) {
+                out << " status=unsupported-size\n";
+                continue;
+            }
+            if ((elf.header.machine == 62 || elf.header.machine == 183) && elf.header.order != ByteOrder::little) {
+                out << " status=unsupported-byte-order\n";
+                continue;
+            }
+            out << " status=decoded\n";
+            const auto value = [&](std::size_t at, std::size_t width) {
+                std::uint64_t result = 0;
+                for (std::size_t i = 0; i < width; ++i) {
+                    const auto shift = elf.header.order == ByteOrder::little ? i : width - i - 1;
+                    result |= std::to_integer<std::uint64_t>(bytes[at + i]) << (shift * 8);
+                }
+                return result;
+            };
+            if (elf.header.machine == 62 && elf.header.order == ByteOrder::little) {
+                out << "  cwd=" << elf_hex(value(0, 2)) << " swd=" << elf_hex(value(2, 2))
+                    << " ftw=" << elf_hex(value(4, 2)) << " fop=" << elf_hex(value(6, 2))
+                    << " rip=" << elf_hex(value(8, 8)) << " rdp=" << elf_hex(value(16, 8))
+                    << " mxcsr=" << elf_hex(value(24, 4)) << " mxcr-mask=" << elf_hex(value(28, 4)) << '\n';
+                const auto emit_vector = [&](std::string_view name, std::size_t at, std::size_t size) {
+                    out << "  " << name << "=0x";
+                    for (std::size_t i = 0; i < size; ++i)
+                        out << std::hex << std::setw(2) << std::setfill('0')
+                            << std::to_integer<unsigned>(bytes[at + i]);
+                    out << std::dec << " file=" << elf_hex(note.description_file_offset + at) << '\n';
+                };
+                for (std::size_t i = 0; i < 8; ++i) emit_vector("st" + std::to_string(i), 32 + i * 16, 16);
+                for (std::size_t i = 0; i < 16; ++i) emit_vector("xmm" + std::to_string(i), 160 + i * 16, 16);
+            } else if (elf.header.machine == 183 && elf.header.order == ByteOrder::little) {
+                const auto emit_vector = [&](std::size_t i) {
+                    const auto at = i * 16;
+                    out << "  v" << i << "=0x";
+                    for (std::size_t b = 0; b < 16; ++b)
+                        out << std::hex << std::setw(2) << std::setfill('0')
+                            << std::to_integer<unsigned>(bytes[at + b]);
+                    out << std::dec << " file=" << elf_hex(note.description_file_offset + at) << '\n';
+                };
+                for (std::size_t i = 0; i < 32; ++i) emit_vector(i);
+                out << "  fpsr=" << elf_hex(value(512, 4)) << " file=" << elf_hex(note.description_file_offset + 512)
+                    << " fpcr=" << elf_hex(value(516, 4)) << " file=" << elf_hex(note.description_file_offset + 516) << '\n';
+            }
+        }
         out << "ELF core signal info: " << elf.core->signal_info.size() << '\n';
         for (const auto &info : elf.core->signal_info) {
             out << "  signal=" << info.signal << " error=" << info.error << " code=" << info.code;

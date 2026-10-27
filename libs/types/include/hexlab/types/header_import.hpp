@@ -93,7 +93,7 @@ struct HeaderImportResult {
 // delegated to include_resolver; literal and macro-expanded header names,
 // #pragma once, object-like and bounded function-like macros, and simple feature
 // guards are handled under the configured limits. Function
-// bodies, unnamed nonzero bitfields, unrecognized attributes and unknown declarators fail
+// bodies, unrecognized attributes and unknown declarators fail
 // explicitly; packed/aligned layout attributes, alignas/_Alignas, and
 // #pragma pack forms are supported where the type model can retain their ABI
 // effects. Named nested and inline namespaces, qualified aggregate/enum/typedef names,

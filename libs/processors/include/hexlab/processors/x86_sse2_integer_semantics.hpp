@@ -44,6 +44,7 @@ inline bool supported(Opcode opcode) noexcept {
     case Opcode::pcmpgtb: case Opcode::pcmpgtw: case Opcode::pcmpgtd:
     case Opcode::phaddw: case Opcode::phaddd: case Opcode::phaddsw:
     case Opcode::phsubw: case Opcode::phsubd: case Opcode::phsubsw:
+    case Opcode::pshufb:
         return true;
     default: return false;
     }
@@ -84,6 +85,14 @@ inline std::optional<X86Sse2PackedIntegerResult> evaluate_x86_sse2_packed_intege
     }
 
     X86Sse2PackedIntegerResult result{};
+    if (op == Opcode::pshufb) {
+        for (unsigned i = 0; i < 16; ++i) {
+            const auto control = std::to_integer<unsigned>(right[i]);
+            result.bytes[i] = (control & 0x80) ? std::byte{0} : left[control & 0x0f];
+        }
+        result.lane_bits = 8;
+        return result;
+    }
     unsigned lane_bits = 0;
     switch (op) {
     case Opcode::paddd: case Opcode::psubd: case Opcode::pcmpeqd: case Opcode::pcmpgtd:

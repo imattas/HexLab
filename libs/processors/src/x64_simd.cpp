@@ -239,6 +239,7 @@ bool simd(State &state, std::uint8_t opcode, bool extended) {
 bool simd_0f38(State &state, std::uint8_t opcode) {
     Opcode operation{};
     switch (opcode) {
+    case 0x00: operation = Opcode::pshufb; break;
     case 0x01: operation = Opcode::phaddw; break;
     case 0x02: operation = Opcode::phaddd; break;
     case 0x03: operation = Opcode::phaddsw; break;
@@ -250,6 +251,8 @@ bool simd_0f38(State &state, std::uint8_t opcode) {
     require_prefix(state, PrefixForm::packed);
     auto decoded = vector_modrm(state, 128);
     state.i.opcode = operation;
+    state.i.vector_bits = 128;
+    state.i.vector_element_bits = operation == Opcode::pshufb ? 8 : 0;
     state.operand(decoded.reg, OperandAccess::read_write);
     state.operand(std::move(decoded.rm), OperandAccess::read);
     return true;
