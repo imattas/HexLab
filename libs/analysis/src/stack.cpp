@@ -481,10 +481,13 @@ bool transfer(const Instruction &instruction, FlowState &state) {
     }
     if ((instruction.context.architecture == Architecture::riscv32 ||
          instruction.context.architecture == Architecture::riscv64) &&
-        (instruction.opcode == Opcode::rv_add || instruction.opcode == Opcode::rv_addw) &&
+        (instruction.opcode == Opcode::rv_add || instruction.opcode == Opcode::rv_sub) &&
         instruction.operands.size() >= 3 &&
-        (riscv_register(second, 0) || riscv_register(register_at(instruction, 2), 0))) {
-        const auto source = riscv_register(second, 0) ? register_at(instruction, 2) : second;
+        ((instruction.opcode == Opcode::rv_add &&
+          (riscv_register(second, 0) || riscv_register(register_at(instruction, 2), 0))) ||
+         (instruction.opcode == Opcode::rv_sub && riscv_register(register_at(instruction, 2), 0)))) {
+        const auto source = instruction.opcode == Opcode::rv_sub || riscv_register(second, 0)
+            ? second : register_at(instruction, 2);
         if (riscv_register(first, 2) && riscv_register(source, 8) && state.frame_register == 8) {
             state.stack_depth = state.frame_depth;
             return true;
@@ -978,6 +981,31 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                     const auto immediate = immediate_value(instruction, 2);
                     if (immediate) address_displacement = *immediate;
                     else {
+                        result.complete = false;
+                        forms_stack_address = false;
+                    }
+                }
+            } else if ((instruction.context.architecture == Architecture::riscv32 ||
+                        instruction.context.architecture == Architecture::riscv64) &&
+                       (instruction.opcode == Opcode::rv_add || instruction.opcode == Opcode::rv_sub) &&
+                       instruction.operands.size() >= 3 && address_destination &&
+                       address_destination->bank == RegisterBank::riscv_gpr &&
+                       address_destination->index != 2 && address_destination->index != 8) {
+                const auto third = register_at(instruction, 2);
+                const bool zero_second = riscv_register(address_source, 0);
+                const bool zero_third = riscv_register(third, 0);
+                const bool valid_copy = instruction.opcode == Opcode::rv_add
+                    ? (zero_second || zero_third) : zero_third;
+                auto base = address_source;
+                if (instruction.opcode == Opcode::rv_add &&
+                    !(riscv_register(base, 2) || riscv_register(base, 8)))
+                    base = third;
+                const auto expected_width = static_cast<std::uint8_t>(pointer_bytes(instruction) * 8);
+                if (base && base->bank == RegisterBank::riscv_gpr && base->width == expected_width &&
+                    (base->index == 2 || (base->index == 8 && state.frame_register == 8))) {
+                    forms_stack_address = true;
+                    address_base = base->index == 2 ? state.stack_depth : state.frame_depth;
+                    if (!valid_copy || address_destination->width != expected_width) {
                         result.complete = false;
                         forms_stack_address = false;
                     }

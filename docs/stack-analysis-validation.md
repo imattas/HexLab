@@ -43,7 +43,8 @@ Immediate stack-address formation is also retained as an address-taking site:
 A32/Thumb `ADD`/`SUB` from SP or the tracked r7/r11 frame base, AArch64
 `ADD`/`SUB` from SP or a tracked x29, MIPS `ADDI`/`ADDIU` and MIPS64
 `DADDI`/`DADDIU` from `$sp` or tracked `$fp`, RISC-V `ADDI` from `sp` or
-tracked `s0/fp`, and PowerPC `ADDI` from `r1` or tracked `r31`. These facts
+tracked `s0/fp`, plus `ADD`/`SUB` register forms only when `x0` makes the
+operation an exact copy, and PowerPC `ADDI` from `r1` or tracked `r31`. These facts
 have unknown width and the address-producing instruction as provenance. If an
 explicit stack load/store names the same entry-SP byte offset, the address
 fact coalesces into that typed slot. This records pointers handed to opaque
