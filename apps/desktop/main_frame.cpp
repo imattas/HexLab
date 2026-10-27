@@ -671,7 +671,7 @@ struct MainFrame::Impl {
     bool session_restore_activation_pending = false;
     std::vector<DocumentId> session_restore_documents;
     std::optional<DocumentId> session_restore_active;
-    std::optional<Location> session_restore_location;
+    std::map<std::uint64_t, Location> session_restore_locations;
     wxTimer compare_timer;
     struct CompareWork {
         std::mutex mutex;
@@ -1690,15 +1690,19 @@ struct MainFrame::Impl {
                     std::any_of(entries.begin(), entries.end(), [this](const DocumentInfo &entry) {
                         return session_restore_active && entry.id == *session_restore_active;
                     });
+                bool active_location_failed = false;
+                for (const auto &[id, location] : session_restore_locations) {
+                    const DocumentId document_id{id};
+                    auto moved = controller->documents().navigate(document_id, location);
+                    if (!moved && session_restore_active && document_id == *session_restore_active)
+                        active_location_failed = true;
+                }
+                session_restore_locations.clear();
                 if (active_survived) {
                     mark_active_document(*session_restore_active);
                     controller->activate(*session_restore_active);
-                    if (session_restore_location) {
-                        auto moved = controller->documents().navigate(*session_restore_active,
-                                                                       *session_restore_location);
-                        if (moved) sync();
-                        else frame.SetStatusText("The saved cursor location is no longer mapped.");
-                    }
+                    if (!active_location_failed) sync();
+                    else frame.SetStatusText("The saved cursor location is no longer mapped.");
                     return;
                 }
             }
@@ -4384,7 +4388,7 @@ void MainFrame::RestoreWorkspaceSession() {
     std::vector<DocumentId> restored_documents;
     restored_documents.reserve(static_cast<std::size_t>(count));
     std::optional<DocumentId> restored_active;
-    std::optional<Location> restored_location;
+    std::map<std::uint64_t, Location> restored_locations;
     std::size_t skipped = 0;
     for (long index = 0; index < count; ++index) {
         wxString saved, kind, mode;
@@ -4442,27 +4446,28 @@ void MainFrame::RestoreWorkspaceSession() {
         }
         const auto documents = projects().documents();
         if (!documents.empty()) {
-            restored_documents.push_back(documents.back().id);
+            const auto restored_id = documents.back().id;
+            restored_documents.push_back(restored_id);
             if (index == active) {
-                restored_active = documents.back().id;
-                wxString location_kind, space_text, offset_text;
-                if (config->Read(wxString::Format("Document%ldLocationKind", index), &location_kind) &&
-                    config->Read(wxString::Format("Document%ldLocationSpace", index), &space_text) &&
-                    config->Read(wxString::Format("Document%ldLocationOffset", index), &offset_text)) {
-                    const auto space = decode_session_integer(space_text);
-                    const auto offset = decode_session_integer(offset_text);
-                    if (offset && location_kind == "file")
-                        restored_location = Location{FileOffset{*offset}};
-                    else if (space && *space <= UINT32_MAX && offset && location_kind == "address")
-                        restored_location = Location{Address{AddressSpaceId{static_cast<std::uint32_t>(*space)},
-                                                             *offset}};
-                }
+                restored_active = restored_id;
+            }
+            wxString location_kind, space_text, offset_text;
+            if (config->Read(wxString::Format("Document%ldLocationKind", index), &location_kind) &&
+                config->Read(wxString::Format("Document%ldLocationSpace", index), &space_text) &&
+                config->Read(wxString::Format("Document%ldLocationOffset", index), &offset_text)) {
+                const auto space = decode_session_integer(space_text);
+                const auto offset = decode_session_integer(offset_text);
+                if (offset && location_kind == "file")
+                    restored_locations.insert_or_assign(restored_id.value, Location{FileOffset{*offset}});
+                else if (space && *space <= UINT32_MAX && offset && location_kind == "address")
+                    restored_locations.insert_or_assign(restored_id.value,
+                        Location{Address{AddressSpaceId{static_cast<std::uint32_t>(*space)}, *offset}});
             }
         }
     }
     impl_->session_restore_documents = std::move(restored_documents);
     impl_->session_restore_active = restored_active;
-    impl_->session_restore_location = std::move(restored_location);
+    impl_->session_restore_locations = std::move(restored_locations);
     impl_->session_restore_activation_pending = !impl_->session_restore_documents.empty();
     config->SetPath(previous_path);
     if (skipped)
@@ -4510,9 +4515,7 @@ void MainFrame::SaveWorkspaceSession() {
         }
         if (entry.path.native().size() > maximum_persisted_path_characters) continue;
         if (active_id && document.id == *active_id) active = static_cast<long>(entries.size());
-        if (active_id && document.id == *active_id && projects().active_document() == active_id) {
-            if (const auto selected = impl_->state().selection()) entry.location = *selected;
-        }
+        if (const auto selected = projects().selection(document.id)) entry.location = *selected;
         entries.push_back(std::move(entry));
     }
     const auto previous_path = config->GetPath();

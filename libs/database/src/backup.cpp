@@ -85,6 +85,41 @@ Result<SavedProject> ProjectStore::save_as_impl(const std::filesystem::path& des
         return std::move(saved);
     });
 }
+Result<BackupVerification> ProjectStore::verify_backup(const std::filesystem::path& path,
+        std::size_t max_history_steps,std::size_t max_history_delta_bytes,std::stop_token stop){
+    return detail::guarded([&]()->Result<BackupVerification>{
+        constexpr std::size_t total_step_limit=65536;
+        constexpr std::size_t total_delta_limit=512u*1024u*1024u;
+        if(path.empty()||max_history_steps==0||max_history_steps>total_step_limit||
+           max_history_delta_bytes==0||max_history_delta_bytes>total_delta_limit)
+            return Error{ErrorCode::invalid_argument,"Backup verification budgets must be 1 through 65,536 history steps and 1 byte through 512 MiB"};
+        if(stop.stop_requested())return Error{ErrorCode::canceled,"Backup verification canceled"};
+        auto backup=detail::take(ProjectStore::open(path,ProjectMode::read_only,stop));
+        auto state=detail::take(backup->snapshot());
+        BackupVerification result{{std::filesystem::absolute(path).lexically_normal(),state->uuid},
+                                  state->history_count,0,0,state->history_count==0};
+        std::uint64_t after=0;
+        while(after<state->history_count){
+            if(stop.stop_requested())return Error{ErrorCode::canceled,"Backup history verification canceled"};
+            const auto remaining_steps=max_history_steps-static_cast<std::size_t>(result.history_steps_verified);
+            const auto remaining_bytes=max_history_delta_bytes-static_cast<std::size_t>(result.history_bytes_verified);
+            if(remaining_steps==0||remaining_bytes==0)break;
+            const HistoryAuditLimits page_limits{
+                std::min(remaining_steps,history_audit_step_limit),
+                std::min(remaining_bytes,history_audit_payload_limit)};
+            auto page=detail::take(backup->audit_history(state->revisions.edit,after,page_limits,stop));
+            detail::require(page.uuid==state->uuid&&page.history_count==state->history_count,
+                            "Backup history changed during verification");
+            result.history_steps_verified+=page.entries_verified;
+            result.history_bytes_verified+=page.delta_bytes;
+            after=page.next_after_step;
+            if(!page.has_more){result.history_complete=true;break;}
+            if(page.entries_verified==0)break;
+        }
+        return result;
+    });
+}
+
 Result<SavedProject> ProjectStore::backup_to(const std::filesystem::path& destination,ReplacePolicy policy,std::stop_token stop){
     return detail::guarded([&]()->Result<SavedProject>{
         std::lock_guard lock(impl_->mutex);

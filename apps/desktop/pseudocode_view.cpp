@@ -973,6 +973,11 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     source_->Bind(wxEVT_LEFT_UP, [deferred_selection](wxMouseEvent &event) { event.Skip(); deferred_selection(); });
     source_->Bind(wxEVT_KEY_UP, [deferred_selection](wxKeyEvent &event) { event.Skip(); deferred_selection(); });
     source_->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &event) {
+        if (event.ControlDown() && event.ShiftDown() && !event.AltDown() &&
+            (event.GetKeyCode() == 'C' || event.GetKeyCode() == 'c')) {
+            copy_addressed_excerpt();
+            return;
+        }
         if (event.ControlDown() && !event.AltDown() && (event.GetKeyCode() == 'B' || event.GetKeyCode() == 'b')) {
             source_selection_changed();
             go_to_definition();

@@ -64,6 +64,17 @@ copied schema and state, reads and hashes all embedded input chunks, and checks
 the saved patches against that input. If source provenance points to an
 external binary, its relative path is recalculated from the backup directory.
 
+Applications can also validate an existing backup with
+`ProjectStore::verify_backup(path, max_history_steps, max_history_delta_bytes,
+stop)`. Opening the backup read-only checks its schema, embedded input chunks,
+and patch ranges. The verifier then audits bounded pages of forward/inverse
+history deltas and their change metadata. Its result reports the number of
+history entries and delta bytes checked; `history_complete` is false when the
+caller-supplied budget ends before the retained history does. Budgets are
+limited to 65,536 entries and 512 MiB of history payload per call, and the
+operation supports cancellation. This is useful for an explicit pre-restore
+integrity check without changing the backup.
+
 The output is built in a uniquely reserved staging database beside the target,
 checkpointed, closed, and then atomically published using the selected
 `ReplacePolicy`. `fail_if_exists` cannot overwrite a file that appears during
