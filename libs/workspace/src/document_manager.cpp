@@ -49,6 +49,8 @@ struct DocumentManager::Impl {
     struct Entry {
         DocumentId id;
         std::shared_ptr<ProjectActor> actor;
+        std::filesystem::path requested_project_path;
+        database::ProjectMode requested_project_mode = database::ProjectMode::read_only;
         Workspace navigation;
         SearchHistory search;
         ActorView view;
@@ -130,14 +132,31 @@ Result<DocumentId> DocumentManager::import_binary(OpenRequest request) {
 Result<DocumentId> DocumentManager::open_project(std::filesystem::path path, database::ProjectMode mode,
                                                  const AnalysisOptions &options) {
     return project_detail::guarded([&]() -> Result<DocumentId> {
+        for (const auto &entry : impl_->entries) {
+            if (entry->error || entry->requested_project_mode != mode ||
+                !same_project_file(entry->requested_project_path, path))
+                continue;
+            impl_->active = entry->id;
+            if (entry->opened) {
+                impl_->pending.reset();
+                impl_->workspace().pending_.reset();
+            } else {
+                impl_->pending = entry->id;
+                impl_->workspace().pending_ = OpenTicket{entry->id, entry->actor->view().session.epoch};
+            }
+            impl_->dirty = true;
+            return entry->id;
+        }
         require(impl_->entries.size() + impl_->retiring.size() < impl_->limit, "Document capacity reached",
                 ErrorCode::resource_limit);
         auto id = next_id();
         auto actor = take(ProjectActor::create({id, 1}, impl_->pool));
-        auto opening = take(actor->open_project(std::move(path), mode, options));
+        auto opening = take(actor->open_project(path, mode, options));
         auto entry = std::make_unique<Impl::Entry>();
         entry->id = id;
         entry->actor = std::move(actor);
+        entry->requested_project_path = path;
+        entry->requested_project_mode = mode;
         entry->opening = std::move(opening);
         entry->operations.reserve(128);
         impl_->entries.push_back(std::move(entry));

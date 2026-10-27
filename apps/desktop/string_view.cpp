@@ -7,10 +7,13 @@
 #include "hexlab/workspace/project.hpp"
 #include <algorithm>
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+#include <wx/clipbrd.h>
+#include <wx/dataobj.h>
 #include <wx/filedlg.h>
 #include <wx/msgdlg.h>
 #include <wx/sizer.h>
@@ -85,6 +88,23 @@ std::string csv_row(const std::vector<std::string> &fields) {
     result += "\r\n";
     return result;
 }
+std::string tsv_field(std::string_view value) {
+    constexpr char hex_digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(value.size());
+    for (const unsigned char c : value) {
+        if (c == '\\') result += "\\\\";
+        else if (c == '\t') result += "\\t";
+        else if (c == '\r') result += "\\r";
+        else if (c == '\n') result += "\\n";
+        else if (c < 0x20 || c == 0x7f) {
+            result += "\\x";
+            result.push_back(hex_digits[c >> 4]);
+            result.push_back(hex_digits[c & 0x0f]);
+        } else result.push_back(static_cast<char>(c));
+    }
+    return result;
+}
 std::string decimal(std::uint64_t value) {
     return std::to_string(value);
 }
@@ -108,11 +128,18 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
     export_all_->SetName("strings-export-all");
     export_all_->Enable(false);
     filter_row->Add(export_all_, 0, wxEXPAND | wxLEFT, FromDIP(4));
+    copy_ = new wxButton(this, wxID_ANY, "Copy selected row");
+    copy_->SetName("strings-copy-row");
+    copy_->Enable(false);
+    filter_row->Add(copy_, 0, wxEXPAND | wxLEFT, FromDIP(4));
     comment_ = new wxButton(this, wxID_ANY, "Comment selected string...");
     comment_->SetName("strings-comment");
     comment_->Enable(false);
     filter_row->Add(comment_, 0, wxEXPAND | wxLEFT, FromDIP(4));
     layout->Add(filter_row, 0, wxEXPAND | wxALL, FromDIP(4));
+    action_status_ = new wxStaticText(this, wxID_ANY, "Select a string to copy or comment");
+    action_status_->SetName("strings-action-status");
+    layout->Add(action_status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
 
     auto *splitter = new wxSplitterWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                            wxSP_LIVE_UPDATE | wxSP_3D);
@@ -149,6 +176,7 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
     filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { filter_timer_.StartOnce(120); });
     export_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_strings(true); });
     export_all_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_strings(false); });
+    copy_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_selected_row(); });
     comment_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         if (!selected_string_ || !comment) return;
         const auto location = string_location(*selected_string_);
@@ -251,8 +279,10 @@ void StringBrowserView::refresh_strings() {
     });
     export_->Enable(document_ && !visible_strings_.empty());
     export_all_->Enable(document_ && !document_->strings().records.empty());
-    comment_->Enable(document_ && selected_string_ && *selected_string_ < document_->strings().records.size() &&
-                     static_cast<bool>(comment));
+    const bool has_selection = document_ && selected_string_ &&
+        *selected_string_ < document_->strings().records.size();
+    comment_->Enable(has_selection && static_cast<bool>(comment));
+    copy_->Enable(has_selection);
     if (previous) {
         const auto visible = std::find(visible_strings_.begin(), visible_strings_.end(), *previous);
         if (visible != visible_strings_.end()) {
@@ -262,9 +292,43 @@ void StringBrowserView::refresh_strings() {
         }
         selected_string_.reset();
         comment_->Enable(false);
+        copy_->Enable(false);
         reference_offset_ = 0;
         refresh_references();
     }
+}
+
+void StringBrowserView::copy_selected_row() {
+    if (!document_ || !selected_string_ || *selected_string_ >= document_->strings().records.size()) {
+        action_status_->SetLabel("Select a string row first");
+        return;
+    }
+    const auto &record = document_->strings().records[*selected_string_];
+    const auto location = string_location(*selected_string_);
+    const auto *annotation = document_->project && location
+        ? annotation_at(*document_->project, *location) : nullptr;
+    const std::vector<std::string> fields = {
+        location ? utf8(location_text(*location, document_->image.get())) : std::string{},
+        utf8(text(record.preview)),
+        utf8(encoding_text(record.encoding)),
+        decimal(record.byte_length),
+        annotation ? utf8(text(annotation->comment)) : std::string{}
+    };
+    std::string row;
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        if (i) row.push_back('\t');
+        row += tsv_field(fields[i]);
+    }
+    if (!wxTheClipboard || !wxTheClipboard->Open()) {
+        action_status_->SetLabel("Clipboard is unavailable");
+        return;
+    }
+    auto data = std::make_unique<wxTextDataObject>(wxString::FromUTF8(row.data(), row.size()));
+    const bool copied = wxTheClipboard->SetData(data.get());
+    if (copied)
+        data.release();
+    wxTheClipboard->Close();
+    action_status_->SetLabel(copied ? "Copied selected string row as TSV" : "Clipboard copy failed");
 }
 
 void StringBrowserView::export_strings(bool filtered) {
@@ -392,6 +456,8 @@ void StringBrowserView::choose_string(std::size_t record_index, bool navigate_to
         return;
     selected_string_ = record_index;
     comment_->Enable(static_cast<bool>(comment));
+    copy_->Enable(true);
+    action_status_->SetLabel("Selected string ready to copy");
     reference_offset_ = 0;
     refresh_references();
     if (navigate_to_string && navigate) {
@@ -492,6 +558,8 @@ void StringBrowserView::clear_selection() {
     references_->clear_selection();
     selected_string_.reset();
     comment_->Enable(false);
+    copy_->Enable(false);
+    action_status_->SetLabel("Select a string to copy or comment");
     reference_offset_ = 0;
     refresh_references();
 }
