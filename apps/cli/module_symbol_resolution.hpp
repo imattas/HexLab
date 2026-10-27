@@ -99,6 +99,7 @@ inline void print_elf_import_resolutions(const std::vector<SuppliedModule> &modu
             std::vector<std::pair<const SuppliedModule *, const ElfSymbol *>> matches;
             bool has_abi_compatible_provider = false;
             bool has_unsupported_provider_symbol = false;
+            bool has_symbol_type_mismatch = false;
             for (const auto provider_index : providers) {
                 const auto *provider = &modules[provider_index];
                 const auto &pe = *provider->metadata->elf;
@@ -122,6 +123,14 @@ inline void print_elf_import_resolutions(const std::vector<SuppliedModule> &modu
                         has_unsupported_provider_symbol = true;
                         continue;
                     }
+                    // STT_NOTYPE carries no useful type constraint. When both
+                    // sides provide a concrete type, avoid claiming a match
+                    // across different ELF symbol kinds (for example FUNC vs
+                    // OBJECT).
+                    if (wanted.type != 0 && candidate.type != 0 && wanted.type != candidate.type) {
+                        has_symbol_type_mismatch = true;
+                        continue;
+                    }
                     matches.emplace_back(provider, &candidate);
                 }
             }
@@ -131,6 +140,10 @@ inline void print_elf_import_resolutions(const std::vector<SuppliedModule> &modu
             }
             if (has_unsupported_provider_symbol) {
                 out << "unsupported (matching provider export requires TLS/IFUNC semantics)\n";
+                continue;
+            }
+            if (matches.empty() && has_symbol_type_mismatch) {
+                out << "unsupported (matching provider export has incompatible ELF symbol type)\n";
                 continue;
             }
             if (matches.empty()) { out << "unresolved (no exact eligible export)\n"; continue; }
