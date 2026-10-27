@@ -52,6 +52,15 @@ inline void minidump_description(std::ostream &out, const ImageMetadata &metadat
     out << "Minidump: architecture=" << minidump_architecture_name(dump.processor_architecture)
         << " threads=" << dump.threads.size() << " modules=" << dump.modules.size()
         << " memory-regions=" << dump.memory.size() << '\n';
+    if (dump.process_info) {
+        const auto &process = *dump.process_info;
+        out << "  Process metadata flags=0x" << std::hex << process.flags << std::dec;
+        if (process.process_id) out << " id=" << *process.process_id;
+        if (process.process_create_time) out << " create-time=" << *process.process_create_time;
+        if (process.process_user_time) out << " user-time=" << *process.process_user_time;
+        if (process.process_kernel_time) out << " kernel-time=" << *process.process_kernel_time;
+        out << '\n';
+    }
     constexpr std::size_t max_threads = 256;
     const auto count = std::min(dump.threads.size(), max_threads);
     for (std::size_t i = 0; i < count; ++i) {

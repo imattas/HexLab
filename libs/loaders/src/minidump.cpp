@@ -15,6 +15,7 @@ constexpr std::uint64_t max_streams = 4096, max_memory_regions = 131072,
 constexpr std::uint64_t max_decoded_contexts = 4096;
 constexpr std::size_t misc_info5_xstate_offset = 832;
 constexpr std::size_t xstate_config_feature_size = 528;
+constexpr std::uint32_t misc_info_process_id = 0x1, misc_info_process_times = 0x2;
 constexpr std::size_t max_xstate_context_bytes = 64u * 1024u;
 
 bool extent(std::uint64_t offset, std::uint64_t size, std::uint64_t total) {
@@ -197,7 +198,34 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                 const auto declared = static_cast<std::size_t>(u(size_bytes.value().bytes, 0, 4));
                 if (declared < 4 || declared > misc->size) {
                     metadata.diagnostics.emplace_back("Minidump MiscInfo SizeOfInfo is inconsistent with its stream extent");
-                } else if (declared >= misc_info5_xstate_offset + xstate_config_feature_size) {
+                } else {
+                    if (declared < 8) {
+                        metadata.diagnostics.emplace_back("Minidump MiscInfo is too short to contain Flags1 process metadata");
+                    } else {
+                        constexpr std::size_t base_info_size = 24;
+                        const auto captured = std::min(declared, base_info_size);
+                        if (budget > max_metadata_bytes - captured)
+                            return Error{ErrorCode::resource_limit, "Minidump metadata exceeds its byte budget"};
+                        budget += captured;
+                        auto base = read(*storage, misc->rva, captured);
+                        if (!base) return base.error();
+                        MinidumpProcessInfo process;
+                        process.flags = static_cast<std::uint32_t>(u(base.value().bytes, 4, 4));
+                        if (process.flags & misc_info_process_id) {
+                            if (declared >= 12) process.process_id = static_cast<std::uint32_t>(u(base.value().bytes, 8, 4));
+                            else metadata.diagnostics.emplace_back("Minidump MiscInfo declares process ID metadata without its field");
+                        }
+                        if (process.flags & misc_info_process_times) {
+                            if (declared >= base_info_size) {
+                                process.process_create_time = static_cast<std::uint32_t>(u(base.value().bytes, 12, 4));
+                                process.process_user_time = static_cast<std::uint32_t>(u(base.value().bytes, 16, 4));
+                                process.process_kernel_time = static_cast<std::uint32_t>(u(base.value().bytes, 20, 4));
+                            } else metadata.diagnostics.emplace_back("Minidump MiscInfo declares process timing metadata without all three fields");
+                        }
+                        metadata.process_info = process;
+                    }
+                }
+                if (declared >= misc_info5_xstate_offset + xstate_config_feature_size) {
                     auto info = read(*storage, misc->rva, misc_info5_xstate_offset + xstate_config_feature_size);
                     if (!info) return info.error();
                     const auto info_size = static_cast<std::size_t>(u(info.value().bytes, misc_info5_xstate_offset, 4));
