@@ -328,7 +328,14 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             auto an=utf8(name_ix);if(!an)return an.error();const auto start=r.p;if(len>r.b.size()-r.p)return malformed("attribute extent exceeds its enclosing owner");
             ReaderExtent extent{r,r.b};r.b=r.b.first(start+len);
             if(!class_level&&(an.value()=="NestHost"||an.value()=="NestMembers"||an.value()=="PermittedSubclasses"||an.value()=="Record"||an.value()=="Module"||an.value()=="ModulePackages"||an.value()=="ModuleMainClass"||an.value()=="SourceFile"))return malformed("class-level attribute appears on a member or Code attribute list");
-            if(an.value()=="ConstantValue"){
+            if(an.value()=="Signature"){
+                if(code_owner)return malformed("Signature attribute appears inside Code");
+                if(len!=2)return malformed("Signature attribute must contain one UTF-8 index");
+                std::uint16_t index=0;if(!r.u2(index))return malformed("truncated Signature attribute");
+                auto signature=utf8(index);if(!signature)return signature.error();
+                if(class_level){if(md.signature)return malformed("duplicate class Signature attribute");md.signature=std::move(signature.value());}
+                else {if(!member)return malformed("Signature attribute has no declaration owner");if(member->signature)return malformed("duplicate member Signature attribute");member->signature=std::move(signature.value());}
+            }else if(an.value()=="ConstantValue"){
                 if(!member||method||class_level||code_owner)
                     return malformed("ConstantValue attribute appears outside a field attribute list");
                 if(!fields_with_constant_value.insert(member).second)

@@ -80,6 +80,7 @@ struct JvmCode {
 struct JvmMember {
     std::uint16_t access_flags = 0, name_index = 0, descriptor_index = 0;
     std::string name, descriptor;
+    std::optional<std::string> signature;
     // Exceptions attribute class names, in class-file declaration order.
     std::optional<std::vector<std::string>> declared_exceptions;
     std::vector<JvmAnnotation> visible_annotations, invisible_annotations;
@@ -142,6 +143,7 @@ struct JvmMetadata {
     std::uint16_t minor_version = 0, major_version = 0, access_flags = 0, this_class = 0, super_class = 0;
     std::string class_name, super_name;
     std::optional<std::string> source_file;
+    std::optional<std::string> signature;
     // Empty identity means the defining loader is unknown. In that state only
     // same-class-name proofs are possible; hierarchy traversal is disabled.
     std::string defining_loader;

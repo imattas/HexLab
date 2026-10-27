@@ -126,9 +126,22 @@ void print_exchange_import_report(std::ostream &out, const ExchangeImport &plan,
 
 int run_recovery_list(const project_detail::Arguments &args, std::ostream &out) {
     using namespace project_detail;
-    const auto candidates = take(database::ProjectStore::discover_recovery_candidates(args.path, {}));
+    std::error_code path_error;
+    const bool supplied_directory = std::filesystem::is_directory(args.path, path_error);
+    require(!path_error, "Cannot inspect recovery discovery path: " + path_error.message());
+    if (!supplied_directory) {
+        const bool supplied_file = std::filesystem::is_regular_file(args.path, path_error);
+        require(!path_error, "Cannot inspect recovery project path: " + path_error.message());
+        require(supplied_file, "Recovery discovery path must be an existing directory or regular project file");
+    }
+    const auto directory = supplied_directory ? args.path
+        : (args.path.has_parent_path() ? args.path.parent_path() : std::filesystem::path("."));
+    const auto candidates = take(database::ProjectStore::discover_recovery_candidates(directory, {}));
     if (args.recovery_json) {
-        out << "{\"schema_version\":1,\"directory\":" << json_string(path_utf8(args.path)) << ",\"candidates\":[";
+        out << "{\"schema_version\":1,\"directory\":" << json_string(path_utf8(directory));
+        if (!supplied_directory)
+            out << ",\"project_path\":" << json_string(path_utf8(args.path));
+        out << ",\"candidates\":[";
         for (std::size_t i = 0; i < candidates.size(); ++i) {
             if (i) out << ',';
             out << "{\"path\":" << json_string(path_utf8(candidates[i].path))
@@ -137,7 +150,10 @@ int run_recovery_list(const project_detail::Arguments &args, std::ostream &out) 
         }
         out << "]}\n";
     } else {
-        out << "Validated project recovery artifacts in " << escape(path_utf8(args.path)) << ": " << candidates.size() << '\n';
+        out << "Validated project recovery artifacts in " << escape(path_utf8(directory));
+        if (!supplied_directory)
+            out << " (requested project " << escape(path_utf8(args.path)) << ')';
+        out << ": " << candidates.size() << '\n';
         for (const auto &candidate : candidates)
             out << "  " << recovery_kind(candidate.kind) << " uuid=" << uuid_text(candidate.uuid)
                 << " path=" << escape(path_utf8(candidate.path)) << '\n';
@@ -419,6 +435,7 @@ void project_usage(std::ostream &out) {
            "       hexlab_cli project history save <project.hxproj> --step N --output <copy.hxproj>\n"
            "           [--expected-edit N] [--max-steps N] [--max-bytes N] [--replace] [--json]\n"
            "       hexlab_cli project recovery list <directory> [--json]\n"
+           "       hexlab_cli project recovery list <project.hxproj> [--json]\n"
            "       hexlab_cli project recovery restore <artifact.tmp> --output <project.hxproj> [--replace]\n"
            "       hexlab_cli project backup <project.hxproj> --output <backup.hxproj> [--replace]\n"
            "       hexlab_cli project backup restore <backup.hxproj> --output <new-project.hxproj> [--replace]\n"
@@ -434,7 +451,7 @@ void project_usage(std::ostream &out) {
            "history audit: read-only paginated integrity check; --verify-replay also reverses the applied branch to empty state (max 4096 steps/64 MiB); JSON emits one summary; exit 3 means resume available\n"
            "history preview: read-only bounded replay to an exact step; reports current and preview record counts without changing the project; exit 3 means target differs from current cursor\n"
            "history save: publishes an independent project at an exact step with full undo/redo history; source stays unchanged\n"
-           "recovery list: read-only scan for fully validated interrupted saves and retained previous versions\n"
+           "recovery list: read-only scan for fully validated interrupted saves and retained previous versions; a project path scans its directory\n"
            "recovery restore: revalidates an artifact and publishes an independent project copy; source artifact stays intact\n"
            "backup project: writes a consistent read-only SQLite snapshot while preserving project UUID and history\n"
            "backup restore: validates the backup and creates an independent project with a new UUID; the backup is retained\n"

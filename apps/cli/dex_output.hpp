@@ -23,6 +23,16 @@ inline void dex_description(std::ostream &out, const ImageMetadata &metadata) {
     const auto &dex = *metadata.dex;
     constexpr std::size_t max_classes = 256;
     constexpr std::size_t max_members_per_class = 128;
+    constexpr std::size_t max_map_items = 256;
+    out << "DEX map entries: " << dex.map_items.size() << '\n';
+    const auto map_count = std::min(dex.map_items.size(), max_map_items);
+    for (std::size_t i = 0; i < map_count; ++i) {
+        const auto &item = dex.map_items[i];
+        out << "  map type=0x" << std::hex << item.type << " offset=0x" << item.offset
+            << std::dec << " count=" << item.size << '\n';
+    }
+    if (map_count < dex.map_items.size())
+        out << "  map entries omitted=" << (dex.map_items.size() - map_count) << '\n';
     out << "DEX class definitions: " << dex.classes.size() << '\n';
     const auto class_count = std::min(dex.classes.size(), max_classes);
     for (std::size_t i = 0; i < class_count; ++i) {

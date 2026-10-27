@@ -1,7 +1,8 @@
 # DEX class metadata in CLI inspection
 
-The normal project inspection output and the DEX report path include a
-`DEX class definitions` section. Each class row identifies its type-table index,
+The normal project inspection output and the DEX report path include validated
+map-list entries (bounded to 256 displayed rows) and a `DEX class definitions`
+section. Each map row reports its type code, file offset, and item count. Each class row identifies its type-table index,
 access flags, optional superclass index, and declared member totals. Static and
 instance fields and direct and virtual methods are listed by their identifier
 table indexes with raw access flags; methods also show their code-item offset

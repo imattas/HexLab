@@ -187,6 +187,7 @@ bool decode_mutf8(std::span<const std::byte> raw, std::uint32_t expected_units, 
 }
 
 struct MapData {
+    std::vector<DexMapItem> items;
     std::vector<std::uint32_t> offsets;
     std::uint32_t method_handle_count = 0, method_handle_off = 0;
     std::uint32_t call_site_count = 0, call_site_off = 0;
@@ -203,6 +204,7 @@ Result<MapData> parse_map(std::span<const std::byte> bytes, std::uint32_t offset
         return Error{ErrorCode::malformed, "DEX map_list extent is invalid"};
     MapData result;
     std::array<bool, 0x10001> seen{};
+    result.items.reserve(count);
     result.offsets.reserve(count);
     std::uint32_t previous = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -211,6 +213,7 @@ Result<MapData> parse_map(std::span<const std::byte> bytes, std::uint32_t offset
             item_off > bytes.size() || (i && item_off < previous))
             return Error{ErrorCode::malformed, "DEX map entry is invalid, duplicated, or out of order"};
         seen[type] = true; previous = item_off; result.offsets.push_back(item_off);
+        result.items.push_back({type, size, item_off});
         if (type == 0x0007) { result.has_call_sites = true; result.call_site_count = size; result.call_site_off = item_off; }
         if (type == 0x0008) { result.has_method_handles = true; result.method_handle_count = size; result.method_handle_off = item_off; }
         if (type == 0xf000) { result.has_hiddenapi = true; result.hiddenapi_count = size; result.hiddenapi_off = item_off; }
@@ -954,6 +957,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
         return Error{ErrorCode::malformed, "DEX hidden API section size does not match its class flag streams"};
     if(code.size()>max_items)return Error{ErrorCode::resource_limit,"DEX defined method count exceeds address-space budget"};
     DexMetadata dex_metadata;
+    dex_metadata.map_items = std::move(map.value().items);
     dex_metadata.classes = std::move(decoded_classes);
     dex_metadata.static_values = std::move(decoded_static_values);
     dex_metadata.method_handles = std::move(decoded_method_handles);

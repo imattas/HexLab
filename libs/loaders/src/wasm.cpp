@@ -1276,18 +1276,23 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
         return Error{ErrorCode::unsupported, "Multiple WebAssembly memories require the multi-memory proposal"};
     if (wasm.declared_data_count && *wasm.declared_data_count != wasm.data_segments.size())
         return Error{ErrorCode::malformed, "WebAssembly data-count does not match the data section"};
+    const auto valid_offset_global = [&](std::uint64_t index) {
+        return index < wasm.imported_globals && index < globals.size() &&
+               globals[static_cast<std::size_t>(index)].value == 0x7f &&
+               !globals[static_cast<std::size_t>(index)].mutable_value;
+    };
     for (const auto &segment : wasm.data_segments) {
         if (segment.mode == WasmDataMode::active &&
             segment.memory_index >= static_cast<std::uint64_t>(wasm.imported_memories) + wasm.defined_memories)
             return Error{ErrorCode::malformed, "WebAssembly active data segment references a missing memory"};
         if (segment.mode == WasmDataMode::active && segment.offset_kind == WasmOffsetExpressionKind::global_get &&
-            segment.offset_value >= static_cast<std::uint64_t>(wasm.imported_globals) + wasm.defined_globals)
-            return Error{ErrorCode::malformed, "WebAssembly data segment offset references a missing global"};
+            !valid_offset_global(segment.offset_value))
+            return Error{ErrorCode::malformed, "WebAssembly data segment offset global must be an immutable imported i32 global"};
     }
     for (const auto &segment : wasm.element_segments) {
         if (segment.mode == WasmElementMode::active && segment.offset_kind == WasmOffsetExpressionKind::global_get &&
-            segment.offset_value >= static_cast<std::uint64_t>(wasm.imported_globals) + wasm.defined_globals)
-            return Error{ErrorCode::malformed, "WebAssembly element segment offset references a missing global"};
+            !valid_offset_global(segment.offset_value))
+            return Error{ErrorCode::malformed, "WebAssembly element segment offset global must be an immutable imported i32 global"};
     }
     if (static_cast<std::uint64_t>(wasm.imported_tables) + wasm.defined_tables > 1)
         return Error{ErrorCode::unsupported, "Multiple WebAssembly tables require an extension outside this loader's subset"};

@@ -6,6 +6,17 @@ List recovery artifacts in a directory without changing any files:
 hexlab_cli project recovery list .\projects --json
 ```
 
+After a project fails to open, pass that project path to scan beside it without
+having to extract its directory first:
+
+```powershell
+hexlab_cli project recovery list .\projects\sample.hxproj --json
+```
+
+The report identifies the scanned directory and, when given a project path,
+echoes that path as `project_path`. Discovery only reports validated sibling
+artifacts; it does not alter the project or select an artifact to restore.
+
 The scan considers only regular files with HexLab's interrupted-save or
 retained-previous-version names. Each candidate is opened through the normal
 read-only project validation path, including schema, project rows, patch ranges,

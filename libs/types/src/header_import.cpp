@@ -2189,6 +2189,7 @@ private:
         if(!aggregate_scopes_.empty()&&at("{"))fail(ErrorCode::unsupported,"nested enum definitions are unsupported");
         if(!take("{")){auto it=names_.find(key);if(it==names_.end())fail(ErrorCode::unsupported,"forward enum reference is unsupported");return it->second;}
         std::vector<Enumerator> values;std::int64_t next_value=0,min_value=0,max_value=0;bool auto_overflow=false;std::set<std::string> unique;
+        std::map<std::string, std::uint64_t, std::less<>> prior_enumerators;
         do {
             if(at("}"))break;
             auto name=next().text;if(!identifier(name))syntax("expected enum constant name");
@@ -2196,11 +2197,25 @@ private:
             if(!unique.insert(name).second||result_.enum_constants.contains(constant_name)||result_.symbols.contains(constant_name)||names_.contains(constant_name))
                 fail(ErrorCode::conflict,"duplicate enum constant '"+constant_name+"'");
             if(take("=")){
-                bool negative=take("-");bool positive=!negative&&take("+");(void)positive;
-                const auto magnitude=integer_magnitude(next().text,negative?(std::uint64_t{1}<<63):std::uint64_t(INT64_MAX));
-                next_value=negative?(magnitude==(std::uint64_t{1}<<63)?INT64_MIN:-static_cast<std::int64_t>(magnitude)):static_cast<std::int64_t>(magnitude);auto_overflow=false;
+                std::vector<Token> expression;
+                std::size_t parentheses=0;
+                while(!at("<eof>")){
+                    if(!parentheses&&(at(",")||at("}")))break;
+                    if(at("("))++parentheses;
+                    else if(at(")")){if(!parentheses)fail(ErrorCode::malformed,"unmatched parenthesis in enum value");--parentheses;}
+                    expression.push_back(next());
+                    if(expression.size()>4096)fail(ErrorCode::resource_limit,"enum value expression exceeds its token limit");
+                }
+                if(parentheses)fail(ErrorCode::malformed,"unclosed parenthesis in enum value");
+                if(expression.size()==2&&expression[0].text=="-"&&
+                   !expression[1].text.empty()&&expression[1].text.front()>='0'&&expression[1].text.front()<='9'&&
+                   integer_token_magnitude(expression[1].text,std::uint64_t{1}<<63)==(std::uint64_t{1}<<63))
+                    next_value=INT64_MIN;
+                else next_value=evaluate_integer_expression(expression,prior_enumerators);
+                auto_overflow=false;
             } else if(auto_overflow)fail(ErrorCode::overflow,"enum auto-increment overflows; provide an explicit value");
             values.push_back({name,static_cast<std::uint64_t>(next_value)});result_.enum_constants.emplace(constant_name,next_value);
+            if(!scoped&&next_value>=0)prior_enumerators.emplace(name,static_cast<std::uint64_t>(next_value));
             min_value=std::min(min_value,next_value);max_value=std::max(max_value,next_value);
             if(next_value==INT64_MAX)auto_overflow=true;else{++next_value;auto_overflow=false;}
         } while(take(","));
