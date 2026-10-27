@@ -6,6 +6,11 @@ local source file with up to twenty surrounding lines on either side. The
 current source line is selected as disassembly navigation changes. Selecting
 a mapped source line navigates back to its address in the disassembly.
 
+Use **Find in excerpt** with **Find previous** or **Find next** to search the
+currently displayed source excerpt. Matching is case-sensitive and wraps at
+the excerpt boundaries. The search selects and reveals the match without
+editing the source file; navigation to another mapped line loads a new excerpt.
+
 The source page lists every source path present in the document's line table.
 Use **Filter source files** to narrow the picker by a case-insensitive match
 against the full debug path, then choose a path to inspect its first mapped line, or the closest preceding line

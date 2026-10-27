@@ -213,6 +213,13 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
     endpoint_bar->Add(source_, 0, wxALL, pad);
     endpoint_bar->Add(target_, 0, wxALL, pad);
     stack->Add(endpoint_bar, 0, wxEXPAND);
+    auto *filter_bar = new wxBoxSizer(wxHORIZONTAL);
+    filter_ = new wxTextCtrl(this, wxID_ANY);
+    filter_->SetName("reference-filter");
+    filter_->SetHint("Filter current reference page");
+    filter_bar->Add(new wxStaticText(this, wxID_ANY, "Filter page:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, pad);
+    filter_bar->Add(filter_, 1, wxEXPAND | wxALL, pad);
+    stack->Add(filter_bar, 0, wxEXPAND);
     table_ = new VirtualTable(this, "references",
                               {"Source", "Target", "Kind", "Evidence", "Association", "Source context", "Target context"});
     stack->Add(table_, 1, wxEXPAND);
@@ -279,10 +286,10 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
         }
     });
     table_->activate = [this](std::size_t row) {
-        if (!document_ || !rows_ || row >= rows_->rows.size())
+        if (!document_ || !rows_ || row >= visible_rows_.size())
             return;
         const auto id = *document_;
-        const auto &ref = rows_->rows[row];
+        const auto &ref = rows_->rows[visible_rows_[row]];
         preferences_[id.value].selected = ref.id;
         update_detail();
         update_actions();
@@ -301,6 +308,7 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
     });
     source_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { follow_selected(false); });
     target_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { follow_selected(true); });
+    filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { reload(); });
     origin_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         if (document_ && location_ && navigate) {
             const auto id = *document_;
@@ -512,6 +520,7 @@ void ReferenceView::update(std::optional<DocumentId> id, std::shared_ptr<const P
 }
 void ReferenceView::reload() {
     rows_.reset();
+    visible_rows_.clear();
     table_->populate(0, {});
     update_actions();
     update_detail();
@@ -576,7 +585,7 @@ void ReferenceView::reload() {
     }
     auto rows = rows_;
     auto project = project_;
-    table_->populate(rows->rows.size(), [rows, project](std::size_t row, int column) {
+    const auto cell = [rows, project](std::size_t row, int column) {
         const auto *image = project->loaded ? project->loaded->image.get() : nullptr;
         auto &ref = rows->rows[row];
         switch (column) {
@@ -604,21 +613,41 @@ void ReferenceView::reload() {
         default:
             return wxString{};
         }
+    };
+    wxString query = filter_->GetValue();
+    query.Trim(true).Trim(false);
+    query.MakeLower();
+    for (std::size_t row = 0; row < rows->rows.size(); ++row) {
+        bool matches = query.empty();
+        for (int column = 0; !matches && column < 7; ++column) {
+            auto value = cell(row, column);
+            value.MakeLower();
+            matches = value.Find(query) != wxNOT_FOUND;
+        }
+        if (matches) visible_rows_.push_back(row);
+    }
+    const auto display_rows = visible_rows_;
+    table_->populate(display_rows.size(), [cell, display_rows](std::size_t row, int column) {
+        return row < display_rows.size() ? cell(display_rows[row], column) : wxString{};
     });
     table_->fit_columns({0, 1, 5, 6});
     if (preference.selected) {
         const auto selected = std::find_if(rows_->rows.begin(), rows_->rows.end(), [&](const auto &reference) {
             return reference.id == *preference.selected;
         });
-        if (selected != rows_->rows.end())
-            table_->select_row(static_cast<std::size_t>(selected - rows_->rows.begin()));
-        else preference.selected.reset();
+        if (selected != rows_->rows.end()) {
+            const auto source_row = static_cast<std::size_t>(selected - rows_->rows.begin());
+            const auto visible = std::find(display_rows.begin(), display_rows.end(), source_row);
+            if (visible != display_rows.end()) table_->select_row(static_cast<std::size_t>(visible - display_rows.begin()));
+            else preference.selected.reset();
+        } else preference.selected.reset();
     }
     update_detail();
     update_actions();
     previous_->Enable(preference.offset > 0);
     next_->Enable(rows_->next_offset.has_value());
-    status_->SetLabel(wxString::Format("%zu of %llu references%s; ", rows_->rows.size(),
+    status_->SetLabel(wxString::Format("%zu matches on this page (%zu of %llu references)%s; ",
+                                       visible_rows_.size(), rows_->rows.size(),
                                        static_cast<unsigned long long>(rows_->total),
                                        project_->references->complete() ? "" : " (partial index)") +
                       analysis_state_text(*project_));

@@ -39,6 +39,13 @@ that land at one address remain a single destination. A
 `va:` prefix continues to force numeric virtual-address parsing when a name
 happens to look like an address.
 
+**Navigate > Previous Function** and **Next Function** move to the nearest
+recovered function entry before or after the current mapped address, within
+the same address space. The commands are enabled only while project function
+analysis is current or explicitly incomplete. They do not wrap at either end;
+the current selection and all synchronized panes remain unchanged when no
+adjacent recovered function exists.
+
 ## Graph navigation
 
 Selecting an instruction in a function graph moves the shared selection to

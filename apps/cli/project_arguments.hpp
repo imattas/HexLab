@@ -38,6 +38,7 @@ struct Arguments {
     std::optional<Location> at;
     bool incoming = false;
     bool reference_mapped_range = false;
+    bool search_json = false;
     std::optional<std::uint64_t> reference_range_size;
     PageRequest page;
     GraphKind graph_kind = GraphKind::function_cfg;

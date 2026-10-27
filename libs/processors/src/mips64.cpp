@@ -357,6 +357,18 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
             break;
         default: return invalid("Reserved or unsupported MIPS64 SPECIAL function");
         }
+    } else if (op == 0x1c && funct == 0x02) {
+        // MUL produces the low 32 bits of a signed word product, sign-extended
+        // to the 64-bit GPR. HI/LO are architecturally unpredictable.
+        if (shamt) return invalid("Reserved MIPS64 MUL encoding");
+        i.opcode = Opcode::mips64_mul;
+        i.operands = {reg(rd), reg(rs), reg(rt)};
+        i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
+        if (rs) i.register_reads.push_back(reg(rs));
+        if (rt) i.register_reads.push_back(reg(rt));
+        if (rd) i.register_writes.push_back(reg(rd));
+        i.register_writes.push_back(hi);
+        i.register_writes.push_back(lo);
     } else if (op == 0x1c) {
         // Pre-Release 6 SPECIAL2 count-leading forms. In these encodings the
         // architecture requires rt == rd for compliant software.

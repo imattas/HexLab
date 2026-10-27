@@ -124,6 +124,10 @@ public:
     Result<std::vector<std::byte>> read_register(std::uint64_t number, std::stop_token = {});
     Status write_register(std::uint64_t number, std::span<const std::byte>, std::stop_token = {});
     Result<std::vector<std::byte>> read_memory(std::uint64_t address, std::size_t size, std::stop_token = {});
+    // Requests the remote CRC-32 of a non-empty, non-overflowing memory range.
+    // Empty reply means qCRC is unsupported.
+    Result<std::uint32_t> memory_crc32(std::uint64_t address, std::uint64_t length,
+        std::stop_token = {});
     Status set_breakpoint(std::uint64_t address, BreakpointType, std::uint8_t size, bool insert,
                           std::stop_token = {});
     Status write_memory(std::uint64_t address, std::span<const std::byte>, std::stop_token = {});

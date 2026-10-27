@@ -25,6 +25,10 @@ ExpressionPtr typed_unary(std::string operation, ExpressionPtr value, ValueType 
 ExpressionPtr binary(std::string operation, ExpressionPtr left, ExpressionPtr right, std::uint16_t width) {
     return std::make_shared<Expression>(Expression{integer(width), BinaryValue{std::move(operation), std::move(left), std::move(right)}});
 }
+ExpressionPtr predicate(std::string operation, ExpressionPtr left, ExpressionPtr right) {
+    return std::make_shared<Expression>(Expression{{TypeKind::boolean, 1, false},
+        BinaryValue{std::move(operation), std::move(left), std::move(right)}});
+}
 ExpressionPtr operand(const Operand &value) {
     return std::visit([](const auto &item) -> ExpressionPtr {
         using T = std::decay_t<decltype(item)>;
@@ -543,7 +547,44 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
                                  unary("trunc32", std::move(right), 32), 32);
             return unary("sext", std::move(narrow), 64);
         };
+        const auto trapping_signed_arithmetic = [&](std::string name, ExpressionPtr left,
+                                                     ExpressionPtr right, bool subtract)
+            -> std::optional<Statement> {
+            if (!destination || !src2) return {};
+            const auto value = binary(subtract ? "sub" : "add", left, right, 64);
+            const auto left_sign = predicate("slt", left, constant(0, 64));
+            const auto right_sign = predicate("slt", right, constant(0, 64));
+            const auto result_sign = predicate("slt", value, constant(0, 64));
+            const auto inputs_differ = predicate("ne", left_sign, right_sign);
+            const auto inputs_match = predicate("eq", left_sign, right_sign);
+            const auto result_differs = predicate("ne", result_sign, left_sign);
+            const auto overflow = predicate("and", subtract ? inputs_differ : inputs_match, result_differs);
+            Intrinsic effect{std::move(name), {overflow, left, right}, IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            for (const auto &output : effect.register_writes) {
+                if (output == *destination) effect.register_output_values.push_back(value);
+                else return {};
+            }
+            return Statement{std::move(effect)};
+        };
         switch (op) {
+        case Opcode::mips64_mul:
+            if (src2 && instruction.operands.size() == 3) {
+                Intrinsic effect{"mips64.mul.word.s32", {unary("trunc32", src1, 32),
+                    unary("trunc32", src2, 32)}, IntrinsicMemoryEffect::none};
+                effect.register_writes = instruction.register_writes;
+                const auto result = word_result("mul", src1, src2);
+                for (const auto &output : effect.register_writes) {
+                    if (destination && output == *destination)
+                        effect.register_output_values.push_back(result);
+                    else if (output.bank == RegisterBank::mips_hilo)
+                        effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                            integer(64), UnknownValue{"MIPS64 MUL leaves HI/LO unpredictable"}}));
+                    else return {};
+                }
+                return Statement{std::move(effect)};
+            }
+            break;
         case Opcode::mips64_add:
             return intrinsic(instruction, "mips64.add_word_overflow", IntrinsicMemoryEffect::none);
         case Opcode::mips64_sub:
@@ -566,14 +607,17 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
             }
             break;
         case Opcode::mips64_dadd:
-            return intrinsic(instruction, "mips64_dadd_overflow", IntrinsicMemoryEffect::none);
+            if (src2) return trapping_signed_arithmetic("mips64_dadd_conditional_trap", src1, src2, false);
+            break;
         case Opcode::mips64_daddi:
-            return intrinsic(instruction, "mips64_daddi_overflow", IntrinsicMemoryEffect::none);
+            if (src2) return trapping_signed_arithmetic("mips64_daddi_conditional_trap", src1, src2, false);
+            break;
         case Opcode::mips64_daddu:
             if (src2) return assign(binary("add", src1, src2, 64));
             break;
         case Opcode::mips64_dsub:
-            return intrinsic(instruction, "mips64_dsub_overflow", IntrinsicMemoryEffect::none);
+            if (src2) return trapping_signed_arithmetic("mips64_dsub_conditional_trap", src1, src2, true);
+            break;
         case Opcode::mips64_dsubu:
             if (src2) return assign(binary("sub", src1, src2, 64));
             break;

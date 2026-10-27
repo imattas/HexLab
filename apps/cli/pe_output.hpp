@@ -93,6 +93,49 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata) {
                 out << "  PE version string tables: incomplete or exceeded bounded inspection budget\n";
             ++emitted_versions;
         }
+        std::size_t emitted_manifests = 0, emitted_manifest_dependencies = 0;
+        for (const auto &resource : metadata.pe->resources) {
+            if (!resource.manifest_info) continue;
+            if (emitted_manifests == 256) {
+                out << "PE manifest resources: output limited to 256 rows\n";
+                break;
+            }
+            const auto &manifest = *resource.manifest_info;
+            out << "PE manifest resource name=";
+            if (resource.name.name) out << *resource.name.name;
+            else if (resource.name.id) out << *resource.name.id;
+            else out << "?";
+            if (!manifest.complete) out << " (partial)";
+            if (!manifest.source.spans.empty())
+                out << " file:0x" << std::hex << manifest.source.spans.front().offset.value << std::dec;
+            out << '\n';
+            const auto identity = [&](const char *label, const PeManifestAssemblyIdentity &value) {
+                out << "  " << label;
+                const auto attr = [&](const char *key, const std::optional<std::string> &field) {
+                    if (field) out << ' ' << key << "=\"" << escape_pe_version_text(*field) << '"';
+                };
+                attr("name", value.name); attr("version", value.version); attr("type", value.type);
+                attr("processorArchitecture", value.processor_architecture);
+                attr("publicKeyToken", value.public_key_token); attr("language", value.language);
+                out << '\n';
+            };
+            if (manifest.application_identity) identity("identity", *manifest.application_identity);
+            if (manifest.requested_execution_level) {
+                out << "  requestedExecutionLevel=\""
+                    << escape_pe_version_text(*manifest.requested_execution_level) << '"';
+                if (manifest.ui_access) out << " uiAccess=\"" << (*manifest.ui_access ? "true" : "false") << '"';
+                out << '\n';
+            }
+            for (const auto &dependency : manifest.dependencies) {
+                if (emitted_manifest_dependencies == 4096) {
+                    out << "  PE manifest dependencies: output limited to 4096 rows\n";
+                    break;
+                }
+                identity("dependency", dependency);
+                ++emitted_manifest_dependencies;
+            }
+            ++emitted_manifests;
+        }
     }
     if (metadata.pe && (!metadata.pe->exception_functions.empty() ||
                         !metadata.pe->arm64_exception_functions.empty())) {

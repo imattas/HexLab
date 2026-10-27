@@ -320,7 +320,10 @@ class Itanium {
         if (!take("E")) malformed();
 
         Name entity;
-        if (peek() == 'U' && at_ + 1 < input_.size() &&
+        if (take("s")) {
+            // The ABI records the string literal's type but not its contents.
+            entity.type = named("<string literal>");
+        } else if (peek() == 'U' && at_ + 1 < input_.size() &&
             (input_[at_ + 1] == 'l' || input_[at_ + 1] == 't')) {
             ++at_; // anonymous_type consumes the production following U.
             entity.type = anonymous_type(d + 1);
@@ -340,6 +343,7 @@ class Itanium {
             const auto [end, error] = std::from_chars(input_.data() + begin, input_.data() + at_, discriminator);
             if (error != std::errc{} || end != input_.data() + at_) limit();
             if (extended_discriminator && !take("_")) malformed();
+            if (extended_discriminator ? discriminator < 10 : discriminator >= 10) malformed();
             append(entity.type.base, " [discriminator ");
             append(entity.type.base, std::to_string(discriminator));
             append(entity.type.base, "]");

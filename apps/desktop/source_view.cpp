@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <string>
 #include <utility>
@@ -132,9 +133,17 @@ std::optional<std::filesystem::path> usable_path(const std::string &path) {
 SourceView::SourceView(wxWindow *parent) : wxPanel(parent) {
     auto *layout = new wxBoxSizer(wxVERTICAL);
     auto *navigation = new wxBoxSizer(wxHORIZONTAL);
+    auto *search = new wxBoxSizer(wxHORIZONTAL);
     source_filter_ = new wxTextCtrl(this, wxID_ANY, {}, wxDefaultPosition, FromDIP(wxSize(180, -1)));
     source_filter_->SetName("source-file-filter");
     source_filter_->SetHint("Filter source files");
+    source_find_ = new wxTextCtrl(this, wxID_ANY, {}, wxDefaultPosition, FromDIP(wxSize(220, -1)), wxTE_PROCESS_ENTER);
+    source_find_->SetName("source-text-search");
+    source_find_->SetHint("Find in displayed source");
+    previous_match_ = new wxButton(this, wxID_ANY, "Find previous");
+    previous_match_->SetName("source-find-previous");
+    next_match_ = new wxButton(this, wxID_ANY, "Find next");
+    next_match_->SetName("source-find-next");
     source_file_ = new wxChoice(this, wxID_ANY);
     source_file_->SetName("source-file-picker");
     source_file_->SetMinSize(FromDIP(wxSize(180, -1)));
@@ -168,7 +177,12 @@ SourceView::SourceView(wxWindow *parent) : wxPanel(parent) {
     navigation->Add(previous_mapping_, 0, wxALL, FromDIP(2));
     navigation->Add(next_mapping_, 0, wxALL, FromDIP(2));
     navigation->Add(toggle_breakpoint_, 0, wxALL, FromDIP(2));
+    search->Add(new wxStaticText(this, wxID_ANY, "Find in excerpt:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, FromDIP(4));
+    search->Add(source_find_, 0, wxALIGN_CENTER_VERTICAL | wxALL, FromDIP(2));
+    search->Add(previous_match_, 0, wxALL, FromDIP(2));
+    search->Add(next_match_, 0, wxALL, FromDIP(2));
     layout->Add(navigation, 0, wxEXPAND);
+    layout->Add(search, 0, wxEXPAND);
     layout->Add(source_splitter, 1, wxEXPAND);
     SetSizer(layout);
     source_->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent &event) {
@@ -181,6 +195,9 @@ SourceView::SourceView(wxWindow *parent) : wxPanel(parent) {
     });
     previous_mapping_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { navigate_line_mapping(false); });
     next_mapping_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { navigate_line_mapping(true); });
+    previous_match_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { find_source_text(false); });
+    next_match_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { find_source_text(true); });
+    source_find_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent &) { find_source_text(true); });
     toggle_breakpoint_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         if (selected_line_addresses_.empty()) {
             status_->SetLabel("Select a source line with a mapped address first");
@@ -547,6 +564,43 @@ void SourceView::navigate_line_mapping(bool next) {
         --selected_line_address_index_;
     }
     navigate(Location{selected_line_addresses_[selected_line_address_index_]});
+}
+
+void SourceView::find_source_text(bool next) {
+    const auto query = source_find_->GetValue();
+    if (query.empty()) {
+        status_->SetLabel("Enter text to find in the displayed source excerpt");
+        return;
+    }
+    const auto text = source_->GetValue();
+    if (text.empty()) {
+        status_->SetLabel("No source excerpt is displayed");
+        return;
+    }
+
+    long selection_begin = 0, selection_end = 0;
+    source_->GetSelection(&selection_begin, &selection_end);
+    std::size_t position = wxString::npos;
+    if (next) {
+        const auto start = static_cast<std::size_t>(std::max(0L, selection_end));
+        if (start <= text.length()) position = text.find(query, start);
+        if (position == wxString::npos) position = text.find(query, 0);
+    } else {
+        const auto start = static_cast<std::size_t>(std::max(0L, selection_begin));
+        position = text.rfind(query, start ? start - 1 : wxString::npos);
+        if (position == wxString::npos) position = text.rfind(query, wxString::npos);
+    }
+    const auto maximum_position = static_cast<std::size_t>(std::numeric_limits<long>::max());
+    if (position == wxString::npos || position > maximum_position ||
+        query.length() > maximum_position - position) {
+        status_->SetLabel("No match in the displayed source excerpt");
+        return;
+    }
+    const auto begin = static_cast<long>(position);
+    source_->SetSelection(begin, begin + static_cast<long>(query.length()));
+    source_->ShowPosition(begin);
+    source_->SetFocus();
+    status_->SetLabel("Source match selected");
 }
 
 void SourceView::update_mapping_controls() {

@@ -79,9 +79,13 @@ substitution dictionary to 256 entries and 64 KiB of retained strings by default
 (`max_substitutions` and `max_substitution_bytes`).
 
 Local Itanium names now parse their enclosing function encoding, entity name,
-and both decimal discriminator spellings (`_<number>` and `__<number>_`). The
-discriminator is rendered as a decimal suffix on the local entity. Lambda closure type names (`Ul...E_`) and numbered
-unnamed types (`Ut..._`) are rendered as stable placeholders such as
+and both decimal discriminator spellings (`_<number>` for values below 10 and
+`__<number>_` for values 10 and above). A string-literal local entity (`s`)
+is rendered as `<string literal>` with its optional discriminator. The ABI
+does not encode the literal contents, so the demangler cannot recover them.
+The discriminator is rendered as a decimal suffix on the local entity. Lambda
+closure type names (`Ul...E_`) and numbered unnamed types (`Ut..._`) are
+rendered as stable placeholders such as
 `<lambda(int)#0>` and `<unnamed-type#2>`; this preserves the distinction
 between closures without pretending to reconstruct source capture syntax.
 These forms remain bounded by the usual input, depth, component, and output
@@ -90,9 +94,8 @@ type grammar as ordinary names.
 
 This is not a complete implementation of either ABI. The Itanium substitutions
 described below, array/function/member-pointer types, and selected template
-parameters are recognized; vendor extensions, local-name discriminator
-variants beyond these two discriminator productions, string-literal local
-names, expression-valued template arguments beyond the bounded integer
+parameters are recognized; vendor extensions, default-argument local-name
+forms, expression-valued template arguments beyond the bounded integer
 expression grammar, and broader operator/type
 encodings remain incomplete, including expression calls/casts,
 template parameter references inside expressions, and unrecognized vendor
@@ -154,9 +157,9 @@ Every intermediate string and expanded backreference is bounded by the output
 limit, and retained dictionary strings have a separate aggregate byte budget.
 Parsing depth and total component work remain bounded even when a symbol uses
 many references. Unsupported productions fail the complete parse; no partial
-presentation replaces raw identity. Local/lambda/special names, dependent
-qualified/template-template names, ref-qualified function-type encodings,
-expression calls/casts, and vendor qualifier template arguments
+presentation replaces raw identity. Unrecognized local/lambda/special forms,
+dependent qualified/template-template names, ref-qualified function-type
+encodings, expression calls/casts, and vendor qualifier template arguments
 remain outside this slice. Incomplete/cv-qualified array declarators and other
 unproven qualifier forms also fail closed.
 

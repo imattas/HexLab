@@ -5,6 +5,9 @@ not rewrite source bytes or analysis ownership. The constant pass folds supporte
 fixed-width binary operations, boolean negation, integer bitwise complement,
 sign-bit/even-parity predicates, and fixed immediate shifts/rotates when their
 width and shift-count constraints are explicit; it also folds constant predicates.
+Unsigned `udiv` and `urem` fold when both operands and the result have the same
+unsigned integer type and the divisor is nonzero. A zero divisor remains
+unfolded so its architecture- or runtime-specific behavior is preserved.
 The identity pass applies
 width-aware bit-vector identities, substitutes bounded SSA expressions along
 single-predecessor acyclic paths, and reuses duplicate pure expressions within a

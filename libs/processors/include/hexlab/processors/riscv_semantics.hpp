@@ -27,6 +27,17 @@ HEXLAB_PROCESSORS_EXPORT std::optional<std::uint64_t>
 evaluate_riscv_zba_operation(RiscvOpcode opcode, unsigned xlen, std::uint64_t lhs,
                              std::uint64_t rhs) noexcept;
 
+struct RiscvIntegerConversionResult {
+    std::uint64_t value = 0; // destination-register bits; word results are sign-extended.
+    std::uint8_t fflags_set = 0; // accrued exception bits: NX=1, UF=2, OF=4, DZ=8, NV=16.
+};
+
+// Evaluate Zfa FCVTMOD.W.D from raw IEEE-754 binary64 bits. The conversion
+// truncates toward zero, takes the low 32 bits of the unbounded signed result,
+// then sign-extends it. Non-finite inputs map to zero. Only RV32/RV64 are valid.
+HEXLAB_PROCESSORS_EXPORT std::optional<RiscvIntegerConversionResult>
+evaluate_riscv_fcvtmod_w_d(std::uint64_t source_bits, unsigned xlen) noexcept;
+
 struct RiscvVectorIntegerConfig {
     std::uint16_t vlen_bits = 128;
     std::uint8_t sew_bits = 8;

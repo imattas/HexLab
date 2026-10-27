@@ -1,4 +1,6 @@
 #include "pe_internal.hpp"
+#include <algorithm>
+#include <cstddef>
 #include <iterator>
 #include <map>
 #include <functional>
@@ -239,6 +241,254 @@ std::optional<PeVersionInfo> parse_version_info(const ImageReader &reader, const
     if (resource.size > prefix_size) mark_incomplete();
     return result;
 }
+
+void append_utf8(std::string &out, std::uint32_t cp) {
+    if (cp < 0x80) out.push_back(static_cast<char>(cp));
+    else if (cp < 0x800) {
+        out.push_back(static_cast<char>(0xc0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else if (cp < 0x10000) {
+        out.push_back(static_cast<char>(0xe0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else {
+        out.push_back(static_cast<char>(0xf0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    }
+}
+
+std::optional<PeManifestInfo> parse_manifest(const ImageReader &reader, const PeResource &resource,
+                                             std::uint64_t &remaining_budget) {
+    if (!resource.size) return {};
+    constexpr std::uint64_t per_resource_limit = 1024 * 1024;
+    const auto bounded_size = std::min<std::uint64_t>({resource.size, per_resource_limit, remaining_budget});
+    if (!bounded_size) return {};
+    remaining_budget -= bounded_size;
+    const auto raw = reader.bytes(resource.data_rva, static_cast<std::size_t>(bounded_size));
+    PeManifestInfo result;
+    result.source = {resource.data_entry.index, reader.sources(resource.data_rva, bounded_size)};
+    const auto incomplete = [&]() -> std::optional<PeManifestInfo> {
+        result.complete = false;
+        return result;
+    };
+
+    std::string xml;
+    const auto u8 = [&](std::size_t i) { return std::to_integer<std::uint8_t>(raw[i]); };
+    if (raw.size() >= 2 && ((u8(0) == 0xff && u8(1) == 0xfe) || resource.code_page == 1200)) {
+        const std::size_t begin = u8(0) == 0xff && u8(1) == 0xfe ? 2 : 0;
+        if ((raw.size() - begin) % 2 != 0) return incomplete();
+        for (std::size_t i = begin; i < raw.size(); i += 2) {
+            std::uint32_t cp = u8(i) | (std::uint32_t{u8(i + 1)} << 8);
+            if (cp >= 0xd800 && cp <= 0xdbff) {
+                if (i + 3 >= raw.size()) return incomplete();
+                const auto low = u8(i + 2) | (std::uint32_t{u8(i + 3)} << 8);
+                if (low < 0xdc00 || low > 0xdfff) return incomplete();
+                cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                i += 2;
+            } else if (cp >= 0xdc00 && cp <= 0xdfff) return incomplete();
+            append_utf8(xml, cp);
+        }
+    } else {
+        std::size_t begin = 0;
+        if (raw.size() >= 3 && u8(0) == 0xef && u8(1) == 0xbb && u8(2) == 0xbf) begin = 3;
+        xml.reserve(raw.size() - begin);
+        for (std::size_t i = begin; i < raw.size(); ++i) {
+            const auto ch = u8(i);
+            if (ch == 0) return incomplete();
+            xml.push_back(static_cast<char>(ch));
+        }
+        // Validate UTF-8 before retaining attribute bytes for display.
+        for (std::size_t i = 0; i < xml.size();) {
+            const auto lead = static_cast<unsigned char>(xml[i]);
+            if (lead < 0x80) {
+                if (!((lead == 0x9 || lead == 0xa || lead == 0xd) || lead >= 0x20)) return incomplete();
+                ++i;
+                continue;
+            }
+            const std::size_t width = lead >= 0xc2 && lead <= 0xdf ? 2 :
+                                      lead >= 0xe0 && lead <= 0xef ? 3 :
+                                      lead >= 0xf0 && lead <= 0xf4 ? 4 : 0;
+            if (!width || width > xml.size() - i) return incomplete();
+            std::uint32_t cp = lead & (width == 2 ? 0x1fu : width == 3 ? 0x0fu : 0x07u);
+            for (std::size_t n = 1; n < width; ++n) {
+                const auto next = static_cast<unsigned char>(xml[i + n]);
+                if ((next & 0xc0u) != 0x80u) return incomplete();
+                cp = (cp << 6) | (next & 0x3fu);
+            }
+            if ((width == 2 && cp < 0x80) || (width == 3 && cp < 0x800) ||
+                (width == 4 && cp < 0x10000) || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
+                return incomplete();
+            i += width;
+        }
+    }
+    if (resource.size > bounded_size) result.complete = false;
+
+    const auto decode_attribute = [&](std::string_view input) -> std::optional<std::string> {
+        std::string output;
+        for (std::size_t i = 0; i < input.size(); ++i) {
+            if (input[i] != '&') { output.push_back(input[i]); continue; }
+            const auto semicolon = input.find(';', i + 1);
+            if (semicolon == std::string_view::npos || semicolon - i > 12) return {};
+            const auto entity = input.substr(i + 1, semicolon - i - 1);
+            if (entity == "amp") output.push_back('&');
+            else if (entity == "lt") output.push_back('<');
+            else if (entity == "gt") output.push_back('>');
+            else if (entity == "quot") output.push_back('"');
+            else if (entity == "apos") output.push_back('\'');
+            else if (!entity.empty() && entity.front() == '#') {
+                std::uint32_t cp = 0;
+                const bool hex = entity.size() > 1 && (entity[1] == 'x' || entity[1] == 'X');
+                const auto digits = entity.substr(hex ? 2 : 1);
+                if (digits.empty()) return {};
+                for (const char ch : digits) {
+                    unsigned value = 0;
+                    if (ch >= '0' && ch <= '9') value = static_cast<unsigned>(ch - '0');
+                    else if (hex && ch >= 'a' && ch <= 'f') value = static_cast<unsigned>(ch - 'a' + 10);
+                    else if (hex && ch >= 'A' && ch <= 'F') value = static_cast<unsigned>(ch - 'A' + 10);
+                    else return {};
+                    const unsigned base = hex ? 16 : 10;
+                    if (cp > (0x10ffffu - value) / base) return {};
+                    cp = cp * base + value;
+                }
+                if (!((cp == 0x9 || cp == 0xa || cp == 0xd) ||
+                      (cp >= 0x20 && cp <= 0xd7ff) || (cp >= 0xe000 && cp <= 0xfffd) ||
+                      (cp >= 0x10000 && cp <= 0x10ffff))) return {};
+                append_utf8(output, cp);
+            } else return {};
+            i = semicolon;
+        }
+        return output;
+    };
+    const auto local_name = [](std::string_view name) {
+        const auto colon = name.rfind(':');
+        return name.substr(colon == std::string_view::npos ? 0 : colon + 1);
+    };
+    const auto is_space = [](char ch) { return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n'; };
+    const auto valid_name_char = [](unsigned char ch) {
+        return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+               (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' || ch == ':';
+    };
+    std::vector<std::string> stack;
+    bool saw_root = false;
+    std::size_t pos = 0, tags = 0;
+    const auto parse_identity = [&](const std::map<std::string, std::string, std::less<>> &attributes) {
+        PeManifestAssemblyIdentity identity;
+        const auto get = [&](const char *key) -> std::optional<std::string> {
+            auto it = attributes.find(key);
+            return it == attributes.end() ? std::optional<std::string>{} : std::optional<std::string>{it->second};
+        };
+        identity.type = get("type"); identity.name = get("name"); identity.version = get("version");
+        identity.processor_architecture = get("processorArchitecture");
+        identity.public_key_token = get("publicKeyToken"); identity.language = get("language");
+        identity.source = result.source;
+        return identity;
+    };
+    const auto tag_name = [&](std::size_t &cursor) -> std::optional<std::string> {
+        const auto begin = cursor;
+        while (cursor < xml.size() && valid_name_char(static_cast<unsigned char>(xml[cursor]))) ++cursor;
+        if (begin == cursor || cursor - begin > 256) return {};
+        return xml.substr(begin, cursor - begin);
+    };
+    while (pos < xml.size()) {
+        const auto open = xml.find('<', pos);
+        if (open == std::string::npos) {
+            if (stack.empty() && std::any_of(xml.begin() + static_cast<std::ptrdiff_t>(pos), xml.end(),
+                                             [&](char ch) { return !is_space(ch); }))
+                return incomplete();
+            break;
+        }
+        if (stack.empty() && std::any_of(xml.begin() + static_cast<std::ptrdiff_t>(pos),
+                                         xml.begin() + static_cast<std::ptrdiff_t>(open),
+                                         [&](char ch) { return !is_space(ch); }))
+            return incomplete();
+        pos = open + 1;
+        if (xml.compare(open, 4, "<!--") == 0) {
+            const auto end = xml.find("-->", open + 4);
+            if (end == std::string::npos) return incomplete();
+            pos = end + 3;
+            continue;
+        }
+        if (xml.compare(open, 2, "<?") == 0) {
+            const auto end = xml.find("?>", open + 2);
+            if (end == std::string::npos) return incomplete();
+            pos = end + 2;
+            continue;
+        }
+        if (xml.compare(open, 9, "<![CDATA[") == 0) {
+            const auto end = xml.find("]]>", open + 9);
+            if (end == std::string::npos) return incomplete();
+            pos = end + 3;
+            continue;
+        }
+        if (pos >= xml.size() || xml[pos] == '!') return incomplete(); // No DTD or external entities.
+        if (xml[pos] == '/') {
+            ++pos;
+            auto name = tag_name(pos);
+            while (pos < xml.size() && is_space(xml[pos])) ++pos;
+            if (!name || pos >= xml.size() || xml[pos++] != '>' || stack.empty() || stack.back() != *name)
+                return incomplete();
+            stack.pop_back();
+            continue;
+        }
+        auto name = tag_name(pos);
+        if (!name) return incomplete();
+        if (++tags > 16384 || stack.size() >= 64) return incomplete();
+        std::map<std::string, std::string, std::less<>> attributes;
+        bool self_closing = false;
+        for (;;) {
+            while (pos < xml.size() && is_space(xml[pos])) ++pos;
+            if (pos >= xml.size()) return incomplete();
+            if (xml[pos] == '>') { ++pos; break; }
+            if (xml[pos] == '/') {
+                ++pos;
+                if (pos >= xml.size() || xml[pos++] != '>') return incomplete();
+                self_closing = true;
+                break;
+            }
+            auto key = tag_name(pos);
+            if (!key || attributes.size() >= 64) return incomplete();
+            while (pos < xml.size() && is_space(xml[pos])) ++pos;
+            if (pos >= xml.size() || xml[pos++] != '=') return incomplete();
+            while (pos < xml.size() && is_space(xml[pos])) ++pos;
+            if (pos >= xml.size() || (xml[pos] != '\'' && xml[pos] != '"')) return incomplete();
+            const char quote = xml[pos++];
+            const auto value_begin = pos;
+            while (pos < xml.size() && xml[pos] != quote && xml[pos] != '<') ++pos;
+            if (pos >= xml.size() || pos - value_begin > 4096) return incomplete();
+            auto value = decode_attribute(std::string_view(xml).substr(value_begin, pos - value_begin));
+            ++pos;
+            if (!value || !attributes.emplace(*key, std::move(*value)).second) return incomplete();
+        }
+        const auto local = local_name(*name);
+        const bool root_element = stack.empty();
+        if (root_element) {
+            if (saw_root || local != "assembly") return incomplete();
+            saw_root = true;
+        } else if (stack.size() == 1 && local_name(stack.back()) == "assembly" && local == "assemblyIdentity") {
+            if (result.application_identity) return incomplete();
+            result.application_identity = parse_identity(attributes);
+        } else if (local == "assemblyIdentity" && !stack.empty() && local_name(stack.back()) == "dependentAssembly") {
+            if (result.dependencies.size() >= 4096) return incomplete();
+            result.dependencies.push_back(parse_identity(attributes));
+        } else if (local == "requestedExecutionLevel" && !stack.empty() && local_name(stack.back()) == "requestedPrivileges") {
+            auto level = attributes.find("level");
+            auto ui = attributes.find("uiAccess");
+            if (level == attributes.end() || level->second.empty() || result.requested_execution_level)
+                return incomplete();
+            result.requested_execution_level = level->second;
+            if (ui != attributes.end()) {
+                if (ui->second == "true" || ui->second == "1") result.ui_access = true;
+                else if (ui->second == "false" || ui->second == "0") result.ui_access = false;
+                else return incomplete();
+            }
+        }
+        if (!self_closing) stack.push_back(*name);
+    }
+    if (!saw_root || !stack.empty()) return incomplete();
+    return result;
+}
 }
 
 Result<std::size_t> read_exports(const Image& image,const Directory& directory,ImageMetadata& metadata,std::stop_token stop) {
@@ -315,6 +565,7 @@ Result<std::size_t> read_resources(const Image& image,const Directory& directory
         const std::uint64_t root=directory.location, end=root+directory.size;
         std::size_t total=0;
         std::uint64_t version_parse_budget = 16u * 1024u * 1024u;
+        std::uint64_t manifest_parse_budget = 16u * 1024u * 1024u;
         std::vector<PeResourceIdentifier> path;
         std::set<std::uint32_t> active;
         auto source=[&](std::uint64_t at,std::uint64_t size,std::uint32_t index=0) {
@@ -389,6 +640,8 @@ Result<std::size_t> read_resources(const Image& image,const Directory& directory
                     resource.entry=source(item,8,i); resource.data_entry=source(data_at,16,i);
                     if (resource.type.id == 16)
                         resource.version_info = parse_version_info(r, resource, version_parse_budget);
+                    else if (resource.type.id == 24)
+                        resource.manifest_info = parse_manifest(r, resource, manifest_parse_budget);
                     metadata.pe->resources.push_back(std::move(resource));
                 }
             }

@@ -18,6 +18,13 @@ marker, and 1 MiB aggregate checks; returned `<library>` names and segment
 addresses flow through the existing XML validation and module model. A malformed
 standard object is reported as malformed rather than hidden by a fallback.
 
+`rsp::Client::memory_crc32(address, length)` requests a remote CRC-32 through
+`qCRC:ADDR,LENGTH`, allowing callers to compare a memory range without reading
+the bytes back. The client rejects empty or address-overflowing ranges before
+I/O, treats an empty reply as unsupported, and accepts only a `C`-prefixed
+hexadecimal value that fits in 32 bits. The API does not inspect the target
+memory map, so callers remain responsible for selecting a readable range.
+
 ## Launching on a connected remote target
 
 In a live RSP session, the existing **Launch** command can start a new remote

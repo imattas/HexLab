@@ -22,3 +22,16 @@ first 4 KiB of the resource and only publishes the structured record when the
 root key, bounds, and fixed-info signature match. Other version-resource
 layouts remain available through their raw payload spans. `hexlab_cli inspect`
 prints decoded file and product versions, capped at 256 rows.
+
+For numeric `RT_MANIFEST` (type ID 24), the loader extracts the root
+`assemblyIdentity`, identities beneath `dependentAssembly`, and
+`requestedExecutionLevel`/`uiAccess` attributes. UTF-8 (with an optional BOM)
+and UTF-16LE manifests are inspected. The XML scanner is bounded to 1 MiB per
+resource, 16 MiB across the image, 64 levels, 16,384 tags, and 64 attributes per
+tag. It resolves only predefined XML entities and numeric character references;
+DTDs and external entity expansion are not processed. Unknown XML content is
+skipped while malformed recognized syntax marks the structured record partial.
+Raw payload spans remain available for unsupported encodings and other
+manifest metadata. `hexlab_cli inspect` reports decoded identities and
+execution-level requests with bounded output; these fields are descriptive and
+do not imply that Windows will grant the requested access level.

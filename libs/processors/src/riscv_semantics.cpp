@@ -165,6 +165,63 @@ std::optional<std::uint64_t> evaluate_riscv_zba_operation(RiscvOpcode opcode, un
     }
 }
 
+std::optional<RiscvIntegerConversionResult>
+evaluate_riscv_fcvtmod_w_d(std::uint64_t source_bits, unsigned xlen) noexcept {
+    if (xlen != 32 && xlen != 64) return {};
+
+    constexpr std::uint64_t fraction_mask = (UINT64_C(1) << 52) - 1;
+    const auto exponent = static_cast<unsigned>((source_bits >> 52) & 0x7ffu);
+    const auto fraction = source_bits & fraction_mask;
+    const bool negative_input = (source_bits >> 63) != 0;
+    RiscvIntegerConversionResult result;
+
+    // The Zfa instruction maps infinities and NaNs to zero and raises NV.
+    if (exponent == 0x7ffu) {
+        result.fflags_set = 0x10;
+        return result;
+    }
+
+    const bool subnormal = exponent == 0;
+    const std::uint64_t significand = subnormal ? fraction : ((UINT64_C(1) << 52) | fraction);
+    const int unbiased_exponent = subnormal ? -1022 : static_cast<int>(exponent) - 1023;
+
+    // Compute floor(abs(x)) and fractional status from the binary encoding;
+    // this avoids host FP rounding modes and undefined out-of-range casts.
+    std::uint64_t truncated_magnitude = 0;
+    bool fractional = false;
+    if (unbiased_exponent < 0) {
+        fractional = significand != 0;
+    } else if (unbiased_exponent < 52) {
+        const unsigned discarded_bits = static_cast<unsigned>(52 - unbiased_exponent);
+        const std::uint64_t discarded_mask = (UINT64_C(1) << discarded_bits) - 1;
+        truncated_magnitude = significand >> discarded_bits;
+        fractional = (significand & discarded_mask) != 0;
+    }
+
+    // FCVTMOD raises the same conversion flags as FCVT.W.D. NV has precedence
+    // over NX when the rounded result is outside the signed 32-bit range.
+    const std::uint64_t signed_limit = negative_input ? UINT64_C(0x80000000) : UINT64_C(0x7fffffff);
+    // Values with exponent > 31 are always outside the signed word range. At
+    // exponent 31, truncated_magnitude was computed without a left shift and
+    // can be compared exactly, avoiding overflow in the range check.
+    const bool invalid = unbiased_exponent > 31 || truncated_magnitude > signed_limit;
+    if (invalid) result.fflags_set = 0x10;
+    else if (fractional) result.fflags_set = 0x01;
+
+    // The low 32 bits of a left-shifted significand are zero once the shift is
+    // 32 or greater, so avoid shifts at or above the C++ integer width.
+    std::uint32_t low_bits = 0;
+    if (unbiased_exponent >= 0 && unbiased_exponent < 52) {
+        low_bits = static_cast<std::uint32_t>(truncated_magnitude);
+    } else if (unbiased_exponent >= 52) {
+        const auto shift = static_cast<unsigned>(unbiased_exponent - 52);
+        if (shift < 32) low_bits = static_cast<std::uint32_t>(significand) << shift;
+    }
+    if (negative_input) low_bits = std::uint32_t{0} - low_bits;
+    result.value = sign_extend_32(low_bits);
+    return result;
+}
+
 std::optional<RiscvVectorIntegerConfig>
 make_riscv_vector_integer_config(std::uint16_t vlen_bits, std::uint8_t xlen_bits,
                                  std::uint64_t vl, std::uint64_t vstart,

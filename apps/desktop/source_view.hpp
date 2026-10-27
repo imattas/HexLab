@@ -35,6 +35,7 @@ class SourceView final : public wxPanel {
     };
     wxTextCtrl *source_ = nullptr;
     wxTextCtrl *source_filter_ = nullptr;
+    wxTextCtrl *source_find_ = nullptr;
     wxChoice *source_file_ = nullptr;
     wxStaticText *status_ = nullptr;
     std::shared_ptr<const DocumentSnapshot> document_;
@@ -50,6 +51,8 @@ class SourceView final : public wxPanel {
     std::size_t selected_line_address_index_ = 0;
     wxButton *previous_mapping_ = nullptr;
     wxButton *next_mapping_ = nullptr;
+    wxButton *previous_match_ = nullptr;
+    wxButton *next_match_ = nullptr;
     wxButton *toggle_breakpoint_ = nullptr;
     VirtualTable *mapped_instructions_ = nullptr;
     struct InstructionMapping {
@@ -64,6 +67,7 @@ class SourceView final : public wxPanel {
     void refresh_file_choices(const std::string &preferred_path = {});
     void render_source_row(const SourceRow &, Address context_address);
     void navigate_line_mapping(bool next);
+    void find_source_text(bool next);
     void render_instruction_mappings(const std::string &path, std::int64_t line, AddressSpaceId space);
     void update_mapping_controls();
     void render_unavailable(const wxString &message);

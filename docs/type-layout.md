@@ -86,9 +86,12 @@ members retain their incomplete status through aggregate construction/layout.
 Invalid qualifier placements fail import rather than being silently discarded.
 PDB qualifier metadata is not currently translated into these nodes.
 
-This API covers data object layout only. Function types, `void`, empty
-aggregates, incomplete aggregate definitions, unresolved names, and recursive
-by-value graphs return an `unsupported` error. A final flexible array member
+This API covers data object layout only. Function types, `void`, empty unions,
+incomplete aggregate definitions, unresolved names, and recursive by-value
+graphs return an `unsupported` error. A complete empty structure with a stored
+size and alignment returns those recorded values directly because there are no
+members from which to recompute its extent; layout does not guess an empty
+class rule for a different compiler or ABI. A final flexible array member
 contributes zero size and the element alignment; the containing structure keeps
 its normal tail padding. Its `MemberLayout::flexible_array` flag is true, so
 callers can distinguish that zero-sized tail from an ordinary extent without

@@ -184,6 +184,16 @@ std::optional<ConstantValue> fold_binary(const BinaryValue &binary, ValueType re
     if ((!is_shift && (left->type.bits != result_bits || right->type.bits != result_bits)) ||
         (is_shift && left->type.bits != result_bits)) return {};
     const auto mask = width_mask(result_bits);
+    // Unsigned division and remainder are defined for every nonzero divisor.
+    // Keep divide-by-zero expressions intact so architecture/runtime trap
+    // behavior stays explicit in the lifted IR.
+    if (binary.operation == "udiv" || binary.operation == "urem") {
+        if (left->type.kind != TypeKind::integer || right->type.kind != TypeKind::integer ||
+            result_type.kind != TypeKind::integer || left->type.is_signed || right->type.is_signed ||
+            result_type.is_signed || left->type != right->type || left->type != result_type || b == 0)
+            return {};
+        return ConstantValue{binary.operation == "udiv" ? a / b : a % b, result_type};
+    }
     if (const auto m_opcode = riscv_m_opcode(binary.operation)) {
         const auto folded = evaluate_riscv_m_operation(*m_opcode, bits, left->value, right->value);
         if (folded) return ConstantValue{*folded & width_mask(bits), result_type};

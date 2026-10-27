@@ -94,8 +94,18 @@ values are 17, 18, and 19; derived-cache version 32 recomputes older payloads.
 `hexlab_cli disassemble <path> --show-strings` lists candidate encoding names,
 file offsets, extents, and previews. The desktop Strings view uses the same
 Windows-1253, Windows-1255, Windows-1256, Windows-1257, Windows-1258,
-ISO-8859-2, ISO-8859-5, DOS-437, DOS-850, and ISO-8859-15 labels.
+ISO-8859-2, ISO-8859-5, ISO-8859-9, DOS-437, DOS-850, and ISO-8859-15 labels.
 
 All encoding passes use the same file-backed scan domains, string-record budget,
 and cancellation checks. Returned previews are UTF-8, while each record retains
 the source byte length and encoding identity.
+
+
+ISO-8859-9 (Latin-5) adds Turkish single-byte candidates using the Unicode
+Consortium's [8859-9 mapping table](https://www.unicode.org/Public/MAPPINGS/ISO8859/8859-9.TXT).
+It follows Latin-1 except for the six Turkish G-breve, dotted/dotless I, and
+S-cedilla replacements. C1 controls are split by the shared printable-scalar
+filter. Candidates require a non-ASCII scalar, keep original source extents,
+and use UTF-8 previews. Persisted encoding value 20 and derived-cache version
+33 cause older cache payloads to recompute. This is a heuristic mapping and
+does not classify file locale.

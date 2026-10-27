@@ -23,6 +23,27 @@
 #include <tuple>
 namespace hexlab::cli::project_detail {
 namespace {
+std::string search_json_string(std::string_view value) {
+    std::ostringstream out;
+    out << '"';
+    for (const unsigned char c : value) {
+        switch (c) {
+        case '"': out << "\\\""; break;
+        case '\\': out << "\\\\"; break;
+        case '\b': out << "\\b"; break;
+        case '\f': out << "\\f"; break;
+        case '\n': out << "\\n"; break;
+        case '\r': out << "\\r"; break;
+        case '\t': out << "\\t"; break;
+        default:
+            if (c < 0x20) out << "\\u00" << std::hex << std::setw(2) << std::setfill('0')
+                              << static_cast<unsigned>(c) << std::dec;
+            else out << static_cast<char>(c);
+        }
+    }
+    out << '"';
+    return out.str();
+}
 Sha256Digest catalog_digest(std::string_view text){Sha256 hash;auto bytes=std::span(reinterpret_cast<const std::byte*>(text.data()),text.size());auto updated=hash.update(bytes);if(!updated)throw Failure{updated.error()};return hash.digest();}
 const char *status(DerivedStatus value) {
     switch (value) {
@@ -381,6 +402,41 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
             throw Failure{{ErrorCode::invalid_argument,
                            "Continuation or immediate facts do not match current project: " + result.error().message}};
         auto page = take(std::move(result));
+        if (args.search_json) {
+            out << "{\"schema\":\"hexlab.project-search.v1\",\"complete\":"
+                << (page.complete ? "true" : "false") << ",\"source_complete\":"
+                << (page.source_complete ? "true" : "false") << ",\"examined_candidates\":"
+                << page.examined_candidates << ",\"comparisons\":" << page.comparisons << ",\"matches\":[";
+            for (std::size_t i = 0; i < page.matches.size(); ++i) {
+                if (i) out << ',';
+                const auto &match = page.matches[i];
+                out << "{\"file_offset\":" << search_json_string(hex(match.offset.value))
+                    << ",\"size\":" << match.size << ",\"address\":";
+                if (match.address) out << search_json_string(location(*match.address));
+                else out << "null";
+                out << ",\"instruction_address\":";
+                if (match.instruction_address) out << search_json_string(location(*match.instruction_address));
+                else out << "null";
+                out << ",\"operand_index\":";
+                if (match.operand_index) out << *match.operand_index;
+                else out << "null";
+                out << ",\"file_ranges\":[";
+                for (std::size_t j = 0; j < match.file_ranges.size(); ++j) {
+                    if (j) out << ',';
+                    out << "{\"file_offset\":" << search_json_string(hex(match.file_ranges[j].begin.value))
+                        << ",\"size\":" << match.file_ranges[j].size << '}';
+                }
+                out << "]}";
+            }
+            out << "],\"next\":";
+            if (page.next) out << search_json_string(cursor_text(*page.next));
+            else out << "null";
+            out << ",\"reason\":";
+            if (!page.reason.empty()) out << search_json_string(page.reason);
+            else out << "null";
+            out << "}\n";
+            return page.complete && page.source_complete ? 0 : 3;
+        }
         for (auto &match : page.matches) {
             out << "Match: " << location(match.offset) << " size=" << match.size;
             const auto selected = search_match_location(match);

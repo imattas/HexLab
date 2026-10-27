@@ -7,6 +7,7 @@
 #include <wx/checkbox.h>
 #include <wx/textctrl.h>
 #include <map>
+#include <vector>
 namespace hexlab::desktop {
 class ReferenceView final : public wxPanel {
   public:
@@ -25,6 +26,7 @@ class ReferenceView final : public wxPanel {
     wxCheckBox *range_;
     wxCheckBox *mapped_range_;
     wxTextCtrl *range_size_;
+    wxTextCtrl *filter_;
     wxStaticText *context_;
     wxTextCtrl *detail_;
     wxStaticText *status_;
@@ -43,6 +45,7 @@ class ReferenceView final : public wxPanel {
     };
     std::map<std::uint64_t, Preference> preferences_;
     std::shared_ptr<const ReferencePage> rows_;
+    std::vector<std::size_t> visible_rows_;
     void reload();
     const Reference *selected_reference() const;
     void update_actions();

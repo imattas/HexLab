@@ -61,6 +61,7 @@ std::string exchange_kind_name(ExchangeRecordKind kind) {
     case ExchangeRecordKind::type_definition: return "type_definition";
     case ExchangeRecordKind::type_assignment: return "type_assignment";
     case ExchangeRecordKind::debug_variable: return "debug_variable";
+    case ExchangeRecordKind::project_breakpoint: return "project_breakpoint";
     }
     return "unknown";
 }
@@ -85,7 +86,8 @@ void print_exchange_import_report(std::ostream &out, const ExchangeImport &plan,
             << ",\"bookmarks\":" << plan.bookmarks << ",\"references\":" << plan.references
             << ",\"regions\":" << plan.regions << ",\"functions\":" << plan.functions
             << ",\"types\":" << plan.type_definitions << ",\"type_assignments\":" << plan.type_assignments
-            << ",\"debug_variables\":" << plan.debug_variables << ",\"skipped\":" << plan.skipped
+            << ",\"debug_variables\":" << plan.debug_variables
+            << ",\"project_breakpoints\":" << plan.project_breakpoints << ",\"skipped\":" << plan.skipped
             << ",\"conflicts\":" << plan.conflicts.size() << "},\"reported_conflicts\":" << reported
             << ",\"omitted_conflicts\":" << (plan.conflicts.size() - reported) << ",\"conflict_rows\":[";
         for (std::size_t i = 0; i < reported; ++i) {
@@ -108,7 +110,8 @@ void print_exchange_import_report(std::ostream &out, const ExchangeImport &plan,
         << ": annotations=" << plan.annotations << " bookmarks=" << plan.bookmarks
         << " references=" << plan.references << " regions=" << plan.regions << " functions=" << plan.functions
         << " types=" << plan.type_definitions << " type-assignments=" << plan.type_assignments
-        << " debug-variables=" << plan.debug_variables << " skipped=" << plan.skipped
+        << " debug-variables=" << plan.debug_variables << " project-breakpoints=" << plan.project_breakpoints
+        << " skipped=" << plan.skipped
         << " conflicts=" << plan.conflicts.size();
     if (would_fail) out << " (selected fail policy would reject this import)";
     out << '\n';
@@ -485,7 +488,7 @@ void project_usage(std::ostream &out) {
            "search: --kind bytes --pattern <two-character hex octets; ? masks a nibble, e.g. 48 8B ?? A? ?F>\n"
            "        --kind text --text <literal> --encoding ascii|utf8|utf16le|utf16be|utf32le|utf32be\n"
            "        --kind immediate --value <integer> --width 8|16|32|64 [--signed|--unsigned]\n"
-           "        [--limit N] [--candidate-budget N] [--cursor <continuation>]\n"
+           "        [--limit N] [--candidate-budget N] [--cursor <continuation>] [--json]\n"
            "signatures: --definitions <file> [--function-entries] [--limit N] [--candidate-budget N] [--comparison-budget N]\n"
            "signature-apply: --definitions <file> [--limit N] [--candidate-budget N] [--comparison-budget N]\n"
            "signature-create: --at va:<entry> --name <name> --provenance <source> [--max-bytes N] [--min-exact-bytes N]\n"
