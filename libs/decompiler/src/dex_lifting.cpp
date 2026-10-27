@@ -5,6 +5,7 @@
 #include <bit>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 
 namespace hexlab::decompiler {
@@ -55,6 +56,54 @@ ExpressionPtr wide_binary(std::string op, ExpressionPtr left, ExpressionPtr righ
 ExpressionPtr predicate(std::string op, ExpressionPtr left, ExpressionPtr right) {
     return std::make_shared<Expression>(Expression{{TypeKind::boolean, 1, false},
         BinaryValue{std::move(op), std::move(left), std::move(right)}});
+}
+
+struct DexCallResultShape {
+    bool known = false;
+    bool is_void = false;
+    ValueType type;
+};
+
+Result<DexCallResultShape> call_result_shape(const Instruction &instruction, const DexMetadata *metadata) {
+    if (!metadata || metadata->prototype_return_kinds.empty()) return DexCallResultShape{};
+    const auto first = unit(instruction, 0);
+    const auto op = static_cast<std::uint8_t>(first & 0xff);
+    std::optional<std::uint32_t> proto_index;
+    if ((op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78)) {
+        const auto method_index = unit(instruction, 1);
+        if (method_index >= metadata->method_prototype_indices.size())
+            return Error{ErrorCode::malformed, "DEX invoke method index is outside retained method metadata"};
+        proto_index = metadata->method_prototype_indices[method_index];
+    } else if (op == 0xfa || op == 0xfb) {
+        proto_index = unit(instruction, 3);
+    } else if (op == 0xfc || op == 0xfd) {
+        const auto call_site_index = unit(instruction, 1);
+        if (call_site_index >= metadata->call_sites.size())
+            return Error{ErrorCode::malformed, "DEX invoke-custom call-site index is outside retained metadata"};
+        const auto &site = metadata->call_sites[call_site_index];
+        if (site.values.size() < 3 || site.values[2].type != 0x15 || site.values[2].payload > UINT32_MAX)
+            return DexCallResultShape{};
+        proto_index = static_cast<std::uint32_t>(site.values[2].payload);
+    } else {
+        return DexCallResultShape{};
+    }
+    if (*proto_index >= metadata->prototype_return_kinds.size())
+        return Error{ErrorCode::malformed, "DEX invoke prototype index is outside retained metadata"};
+    switch (metadata->prototype_return_kinds[*proto_index]) {
+    case DexReturnKind::void_value: return DexCallResultShape{true, true, {}};
+    case DexReturnKind::integer32: return DexCallResultShape{true, false, i32()};
+    case DexReturnKind::float32: return DexCallResultShape{true, false, f32()};
+    case DexReturnKind::integer64: return DexCallResultShape{true, false, i64()};
+    case DexReturnKind::float64: return DexCallResultShape{true, false, f64()};
+    case DexReturnKind::reference: return DexCallResultShape{true, false, pointer32()};
+    case DexReturnKind::unknown: return DexCallResultShape{};
+    }
+    return Error{ErrorCode::malformed, "DEX prototype has an invalid retained return kind"};
+}
+
+bool dex_invoke_opcode(std::uint8_t op) {
+    return (op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78) ||
+           (op >= 0xfa && op <= 0xfd);
 }
 
 Result<Statement> lift_one(const Instruction &instruction) {
@@ -649,7 +698,8 @@ Result<Statement> lift_one(const Instruction &instruction) {
 }
 }
 
-Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const FunctionSnapshot &snapshot) {
+Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const FunctionSnapshot &snapshot,
+                                         const DexMetadata *metadata) {
     std::map<std::uint64_t, std::shared_ptr<const BasicBlock>> available;
     for (const auto &block : snapshot.blocks) {
         if (!block) return Error{ErrorCode::invalid_argument, "DEX function snapshot contains a null block"};
@@ -676,6 +726,7 @@ Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const F
             return Error{ErrorCode::resource_limit, "DEX function exceeds the lifting instruction budget"};
         instruction_count += source.instructions.size();
         block.instructions.reserve(source.instructions.size());
+        const Instruction *previous_instruction = nullptr;
         for (const auto &fact : source.instructions) {
             if (!fact) return Error{ErrorCode::invalid_argument, "DEX block contains a null instruction fact"};
             const auto &instruction = fact->instruction;
@@ -696,6 +747,39 @@ Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const F
             // alongside the normal arithmetic result in the lifted block.
             const auto first = unit(instruction, 0);
             const auto op = static_cast<std::uint8_t>(first & 0xff);
+            if (op >= 0x0a && op <= 0x0c) {
+                if (!previous_instruction || previous_instruction->address.space.value != instruction.address.space.value ||
+                    previous_instruction->address.offset > UINT64_MAX - previous_instruction->length ||
+                    previous_instruction->address.offset + previous_instruction->length != instruction.address.offset ||
+                    !dex_invoke_opcode(static_cast<std::uint8_t>(unit(*previous_instruction, 0) & 0xff)))
+                    return Error{ErrorCode::malformed, "DEX move-result is not immediately adjacent to an invoke in the same basic block"};
+                auto shape = call_result_shape(*previous_instruction, metadata);
+                if (!shape) return shape.error();
+                if (shape.value().known) {
+                    const bool matches = op == 0x0a
+                        ? (shape.value().type.kind == TypeKind::integer || shape.value().type.kind == TypeKind::floating) &&
+                          shape.value().type.bits == 32
+                        : op == 0x0b ? shape.value().type.bits == 64
+                        : shape.value().type.kind == TypeKind::pointer && shape.value().type.bits == 32;
+                    if (shape.value().is_void || !matches)
+                        return Error{ErrorCode::malformed, "DEX move-result variant does not match the invoked prototype return type"};
+                    if (block.instructions.empty() || block.instructions.back().origin.address != previous_instruction->address)
+                        return Error{ErrorCode::malformed, "DEX move-result cannot be linked to the preceding invoke statement"};
+                    auto *call = std::get_if<Intrinsic>(&block.instructions.back().statement);
+                    if (!call)
+                        return Error{ErrorCode::malformed, "DEX invoke did not lift to a result-bearing intrinsic"};
+                    const auto destination_index = static_cast<std::uint16_t>(first >> 8);
+                    if (shape.value().type.bits == 64 && destination_index >= 255)
+                        return Error{ErrorCode::malformed, "DEX wide move-result register pair exceeds the typed register model"};
+                    const RegisterOperand destination{RegisterBank::dex_vreg,
+                        static_cast<std::uint8_t>(destination_index), shape.value().type.bits, false};
+                    call->register_writes.push_back(destination);
+                    call->register_output_values.push_back(unknown_value(shape.value().type,
+                        "DEX invocation result for immediately following move-result"));
+                    call->result_type = shape.value().type;
+                    statement.value() = Statement{Intrinsic{"dex_move_result_link", {}, IntrinsicMemoryEffect::none}};
+                }
+            }
             ExpressionPtr divisor;
             bool division_or_remainder = false;
             bool wide = false;
@@ -740,6 +824,7 @@ Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const F
             }
             if (instruction.opcode != Opcode::dex_switch)
                 block.instructions.push_back({{instruction.address, fact->id}, std::move(statement.value())});
+            previous_instruction = &instruction;
         }
         if (!source.instructions.empty() &&
             source.instructions.back()->instruction.opcode == Opcode::dex_switch) {

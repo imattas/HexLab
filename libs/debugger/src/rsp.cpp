@@ -856,31 +856,41 @@ Result<std::optional<std::string>> Client::read_threads_annex(std::size_t limit,
 }
 Result<std::optional<std::string>> Client::read_processes_annex(std::size_t limit, std::size_t chunk,
     std::stop_token stop) {
-    if (limit == 0 || limit > 1024 * 1024 || chunk == 0 || chunk > 64 * 1024 || chunk > max_packet_ / 2)
-        return Error{ErrorCode::invalid_argument, "invalid RSP process annex bounds"};
+    return read_osdata_annex("processes", limit, chunk, stop);
+}
+Result<std::optional<std::string>> Client::read_osdata_annex(std::string_view type,
+    std::size_t limit, std::size_t chunk, std::stop_token stop) {
+    const bool valid_type = !type.empty() && type.size() <= 64 &&
+        std::all_of(type.begin(), type.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '-' || c == '_';
+        });
+    if (!valid_type || limit == 0 || limit > 1024 * 1024 || chunk == 0 ||
+        chunk > 64 * 1024 || chunk > max_packet_ / 2)
+        return Error{ErrorCode::invalid_argument, "invalid RSP OS-data annex type or bounds"};
     std::string result;
     for (std::size_t offset = 0; offset <= limit;) {
         const auto request_size = std::min(chunk, limit - std::min(offset, limit));
         if (offset == limit && request_size == 0)
-            return Error{ErrorCode::resource_limit, "RSP process annex exceeds configured limit"};
-        auto response = transact("qXfer:osdata:read:processes:" + hex_u64(offset) + "," + hex_u64(request_size), stop);
+            return Error{ErrorCode::resource_limit, "RSP OS-data annex exceeds configured limit"};
+        auto response = transact("qXfer:osdata:read:" + std::string(type) + ":" + hex_u64(offset) + "," + hex_u64(request_size), stop);
         if (!response) return response.error();
         if (response.value().empty()) {
             if (offset == 0) return std::optional<std::string>{};
-            return Error{ErrorCode::malformed, "RSP process annex ended without final marker"};
+            return Error{ErrorCode::malformed, "RSP OS-data annex ended without final marker"};
         }
         const char marker = response.value().front();
-        if (marker != 'm' && marker != 'l') return Error{ErrorCode::malformed, "invalid RSP process annex marker"};
+        if (marker != 'm' && marker != 'l') return Error{ErrorCode::malformed, "invalid RSP OS-data annex marker"};
         const auto count = response.value().size() - 1;
         if (count > request_size || count > limit - result.size())
-            return Error{ErrorCode::resource_limit, "RSP process annex chunk exceeds configured limit"};
+            return Error{ErrorCode::resource_limit, "RSP OS-data annex chunk exceeds configured limit"};
         result.append(response.value().data() + 1, count);
         if (marker == 'l') return std::optional<std::string>(std::move(result));
         if (count == 0 || offset > std::numeric_limits<std::size_t>::max() - count)
-            return Error{ErrorCode::malformed, "RSP process annex made no progress"};
+            return Error{ErrorCode::malformed, "RSP OS-data annex made no progress"};
         offset += count;
     }
-    return Error{ErrorCode::resource_limit, "RSP process annex exceeds configured limit"};
+    return Error{ErrorCode::resource_limit, "RSP OS-data annex exceeds configured limit"};
 }
 Result<std::optional<std::string>> Client::read_exec_file_annex(std::optional<std::uint64_t> process,
     std::size_t limit, std::size_t chunk, std::stop_token stop) {
@@ -950,6 +960,39 @@ Result<std::optional<std::vector<std::byte>>> Client::read_auxv_annex(
         offset += count;
     }
     return Error{ErrorCode::resource_limit, "RSP auxiliary-vector annex exceeds configured limit"};
+}
+Result<std::optional<std::vector<std::byte>>> Client::read_siginfo_annex(
+    std::size_t limit, std::size_t chunk, std::stop_token stop) {
+    const auto packet_limit = std::min(max_packet_, peer_packet_size_);
+    if (limit == 0 || limit > 64 * 1024 || chunk == 0 || chunk > 64 * 1024 || packet_limit < 32)
+        return Error{ErrorCode::invalid_argument, "invalid RSP siginfo annex bounds"};
+    const auto bounded_chunk = std::min(chunk, packet_limit / 2);
+    std::vector<std::byte> result;
+    result.reserve(std::min(limit, bounded_chunk));
+    for (std::size_t offset = 0; offset <= limit;) {
+        const auto request_size = std::min(bounded_chunk, limit - std::min(offset, limit));
+        if (offset == limit && request_size == 0)
+            return Error{ErrorCode::resource_limit, "RSP siginfo annex exceeds configured limit"};
+        auto response = transact("qXfer:siginfo:read::" + hex_u64(offset) + "," + hex_u64(request_size), stop);
+        if (!response) return response.error();
+        if (response.value().empty()) {
+            if (offset == 0) return std::optional<std::vector<std::byte>>{};
+            return Error{ErrorCode::malformed, "RSP siginfo annex ended without final marker"};
+        }
+        const char marker = response.value().front();
+        if (marker != 'm' && marker != 'l')
+            return Error{ErrorCode::malformed, "invalid RSP siginfo annex marker"};
+        const auto count = response.value().size() - 1;
+        if (count > request_size || count > limit - result.size())
+            return Error{ErrorCode::resource_limit, "RSP siginfo chunk exceeds configured limit"};
+        for (std::size_t i = 1; i < response.value().size(); ++i)
+            result.push_back(static_cast<std::byte>(static_cast<unsigned char>(response.value()[i])));
+        if (marker == 'l') return std::optional<std::vector<std::byte>>(std::move(result));
+        if (count == 0 || offset > std::numeric_limits<std::size_t>::max() - count)
+            return Error{ErrorCode::malformed, "RSP siginfo annex made no progress"};
+        offset += count;
+    }
+    return Error{ErrorCode::resource_limit, "RSP siginfo annex exceeds configured limit"};
 }
 Result<std::vector<std::byte>> Client::read_register(std::uint64_t number, std::stop_token stop) {
     auto response = transact("p" + hex_u64(number), stop); if (!response) return response.error(); return decode_hex(response.value());

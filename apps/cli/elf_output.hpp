@@ -151,6 +151,11 @@ inline void elf_description(std::ostream &out, const ImageMetadata &metadata, co
                                 : entry.tag == 14 ? "SONAME"
                                 : entry.tag == 15 ? "RPATH"
                                 : entry.tag == 29 ? "RUNPATH"
+                                : entry.tag == 0x6ffffefa ? "CONFIG"
+                                : entry.tag == 0x6ffffefb ? "DEPAUDIT"
+                                : entry.tag == 0x6ffffefc ? "AUDIT"
+                                : entry.tag == 0x7ffffffd ? "AUXILIARY"
+                                : entry.tag == 0x7fffffff ? "FILTER"
                                                   : nullptr;
             if (label && entry.string_value)
                 out << "  " << label << ": " << elf_text(*entry.string_value) << '\n';

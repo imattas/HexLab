@@ -1109,7 +1109,9 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
                                    ? &*project_->loaded->metadata.jvm : nullptr;
     const auto *wasm_metadata = project_ && project_->loaded && project_->loaded->metadata.wasm
                                     ? &*project_->loaded->metadata.wasm : nullptr;
-    auto lifted = decompiler::lift_function(*match->function, *snapshot, jvm_metadata, wasm_metadata);
+    const auto *dex_metadata = project_ && project_->loaded && project_->loaded->metadata.dex
+                                   ? &*project_->loaded->metadata.dex : nullptr;
+    auto lifted = decompiler::lift_function(*match->function, *snapshot, jvm_metadata, wasm_metadata, dex_metadata);
     if (!lifted) {
         report_decompiler_failure(lifted.error().message);
         status_->SetLabel("Could not lift the selected function: " + text(lifted.error().message));

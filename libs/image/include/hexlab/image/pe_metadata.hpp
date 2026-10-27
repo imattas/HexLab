@@ -688,6 +688,8 @@ struct PePdbInlineSite {
     bool operator==(const PePdbInlineSite &) const = default;
 };
 struct PeMetadata {
+    // IMAGE_DIRECTORY_ENTRY_GLOBALPTR is an RVA whose directory size is zero.
+    std::optional<std::uint32_t> global_pointer_rva;
     std::vector<PeImageCoffSymbol> coff_symbols;
     std::optional<PeMsvcRttiMetadata> msvc_rtti;
     std::optional<PeCertificateTable> certificate_table;

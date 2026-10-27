@@ -26,7 +26,14 @@ The CLI shows visibility, owner, target type, path length, descriptor, and
 element count. Type annotations nested in record-component attribute lists are
 not yet retained.
 
-Field `ConstantValue` attributes are retained after strict field-owner,
+For class-file version 52 and later, method `MethodParameters` attributes retain
+each parameter's optional UTF-8 name index and access flags in descriptor
+order. The parser enforces method ownership, one occurrence, exact attribute
+length, descriptor parameter count, valid UTF-8 indexes, and only `final`,
+`synthetic`, and `mandated` flags. A zero name index is retained as an unnamed
+parameter. CLI summaries list parameter names (or `<unnamed>`) and flags.
+
+Static-field `ConstantValue` attributes are retained after strict field-owner,
 uniqueness, payload-length, constant-pool-tag, and descriptor checks. Numeric
 values preserve their raw constant-pool bits; string values expose the resolved
 modified-UTF-8 text. CLI field summaries show the value, with numeric values in

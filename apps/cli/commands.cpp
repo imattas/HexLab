@@ -1130,6 +1130,7 @@ std::string_view string_encoding_label(StringEncoding encoding) {
     case StringEncoding::windows1256: return "Windows-1256";
     case StringEncoding::windows1257: return "Windows-1257";
     case StringEncoding::windows1258: return "Windows-1258";
+    case StringEncoding::iso8859_2: return "ISO-8859-2";
     }
     return "unknown";
 }
@@ -1574,7 +1575,8 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
                     const auto &function = functions.value()->functions[index];
                     const auto *jvm_metadata = document.metadata.jvm ? &*document.metadata.jvm : nullptr;
                     const auto *wasm_metadata = document.metadata.wasm ? &*document.metadata.wasm : nullptr;
-                    auto lifted = decompiler::lift_function(*function, *functions.value(), jvm_metadata, wasm_metadata);
+                    const auto *dex_metadata = document.metadata.dex ? &*document.metadata.dex : nullptr;
+                    auto lifted = decompiler::lift_function(*function, *functions.value(), jvm_metadata, wasm_metadata, dex_metadata);
                     if (!lifted) {
                         err << "Decompilation at " << hex(function->entry.offset) << ": "
                             << lifted.error().message << '\n';
@@ -1664,7 +1666,8 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
                 }
                 const auto *jvm_metadata = document.metadata.jvm ? &*document.metadata.jvm : nullptr;
                 const auto *wasm_metadata = document.metadata.wasm ? &*document.metadata.wasm : nullptr;
-                auto lifted = decompiler::lift_function(*function, *functions.value(), jvm_metadata, wasm_metadata);
+                const auto *dex_metadata = document.metadata.dex ? &*document.metadata.dex : nullptr;
+                auto lifted = decompiler::lift_function(*function, *functions.value(), jvm_metadata, wasm_metadata, dex_metadata);
                 if (!lifted) {
                     err << "Decompilation at " << hex(function->entry.offset) << ": "
                         << lifted.error().message << '\n';

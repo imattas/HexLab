@@ -958,6 +958,22 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::stop_
     if(code.size()>max_items)return Error{ErrorCode::resource_limit,"DEX defined method count exceeds address-space budget"};
     DexMetadata dex_metadata;
     dex_metadata.map_items = std::move(map.value().items);
+    dex_metadata.prototype_return_kinds.reserve(protos.size());
+    for (const auto &proto : protos) {
+        const auto &descriptor = types[proto.return_type];
+        const auto kind = descriptor == "V" ? DexReturnKind::void_value :
+            descriptor == "F" ? DexReturnKind::float32 :
+            descriptor == "D" ? DexReturnKind::float64 :
+            descriptor == "J" ? DexReturnKind::integer64 :
+            descriptor == "Z" || descriptor == "B" || descriptor == "C" || descriptor == "S" || descriptor == "I"
+                ? DexReturnKind::integer32 :
+            !descriptor.empty() && (descriptor.front() == 'L' || descriptor.front() == '[')
+                ? DexReturnKind::reference : DexReturnKind::unknown;
+        dex_metadata.prototype_return_kinds.push_back(kind);
+    }
+    dex_metadata.method_prototype_indices.reserve(methods.size());
+    for (const auto &method : methods)
+        dex_metadata.method_prototype_indices.push_back(method.proto);
     dex_metadata.classes = std::move(decoded_classes);
     dex_metadata.static_values = std::move(decoded_static_values);
     dex_metadata.method_handles = std::move(decoded_method_handles);

@@ -209,6 +209,15 @@ missing target XML, and stubs that do not advertise the annex return
 `unsupported`; no host architecture, pointer width, or byte order is guessed. Other operating
 systems' auxv formats and architecture-specific symbolic names are not decoded.
 
+## Signal information
+
+When `qSupported` advertises `qXfer:siginfo:read`, a stopped remote session
+can retrieve the signal-information object through `DebugSession::signal_info()`.
+HexLab preserves the target's opaque bytes because the object follows the target
+operating system's and architecture's `siginfo_t` layout. The reader uses
+bounded binary qXfer chunks and caps the object at 64 KiB. It does not interpret
+the ABI-specific fields; unsupported or empty annexes report `unsupported`.
+
 When `qSupported` advertises `qXfer:osdata:read`, `DebugSession::processes()`
 reads the standard `processes` annex and returns its decimal PID values with
 the optional `command` column as each process name. The bounded XML reader
@@ -218,6 +227,16 @@ and the process list at 4,096 entries. Missing command columns fall back to
 `process <pid>`. Stubs without this feature continue to report process
 enumeration as unsupported; listing does not attach to or change the selected
 remote process.
+
+For other target-provided operating-system tables, `DebugSession::os_data(type)`
+reads the named annex (for example `cpus` or `procgroups`) and preserves each
+`<item>` as named `column` values. The root `<osdata type="...">` must match
+the requested type. XML is capped at 1 MiB, each response chunk is bounded by
+the negotiated packet size, and results are capped at 4,096 rows, 64 columns
+per row, and 4,096 bytes per column. Entity expansion is limited to the five
+predefined XML entities and numeric character references; DTDs are not fetched
+or expanded. The process convenience API continues to require a unique positive
+decimal `pid` column and uses `command` when available.
 
 If the stub also advertises `qXfer:exec-file:read`, the process list enriches
 the selected process name with its full target-side executable path. Multiprocess

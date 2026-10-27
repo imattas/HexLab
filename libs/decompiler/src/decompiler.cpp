@@ -4930,11 +4930,24 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
 
 Result<LiftedFunction> lift_function(const FunctionRecord &function, const FunctionSnapshot &snapshot,
                                      const JvmMetadata *jvm_metadata, const WasmMetadata *wasm_metadata) {
-    return lift_function(function, snapshot, jvm_metadata, wasm_metadata, {});
+    return lift_function(function, snapshot, jvm_metadata, wasm_metadata, OpaqueInstructionLifter{});
 }
 
 Result<LiftedFunction> lift_function(const FunctionRecord &function, const FunctionSnapshot &snapshot,
                                      const JvmMetadata *jvm_metadata, const WasmMetadata *wasm_metadata,
+                                     const DexMetadata *dex_metadata) {
+    return lift_function(function, snapshot, jvm_metadata, wasm_metadata, dex_metadata, {});
+}
+
+Result<LiftedFunction> lift_function(const FunctionRecord &function, const FunctionSnapshot &snapshot,
+                                     const JvmMetadata *jvm_metadata, const WasmMetadata *wasm_metadata,
+                                     const OpaqueInstructionLifter &opaque_lifter) {
+    return lift_function(function, snapshot, jvm_metadata, wasm_metadata, nullptr, opaque_lifter);
+}
+
+Result<LiftedFunction> lift_function(const FunctionRecord &function, const FunctionSnapshot &snapshot,
+                                     const JvmMetadata *jvm_metadata, const WasmMetadata *wasm_metadata,
+                                     const DexMetadata *dex_metadata,
                                      const OpaqueInstructionLifter &opaque_lifter) {
     std::map<std::uint64_t, std::shared_ptr<const BasicBlock>> available;
     for (const auto &block : snapshot.blocks) {
@@ -4951,7 +4964,7 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
         if (!facts.empty() && facts.front()) {
             const auto architecture = facts.front()->instruction.context.architecture;
             if (architecture == Architecture::dex)
-                return lift_dex_function(function, snapshot);
+                return lift_dex_function(function, snapshot, dex_metadata);
             if (architecture == Architecture::wasm)
                 return lift_wasm_function(function, snapshot, wasm_metadata);
             if (architecture == Architecture::jvm)

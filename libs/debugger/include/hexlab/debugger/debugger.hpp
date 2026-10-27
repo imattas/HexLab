@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace hexlab::debugger {
@@ -26,6 +27,9 @@ inline constexpr std::size_t max_inspection_modules = 4096;
 inline constexpr std::size_t max_inspection_processes = 4096;
 inline constexpr std::size_t max_inspection_threads = 4096;
 inline constexpr std::size_t max_inspection_memory_regions = 65536;
+inline constexpr std::size_t max_inspection_osdata_columns = 64;
+inline constexpr std::size_t max_inspection_osdata_rows = 4096;
+inline constexpr std::size_t max_inspection_signal_info_bytes = 64 * 1024;
 
 enum class SessionState { idle, running, stopped, exited, detached, faulted };
 enum class ThreadState { running, stopped, exited, unknown };
@@ -53,6 +57,13 @@ struct ProcessInfo {
     ProcessId id = 0;
     std::string name;
     Architecture architecture = Architecture::unknown;
+};
+struct OsDataRow {
+    std::vector<std::pair<std::string, std::string>> columns;
+};
+struct OsDataTable {
+    std::string type;
+    std::vector<OsDataRow> rows;
 };
 struct ThreadInfo {
     ThreadId id = 0;
@@ -126,6 +137,9 @@ public:
     virtual Result<std::vector<ProcessInfo>> processes() {
         return Error{ErrorCode::unsupported, "process enumeration is not supported by this backend"};
     }
+    virtual Result<OsDataTable> os_data(std::string_view) {
+        return Error{ErrorCode::unsupported, "OS-data inspection is not supported by this backend"};
+    }
     virtual Result<ProcessInfo> launch(const Target&) = 0;
     // Starts a new target on an already connected remote session. Native
     // backends leave this unsupported; remote backends may require extended
@@ -198,6 +212,9 @@ public:
     virtual Result<std::vector<AuxiliaryVectorEntry>> auxiliary_vector() {
         return Error{ErrorCode::unsupported, "auxiliary-vector inspection is not supported by this backend"};
     }
+    virtual Result<std::vector<std::byte>> signal_info() {
+        return Error{ErrorCode::unsupported, "signal-info inspection is not supported by this backend"};
+    }
     virtual Result<std::vector<RegisterValue>> read_registers(ThreadId) = 0;
     virtual Status write_registers(ThreadId, std::span<const RegisterValue>) = 0;
     virtual Result<Breakpoint> add_breakpoint(std::uint64_t address, BreakpointKind) = 0;
@@ -231,6 +248,7 @@ public:
     bool supports_scheduled_signal_disposition() const noexcept;
     const std::optional<std::string>& last_diagnostic() const noexcept;
     Result<std::vector<ProcessInfo>> processes();
+    Result<OsDataTable> os_data(std::string_view type);
     // Launches locally from idle/detached state, or starts a new inferior on
     // an active remote session when that backend supports extended mode.
     Result<ProcessInfo> launch(const Target& target);
@@ -272,6 +290,7 @@ public:
     Result<std::vector<ModuleInfo>> modules();
     Result<std::vector<MemoryRegion>> memory_regions();
     Result<std::vector<AuxiliaryVectorEntry>> auxiliary_vector();
+    Result<std::vector<std::byte>> signal_info();
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread);
     // Evaluates a bounded register/memory expression against one stopped thread.
     Result<std::uint64_t> evaluate_expression(ThreadId thread, std::string_view expression);
