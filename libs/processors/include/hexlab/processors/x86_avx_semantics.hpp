@@ -35,6 +35,17 @@ struct X86EvexMaskCompareResult {
     bool operator==(const X86EvexMaskCompareResult &) const = default;
 };
 
+struct X86EvexFloatCompareResult {
+    std::uint64_t mask = 0;
+    std::uint16_t vector_bits = 0;
+    std::uint8_t active_bits = 0;
+    bool invalid_operation = false;
+    bool denormal_operand = false;
+    // An unmasked #I or #D suppresses retirement of the K-register result.
+    bool completed = true;
+    bool operator==(const X86EvexFloatCompareResult &) const = default;
+};
+
 namespace x86_avx_detail {
 // Input and result lane shapes are separate for narrowing, widening and
 // mixed-signedness operations. Every shape here uses full-width vector inputs;
@@ -767,6 +778,128 @@ inline std::optional<X86EvexMaskCompareResult> evaluate_x86_evex_mask_compare(
         }
         if (match) result.mask |= UINT64_C(1) << lane;
     }
+    return result;
+}
+
+// Evaluate EVEX VCMPPS/VCMPPD predicates directly from IEEE bit patterns.
+// source2 supplies a full vector for register/non-broadcast operands and the
+// scalar value in its low bytes for an EVEX.b memory broadcast. MXCSR supplies
+// DAZ and exception-mask controls; sticky-flag updates remain the caller's
+// responsibility. If completed is false, the partial mask must not be
+// committed because an unmasked floating-point exception was raised.
+inline std::optional<X86EvexFloatCompareResult> evaluate_x86_evex_float_compare(
+    const Instruction &instruction, const std::array<std::byte, 64> &source1,
+    const std::array<std::byte, 64> &source2, std::uint64_t opmask_value = UINT64_MAX,
+    std::uint32_t mxcsr = 0x1f80) noexcept {
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || !instruction.x86_evex ||
+        (instruction.opcode != Opcode::vcmpps && instruction.opcode != Opcode::vcmppd) ||
+        (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512) ||
+        instruction.operands.size() != 4 || instruction.x86_opmask_zeroing ||
+        (instruction.x86_opmask && (*instruction.x86_opmask == 0 || *instruction.x86_opmask >= 8)))
+        return std::nullopt;
+    const auto width = static_cast<unsigned>(instruction.vector_bits);
+    const unsigned lane_bits = instruction.opcode == Opcode::vcmpps ? 32 : 64;
+    if (instruction.vector_element_bits && instruction.vector_element_bits != lane_bits) return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
+    const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+    const bool source2_vector = x86_avx_detail::is_evex_vector(instruction.operands[2], width);
+    const bool source2_memory = memory && memory->data_width ==
+        (instruction.x86_evex_broadcast ? lane_bits : width);
+    if (!destination || destination->bank != RegisterBank::opmask || destination->index >= 8 ||
+        destination->width != 64 || destination->high_byte ||
+        !x86_avx_detail::is_evex_vector(instruction.operands[1], width) ||
+        (!source2_vector && !source2_memory) ||
+        (instruction.x86_evex_broadcast && !memory) || !predicate ||
+        predicate->encoded_width != 8 || predicate->effective_width != 8 || predicate->is_signed ||
+        predicate->value >= 32)
+        return std::nullopt;
+
+    X86EvexFloatCompareResult result{};
+    result.vector_bits = static_cast<std::uint16_t>(width);
+    result.active_bits = static_cast<std::uint8_t>(width / lane_bits);
+    const auto exponent_mask = lane_bits == 32 ? UINT64_C(0x7f800000) : UINT64_C(0x7ff0000000000000);
+    const auto fraction_mask = lane_bits == 32 ? UINT64_C(0x007fffff) : UINT64_C(0x000fffffffffffff);
+    const auto quiet_mask = lane_bits == 32 ? UINT64_C(0x00400000) : UINT64_C(0x0008000000000000);
+    const auto sign_mask = lane_bits == 32 ? UINT64_C(0x80000000) : UINT64_C(0x8000000000000000);
+    const auto encoding_mask = lane_bits == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
+    const bool daz = (mxcsr & (UINT32_C(1) << 6)) != 0;
+    bool signaling_predicate = false;
+    switch (predicate->value) {
+    case 1: case 2: case 5: case 6: case 9: case 10: case 13: case 14:
+    case 16: case 19: case 20: case 24: case 27: case 28: case 31:
+        signaling_predicate = true;
+        break;
+    default:
+        break;
+    }
+    for (unsigned lane = 0; lane < result.active_bits; ++lane) {
+        if (instruction.x86_opmask && !(opmask_value & (UINT64_C(1) << lane))) continue;
+        const auto offset = instruction.x86_evex_broadcast ? 0 : lane * (lane_bits / 8);
+        auto left = x86_avx_detail::load_lane(source1, lane * (lane_bits / 8), lane_bits);
+        auto right = x86_avx_detail::load_lane(source2, offset, lane_bits);
+        const auto classify = [&](std::uint64_t bits) {
+            const bool special = (bits & exponent_mask) == exponent_mask;
+            const auto fraction = bits & fraction_mask;
+            const bool nan = special && fraction != 0;
+            const bool signaling = nan && !(fraction & quiet_mask);
+            const bool subnormal = (bits & exponent_mask) == 0 && (bits & fraction_mask) != 0;
+            return std::array<bool, 3>{nan, signaling, subnormal};
+        };
+        const auto left_class = classify(left);
+        const auto right_class = classify(right);
+        const bool nan = left_class[0] || right_class[0];
+        result.invalid_operation |= left_class[1] || right_class[1] ||
+            (signaling_predicate && nan && !(left_class[1] || right_class[1]));
+        const bool denormal = left_class[2] || right_class[2];
+        result.denormal_operand |= denormal && !daz;
+        if (daz) {
+            if (left_class[2]) left &= sign_mask;
+            if (right_class[2]) right &= sign_mask;
+        }
+
+        bool less = false, equal = false;
+        if (!nan) {
+            const auto magnitude_mask = ~sign_mask;
+            const bool left_zero = (left & magnitude_mask) == 0;
+            const bool right_zero = (right & magnitude_mask) == 0;
+            if (left_zero && right_zero) {
+                equal = true;
+            } else {
+                const auto order_key = [&](std::uint64_t bits) {
+                    return bits & sign_mask ? ((~bits) & encoding_mask) : (bits ^ sign_mask);
+                };
+                const auto left_key = order_key(left), right_key = order_key(right);
+                less = left_key < right_key;
+                equal = left == right;
+            }
+        }
+        const bool unordered = nan;
+        const bool greater = !unordered && !less && !equal;
+        bool match = false;
+        switch (predicate->value) {
+        case 0: case 8: case 16: case 24: match = equal || (unordered && (predicate->value == 8 || predicate->value == 24)); break;
+        case 1: case 17: match = !unordered && less; break;
+        case 2: case 18: match = !unordered && (less || equal); break;
+        case 3: case 19: match = unordered; break;
+        case 4: case 20: match = unordered || !equal; break;
+        case 5: case 21: match = unordered || !less; break;
+        case 6: case 22: match = unordered || (!less && !equal); break;
+        case 7: case 23: match = !unordered; break;
+        case 9: case 25: match = unordered || less; break;
+        case 10: case 26: match = unordered || less || equal; break;
+        case 11: case 27: match = false; break;
+        case 12: case 28: match = !unordered && !equal; break;
+        case 13: case 29: match = !unordered && (greater || equal); break;
+        case 14: case 30: match = !unordered && greater; break;
+        case 15: case 31: match = true; break;
+        default: return std::nullopt;
+        }
+        if (match) result.mask |= UINT64_C(1) << lane;
+    }
+    result.completed = !(result.invalid_operation && !(mxcsr & (UINT32_C(1) << 7))) &&
+        !(result.denormal_operand && !(mxcsr & (UINT32_C(1) << 8)));
     return result;
 }
 

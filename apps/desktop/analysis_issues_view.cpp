@@ -85,6 +85,13 @@ AnalysisIssuesView::AnalysisIssuesView(wxWindow *parent) : wxPanel(parent) {
     filter_->Append("Type import diagnostics");
     filter_->Append("Decompiler diagnostics");
     filter_->SetSelection(0);
+    severity_ = new wxChoice(this, wxID_ANY);
+    severity_->SetName("analysis-issues-severity");
+    severity_->Append("All severities");
+    severity_->Append("Errors");
+    severity_->Append("Warnings");
+    severity_->Append("Info");
+    severity_->SetSelection(0);
     search_ = new wxTextCtrl(this, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
     search_->SetName("analysis-issues-search");
     search_->SetHint("Filter findings by address or detail");
@@ -127,18 +134,20 @@ AnalysisIssuesView::AnalysisIssuesView(wxWindow *parent) : wxPanel(parent) {
     next_->Enable(false);
     scope_cursor_->Enable(false);
     scope_all_->Enable(false);
-    table_ = new VirtualTable(this, "analysis-issues", {"Finding", "Address", "Related", "Function", "Details"});
+    table_ = new VirtualTable(this, "analysis-issues", {"Finding", "Severity", "Address", "Related", "Function", "Details"});
     table_->SetColumnWidth(0, FromDIP(140));
-    table_->SetColumnWidth(1, FromDIP(130));
+    table_->SetColumnWidth(1, FromDIP(86));
     table_->SetColumnWidth(2, FromDIP(130));
     table_->SetColumnWidth(3, FromDIP(130));
-    table_->SetColumnWidth(4, FromDIP(360));
+    table_->SetColumnWidth(4, FromDIP(130));
+    table_->SetColumnWidth(5, FromDIP(360));
     detail_ = new wxTextCtrl(this, wxID_ANY, "Select a finding to inspect its details.", wxDefaultPosition,
                              FromDIP(wxSize(-1, 115)), wxTE_MULTILINE | wxTE_READONLY | wxTE_DONTWRAP);
     detail_->SetName("analysis-issue-details");
     detail_->SetToolTip("Finding details and related locations. Select text here to copy an excerpt.");
 
     controls->Add(filter_, 0, wxEXPAND | wxRIGHT, FromDIP(6));
+    controls->Add(severity_, 0, wxEXPAND | wxRIGHT, FromDIP(6));
     controls->Add(search_, 1, wxEXPAND);
     actions->Add(previous_, 0, wxRIGHT, FromDIP(4));
     actions->Add(next_, 0, wxRIGHT, FromDIP(6));
@@ -156,6 +165,7 @@ AnalysisIssuesView::AnalysisIssuesView(wxWindow *parent) : wxPanel(parent) {
     SetSizer(layout);
 
     filter_->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { render(); remember_preference(); });
+    severity_->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { render(); remember_preference(); });
     search_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { render(); remember_preference(); });
     search_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent &) { step(true); });
     table_->activate = [this](std::size_t row) { activate_row(row); };
@@ -232,6 +242,7 @@ void AnalysisIssuesView::update(std::optional<DocumentId> document, std::shared_
             if (found != preferences_.end()) preference = found->second;
         }
         filter_->SetSelection(std::clamp(preference.filter, 0, 6));
+        severity_->SetSelection(std::clamp(preference.severity, 0, 3));
         search_->ChangeValue(preference.query);
         scope_entry_ = preference.function;
         selection_key_ = std::move(preference.selected);
@@ -282,6 +293,7 @@ void AnalysisIssuesView::retain_documents(std::span<const DocumentInfo> document
         scope_partial_ = false;
         scope_error_.clear();
         filter_->SetSelection(0);
+        severity_->SetSelection(0);
         search_->ChangeValue({});
         rows_.clear();
         capped_ = false;
@@ -318,7 +330,8 @@ void AnalysisIssuesView::set_decompiler_diagnostics(std::optional<DocumentId> do
 
 void AnalysisIssuesView::remember_preference() {
     if (!document_) return;
-    preferences_[document_->value] = {filter_->GetSelection(), search_->GetValue(), scope_entry_, selection_key_};
+    preferences_[document_->value] = {filter_->GetSelection(), severity_->GetSelection(), search_->GetValue(),
+                                      scope_entry_, selection_key_};
 }
 
 void AnalysisIssuesView::rebuild_scope() {
@@ -607,9 +620,10 @@ wxString AnalysisIssuesView::cell(std::size_t row, int column) const {
     const auto *image = active_image();
     switch (column) {
     case 0: return kind_text(item.kind);
-    case 1: return item.address ? location_text(*item.address, image) : wxString{};
-    case 2: return item.related ? location_text(*item.related, image) : wxString{};
-    case 3: return item.function_entry ? location_text(*item.function_entry, image) : wxString{};
+    case 1: return severity_text(item.severity);
+    case 2: return item.address ? location_text(*item.address, image) : wxString{};
+    case 3: return item.related ? location_text(*item.related, image) : wxString{};
+    case 4: return item.function_entry ? location_text(*item.function_entry, image) : wxString{};
     default: {
         const auto encoded = item.detail.ToUTF8();
         return encoded.data() ? preview_text(std::string_view(encoded.data(), encoded.length()), 768) : wxString{};
@@ -623,6 +637,7 @@ wxString AnalysisIssuesView::export_text() const {
         static_cast<unsigned long long>(visible_rows_.size()),
         static_cast<unsigned long long>(rows_.size())) + "\n";
     result += "# Filter\t" + tsv_field(filter_->GetStringSelection()) + "\n";
+    result += "# Severity\t" + tsv_field(severity_->GetStringSelection()) + "\n";
     result += "# Search\t" + tsv_field(search_->GetValue()) + "\n";
     result += "# Scope\t" + tsv_field(scope_entry_
         ? "Function " + location_text(*scope_entry_, active_image())
@@ -631,11 +646,11 @@ wxString AnalysisIssuesView::export_text() const {
         result += "# Scope coverage\tFunction is unavailable or chunk coverage is partial\n";
     if (capped_)
         result += "# Coverage\tCapped at 20,000 findings and 100,000 functions\n";
-    result += "finding\taddress\trelated\tfunction\tdetails\n";
+    result += "finding\tseverity\taddress\trelated\tfunction\tdetails\n";
     for (const auto index : visible_rows_) {
         const auto &item = rows_[index];
-        const std::array<wxString, 5> fields{kind_text(item.kind), cell(index, 1), cell(index, 2),
-                                             cell(index, 3), item.detail};
+        const std::array<wxString, 6> fields{kind_text(item.kind), severity_text(item.severity), cell(index, 2),
+                                             cell(index, 3), cell(index, 4), item.detail};
         for (std::size_t column = 0; column < fields.size(); ++column) {
             if (column) result += '\t';
             result += tsv_field(fields[column]);
@@ -676,6 +691,7 @@ void AnalysisIssuesView::export_visible() {
 void AnalysisIssuesView::render() {
     visible_rows_.clear();
     const auto selected_filter = filter_ ? filter_->GetSelection() : 0;
+    const auto selected_severity = severity_ ? severity_->GetSelection() : 0;
     auto query = search_ ? search_->GetValue() : wxString{};
     query.MakeLower();
     for (std::size_t index = 0; index < rows_.size(); ++index) {
@@ -691,8 +707,13 @@ void AnalysisIssuesView::render() {
             continue;
         if (selected_filter == 5 && kind != Kind::type_import_diagnostic) continue;
         if (selected_filter == 6 && kind != Kind::decompiler_diagnostic) continue;
+        if ((selected_severity == 1 && rows_[index].severity != DiagnosticSeverity::error) ||
+            (selected_severity == 2 && rows_[index].severity != DiagnosticSeverity::warning) ||
+            (selected_severity == 3 && rows_[index].severity != DiagnosticSeverity::info))
+            continue;
         if (!query.empty()) {
             wxString aggregate = kind_text(kind) + " " +
+                                 severity_text(rows_[index].severity) + " " +
                                  (rows_[index].address ? location_text(*rows_[index].address)
                                                        : wxString("not location-specific")) + " " +
                                  (rows_[index].related ? location_text(Location{*rows_[index].related}) : wxString{}) + " " +
@@ -774,7 +795,7 @@ void AnalysisIssuesView::step(bool forward) {
 
 wxString AnalysisIssuesView::finding_text(const Row &row) const {
     const auto *image = active_image();
-    wxString report = kind_text(row.kind) + "\nAddress: " +
+    wxString report = kind_text(row.kind) + "\nSeverity: " + severity_text(row.severity) + "\nAddress: " +
                       (row.address ? location_text(*row.address, image) : wxString("not location-specific"));
     if (row.related) report += "\nRelated: " + location_text(*row.related, image);
     if (row.function_entry) {

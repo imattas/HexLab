@@ -6,14 +6,16 @@ function boundaries, unconfirmed entry candidates, and overlapping function
 or decision records. A binary opened without a project still shows the loader
 and inspection diagnostics retained by its immutable document snapshot. The
 page also receives transient diagnostics from C header and PDB type imports
-and from the decompiler. Each row includes its address, related address when
+and from the decompiler. Each row includes its severity, address, related address when
 available, owning function, and the analysis detail. Selecting a row navigates
 the disassembly to its primary address. The selection strip shows the finding
 summary and provides separate actions to navigate to its related address or
-owning function. Use **Copy finding** to copy the issue kind and all available
-addresses with the full bounded detail for a report or project note.
+owning function. Use **Copy finding** to copy the issue kind, severity and all
+available addresses with the full bounded detail for a report or project note.
 
-Use the category selector and text filter to narrow the list; the filter checks
+Use the category and severity selectors together with the text filter to narrow
+the list; severity appears as its own table column and combines with category,
+text and function scope. The text filter checks
 the primary, related, and owning-function addresses as well as the finding
 detail. Filtering preserves the selected finding while it remains visible.
 Function stops with ordinary `ret` and `trap` endings are omitted. The diagnostic
@@ -26,6 +28,10 @@ producer does not provide. PDB data-symbol diagnostics use a mapped address only
 when the selected PDB uniquely matches the loaded PE. A function scope includes
 addressed diagnostics within that function's chunks and function-associated
 decompiler diagnostics, and hides unlocated diagnostics, which the status line reports.
+
+Function-recovery rows use the view's warning default. Loader, type-import and
+decompiler diagnostic rows retain their producer-reported info, warning or error
+severity. Severity is included in copied finding reports and TSV export.
 
 The view reads immutable project or file-only document snapshots and does not edit
 analysis decisions. It shows diagnostics from the snapshot's loaded image when one
