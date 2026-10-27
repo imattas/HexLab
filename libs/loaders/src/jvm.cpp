@@ -276,7 +276,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     for(unsigned i=0;i<n;++i){std::uint16_t ix=0;if(!r.u2(ix))return malformed("truncated interface list");auto name=class_name(ix);if(!name)return name.error();md.interfaces.push_back(std::move(name.value()));}
     std::uint64_t attribute_bytes=0;bool metadata_complete=true;
     std::size_t expanded_verification_entries=0,stack_map_frames=0;
-    bool have_record=false,have_nest_host=false,have_nest_members=false,have_permitted_subclasses=false;
+    bool have_record=false,have_inner_classes=false,have_nest_host=false,have_nest_members=false,have_permitted_subclasses=false;
     bool have_module_packages=false,have_module_main_class=false;
     bool have_class_visible_annotations=false,have_class_invisible_annotations=false;
     std::unordered_set<const JvmMember *> visible_annotations_seen,invisible_annotations_seen;
@@ -327,7 +327,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             if(len>64*1024*1024||attribute_bytes>max_total_attributes-len)return Error{ErrorCode::resource_limit,"classfile attribute data exceeds bounded size limits"};attribute_bytes+=len;
             auto an=utf8(name_ix);if(!an)return an.error();const auto start=r.p;if(len>r.b.size()-r.p)return malformed("attribute extent exceeds its enclosing owner");
             ReaderExtent extent{r,r.b};r.b=r.b.first(start+len);
-            if(!class_level&&(an.value()=="NestHost"||an.value()=="NestMembers"||an.value()=="PermittedSubclasses"||an.value()=="Record"||an.value()=="Module"||an.value()=="ModulePackages"||an.value()=="ModuleMainClass"||an.value()=="SourceFile"))return malformed("class-level attribute appears on a member or Code attribute list");
+            if(!class_level&&(an.value()=="NestHost"||an.value()=="NestMembers"||an.value()=="PermittedSubclasses"||an.value()=="Record"||an.value()=="InnerClasses"||an.value()=="Module"||an.value()=="ModulePackages"||an.value()=="ModuleMainClass"||an.value()=="SourceFile"))return malformed("class-level attribute appears on a member or Code attribute list");
             if(an.value()=="Signature"){
                 if(code_owner)return malformed("Signature attribute appears inside Code");
                 if(len!=2)return malformed("Signature attribute must contain one UTF-8 index");
@@ -434,6 +434,30 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 if(md.source_file)return malformed("duplicate SourceFile attribute");
                 std::uint16_t index=0;if(len!=2||!r.u2(index))return malformed("SourceFile attribute must contain one UTF-8 index");
                 auto source=utf8(index);if(!source)return source.error();md.source_file=std::move(source.value());
+            }else if(class_level&&an.value()=="InnerClasses"){
+                if(have_inner_classes)return malformed("duplicate InnerClasses attribute");
+                if(len<2)return malformed("truncated InnerClasses attribute");
+                std::uint16_t count=0;
+                if(!r.u2(count)||count>8192||std::uint64_t(count)*8+2!=len)
+                    return malformed("InnerClasses count or extent is invalid");
+                md.inner_classes.reserve(count);
+                std::unordered_set<std::uint16_t> inner_indexes;
+                constexpr std::uint16_t allowed_flags=0x761f;
+                for(unsigned i=0;i<count;++i){
+                    std::uint16_t inner_index=0,outer_index=0,name_index=0,flags=0;
+                    if(!r.u2(inner_index)||!r.u2(outer_index)||!r.u2(name_index)||!r.u2(flags))
+                        return malformed("truncated InnerClasses entry");
+                    if(!inner_indexes.insert(inner_index).second||flags&~allowed_flags)
+                        return malformed("duplicate inner class or reserved InnerClasses flags");
+                    if(md.major_version>=51&&name_index==0&&outer_index!=0)
+                        return malformed("InnerClasses entry with no inner name must not specify an outer class");
+                    auto inner_name=class_name(inner_index);if(!inner_name)return inner_name.error();
+                    JvmInnerClass entry;entry.inner_class=std::move(inner_name.value());entry.access_flags=flags;
+                    if(outer_index){auto outer_name=class_name(outer_index);if(!outer_name)return outer_name.error();entry.outer_class=std::move(outer_name.value());}
+                    if(name_index){auto name=utf8(name_index);if(!name)return name.error();entry.inner_name=std::move(name.value());}
+                    md.inner_classes.push_back(std::move(entry));
+                }
+                have_inner_classes=true;
             }else if(class_level&&an.value()=="NestHost"){
                 if(have_nest_members)return malformed("class cannot declare both NestHost and NestMembers");
                 if(have_nest_host)return malformed("duplicate NestHost attribute");

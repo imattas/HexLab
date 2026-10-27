@@ -48,11 +48,12 @@ std::optional<std::uint8_t> bulk_memory_subopcode(const Instruction &i) {
         const auto byte = std::to_integer<std::uint8_t>(i.bytes[position]);
         subopcode |= std::uint32_t(byte & 0x7f) << ((position - 1) * 7);
         if (!(byte & 0x80))
-            return subopcode >= 8 && subopcode <= 11 ? std::optional<std::uint8_t>{static_cast<std::uint8_t>(subopcode)} : std::nullopt;
+            return subopcode <= 11 ? std::optional<std::uint8_t>{static_cast<std::uint8_t>(subopcode)} : std::nullopt;
     }
     return {};
 }
 bool valid_bulk_memory_indices(const Instruction &i, const WasmMetadata *metadata, std::uint8_t subopcode) {
+    if (subopcode <= 7) return true;
     if (!metadata) return false;
     const auto memory_count = static_cast<std::uint64_t>(metadata->imported_memories) + metadata->defined_memories;
     if (subopcode == 9) {
@@ -92,6 +93,18 @@ std::optional<OpInfo> numeric(std::uint8_t op) {
     return {};
 }
 struct ConversionInfo { ValueType input, output; std::string_view operation; };
+std::optional<ConversionInfo> saturating_conversion(std::uint8_t subopcode) {
+    const auto i32 = integer(32), i64 = integer(64), f32 = floating(32), f64 = floating(64);
+    static constexpr std::array<std::string_view, 8> names{
+        "wasm_i32_trunc_sat_f32_s", "wasm_i32_trunc_sat_f32_u",
+        "wasm_i32_trunc_sat_f64_s", "wasm_i32_trunc_sat_f64_u",
+        "wasm_i64_trunc_sat_f32_s", "wasm_i64_trunc_sat_f32_u",
+        "wasm_i64_trunc_sat_f64_s", "wasm_i64_trunc_sat_f64_u"};
+    if (subopcode >= names.size()) return {};
+    const std::array<ValueType, 8> inputs{f32, f32, f64, f64, f32, f32, f64, f64};
+    const std::array<ValueType, 8> outputs{i32, i32, i32, i32, i64, i64, i64, i64};
+    return ConversionInfo{inputs[subopcode], outputs[subopcode], names[subopcode]};
+}
 std::optional<ConversionInfo> conversion(std::uint8_t op) {
     const auto i32=integer(32), i64=integer(64), f32=floating(32), f64=floating(64);
     switch (op) {
@@ -627,7 +640,13 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 const auto subopcode = bulk_memory_subopcode(code[n]->instruction);
                 if (!subopcode || !valid_bulk_memory_indices(code[n]->instruction, metadata, *subopcode))
                     return unsupported("bulk-memory instruction requires validated segment and single-memory indices");
-                if (*subopcode == 8 || *subopcode == 10 || *subopcode == 11) {
+                if (*subopcode <= 7) {
+                    const auto cv = saturating_conversion(*subopcode);
+                    if (!cv) return unsupported("trunc_sat subopcode is unavailable");
+                    auto value = shape_pop(stack, cv->input);
+                    if (!value) return value.error();
+                    stack.push_back(cv->output);
+                } else if (*subopcode == 8 || *subopcode == 10 || *subopcode == 11) {
                     for (unsigned operand = 0; operand < 3; ++operand) {
                         auto value = shape_pop(stack, integer(32));
                         if (!value) return value.error();
@@ -945,6 +964,14 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 const auto subopcode = bulk_memory_subopcode(i);
                 if (!subopcode || !valid_bulk_memory_indices(i, metadata, *subopcode))
                     return unsupported("bulk-memory instruction requires validated segment and single-memory indices");
+                if (*subopcode <= 7) {
+                    const auto cv = saturating_conversion(*subopcode);
+                    if (!cv) return unsupported("trunc_sat subopcode is unavailable");
+                    auto operand = pop(cv->input);
+                    if (!operand) return operand.error();
+                    stack.push_back(unary(std::string(cv->operation), operand.value(), cv->output));
+                    continue;
+                }
                 Intrinsic effect;
                 if (*subopcode == 9) {
                     effect.name = "wasm_data_drop_segment_" + std::to_string(*immediate(i, 0));
