@@ -1423,7 +1423,7 @@ public:
             CloseHandle(thread);
             if (!ok) return error;
             std::vector<RegisterValue> out;
-            out.reserve(31 + 5 + 32);
+            out.reserve(31 + 5 + 32 * 6);
             for (std::uint32_t i = 0; i <= 30; ++i) {
                 RegisterValue reg;
                 reg.name = "x" + std::to_string(i);
@@ -1462,6 +1462,24 @@ public:
                 reg.bytes.resize(sizeof(c.V[i]));
                 std::memcpy(reg.bytes.data(), &c.V[i], sizeof(c.V[i]));
                 out.push_back(std::move(reg));
+                RegisterValue quad;
+                quad.name = "q" + std::to_string(i);
+                quad.group = "vector";
+                quad.number = i;
+                quad.byte_order = ByteOrder::little;
+                quad.bytes.resize(sizeof(c.V[i]));
+                std::memcpy(quad.bytes.data(), &c.V[i], sizeof(c.V[i]));
+                out.push_back(std::move(quad));
+                for (const auto& [prefix, width] : std::array<std::pair<char, std::size_t>, 4>{{{'b', 1}, {'h', 2}, {'s', 4}, {'d', 8}}}) {
+                    RegisterValue scalar;
+                    scalar.name = std::string(1, prefix) + std::to_string(i);
+                    scalar.group = "vector";
+                    scalar.number = i;
+                    scalar.byte_order = ByteOrder::little;
+                    scalar.bytes.resize(width);
+                    std::memcpy(scalar.bytes.data(), &c.V[i], width);
+                    out.push_back(std::move(scalar));
+                }
             }
             append_register(out, "fpcr", c.Fpcr);
             append_register(out, "fpsr", c.Fpsr);
@@ -1687,6 +1705,15 @@ public:
                 else if (reg.name == "fp") alias_key = "x29";
                 else if (reg.name == "lr") alias_key = "x30";
                 else if (reg.name == "wsp") alias_key = "sp";
+                else if (reg.name.size() >= 2 && std::string_view("vbhsdq").find(reg.name[0]) != std::string_view::npos) {
+                    const auto prefix = reg.name[0];
+                    if (prefix == 'v' || prefix == 'b' || prefix == 'h' || prefix == 's' || prefix == 'd' || prefix == 'q') {
+                        std::uint32_t index = 0;
+                        const auto parsed = std::from_chars(reg.name.data() + 1, reg.name.data() + reg.name.size(), index);
+                        if (parsed.ec == std::errc{} && parsed.ptr == reg.name.data() + reg.name.size() && index < 32)
+                            alias_key = "v" + std::to_string(index);
+                    }
+                }
                 if (std::find(written_aliases.begin(), written_aliases.end(), alias_key) != written_aliases.end()) {
                     CloseHandle(thread);
                     return Error{ErrorCode::invalid_argument, "duplicate Windows ARM64 register or overlapping alias write"};
@@ -1747,12 +1774,15 @@ public:
                         return Error{ErrorCode::invalid_argument, "ARM64 CPSR edits may change only the NZCV condition flags"};
                     }
                     if (matched) c.Cpsr = value;
-                } else if (reg.name.size() >= 2 && reg.name[0] == 'v') {
+                } else if (reg.name.size() >= 2 && std::string_view("vbhsdq").find(reg.name[0]) != std::string_view::npos) {
+                    const auto prefix = reg.name[0];
                     std::uint32_t index = 0;
                     const auto parsed = std::from_chars(reg.name.data() + 1, reg.name.data() + reg.name.size(), index);
                     if (parsed.ec == std::errc{} && parsed.ptr == reg.name.data() + reg.name.size() && index < 32) {
-                        matched = reg.bytes.size() == sizeof(c.V[index]);
-                        if (matched) std::memcpy(&c.V[index], reg.bytes.data(), sizeof(c.V[index]));
+                        const std::size_t width = (prefix == 'v' || prefix == 'q') ? sizeof(c.V[index]) :
+                            prefix == 'd' ? 8 : prefix == 's' ? 4 : prefix == 'h' ? 2 : 1;
+                        matched = reg.bytes.size() == width;
+                        if (matched) std::memcpy(&c.V[index], reg.bytes.data(), width);
                     }
                 } else if (reg.name == "fpcr") matched = assign_register(reg, "fpcr", c.Fpcr);
                 else if (reg.name == "fpsr") matched = assign_register(reg, "fpsr", c.Fpsr);

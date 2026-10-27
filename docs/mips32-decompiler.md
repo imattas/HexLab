@@ -50,10 +50,10 @@ D arithmetic, comparisons, conversions, and W rounding forms remain named
 For all 16 classic S/D `C.<cond>` predicates, the intrinsic retains the
 predicate and selected FCC effect, while the FCC output is also expressed as
 symbolic SSA from ordered equal/less/less-equal and unordered terms. This
-allows `BC1T`/`BC1F` and downstream condition flow to consume the predicate
+allows `BC1T`/`BC1F`/`BC1TL`/`BC1FL` and downstream condition flow to consume the predicate
 without relying on host floating-point evaluation. Signaling-NaN exception
 details and FCSR Cause/Flag updates remain unevaluated.
-`BC1T` and `BC1F` produce branches over the selected `mips.fccN` predicate.
+These branches produce edges over the selected `mips.fccN` predicate; the branch-likely variants execute the delay slot only on the taken edge.
 `MFC1` and `MTC1` are typed 32-bit bitcasts between GPR and FPR values;
 `CFC1` and `CTC1` on aggregate FCSR31 are exact 32-bit copies, and a write
 projects its condition-code bits into FCC0-FCC7 SSA. FCCR25 writes conservatively

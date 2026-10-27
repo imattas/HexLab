@@ -202,6 +202,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips64_c_cond_d: return "c.cond.d";
     case Opcode::mips64_bc1tl: return "bc1tl";
     case Opcode::mips64_bc1fl: return "bc1fl";
+    case Opcode::mips_bc1tl: return "bc1tl";
+    case Opcode::mips_bc1fl: return "bc1fl";
     case Opcode::mips_clz: return "clz";
     case Opcode::mips_clo: return "clo";
     case Opcode::mips64_dclz: return "dclz";
@@ -857,6 +859,7 @@ std::string format_instruction(const Instruction &i) {
             ((i.opcode >= Opcode::mips_c_eq_s && i.opcode <= Opcode::mips_c_le_s) ||
              (i.opcode >= Opcode::mips_c_eq_d && i.opcode <= Opcode::mips_c_le_d) ||
              i.opcode == Opcode::mips_bc1f || i.opcode == Opcode::mips_bc1t ||
+             i.opcode == Opcode::mips_bc1tl || i.opcode == Opcode::mips_bc1fl ||
              i.opcode == Opcode::mips64_bc1tl || i.opcode == Opcode::mips64_bc1fl);
         if (fcc_operand) out += " fcc" + std::to_string(i.condition & 7);
         for (std::size_t n = 0; n < i.operands.size(); ++n) {

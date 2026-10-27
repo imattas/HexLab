@@ -462,7 +462,7 @@ void project_usage(std::ostream &out) {
            "       hexlab_cli project backup restore-in-place <backup.hxproj> --target <existing-project.hxproj>\n"
            "       hexlab_cli project exchange import <project> --input <file> [--conflict fail|skip|replace] [--dry-run] [--json]\n"
            "Actions: create inspect rename comment bookmark define undefine reference patch undo redo\n"
-           "         save save-as export functions references switches stack graph search signatures signature-apply signature-create flirt flirt-apply fingerprints fingerprint-create recognition-evidence methods managed-types fields\n"
+           "         save save-as export functions references switches stack graph search signatures signature-apply signature-create flirt flirt-apply fingerprints fingerprint-create recognition-evidence methods managed-types fields user-strings\n"
            "         exchange export|import <project> --output/--input <file> [--conflict fail|skip|replace]\n"
            "         types export|import <project> --output/--input <file> [--replace] [--replace-assignments] [--skip-assignments-on-mismatch]\n"
            "         types verify <type-library-file>\n"
@@ -585,7 +585,7 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
         }
         bool query = args.action == L"exchange-export" || args.action == L"types-export" ||
                      (args.action == L"exchange-import" && args.exchange_dry_run) ||
-                     args.action == L"inspect" || args.action == L"functions" || args.action == L"methods" || args.action == L"managed-types" || args.action == L"fields" || args.action == L"references" || args.action == L"stack" ||
+                     args.action == L"inspect" || args.action == L"functions" || args.action == L"methods" || args.action == L"managed-types" || args.action == L"fields" || args.action == L"user-strings" || args.action == L"references" || args.action == L"stack" ||
                      args.action == L"switches" ||
                      args.action == L"graph" || args.action == L"search" || args.action == L"recognition-evidence" || (args.action == L"signatures" && !args.signature_function_entries) ||
                      args.action == L"signature-create" || args.action == L"flirt" ||

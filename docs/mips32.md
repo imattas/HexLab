@@ -15,15 +15,15 @@ outside the selected destination range, and inserts the low `size` bits of
 `rs`. The MIPS32 decompiler expresses these as logical shifts, masks, and
 merge operations.
 
-Every decoded control transfer records `delay_slots = 1`. Automatic reachable analysis and function recovery decode and own the instruction at PC+4 before following a transfer's target or post-slot continuation. Calls and classic conditional branches continue at PC+8; likely branches send the not-taken edge directly to PC+8 and route the taken edge through the delay slot. Jumps have no invented fallthrough; returns terminate after their slot. A control transfer in a delay slot is explicitly unsupported, and missing, excluded, malformed, or truncated slots stop recovery without fabricating an edge. Instruction and membership budgets and cancellation continue to bound traversal. JAL and JALR expose link-register writes, and `jr $ra` is identified as return. Compressed/MIPS16/microMIPS, unsupported COP1 formats/functions (including COP1 likely branches), exception instructions, REGIMM link-likely forms, and complete ISA semantics remain unsupported.
+Every decoded control transfer records `delay_slots = 1`. Automatic reachable analysis and function recovery decode and own the instruction at PC+4 before following a transfer's target or post-slot continuation. Calls and classic conditional branches continue at PC+8; likely branches send the not-taken edge directly to PC+8 and route the taken edge through the delay slot. Jumps have no invented fallthrough; returns terminate after their slot. A control transfer in a delay slot is explicitly unsupported, and missing, excluded, malformed, or truncated slots stop recovery without fabricating an edge. Instruction and membership budgets and cancellation continue to bound traversal. JAL and JALR expose link-register writes, and `jr $ra` is identified as return. Compressed/MIPS16/microMIPS, unsupported COP1 formats/functions, exception instructions, REGIMM link-likely forms, and complete ISA semantics remain unsupported. COP1 `BC1TL`/`BC1FL` select FCC0-FCC7 like `BC1T`/`BC1F`; their not-taken edges annul the delay slot.
 
 The HI/LO encoding and result behavior follows the MIPS32 Instruction Set Manual, Volume II, Revision 0.95: [MIPS32 Architecture for Programmers](https://www.ece.lsu.edu/ee4720/mips32v2.pdf). Division by zero is architecturally unpredictable/undefined, so the semantic helper returns no result rather than choosing a quotient or remainder.
 # COP1 scalar floating-point subset
 
 The scalar decoder recognizes `LWC1`/`SWC1` and `LDC1`/`SDC1`, COP1 S-format arithmetic
 operations `ADD.S`, `SUB.S`, `MUL.S`, `DIV.S`, `SQRT.S`, `ABS.S`, `MOV.S`,
-`NEG.S`, all 16 classic `C.<cond>.S` comparisons, and non-likely `BC1T`/`BC1F`
-branches selecting FCC0 through FCC7. It also recognizes D-format
+`NEG.S`, all 16 classic `C.<cond>.S` comparisons, and `BC1T`/`BC1F`/`BC1TL`/
+`BC1FL` branches selecting FCC0 through FCC7. It also recognizes D-format
 arithmetic/unary operations and all 16 classic `C.<cond>.D` comparisons,
 conversions between S/D/W for the common
 `CVT` forms, and `ROUND.W`, `TRUNC.W`, `CEIL.W`, and `FLOOR.W` from S/D.

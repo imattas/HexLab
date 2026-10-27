@@ -234,11 +234,10 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
                 return {DecodeStatus::decoded, std::move(i), {}};
             }
             if (op == 0x11) { // COP1 scalar arithmetic and CC0 branches.
-                if (rs == 8) { // BC1F/BC1T FCC0-FCC7, non-likely forms.
-                    if ((rt & 2) != 0)
-                        return {DecodeStatus::unsupported, {}, "MIPS32 COP1 likely branches are unsupported"};
+                if (rs == 8) { // BC1F/BC1T and likely FCC0-FCC7 forms.
                     const auto condition_code = (rt >> 2) & 7;
-                    i.opcode = (rt & 1) ? Opcode::mips_bc1t : Opcode::mips_bc1f;
+                    i.opcode = (rt & 2) ? ((rt & 1) ? Opcode::mips_bc1tl : Opcode::mips_bc1fl)
+                                         : ((rt & 1) ? Opcode::mips_bc1t : Opcode::mips_bc1f);
                     i.condition = static_cast<std::uint8_t>(condition_code);
                     i.flow = FlowKind::conditional_branch; i.delay_slots = 1;
                     i.register_reads = {fcc(condition_code)};

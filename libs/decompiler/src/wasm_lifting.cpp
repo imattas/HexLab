@@ -72,6 +72,30 @@ bool valid_bulk_memory_indices(const Instruction &i, const WasmMetadata *metadat
     const auto memory = immediate(i, 0);
     return memory && *memory == 0;
 }
+std::optional<std::uint32_t> resolved_indirect_target(const WasmMetadata *metadata,
+                                                      std::uint32_t type_index,
+                                                      const ExpressionPtr &table_index) {
+    if (!metadata || !table_index || table_index->type != integer(32) ||
+        !metadata->initial_table_complete ||
+        static_cast<std::uint64_t>(metadata->imported_tables) + metadata->defined_tables != 1 ||
+        std::any_of(metadata->exports.begin(), metadata->exports.end(), [](const WasmExport &entry) {
+            return entry.kind == WasmExternalKind::table && entry.index == 0;
+        }))
+        return {};
+    const auto *constant_index = std::get_if<ConstantValue>(&table_index->value);
+    if (!constant_index || constant_index->value > UINT32_MAX ||
+        constant_index->value >= metadata->initial_table_element_count)
+        return {};
+    const auto slot = static_cast<std::uint32_t>(constant_index->value);
+    const auto element = std::lower_bound(metadata->initial_table_elements.begin(),
+        metadata->initial_table_elements.end(), slot,
+        [](const WasmTableElement &candidate, std::uint32_t value) { return candidate.slot < value; });
+    if (element == metadata->initial_table_elements.end() || element->slot != slot ||
+        element->function_index >= metadata->function_type_indices.size() ||
+        metadata->function_type_indices[element->function_index] != type_index)
+        return {};
+    return element->function_index;
+}
 struct OpInfo { unsigned pops; ValueType input, output; std::string_view op; bool comparison = false; };
 std::optional<OpInfo> numeric(std::uint8_t op) {
     const auto i32 = integer(32), i64 = integer(64), f32 = floating(32), f64 = floating(64);
@@ -860,6 +884,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     return unsupported("call_indirect table index is unavailable or not i32");
                 auto table_index_value = stack.back();
                 stack.pop_back();
+                const auto target_function = resolved_indirect_target(metadata,
+                    static_cast<std::uint32_t>(*type_index), table_index_value);
                 std::vector<ExpressionPtr> arguments(callee->parameter_types.size());
                 for (std::size_t argument = callee->parameter_types.size(); argument > 0; --argument) {
                     const auto arg_type = wasm_value_type(callee->parameter_types[argument - 1]);
@@ -870,6 +896,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 }
                 Intrinsic call;
                 call.name = "wasm_call_indirect_type_" + std::to_string(*type_index);
+                if (target_function)
+                    call.name += "_target_" + std::to_string(*target_function);
                 call.operands = std::move(arguments);
                 call.operands.push_back(std::move(table_index_value));
                 call.memory_effect = IntrinsicMemoryEffect::unknown;

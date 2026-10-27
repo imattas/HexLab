@@ -55,4 +55,5 @@ struct ManagedMethodAnalysis {
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedMethodAnalysis>> inspect_managed_methods(const LoadedImage&,std::stop_token={});
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedTypeDefinition>> inspect_managed_types(const LoadedImage&);
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedField>> inspect_managed_fields(const LoadedImage&);
+HEXLAB_LOADERS_EXPORT Result<ManagedUserStringCatalog> inspect_managed_user_strings(const LoadedImage&);
 }

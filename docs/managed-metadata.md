@@ -131,3 +131,13 @@ applies both owner `VAR` and MethodSpec `MVAR` argument vectors. An open
 argument that has no corresponding supplied value remains a VAR/MVAR node.
 External or unbound constructor identity, invalid arity, cyclic TypeSpec trees,
 and exhausted traversal budgets never produce guessed substitutions.
+
+`parse_managed_user_strings` parses `#US` heap entries as UTF-16 code units,
+keyed by the complete `0x70xxxxxx` metadata token. It validates the compressed
+byte count, even UTF-16 payload length, and trailing kind byte; each string is
+capped at 4 MiB. The CIL inspector resolves `ldstr` tokens against this catalog
+for decompilation. The `project user-strings` query exposes the full catalog
+from a loaded managed PE and prints each value as comma-separated four-digit
+hexadecimal UTF-16 code units. This preserves embedded NULs and unpaired
+surrogates exactly, without normalization or terminal decoding. A missing `#US`
+stream is a valid empty catalog.

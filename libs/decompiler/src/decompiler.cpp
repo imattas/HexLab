@@ -289,6 +289,7 @@ bool mips_branch_likely(Opcode opcode) {
     case Opcode::mips_beql: case Opcode::mips_bnel: case Opcode::mips_blezl:
     case Opcode::mips_bgtzl: case Opcode::mips_bltzl: case Opcode::mips_bgezl:
     case Opcode::mips64_bltzall: case Opcode::mips64_bgezall:
+    case Opcode::mips_bc1tl: case Opcode::mips_bc1fl:
     case Opcode::mips64_bc1tl: case Opcode::mips64_bc1fl:
         return true;
     default:
@@ -2541,11 +2542,12 @@ a64_unhandled:
                 effect.register_writes = instruction.register_writes;
                 return effect;
             }
-            if (op == Opcode::mips_bc1t || op == Opcode::mips_bc1f) {
+            if (op == Opcode::mips_bc1t || op == Opcode::mips_bc1f ||
+                op == Opcode::mips_bc1tl || op == Opcode::mips_bc1fl) {
                 auto fcc = reg_expr({RegisterBank::mips_fcsr, static_cast<std::uint8_t>((instruction.condition & 7) + 1), 32, false});
                 auto predicate = std::make_shared<Expression>(Expression{ValueType{TypeKind::boolean, 1, false},
                     UnaryValue{"mips.fcc" + std::to_string(instruction.condition & 7), std::move(fcc)}});
-                if (op == Opcode::mips_bc1f)
+                if (op == Opcode::mips_bc1f || op == Opcode::mips_bc1fl)
                     predicate = std::make_shared<Expression>(Expression{ValueType{TypeKind::boolean, 1, false},
                         UnaryValue{"not", std::move(predicate)}});
                 return Branch{"mips-fcc" + std::to_string(instruction.condition & 7), instruction.direct_target, {}, std::move(predicate)};
