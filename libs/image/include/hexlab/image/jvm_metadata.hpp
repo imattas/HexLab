@@ -33,6 +33,14 @@ struct JvmLocalVariable {
     std::string name, descriptor;
     bool operator==(const JvmLocalVariable &) const = default;
 };
+// LocalVariableTypeTable retains generic local signatures as class-file text.
+// The loader validates the referenced UTF-8 entry but does not parse the
+// generic-signature grammar.
+struct JvmLocalVariableType {
+    std::uint16_t start_pc = 0, length = 0, name_index = 0, signature_index = 0, slot = 0;
+    std::string name, signature;
+    bool operator==(const JvmLocalVariableType &) const = default;
+};
 // Annotation element values use a lossless, validated JVM-style textual form
 // (for example `enum(Lx;#NAME)` or `[const(I:3),... ]`).
 struct JvmAnnotationElement { std::string name, value; bool operator==(const JvmAnnotationElement &) const = default; };
@@ -95,6 +103,7 @@ struct JvmCode {
     std::vector<JvmExceptionHandler> exception_table;
     std::optional<std::vector<JvmLineNumber>> line_numbers;
     std::optional<std::vector<JvmLocalVariable>> local_variables;
+    std::optional<std::vector<JvmLocalVariableType>> local_variable_types;
     // Distinguishes an absent attribute from an explicitly empty table.
     std::optional<JvmStackMapTable> stack_map_table;
     std::vector<JvmTypeAnnotation> visible_type_annotations, invisible_type_annotations;

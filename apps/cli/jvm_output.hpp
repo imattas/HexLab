@@ -66,6 +66,7 @@ inline void jvm_description(std::ostream &out, const ImageMetadata &metadata) {
             type_annotations(method.code->visible_type_annotations,"visible","Code");type_annotations(method.code->invisible_type_annotations,"invisible","Code");
             if(method.code->line_numbers)for(const auto &line:*method.code->line_numbers)out<<"    line "<<line.line_number<<" at +0x"<<std::hex<<line.start_pc<<std::dec<<'\n';
             if(method.code->local_variables)for(const auto &local:*method.code->local_variables)out<<"    local "<<local.name<<' '<<local.descriptor<<" slot="<<local.slot<<" range=["<<local.start_pc<<','<<std::uint32_t(local.start_pc)+local.length<<")\n";
+            if(method.code->local_variable_types)for(const auto &local:*method.code->local_variable_types)out<<"    local-type "<<local.name<<' '<<local.signature<<" slot="<<local.slot<<" range=["<<local.start_pc<<','<<std::uint32_t(local.start_pc)+local.length<<")\n";
         }
         const auto parameter_annotations=[&](const auto &parameters,const char *visibility){
             if(!parameters)return;

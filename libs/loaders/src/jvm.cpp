@@ -321,6 +321,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     std::size_t annotation_items=0;
     using LocalVariableKey=std::tuple<std::uint16_t,std::uint16_t,std::uint16_t,std::uint16_t,std::uint16_t>;
     std::unordered_map<const JvmCode *,std::set<LocalVariableKey>> local_variable_entries_seen;
+    std::unordered_map<const JvmCode *,std::set<LocalVariableKey>> local_variable_type_entries_seen;
     std::function<Result<std::string>(unsigned)> annotation_value;
     annotation_value=[&](unsigned depth)->Result<std::string>{
         if(depth>64)return Error{ErrorCode::resource_limit,"annotation nesting exceeds 64 levels"};
@@ -509,6 +510,21 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                     local.name=std::move(name.value());local.descriptor=std::move(descriptor.value());
                     auto &seen=local_variable_entries_seen[code_owner];
                     if(!seen.emplace(local.start_pc,local.length,local.name_index,local.descriptor_index,local.slot).second)return malformed("duplicate LocalVariableTable entry");
+                    locals.push_back(std::move(local));
+                }
+            }else if(an.value()=="LocalVariableTypeTable"){
+                if(!code_owner||!member)return malformed("LocalVariableTypeTable appears outside a Code attribute");
+                std::uint16_t entries=0;if(len<2||!r.u2(entries)||std::uint64_t(entries)*10+2!=len)return malformed("LocalVariableTypeTable length does not match its entries");
+                if(code_owner->local_variable_types&&entries>65535-code_owner->local_variable_types->size())return Error{ErrorCode::resource_limit,"aggregate LocalVariableTypeTable entries exceed 65535 per Code attribute"};
+                if(!code_owner->local_variable_types)code_owner->local_variable_types.emplace();
+                auto &locals=*code_owner->local_variable_types;locals.reserve(locals.size()+entries);
+                for(unsigned i=0;i<entries;++i){JvmLocalVariableType local;
+                    if(!r.u2(local.start_pc)||!r.u2(local.length)||!r.u2(local.name_index)||!r.u2(local.signature_index)||!r.u2(local.slot))return malformed("truncated LocalVariableTypeTable entry");
+                    if(local.start_pc>=code_owner->code_size||std::uint32_t(local.start_pc)+local.length>code_owner->code_size||local.slot>=code_owner->max_locals)return malformed("LocalVariableTypeTable entry exceeds Code bounds");
+                    auto name=utf8(local.name_index),signature=utf8(local.signature_index);if(!name)return name.error();if(!signature)return signature.error();
+                    local.name=std::move(name.value());local.signature=std::move(signature.value());
+                    auto &seen=local_variable_type_entries_seen[code_owner];
+                    if(!seen.emplace(local.start_pc,local.length,local.name_index,local.signature_index,local.slot).second)return malformed("duplicate LocalVariableTypeTable entry");
                     locals.push_back(std::move(local));
                 }
             }else if(method&&member&&an.value()=="Exceptions"){
@@ -712,7 +728,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 if(md.major_version<53||md.class_name!="module-info"||(md.access_flags&0x8000)==0||len!=2)return malformed("ModuleMainClass requires one class index in a Java 9 module-info class");
                 std::uint16_t index=0;if(!r.u2(index))return malformed("truncated ModuleMainClass attribute");auto name=class_name(index);if(!name)return name.error();md.module_main_class=std::move(name.value());have_module_main_class=true;
             }else{
-                if(an.value()!="ConstantValue"&&an.value()!="Exceptions"&&an.value()!="Signature"&&an.value()!="SourceFile"&&an.value()!="Synthetic"&&an.value()!="Deprecated"&&an.value()!="LineNumberTable"&&an.value()!="LocalVariableTable"&&an.value()!="BootstrapMethods")metadata_complete=false;
+                if(an.value()!="ConstantValue"&&an.value()!="Exceptions"&&an.value()!="Signature"&&an.value()!="SourceFile"&&an.value()!="Synthetic"&&an.value()!="Deprecated"&&an.value()!="LineNumberTable"&&an.value()!="LocalVariableTable"&&an.value()!="LocalVariableTypeTable"&&an.value()!="BootstrapMethods")metadata_complete=false;
                 if(!r.skip(len))return malformed("truncated attribute payload");
             }
             if(r.p!=start+len)return malformed("attribute parser did not consume its declared extent");

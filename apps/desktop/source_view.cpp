@@ -14,6 +14,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace hexlab::desktop {
@@ -84,20 +85,79 @@ std::vector<std::byte> read_source(const std::filesystem::path &path, std::strin
     return bytes;
 }
 
-std::vector<std::string> split_lines(std::span<const std::byte> bytes) {
+bool append_utf8(std::string &output, std::uint32_t value) {
+    if (value <= 0x7f) output.push_back(static_cast<char>(value));
+    else if (value <= 0x7ff) {
+        output.push_back(static_cast<char>(0xc0 | (value >> 6)));
+        output.push_back(static_cast<char>(0x80 | (value & 0x3f)));
+    } else if (value <= 0xffff) {
+        output.push_back(static_cast<char>(0xe0 | (value >> 12)));
+        output.push_back(static_cast<char>(0x80 | ((value >> 6) & 0x3f)));
+        output.push_back(static_cast<char>(0x80 | (value & 0x3f)));
+    } else if (value <= 0x10ffff) {
+        output.push_back(static_cast<char>(0xf0 | (value >> 18)));
+        output.push_back(static_cast<char>(0x80 | ((value >> 12) & 0x3f)));
+        output.push_back(static_cast<char>(0x80 | ((value >> 6) & 0x3f)));
+        output.push_back(static_cast<char>(0x80 | (value & 0x3f)));
+    } else return false;
+    return true;
+}
+
+std::optional<std::string> decode_source_text(std::span<const std::byte> bytes, std::string &failure) {
+    const auto byte = [&](std::size_t index) { return std::to_integer<std::uint8_t>(bytes[index]); };
+    if (bytes.size() >= 3 && byte(0) == 0xef && byte(1) == 0xbb && byte(2) == 0xbf)
+        return std::string(reinterpret_cast<const char *>(bytes.data() + 3), bytes.size() - 3);
+    const bool little_endian = bytes.size() >= 2 && byte(0) == 0xff && byte(1) == 0xfe;
+    const bool big_endian = bytes.size() >= 2 && byte(0) == 0xfe && byte(1) == 0xff;
+    if (!little_endian && !big_endian)
+        return std::string(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+    if ((bytes.size() - 2) % 2 != 0) {
+        failure = "UTF-16 source file has an odd byte length";
+        return {};
+    }
+    std::string output;
+    output.reserve(bytes.size());
+    const auto unit = [&](std::size_t index) {
+        return little_endian ? static_cast<std::uint16_t>(byte(index) | (byte(index + 1) << 8))
+                             : static_cast<std::uint16_t>((byte(index) << 8) | byte(index + 1));
+    };
+    for (std::size_t at = 2; at < bytes.size(); at += 2) {
+        std::uint32_t scalar = unit(at);
+        if (scalar >= 0xd800 && scalar <= 0xdbff) {
+            if (at + 3 >= bytes.size()) {
+                failure = "UTF-16 source file ends with an unpaired high surrogate";
+                return {};
+            }
+            const auto low = unit(at + 2);
+            if (low < 0xdc00 || low > 0xdfff) {
+                failure = "UTF-16 source file contains an invalid surrogate pair";
+                return {};
+            }
+            scalar = 0x10000 + ((scalar - 0xd800) << 10) + (low - 0xdc00);
+            at += 2;
+        } else if (scalar >= 0xdc00 && scalar <= 0xdfff) {
+            failure = "UTF-16 source file contains an unpaired low surrogate";
+            return {};
+        }
+        append_utf8(output, scalar);
+    }
+    return output;
+}
+
+std::vector<std::string> split_lines(std::string_view bytes) {
     std::vector<std::string> lines;
     std::size_t begin = 0;
     for (std::size_t i = 0; i < bytes.size(); ++i) {
-        if (bytes[i] != std::byte{'\n'}) continue;
+        if (bytes[i] != '\n') continue;
         std::size_t end = i;
-        if (end > begin && bytes[end - 1] == std::byte{'\r'}) --end;
-        lines.emplace_back(reinterpret_cast<const char *>(bytes.data() + begin), end - begin);
+        if (end > begin && bytes[end - 1] == '\r') --end;
+        lines.emplace_back(bytes.data() + begin, end - begin);
         begin = i + 1;
     }
     if (begin < bytes.size() || lines.empty()) {
         std::size_t end = bytes.size();
-        if (end > begin && bytes[end - 1] == std::byte{'\r'}) --end;
-        lines.emplace_back(reinterpret_cast<const char *>(bytes.data() + begin), end - begin);
+        if (end > begin && bytes[end - 1] == '\r') --end;
+        lines.emplace_back(bytes.data() + begin, end - begin);
     }
     return lines;
 }
@@ -384,7 +444,12 @@ void SourceView::render_source_row(const SourceRow &source_row, Address context_
         render_unavailable(display_path(selected->path) + ": " + text(failure));
         return;
     }
-    auto lines = split_lines(bytes);
+    const auto decoded = decode_source_text(bytes, failure);
+    if (!decoded) {
+        render_unavailable(display_path(selected->path) + ": " + text(failure));
+        return;
+    }
+    auto lines = split_lines(*decoded);
     if (selected->line <= 0 || static_cast<std::uint64_t>(selected->line) > lines.size()) {
         render_unavailable(display_path(selected->path) + ": mapped source line is outside the available file");
         return;

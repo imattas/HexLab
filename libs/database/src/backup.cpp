@@ -226,61 +226,22 @@ Result<BackupRotationResult> ProjectStore::backup_to_rotating(const std::filesys
         auto saved=backup_to(latest,ReplacePolicy::fail_if_exists,stop);
         if(!saved)return saved.error();
         BackupRotationResult result{saved.value(),0,true};
-
-        struct Candidate {std::filesystem::path path;std::string order;bool newest=false;std::uint64_t size=0;};
-        std::vector<Candidate> candidates{{latest,timestamp+"-new",true,0}};
-        const auto prefix=normalized.stem().native()+std::filesystem::path(".backup-").native();
-        const auto extension=normalized.extension().native();
-        std::error_code error;
-        std::filesystem::directory_iterator current(normalized.parent_path(),error),end;
-        if(error){result.retention_satisfied=false;return result;}
-        constexpr std::size_t directory_entry_limit=8192,candidate_limit=64;
-        constexpr std::uint64_t validation_byte_limit=UINT64_C(1024)*1024*1024;
-        std::size_t entries=0;
-        std::uint64_t validation_bytes=0;
-        while(current!=end){
+        // Enumerate and fully verify the same candidate set exposed by the
+        // listing/pruning APIs. In particular, don't prune merely because a
+        // candidate opens and carries the expected UUID: its embedded input,
+        // patches, and retained undo/redo payloads must also validate.
+        auto listing=list_rotated_backups(normalized,stop);
+        if(!listing||!listing.value().complete){result.retention_satisfied=false;return result;}
+        auto candidates=std::move(listing.value().backups);
+        const auto newest=std::find_if(candidates.begin(),candidates.end(),[&](const RotatedBackup& row){
+            return detail::same_file(row.backup.path,latest);
+        });
+        if(newest==candidates.end()){result.retention_satisfied=false;return result;}
+        std::rotate(candidates.begin(),newest,newest+1);
+        for(std::size_t i=retain;i<candidates.size();++i){
             if(stop.stop_requested()){result.retention_satisfied=false;return result;}
-            if(++entries>directory_entry_limit){result.retention_satisfied=false;return result;}
-            const auto entry=*current;current.increment(error);
-            if(error){result.retention_satisfied=false;return result;}
-            const auto filename=entry.path().filename().native();
-            if(!filename.starts_with(prefix)||!filename.ends_with(extension)||filename.size()<prefix.size()+13+1+32+extension.size())continue;
-            const auto token_begin=prefix.size()+14;
-            if(filename.size()-extension.size()!=token_begin+32)continue;
-            const auto stamp=filename.substr(prefix.size(),13);
-            const auto separator=filename[prefix.size()+13];
-            if(separator!=static_cast<std::filesystem::path::value_type>('-'))continue;
-            const auto is_decimal=[](auto ch){return ch>=static_cast<std::filesystem::path::value_type>('0')&&ch<=static_cast<std::filesystem::path::value_type>('9');};
-            if(!std::all_of(stamp.begin(),stamp.end(),is_decimal))continue;
-            bool token_valid=true;
-            for(std::size_t i=token_begin;i<token_begin+32;++i){const auto ch=filename[i];token_valid=token_valid&&((ch>=static_cast<std::filesystem::path::value_type>('0')&&ch<=static_cast<std::filesystem::path::value_type>('9'))||(ch>=static_cast<std::filesystem::path::value_type>('a')&&ch<=static_cast<std::filesystem::path::value_type>('f')));}
-            if(!token_valid||entry.path()==latest)continue;
-            const auto status=entry.symlink_status(error);
-            if(error){result.retention_satisfied=false;return result;}
-            if(!std::filesystem::is_regular_file(status))continue;
-            const auto size=entry.file_size(error);
-            if(error||size>validation_byte_limit-validation_bytes){result.retention_satisfied=false;return result;}
-            validation_bytes+=size;
-            if(candidates.size()>=candidate_limit){result.retention_satisfied=false;return result;}
-            std::string order;order.reserve(13+1+32);
-            for(const auto ch:stamp)order.push_back(static_cast<char>(ch));
-            order.push_back('-');
-            for(std::size_t i=token_begin;i<token_begin+32;++i)order.push_back(static_cast<char>(filename[i]));
-            candidates.push_back({entry.path(),std::move(order),false,size});
-        }
-        std::sort(candidates.begin()+1,candidates.end(),[](const Candidate& left,const Candidate& right){return left.order>right.order;});
-        std::size_t kept=1;
-        for(std::size_t i=1;i<candidates.size();++i){
-            if(stop.stop_requested()){result.retention_satisfied=false;return result;}
-            auto candidate=ProjectStore::open(candidates[i].path,ProjectMode::read_only,stop);
-            if(!candidate){result.retention_satisfied=false;continue;}
-            auto state=candidate.value()->snapshot();
-            const bool matching=state&&state.value()->uuid==saved.value().uuid;
-            candidate.value().reset();
-            if(!matching){result.retention_satisfied=false;continue;}
-            if(kept<retain){++kept;continue;}
             std::error_code remove_error;
-            if(std::filesystem::remove(candidates[i].path,remove_error))++result.removed_generations;
+            if(std::filesystem::remove(candidates[i].backup.path,remove_error))++result.removed_generations;
             else result.retention_satisfied=false;
         }
         return result;
@@ -301,6 +262,9 @@ Result<BackupListing> ProjectStore::list_rotated_backups(const std::filesystem::
         constexpr std::size_t entry_limit=8192,candidate_limit=64;
         constexpr std::uint64_t byte_limit=UINT64_C(1024)*1024*1024;
         std::size_t entries=0;std::uint64_t bytes=0;
+        constexpr std::size_t total_history_step_limit=65536;
+        constexpr std::size_t total_history_byte_limit=512u*1024u*1024u;
+        std::size_t verified_history_steps=0,verified_history_bytes=0;
         while(it!=end){
             if(stop.stop_requested()){listing.complete=false;break;}
             if(++entries>entry_limit){listing.complete=false;break;}
@@ -316,10 +280,18 @@ Result<BackupListing> ProjectStore::list_rotated_backups(const std::filesystem::
             if(!std::filesystem::is_regular_file(status))continue;
             const auto size=entry.file_size(ec);if(ec||size>byte_limit-bytes){listing.complete=false;break;}bytes+=size;
             if(listing.backups.size()>=candidate_limit){listing.complete=false;break;}
-            auto candidate=ProjectStore::open(entry.path(),ProjectMode::read_only,stop);
-            if(!candidate){listing.complete=false;continue;}
-            auto candidate_state=candidate.value()->snapshot();
-            if(!candidate_state||candidate_state.value()->uuid!=state->uuid){listing.complete=false;continue;}
+            const auto remaining_steps=total_history_step_limit-verified_history_steps;
+            const auto remaining_bytes=total_history_byte_limit-verified_history_bytes;
+            if(remaining_steps==0||remaining_bytes==0){listing.complete=false;break;}
+            auto verification=ProjectStore::verify_backup(entry.path(),remaining_steps,remaining_bytes,stop);
+            if(!verification){listing.complete=false;continue;}
+            verified_history_steps+=static_cast<std::size_t>(verification.value().history_steps_verified);
+            verified_history_bytes+=static_cast<std::size_t>(verification.value().history_bytes_verified);
+            if(verification.value().backup.uuid!=state->uuid||!verification.value().history_complete){
+                listing.complete=false;
+                if(!verification.value().history_complete)break;
+                continue;
+            }
             std::uint64_t timestamp=0;for(auto c:stamp)timestamp=timestamp*10+static_cast<unsigned>(c-'0');
             listing.backups.push_back({SavedProject{entry.path(),state->uuid},timestamp});
         }

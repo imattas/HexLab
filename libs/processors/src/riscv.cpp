@@ -1011,8 +1011,8 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
         if (f3 == 1) {
             if (rd != 0 || rs1 != 0 || (w >> 20) != 0)
                 return false;
-            unsupported = "FENCE.I requires the disabled Zifencei extension";
-            return false;
+            i.opcode = RiscvOpcode::fence_i;
+            return true;
         }
         if (f3 != 0 || rd != 0 || rs1 != 0)
             return false;
