@@ -41,8 +41,19 @@ binary80 operands. It aligns finite significands with an integer
 shift-right-jam path, normalizes cancellation results, rounds to the selected
 PC/RC, and reports DE, PE, OE, C1, and exception-delivery state. Opposite-sign
 exact cancellation produces negative zero only under round-toward-negative-
-infinity; same-sign zero inputs retain their sign. Masked denormal operands
-set DE and continue; an unmasked DE stops before arithmetic.
+infinity; C1 denotes rounding toward +infinity for either result sign, both
+normal and subnormal. Same-sign zero inputs retain their sign. Masked denormal operands
+set DE and continue; an unmasked DE stops before arithmetic. Gradual underflow
+rounds directly from the extended significand/guard-round-sticky representation
+into the binary80 subnormal lattice, applying PC's reduced subnormal precision
+in that same rounding decision. A result rounded to the least normal value is
+encoded as normal; tiny inexact results raise UE/PE as appropriate, and an
+unmasked UE withholds the destination value before PE delivery. The bounded
+three-bit jam representation remains sufficient here: alignment retains the
+leading exact bits and jams every discarded bit into the sticky position, which
+stays below the subnormal rounding boundary even after cancellation shifts.
+Subnormal results are rounded from that unrounded extended value in one step;
+no host float or double rounding is used.
 
 QNaNs propagate without IE. Masked SNaNs are quieted and raise IE; x87 NaN
 source selection uses the SDM's QNaN preference and larger-significand rule.

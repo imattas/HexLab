@@ -62,6 +62,18 @@ struct DexStaticValue {
     DexEncodedValue value;
     bool operator==(const DexStaticValue &) const = default;
 };
+struct DexMethodHandle {
+    std::uint16_t kind = 0; // DEX method_handle_type (static/instance field or method operation).
+    std::uint32_t member_index = 0; // Field ID for kinds 0..3; method ID for kinds 4..8.
+    std::uint64_t file_offset = 0; // method_handle_item start in the DEX file.
+    bool operator==(const DexMethodHandle &) const = default;
+};
+struct DexCallSite {
+    std::uint64_t file_offset = 0; // call_site_item encoded_array start in the DEX file.
+    // Bootstrap handle, method name, method type, then ordered bootstrap arguments.
+    std::vector<DexEncodedValue> values;
+    bool operator==(const DexCallSite &) const = default;
+};
 struct DexAnnotationItem {
     std::uint8_t visibility = 0; // DEX build, runtime, or system visibility.
     std::uint32_t type_index = 0;
@@ -83,6 +95,8 @@ struct DexMetadata {
     std::vector<DexMethodDebug> methods;
     std::vector<DexMethodCode> code;
     std::vector<DexStaticValue> static_values;
+    std::vector<DexMethodHandle> method_handles;
+    std::vector<DexCallSite> call_sites;
     std::vector<DexAnnotationItem> annotations;
     std::vector<DexAnnotationLink> annotation_links;
     bool operator==(const DexMetadata &) const = default;
