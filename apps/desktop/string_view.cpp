@@ -367,6 +367,15 @@ void StringBrowserView::export_strings(bool filtered) {
                         "CSV files (*.csv)|*.csv|All files (*.*)|*.*", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
     if (dialog.ShowModal() != wxID_OK)
         return;
+    // Document snapshots may be replaced when tabs switch or project analysis
+    // publishes while the native save dialog is open. Never export a snapshot
+    // that is no longer the active document.
+    if (document_ != document) {
+        wxMessageBox("The active document or its analysis changed while the save dialog was open. "
+                     "No strings were exported; review the current document and try again.",
+                     "Export strings", wxOK | wxICON_WARNING, this);
+        return;
+    }
     auto publication = FilePublication::create(std::filesystem::path(dialog.GetPath().ToStdWstring()),
                                                ExistingFilePolicy::replace, protected_paths, {});
     if (!publication) {

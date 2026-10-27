@@ -130,6 +130,15 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
         i.memory_read = true;
         return finish(length);
     };
+    auto axs = [&]() -> DecodeResult {
+        if (!begin(Opcode::m6502_axs, 2))
+            return bad(DecodeStatus::truncated, "6502 operand bytes are truncated");
+        i.operands.emplace_back(ImmediateOperand{byte(1), 8, 8, false, EncodedField{1, 1}});
+        i.access = {OperandAccess::read};
+        i.register_reads = {a, x};
+        i.register_writes = {x, p};
+        return finish(2);
+    };
 
     // Regular ALU family: xx01 encodes the operation in bits 7..5 and the
     // addressing form in bits 4..2. This covers 55 legal NMOS opcodes.
@@ -149,6 +158,8 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     }
 
     switch (op) {
+    // AXS (also called SBX) is the stable NMOS $CB immediate form.
+    case 0xcb: return axs();
     case 0x0b: case 0x2b: return data_op(Opcode::m6502_anc, Mode::immediate, a, false);
     // Undocumented NMOS decrement-then-compare family. These byte forms are
     // stable on the NMOS 6502; the decoder records their combined effects.
@@ -390,7 +401,7 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     if (op == 0x80 || op == 0x64 || op == 0x74 || op == 0x89 || op == 0x9c || op == 0x9e ||
         op == 0x12 || op == 0x32 || op == 0x52 || op == 0x72 || op == 0x92 || op == 0xb2 || op == 0xd2 || op == 0xf2 ||
         op == 0x04 || op == 0x0c || op == 0x14 || op == 0x1a || op == 0x34 || op == 0x3a || op == 0x3c ||
-        op == 0x5a || op == 0x7a || op == 0x7c || op == 0x89 || op == 0x9c || op == 0xcb || op == 0xdb)
+        op == 0x5a || op == 0x7a || op == 0x7c || op == 0x89 || op == 0x9c || op == 0xdb)
         return bad(DecodeStatus::unsupported, "65C02-only opcode is not enabled in the NMOS 6502 mode");
     return bad(DecodeStatus::unsupported, "Undocumented NMOS 6502 opcode has no defined decoder semantics");
 }

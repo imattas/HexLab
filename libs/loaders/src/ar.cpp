@@ -178,7 +178,9 @@ Result<ArArchive> read_ar_archive(const ByteStorage &storage, std::stop_token st
         ArArchive archive;
         std::vector<std::byte> long_names;
         std::vector<PendingSymbol> pending_symbols;
+        std::uint64_t symbol_index_bytes = 0;
         std::map<std::uint64_t, std::size_t> member_by_header;
+        constexpr std::uint64_t max_symbol_index_bytes = 256ULL * 1024 * 1024;
         std::uint64_t cursor = magic.size();
         while (cursor < storage.size()) {
             canceled(stop);
@@ -242,12 +244,13 @@ Result<ArArchive> read_ar_archive(const ByteStorage &storage, std::stop_token st
                 long_names = reader.read(data_start, raw_size);
             } else if (kind == ArMemberKind::symbol_index && raw_name == "/") {
                 archive.has_symbol_index = true;
-                if (raw_size > 256ULL * 1024 * 1024) {
+                if (raw_size > max_symbol_index_bytes - symbol_index_bytes) {
                     archive.symbol_index_complete = false;
-                    archive.diagnostics.emplace_back("GNU ar symbol index exceeds its metadata budget; member listing and extraction remain available");
+                    archive.diagnostics.emplace_back("GNU ar symbol index exceeds the cumulative metadata budget; member listing and extraction remain available");
                 } else {
+                    symbol_index_bytes += raw_size;
                     const auto bytes = reader.read(data_start, raw_size);
-                    auto decoded = decode_gnu_index(bytes, 4, limits.max_symbols, limits.max_name_bytes, stop);
+                    auto decoded = decode_gnu_index(bytes, 4, limits.max_symbols - pending_symbols.size(), limits.max_name_bytes, stop);
                     if (decoded) {
                         pending_symbols.insert(pending_symbols.end(),
                                                std::make_move_iterator(decoded->begin()),
@@ -259,12 +262,13 @@ Result<ArArchive> read_ar_archive(const ByteStorage &storage, std::stop_token st
                 }
             } else if (kind == ArMemberKind::symbol_index && raw_name == "/SYM64/") {
                 archive.has_symbol_index = true;
-                if (raw_size > 256ULL * 1024 * 1024) {
+                if (raw_size > max_symbol_index_bytes - symbol_index_bytes) {
                     archive.symbol_index_complete = false;
-                    archive.diagnostics.emplace_back("GNU ar 64-bit symbol index exceeds its metadata budget; member listing and extraction remain available");
+                    archive.diagnostics.emplace_back("GNU ar 64-bit symbol index exceeds the cumulative metadata budget; member listing and extraction remain available");
                 } else {
+                    symbol_index_bytes += raw_size;
                     const auto bytes = reader.read(data_start, raw_size);
-                    auto decoded = decode_gnu_index(bytes, 8, limits.max_symbols, limits.max_name_bytes, stop);
+                    auto decoded = decode_gnu_index(bytes, 8, limits.max_symbols - pending_symbols.size(), limits.max_name_bytes, stop);
                     if (decoded) {
                         pending_symbols.insert(pending_symbols.end(),
                                                std::make_move_iterator(decoded->begin()),
@@ -276,18 +280,24 @@ Result<ArArchive> read_ar_archive(const ByteStorage &storage, std::stop_token st
                 }
             } else if (kind == ArMemberKind::symbol_index && raw_name.starts_with("__.SYMDEF")) {
                 archive.has_symbol_index = true;
-                require(raw_size <= 256ULL * 1024 * 1024, "BSD ranlib index exceeds metadata budget", ErrorCode::resource_limit);
-                const auto bytes = reader.read(data_start, raw_size);
-                const std::size_t width = raw_name.find("_64") != std::string::npos ? 8 : 4;
-                auto decoded = decode_bsd_index(bytes, width, true, limits.max_symbols, limits.max_name_bytes, stop);
-                if (!decoded) decoded = decode_bsd_index(bytes, width, false, limits.max_symbols, limits.max_name_bytes, stop);
-                if (decoded) {
-                    pending_symbols.insert(pending_symbols.end(),
-                                           std::make_move_iterator(decoded->begin()),
-                                           std::make_move_iterator(decoded->end()));
-                } else {
+                if (raw_size > max_symbol_index_bytes - symbol_index_bytes) {
                     archive.symbol_index_complete = false;
-                    archive.diagnostics.emplace_back("BSD ranlib symbol index has an unsupported or malformed layout; member listing and extraction remain available");
+                    archive.diagnostics.emplace_back("BSD ranlib index exceeds the cumulative metadata budget; member listing and extraction remain available");
+                } else {
+                    symbol_index_bytes += raw_size;
+                    const auto bytes = reader.read(data_start, raw_size);
+                    const std::size_t width = raw_name.find("_64") != std::string::npos ? 8 : 4;
+                    const auto remaining_symbols = limits.max_symbols - pending_symbols.size();
+                    auto decoded = decode_bsd_index(bytes, width, true, remaining_symbols, limits.max_name_bytes, stop);
+                    if (!decoded) decoded = decode_bsd_index(bytes, width, false, remaining_symbols, limits.max_name_bytes, stop);
+                    if (decoded) {
+                        pending_symbols.insert(pending_symbols.end(),
+                                               std::make_move_iterator(decoded->begin()),
+                                               std::make_move_iterator(decoded->end()));
+                    } else {
+                        archive.symbol_index_complete = false;
+                        archive.diagnostics.emplace_back("BSD ranlib symbol index has an unsupported, malformed, or over-budget layout; member listing and extraction remain available");
+                    }
                 }
             }
 
