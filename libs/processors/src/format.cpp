@@ -612,6 +612,10 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::rv_fmaxm_s) return "fmaxm.s";
     if (op == Opcode::rv_fminm_d) return "fminm.d";
     if (op == Opcode::rv_fmaxm_d) return "fmaxm.d";
+    if (op == Opcode::rv_fleq_s) return "fleq.s";
+    if (op == Opcode::rv_fltq_s) return "fltq.s";
+    if (op == Opcode::rv_fleq_d) return "fleq.d";
+    if (op == Opcode::rv_fltq_d) return "fltq.d";
     if (op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) {
         static constexpr const char *fp_names[]{
             "flw","fld","fsw","fsd","fadd.s","fsub.s","fmul.s","fdiv.s","fsqrt.s","fsgnj.s","fsgnjn.s","fsgnjx.s","fmin.s","fmax.s","fmadd.s","fmsub.s","fnmsub.s","fnmadd.s","feq.s","flt.s","fle.s","fclass.s","fcvt.w.s","fcvt.wu.s","fcvt.l.s","fcvt.lu.s","fcvt.s.w","fcvt.s.wu","fcvt.s.l","fcvt.s.lu","fmv.x.w","fmv.w.x",

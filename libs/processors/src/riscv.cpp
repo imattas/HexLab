@@ -794,7 +794,19 @@ bool decode_fp_op(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
         if(f3<2) ok=plain(d?(f3?RiscvOpcode::fmax_d:RiscvOpcode::fmin_d):(f3?RiscvOpcode::fmax_s:RiscvOpcode::fmin_s),true);
         else if(f3<4) ok=plain(d?(f3==3?RiscvOpcode::fmaxm_d:RiscvOpcode::fminm_d):(f3==3?RiscvOpcode::fmaxm_s:RiscvOpcode::fminm_s),true);
     }
-    else if (operation == 0x50) { if(f3>=1 && f3<=2) { ok=plain(d?(f3==2?RiscvOpcode::feq_d:RiscvOpcode::flt_d):(f3==2?RiscvOpcode::feq_s:RiscvOpcode::flt_s),true); dst_fp=false; src1_fp=src2_fp=true; } else if(f3==0){ok=plain(d?RiscvOpcode::fle_d:RiscvOpcode::fle_s,true);dst_fp=false;} }
+    else if (operation == 0x50) {
+        if (f3 >= 1 && f3 <= 2) {
+            ok=plain(d?(f3==2?RiscvOpcode::feq_d:RiscvOpcode::flt_d):(f3==2?RiscvOpcode::feq_s:RiscvOpcode::flt_s),true);
+            dst_fp=false; src1_fp=src2_fp=true;
+        } else if (f3 == 0) { ok=plain(d?RiscvOpcode::fle_d:RiscvOpcode::fle_s,true); dst_fp=false; }
+        else if (f3 == 4 || f3 == 5) {
+            // Zfa FLEQ/FLTQ are bit-14 variants of FLE/FLT. Quiet NaNs do
+            // not raise NV, but signaling NaNs still can.
+            ok=plain(d?(f3==4?RiscvOpcode::fleq_d:RiscvOpcode::fltq_d)
+                       :(f3==4?RiscvOpcode::fleq_s:RiscvOpcode::fltq_s),true);
+            dst_fp=false;
+        }
+    }
     else if (operation == 0x60 && d && rs2 == 8 && f3 == 1) {
         ok = set(RiscvOpcode::fcvtmod_w_d, true, true, false);
         dst_fp = false; unary = true;

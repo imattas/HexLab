@@ -199,3 +199,8 @@ The integer reduction subset now includes unmasked `vredsum.vs`, `vredand.vs`, `
 The scalar Zfa `fminm.s/d` and `fmaxm.s/d` forms are also decoded, retaining FPR
 inputs and accrued floating status effects. Their canonical-NaN behavior for
 NaN inputs is represented by typed decompiler intrinsics rather than evaluated.
+The quiet comparison forms `fleq.s/d` and `fltq.s/d` are decoded and lifted
+with GPR results and accrued `fflags` dependencies. Their intrinsic semantics
+distinguish quiet from signaling NaNs: quiet NaNs do not raise NV, while
+signaling NaNs may. The other Zfa scalar format families (H and Q) remain
+outside this F/D decoder.

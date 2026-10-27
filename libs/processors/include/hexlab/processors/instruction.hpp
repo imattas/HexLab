@@ -484,7 +484,9 @@ enum class Opcode {
     // SSSE3 byte shuffle; appended to preserve persisted opcode IDs.
     pshufb,
     // MIPS64 pre-Release 6 SPECIAL2 word multiply-accumulate operations.
-    mips64_madd, mips64_maddu, mips64_msub, mips64_msubu
+    mips64_madd, mips64_maddu, mips64_msub, mips64_msubu,
+    // Scalar Zfa quiet comparisons; appended to preserve serialized IDs.
+    rv_fleq_s, rv_fltq_s, rv_fleq_d, rv_fltq_d
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

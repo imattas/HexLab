@@ -375,14 +375,17 @@ Result<LoadedImage> load_elf(std::shared_ptr<const ByteStorage> storage, const E
         }
         if (header.object_type != 1)
             normalize_loads(elf, layout, budget, stop);
-        auto image = take(Image::create(storage, layout));
+        // Keep the image on the tracked storage as well as the parser. Some
+        // ELF metadata paths (notably implicit runtime relocation addends) read
+        // through Image::storage() rather than through a parser helper.
+        auto image = take(Image::create(tracking, layout));
         if (header.object_type != 1 && header.object_type != 4 && header.entry) {
             const Address entry{
                 {0}, architecture == Architecture::arm && !header.is_64 ? header.entry & ~UINT64_C(1) : header.entry};
             const auto *segment = image->segment_at(entry);
             if (segment && segment->executable && image->to_file_offset(entry)) {
                 layout.entries.push_back(entry);
-                image = take(Image::create(storage, std::move(layout)));
+                image = take(Image::create(tracking, std::move(layout)));
             } else
                 partial("ELF entry is not initialized executable memory");
         }
@@ -423,7 +426,7 @@ Result<LoadedImage> load_elf(std::shared_ptr<const ByteStorage> storage, const E
                 auto context_layout = loaded.image->layout();
                 populate_arm_context(elf, context_layout, budget, stop);
                 if (context_layout.arm_profile)
-                    loaded.image = take(Image::create(storage, std::move(context_layout)));
+                    loaded.image = take(Image::create(tracking, std::move(context_layout)));
             }
             RelocationRegistry relocation_registry;
             read_relocations(*tracking, *loaded.image, elf, budget, relocation_registry, stop);
