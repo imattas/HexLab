@@ -22,8 +22,11 @@ NaN bias in the operation name. Integer
 lift with signed immediate handling; shift counts are masked to five bits.
 The compare-result intrinsic can feed the existing conditional branches.
 
-The lifter still rejects integer divide/remainder opcodes because their
-divide-by-zero exception edges are not modeled. Floating constants are kept
+Integer signed divide/remainder operations (int and long, three-register,
+`/2addr`, and literal forms) produce typed arithmetic values and add a
+method-relative `may_trap` edge for `java.lang.ArithmeticException` when the
+divisor is zero. DEX integer division's minimum-value divided by negative one
+case remains a normal wrapped result. Floating constants are kept
 as exact bit patterns until a typed use provides floating context. It also
 lifts `iget`/`iput`, `sget`/`sput`, array loads/stores and `array-length`, the five
 invoke kinds and their `/range` forms, `move-result` variants, `new-instance`,

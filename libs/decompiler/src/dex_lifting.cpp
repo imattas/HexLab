@@ -292,8 +292,6 @@ Result<Statement> lift_one(const Instruction &instruction) {
         static constexpr std::array<const char *, 11> operations{
             "add", "sub", "mul", "sdiv", "srem", "and", "or", "xor", "shl", "sar", "shr"};
         const auto slot = static_cast<unsigned>((op >= 0xb0 ? op - 0xb0 : op - 0x90));
-        if (slot == 3 || slot == 4)
-            return Error{ErrorCode::unsupported, "DEX signed division/remainder exception behavior is not modeled"};
         std::uint16_t dst = hi, left = hi, right = 0;
         if (op >= 0xb0) { dst = hi & 15; left = dst; right = hi >> 4; }
         else { const auto rhs = unit(instruction, 1); right = rhs & 0xff; }
@@ -319,8 +317,6 @@ Result<Statement> lift_one(const Instruction &instruction) {
         const auto immediate = literal16
             ? static_cast<std::int32_t>(std::bit_cast<std::int16_t>(unit(instruction, 1)))
             : static_cast<std::int32_t>(std::bit_cast<std::int8_t>(static_cast<std::uint8_t>(packed >> 8)));
-        if (slot == 3 || slot == 4)
-            return Error{ErrorCode::unsupported, "DEX literal division/remainder exception behavior is not modeled"};
         auto source = require_reg(source_index);
         if (!source) return source.error();
         ExpressionPtr literal = constant(static_cast<std::uint32_t>(immediate));
@@ -408,8 +404,6 @@ Result<Statement> lift_one(const Instruction &instruction) {
         static constexpr std::array<const char *, 11> operations{
             "add", "sub", "mul", "sdiv", "srem", "and", "or", "xor", "shl", "sar", "shr"};
         const auto slot = static_cast<unsigned>(op >= 0xbb ? op - 0xbb : op - 0x9b);
-        if (slot == 3 || slot == 4)
-            return Error{ErrorCode::unsupported, "DEX wide signed division/remainder exception behavior is not modeled"};
         const bool two_address = op >= 0xbb;
         const auto dst = two_address ? static_cast<std::uint16_t>(hi & 15) : static_cast<std::uint16_t>(hi);
         const auto operands = two_address ? std::uint16_t(hi >> 4) : unit(instruction, 1);
@@ -697,6 +691,41 @@ Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const F
                     std::reverse(out.begin(), out.end());
                     return out;
                 }() + ": " + statement.error().message};
+            // Dalvik integer division and remainder throw ArithmeticException
+            // exactly when the divisor is zero. Preserve that exceptional edge
+            // alongside the normal arithmetic result in the lifted block.
+            const auto first = unit(instruction, 0);
+            const auto op = static_cast<std::uint8_t>(first & 0xff);
+            ExpressionPtr divisor;
+            bool division_or_remainder = false;
+            bool wide = false;
+            if ((op >= 0x90 && op <= 0x9a) || (op >= 0xb0 && op <= 0xba)) {
+                const auto slot = static_cast<unsigned>(op >= 0xb0 ? op - 0xb0 : op - 0x90);
+                division_or_remainder = slot == 3 || slot == 4;
+                const auto index = op >= 0xb0 ? static_cast<std::uint16_t>(first >> 12)
+                                               : static_cast<std::uint16_t>(unit(instruction, 1) >> 8);
+                if (division_or_remainder) divisor = reg(vreg(index));
+            } else if ((op >= 0x9b && op <= 0xa5) || (op >= 0xbb && op <= 0xc5)) {
+                const auto slot = static_cast<unsigned>(op >= 0xbb ? op - 0xbb : op - 0x9b);
+                division_or_remainder = slot == 3 || slot == 4;
+                wide = true;
+                const auto index = op >= 0xbb ? static_cast<std::uint16_t>(first >> 12)
+                                               : static_cast<std::uint16_t>(unit(instruction, 1) >> 8);
+                if (division_or_remainder) divisor = wide_reg(vreg(index));
+            } else if (op >= 0xd0 && op <= 0xe2) {
+                const bool literal16 = op <= 0xd7;
+                const auto slot = static_cast<unsigned>(literal16 ? op - 0xd0 : op - 0xd8);
+                division_or_remainder = slot == 3 || slot == 4;
+                const auto packed = literal16 ? static_cast<std::uint16_t>(first >> 8) : unit(instruction, 1);
+                const auto immediate = literal16
+                    ? static_cast<std::int32_t>(std::bit_cast<std::int16_t>(unit(instruction, 1)))
+                    : static_cast<std::int32_t>(std::bit_cast<std::int8_t>(static_cast<std::uint8_t>(packed >> 8)));
+                if (division_or_remainder) divisor = constant(static_cast<std::uint32_t>(immediate));
+            }
+            if (division_or_remainder)
+                block.trap_edges.push_back({instruction.address, TrapEdgeKind::may_trap,
+                    std::string("java.lang.ArithmeticException from ") + instruction.mnemonic_override,
+                    predicate("eq", std::move(divisor), wide ? wide_constant(0) : constant(0))});
             if (auto *branch = std::get_if<Branch>(&statement.value())) {
                 if (!instruction.direct_target || !block_entries.contains(
                         {instruction.direct_target->space.value, instruction.direct_target->offset}))

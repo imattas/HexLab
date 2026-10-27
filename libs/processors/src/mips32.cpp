@@ -147,6 +147,32 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
             break;
         default: return invalid("Reserved MIPS32 SPECIAL function");
         }
+    } else if (op == 0x1f) {
+        // MIPS32 Release 2 SPECIAL3 EXT/INS. EXT stores size-1 in rd;
+        // INS stores the inclusive most-significant bit in rd.
+        const unsigned position = shamt;
+        const unsigned field = rd;
+        const bool insert = funct == 0x04;
+        unsigned size = 0;
+        if (funct == 0x00) {
+            size = field + 1;
+            if (position + size > 32) return invalid("Reserved MIPS32 EXT range");
+            i.opcode = Opcode::mips_ext;
+        } else if (insert) {
+            if (field < position) return invalid("Reserved MIPS32 INS range");
+            size = field - position + 1;
+            i.opcode = Opcode::mips_ins;
+        } else {
+            return {DecodeStatus::unsupported, {}, "MIPS32 SPECIAL3 operation is outside the EXT/INS subset"};
+        }
+        i.operands = {reg(rt), reg(rs),
+            ImmediateOperand{position, 5, 32, false, EncodedField{3, 1}},
+            ImmediateOperand{size, 6, 32, false, EncodedField{2, 1}}};
+        i.access = {insert ? OperandAccess::read_write : OperandAccess::write,
+                    OperandAccess::read, OperandAccess::read, OperandAccess::read};
+        if (insert && rt) i.register_reads = {reg(rt)};
+        if (rs) i.register_reads.push_back(reg(rs));
+        if (rt) i.register_writes = {reg(rt)};
     } else if (op == 2 || op == 3) {
         i.opcode = op == 2 ? Opcode::mips_j : Opcode::mips_jal;
         const auto pc4 = static_cast<std::uint32_t>(static_cast<std::uint32_t>(at.offset) + 4u);

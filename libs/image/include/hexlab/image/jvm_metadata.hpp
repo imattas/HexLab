@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace hexlab {
@@ -29,6 +30,15 @@ struct JvmLocalVariable {
 // (for example `enum(Lx;#NAME)` or `[const(I:3),... ]`).
 struct JvmAnnotationElement { std::string name, value; bool operator==(const JvmAnnotationElement &) const = default; };
 struct JvmAnnotation { std::string descriptor; std::vector<JvmAnnotationElement> elements; bool operator==(const JvmAnnotation &) const = default; };
+// Type annotations preserve the target_info encoding and validated type path
+// in class-file order, alongside the decoded annotation payload.
+struct JvmTypeAnnotation {
+    std::uint8_t target_type = 0;
+    std::vector<std::uint8_t> target_info;
+    std::vector<std::pair<std::uint8_t, std::uint8_t>> type_path;
+    JvmAnnotation annotation;
+    bool operator==(const JvmTypeAnnotation &) const = default;
+};
 // Values retain the class-file verification_type_info tag. Long/double are
 // one logical entry occupying two JVM local/operand locations.
 enum class JvmVerificationKind : std::uint8_t {
@@ -75,12 +85,16 @@ struct JvmCode {
     std::optional<std::vector<JvmLocalVariable>> local_variables;
     // Distinguishes an absent attribute from an explicitly empty table.
     std::optional<JvmStackMapTable> stack_map_table;
+    std::vector<JvmTypeAnnotation> visible_type_annotations, invisible_type_annotations;
     bool operator==(const JvmCode &) const = default;
 };
 struct JvmMember {
     std::uint16_t access_flags = 0, name_index = 0, descriptor_index = 0;
     std::string name, descriptor;
     std::optional<std::string> signature;
+    // ConstantValue payload: numeric entries preserve their class-file bits;
+    // strings contain the resolved CONSTANT_Utf8 text.
+    std::optional<JvmConstant> constant_value;
     // Exceptions attribute class names, in class-file declaration order.
     std::optional<std::vector<std::string>> declared_exceptions;
     std::vector<JvmAnnotation> visible_annotations, invisible_annotations;
@@ -89,6 +103,7 @@ struct JvmMember {
     std::optional<std::vector<std::vector<JvmAnnotation>>> visible_parameter_annotations, invisible_parameter_annotations;
     // AnnotationDefault uses the same validated textual encoding as element values.
     std::optional<std::string> annotation_default;
+    std::vector<JvmTypeAnnotation> visible_type_annotations, invisible_type_annotations;
     std::optional<JvmCode> code;
     bool operator==(const JvmMember &) const = default;
 };
@@ -166,6 +181,7 @@ struct JvmMetadata {
     std::optional<std::string> module_main_class;
     std::vector<JvmMember> fields, methods;
     std::vector<JvmAnnotation> visible_annotations, invisible_annotations;
+    std::vector<JvmTypeAnnotation> visible_type_annotations, invisible_type_annotations;
     bool operator==(const JvmMetadata &) const = default;
 };
 } // namespace hexlab

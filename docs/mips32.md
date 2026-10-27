@@ -4,6 +4,17 @@ HexLab recognizes ELF `e_machine=EM_MIPS` (`8`) for ELF32 inputs in both byte or
 
 The fixed-width decoder covers selected SPECIAL shifts and register jumps, integer add/subtract/logic/compare, immediate forms, J/JAL, BEQ/BNE/BLEZ/BGTZ/BLTZ/BGEZ and their BEQL/BNEL/BLEZL/BGTZL/BLTZL/BGEZL likely forms, and common byte/halfword/word loads and stores including LWL/LWR/SWL/SWR. Instruction-word and encoded low-halfword fields follow the ELF byte order. It also decodes the integer HI/LO path: MULT/MULTU and DIV/DIVU read two GPRs and write the special HI and LO registers; MFHI/MFLO transfer one special register to a GPR; MTHI/MTLO transfer a GPR to a special register. These operands have explicit access directions and format as `hi` and `lo`. A pure helper evaluates the 32-bit multiply/divide result pair; divide-by-zero and signed quotient overflow have no concrete helper result. The bounded native COP1 subset includes `MFC1`/`MTC1` and `CFC1`/`CTC1` for FCCR25/FEXR26/FENR28/FCSR31, as described below; unsupported encodings may still be decoded opaquely through the generic Capstone fallback. Reserved encodings, bad fixed fields, and unaligned addresses report `invalid`; fewer than four bytes report `truncated`.
 
+MIPS32 Release 2 SPECIAL3 `EXT` and `INS` decode as `ext rt, rs, pos, size` and
+`ins rt, rs, pos, size`. `EXT` accepts positions 0–31 and sizes 1–32 only when
+`pos + size <= 32`; its `rd` field encodes `size - 1`. `INS` requires the
+encoded inclusive MSB (`rd`) to be at least `pos`; the displayed size is
+`msb - pos + 1`. Reserved ranges are invalid, while other SPECIAL3 functions
+remain unsupported. Both expose exact GPR effects: `EXT` writes the extracted
+zero-extended field, and `INS` reads/writes `rt`, reads `rs`, preserves all bits
+outside the selected destination range, and inserts the low `size` bits of
+`rs`. The MIPS32 decompiler expresses these as logical shifts, masks, and
+merge operations.
+
 Every decoded control transfer records `delay_slots = 1`. Automatic reachable analysis and function recovery decode and own the instruction at PC+4 before following a transfer's target or post-slot continuation. Calls and classic conditional branches continue at PC+8; likely branches send the not-taken edge directly to PC+8 and route the taken edge through the delay slot. Jumps have no invented fallthrough; returns terminate after their slot. A control transfer in a delay slot is explicitly unsupported, and missing, excluded, malformed, or truncated slots stop recovery without fabricating an edge. Instruction and membership budgets and cancellation continue to bound traversal. JAL and JALR expose link-register writes, and `jr $ra` is identified as return. Compressed/MIPS16/microMIPS, unsupported COP1 formats/functions (including COP1 likely branches), exception instructions, REGIMM link-likely forms, and complete ISA semantics remain unsupported.
 
 The HI/LO encoding and result behavior follows the MIPS32 Instruction Set Manual, Volume II, Revision 0.95: [MIPS32 Architecture for Programmers](https://www.ece.lsu.edu/ee4720/mips32v2.pdf). Division by zero is architecturally unpredictable/undefined, so the semantic helper returns no result rather than choosing a quotient or remainder.

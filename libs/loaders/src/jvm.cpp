@@ -279,8 +279,11 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     bool have_record=false,have_inner_classes=false,have_nest_host=false,have_nest_members=false,have_permitted_subclasses=false;
     bool have_module_packages=false,have_module_main_class=false;
     bool have_class_visible_annotations=false,have_class_invisible_annotations=false;
+    bool have_class_visible_type_annotations=false,have_class_invisible_type_annotations=false;
     std::unordered_set<const JvmMember *> visible_annotations_seen,invisible_annotations_seen;
     std::unordered_set<const JvmMember *> visible_parameter_annotations_seen,invisible_parameter_annotations_seen,annotation_defaults_seen;
+    std::unordered_set<const JvmMember *> visible_member_type_annotations_seen,invisible_member_type_annotations_seen;
+    std::unordered_set<const JvmCode *> visible_code_type_annotations_seen,invisible_code_type_annotations_seen;
     std::size_t annotation_items=0;
     using LocalVariableKey=std::tuple<std::uint16_t,std::uint16_t,std::uint16_t,std::uint16_t,std::uint16_t>;
     std::unordered_map<const JvmCode *,std::set<LocalVariableKey>> local_variable_entries_seen;
@@ -308,14 +311,20 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
         if(tag=='['){std::uint16_t count=0;if(!r.u2(count))return malformed("truncated annotation array element");if(count>65536-annotation_items)return Error{ErrorCode::resource_limit,"annotation metadata exceeds 65536 elements"};annotation_items+=count;std::string result="[";for(unsigned i=0;i<count;++i){auto value=annotation_value(depth+1);if(!value)return value.error();if(i)result+=",";result+=value.value();}return result+"]";}
         return malformed("invalid annotation element_value tag");
     };
+    const auto read_one_annotation=[&]()->Result<JvmAnnotation>{
+        JvmAnnotation annotation;std::uint16_t type=0,pairs=0;
+        if(!r.u2(type)||!r.u2(pairs))return malformed("truncated annotation declaration");
+        auto descriptor=utf8(type);if(!descriptor)return descriptor.error();
+        if(pairs>65536-annotation_items)return Error{ErrorCode::resource_limit,"annotation metadata exceeds 65536 elements"};
+        annotation_items+=pairs;annotation.descriptor=std::move(descriptor.value());annotation.elements.reserve(pairs);
+        for(unsigned j=0;j<pairs;++j){std::uint16_t name=0;if(!r.u2(name))return malformed("truncated annotation element name");auto element_name=utf8(name);if(!element_name)return element_name.error();auto value=annotation_value(0);if(!value)return value.error();annotation.elements.push_back({std::move(element_name.value()),std::move(value.value())});}
+        return annotation;
+    };
     const auto read_annotations=[&](std::vector<JvmAnnotation> &out)->Result<bool>{
         std::uint16_t count=0;if(!r.u2(count))return malformed("truncated annotation count");
         if(count>65536-annotation_items)return Error{ErrorCode::resource_limit,"annotation metadata exceeds 65536 elements"};annotation_items+=count;
         out.reserve(out.size()+count);
-        for(unsigned i=0;i<count;++i){JvmAnnotation annotation;std::uint16_t type=0,pairs=0;if(!r.u2(type)||!r.u2(pairs))return malformed("truncated annotation declaration");auto descriptor=utf8(type);if(!descriptor)return descriptor.error();
-            if(pairs>65536-annotation_items)return Error{ErrorCode::resource_limit,"annotation metadata exceeds 65536 elements"};annotation_items+=pairs;annotation.descriptor=std::move(descriptor.value());annotation.elements.reserve(pairs);
-            for(unsigned j=0;j<pairs;++j){std::uint16_t name=0;if(!r.u2(name))return malformed("truncated annotation element name");auto element_name=utf8(name);if(!element_name)return element_name.error();auto value=annotation_value(0);if(!value)return value.error();annotation.elements.push_back({std::move(element_name.value()),std::move(value.value())});}
-            out.push_back(std::move(annotation));
+        for(unsigned i=0;i<count;++i){auto annotation=read_one_annotation();if(!annotation)return annotation.error();out.push_back(std::move(annotation.value()));
         }return true;
     };
     std::unordered_set<const JvmMember *> fields_with_constant_value;
@@ -350,8 +359,14 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                     descriptor=="Ljava/lang/String;" ? 8 : 0;
                 if(!expected_tag||constant.tag!=expected_tag)
                     return malformed("ConstantValue constant kind does not match the field descriptor");
-                // The value is validated but not represented in JvmMember yet.
-                metadata_complete=false;
+                JvmConstant value=constant;
+                if(constant.tag==8){
+                    const auto string_index=static_cast<std::size_t>(constant.first);
+                    if(string_index>=md.constant_pool.size()||md.constant_pool[string_index].tag!=1)
+                        return malformed("ConstantValue string has an invalid UTF-8 constant index");
+                    value.text=md.constant_pool[string_index].text;
+                }
+                member->constant_value=std::move(value);
             }else if(an.value()=="RuntimeVisibleAnnotations"||an.value()=="RuntimeInvisibleAnnotations"){
                 if(code_owner)return malformed("declaration annotation attribute appears inside Code");
                 if(!class_level&&!member)return malformed("annotation attribute has no declaration owner");
@@ -362,6 +377,40 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 if(duplicate)return malformed("duplicate annotation attribute");
                 auto &target=class_level?(an.value()=="RuntimeVisibleAnnotations"?md.visible_annotations:md.invisible_annotations):(an.value()=="RuntimeVisibleAnnotations"?member->visible_annotations:member->invisible_annotations);
                 auto parsed=read_annotations(target);if(!parsed)return parsed.error();
+            }else if(an.value()=="RuntimeVisibleTypeAnnotations"||an.value()=="RuntimeInvisibleTypeAnnotations"){
+                if(major<52)return malformed("type-annotation attribute requires class-file version 52 or newer");
+                const bool visible=an.value()=="RuntimeVisibleTypeAnnotations";
+                if(class_level){bool &seen=visible?have_class_visible_type_annotations:have_class_invisible_type_annotations;if(seen)return malformed("duplicate type-annotation attribute");seen=true;}
+                else if(code_owner){auto &seen=visible?visible_code_type_annotations_seen:invisible_code_type_annotations_seen;if(!seen.insert(code_owner).second)return malformed("duplicate Code type-annotation attribute");}
+                else {if(!member)return malformed("type-annotation attribute has no declaration owner");auto &seen=visible?visible_member_type_annotations_seen:invisible_member_type_annotations_seen;if(!seen.insert(member).second)return malformed("duplicate member type-annotation attribute");}
+                auto &target=class_level?(visible?md.visible_type_annotations:md.invisible_type_annotations):code_owner?(visible?code_owner->visible_type_annotations:code_owner->invisible_type_annotations):(visible?member->visible_type_annotations:member->invisible_type_annotations);
+                std::uint16_t entries=0;if(!r.u2(entries))return malformed("truncated type-annotation count");
+                if(entries>65536-annotation_items)return Error{ErrorCode::resource_limit,"type-annotation metadata exceeds 65536 entries"};annotation_items+=entries;
+                if(target.size()+entries>65536)return Error{ErrorCode::resource_limit,"type-annotation owner exceeds 65536 entries"};target.reserve(target.size()+entries);
+                const auto append1=[](std::vector<std::uint8_t> &out,std::uint8_t v){out.push_back(v);};
+                const auto append2=[](std::vector<std::uint8_t> &out,std::uint16_t v){out.push_back(static_cast<std::uint8_t>(v>>8));out.push_back(static_cast<std::uint8_t>(v));};
+                for(unsigned ti=0;ti<entries;++ti){
+                    JvmTypeAnnotation item;if(!r.u1(item.target_type))return malformed("truncated type-annotation target_type");
+                    const auto tt=item.target_type;
+                    const bool class_target=tt==0x00||tt==0x10||tt==0x11;
+                    const bool method_target=tt==0x01||tt==0x12||(tt>=0x14&&tt<=0x17);
+                    const bool field_target=tt==0x13;
+                    const bool code_target=tt>=0x40&&tt<=0x4b;
+                    const bool owner_mismatch=class_level?!class_target:code_owner?!code_target:method?!method_target:!field_target;
+                    if(owner_mismatch)return malformed("type-annotation target is invalid for its owner");
+                    std::uint8_t b1=0,b2=0;std::uint16_t w1=0,w2=0;
+                    if(tt==0x00||tt==0x01||tt==0x16){if(!r.u1(b1))return malformed("truncated type-annotation target_info");append1(item.target_info,b1);}
+                    else if(tt==0x10||tt==0x17||tt==0x42||(tt>=0x43&&tt<=0x46)){if(!r.u2(w1))return malformed("truncated type-annotation target_info");append2(item.target_info,w1);if(tt==0x10&&w1!=0xffff&&w1>=md.interfaces.size())return malformed("type-annotation supertype index exceeds interface table");}
+                    else if(tt==0x11||tt==0x12){if(!r.u1(b1)||!r.u1(b2))return malformed("truncated type-annotation bound target_info");append1(item.target_info,b1);append1(item.target_info,b2);}
+                    else if(tt==0x13||tt==0x14||tt==0x15){}
+                    else if(tt==0x40||tt==0x41){if(!r.u2(w1))return malformed("truncated type-annotation local-variable table");append2(item.target_info,w1);if(w1>65536-annotation_items)return Error{ErrorCode::resource_limit,"type-annotation local-variable table exceeds bound"};annotation_items+=w1;for(unsigned j=0;j<w1;++j){std::uint16_t start_pc=0,length=0,slot=0;if(!r.u2(start_pc)||!r.u2(length)||!r.u2(slot))return malformed("truncated type-annotation local-variable entry");if(std::uint32_t(start_pc)+length>code_owner->code_size||slot>=code_owner->max_locals)return malformed("type-annotation local-variable entry exceeds Code bounds");append2(item.target_info,start_pc);append2(item.target_info,length);append2(item.target_info,slot);}}
+                    else if(tt==0x47||tt==0x48||tt==0x49||tt==0x4a||tt==0x4b){if(!r.u2(w1)||!r.u1(b1))return malformed("truncated type-annotation type-argument target");if(w1>=code_owner->code_size)return malformed("type-annotation target offset exceeds Code bounds");append2(item.target_info,w1);append1(item.target_info,b1);}
+                    if(tt==0x42&&w1>=code_owner->exception_table.size())return malformed("type-annotation exception target exceeds exception table");
+                    if(tt>=0x43&&tt<=0x46&&w1>=code_owner->code_size)return malformed("type-annotation target offset exceeds Code bounds");
+                    std::uint8_t path_length=0;if(!r.u1(path_length))return malformed("truncated type_path length");if(path_length>65536-annotation_items)return Error{ErrorCode::resource_limit,"type_path entries exceed annotation bound"};annotation_items+=path_length;item.type_path.reserve(path_length);
+                    for(unsigned j=0;j<path_length;++j){std::uint8_t kind=0,arg=0;if(!r.u1(kind)||!r.u1(arg)||kind>3||(kind!=3&&arg!=0))return malformed("invalid type_path entry");item.type_path.emplace_back(kind,arg);}
+                    auto annotation=read_one_annotation();if(!annotation)return annotation.error();item.annotation=std::move(annotation.value());target.push_back(std::move(item));
+                }
             }else if(an.value()=="RuntimeVisibleParameterAnnotations"||an.value()=="RuntimeInvisibleParameterAnnotations"){
                 if(class_level||!member||!method||code_owner)return malformed("parameter annotation attribute appears outside a method declaration");
                 const bool visible=an.value()=="RuntimeVisibleParameterAnnotations";
