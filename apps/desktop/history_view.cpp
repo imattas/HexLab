@@ -8,6 +8,8 @@
 #include <wx/filedlg.h>
 #include <wx/msgdlg.h>
 #include <wx/textctrl.h>
+#include <wx/clipbrd.h>
+#include <wx/dataobj.h>
 
 #include <algorithm>
 #include <chrono>
@@ -54,19 +56,23 @@ HistoryView::HistoryView(wxWindow* parent) : wxPanel(parent), timer_(this) {
     initial_state_ = new wxButton(this, wxID_ANY, "Preview initial state");
     compare_previous_ = new wxButton(this, wxID_ANY, "Compare with previous step");
     audit_ = new wxButton(this, wxID_ANY, "Audit history");
+    copy_audit_ = new wxButton(this, wxID_ANY, "Copy audit result");
     refresh_->SetName("history-refresh");
     next_page_->SetName("history-next-page");
     initial_state_->SetName("history-preview-initial");
     compare_previous_->SetName("history-compare-previous");
     audit_->SetName("history-audit");
+    copy_audit_->SetName("history-copy-audit");
     next_page_->Enable(false);
     controls->Add(refresh_, 0, wxRIGHT, FromDIP(4));
     controls->Add(next_page_, 0, wxRIGHT, FromDIP(4));
     controls->Add(initial_state_, 0);
     controls->Add(compare_previous_, 0, wxLEFT, FromDIP(4));
     controls->Add(audit_, 0, wxLEFT, FromDIP(4));
+    controls->Add(copy_audit_, 0, wxLEFT, FromDIP(4));
     compare_previous_->Enable(false);
     audit_->Enable(false);
+    copy_audit_->Enable(false);
     root->Add(controls, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
 
     status_ = new wxStaticText(this, wxID_ANY, "Open a project to inspect its history.");
@@ -115,6 +121,8 @@ HistoryView::HistoryView(wxWindow* parent) : wxPanel(parent), timer_(this) {
         cancel_pending();
         audit_in_progress_ = false;
         audit_->SetLabel("Audit history");
+        audit_report_.clear();
+        copy_audit_->Enable(false);
         rows_.clear();
         page_.reset();
         preview_.reset();
@@ -133,6 +141,17 @@ HistoryView::HistoryView(wxWindow* parent) : wxPanel(parent), timer_(this) {
     audit_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
         if (audit_in_progress_) stop_audit();
         else begin_audit();
+    });
+    copy_audit_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+        if (audit_report_.empty()) return;
+        if (!wxTheClipboard || !wxTheClipboard->Open()) {
+            status_->SetLabel("The system clipboard is unavailable; the saved audit result is still available.");
+            return;
+        }
+        const bool copied = wxTheClipboard->SetData(new wxTextDataObject(audit_report_));
+        wxTheClipboard->Close();
+        status_->SetLabel(copied ? "Copied the last history audit result to the clipboard."
+                                 : "Could not copy the last history audit result.");
     });
     save_copy_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { save_selected_history(); });
     cancel_save_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
@@ -193,6 +212,8 @@ void HistoryView::update(std::optional<DocumentId> id, std::shared_ptr<ProjectAc
         audit_in_progress_ = false;
         audit_verified_ = 0;
         audit_bytes_ = 0;
+        audit_report_.clear();
+        copy_audit_->Enable(false);
         if (had_project) {
             status_->SetLabel("Open a project to inspect its history.");
             preview_status_->SetLabel("Select a history step to preview it.");
@@ -228,6 +249,8 @@ void HistoryView::update(std::optional<DocumentId> id, std::shared_ptr<ProjectAc
     audit_in_progress_ = false;
     audit_verified_ = 0;
     audit_bytes_ = 0;
+    audit_report_.clear();
+    copy_audit_->Enable(false);
     status_->SetLabel("Loading durable project history…");
     preview_status_->SetLabel("Select a history step to preview it.");
     refresh_->Enable(true);
@@ -235,6 +258,7 @@ void HistoryView::update(std::optional<DocumentId> id, std::shared_ptr<ProjectAc
     compare_previous_->Enable(false);
     audit_->Enable(false);
     audit_->SetLabel("Audit history");
+    copy_audit_->Enable(false);
     render_entries();
     render_preview();
     request_page(0);
@@ -263,6 +287,8 @@ void HistoryView::begin_audit() {
     audit_in_progress_ = true;
     audit_verified_ = 0;
     audit_bytes_ = 0;
+    audit_report_.clear();
+    copy_audit_->Enable(false);
     audit_->SetLabel("Cancel audit");
     next_page_->Enable(false);
     initial_state_->Enable(false);
@@ -279,10 +305,18 @@ void HistoryView::stop_audit() {
     next_page_->Enable(page_ && page_->has_more);
     initial_state_->Enable(bool(actor_));
     compare_previous_->Enable(selected_step_ && *selected_step_ > 0);
-    status_->SetLabel(wxString::Format("Audit canceled after %llu of %llu steps (%llu delta bytes verified).",
+    record_audit_result(wxString::Format("Audit canceled after %llu of %llu steps (%llu delta bytes verified).",
         static_cast<unsigned long long>(audit_verified_),
         static_cast<unsigned long long>(page_ ? page_->history_count : 0),
         static_cast<unsigned long long>(audit_bytes_)));
+}
+
+void HistoryView::record_audit_result(const wxString& report) {
+    constexpr std::size_t maximum_report_characters = 4096;
+    audit_report_ = report.length() <= maximum_report_characters
+        ? report : report.Left(maximum_report_characters);
+    copy_audit_->Enable(!audit_report_.empty());
+    status_->SetLabel(audit_report_);
 }
 
 void HistoryView::request_audit_page(std::uint64_t after_step) {
@@ -294,7 +328,7 @@ void HistoryView::request_audit_page(std::uint64_t after_step) {
         audit_->SetLabel("Audit history");
         initial_state_->Enable(bool(actor_));
         compare_previous_->Enable(selected_step_ && *selected_step_ > 0);
-        status_->SetLabel(wxString::Format("Audit stopped after %llu of %llu steps: %s",
+        record_audit_result(wxString::Format("Audit stopped after %llu of %llu steps: %s",
             static_cast<unsigned long long>(audit_verified_),
             static_cast<unsigned long long>(page_ ? page_->history_count : 0),
             text(submission.error().message)));
@@ -496,7 +530,7 @@ void HistoryView::poll() {
             audit_->SetLabel("Audit history");
             initial_state_->Enable(bool(actor_));
             compare_previous_->Enable(selected_step_ && *selected_step_ > 0);
-            status_->SetLabel(wxString::Format("Audit stopped after %llu of %llu steps (%llu delta bytes): %s",
+            record_audit_result(wxString::Format("Audit stopped after %llu of %llu steps (%llu delta bytes): %s",
                 static_cast<unsigned long long>(audit_verified_),
                 static_cast<unsigned long long>(page_ ? page_->history_count : 0),
                 static_cast<unsigned long long>(audit_bytes_), text(result.error().message)));
@@ -543,7 +577,7 @@ void HistoryView::poll() {
             audit_in_progress_ = false;
             audit_->SetLabel("Audit history");
             initial_state_->Enable(bool(actor_));
-            status_->SetLabel("History audit returned no report.");
+            record_audit_result("History audit returned no report.");
             return;
         }
         const auto& received = *result.value().history_audit;
@@ -552,7 +586,7 @@ void HistoryView::poll() {
             audit_in_progress_ = false;
             audit_->SetLabel("Audit history");
             initial_state_->Enable(bool(actor_));
-            status_->SetLabel("Project identity or revision changed; restart the history audit.");
+            record_audit_result("Project identity or revision changed; restart the history audit.");
             return;
         }
         audit_verified_ += received.entries_verified;
@@ -573,7 +607,7 @@ void HistoryView::poll() {
             next_page_->Enable(page_ && page_->has_more);
             initial_state_->Enable(bool(actor_));
             compare_previous_->Enable(selected_step_ && *selected_step_ > 0);
-            status_->SetLabel(wxString::Format("History audit passed: %llu of %llu steps verified; %llu delta bytes checked; cursor %llu.",
+            record_audit_result(wxString::Format("History audit passed: %llu of %llu steps verified; %llu delta bytes checked; cursor %llu.",
                 static_cast<unsigned long long>(audit_verified_),
                 static_cast<unsigned long long>(received.history_count),
                 static_cast<unsigned long long>(audit_bytes_),

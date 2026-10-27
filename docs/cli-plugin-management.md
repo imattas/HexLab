@@ -10,6 +10,21 @@ Use `--json` for machine-readable output:
 hexlab_cli plugins scan ./plugin-root --json
 ```
 
+Append `--strict` to either `scan` or `dependencies` to make advisory metadata
+problems affect the process status while still printing the full report. Strict
+`scan` returns status 3 when one or more sidecars are malformed or unreadable;
+modules without a sidecar remain valid candidates. Strict `dependencies`
+returns status 3 when a candidate has no readable manifest or when any required
+capability is unavailable or ambiguous. A unique candidate provider is
+considered resolved for this check, but is still only an advisory manifest
+match. Without `--strict`, both commands retain their ordinary successful
+status for reportable metadata problems.
+
+```text
+hexlab_cli plugins scan ./plugin-root --strict
+hexlab_cli plugins dependencies ./plugin-root --json --strict
+```
+
 The JSON object includes the scanned directory, a `loaded: false` marker, candidate count, and a `candidates` array. Each candidate has a path, a nullable manifest object, and a `manifest_error` string. Capability records contain their ID, major/minor version, and flags. JSON strings are escaped before writing. The command only reports advisory sidecar metadata; the host validates its identity against the loaded module during explicit load.
 
 To load a plugin for a supported CLI operation, continue to pass its module explicitly with `--plugin <module>` to `inspect`, `disassemble`, or `decompile`. Scanning never changes files or plugin state.

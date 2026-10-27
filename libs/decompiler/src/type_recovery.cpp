@@ -1446,6 +1446,12 @@ static Result<TypeRecoveryResult> recover_types_impl(
             if constexpr(std::is_same_v<T,RegisterValue>) {
                 parameter_evidence.insert(key(x.reg, x.version));
                 auto &fact = ensure(x.reg,x.version);
+                // A signed integer annotation on the expression is positive
+                // type evidence. The default false value is intentionally not
+                // treated as unsigned evidence because most lifted operands
+                // use it simply to mean "not classified".
+                if (e->type.kind == TypeKind::integer && e->type.is_signed &&
+                    !fact.sign_ambiguous) fact.sign = true;
                 if (e->type.kind == TypeKind::floating && !fact.floating_ambiguous) {
                     fact.floating = true;
                     if (e->type.bits) fact.bits = e->type.bits;
@@ -2024,6 +2030,13 @@ static Result<TypeRecoveryResult> recover_types_impl(
             fact->second.sign_ambiguous = true;
         } else if (evidence == 1) {
             fact->second.sign = true;
+        } else if (evidence == 2 && fact->second.sign) {
+            // An unsigned comparison contradicts positive signed evidence
+            // already carried from an explicit IR type, extension, or
+            // arithmetic operation. Preserve the conflict instead of letting
+            // the earlier source silently win.
+            fact->second.sign = false;
+            fact->second.sign_ambiguous = true;
         }
     }
 
@@ -2143,7 +2156,13 @@ static Result<TypeRecoveryResult> recover_types_impl(
         std::visit([&](const auto &x) {
             using T=std::decay_t<decltype(x)>;
             if constexpr(std::is_same_v<T,RegisterValue>) { auto it=facts.find(key(x.reg,x.version)); if(it!=facts.end()) { out.bits=it->second.bits; out.sign=it->second.sign; out.sign_ambiguous=it->second.sign_ambiguous; out.pointer=it->second.pointer; out.floating = out.floating || it->second.floating; out.floating_ambiguous = it->second.floating_ambiguous; out.object_fields=it->second.object_fields; out.object_layout_ambiguous=it->second.object_layout_ambiguous; out.pointer_fields=it->second.pointer_fields; out.indexed_element_bits=it->second.indexed_element_bits; out.indexed_element_ambiguous=it->second.indexed_element_ambiguous; if (it->second.exact_type) merge_exact_type(out, it->second.exact_type); if (it->second.exact_type_ambiguous) out.exact_type_ambiguous = true; if (it->second.vector_evidence) merge_vector_fact(out, it->second); } }
-            else if constexpr(std::is_same_v<T,MemoryValue>) { out.bits=x.type.bits; out.floating=x.type.kind==TypeKind::floating; }
+            else if constexpr(std::is_same_v<T,MemoryValue>) {
+                out.bits=x.type.bits;
+                out.floating=x.type.kind==TypeKind::floating;
+                // MemoryValue's signed marker is explicit positive evidence;
+                // false remains ambiguous in the lifted IR's default type.
+                out.sign=x.type.kind==TypeKind::integer && x.type.is_signed;
+            }
             else if constexpr(std::is_same_v<T,UnaryValue>) { out=self(x.operand,self); if(x.operation=="sext") { out.sign=true; out.sign_ambiguous=false; } if(x.operation=="zext") { out.sign=false; out.sign_ambiguous=false; } }
             else if constexpr(std::is_same_v<T,BinaryValue>) {
                 if (e->type.kind == TypeKind::boolean) {

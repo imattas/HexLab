@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -386,10 +387,29 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
         }
         const auto &summary = report.value().summary;
         if (json_output) {
-            if (match_functions)
-                throw std::invalid_argument("--json currently emits byte and region results; omit --functions");
+            std::optional<compare::Result<std::vector<compare::FunctionMatch>>> function_result;
+            if (match_functions) {
+                auto old_functions = recover_functions(*old_document.value()->image,
+                    old_document.value()->metadata, {}, {}, {});
+                auto new_functions = recover_functions(*new_document.value()->image,
+                    new_document.value()->metadata, {}, {}, {});
+                if (!old_functions || !new_functions) {
+                    err << "Function analysis: "
+                        << (!old_functions ? old_functions.error().message : new_functions.error().message) << '\n';
+                    return 1;
+                }
+                auto old_features = function_features(*old_functions.value(), old_document.value()->metadata);
+                auto new_features = function_features(*new_functions.value(), new_document.value()->metadata);
+                function_result.emplace(compare::match_functions_detailed(
+                    old_features, new_features, function_options));
+                if (!*function_result) {
+                    err << "Function comparison: " << function_result->error().message << '\n';
+                    return 1;
+                }
+            }
             const auto shown_runs = std::min<std::size_t>(report.value().runs.size(), static_cast<std::size_t>(run_limit));
-            out << "{\"schema\":\"hexlab.compare.v1\",\"summary\":{\"compared_bytes\":" << summary.compared_bytes
+            out << "{\"schema\":\"" << (match_functions ? "hexlab.compare.v2" : "hexlab.compare.v1")
+                << "\",\"summary\":{\"compared_bytes\":" << summary.compared_bytes
                 << ",\"equal_bytes\":" << summary.equal_bytes << ",\"changed_bytes\":" << summary.changed_bytes
                 << ",\"added_bytes\":" << summary.added_bytes << ",\"removed_bytes\":" << summary.removed_bytes
                 << ",\"ignored_bytes\":" << summary.ignored_bytes << ",\"matched_regions\":" << summary.matched_regions
@@ -407,7 +427,45 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
                 if (run.new_address) out << json_string(address(*run.new_address)); else out << "null";
                 out << '}';
             }
-            out << "],\"omitted_runs\":" << (report.value().runs.size() - shown_runs) << "}\n";
+            out << "],\"omitted_runs\":" << (report.value().runs.size() - shown_runs);
+            if (function_result) {
+                std::uint64_t matched_count = 0, ambiguous_count = 0, added_count = 0, removed_count = 0;
+                for (const auto &match : function_result->value()) {
+                    switch (match.kind) {
+                    case compare::FunctionMatchKind::matched: ++matched_count; break;
+                    case compare::FunctionMatchKind::ambiguous: ++ambiguous_count; break;
+                    case compare::FunctionMatchKind::added: ++added_count; break;
+                    case compare::FunctionMatchKind::removed: ++removed_count; break;
+                    }
+                }
+                const auto &matches = function_result->value();
+                const auto shown_matches = std::min<std::size_t>(matches.size(),
+                    static_cast<std::size_t>(function_limit));
+                out << ",\"functions\":{\"matched\":" << matched_count
+                    << ",\"ambiguous\":" << ambiguous_count << ",\"added\":" << added_count
+                    << ",\"removed\":" << removed_count << ",\"total_matches\":" << matches.size()
+                    << ",\"matches\":[";
+                for (std::size_t i = 0; i < shown_matches; ++i) {
+                    const auto &match = matches[i];
+                    const char *kind = match.kind == compare::FunctionMatchKind::matched ? "matched" :
+                        match.kind == compare::FunctionMatchKind::ambiguous ? "ambiguous" :
+                        match.kind == compare::FunctionMatchKind::added ? "added" : "removed";
+                    if (i) out << ',';
+                    out << "{\"kind\":" << json_string(kind) << ",\"confidence\":" << match.confidence
+                        << ",\"old_address\":";
+                    if (match.old_entry) out << json_string(address(*match.old_entry)); else out << "null";
+                    out << ",\"old_space\":" << match.old_space << ",\"old_name\":"
+                        << json_string(match.old_name) << ",\"new_address\":";
+                    if (match.new_entry) out << json_string(address(*match.new_entry)); else out << "null";
+                    out << ",\"new_space\":" << match.new_space << ",\"new_name\":"
+                        << json_string(match.new_name) << ",\"evidence\":{\"base_confidence\":"
+                        << match.evidence.base_confidence << ",\"supporting_call_neighbors\":"
+                        << match.evidence.supporting_call_neighbors << ",\"call_graph_round\":"
+                        << match.evidence.call_graph_round << "}}";
+                }
+                out << "],\"omitted_matches\":" << (matches.size() - shown_matches) << '}';
+            }
+            out << "}\n";
             return 0;
         }
         out << "Compared bytes: " << summary.compared_bytes << "\nEqual: " << summary.equal_bytes

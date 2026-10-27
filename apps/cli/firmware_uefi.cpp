@@ -176,6 +176,12 @@ int run_uefi_firmware_cli(std::span<const std::wstring_view> args, std::ostream 
                 << " fs-guid=" << firmware::uefi_guid_string(volume.file_system_guid)
                 << " revision=" << static_cast<unsigned>(volume.revision)
                 << " header-checksum=valid files=" << volume.files.size() << '\n';
+            for (std::size_t block_index = 0; block_index < volume.block_map.size(); ++block_index) {
+                const auto &block = volume.block_map[block_index];
+                out << "  BlockMap[" << block_index << "] blocks=" << block.block_count
+                    << " block-size=" << hex_value(block.block_size)
+                    << " mapped-size=" << hex_value(std::uint64_t(block.block_count) * block.block_size) << '\n';
+            }
             for (const auto &entry : volume.files) {
                 if (listed_files >= file_output_limit) break;
                 out << "  " << firmware::uefi_guid_string(entry.name_guid)

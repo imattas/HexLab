@@ -83,6 +83,10 @@ struct UefiFirmwareVolumeExtensionEntry {
     std::uint64_t payload_offset = 0;
     std::uint64_t payload_size = 0;
 };
+struct UefiFirmwareVolumeBlockMapEntry {
+    std::uint32_t block_count = 0;
+    std::uint32_t block_size = 0;
+};
 struct UefiFirmwareVolume {
     std::array<std::uint8_t, 16> file_system_guid{};
     std::uint64_t file_offset = 0;
@@ -91,6 +95,9 @@ struct UefiFirmwareVolume {
     std::uint16_t header_length = 0;
     std::uint8_t revision = 0;
     bool header_checksum_valid = false;
+    // The bounded block-map rows as encoded in the FV header. The terminating
+    // {0,0} row is represented by the end of this vector.
+    std::vector<UefiFirmwareVolumeBlockMapEntry> block_map;
     std::optional<std::array<std::uint8_t, 16>> extended_header_name_guid;
     std::optional<std::uint32_t> extended_header_size;
     std::vector<UefiFirmwareVolumeExtensionEntry> extension_entries;
