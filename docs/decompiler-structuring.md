@@ -411,8 +411,8 @@ follows the region bookkeeping in Ghidra's native
 HexLab adds an explicit predecessor and SSA-phi proof before emitting C-like
 breaks, and does not copy Ghidra source.
 
-Nested pre-tested child loops accept the same bounded cleanup chain on a
-conditional break edge. Every cleanup block must be single-entry from its
+Nested pre-tested child loops accept a bounded cleanup chain of up to 128 blocks
+on a conditional break edge. Every cleanup block must be single-entry from its
 predecessor, phi-free, and end in one unconditional edge; paths cannot overlap
 the child body or another claimed region. Child-exit register phis are copied
 in parallel at the final cleanup edge while still inside the original break
