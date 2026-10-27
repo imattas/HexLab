@@ -2995,6 +2995,77 @@ std::optional<SwitchSite> a32_pc_indexed_ldr_switch(
     return site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1)
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
+
+std::optional<SwitchSite> a32_pc_add_branch_table_switch(
+    const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
+    const std::vector<std::shared_ptr<const InstructionFact>> &facts,
+    std::size_t dispatch_index, SwitchGuardContext &guards, std::stop_token stop) {
+    if (dispatch_index >= facts.size() || !facts[dispatch_index] || stop.stop_requested())
+        return {};
+    const auto &dispatch = facts[dispatch_index]->instruction;
+    if (dispatch.context.architecture != Architecture::arm || dispatch.context.mode != ExecutionMode::a32 ||
+        dispatch.opcode != Opcode::a32_add || dispatch.flow != FlowKind::jump || dispatch.condition != 14 ||
+        dispatch.operands.size() != 3 || !dispatch.arm || !dispatch.arm->writes_pc ||
+        dispatch.arm->flags_written != 0)
+        return {};
+    const auto *destination = register_operand(dispatch, 0);
+    const auto *base = register_operand(dispatch, 1);
+    const auto *indexed = std::get_if<ArmShiftedRegisterOperand>(&dispatch.operands[2]);
+    if (!destination || destination->bank != RegisterBank::arm32_gpr || destination->index != 15 ||
+        destination->width != 32 || !base || base->bank != RegisterBank::arm32_gpr || base->index != 15 ||
+        base->width != 32 || !indexed || indexed->source.bank != RegisterBank::arm32_gpr ||
+        indexed->source.index == 15 || indexed->source.width != 32 || indexed->source.high_byte ||
+        indexed->shift != ArmShift::lsl || indexed->amount != 2 || indexed->amount_register)
+        return {};
+
+    // ADD pc, pc, Rm, LSL #2 indexes an inline array of A32 B instructions.
+    // Scan only when the CFG guard proves the exact number of branch entries.
+    const auto table = add_offset(dispatch.address, 8, image);
+    if (!table || !file_backed_range(image, *table, 4, true))
+        return {};
+    SwitchSite site;
+    site.dispatch = dispatch.address;
+    site.table = *table;
+    site.selector = indexed->source;
+    site.scale = 4;
+    site.entry_encoding = SwitchEntryEncoding::a32_branch_instruction;
+    const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
+                                           dispatch.address, dispatch.address, dispatch.context, guards, stop);
+    if (stop.stop_requested())
+        return {};
+    if (!bound || bound->case_count == 0 || bound->case_count > max_entries)
+        return {};
+    site.case_count = bound->case_count;
+    site.default_target = bound->default_target;
+    for (std::uint32_t index = 0; index < bound->case_count; ++index) {
+        if (stop.stop_requested())
+            return {};
+        const auto entry = add_offset(*table, static_cast<std::uint64_t>(index) * 4, image);
+        if (!entry || !file_backed_range(image, *entry, 4, true)) {
+            site.complete = false;
+            break;
+        }
+        const auto bytes = image.read(*entry, 4);
+        if (!bytes || bytes.value().size() != 4) {
+            site.complete = false;
+            break;
+        }
+        const auto decoded = decode_instruction(dispatch.context, bytes.value(), *entry);
+        if (decoded.status != DecodeStatus::decoded || !decoded.instruction ||
+            decoded.instruction->length != 4 || decoded.instruction->opcode != Opcode::a32_b ||
+            decoded.instruction->condition != 14 || decoded.instruction->flow != FlowKind::jump ||
+            !decoded.instruction->direct_target || !decodes_at(image, dispatch.context,
+                                                                 *decoded.instruction->direct_target, stop)) {
+            site.complete = false;
+            break;
+        }
+        site.cases.push_back({index, *decoded.instruction->direct_target});
+    }
+    if (site.cases.size() != bound->case_count)
+        site.complete = false;
+    return site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1)
+        ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
+}
 } // namespace
 
 static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, const FunctionRecord &function,
@@ -3125,6 +3196,19 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
                 if (a64_switch) {
                     result.complete = result.complete && a64_switch->complete;
                     result.sites.push_back(std::move(*a64_switch));
+                }
+                continue;
+            }
+            if (instruction.context.architecture == Architecture::arm &&
+                instruction.context.mode == ExecutionMode::a32 && instruction.opcode == Opcode::a32_add &&
+                instruction.flow == FlowKind::jump) {
+                auto arm_switch = a32_pc_add_branch_table_switch(image, function, snapshot,
+                    found->second->instructions, fact_index, guards, stop);
+                if (stop.stop_requested())
+                    return Error{ErrorCode::canceled, "Switch analysis canceled"};
+                if (arm_switch) {
+                    result.complete = result.complete && arm_switch->complete;
+                    result.sites.push_back(std::move(*arm_switch));
                 }
                 continue;
             }

@@ -188,6 +188,17 @@ public:
     IntegerExpressionParser(const std::vector<Token> &tokens,
                             const std::map<std::string, std::uint64_t, std::less<>> &bindings,
                             std::uint16_t max_nesting)
+        : tokens_(tokens), max_nesting_(max_nesting) {
+        for (const auto &[name, value] : bindings) {
+            if (value > static_cast<std::uint64_t>(INT64_MAX))
+                fail(ErrorCode::overflow, "bound integer exceeds the signed expression range");
+            bindings_.emplace(name, static_cast<std::int64_t>(value));
+        }
+    }
+
+    IntegerExpressionParser(const std::vector<Token> &tokens,
+                            const std::map<std::string, std::int64_t, std::less<>> &bindings,
+                            std::uint16_t max_nesting)
         : tokens_(tokens), bindings_(bindings), max_nesting_(max_nesting) {}
 
     std::int64_t parse() {
@@ -275,9 +286,7 @@ private:
             const auto binding = bindings_.find(token);
             if (binding == bindings_.end())
                 fail(ErrorCode::unsupported, "unbound name in integer constant expression: '" + token + "'");
-            if (binding->second > static_cast<std::uint64_t>(INT64_MAX))
-                fail(ErrorCode::overflow, "bound integer exceeds the signed expression range");
-            return static_cast<std::int64_t>(binding->second);
+            return binding->second;
         }
         return static_cast<std::int64_t>(integer_token_magnitude(token, static_cast<std::uint64_t>(INT64_MAX)));
     }
@@ -343,7 +352,7 @@ private:
     }
 
     const std::vector<Token> &tokens_;
-    const std::map<std::string, std::uint64_t, std::less<>> &bindings_;
+    std::map<std::string, std::int64_t, std::less<>> bindings_;
     std::uint16_t max_nesting_;
     std::size_t position_ = 0;
     std::size_t operations_ = 0;
@@ -1121,7 +1130,8 @@ private:
                                           std::map<std::string, std::uint64_t, std::less<>> &bindings,
                                           std::uint64_t argument, unsigned &strength) {
         if (pattern.size() != 1) {
-            const auto value = evaluate_integer_expression(pattern, {});
+            const auto value = evaluate_integer_expression(
+                pattern, std::map<std::string, std::uint64_t, std::less<>>{});
             if (value < 0) fail(ErrorCode::unsupported, "negative non-type specialization patterns are unsupported");
             strength = 8;
             return static_cast<std::uint64_t>(value) == argument;
@@ -2174,6 +2184,11 @@ private:
         const std::map<std::string, std::uint64_t, std::less<>> &bindings) const {
         return IntegerExpressionParser(expression, bindings, o_.max_nesting).parse();
     }
+    std::int64_t evaluate_integer_expression(
+        const std::vector<Token> &expression,
+        const std::map<std::string, std::int64_t, std::less<>> &bindings) const {
+        return IntegerExpressionParser(expression, bindings, o_.max_nesting).parse();
+    }
     std::uint64_t integer_magnitude(std::string s,std::uint64_t limit){
         while(!s.empty()&&(s.back()=='u'||s.back()=='U'||s.back()=='l'||s.back()=='L'))s.pop_back();if(s.empty())syntax("invalid enum integer");
         int base=10;std::string_view v=s;if(v.size()>2&&v[0]=='0'&&(v[1]=='x'||v[1]=='X')){base=16;v.remove_prefix(2);}else if(v.size()>1&&v[0]=='0'){base=8;v.remove_prefix(1);}std::uint64_t val=0;auto [end,ec]=std::from_chars(v.data(),v.data()+v.size(),val,base);if(ec!=std::errc{}||end!=v.data()+v.size()||val>limit)syntax("integer is outside the supported range");return val;
@@ -2188,7 +2203,7 @@ private:
         if(!aggregate_scopes_.empty()&&at("{"))fail(ErrorCode::unsupported,"nested enum definitions are unsupported");
         if(!take("{")){auto it=names_.find(key);if(it==names_.end())fail(ErrorCode::unsupported,"forward enum reference is unsupported");return it->second;}
         std::vector<Enumerator> values;std::int64_t next_value=0,min_value=0,max_value=0;bool auto_overflow=false;std::set<std::string> unique;
-        std::map<std::string, std::uint64_t, std::less<>> prior_enumerators;
+        std::map<std::string, std::int64_t, std::less<>> prior_enumerators;
         do {
             if(at("}"))break;
             auto name=next().text;if(!identifier(name))syntax("expected enum constant name");
@@ -2214,7 +2229,7 @@ private:
                 auto_overflow=false;
             } else if(auto_overflow)fail(ErrorCode::overflow,"enum auto-increment overflows; provide an explicit value");
             values.push_back({name,static_cast<std::uint64_t>(next_value)});result_.enum_constants.emplace(constant_name,next_value);
-            if(!scoped&&next_value>=0)prior_enumerators.emplace(name,static_cast<std::uint64_t>(next_value));
+            if(!scoped)prior_enumerators.emplace(name,next_value);
             min_value=std::min(min_value,next_value);max_value=std::max(max_value,next_value);
             if(next_value==INT64_MAX)auto_overflow=true;else{++next_value;auto_overflow=false;}
         } while(take(","));

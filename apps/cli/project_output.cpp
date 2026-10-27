@@ -575,6 +575,13 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
                                       catalog_set.catalogs.front(), args.flirt_limits)
             : recognize_flirt_catalogs(image, *snapshot.effective, *snapshot.functions,
                                        catalog_set.catalogs, args.flirt_limits));
+        for (const auto &catalog : catalog_set.catalogs) {
+            if (catalog.source_format_version == 0) continue;
+            out << "FLAIR catalog: version=" << static_cast<unsigned>(catalog.source_format_version)
+                << " library-bytes=\"" << escape(catalog.library_name_bytes) << "\""
+                << " alternate-compiler-type-crc16=" << catalog.alternate_compiler_type_crc16
+                << " provenance=" << escape(catalog.provenance) << '\n';
+        }
         if (args.action == L"flirt-apply") {
             auto evidence = take(make_function_recognition_evidence(*snapshot.functions,
                 catalog_digest(catalog_set.identity), recognized));
@@ -688,6 +695,7 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
                 << (site.entry_encoding == SwitchEntryEncoding::absolute_pointer ? "absolute_pointer"
                     : site.entry_encoding == SwitchEntryEncoding::signed_offset_from_table ? "signed_offset_from_table"
                     : site.entry_encoding == SwitchEntryEncoding::thumb_scaled_pc_relative ? "thumb_scaled_pc_relative"
+                    : site.entry_encoding == SwitchEntryEncoding::a32_branch_instruction ? "a32_branch_instruction"
                     : "signed_offset_from_target_base")
                 << "\",\"target_base\":";
             if (site.target_base)

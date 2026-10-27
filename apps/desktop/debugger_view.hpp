@@ -158,6 +158,7 @@ class DebuggerView final : public wxPanel {
     void thread_context_action(debugger::ThreadResumeKind action);
     void step_event();
     void add_breakpoint();
+    void refresh_breakpoints();
     void save_breakpoint_rule();
     void remove_breakpoint();
     void apply_project_breakpoints();

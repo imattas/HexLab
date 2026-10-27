@@ -149,7 +149,10 @@ int run_recovery_list(const project_detail::Arguments &args, std::ostream &out) 
             if (i) out << ',';
             out << "{\"path\":" << json_string(path_utf8(candidates[i].path))
                 << ",\"uuid\":" << json_string(uuid_text(candidates[i].uuid))
-                << ",\"kind\":" << json_string(recovery_kind(candidates[i].kind)) << '}';
+                << ",\"kind\":" << json_string(recovery_kind(candidates[i].kind))
+                << ",\"revisions\":{\"edit\":" << candidates[i].revisions.edit
+                << ",\"bytes\":" << candidates[i].revisions.bytes
+                << ",\"decisions\":" << candidates[i].revisions.decisions << "}}";
         }
         out << "]}\n";
     } else {
@@ -159,6 +162,8 @@ int run_recovery_list(const project_detail::Arguments &args, std::ostream &out) 
         out << ": " << candidates.size() << '\n';
         for (const auto &candidate : candidates)
             out << "  " << recovery_kind(candidate.kind) << " uuid=" << uuid_text(candidate.uuid)
+                << " revisions=" << candidate.revisions.edit << ':' << candidate.revisions.bytes
+                << ':' << candidate.revisions.decisions
                 << " path=" << escape(path_utf8(candidate.path)) << '\n';
     }
     return 0;

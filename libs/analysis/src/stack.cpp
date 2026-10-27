@@ -608,6 +608,21 @@ bool transfer(const Instruction &instruction, FlowState &state) {
                 }
                 return adjusted;
             }
+            if (list && state.frame_register >= 0 &&
+                arm32_register(arm_first, static_cast<std::uint8_t>(state.frame_register)) &&
+                instruction.arm && instruction.arm->writeback) {
+                const auto bytes = static_cast<std::int64_t>(std::popcount(list->mask)) * 4;
+                const auto mode = instruction.arm->multiple_mode;
+                auto adjusted = mode == ArmMultipleMode::ia || mode == ArmMultipleMode::ib
+                                    ? add(state.frame_depth, -bytes)
+                                    : add(state.frame_depth, bytes);
+                if (instruction.opcode == Opcode::a32_ldm && (list->mask & (1u << state.frame_register))) {
+                    state.frame_depth = {};
+                    state.frame_register = -1;
+                    state.supported = false;
+                }
+                return adjusted;
+            }
         }
         if (const auto *memory = instruction.operands.size() > 1
                                      ? std::get_if<ArmMemoryOperand>(&instruction.operands[1])
@@ -1264,8 +1279,7 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                         const unsigned count = std::popcount(list->mask);
                         const auto base_depth = stack_base ? state.stack_depth : state.frame_depth;
                         std::int64_t base_offset = 0;
-                        if ((frame_base && instruction.arm && instruction.arm->writeback) ||
-                            (!instruction.memory_read && !instruction.memory_write) ||
+                        if ((!instruction.memory_read && !instruction.memory_write) ||
                             !base_depth.known || !subtract_checked(0, base_depth.value, base_offset) ||
                             !instruction.arm || !count) {
                             result.complete = false;

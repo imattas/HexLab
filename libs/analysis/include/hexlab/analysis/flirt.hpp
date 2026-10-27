@@ -47,6 +47,9 @@ struct FlirtCatalog {
     // Exact temporary expansion size for compressed inputs, used by callers
     // aggregating several catalogs under one inflated-byte budget.
     std::size_t inflated_body_bytes = 0;
+    // Binary .sig header metadata. Text .pat catalogs have no embedded values.
+    std::uint16_t alternate_compiler_type_crc16 = 0;
+    std::string library_name_bytes;
 };
 
 struct FlirtCatalogLimits {

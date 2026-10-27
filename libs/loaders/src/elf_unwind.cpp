@@ -156,7 +156,8 @@ void parse_section(const ByteStorage &storage, const Image &image, const ElfMeta
                                    (machine == 62 && metadata.header.is_64) ||
                                    (machine == 40 && !metadata.header.is_64) ||
                                    (machine == 183 && metadata.header.is_64) || machine == 243 ||
-                                   (machine == 8 && !metadata.header.is_64);
+                                   (machine == 8 && !metadata.header.is_64) ||
+                                   (machine == 8 && metadata.header.is_64);
     require(supported_machine, "ELF machine has no supported .eh_frame root semantics", ErrorCode::unsupported);
     require(section.size <= metadata_limit, "ELF .eh_frame exceeds metadata budget", ErrorCode::resource_limit);
     budget.include(section.size);

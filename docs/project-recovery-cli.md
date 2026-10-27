@@ -22,7 +22,10 @@ retained-previous-version names. Each candidate is opened through the normal
 read-only project validation path, including schema, project rows, patch ranges,
 and embedded input checks. Unopenable artifacts are skipped. Directory scans
 are bounded to 8,192 entries and 256 validated candidates. JSON output reports
-the UTF-8 path, project UUID, and artifact kind for each candidate.
+the UTF-8 path, project UUID, artifact kind, and the edit/byte/decision revision
+triple captured at discovery for each candidate. Text output includes the same
+triple as `revisions=edit:bytes:decisions`; it is a comparison aid, not a
+timestamp or a substitute for restore-time validation.
 
 Restore one listed artifact to an independent project:
 

@@ -295,7 +295,8 @@ DebuggerView::DebuggerView(wxWindow *parent, std::unique_ptr<debugger::Backend> 
     details->Add(locals_column, 2, wxEXPAND | wxRIGHT, FromDIP(5));
     auto *bp_column = new wxBoxSizer(wxVERTICAL);
     bp_column->Add(new wxStaticText(this, wxID_ANY, "Breakpoints"), 0, wxBOTTOM, FromDIP(3));
-    breakpoints_view_ = make_list(this, "debug-breakpoints", {"ID", "Address", "Kind"});
+    breakpoints_view_ = make_list(this, "debug-breakpoints",
+                                  {"ID", "Address", "Kind", "Enabled", "Hits", "Ignore", "Rule"});
     bp_column->Add(breakpoints_view_, 1, wxEXPAND);
     auto *bp_controls = new wxBoxSizer(wxHORIZONTAL);
     breakpoint_address_ = make_text(this, "debug-breakpoint-address"); breakpoint_address_->SetHint("Address (hex/decimal)");
@@ -1062,6 +1063,7 @@ void DebuggerView::poll_event() {
         poll_timer_.Stop(); report(wxString::FromUTF8(result.error().message)); refresh_state(); return;
     }
     const auto &received = result.value();
+    refresh_breakpoints();
     persist_project_breakpoint_hit_counts();
     if (received.kind == debugger::EventKind::output && session_->state() == debugger::SessionState::running) {
         event_->SetValue(wxString::FromUTF8(received.message));
@@ -1202,6 +1204,41 @@ void DebuggerView::step_event() {
     report("Stepped one instruction; waiting for the next target event.");
 }
 
+void DebuggerView::refresh_breakpoints() {
+    const auto selected_row = breakpoints_view_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+    const auto selected_id = selected_row >= 0 && static_cast<std::size_t>(selected_row) < breakpoints_.size()
+        ? std::optional{breakpoints_[static_cast<std::size_t>(selected_row)].id} : std::nullopt;
+    {
+        std::lock_guard lock(inspection_state_->backend_mutex);
+        breakpoints_ = session_->breakpoints();
+    }
+    breakpoints_view_->DeleteAllItems();
+    for (const auto &breakpoint : breakpoints_) {
+        const auto row = breakpoints_view_->InsertItem(breakpoints_view_->GetItemCount(),
+            wxString::Format("%llu", static_cast<unsigned long long>(breakpoint.id)));
+        breakpoints_view_->SetItem(row, 1,
+            wxString::Format("0x%llX", static_cast<unsigned long long>(breakpoint.address)));
+        const char *kind_name = breakpoint.kind == debugger::BreakpointKind::software ? "software" :
+                                breakpoint.kind == debugger::BreakpointKind::execute ? "hardware execute" :
+                                breakpoint.kind == debugger::BreakpointKind::read ? "hardware read" :
+                                breakpoint.kind == debugger::BreakpointKind::write ? "hardware write" : "hardware access";
+        auto description = wxString::FromUTF8(kind_name);
+        if (breakpoint.kind != debugger::BreakpointKind::software)
+            description += wxString::Format(" (%u byte%s)", static_cast<unsigned>(breakpoint.size),
+                                             breakpoint.size == 1 ? "" : "s");
+        breakpoints_view_->SetItem(row, 2, description);
+        breakpoints_view_->SetItem(row, 3, breakpoint.enabled ? "yes" : "no");
+        breakpoints_view_->SetItem(row, 4, wxString::Format("%llu", static_cast<unsigned long long>(breakpoint.hit_count)));
+        breakpoints_view_->SetItem(row, 5, wxString::Format("%llu", static_cast<unsigned long long>(breakpoint.ignore_count)));
+        wxString rule = breakpoint.condition.empty() ? wxString("always") : wxString::FromUTF8(breakpoint.condition);
+        if (breakpoint.logpoint)
+            rule = rule == "always" ? wxString("logpoint") : rule + " + logpoint";
+        breakpoints_view_->SetItem(row, 6, rule);
+        if (selected_id && breakpoint.id == *selected_id)
+            breakpoints_view_->SetItemState(row, wxLIST_STATE_SELECTED, wxLIST_STATE_SELECTED);
+    }
+}
+
 void DebuggerView::add_breakpoint() {
     std::uint64_t address = 0;
     if (!parse_unsigned(narrow(breakpoint_address_->GetValue()), address)) {
@@ -1241,7 +1278,7 @@ void DebuggerView::add_breakpoint() {
         return found==configured.end()?added:Result<debugger::Breakpoint>(*found);
     }();
     if (!result) { report(wxString::FromUTF8(result.error().message)); return; }
-    const auto breakpoint = result.value(); breakpoints_.push_back(breakpoint);
+    const auto breakpoint = result.value();
     if (submit_ && document_) {
         auto current=document_();
         std::string reason;
@@ -1256,18 +1293,16 @@ void DebuggerView::add_breakpoint() {
             } else report("Breakpoint added to this session only; the active module mapping does not identify the project image.");
         } else report("Breakpoint added to this session only; no verified project image mapping is available.");
     }
-    const auto row = breakpoints_view_->InsertItem(breakpoints_view_->GetItemCount(),
-                                                    wxString::Format("%llu", static_cast<unsigned long long>(breakpoint.id)));
-    breakpoints_view_->SetItem(row, 1, wxString::Format("0x%llX", static_cast<unsigned long long>(breakpoint.address)));
+    refresh_breakpoints();
     const char *kind_name = breakpoint.kind == debugger::BreakpointKind::software ? "software" :
                             breakpoint.kind == debugger::BreakpointKind::execute ? "hardware execute" :
                             breakpoint.kind == debugger::BreakpointKind::read ? "hardware read" :
                             breakpoint.kind == debugger::BreakpointKind::write ? "hardware write" : "hardware access";
     auto description = wxString::FromUTF8(kind_name);
     if (breakpoint.kind != debugger::BreakpointKind::software)
-        description += wxString::Format(" (%u byte%s)", static_cast<unsigned>(breakpoint.size), breakpoint.size == 1 ? "" : "s");
-    breakpoints_view_->SetItem(row, 2, description);
-    if (logpoint) breakpoints_view_->SetItem(row, 2, description + " · logpoint");
+        description += wxString::Format(" (%u byte%s)", static_cast<unsigned>(breakpoint.size),
+                                        breakpoint.size == 1 ? "" : "s");
+    if (logpoint) description += " · logpoint";
     report(description + " breakpoint added.");
 }
 
@@ -1293,6 +1328,7 @@ void DebuggerView::save_breakpoint_rule() {
         return session_->set_breakpoint_ignore_count(breakpoint.id, ignore_count);
     }();
     if (!configured) { report(wxString::FromUTF8(configured.error().message)); return; }
+    refresh_breakpoints();
     if (document_ && submit_) {
         const auto current = document_();
         std::string reason;
@@ -1393,11 +1429,9 @@ void DebuggerView::apply_project_breakpoints() {
             row.enabled=false;
         }
         breakpoints_.push_back(row);
-        const auto line=breakpoints_view_->InsertItem(breakpoints_view_->GetItemCount(),wxString::Format("%llu",static_cast<unsigned long long>(row.id)));
-        breakpoints_view_->SetItem(line,1,wxString::Format("0x%llX",static_cast<unsigned long long>(row.address)));
-        breakpoints_view_->SetItem(line,2,wxString::Format("project %u",static_cast<unsigned>(saved.kind)));
         ++applied;
     }
+    refresh_breakpoints();
     report(wxString::Format("Applied %llu project breakpoint(s); %llu were skipped because they were unmapped or unsupported. Saved project addresses were not changed.",static_cast<unsigned long long>(applied),static_cast<unsigned long long>(skipped)));
 }
 
