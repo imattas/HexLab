@@ -20,6 +20,10 @@ template-parameter references inside expressions, and other expression
 productions remain unsupported. Vendor-qualified types
 using `U <source-name> <type>` are presented as a GNU-style
 `__attribute__((name))` suffix. It recognizes a
+bounded set of additional encoded floating types: `Df`/`Dd`/`De` for
+decimal32/decimal64/decimal128, `Dh` for `_Float16`, and `DF<number>_` for
+`_Float<number>`. They are rendered as type names only; the parser does not
+infer target availability or floating representation. It recognizes a
 bounded subset of Microsoft decorated free and member functions. In addition
 to `?name@scope@@Y...` global functions, it parses ordinary
 `?method@Class@@...` and nested namespace/class names, access and
@@ -92,7 +96,8 @@ names, expression-valued template arguments beyond the bounded integer
 expression grammar, and broader operator/type
 encodings remain incomplete, including expression calls/casts,
 template parameter references inside expressions, and unrecognized vendor
-qualifiers. Microsoft thunks and other special names,
+qualifiers. Other Itanium builtin extensions and newer instantiation-dependent
+builtin encodings remain unsupported. Microsoft thunks and other special names,
 non-integral template values (including pointers, member pointers, symbol
 references, `auto` values, and parameter packs), template backreferences,
 pointer-to-member and function-pointer types, and many calling-convention/type
