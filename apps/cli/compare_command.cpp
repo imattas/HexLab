@@ -14,6 +14,7 @@
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -24,6 +25,28 @@ std::string address(std::uint64_t value) {
     std::ostringstream out;
     out << "0x" << std::hex << value;
     return out.str();
+}
+
+std::string json_string(std::string_view value) {
+    std::ostringstream escaped;
+    escaped << '"';
+    constexpr char hex[] = "0123456789abcdef";
+    for (const unsigned char ch : value) {
+        switch (ch) {
+        case '"': escaped << "\\\""; break;
+        case '\\': escaped << "\\\\"; break;
+        case '\b': escaped << "\\b"; break;
+        case '\f': escaped << "\\f"; break;
+        case '\n': escaped << "\\n"; break;
+        case '\r': escaped << "\\r"; break;
+        case '\t': escaped << "\\t"; break;
+        default:
+            if (ch < 0x20) escaped << "\\u00" << hex[ch >> 4] << hex[ch & 0xf];
+            else escaped << static_cast<char>(ch);
+        }
+    }
+    escaped << '"';
+    return escaped.str();
 }
 
 struct InstructionHash {
@@ -281,7 +304,7 @@ std::uint64_t parse_count(std::wstring_view text) {
 
 int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std::ostream &err) {
     if (arguments.size() == 1 && arguments[0] == L"--help") {
-        out << "Usage: hexlab_cli compare <old-image> <new-image> [--window <bytes>] [--anchor <bytes>] [--limit <runs>]\n"
+        out << "Usage: hexlab_cli compare <old-image> <new-image> [--window <bytes>] [--anchor <bytes>] [--limit <runs>] [--json]\n"
                "       [--functions] [--function-limit <count>] [--instruction-limit <runs>] [--min-confidence <0..100>] [--ambiguity-margin <0..100>]\n"
                "Compare file-backed regions; optionally recover and match functions with instruction alignment.\n";
         return 0;
@@ -293,11 +316,14 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
         std::uint64_t function_limit = 100;
         std::uint64_t instruction_limit = 1000;
         bool match_functions = false;
+        bool json_output = false;
         compare::FunctionMatchOptions function_options;
         for (std::size_t i = 0; i < arguments.size(); ++i) {
             const auto argument = arguments[i];
             if (argument == L"--functions") {
                 match_functions = true;
+            } else if (argument == L"--json") {
+                json_output = true;
             } else if (argument == L"--window" || argument == L"--anchor" || argument == L"--limit" ||
                        argument == L"--function-limit" || argument == L"--min-confidence" ||
                        argument == L"--ambiguity-margin" || argument == L"--instruction-limit") {
@@ -359,6 +385,31 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
             return 1;
         }
         const auto &summary = report.value().summary;
+        if (json_output) {
+            if (match_functions)
+                throw std::invalid_argument("--json currently emits byte and region results; omit --functions");
+            const auto shown_runs = std::min<std::size_t>(report.value().runs.size(), static_cast<std::size_t>(run_limit));
+            out << "{\"schema\":\"hexlab.compare.v1\",\"summary\":{\"compared_bytes\":" << summary.compared_bytes
+                << ",\"equal_bytes\":" << summary.equal_bytes << ",\"changed_bytes\":" << summary.changed_bytes
+                << ",\"added_bytes\":" << summary.added_bytes << ",\"removed_bytes\":" << summary.removed_bytes
+                << ",\"ignored_bytes\":" << summary.ignored_bytes << ",\"matched_regions\":" << summary.matched_regions
+                << ",\"added_regions\":" << summary.added_regions << ",\"removed_regions\":" << summary.removed_regions
+                << "},\"total_runs\":" << report.value().runs.size() << ",\"runs\":[";
+            for (std::size_t i = 0; i < shown_runs; ++i) {
+                const auto &run = report.value().runs[i];
+                const char *kind = run.kind == compare::ChangeKind::changed ? "changed"
+                                 : run.kind == compare::ChangeKind::added ? "added" : "removed";
+                if (i) out << ',';
+                out << "{\"kind\":" << json_string(kind) << ",\"region\":" << json_string(run.region_key)
+                    << ",\"size\":" << run.size << ",\"old_address\":";
+                if (run.old_address) out << json_string(address(*run.old_address)); else out << "null";
+                out << ",\"new_address\":";
+                if (run.new_address) out << json_string(address(*run.new_address)); else out << "null";
+                out << '}';
+            }
+            out << "],\"omitted_runs\":" << (report.value().runs.size() - shown_runs) << "}\n";
+            return 0;
+        }
         out << "Compared bytes: " << summary.compared_bytes << "\nEqual: " << summary.equal_bytes
             << "\nChanged: " << summary.changed_bytes << "\nAdded: " << summary.added_bytes
             << "\nRemoved: " << summary.removed_bytes << "\nMatched regions: " << summary.matched_regions

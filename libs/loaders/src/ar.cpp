@@ -154,6 +154,12 @@ Result<ArArchive> read_ar_archive(const ByteStorage &storage, std::stop_token st
             require(header[58] == std::byte{'`'} && header[59] == std::byte{'\n'}, "invalid ar member trailer");
             std::string raw_name = field(std::span(header).subspan(0, 16));
             while (!raw_name.empty() && raw_name.back() == ' ') raw_name.pop_back();
+            const auto timestamp = number(std::span(header).subspan(16, 12), 10, "invalid ar member timestamp");
+            const auto uid = number(std::span(header).subspan(28, 6), 10, "invalid ar member uid");
+            const auto gid = number(std::span(header).subspan(34, 6), 10, "invalid ar member gid");
+            const auto mode = number(std::span(header).subspan(40, 8), 8, "invalid ar member mode");
+            require(uid <= UINT32_MAX && gid <= UINT32_MAX && mode <= UINT32_MAX,
+                    "ar member header metadata exceeds supported range", ErrorCode::overflow);
             const auto raw_size = number(std::span(header).subspan(48, 10), 10, "invalid ar member size");
             const auto data_start = add(cursor, 60);
             require(raw_size <= storage.size() - data_start, "ar member data exceeds input");
@@ -192,7 +198,9 @@ Result<ArArchive> read_ar_archive(const ByteStorage &storage, std::stop_token st
             } else name = trim_ar_name(raw_name);
             require(!name.empty() || kind != ArMemberKind::regular, "empty ar member name");
             const std::size_t index = archive.members.size();
-            archive.members.push_back({std::move(name), {cursor}, {payload_offset}, payload_size, kind});
+            archive.members.push_back({std::move(name), {cursor}, {payload_offset}, payload_size, kind,
+                                       timestamp, static_cast<std::uint32_t>(uid),
+                                       static_cast<std::uint32_t>(gid), static_cast<std::uint32_t>(mode)});
             member_by_header.emplace(cursor, index);
 
             if (kind == ArMemberKind::long_name_table) {

@@ -716,6 +716,91 @@ void HistoryView::render_preview() {
         static_cast<unsigned long long>(state.patches.size())));
     if (comparison_base_ && comparison_base_->user) {
         const auto& before = *comparison_base_->user;
+        constexpr std::size_t max_detail_rows = 512;
+        std::size_t detail_rows = 0;
+        bool details_truncated = false;
+        auto add_detail = [&](const wxString& category, std::optional<Location> location,
+                              const wxString& name, std::uint64_t id, const wxString& change,
+                              const wxString& detail) {
+            if (detail_rows >= max_detail_rows) { details_truncated = true; return; }
+            ++detail_rows;
+            add("History " + category + " " + change, std::move(location), name,
+                "id=" + hex_value(id) + "; " + detail);
+        };
+        auto append_details = [&](const auto& old_rows, const auto& new_rows,
+                                  const wxString& category, auto describe,
+                                  auto row_location, auto row_name) {
+            using Rows = std::decay_t<decltype(old_rows)>;
+            using Row = typename Rows::value_type;
+            std::map<std::uint64_t, const Row*> old_by_id;
+            std::map<std::uint64_t, const Row*> new_by_id;
+            for (const auto& row : old_rows) old_by_id.emplace(row.id, &row);
+            for (const auto& row : new_rows) new_by_id.emplace(row.id, &row);
+            for (const auto& [id, old_row] : old_by_id) {
+                const auto current = new_by_id.find(id);
+                if (current == new_by_id.end()) {
+                    add_detail(category, row_location(*old_row), row_name(*old_row), id,
+                        "removed", describe(*old_row));
+                } else if (!(*current->second == *old_row)) {
+                    add_detail(category, row_location(*current->second), row_name(*current->second), id,
+                        "changed",
+                        "before: " + describe(*old_row) + "; after: " + describe(*current->second));
+                }
+            }
+            for (const auto& [id, new_row] : new_by_id)
+                if (!old_by_id.contains(id)) add_detail(category, row_location(*new_row), row_name(*new_row), id,
+                    "added", describe(*new_row));
+        };
+        append_details(before.annotations, state.annotations, "annotation", [](const auto& row) {
+            return "name=" + preview_text(row.name, 128) + "; comment=" + preview_text(row.comment, 256);
+        }, [](const auto& row) { return std::optional<Location>{row.location}; },
+           [](const auto& row) { return preview_text(row.name, 128); });
+        append_details(before.bookmarks, state.bookmarks, "bookmark", [](const auto& row) {
+            return "label=" + preview_text(row.label, 160);
+        }, [](const auto& row) { return std::optional<Location>{row.location}; },
+           [](const auto& row) { return preview_text(row.label, 128); });
+        append_details(before.breakpoints, state.breakpoints, "breakpoint", [](const auto& row) {
+            return wxString(row.enabled ? "enabled" : "disabled") +
+                wxString::Format("; kind %u; size %u; ignore %llu; hit %llu; logpoint %s; condition=%s; message=%s",
+                    static_cast<unsigned>(row.kind), static_cast<unsigned>(row.size),
+                    static_cast<unsigned long long>(row.ignore_count), static_cast<unsigned long long>(row.hit_count),
+                    row.logpoint ? "yes" : "no", preview_text(row.condition, 192), preview_text(row.log_message, 192));
+        }, [](const auto& row) { return std::optional<Location>{Location{row.address}}; },
+           [](const auto&) { return wxString{}; });
+        append_details(before.types, state.types, "type", [](const auto& row) {
+            return "declaration kind " + wxString::Format("%u", static_cast<unsigned>(row.declaration_kind)) +
+                "; " + (row.type ? preview_text(types::format(*row.type), 384) : wxString("unavailable type"));
+        }, [](const auto&) { return std::optional<Location>{}; },
+           [](const auto& row) { return preview_text(row.name, 128); });
+        append_details(before.type_assignments, state.type_assignments, "type assignment", [](const auto& row) {
+            return "type=" + hex_value(row.type_id);
+        }, [](const auto& row) { return std::optional<Location>{row.location}; },
+           [](const auto& row) { return hex_value(row.type_id); });
+        append_details(before.decisions.functions, state.decisions.functions, "function decision", [](const auto& row) {
+            return wxString(row.suppressed ? "suppressed" : "enabled") + wxString::Format("; %llu chunks",
+                static_cast<unsigned long long>(row.chunks.size()));
+        }, [](const auto& row) { return std::optional<Location>{Location{row.entry}}; },
+           [](const auto& row) { return hex_value(row.id); });
+        append_details(before.decisions.regions, state.decisions.regions, "region", [](const auto& row) {
+            return wxString::Format("%llu bytes; kind %u", static_cast<unsigned long long>(row.size),
+                static_cast<unsigned>(row.kind));
+        }, [](const auto& row) { return std::optional<Location>{Location{row.begin}}; },
+           [](const auto& row) { return hex_value(row.id); });
+        append_details(before.decisions.references, state.decisions.references, "user reference", [image](const auto& row) {
+            return "target=" + location_text(row.target, image) +
+                wxString::Format("; kind %u", static_cast<unsigned>(row.kind));
+        }, [](const auto& row) { return std::optional<Location>{row.source}; },
+           [image](const auto& row) { return location_text(row.target, image); });
+        append_details(before.debug_variables, state.debug_variables, "debug variable", [](const auto& row) {
+            wxString detail = row.is_parameter ? "parameter" : "local";
+            if (row.type_id) detail += "; type " + hex_value(*row.type_id);
+            if (row.address) detail += "; address " + hex_value(*row.address);
+            detail += wxString::Format("; scope 0x%llx; location ranges %llu",
+                static_cast<unsigned long long>(row.scope_offset),
+                static_cast<unsigned long long>(row.location_ranges.size()));
+            return detail;
+        }, [](const auto& row) { return std::optional<Location>{Location{row.function_entry}}; },
+           [](const auto& row) { return preview_text(row.name, 128); });
         struct ChangeCounts { std::size_t added=0, removed=0, changed=0; };
         auto count_changes = [](const auto& old_rows, const auto& new_rows, auto key) {
             ChangeCounts counts;
@@ -806,10 +891,15 @@ void HistoryView::render_preview() {
         add_summary("User references", references);
         add_summary("Debug variables", debug_variables);
         add_summary("Patches", patches);
+        if (details_truncated)
+            add("History delta", {}, "Additional row changes omitted",
+                wxString::Format("The detailed comparison reached its %llu-row display limit.",
+                    static_cast<unsigned long long>(max_detail_rows)));
         preview_status_->SetLabel(wxString::Format(
-            "Step %llu compared with %llu. Change summary rows show additions, removals, and edits for every durable user-state collection.",
+            "Step %llu compared with %llu. Detailed rows show additions, removals, and edits; collection totals remain summarized below. Displayed detail is capped at %llu rows.",
             static_cast<unsigned long long>(preview_->target_step),
-            static_cast<unsigned long long>(comparison_base_->target_step)));
+            static_cast<unsigned long long>(comparison_base_->target_step),
+            static_cast<unsigned long long>(max_detail_rows)));
     }
     preview_items_->populate(preview_rows_.size(), [this](std::size_t row, int column) {
         const auto& item = preview_rows_[row];
