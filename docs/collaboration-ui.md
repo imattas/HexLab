@@ -19,6 +19,11 @@ operation. **Dismiss
 Proposal** refreshes and records a resolved, unaccepted audit entry without
 changing user state.
 
+The database rejects proposals whose base edit revision is newer than the
+observed project head instead of storing them as stale conflicts. Conflict IDs
+used for preview and dismissal must be nonzero SQLite row IDs representable by
+the signed integer key; invalid IDs fail before database access.
+
 Reference decisions merge `source`, `target`, and `kind` independently when
 the current row still has the proposal's stable ID. A convergent insertion
 with the same `(source, target, kind)` is a no-op; a reused reference ID with

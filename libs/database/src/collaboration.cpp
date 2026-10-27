@@ -800,6 +800,9 @@ Result<CollaborationSubmission> ProjectCollaboration::submit(
     // revision race falls through to the durable conflict inbox below.
     auto latest = refresh(stop);
     if (!latest) return latest.error();
+    if (base_revision > latest.value()->revisions.edit)
+        return Error{ErrorCode::invalid_argument,
+                     "Collaboration proposal base revision is newer than the project head"};
     std::shared_ptr<const ByteStorage> original;
     if(std::any_of(proposal.changes.begin(),proposal.changes.end(),
                    [](const UserChange& change){return std::holds_alternative<PatchChange>(change);} )){
@@ -869,6 +872,8 @@ Result<std::vector<CollaborationConflict>> ProjectCollaboration::conflicts(
 
 Result<std::optional<StateDelta>> ProjectCollaboration::preview_resolution(
     std::uint64_t id, std::uint64_t expected_revision, std::stop_token stop) {
+    if (id == 0 || id > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        return Error{ErrorCode::invalid_argument, "Invalid collaboration conflict ID"};
     auto latest = refresh(stop);
     if (!latest) return latest.error();
     if (latest.value()->revisions.edit != expected_revision)
@@ -906,6 +911,8 @@ Result<CommitAck> ProjectCollaboration::resolve(
 
 Result<bool> ProjectCollaboration::dismiss(std::uint64_t id, std::uint64_t expected_revision,
                                             std::stop_token stop) {
+    if (id == 0 || id > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        return Error{ErrorCode::invalid_argument, "Invalid collaboration conflict ID"};
     return detail::guarded([&]() -> Result<bool> {
         std::lock_guard lock(impl_->mutex);
         detail::Cancellation cancellation(*impl_->connection, stop);
