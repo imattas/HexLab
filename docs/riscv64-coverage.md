@@ -195,3 +195,7 @@ specification, version 2.1](https://docs.riscv.org/reference/isa/unpriv/a-st-ext
 
 
 The integer reduction subset now includes unmasked `vredsum.vs`, `vredand.vs`, `vredor.vs`, `vredxor.vs`, `vredminu.vs`, `vredmin.vs`, `vredmaxu.vs`, and `vredmax.vs` OPMVV forms. Their scalar seed remains typed as vector-register element data, destination and configuration dependencies are retained, and masked encodings are rejected. The generic decompiler emits named reduction intrinsics. Dynamic vtype shape and register-group alignment are not checked at decode time.
+
+The scalar Zfa `fminm.s/d` and `fmaxm.s/d` forms are also decoded, retaining FPR
+inputs and accrued floating status effects. Their canonical-NaN behavior for
+NaN inputs is represented by typed decompiler intrinsics rather than evaluated.
