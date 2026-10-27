@@ -193,3 +193,14 @@ Format and instruction details follow the Android Open Source Project's
 [DEX file format](https://source.android.com/docs/core/runtime/dex-format),
 [Dalvik bytecode reference](https://source.android.com/docs/core/runtime/dalvik-bytecode),
 and [instruction formats](https://source.android.com/docs/core/runtime/instruction-formats).
+
+The decoder also recognizes legacy optimized Dalvik code units listed in the
+[AOSP optimized bytecode table](https://android.googlesource.com/platform/dalvik2/+/refs/heads/main/opcode-gen/bytecode.txt)
+for volatile field access (`0xe3`–`0xeb`), inline invokes (`0xee`–`0xef`),
+`return-void-barrier` (`0xf1`), quick field access (`0xf2`–`0xf7`), and quick
+virtual invokes (`0xf8`–`0xf9`). These forms retain their register effects,
+field/vtable/inline indexes, and memory or call classification. Quick indexes
+remain unresolved; no dequickening, inline-method expansion, runtime-version
+selection, or optimized-container validation is performed. Standard DEX
+`invoke-polymorphic` and `invoke-custom` opcodes at `0xfa`–`0xfd` keep their
+standard interpretation.
