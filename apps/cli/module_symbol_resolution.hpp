@@ -29,11 +29,17 @@ inline bool is_pe_module(const ImageMetadata &metadata) {
     return metadata.format == "PE32" || metadata.format == "PE32+";
 }
 
-inline bool elf_abi_compatible(const ElfHeader &importer, const ElfHeader &provider) {
-    // ELF's generic loader model is not enough to prove that an address from
-    // one object is meaningful in another architecture's process image.
-    return importer.is_64 == provider.is_64 && importer.order == provider.order &&
-           importer.machine == provider.machine;
+inline std::optional<std::string> elf_abi_incompatibility(const ElfHeader &importer,
+                                                          const ElfHeader &provider) {
+    if (importer.is_64 != provider.is_64 || importer.order != provider.order ||
+        importer.machine != provider.machine)
+        return "ELF class, byte order, or machine";
+    // OSABI 0 is the generic System V value used by many Linux and BSD
+    // binaries. Treat it as unspecified; two conflicting concrete tags are
+    // strong evidence that these objects target different runtime ABIs.
+    if (importer.os_abi != 0 && provider.os_abi != 0 && importer.os_abi != provider.os_abi)
+        return "conflicting concrete OSABI tags";
+    return std::nullopt;
 }
 
 inline std::vector<std::size_t> elf_dynamic_symbol_table_indices(const ElfMetadata &elf) {
@@ -98,12 +104,16 @@ inline void print_elf_import_resolutions(const std::vector<SuppliedModule> &modu
             if (providers.empty()) { out << "unresolved (no supplied DT_NEEDED provider)\n"; continue; }
             std::vector<std::pair<const SuppliedModule *, const ElfSymbol *>> matches;
             bool has_abi_compatible_provider = false;
+            std::string abi_mismatch;
             bool has_unsupported_provider_symbol = false;
             bool has_symbol_type_mismatch = false;
             for (const auto provider_index : providers) {
                 const auto *provider = &modules[provider_index];
                 const auto &pe = *provider->metadata->elf;
-                if (!elf_abi_compatible(elf.header, pe.header)) continue;
+                if (const auto mismatch = elf_abi_incompatibility(elf.header, pe.header)) {
+                    if (abi_mismatch.empty()) abi_mismatch = *mismatch;
+                    continue;
+                }
                 has_abi_compatible_provider = true;
                 if (wanted.version_file && module_leaf(*wanted.version_file) != module_leaf(provider->path))
                     continue;
@@ -135,7 +145,8 @@ inline void print_elf_import_resolutions(const std::vector<SuppliedModule> &modu
                 }
             }
             if (!has_abi_compatible_provider) {
-                out << "unsupported (supplied DT_NEEDED providers have incompatible ELF class, byte order, or machine)\n";
+                out << "unsupported (supplied DT_NEEDED providers have incompatible "
+                    << (abi_mismatch.empty() ? "ELF ABI" : abi_mismatch) << ")\n";
                 continue;
             }
             if (has_unsupported_provider_symbol) {

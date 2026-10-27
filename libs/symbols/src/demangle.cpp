@@ -573,7 +573,20 @@ class Itanium {
             std::string value;
             if (take("a")) value = "auto"; else if (take("c")) value = "decltype(auto)";
             else if (take("n")) value = "std::nullptr_t"; else if (take("s")) value = "char16_t";
-            else if (take("i")) value = "char32_t"; else unsupported();
+            else if (take("i")) value = "char32_t";
+            else if (take("f")) value = "decimal32";
+            else if (take("d")) value = "decimal64";
+            else if (take("e")) value = "decimal128";
+            else if (take("h")) value = "_Float16";
+            else if (take("F")) {
+                // ISO/IEC TS 18661 binary floating types use DF<number>_.
+                // Keep the encoded width decimal and bounded by the shared
+                // input and component limits; zero is not a valid width.
+                const auto width = number('_');
+                if (!take("_")) malformed();
+                if (!width) malformed();
+                value = combine({"_Float", std::to_string(width)});
+            } else unsupported();
             TypeName result; result.base = value; result.key = combine({"builtin:", value}); result.builtin = true; return result;
         }
         case 'N': --at_; return parse_name(d + 1, true).type;
