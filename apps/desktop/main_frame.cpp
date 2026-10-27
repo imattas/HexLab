@@ -729,6 +729,12 @@ struct MainFrame::Impl {
     VirtualTable *candidates, *symbols, *segments, *imports, *exports, *annotations, *bookmarks;
     StringBrowserView *strings;
     wxTextCtrl *function_filter = nullptr;
+    wxTextCtrl *symbol_filter = nullptr;
+    wxStaticText *symbol_filter_status = nullptr;
+    std::vector<std::size_t> visible_symbol_rows;
+    std::function<wxString(std::size_t, int)> symbol_source_cell;
+    std::function<void(std::size_t)> symbol_source_activate;
+    std::size_t symbol_source_count = 0;
     std::vector<CandidateBrowserItem> candidate_items, visible_candidate_items;
     int candidate_sort_column = 0;
     bool candidate_sort_ascending = true;
@@ -1131,27 +1137,34 @@ struct MainFrame::Impl {
         const auto &metadata = doc->metadata_view();
         if (metadata.macho) {
             const auto &rows = metadata.macho->symbols;
-            for (std::size_t row = 0; row < rows.size(); ++row) {
+            for (std::size_t view_row = 0; view_row < visible_symbol_rows.size(); ++view_row) {
+                const auto row = visible_symbol_rows[view_row];
+                if (row >= rows.size()) continue;
                 if (rows[row].address)
-                    index_context_row(symbol_rows, context_key(*rows[row].address), row);
+                    index_context_row(symbol_rows, context_key(*rows[row].address), view_row);
                 else
-                    index_context_row(symbol_rows, context_key(FileOffset{rows[row].record_file_offset}), row);
+                    index_context_row(symbol_rows, context_key(FileOffset{rows[row].record_file_offset}), view_row);
             }
         } else if (metadata.elf) {
             const auto &rows = metadata.elf->symbols;
-            for (std::size_t row = 0; row < rows.size(); ++row) {
+            for (std::size_t view_row = 0; view_row < visible_symbol_rows.size(); ++view_row) {
+                const auto row = visible_symbol_rows[view_row];
+                if (row >= rows.size()) continue;
                 if (rows[row].address)
-                    index_context_row(symbol_rows, context_key(*rows[row].address), row);
+                    index_context_row(symbol_rows, context_key(*rows[row].address), view_row);
                 else if (doc->project) {
                     const auto record = elf_symbol_record_at(*doc->project, row);
-                    if (record) index_context_row(symbol_rows, context_key(*record), row);
+                    if (record) index_context_row(symbol_rows, context_key(*record), view_row);
                 }
             }
         } else {
             const auto &rows = metadata.exports;
-            for (std::size_t row = 0; row < rows.size(); ++row)
+            for (std::size_t view_row = 0; view_row < visible_symbol_rows.size(); ++view_row) {
+                const auto row = visible_symbol_rows[view_row];
+                if (row >= rows.size()) continue;
                 if (rows[row].address)
-                    index_context_row(symbol_rows, context_key(*rows[row].address), row);
+                    index_context_row(symbol_rows, context_key(*rows[row].address), view_row);
+            }
         }
         for (std::size_t row = 0; row < metadata.imports.size(); ++row)
             index_context_row(import_rows, context_key(metadata.imports[row].iat), row);
@@ -1166,6 +1179,31 @@ struct MainFrame::Impl {
             for (std::size_t row = 0; row < bookmark_records.size(); ++row)
                 index_context_row(bookmark_rows, context_key(bookmark_records[row].location), row);
         }
+    }
+    void render_symbol_filter(const std::shared_ptr<const DocumentSnapshot> &doc) {
+        const wxString query = symbol_filter ? symbol_filter->GetValue().Lower().Trim(true).Trim(false) : wxString{};
+        visible_symbol_rows.clear();
+        if (query.empty()) {
+            for (std::size_t row = 0; row < symbol_source_count; ++row) visible_symbol_rows.push_back(row);
+        } else {
+            for (std::size_t row = 0; row < symbol_source_count; ++row) {
+                bool match = false;
+                for (int column = 0; column < 3; ++column) {
+                    if (symbol_source_cell(row, column).Lower().Find(query) != wxNOT_FOUND) { match = true; break; }
+                }
+                if (match) visible_symbol_rows.push_back(row);
+            }
+        }
+        symbols->populate(visible_symbol_rows.size(), [this](std::size_t row, int column) {
+            return row < visible_symbol_rows.size() ? symbol_source_cell(visible_symbol_rows[row], column) : wxString{};
+        });
+        symbols->activate = [this](std::size_t row) {
+            if (row < visible_symbol_rows.size() && symbol_source_activate) symbol_source_activate(visible_symbol_rows[row]);
+        };
+        if (symbol_filter_status)
+            symbol_filter_status->SetLabel(wxString::Format("%llu of %llu symbols", static_cast<unsigned long long>(visible_symbol_rows.size()), static_cast<unsigned long long>(symbol_source_count)));
+        index_context_tables(doc);
+        select_context_rows(state().selection());
     }
     void populate_candidate_model(const std::shared_ptr<const DocumentSnapshot> &doc) {
         candidate_items.clear();
@@ -2141,6 +2179,10 @@ struct MainFrame::Impl {
             macho_objc_source = nullptr;
             candidate_items.clear();
             visible_candidate_items.clear();
+            symbol_source_count = 0;
+            symbol_source_cell = {};
+            symbol_source_activate = {};
+            visible_symbol_rows.clear();
             strings->set_document({});
             for (auto *table : {candidates, symbols, segments, imports, exports, annotations, bookmarks,
                                 elf_programs, elf_sections, elf_dynamic, elf_tables, macho_metadata, macho_objc}) {
@@ -2202,7 +2244,8 @@ struct MainFrame::Impl {
                                  : (item.forwarder ? text(*item.forwarder) : wxString{});
         };
         exports->populate(doc->metadata_view().exports.size(), export_cell);
-        symbols->populate(doc->metadata_view().exports.size(), export_cell);
+        symbol_source_count = doc->metadata_view().exports.size();
+        symbol_source_cell = export_cell;
         auto export_jump = [this, doc](std::size_t row) {
             if (row >= doc->metadata_view().exports.size()) return;
             const auto &item = doc->metadata_view().exports[row];
@@ -2212,9 +2255,10 @@ struct MainFrame::Impl {
                 log("Forwarder: " + text(*item.forwarder));
         };
         exports->activate = export_jump;
-        symbols->activate = export_jump;
+        symbol_source_activate = export_jump;
         if (doc->metadata_view().elf) {
-            symbols->populate(doc->metadata_view().elf->symbols.size(), [doc](std::size_t row, int column) {
+            symbol_source_count = doc->metadata_view().elf->symbols.size();
+            symbol_source_cell = [doc](std::size_t row, int column) {
                 const auto &item = doc->metadata_view().elf->symbols[row];
                 if (column == 0) {
                     if (item.address)
@@ -2230,8 +2274,8 @@ struct MainFrame::Impl {
                     return preview_text(item.name, 256);
                 return elf_symbol_state(item.state) + "; table file:" + elf_number(item.table_offset) +
                        wxString::Format("; #%u", item.index);
-            });
-            symbols->activate = [this, doc](std::size_t row) {
+            };
+            symbol_source_activate = [this, doc](std::size_t row) {
                 if (row >= doc->metadata_view().elf->symbols.size()) return;
                 const auto &item = doc->metadata_view().elf->symbols[row];
                 if (item.address)
@@ -2244,7 +2288,8 @@ struct MainFrame::Impl {
             };
         }
         if (doc->metadata_view().macho) {
-            symbols->populate(doc->metadata_view().macho->symbols.size(), [doc](std::size_t row, int column) {
+            symbol_source_count = doc->metadata_view().macho->symbols.size();
+            symbol_source_cell = [doc](std::size_t row, int column) {
                 const auto &item = doc->metadata_view().macho->symbols[row];
                 if (column == 0)
                     return item.address ? location_text(*item.address, doc->image.get())
@@ -2253,14 +2298,15 @@ struct MainFrame::Impl {
                     return preview_text(item.name, 256);
                 return macho_symbol_state(item.state) + wxString::Format("; #%u; ", item.index) +
                        location_text(FileOffset{item.record_file_offset});
-            });
-            symbols->activate = [this, doc](std::size_t row) {
+            };
+            symbol_source_activate = [this, doc](std::size_t row) {
                 if (row >= doc->metadata_view().macho->symbols.size()) return;
                 const auto &item = doc->metadata_view().macho->symbols[row];
                 navigate_from_document(doc, item.address ? Location{*item.address}
                                                          : Location{FileOffset{item.record_file_offset}});
             };
         }
+        render_symbol_filter(doc);
         macho_metadata->populate(doc->project ? static_cast<std::size_t>(macho_metadata_row_count(*doc->project)) : 0,
                                  [doc](std::size_t row, int column) {
                                      const auto item = macho_metadata_row_at(*doc->project, row);
@@ -3158,10 +3204,21 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.function_filter->SetName("function-filter");
     ui.function_filter->SetHint("Filter by function name or address");
     ui.candidates = new VirtualTable(function_panel, "functions", {"Address", "Name", "Blocks", "State"});
-    ui.symbols = new VirtualTable(this, "symbols", {"Address / record", "Symbol", "State / forwarder"});
+    auto *symbol_panel = new wxPanel(this);
+    symbol_panel->SetName("Symbols pane");
+    auto *symbol_layout = new wxBoxSizer(wxVERTICAL);
+    ui.symbol_filter = new wxTextCtrl(symbol_panel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+    ui.symbol_filter->SetName("symbol-filter");
+    ui.symbol_filter->SetHint("Filter symbols by address, name, or state");
+    ui.symbol_filter_status = new wxStaticText(symbol_panel, wxID_ANY, "0 of 0 symbols");
+    ui.symbols = new VirtualTable(symbol_panel, "symbols", {"Address / record", "Symbol", "State / forwarder"});
     ui.symbols->SetName("Symbols pane");
     ui.candidates->SetColumnWidth(0, FromDIP(140));
     ui.symbols->SetColumnWidth(0, FromDIP(140));
+    symbol_layout->Add(ui.symbol_filter, 0, wxEXPAND | wxALL, FromDIP(4));
+    symbol_layout->Add(ui.symbol_filter_status, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
+    symbol_layout->Add(ui.symbols, 1, wxEXPAND);
+    symbol_panel->SetSizer(symbol_layout);
     function_layout->Add(ui.function_filter, 0, wxEXPAND | wxALL, FromDIP(4));
     function_layout->Add(ui.candidates, 1, wxEXPAND);
     function_panel->SetSizer(function_layout);
@@ -3172,7 +3229,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
                                         .Position(0)
                                         .BestSize(FromDIP(wxSize(260, 250)))
                                         .MinSize(FromDIP(wxSize(160, 100))));
-    docking_.AddPane(ui.symbols, wxAuiPaneInfo()
+    docking_.AddPane(symbol_panel, wxAuiPaneInfo()
                                      .Name("symbols")
                                      .Caption("Symbols")
                                      .Left()
@@ -3836,6 +3893,9 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.function_filter->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
         impl_->render_candidate_rows(impl_->shown);
         impl_->select_context_rows(impl_->state().selection());
+    });
+    ui.symbol_filter->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+        impl_->render_symbol_filter(impl_->shown);
     });
     ui.candidates->Bind(wxEVT_LIST_COL_CLICK, [this](wxListEvent &event) {
         const int column = event.GetColumn();

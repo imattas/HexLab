@@ -108,6 +108,18 @@ struct MachOBuildVersion {
     std::vector<MachOBuildToolVersion> tools;
     bool operator==(const MachOBuildVersion &) const = default;
 };
+// A bounded LC_FILESET_ENTRY declaration. Child commands are range-checked,
+// but child images are not mapped or recursively imported into this image.
+struct MachOFileSetEntry {
+    std::uint32_t command_index = 0, entry_id_offset = 0, reserved = 0;
+    std::uint64_t record_file_offset = 0, vm_address = 0, raw_file_offset = 0;
+    std::string entry_id;
+    bool child_is_64 = false;
+    std::uint32_t child_cpu_type = 0, child_cpu_subtype = 0, child_file_type = 0;
+    std::uint32_t child_command_count = 0, child_command_bytes = 0;
+    bool child_commands_valid = false;
+    bool operator==(const MachOFileSetEntry &) const = default;
+};
 struct MachOEntry {
     std::uint32_t command_index = 0, command = 0, flavor = 0, count = 0;
     std::uint64_t record_file_offset = 0, stack_size = 0;
@@ -391,6 +403,7 @@ struct MachOMetadata {
     std::vector<MachOLibrary> libraries;
     std::vector<MachOCommandString> paths;
     std::vector<MachOBuildVersion> build_versions;
+    std::vector<MachOFileSetEntry> fileset_entries;
     std::vector<MachOEntry> entries;
     std::vector<MachOInitializer> initializers;
     std::vector<MachOFunctionStart> function_starts;
