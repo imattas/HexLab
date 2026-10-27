@@ -380,3 +380,20 @@ provenance is exposed by the analysis API; CLI serialization and durable
 provenance persistence are not extended here. REL implicit addends,
 preemptible/global symbols, GOT indirection, arbitrary address propagation and
 other instruction relocation families remain unsupported.
+
+A32 also recognizes the exact `LDR pc, [pc, Rm, LSL #2]` dispatch. The table
+starts at the architectural PC value (`dispatch + 8`) and contains 32-bit
+absolute destinations. The load must be unconditional, word-sized, pre-indexed,
+additive, and have no writeback; the base must be PC and the index must be a
+non-PC A32 register shifted left by exactly two. Each entry must be aligned and
+decode as an executable A32 instruction in file-backed bytes. A contiguous
+`CMP Rm, #limit` plus `BHS default` bounds the table to `limit` entries;
+`BHI default` bounds it to `limit + 1`. Guard evidence uses the shared complete
+CFG predecessor proof and is withheld for incomplete function/snapshot data.
+Without that proof the scanner checks at most 4096 entries, stops at the first
+unreadable or invalid target, and leaves the case count/default absent. The
+verified cases retain their table-order indices and encoded-byte provenance.
+Interworking pointers with bit zero set are rejected because their Thumb target
+context cannot be represented by this A32-only recovery path. Other A32
+indexed-load forms, conditional loads, and PC-relative setup sequences are
+unsupported.

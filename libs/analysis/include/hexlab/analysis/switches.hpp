@@ -59,8 +59,11 @@ struct SwitchAnalysis {
     bool complete = true;
 };
 
-// Recovers bounded x86 and AArch64 jump tables from statically based indexed indirect
-// JMP, or the contiguous x86-64 LEA (RIP-relative table base), MOVSXD
+// Recovers bounded x86, AArch64, Thumb, and A32 jump tables from recognized
+// indexed indirect dispatch forms. A32 LDR-PC tables require aligned ARM-mode
+// targets; mixed ARM/Thumb interworking slots are not represented. x86 supports
+// statically based indexed indirect JMPs and the contiguous x86-64 LEA
+// (RIP-relative table base), MOVSXD
 // ([base + index*4]), ADD (loaded value + table base), JMP (loaded register)
 // sequence. The LEA may be earlier in the same basic block when its value has
 // no intervening writes, calls, unknown facts, or control-flow changes. The
