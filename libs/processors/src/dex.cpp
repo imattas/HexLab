@@ -357,7 +357,21 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated optimized DEX quick field access");
         text = std::string(names[op - 0xf2]) + " " + vr(hi & 15) + ", " + vr(hi >> 4) +
                ", fieldoff@" + std::to_string(word(1));
-    } else if (op == 0xee || op == 0xef || op == 0xf0 || op == 0xf8 || op == 0xf9) {
+    } else if (op == 0xf0) {
+        words = 3;
+        if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated optimized DEX object-initializer invoke");
+        const auto method_index = word(1);
+        if (hi == 1) {
+            // API 14+ ODEX uses 3rc: one argument word and a 16-bit start vreg.
+            text = "invoke-object-init/range {" + vr(word(2)) + "}, method@" + std::to_string(method_index);
+        } else if ((hi >> 4) == 1) {
+            // API <=13 called this invoke-direct-empty and used 35c.
+            text = "invoke-direct-empty {" + vr(word(2) & 15) + "}, method@" + std::to_string(method_index);
+        } else {
+            return fail(DecodeStatus::invalid, "optimized DEX object-initializer invoke must encode exactly one receiver");
+        }
+        flow = FlowKind::call;
+    } else if (op == 0xee || op == 0xef || op == 0xf8 || op == 0xf9) {
         const bool range = op == 0xef || op == 0xf9;
         words = 3;
         if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated optimized DEX invoke");
@@ -375,12 +389,11 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
             const auto packed = word(2);
             const std::array<unsigned, 5> regs{unsigned(packed & 15), unsigned((packed >> 4) & 15),
                 unsigned((packed >> 8) & 15), unsigned((packed >> 12) & 15), unsigned((hi >> 4) & 15)};
-            text = std::string(op == 0xee ? "execute-inline {" : op == 0xf0 ? "invoke-object-init/range {" : "invoke-virtual-quick {");
+            text = std::string(op == 0xee ? "execute-inline {" : "invoke-virtual-quick {");
             for (unsigned n = 0; n < count; ++n) { if (n) text += ", "; text += vr(regs[n]); }
         }
         text += "}";
         if (op == 0xee || op == 0xef) text += ", inline@" + std::to_string(index);
-        else if (op == 0xf0) text += ", method@" + std::to_string(index);
         else text += ", vtable@" + std::to_string(index);
         flow = FlowKind::call;
     } else if ((op >= 0x32 && op <= 0x37) || (op >= 0x38 && op <= 0x3d)) {
@@ -565,7 +578,12 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         // arguments. Prototype/type resolution belongs to method analysis.
         imm(word(1), 16, 16);
         if (invoke_ext && (op == 0xfa || op == 0xfb)) imm(word(3), 16, 16);
-    } else if (op == 0xee || op == 0xef || op == 0xf0 || op == 0xf8 || op == 0xf9) {
+    } else if (op == 0xf0) {
+        if (hi == 1) reg(word(2), read);
+        else if ((hi >> 4) == 1) reg(word(2) & 15, read);
+        else return fail(DecodeStatus::invalid, "optimized DEX object-initializer invoke must encode exactly one receiver");
+        imm(word(1), 16, 16);
+    } else if (op == 0xee || op == 0xef || op == 0xf8 || op == 0xf9) {
         const bool range = op == 0xef || op == 0xf9;
         const unsigned count = range ? hi : ((first >> 12) & 15);
         if (!range && count > 5)
