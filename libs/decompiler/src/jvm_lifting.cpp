@@ -108,6 +108,50 @@ std::optional<std::string> string_concat_recipe(const JvmMetadata &metadata,cons
     }
     return encoded;
 }
+std::optional<std::string> string_concat_bootstrap_constants(
+    const JvmMetadata &metadata, const JvmBootstrapMethod &bootstrap) {
+    if (bootstrap.argument_indices.empty()) return {};
+    std::string encoded;
+    constexpr char hex[] = "0123456789abcdef";
+    for (std::size_t i = 1; i < bootstrap.argument_indices.size(); ++i) {
+        const auto index = bootstrap.argument_indices[i];
+        if (!index || index >= metadata.constant_pool.size()) return {};
+        const auto &constant = metadata.constant_pool[index];
+        if (i > 1) encoded += ",";
+        if (constant.tag == 8) {
+            if (!constant.first || constant.first >= metadata.constant_pool.size() ||
+                metadata.constant_pool[constant.first].tag != 1) return {};
+            const auto &value = metadata.constant_pool[constant.first].text;
+            encoded += "string=\"";
+            for (unsigned char c : value) {
+                if (c == '\"') { encoded.push_back(static_cast<char>(0x5c)); encoded.push_back('\"'); }
+                else if (c == '\n') encoded += "\\n";
+                else if (c == '\r') encoded += "\\r";
+                else if (c == '\t') encoded += "\\t";
+                else if (c < 0x20 || c >= 0x7f) {
+                    encoded += "\\x"; encoded.push_back(hex[c >> 4]); encoded.push_back(hex[c & 15]);
+                } else encoded.push_back(static_cast<char>(c));
+            }
+            encoded += "\"";
+        } else if (constant.tag == 3 || constant.tag == 4 || constant.tag == 5 || constant.tag == 6) {
+            const unsigned digits = constant.tag == 3 || constant.tag == 4 ? 8u : 16u;
+            switch (constant.tag) {
+            case 3: encoded += "int32_raw=0x"; break;
+            case 4: encoded += "float32_bits=0x"; break;
+            case 5: encoded += "long64_raw=0x"; break;
+            case 6: encoded += "double64_bits=0x"; break;
+            default: return {};
+            }
+            for (unsigned n = digits; n > 0; --n)
+                encoded.push_back(hex[(constant.first >> ((n - 1) * 4)) & 0xf]);
+        } else {
+            // Bootstrap constants outside the primitive and string forms have
+            // runtime conversion/linkage semantics that this lifter does not model.
+            return {};
+        }
+    }
+    return encoded;
+}
 Result<DynamicCallSite> cp_dynamic_constant(const JvmMetadata &metadata, std::uint64_t index) {
     if (index == 0 || index >= metadata.constant_pool.size() || metadata.constant_pool[index].tag != 17)
         return no("dynamic constant-pool entry is invalid");
@@ -852,8 +896,13 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                         const auto marker_count=[&](std::string_view marker){std::size_t count=0,pos=0;while((pos=recipe->find(marker,pos))!=std::string::npos){++count;pos+=marker.size();}return count;};
                         const auto dynamic_markers=marker_count("\\x01");
                         const auto constant_markers=marker_count("\\x02");
-                        if(dynamic_markers==signature.value().parameters.size()&&constant_markers+1==bootstrap.argument_indices.size())
+                        if(dynamic_markers==signature.value().parameters.size()&&constant_markers+1==bootstrap.argument_indices.size()) {
                             call.name+=" concat_recipe=\""+*recipe+"\"";
+                            if (constant_markers) {
+                                if (auto constants = string_concat_bootstrap_constants(*metadata, bootstrap))
+                                    call.name += " concat_constants=[" + *constants + "]";
+                            }
+                        }
                     }
                 }
                 call.operands=std::move(arguments);call.memory_effect=IntrinsicMemoryEffect::unknown;

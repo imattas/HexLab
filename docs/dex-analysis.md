@@ -32,7 +32,11 @@ These are index-based records: the loader does not resolve names into shared
 symbols/types or infer verifier properties from access flags. Class rows are
 capped at 250,000; member and interface rows share a one-million-row cap, and
 the retained class records are capped at 64 MiB. Each interface index and
-member owner is validated before retention.
+member owner is validated before retention. For every method with code, the
+loader also checks `code_item.ins_size` against its prototype's incoming word
+count, adding one receiver word for instance methods and two words for each
+`J`/`D` parameter. A mismatch is rejected as malformed input. This validates
+the method entry shape without claiming full Dalvik register-type verification.
 
 For DEX 038 and later, method-handle entries are validated for kind, reserved
 fields, and referenced field/method indexes. Call-site entries are decoded as
@@ -51,7 +55,7 @@ The interpreter validates register, string, type, and code-address references,
 requires an `end_sequence`, and caps each program at two million opcodes and
 the aggregate retained debug metadata at two million rows/64 MiB. Multi-member
 DEX 041 parsing, reverse-endian files, annotation visibility
-interpretation, and verifier semantics are not implemented. Class
+interpretation, and verifier semantics beyond the `ins_size` invariant documented\nbelow are not implemented. Class
 static initializers are retained as class/field-linked `encoded_value` trees.
 Scalar payloads retain their DEX tag, encoded width, normalized payload bits, and exact
 file offset; index-valued tags are checked against their identifier table.
@@ -174,8 +178,8 @@ branches and switches retain byte-relative target/payload operands.
 Registers above 255, wide pairs ending above 255, and register ranges that
 exceed the 16-bit encoding are rejected before narrowing. Range instructions
 with more than 15 register words are unsupported because their trailing table
-index would exceed the shared 16-operand instruction/cache budget. Method
-register-count and invoke prototype validation remain verifier responsibilities.
+index would exceed the shared 16-operand instruction/cache budget. Full
+register-range and invoke-prototype validation remain verifier responsibilities.
 
 Filled-array instructions decode their 35c register list (up to five entries)
 or 3rc contiguous range, retain each source register and the 16-bit type index

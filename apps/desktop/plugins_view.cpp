@@ -192,6 +192,8 @@ PluginsView::PluginsView(wxWindow *parent, std::shared_ptr<plugins::ModuleProvid
     unload_dependents_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { unload_dependents(); });
     invoke_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { invoke_action(); });
     provider_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { run_provider(); });
+    actions_->Bind(wxEVT_LIST_ITEM_ACTIVATED, [this](wxListEvent &) { invoke_action(); });
+    providers_->Bind(wxEVT_LIST_ITEM_ACTIVATED, [this](wxListEvent &) { run_provider(); });
     refresh();
     const auto manager = manager_;
     const auto state = operation_state_;

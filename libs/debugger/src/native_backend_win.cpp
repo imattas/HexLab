@@ -466,11 +466,27 @@ std::optional<Arm32StepDestination> arm32_branch_destination(
             if (target < 0 || target > UINT32_MAX || (target & 1)) return {};
             return Arm32StepDestination{static_cast<DWORD>(target), true};
         };
-        // Thumb-2 B.W (encoding T4). Bounded to the unconditional form; BL,
-        // BLX, and conditional wide branches remain unsupported here.
+        // Thumb-2 B<cond>.W (encoding T3). Branches inside an IT block are
+        // accepted only in the final slot and when both predicates agree.
         if (bytes.size() >= 4 && (half & 0xf800u) == 0xf000u) {
             const auto second = static_cast<std::uint16_t>(std::to_integer<unsigned>(bytes[2]) |
                 (std::to_integer<unsigned>(bytes[3]) << 8));
+            if ((second & 0xd000u) == 0x8000u) {
+                const auto condition = static_cast<unsigned>((half >> 6) & 0xfu);
+                if (condition >= 14 || (in_it && condition != static_cast<unsigned>(it_state >> 4))) return {};
+                const bool take = it_executes && arm32_condition_passed(condition, cpsr);
+                if (!take) return Arm32StepDestination{static_cast<DWORD>(pc + 4u), true};
+                const auto s = static_cast<std::uint32_t>((half >> 10) & 1u);
+                const auto j1 = static_cast<std::uint32_t>((second >> 13) & 1u);
+                const auto j2 = static_cast<std::uint32_t>((second >> 11) & 1u);
+                const auto encoded = (s << 20) | (j2 << 19) | (j1 << 18) |
+                    (static_cast<std::uint32_t>(half & 0x003fu) << 12) |
+                    (static_cast<std::uint32_t>(second & 0x07ffu) << 1);
+                const auto target = static_cast<std::int64_t>(pc) + 4 + arm32_sign_extend(encoded, 21);
+                if (target < 0 || target > UINT32_MAX || (target & 1)) return {};
+                return Arm32StepDestination{static_cast<DWORD>(target), true};
+            }
+            // Thumb-2 B.W (encoding T4), the unconditional form.
             if ((second & 0xd000u) == 0x9000u) {
                 if (!it_executes) return Arm32StepDestination{static_cast<DWORD>(pc + 4u), true};
                 const auto s = static_cast<std::uint32_t>((half >> 10) & 1u);
