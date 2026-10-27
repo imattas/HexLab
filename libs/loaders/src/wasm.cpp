@@ -1075,6 +1075,40 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
                 return fail("invalid memory size/grow memory index");
             if (op == 0x40 && !pop(0x7f)) return fail("memory.grow operand must be i32");
             if (!push(0x7f)) return fail("operand stack limit exceeded");
+        } else if (op == 0xfc) {
+            std::uint32_t subopcode = 0, first = 0, second = 0;
+            if (!code.uleb(subopcode)) return fail("invalid bulk-memory subopcode");
+            const auto memory_count = metadata.imported_memories + metadata.defined_memories;
+            if (subopcode == 8) {
+                if (!code.uleb(first) || !code.uleb(second)) return fail("truncated memory.init immediates");
+                if (!metadata.declared_data_count || first >= *metadata.declared_data_count ||
+                    memory_count != 1 || second != 0)
+                    return fail("memory.init requires a declared data segment and memory index zero");
+                if (!pop(0x7f) || !pop(0x7f) || !pop(0x7f))
+                    return fail("memory.init requires destination, source, and length i32 operands");
+            } else if (subopcode == 9) {
+                if (!code.uleb(first)) return fail("truncated data.drop segment index");
+                if (!metadata.declared_data_count || first >= *metadata.declared_data_count)
+                    return fail("data.drop segment index is out of range or data-count is missing");
+            } else if (subopcode == 10) {
+                if (!code.uleb(first) || !code.uleb(second)) return fail("truncated memory.copy immediates");
+                if (memory_count != 1 || first != 0 || second != 0)
+                    return fail("memory.copy requires one memory and both indices zero");
+                if (!pop(0x7f) || !pop(0x7f) || !pop(0x7f))
+                    return fail("memory.copy requires destination, source, and length i32 operands");
+            } else if (subopcode == 11) {
+                if (!code.uleb(first)) return fail("truncated memory.fill memory index");
+                if (memory_count != 1 || first != 0)
+                    return fail("memory.fill requires one memory and index zero");
+                if (!pop(0x7f) || !pop(0x7f) || !pop(0x7f))
+                    return fail("memory.fill requires destination, byte value, and length i32 operands");
+            } else {
+                unsupported = true;
+                return fail("bulk-memory subopcode is outside the enabled subset");
+            }
+        } else if (op >= 0xc0 && op <= 0xc4) {
+            const std::uint8_t type = op <= 0xc1 ? std::uint8_t{0x7f} : std::uint8_t{0x7e};
+            if (!pop(type) || !push(type)) return fail("sign-extension operand type mismatch");
         } else if (op >= 0x41 && op <= 0x44) {
             if (op == 0x41 || op == 0x42) {
                 if (!code.sleb(op == 0x41 ? 32 : 64)) return fail("invalid integer constant");

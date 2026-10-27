@@ -442,7 +442,11 @@ enum class Opcode {
     // EVEX packed floating compare-to-opmask forms; append to preserve IDs.
     vcmpps, vcmppd,
     // RVV reciprocal estimate intrinsics; append to preserve cached IDs.
-    rv_vfrsqrt7_v, rv_vfrec7_v
+    rv_vfrsqrt7_v, rv_vfrec7_v,
+    // x86 wide memory compare-exchange; appended to retain persisted IDs.
+    cmpxchg8b, cmpxchg16b,
+    // BMI2 scalar integer operations; append to preserve serialized opcode IDs.
+    bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
