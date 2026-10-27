@@ -22,11 +22,16 @@ std::size_t context_prefix_size(std::uint16_t architecture) {
 }
 
 MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::byte> input,
-                              std::uint32_t source_rva, std::uint32_t source_size) {
+                              std::uint32_t source_rva, std::uint32_t source_size,
+                              std::uint32_t xstate_context_size,
+                              std::span<const XstateFeatureInfo> xstate_features) {
     MinidumpContext result;
     result.processor_architecture = architecture;
     result.source_rva = source_rva; result.source_size = source_size;
-    const auto bytes = input.first(std::min({input.size(), static_cast<std::size_t>(source_size), context_prefix_size(architecture)}));
+    std::size_t decode_size = context_prefix_size(architecture);
+    if (architecture == 9 && input.size() >= 52 && (fixed(input, 48, 4) & 0x40u))
+        decode_size += 64u * 1024u;
+    const auto bytes = input.first(std::min({input.size(), static_cast<std::size_t>(source_size), decode_size}));
     result.captured_prefix.assign(bytes.begin(), bytes.end());
     const std::uint64_t family = architecture == 0 ? 0x10000u : architecture == 5 ? 0x200000u
         : architecture == 9 ? 0x100000u : architecture == 12 ? 0x400000u
@@ -130,6 +135,60 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
             add("fxsave_mxcsr",280,4);
             for (std::size_t i=0;i<8;++i) add("st"+std::to_string(i),288+i*16,10);
             for (std::size_t i=0;i<16;++i) add("xmm"+std::to_string(i),416+i*16,16);
+        }
+        if (result.flags & 0x40u) {
+            constexpr std::uint64_t xsave_area_in_context = 256;
+            constexpr std::size_t xsave_header_in_context = 768;
+            constexpr std::size_t xstate_chunk_bytes = 16;
+            const bool xsave_header_valid = bytes.size() >= xsave_header_in_context + 8;
+            const auto in_use = xsave_header_valid ? fixed(bytes, xsave_header_in_context, 8) : 0;
+            bool omitted = xstate_context_size == 0 || !xsave_header_valid;
+            std::uint64_t retained = 0;
+            if (xsave_header_valid) {
+                for (std::size_t index = 3; index < 64; ++index) {
+                    if ((in_use & (std::uint64_t{1} << index)) &&
+                        std::none_of(xstate_features.begin(), xstate_features.end(), [&](const auto &feature) {
+                            return feature.index == index;
+                        })) omitted = true;
+                }
+            }
+            for (const auto &feature : xstate_features) {
+                // Features 0 through 2 (legacy FP, SSE, and AVX) are already
+                // represented by the fixed AMD64 CONTEXT fields.
+                if (feature.index < 3) continue;
+                if (!(in_use & (std::uint64_t{1} << feature.index))) continue;
+                const std::uint64_t offset = feature.offset;
+                const std::uint64_t size = feature.size;
+                if (!size || offset > xstate_context_size || size > xstate_context_size - offset ||
+                    offset > UINT64_MAX - xsave_area_in_context ||
+                    size > UINT64_MAX - xsave_area_in_context - offset) {
+                    omitted = true;
+                    result.diagnostics.emplace_back("AMD64 XSTATE feature has an invalid offset or size");
+                    continue;
+                }
+                const std::uint64_t begin = xsave_area_in_context + offset;
+                const std::uint64_t end = begin + size;
+                if (end > bytes.size() || end > source_size ||
+                    retained > 64u * 1024u || size > 64u * 1024u - retained) {
+                    omitted = true;
+                    continue;
+                }
+                retained += size;
+                for (std::uint64_t part = 0, at = begin; at < end; ++part) {
+                    const auto chunk = static_cast<std::size_t>(std::min<std::uint64_t>(xstate_chunk_bytes, end - at));
+                    add("xstate_feature_" + std::to_string(feature.index) + "_part_" + std::to_string(part),
+                        static_cast<std::size_t>(at), chunk);
+                    at += chunk;
+                }
+            }
+            if (xstate_context_size == 0) {
+                result.diagnostics.emplace_back("AMD64 XSTATE is requested but no validated MiscInfo5 feature map is available");
+            } else if (!xsave_header_valid) {
+                result.diagnostics.emplace_back("AMD64 XSTATE header is truncated from the captured context");
+            } else {
+                result.diagnostics.emplace_back("AMD64 XSTATE components are retained as opaque 16-byte chunks; feature semantics remain unsupported");
+            }
+            if (omitted) result.diagnostics.emplace_back("Some AMD64 XSTATE feature bytes exceed the validated source extent or 64 KiB capture bound");
         }
     } else if (architecture == 5) {
         if (group(2,56,"ARM integer")) {

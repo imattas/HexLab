@@ -404,6 +404,17 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         i.operands = {reg(rs)}; i.access = {OperandAccess::read}; i.register_reads = {reg(rs)};
         i.flow = FlowKind::conditional_branch; target(i, signed16(word)); i.access.push_back(OperandAccess::address); i.delay_slots = 1;
     } else if (op == 1) {
+        if (rt == 8 || rt == 9 || rt == 10 || rt == 11 || rt == 12 || rt == 14) {
+            static constexpr Opcode trap_operations[]{Opcode::mips64_tgei, Opcode::mips64_tgeiu,
+                Opcode::mips64_tlti, Opcode::mips64_tltiu, Opcode::mips64_teqi, Opcode::mips64_tnei};
+            const unsigned index = rt == 8 ? 0 : rt == 9 ? 1 : rt == 10 ? 2 :
+                                   rt == 11 ? 3 : rt == 12 ? 4 : 5;
+            i.opcode = trap_operations[index];
+            i.operands = {reg(rs), ImmediateOperand{static_cast<std::uint64_t>(signed16(word)), 16, 64,
+                                                     true, EncodedField{2, 2}}};
+            i.access = {OperandAccess::read, OperandAccess::read};
+            if (rs) i.register_reads = {reg(rs)};
+        } else {
         if (rt > 3 && (rt < 16 || rt > 19)) return {DecodeStatus::unsupported, {}, "MIPS64 REGIMM suboperation is unsupported"};
         const bool link = rt >= 16;
         const bool ge_zero = (rt & 1) != 0;
@@ -415,6 +426,7 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         i.operands = {reg(rs)}; i.access = {OperandAccess::read}; i.register_reads = {reg(rs)};
         if (link) i.register_writes = {reg(31)};
         i.flow = FlowKind::conditional_branch; target(i, signed16(word)); i.access.push_back(OperandAccess::address); i.delay_slots = 1;
+        }
     } else if (op == 0x08 || op == 0x09 || op == 0x0a || op == 0x0b || (op >= 0x0c && op <= 0x0e) || op == 0x18 || op == 0x19) {
         i.opcode = op == 0x08 ? Opcode::mips64_addi : op == 0x09 ? Opcode::mips64_addiu : op == 0x0a ? Opcode::mips64_slti :
                    op == 0x0b ? Opcode::mips64_sltiu : op == 0x0c ? Opcode::mips_andi : op == 0x0d ? Opcode::mips_ori :

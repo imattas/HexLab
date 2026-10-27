@@ -42,8 +42,11 @@ The parser retains the lower 32-bit target payload (4-bit segment index plus
 28-bit segment offset), the 12-bit next field, and authenticated diversity,
 address-diversity, and key fields. It leaves every format-14 row incomplete
 because this loader has no segmented-address table, so no target address is
-assembled or resolved. The current Ghidra implementation does not enumerate
-format 14; Apple's header is the format authority for this decode.
+assembled or resolved. Chain traversal advances by four bytes per `next`
+unit even though each pointer occupies eight bytes; overlapping pointer words
+are retained but marked incomplete by the normal overlap check. The current
+Ghidra implementation does not enumerate format 14; Apple's header is the
+format authority for this decode.
 
 The 32-bit cache (format 4) and firmware (format 5) pointer formats retain
 their bounded 30-bit/2-bit and 26-bit/6-bit target/next fields respectively,

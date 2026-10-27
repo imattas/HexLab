@@ -148,6 +148,19 @@ struct X87AddSubtractRequest {
 HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
 evaluate_x87_add_subtract(const X87AddSubtractRequest &request) noexcept;
 
+enum class X87DivisionOperation : std::uint8_t { divide, reverse };
+struct X87DivideRequest {
+    X87Binary80 left, right;
+    X87DivisionOperation operation = X87DivisionOperation::divide;
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+};
+// Evaluate finite, nonzero binary80 FDIV/FDIVR operands using exact quotient
+// bits, x87 precision/rounding control, gradual underflow, and exception
+// masks. Zero, infinity, NaN, and unsupported encodings fail closed.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
+evaluate_x87_divide(const X87DivideRequest &request) noexcept;
+
 enum class X87UnaryArithmetic : std::uint8_t { change_sign, absolute };
 struct X87UnaryResult {
     X87Binary80 value;

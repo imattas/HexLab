@@ -13,10 +13,11 @@ reference, rvalue-reference, const, and volatile types. Function and
 member-function pointer declarators preserve C++ precedence, rendering forms
 such as `int (*)(float)` and `int (Widget::*)(float)`. Template arguments
 support bounded integer literals and recursive `X <expression> E` arithmetic,
-comparison, bitwise, logical, assignment, and unary expression forms. The
+comparison, bitwise, logical, assignment, unary, and conditional (`qu`)
+expression forms. The
 supported expression operands are themselves integer literals; calls, casts,
-conditional expressions, template-parameter references inside expressions,
-and other expression productions remain unsupported. Vendor-qualified types
+template-parameter references inside expressions, and other expression
+productions remain unsupported. Vendor-qualified types
 using `U <source-name> <type>` are presented as a GNU-style
 `__attribute__((name))` suffix. It recognizes a
 bounded subset of Microsoft decorated free and member functions. In addition
@@ -85,8 +86,9 @@ type grammar as ordinary names.
 This is not a complete implementation of either ABI. The Itanium substitutions
 described below, array/function/member-pointer types, and selected template
 parameters are recognized; vendor extensions, local-name discriminator
-variants, expression-valued template arguments, and broader operator/type
-encodings remain incomplete, including expression calls/casts/conditionals,
+variants, expression-valued template arguments beyond the bounded integer
+expression grammar, and broader operator/type
+encodings remain incomplete, including expression calls/casts,
 template parameter references inside expressions, and unrecognized vendor
 qualifiers. Microsoft thunks and other special names,
 non-integral template values (including pointers, member pointers, symbol
@@ -147,7 +149,7 @@ Parsing depth and total component work remain bounded even when a symbol uses
 many references. Unsupported productions fail the complete parse; no partial
 presentation replaces raw identity. Local/lambda/special names, dependent
 qualified/template-template names, ref-qualified function-type encodings,
-expression calls/casts/conditionals, and vendor qualifier template arguments
+expression calls/casts, and vendor qualifier template arguments
 remain outside this slice. Incomplete/cv-qualified array declarators and other
 unproven qualifier forms also fail closed.
 

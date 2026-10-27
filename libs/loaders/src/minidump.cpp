@@ -9,10 +9,13 @@ namespace {
 constexpr std::uint32_t stream_thread_list = 3, stream_module_list = 4,
     stream_memory_list = 5, stream_exception = 6, stream_system_info = 7,
     stream_memory64_list = 9, stream_unloaded_module_list = 14,
-    stream_memory_info = 16, stream_thread_names = 24;
+    stream_misc_info = 15, stream_memory_info = 16, stream_thread_names = 24;
 constexpr std::uint64_t max_streams = 4096, max_memory_regions = 131072,
     max_modules = 65536, max_threads = 65536, max_metadata_bytes = 64u * 1024u * 1024u;
 constexpr std::uint64_t max_decoded_contexts = 4096;
+constexpr std::size_t misc_info5_xstate_offset = 832;
+constexpr std::size_t xstate_config_feature_size = 528;
+constexpr std::size_t max_xstate_context_bytes = 64u * 1024u;
 
 bool extent(std::uint64_t offset, std::uint64_t size, std::uint64_t total) {
     return offset <= total && size <= total - offset;
@@ -119,7 +122,7 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                     return existing.type == row.type && (row.type == stream_thread_list || row.type == stream_module_list ||
                         row.type == stream_memory_list || row.type == stream_exception || row.type == stream_system_info ||
                         row.type == stream_memory64_list || row.type == stream_unloaded_module_list ||
-                        row.type == stream_memory_info || row.type == stream_thread_names);
+                        row.type == stream_misc_info || row.type == stream_memory_info || row.type == stream_thread_names);
                 }) != streams.end())
                 return Error{ErrorCode::malformed, "Minidump contains duplicate standard streams"};
             streams.push_back(row);
@@ -141,6 +144,46 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
             metadata.processor_count = static_cast<std::uint8_t>(u(bytes.value().bytes, 6, 1));
         } else metadata.diagnostics.emplace_back("Minidump has no SystemInfo stream; decode architecture is unknown");
 
+        std::vector<minidump_detail::XstateFeatureInfo> xstate_features;
+        std::uint32_t xstate_context_size = 0;
+        if (auto misc = stream(stream_misc_info)) {
+            if (misc->size < 4) {
+                metadata.diagnostics.emplace_back("Minidump MiscInfo stream is truncated before SizeOfInfo");
+            } else {
+                auto size_bytes = read(*storage, misc->rva, 4);
+                if (!size_bytes) return size_bytes.error();
+                const auto declared = static_cast<std::size_t>(u(size_bytes.value().bytes, 0, 4));
+                if (declared < 4 || declared > misc->size) {
+                    metadata.diagnostics.emplace_back("Minidump MiscInfo SizeOfInfo is inconsistent with its stream extent");
+                } else if (declared >= misc_info5_xstate_offset + xstate_config_feature_size) {
+                    auto info = read(*storage, misc->rva, misc_info5_xstate_offset + xstate_config_feature_size);
+                    if (!info) return info.error();
+                    const auto info_size = static_cast<std::size_t>(u(info.value().bytes, misc_info5_xstate_offset, 4));
+                    xstate_context_size = static_cast<std::uint32_t>(u(info.value().bytes, misc_info5_xstate_offset + 4, 4));
+                    const auto enabled = u(info.value().bytes, misc_info5_xstate_offset + 8, 8);
+                    bool valid = info_size >= xstate_config_feature_size &&
+                                 info_size <= declared - misc_info5_xstate_offset &&
+                                 xstate_context_size != 0 && xstate_context_size <= 1024u * 1024u;
+                    for (std::size_t index = 0; index < 64; ++index) {
+                        if (!(enabled & (std::uint64_t{1} << index))) continue;
+                        const auto at = misc_info5_xstate_offset + 16 + index * 8;
+                        const auto offset = static_cast<std::uint32_t>(u(info.value().bytes, at, 4));
+                        const auto size = static_cast<std::uint32_t>(u(info.value().bytes, at + 4, 4));
+                        if (!size || offset > xstate_context_size || size > xstate_context_size - offset) {
+                            valid = false;
+                            break;
+                        }
+                        xstate_features.push_back({static_cast<std::uint8_t>(index), offset, size});
+                    }
+                    if (!valid) {
+                        xstate_features.clear();
+                        xstate_context_size = 0;
+                        metadata.diagnostics.emplace_back("Minidump MiscInfo5 XSTATE feature map is inconsistent or exceeds its validation bounds");
+                    }
+                }
+            }
+        }
+
         auto context_at = [&](std::uint32_t size, std::uint32_t rva)
             -> Result<std::optional<MinidumpContext>> {
             if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump context decoding canceled"};
@@ -155,9 +198,25 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                 return std::optional<MinidumpContext>{};
             }
             const auto prefix = minidump_detail::context_prefix_size(metadata.processor_architecture);
-            auto data = read(*storage, rva, std::min<std::size_t>(size, prefix));
+            std::size_t capture_size = std::min<std::size_t>(size, prefix);
+            auto initial = read(*storage, rva, capture_size);
+            if (!initial) return initial.error();
+            if (metadata.processor_architecture == 9 && initial.value().bytes.size() >= 52 &&
+                (u(initial.value().bytes, 48, 4) & 0x40u) && xstate_context_size) {
+                constexpr std::uint64_t amd64_xsave_base = 256;
+                for (const auto &feature : xstate_features) {
+                    if (feature.index < 2) continue;
+                    const std::uint64_t end = amd64_xsave_base + feature.offset + feature.size;
+                    if (end <= size && end <= prefix + max_xstate_context_bytes)
+                        capture_size = std::max(capture_size, static_cast<std::size_t>(end));
+                }
+            }
+            auto data = capture_size == initial.value().bytes.size()
+                ? std::move(initial)
+                : read(*storage, rva, capture_size);
             if (!data) return data.error();
-            auto context = minidump_detail::decode_context(metadata.processor_architecture, data.value().bytes, rva, size);
+            auto context = minidump_detail::decode_context(metadata.processor_architecture, data.value().bytes, rva, size,
+                                                            xstate_context_size, xstate_features);
             if (context.status != MinidumpContextStatus::decoded) ++context_issue_count;
             std::uint64_t cost = sizeof(MinidumpContext) + context.registers.size() * sizeof(MinidumpRegister);
             cost += context.captured_prefix.size();

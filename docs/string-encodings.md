@@ -1,9 +1,12 @@
 # String encoding candidates
 
 String discovery reports the encoding used to decode each candidate. UTF-8 is
-validated strictly; UTF-16 rejects isolated surrogates; UTF-32 rejects invalid
-scalars. ASCII-only text is reported as ASCII, while multibyte candidates keep
-their explicit byte order.
+validated strictly; UTF-16LE and UTF-16BE reject isolated surrogates and scan
+both possible two-byte alignments; UTF-32LE and UTF-32BE reject invalid
+scalars. Unicode NUL code units terminate candidates. Each record retains the
+original source byte start and length, its encoding and termination state, and
+the mapped address when one exists. ASCII-only text is reported as ASCII,
+while multibyte candidates keep their explicit byte order.
 
 Windows-1252 is also scanned as a heuristic single-byte candidate. Bytes in
 the printable Latin-1 range map to the same Unicode scalar, and the Windows

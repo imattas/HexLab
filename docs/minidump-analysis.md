@@ -31,7 +31,7 @@ The supported fixed little-endian Windows CONTEXT layouts are:
 | Architecture | Captured register groups |
 | --- | --- |
 | x86 | Control (`ebp`, `eip`, `esp`, segments and flags), integer, segments, debug, legacy x87, and extended FXSAVE x87/XMM0-7/MXCSR. Extended storage takes precedence when both floating layouts are present. |
-| AMD64 | Control (`rsp`, `rip`, segments and flags), integer, segments, debug, and fixed x87/XMM0-15/MXCSR floating storage. Both top-level and FXSAVE MXCSR copies are retained. |
+| AMD64 | Control (`rsp`, `rip`, segments and flags), integer, segments, debug, and fixed x87/XMM0-15/MXCSR floating storage. Both top-level and FXSAVE MXCSR copies are retained. When `CONTEXT_XSTATE` and a validated MiscInfo5 map are present, non-legacy XSAVE components are retained as opaque 16-byte chunks with checked source offsets. |
 | ARM32 | Control (`sp`, `lr`, `pc`, `cpsr`), integer R0-12, FPSCR and D0-31/Q0-15 aliases, and fixed breakpoint/watchpoint registers. |
 | ARM64 | Control (`x29`, `x30`, `sp`, `pc`, `cpsr`), integer X0-28 with X18 retained only when explicitly requested by its separate flag, full or low/high partial NEON V-register storage, FPCR/FPSR when the low/full group is available, and fixed breakpoint/watchpoint registers. |
 | Breakpad ARM64 (`processor_architecture=0x8003`) | Its packed legacy layout and 64-bit ContextFlags are decoded separately: integer/control group includes X0-X30, SP, PC and CPSR; floating group includes FPSR, FPCR and V0-V31. |
@@ -51,7 +51,8 @@ zero-size contexts remain absent. Nonempty null or out-of-file context extents
 reject the input; in-range incomplete layouts remain inspectable with status
 and diagnostics. Context issues also mark overall metadata incomplete.
 
-Context reads retain at most 716 bytes for x86, 416 for ARM32, 1,232 for AMD64,
+Context reads retain at most 716 bytes for x86, 416 for ARM32, 1,232 fixed bytes
+for AMD64 plus a 64 KiB bounded XSTATE extension when available,
 912 for Microsoft ARM64, 796 for Breakpad ARM64, and 64 for unknown architectures. The full advertised source
 extent is validated even when only a prefix is decoded. Decoding is capped at
 4,096 contexts; later descriptors retain source extents with a global diagnostic.
@@ -76,7 +77,15 @@ receive their corresponding decode modes; ARM remains mode-unknown because
 module records do not establish ARM versus Thumb state. A mapped exception
 address becomes the image entry.
 
-XSTATE/AVX/AVX-512, CET, ARM scalable state, ARM64EC alternate context layouts,
+AVX-512 values beyond the fixed AVX register context are retained as opaque
+feature-ID chunks only; the processor state layouts and execution semantics
+are not decoded. Legacy floating-point, SSE, and AVX feature IDs 0–2 remain in
+the fixed AMD64 context fields. Context XSTATE chunks
+are included only when the MiscInfo5 feature table validates and the checked
+XSAVE-relative range (`256 + feature offset`) is present in the original
+context extent and the corresponding XSTATE_BV bit marks the component in use.
+Unknown feature IDs are preserved. CET, ARM scalable state,
+ARM64EC alternate context layouts,
 WOW64 context-family substitution, architecture inference from bytes, and other
 processor layouts are unsupported. Unsupported group flags yield a partial
 context while preserving supported groups and original source extents; extended

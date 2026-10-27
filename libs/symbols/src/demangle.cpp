@@ -409,6 +409,12 @@ class Itanium {
         static constexpr std::pair<std::string_view, std::string_view> unary[] = {
             {"ps", "+"}, {"ng", "-"}, {"ad", "&"}, {"de", "*"}, {"co", "~"}, {"nt", "!"}};
         for (const auto &[code, op] : unary) if (take(code)) return combine({"(", op, expression(d + 1), ")"});
+        if (take("qu")) {
+            const auto condition = expression(d + 1);
+            const auto when_true = expression(d + 1);
+            const auto when_false = expression(d + 1);
+            return combine({"(", condition, " ? ", when_true, " : ", when_false, ")"});
+        }
         static constexpr std::pair<std::string_view, std::string_view> binary[] = {
             {"pl", "+"}, {"mi", "-"}, {"ml", "*"}, {"dv", "/"}, {"rm", "%"},
             {"an", "&"}, {"or", "|"}, {"eo", "^"}, {"ls", "<<"}, {"rs", ">>"},

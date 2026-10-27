@@ -3147,6 +3147,11 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     return {};
                 return found->second;
             };
+            const bool known_pc_predicate = instruction.arm &&
+                (instruction.arm->predicate == ArmPredicate::always ||
+                 (instruction.arm->predicate == ArmPredicate::condition && instruction.condition < 14));
+            const bool pc_write_may_execute = instruction.arm && instruction.arm->writes_pc &&
+                known_pc_predicate && predicate_executes != false;
             if (instruction.opcode == Opcode::t32_adr && instruction.operands.size() >= 2) {
                 const auto *destination = architecture_register(instruction, 0, RegisterBank::arm32_gpr, 32);
                 const auto *literal = std::get_if<ArmMemoryOperand>(&instruction.operands[1]);
@@ -3155,16 +3160,16 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                     definition = {{destination->index, *literal->resolved_address}};
             } else if (instruction.opcode == Opcode::a32_mov && instruction.operands.size() == 2) {
                 const auto *destination = architecture_register(instruction, 0, RegisterBank::arm32_gpr, 32);
-                if (arm_instruction_unconditional && destination) {
+                if (destination) {
                     if (const auto operand2 = arm_operand2_value(instruction.operands[1])) {
-                        if (destination->index == 15 && instruction.arm->writes_pc) {
+                        if (destination->index == 15 && pc_write_may_execute) {
                             if (const auto target = arm_pc_target(instruction, *operand2)) {
                                 const ReferenceOperandKey key{fact->id,
                                     analysis_detail::control_operand_index(instruction)};
                                 result.immediate_targets[key] = target->first;
                                 result.target_modes[key] = target->second;
                             }
-                        } else if (destination->index != 15) {
+                        } else if (arm_instruction_unconditional && destination->index != 15) {
                             definition = {{destination->index, Address{instruction.address.space, *operand2}}};
                             const Address target{instruction.address.space, *operand2};
                             if (std::holds_alternative<ImmediateOperand>(instruction.operands[1]) &&
@@ -3175,17 +3180,17 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                 }
             } else if (instruction.opcode == Opcode::a32_mvn && instruction.operands.size() == 2) {
                 const auto *destination = architecture_register(instruction, 0, RegisterBank::arm32_gpr, 32);
-                if (arm_instruction_unconditional && destination) {
+                if (destination) {
                     if (const auto operand2 = arm_operand2_value(instruction.operands[1])) {
                         const auto value = static_cast<std::uint32_t>(~*operand2);
-                        if (destination->index == 15 && instruction.arm->writes_pc) {
+                        if (destination->index == 15 && pc_write_may_execute) {
                             if (const auto target = arm_pc_target(instruction, value)) {
                                 const ReferenceOperandKey key{fact->id,
                                     analysis_detail::control_operand_index(instruction)};
                                 result.immediate_targets[key] = target->first;
                                 result.target_modes[key] = target->second;
                             }
-                        } else if (destination->index != 15) {
+                        } else if (arm_instruction_unconditional && destination->index != 15) {
                             definition = {{destination->index, Address{instruction.address.space, value}}};
                             const Address target{instruction.address.space, value};
                             if (std::holds_alternative<ImmediateOperand>(instruction.operands[1]) &&
@@ -3207,7 +3212,8 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
                 const bool carry_arithmetic = instruction.opcode == Opcode::a32_adc ||
                                                instruction.opcode == Opcode::a32_sbc ||
                                                instruction.opcode == Opcode::a32_rsc;
-                if (arm_instruction_unconditional && destination && source && operand2 &&
+                const bool pc_target_only = destination && destination->index == 15 && pc_write_may_execute;
+                if ((arm_instruction_unconditional || pc_target_only) && destination && source && operand2 &&
                     (!carry_arithmetic || carry)) {
                     std::optional<Address> target;
                     if (carry_arithmetic && source->index != 15 && carry) {

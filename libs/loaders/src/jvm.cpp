@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <string_view>
+#include <unordered_set>
 
 namespace hexlab {
 namespace {
@@ -259,6 +260,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     std::size_t expanded_verification_entries=0,stack_map_frames=0;
     bool have_record=false,have_nest_host=false,have_nest_members=false,have_permitted_subclasses=false;
     bool have_module_packages=false,have_module_main_class=false;
+    std::unordered_set<const JvmMember *> fields_with_constant_value;
     std::function<Result<bool>(bool,JvmMember*,bool,JvmCode*)> attributes;
     attributes=[&](bool method,JvmMember *member,bool class_level,JvmCode *code_owner)->Result<bool>{
         std::uint16_t count=0;if(!r.u2(count))return malformed("truncated attributes_count");
@@ -268,7 +270,24 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             auto an=utf8(name_ix);if(!an)return an.error();const auto start=r.p;if(len>r.b.size()-r.p)return malformed("attribute extent exceeds its enclosing owner");
             ReaderExtent extent{r,r.b};r.b=r.b.first(start+len);
             if(!class_level&&(an.value()=="NestHost"||an.value()=="NestMembers"||an.value()=="PermittedSubclasses"||an.value()=="Record"||an.value()=="Module"||an.value()=="ModulePackages"||an.value()=="ModuleMainClass"))return malformed("class-level attribute appears on a member or Code attribute list");
-            if(an.value()=="StackMapTable"){
+            if(an.value()=="ConstantValue"){
+                if(!member||method||class_level||code_owner)
+                    return malformed("ConstantValue attribute appears outside a field attribute list");
+                if(!fields_with_constant_value.insert(member).second)
+                    return malformed("duplicate ConstantValue attribute on a field");
+                std::uint16_t index=0;
+                if(len!=2||!r.u2(index)||!index||index>=md.constant_pool.size())
+                    return malformed("ConstantValue attribute has an invalid constant index or length");
+                const auto &constant=md.constant_pool[index];
+                const auto &descriptor=member->descriptor;
+                const std::uint8_t expected_tag = descriptor=="B"||descriptor=="C"||descriptor=="I"||descriptor=="S"||descriptor=="Z" ? 3 :
+                    descriptor=="F" ? 4 : descriptor=="J" ? 5 : descriptor=="D" ? 6 :
+                    descriptor=="Ljava/lang/String;" ? 8 : 0;
+                if(!expected_tag||constant.tag!=expected_tag)
+                    return malformed("ConstantValue constant kind does not match the field descriptor");
+                // The value is validated but not represented in JvmMember yet.
+                metadata_complete=false;
+            }else if(an.value()=="StackMapTable"){
                 if(!code_owner||!member)return malformed("StackMapTable appears outside a Code attribute");
                 if(code_owner->stack_map_table)return malformed("duplicate StackMapTable attribute");
                 const auto code_bytes=bytes.subspan(static_cast<std::size_t>(code_owner->file_begin.value),code_owner->code_size);

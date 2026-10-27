@@ -508,7 +508,7 @@ std::optional<X87ArithmeticResult> round_add_sub_result(
         const unsigned subnormal_discard = precision_shift > 0
             ? static_cast<unsigned>(precision_shift) : 0;
         const int signed_shift = 4 - exponent + static_cast<int>(subnormal_discard);
-        if (signed_shift <= 0 || signed_shift >= 128) return {};
+        if (signed_shift <= 0) return {};
         const auto shift = static_cast<unsigned>(signed_shift);
         std::uint64_t subnormal_retained = 0;
         if (shift < 64)
@@ -518,6 +518,9 @@ std::optional<X87ArithmeticResult> round_add_sub_result(
         else
             subnormal_retained = extended.hi >> (shift - 64);
         const bool subnormal_guard = wide_bit(extended, shift - 1);
+        // For results far below the subnormal range, the retained and guard
+        // bits are zero but the jammed sticky bit still distinguishes exact
+        // zero from a nonzero value for directed rounding.
         const bool subnormal_sticky = shift > 1 && wide_any_below(extended, shift - 1);
         const bool subnormal_inexact = subnormal_guard || subnormal_sticky;
         const bool subnormal_increment = round_up(negative,
@@ -1069,6 +1072,73 @@ evaluate_x87_add_subtract(const X87AddSubtractRequest &request) noexcept {
     auto result = round_add_sub_result(combined, exponent, negative, effective_request);
     if (!result) return {};
     return add_denormal_status(std::move(*result));
+}
+
+std::optional<X87ArithmeticResult> evaluate_x87_divide(const X87DivideRequest &request) noexcept {
+    if (((request.control_word >> 8) & 3) == 1 ||
+        (request.operation != X87DivisionOperation::divide &&
+         request.operation != X87DivisionOperation::reverse))
+        return {};
+    auto left = decode(request.left), right = decode(request.right);
+    if (request.operation == X87DivisionOperation::reverse) std::swap(left, right);
+    if (left.kind != Class::finite || right.kind != Class::finite) return {};
+
+    const auto denormal_operand = [](const Decoded &operand) noexcept {
+        return operand.exponent == 0 && (operand.significand & integer_bit) == 0;
+    };
+    const bool denormal = denormal_operand(left) || denormal_operand(right);
+    if (denormal && (request.control_word & fcw_denormal_mask) == 0) {
+        X87ArithmeticResult result;
+        result.status_word = signal_exception(
+            static_cast<std::uint16_t>(request.status_word & ~fsw_c1), fsw_denormal);
+        result.completed = false;
+        return result;
+    }
+
+    const auto numerator = normalize_finite(left);
+    const auto denominator = normalize_finite(right);
+    const bool negative = left.negative != right.negative;
+    std::uint64_t remainder = 0;
+    int exponent = numerator.exponent - denominator.exponent + 16383;
+    std::uint64_t significand = integer_bit;
+    if (numerator.significand >= denominator.significand) {
+        remainder = numerator.significand - denominator.significand;
+    } else {
+        // Both normalized significands have bit 63 set. The exact value
+        // 2*numerator-denominator is nonnegative and below denominator; its
+        // low 64 bits are therefore the exact remainder even if 2*numerator
+        // has a carry into bit 64.
+        remainder = (numerator.significand << 1) - denominator.significand;
+        --exponent;
+    }
+
+    const auto next_quotient_bit = [&]() noexcept {
+        const bool carry = (remainder & integer_bit) != 0;
+        const auto doubled = remainder << 1;
+        if (carry || doubled >= denominator.significand) {
+            remainder = doubled - denominator.significand;
+            return true;
+        }
+        remainder = doubled;
+        return false;
+    };
+    for (int bit = 62; bit >= 0; --bit)
+        if (next_quotient_bit()) significand |= std::uint64_t{1} << bit;
+
+    const bool guard = next_quotient_bit();
+    const bool round = next_quotient_bit();
+    const bool sticky = remainder != 0;
+    const Product128 extended{significand >> 61,
+        (significand << 3) | (static_cast<std::uint64_t>(guard) << 2) |
+        (static_cast<std::uint64_t>(round) << 1) | static_cast<std::uint64_t>(sticky)};
+
+    X87AddSubtractRequest rounding_request;
+    rounding_request.control_word = request.control_word;
+    rounding_request.status_word = static_cast<std::uint16_t>(request.status_word |
+        (denormal ? fsw_denormal : 0));
+    auto result = round_add_sub_result(extended, exponent, negative, rounding_request);
+    if (!result) return {};
+    return result;
 }
 
 X87UnaryResult evaluate_x87_unary(X87Binary80 value, std::uint16_t status_word,
