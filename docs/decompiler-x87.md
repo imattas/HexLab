@@ -28,7 +28,10 @@ rounding and exception outputs unknown.
 The IR includes exact binary80 literals for `FLD1` and `FLDZ` when their
 logical stack output is known. A same-block `FCHS` or `FABS` over one of these
 proven literals is folded through the exact processor semantic helper; inputs
-that remain register values stay symbolic. FIST/FISTP/FISTTP remain named
+that remain register values stay symbolic. `FSQRT` has a typed 80-bit result
+with explicit FCW/FSW dependencies. Constant folding accepts a positive normal
+literal only when the processor evaluator returns the same result under every
+valid precision and rounding setting. FIST/FISTP/FISTTP remain named
 memory-writing intrinsics with decoded stack deltas. The lifter has no proven
 FCW/FSW values or concrete memory input for these instructions, so it does not
 invent a converted store value or claim exception retirement.

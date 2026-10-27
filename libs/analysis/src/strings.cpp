@@ -263,6 +263,31 @@ std::optional<std::uint32_t> decode_windows1257(unsigned byte) {
     if(!scalar)return {};
     return scalar;
 }
+std::optional<std::uint32_t> decode_windows1258(unsigned byte) {
+    // Windows-1258 Vietnamese mapping from the Unicode Consortium's Microsoft table.
+    // Zero entries are undefined positions; combining marks remain separate scalars.
+    static constexpr std::uint16_t high[128]={
+        0x20ac,0,0x201a,0x0192,0x201e,0x2026,0x2020,0x2021,
+        0x02c6,0x2030,0,0x2039,0x0152,0,0,0,
+        0,0x2018,0x2019,0x201c,0x201d,0x2022,0x2013,0x2014,
+        0x02dc,0x2122,0,0x203a,0x0153,0,0,0,
+        0x00a0,0x00a1,0x00a2,0x00a3,0x00a4,0x00a5,0x00a6,0x00a7,
+        0x00a8,0x00a9,0x00aa,0x00ab,0x00ac,0x00ad,0x00ae,0x00af,
+        0x00b0,0x00b1,0x00b2,0x00b3,0x00b4,0x00b5,0x00b6,0x00b7,
+        0x00b8,0x00b9,0x00ba,0x00bb,0x00bc,0x00bd,0x00be,0x00bf,
+        0x00c0,0x00c1,0x00c2,0x0102,0x00c4,0x00c5,0x00c6,0x00c7,
+        0x00c8,0x00c9,0x00ca,0x00cb,0x0300,0x00cd,0x00ce,0x00cf,
+        0x0110,0x00d1,0x0309,0x00d3,0x00d4,0x01a0,0x00d6,0x00d7,
+        0x00d8,0x00d9,0x00da,0x00db,0x00dc,0x01af,0x0303,0x00df,
+        0x00e0,0x00e1,0x00e2,0x0103,0x00e4,0x00e5,0x00e6,0x00e7,
+        0x00e8,0x00e9,0x00ea,0x00eb,0x0301,0x00ed,0x00ee,0x00ef,
+        0x0111,0x00f1,0x0323,0x00f3,0x00f4,0x01a1,0x00f6,0x00f7,
+        0x00f8,0x00f9,0x00fa,0x00fb,0x00fc,0x01b0,0x20ab,0x00ff};
+    if(byte<0x80)return byte;
+    const auto scalar=high[byte-0x80];
+    if(!scalar)return {};
+    return scalar;
+}
 }
 namespace {
 Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& options,
@@ -407,6 +432,16 @@ Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& optio
                 else emit(run,false,StringEncoding::windows1257,range,options,output,true);
             }
             emit(run,false,StringEncoding::windows1257,range,options,output,true);
+            run={};
+            for(auto at=range.begin;at<range.end;++at) {
+                if(((at-range.begin)&4095)==0)check_stop(stop);
+                const auto value=input.byte(at);
+                if(value==0) {emit(run,true,StringEncoding::windows1258,range,options,output,true);continue;}
+                const auto scalar=decode_windows1258(value);
+                if(scalar && printable(*scalar))run.add(at,*scalar,1);
+                else emit(run,false,StringEncoding::windows1258,range,options,output,true);
+            }
+            emit(run,false,StringEncoding::windows1258,range,options,output,true);
         }
     } catch(const BudgetEnd&) {
         output.complete=false;output.diagnostics.push_back({DiagnosticSeverity::warning,"String record budget reached",{}});

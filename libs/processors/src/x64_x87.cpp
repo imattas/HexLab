@@ -270,6 +270,8 @@ bool register_form(State &s, std::uint8_t opcode, unsigned group, unsigned index
                     pop(s);
                 if ((group == 6 && (index == 2 || index == 4)) || (group == 7 && index == 3))
                     push(s);
+                if (group == 7 && index == 2)
+                    arithmetic_environment(s); // FSQRT reads FCW and updates sticky FSW state.
             }
             if (group == 6 && (index == 6 || index == 7)) status_read_write(s);
             return true;

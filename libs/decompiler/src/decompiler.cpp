@@ -1365,6 +1365,22 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 floating_type(80), UnaryValue{name == "fchs" ? "x87_fchs" : "x87_fabs", std::move(input)}});
             return Assign{instruction.register_writes.front(), std::move(value)};
         }
+        if (name == "fsqrt" && numeric_operands.size() == 1 &&
+            std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::x87 && reg.index == 0; }) &&
+            std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::x87_status; })) {
+            auto value = std::make_shared<Expression>(Expression{floating_type(80),
+                UnaryValue{"x87_sqrt", retag_expr(numeric_operands.front(), floating_type(80))}});
+            Intrinsic effect{"x87_fsqrt", std::move(typed_operands), IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.register_output_values.reserve(effect.register_writes.size());
+            for (const auto reg : effect.register_writes)
+                effect.register_output_values.push_back(reg.bank == RegisterBank::x87 && reg.index == 0
+                    ? value : unknown_expr("x87-status-after-fsqrt", reg.width));
+            effect.result_type = floating_type(80);
+            return effect;
+        }
         if (name == "sahf") {
             const auto ah = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
                 [](RegisterOperand reg) { return reg.bank == RegisterBank::gpr && reg.index == 0 &&
