@@ -571,6 +571,7 @@ std::string operation_name(Opcode opcode) {
     case Opcode::m6502_sre: return "SRE";
     case Opcode::m6502_rra: return "RRA";
     case Opcode::m6502_isc: return "ISC";
+    case Opcode::m6502_las: return "LAS";
     case Opcode::m6502_cpx: return "CPX"; case Opcode::m6502_cpy: return "CPY";
     case Opcode::m6502_bit: return "BIT"; case Opcode::m6502_inc: return "INC";
     case Opcode::m6502_dec: return "DEC"; case Opcode::m6502_inx: return "INX";
@@ -1466,6 +1467,7 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                        instruction.context.mode == ExecutionMode::m6502;
     if (m6502) {
         const RegisterOperand accumulator{RegisterBank::mos6502, 0, 8, false};
+        const RegisterOperand index_x{RegisterBank::mos6502, 1, 8, false};
         const RegisterOperand status{RegisterBank::mos6502, 3, 8, false};
         const RegisterOperand stack_pointer{RegisterBank::mos6502, 4, 8, false};
         const auto status_value = reg_expr(status);
@@ -1570,6 +1572,25 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         }
         const auto op = instruction.opcode;
         if (!operands.empty()) {
+            if (op == Opcode::m6502_las && is_memory(instruction.operands.front())) {
+                const auto value = binary("and", operands.front(), reg_expr(stack_pointer));
+                const auto zero = boolean_binary("eq", value, constant_expr(0, 8));
+                const auto negative = boolean_binary("bit_extract", value, constant_expr(7, 8));
+                const auto bool_byte = [](ExpressionPtr predicate) -> ExpressionPtr {
+                    return std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", std::move(predicate)}});
+                };
+                const auto bit = [&](ExpressionPtr predicate, unsigned index) -> ExpressionPtr {
+                    return binary("shl", bool_byte(std::move(predicate)), constant_expr(index, 8));
+                };
+                const auto new_status = binary("or",
+                    binary("and", status_value, constant_expr(0x7d, 8)),
+                    binary("or", bit(zero, 1), bit(negative, 7)));
+                Intrinsic effect{"m6502_las_load_and_stack_mask",
+                    {operands.front(), reg_expr(stack_pointer), value, status_value}, IntrinsicMemoryEffect::read};
+                effect.register_writes = {accumulator, index_x, stack_pointer, status};
+                effect.register_output_values = {value, value, value, new_status};
+                return effect;
+            }
             RegisterOperand destination = accumulator;
             bool loads_accumulator = op == Opcode::m6502_lda;
             if (op == Opcode::m6502_ldx) destination.index = 1;

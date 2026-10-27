@@ -42,6 +42,22 @@ metadata until the referenced definition exists; the layout inspector then
 resolves the member and calculates its actual size and alignment. Direct
 by-value cycles remain unlayoutable and are reported rather than guessed.
 
+A final structure member can be written with a `[]` suffix to author a C-style
+flexible array, for example `payload byte[] 4`. The element type must have a
+complete size; inline pointer elements such as `items Node*[] 8` are supported.
+The flexible member must follow another structure member, cannot appear in a
+union, contributes no fixed tail size, and uses its element type's alignment.
+The type editor preserves this form when reopening the aggregate. Fixed arrays
+remain independently authorable as named project types with a positive count.
+For imported flexible-array types with nested qualifiers, the editor uses a
+compact generated expression to preserve the exact type-graph nesting. The
+expression starts with `$`; `N<bytes>:<name>` is a named type, `P<size>,<align>(T)`
+is a pointer, `A<count>(T)` is an array (count zero is flexible), and
+`Q<mask>(T)` qualifies the wrapped type (`const=1`, `volatile=2`, `restrict=4`).
+For example, `$A0,1(Q1(N4:byte))` means a flexible array of const `byte`, while
+`$Q1(A0,1(N4:byte))` preserves a const-qualified flexible-array node. Array records
+carry their effective alignment so explicitly over-aligned array nodes round-trip.
+
 Member names must be unique. The model validates known sizes, offsets,
 alignment, overlaps, overflow, duplicate project type names, and descriptions
 larger than 1 MiB before submitting a project command. Deferred members retain

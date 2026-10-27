@@ -576,6 +576,18 @@ struct PeFpoRecord {
     PeRecordSource source;
     bool operator==(const PeFpoRecord &) const = default;
 };
+struct PePogoEntry {
+    std::uint32_t rva = 0, size = 0;
+    std::string name;
+    PeRecordSource source;
+    bool operator==(const PePogoEntry &) const = default;
+};
+struct PePogoData {
+    std::uint32_t signature = 0;
+    PeRecordSource signature_source;
+    std::vector<PePogoEntry> entries;
+    bool operator==(const PePogoData &) const = default;
+};
 // A PDB C13 line row after optional section-to-RVA mapping. The original
 // section coordinate and module/file provenance remain available even when
 // the PE/PDB identity or section mapping cannot be established.
@@ -705,6 +717,7 @@ struct PeMetadata {
     std::vector<PeCodeViewIdentity> codeview;
     std::vector<PeDebugDirectoryEntry> debug_directories;
     std::vector<PeFpoRecord> fpo_records;
+    std::vector<PePogoData> pogo_data;
     std::vector<PeSourceLine> source_lines;
     PePdbStatus pdb_status = PePdbStatus::unavailable;
     std::string pdb_path;

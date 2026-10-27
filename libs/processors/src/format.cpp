@@ -789,6 +789,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::m6502_sre) return "sre";
     if (op == Opcode::m6502_rra) return "rra";
     if (op == Opcode::m6502_isc) return "isc";
+    if (op == Opcode::m6502_las) return "las";
     const auto index = static_cast<std::size_t>(op);
     return index < std::size(names) ? names[index] : "?opcode";
 }
