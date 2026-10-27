@@ -16,6 +16,8 @@ constexpr std::uint32_t max_vector_items = 1'000'000;
 constexpr std::size_t max_wasm_control_depth = 100'000;
 constexpr std::size_t max_wasm_operand_stack = 1'000'000;
 constexpr std::uint32_t max_wasm_multi_values = 128;
+constexpr std::uint32_t max_wasm_producer_fields = 64;
+constexpr std::uint32_t max_wasm_producer_values = 4096;
 constexpr std::uint32_t max_name_bytes = 1024u * 1024u;
 constexpr std::uint64_t max_total_name_bytes = 16u * 1024u * 1024u;
 constexpr std::uint64_t wasm_page_bytes = 65536;
@@ -286,6 +288,58 @@ bool parse_exports(Reader &r, WasmMetadata &metadata, std::uint64_t section_file
         metadata.exports.push_back(std::move(entry));
     }
     if (r.position != r.bytes.size()) { reason = "trailing bytes in export section"; return false; }
+    return true;
+}
+
+bool parse_producers(Reader &r, std::uint64_t section_file_offset,
+                     std::uint64_t &name_bytes, std::vector<WasmProducer> &producers,
+                     std::string &reason) {
+    std::uint32_t field_count = 0;
+    if (!r.uleb(field_count) || field_count > max_wasm_producer_fields) {
+        reason = "invalid WebAssembly producers field count";
+        return false;
+    }
+    std::vector<WasmProducer> parsed;
+    std::set<std::string> fields;
+    std::uint32_t total_values = 0;
+    auto bounded_name_bytes = name_bytes;
+    for (std::uint32_t field_index = 0; field_index < field_count; ++field_index) {
+        const auto entry_offset = section_file_offset + r.position;
+        std::string field;
+        std::uint32_t value_count = 0;
+        if (!r.name(field, bounded_name_bytes) || !r.uleb(value_count) ||
+            value_count > max_wasm_producer_values - total_values) {
+            reason = "invalid WebAssembly producers field or value count";
+            return false;
+        }
+        if (!fields.insert(field).second) {
+            reason = "duplicate WebAssembly producers field name";
+            return false;
+        }
+        total_values += value_count;
+        std::set<std::string> names;
+        for (std::uint32_t value_index = 0; value_index < value_count; ++value_index) {
+            WasmProducer producer;
+            producer.field = field;
+            producer.entry_file_offset = {entry_offset};
+            if (!r.name(producer.name, bounded_name_bytes) ||
+                !r.name(producer.version, bounded_name_bytes)) {
+                reason = "invalid WebAssembly producer name or version";
+                return false;
+            }
+            if (!names.insert(producer.name).second) {
+                reason = "duplicate WebAssembly producer name in field";
+                return false;
+            }
+            parsed.push_back(std::move(producer));
+        }
+    }
+    if (r.position != r.bytes.size()) {
+        reason = "trailing bytes in WebAssembly producers section";
+        return false;
+    }
+    name_bytes = bounded_name_bytes;
+    producers = std::move(parsed);
     return true;
 }
 
@@ -1202,6 +1256,7 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
     std::array<bool, 13> seen{};
     std::array<bool, 13> warned_section{};
     bool warned_custom = false;
+    bool saw_producers = false;
     int previous_order = 0;
     Reader module{bytes, 8};
     while (module.position < bytes.size()) {
@@ -1250,6 +1305,21 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
             valid = section.name(custom_name, name_bytes);
             if (valid && custom_name == "name") {
                 valid = parse_name_section(section, section_begin, wasm, name_bytes, parse_reason);
+            } else if (valid && custom_name == "producers") {
+                if (saw_producers) {
+                    wasm_diagnostics.push_back({DiagnosticSeverity::info,
+                        "Additional WebAssembly producers custom section was ignored", {}});
+                } else {
+                    saw_producers = true;
+                    std::vector<WasmProducer> producers;
+                    std::string producers_reason;
+                    if (parse_producers(section, section_begin, name_bytes, producers, producers_reason)) {
+                        wasm.producers = std::move(producers);
+                    } else {
+                        wasm_diagnostics.push_back({DiagnosticSeverity::info,
+                            "Malformed WebAssembly producers custom section was ignored: " + producers_reason, {}});
+                    }
+                }
             } else if (valid && !warned_custom) {
                 warned_custom = true;
                 wasm_diagnostics.push_back({DiagnosticSeverity::info,

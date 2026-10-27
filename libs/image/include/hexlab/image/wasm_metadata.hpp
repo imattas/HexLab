@@ -70,6 +70,14 @@ struct WasmStartFunction {
     bool operator==(const WasmStartFunction &) const = default;
 };
 
+// Producer custom-section metadata is descriptive only and never affects
+// module validation or execution. Unknown field/tool names are preserved.
+struct WasmProducer {
+    std::string field, name, version;
+    FileOffset entry_file_offset{};
+    bool operator==(const WasmProducer &) const = default;
+};
+
 enum class WasmDataMode : std::uint8_t { active, passive };
 enum class WasmOffsetExpressionKind : std::uint8_t { i32_constant, global_get };
 struct WasmDataSegment {
@@ -143,6 +151,7 @@ struct WasmMetadata {
     std::vector<WasmImport> imports;
     std::vector<WasmExport> exports;
     std::optional<WasmStartFunction> start_function;
+    std::vector<WasmProducer> producers;
     std::optional<std::uint32_t> declared_data_count;
     std::vector<WasmDataSegment> data_segments;
     std::vector<WasmLimits> defined_memory_limits;

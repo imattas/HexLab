@@ -140,6 +140,14 @@ method to interrupt the native scan; cancellation raises `AnalysisCancelled` and
 does not return a partial page. `source_complete` distinguishes a completed scan
 from a complete decoded instruction source.
 
+For full effective-byte searches, `iter_search_bytes()` and
+`iter_search_text()` follow revision-bound cursors and yield matches without
+collecting the full result set. Both accept `page_size` (1..4096), optional
+`max_rows`, and `cancel`. A source edit between pages raises
+`ProjectChangedDuringQuery`; reaching `max_rows` intentionally stops early.
+Keep the page methods when you need each `SearchPage`'s scan counters or
+completion metadata.
+
 `image_info()` reports whether an image is mapped, loader format/machine/base/
 size/header metadata, metadata completeness, architecture and execution-mode
 enum values, entry addresses, address-space count, and segment count. Use
@@ -344,6 +352,7 @@ Methods:
 | `all_references(start=0, count=256)` | Page every current reference-index row, including non-instruction sources; max4096 rows |
 | `search_bytes(pattern, cursor=None, max_results=256, cancel=None)` | Paged masked search over effective bytes; two-character octets accept hex digits or `?` in each nibble, such as `A?`, `?F`, or `??`; a cancellation token interrupts the native scan |
 | `search_text(text, encoding="utf8", cursor=None, max_results=256, cancel=None)` | Paged ASCII, UTF-8, UTF-16LE/BE, or UTF-32LE/BE search over effective bytes; supports cancellation |
+| `iter_search_bytes(pattern, page_size=256, max_rows=None, cancel=None)`, `iter_search_text(text, encoding="utf8", page_size=256, max_rows=None, cancel=None)` | Yield full effective-byte/text search matches across revision-bound pages; bounded and cancellable |
 | `search_immediate(value, width=64, signed=False, cursor=None, max_results=256, cancel=None)` | Paged immediate-operand search over current decoded facts; supports cancellation |
 | `rename`, `comment`, `bookmark`, `patch` | Validated normal commands; optional `group=0`; patch max1MiB and optional `expected_revision` compare against the snapshot's edit revision |
 | `define_code`, `define_data`, `define_function`, `suppress_function` | Normal decision validation; instruction boundaries enforced |

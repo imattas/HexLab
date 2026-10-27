@@ -747,6 +747,27 @@ bool decode_metaclass(const Image &image, const RelocationResolver &resolver, Ma
 
 } // namespace
 
+std::vector<std::string> macho_objc_class_ro_flag_names(std::uint32_t flags) {
+    // Values are the compiler-emitted class_ro_t flags in Apple's objc4
+    // runtime header. Do not decode RW_* realization bits here.
+    static constexpr std::pair<std::uint32_t, const char *> known[] = {
+        {1u << 0, "metaclass"},
+        {1u << 1, "root-class"},
+        {1u << 2, "cxx-structors"},
+        {1u << 4, "hidden"},
+        {1u << 5, "objc-exception"},
+        {1u << 6, "swift-initializer"},
+        {1u << 7, "arc"},
+        {1u << 8, "cxx-dtor-only"},
+        {1u << 9, "weak-layout-without-arc"},
+        {1u << 10, "forbids-associated-objects"},
+    };
+    std::vector<std::string> result;
+    for (const auto &[mask, name] : known)
+        if ((flags & mask) != 0) result.emplace_back(name);
+    return result;
+}
+
 Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMetadata &metadata,
                                               const MachOObjCLimits &limits, std::stop_token stop) {
     try {

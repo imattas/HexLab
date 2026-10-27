@@ -11,6 +11,16 @@ inline std::string macho_hex(std::uint64_t value) {
     out << "0x" << std::hex << value;
     return out.str();
 }
+inline std::string macho_objc_class_ro_flags(std::uint32_t flags) {
+    const auto names = macho_objc_class_ro_flag_names(flags);
+    if (names.empty()) return "none-recognized";
+    std::string result;
+    for (const auto &name : names) {
+        if (!result.empty()) result += ',';
+        result += name;
+    }
+    return result;
+}
 inline const char *macho_pac_key(std::uint8_t key) {
     constexpr const char *names[] = {"IA", "IB", "DA", "DB"};
     return key < 4 ? names[key] : "unknown";
@@ -396,6 +406,7 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
                     << " class-ro=" << (row.class_ro_address ? format_location(*row.class_ro_address, image) : "-")
                     << " class-ro-pointer=" << macho_text(row.class_ro_pointer_status)
                     << " flags=" << (row.flags ? macho_hex(*row.flags) : "-")
+                    << " flag-semantics=" << (row.flags ? macho_objc_class_ro_flags(*row.flags) : "-")
                     << " instance-start=" << (row.instance_start ? macho_hex(*row.instance_start) : "-")
                     << " instance-size=" << (row.instance_size ? macho_hex(*row.instance_size) : "-")
                     << " methods=" << macho_text(row.methods.status);

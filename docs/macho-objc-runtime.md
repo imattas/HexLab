@@ -19,6 +19,12 @@ and name only when the superclass address maps to a scanned class-list entry.
 The directly referenced metaclass is decoded as a class object; its `class_ro_t`
 name and class-method list are reported with separate pointer statuses. Names
 must terminate within initialized mapped bytes and the configured name limit.
+The CLI and desktop view also name recognized compiler-emitted
+`class_ro_t.flags` bits (`metaclass`, `root-class`, C++ structors, hidden,
+Objective-C exception, Swift initializer, ARC, and associated-object/weak-layout
+attributes). The raw word remains available; unknown bits are not assigned a
+meaning, and runtime `class_rw_t` state flags are not decoded as `class_ro_t`
+flags.
 
 Class and category list headers are accepted only when their full extents fit
 inside initialized readable bytes. Their entries are decoded within the same
