@@ -1829,11 +1829,7 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         case Opcode::m6502_pla: {
             const auto pulled = stack_read("PLA byte from $0100 | ((S+1)&$ff)");
             const auto new_sp = byte_wrap(binary("add", reg_expr(stack_pointer), constant_expr(1, 8)));
-            const auto zero = boolean_binary("eq", pulled, constant_expr(0, 8));
-            const auto negative = boolean_binary("bit_extract", pulled, constant_expr(7, 8));
-            const auto zbit = binary("shl", std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", zero}}), constant_expr(1, 8));
-            const auto nbit = binary("shl", std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", negative}}), constant_expr(7, 8));
-            const auto new_p = binary("or", binary("and", status_value, constant_expr(0x7d, 8)), binary("or", zbit, nbit));
+            const auto new_p = nz_flags(pulled, status_value);
             auto effect = opaque("m6502_pla_stack_read_page_0100_wrap", {reg_expr(stack_pointer)},
                                  {accumulator, status, stack_pointer}, IntrinsicMemoryEffect::read);
             std::get<Intrinsic>(effect).register_output_values = {pulled, new_p, new_sp};
@@ -1891,9 +1887,14 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             default: break;
             }
             const bool updates_nz = op != Opcode::m6502_txs;
-            return opaque("m6502_transfer", {reg_expr(source), status_value},
-                          updates_nz ? std::vector<RegisterOperand>{destination, status}
-                                     : std::vector<RegisterOperand>{destination});
+            const auto transferred = reg_expr(source);
+            Intrinsic effect{"m6502_transfer", {transferred, status_value}, IntrinsicMemoryEffect::none};
+            effect.register_writes = updates_nz ? std::vector<RegisterOperand>{destination, status}
+                                                : std::vector<RegisterOperand>{destination};
+            effect.register_output_values = updates_nz
+                ? std::vector<ExpressionPtr>{transferred, nz_flags(transferred, status_value)}
+                : std::vector<ExpressionPtr>{transferred};
+            return effect;
         }
         RegisterOperand counter{RegisterBank::mos6502, 0, 8, false};
         bool increment = true;
@@ -1905,8 +1906,14 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         default: counter.width = 0; break;
         }
         if (counter.width) {
-            return opaque(increment ? "m6502_increment" : "m6502_decrement",
-                          {reg_expr(counter), status_value}, {counter, status});
+            const auto before = reg_expr(counter);
+            const auto result = byte_wrap(binary(increment ? "add" : "sub", before,
+                                                  constant_expr(1, 8)));
+            Intrinsic effect{increment ? "m6502_increment" : "m6502_decrement",
+                             {before, result, status_value}, IntrinsicMemoryEffect::none};
+            effect.register_writes = {counter, status};
+            effect.register_output_values = {result, nz_flags(result, status_value)};
+            return effect;
         }
     }
 
@@ -2570,6 +2577,37 @@ a64_unhandled:
     if (riscv && !instruction.operands.empty()) {
         const auto dst = as_register(instruction.operands[0]);
         const auto op = instruction.opcode;
+        if (op == Opcode::rv_fli_s || op == Opcode::rv_fli_d) {
+            const auto *selector = instruction.operands.size() == 2
+                ? std::get_if<ImmediateOperand>(&instruction.operands[1]) : nullptr;
+            const bool single = op == Opcode::rv_fli_s;
+            static constexpr std::uint32_t single_bits[32]{
+                0xbf800000, 0x00800000, 0x37800000, 0x38000000,
+                0x3b800000, 0x3c000000, 0x3d800000, 0x3e000000,
+                0x3e800000, 0x3ea00000, 0x3ec00000, 0x3ee00000,
+                0x3f000000, 0x3f200000, 0x3f400000, 0x3f600000,
+                0x3f800000, 0x3fa00000, 0x3fc00000, 0x3fe00000,
+                0x40000000, 0x40200000, 0x40400000, 0x40800000,
+                0x41000000, 0x41800000, 0x43000000, 0x43800000,
+                0x47000000, 0x47800000, 0x7f800000, 0x7fc00000};
+            static constexpr std::uint64_t double_bits[32]{
+                0xbff0000000000000, 0x0010000000000000, 0x3ef0000000000000, 0x3f00000000000000,
+                0x3f70000000000000, 0x3f80000000000000, 0x3fb0000000000000, 0x3fc0000000000000,
+                0x3fd0000000000000, 0x3fd4000000000000, 0x3fd8000000000000, 0x3fdc000000000000,
+                0x3fe0000000000000, 0x3fe4000000000000, 0x3fe8000000000000, 0x3fec000000000000,
+                0x3ff0000000000000, 0x3ff4000000000000, 0x3ff8000000000000, 0x3ffc000000000000,
+                0x4000000000000000, 0x4004000000000000, 0x4008000000000000, 0x4010000000000000,
+                0x4020000000000000, 0x4030000000000000, 0x4060000000000000, 0x4070000000000000,
+                0x40e0000000000000, 0x40f0000000000000, 0x7ff0000000000000, 0x7ff8000000000000};
+            if (!dst || dst->bank != RegisterBank::riscv_fpr || !selector || selector->is_signed ||
+                selector->value > 31 || instruction.register_reads.size() != 0 ||
+                instruction.register_writes != std::vector<RegisterOperand>{*dst} ||
+                instruction.writes_fflags || instruction.reads_fflags || instruction.reads_frm)
+                return Intrinsic{"riscv_malformed_fli", {}, IntrinsicMemoryEffect::none};
+            const auto type = floating_type(single ? 32 : 64);
+            const std::uint64_t bits = single ? single_bits[selector->value] : double_bits[selector->value];
+            return Assign{*dst, std::make_shared<Expression>(Expression{type, ConstantValue{bits, type}})};
+        }
         const auto append_vector_mask = [&](std::vector<ExpressionPtr> &inputs) {
             for (const auto &reg : instruction.register_reads) {
                 const bool mask = instruction.riscv_vector_masked && reg.bank == RegisterBank::riscv_vpr && reg.index == 0;
@@ -2684,7 +2722,8 @@ a64_unhandled:
             effect.register_writes = instruction.register_writes;
             return effect;
         }
-        if ((op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) || op == Opcode::rv_fcvtmod_w_d) {
+        if ((op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) || op == Opcode::rv_fcvtmod_w_d ||
+            op == Opcode::rv_fli_s || op == Opcode::rv_fli_d) {
             if (auto converted = lift_riscv_fp_conversion(instruction, operands)) return *converted;
             if ((op == Opcode::rv_flw || op == Opcode::rv_fld) && dst && operands.size() >= 2) {
                 auto loaded = *operands[1];

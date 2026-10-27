@@ -797,6 +797,14 @@ bool decode_fp_op(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
         dst_fp = false; unary = true;
     }
     else if (operation == 0x70 && rs2==0 && (f3==0 || f3==1) && (!d || f3==1 || xlen==64)) { ok=plain(d?(f3?RiscvOpcode::fclass_d:RiscvOpcode::fmv_x_d):(f3?RiscvOpcode::fclass_s:RiscvOpcode::fmv_x_w)); dst_fp=false; unary=true; }
+    else if (operation == 0x78 && rs2 == 1 && f3 == 0) {
+        // Zfa FLI uses the FMV.W.X encoding with rs2=1; rs1 is a five-bit
+        // constant selector, not an integer-register source.
+        i.opcode = d ? RiscvOpcode::fli_d : RiscvOpcode::fli_s;
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(rd), true}, RiscvOperandAccess::write);
+        operand(i, RiscvImmediate{static_cast<std::int64_t>(rs1), 5, false}, RiscvOperandAccess::read);
+        return true;
+    }
     else if (operation == 0x78 && rs2==0 && f3==0 && (!d || xlen==64)) { ok=plain(d?RiscvOpcode::fmv_d_x:RiscvOpcode::fmv_w_x); src1_fp=false; unary=true; }
     else if ((operation==0x60 || operation==0x68) && rs2<=3 && (rs2<2 || xlen==64)) {
         const bool to_int=operation==0x60; static constexpr RiscvOpcode tos[2][4]{{RiscvOpcode::fcvt_w_s,RiscvOpcode::fcvt_wu_s,RiscvOpcode::fcvt_l_s,RiscvOpcode::fcvt_lu_s},{RiscvOpcode::fcvt_w_d,RiscvOpcode::fcvt_wu_d,RiscvOpcode::fcvt_l_d,RiscvOpcode::fcvt_lu_d}};

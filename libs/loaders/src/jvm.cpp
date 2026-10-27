@@ -4,7 +4,10 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <set>
 #include <string_view>
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace hexlab {
@@ -20,6 +23,21 @@ struct Reader {
     bool slice(std::size_t n,std::span<const std::byte>&out){if(n>b.size()-p)return false;out=b.subspan(p,n);p+=n;return true;}
 };
 Error malformed(std::string s){return {ErrorCode::malformed,std::move(s)};}
+bool valid_field_descriptor(std::string_view descriptor){
+    if(descriptor.empty())return false;
+    std::size_t position=0,dimensions=0;
+    while(position<descriptor.size()&&descriptor[position]=='['){++position;if(++dimensions>255)return false;}
+    if(position>=descriptor.size())return false;
+    const auto type=descriptor[position++];
+    if(type=='L'){
+        const auto begin=position;const auto end=descriptor.find(';',position);
+        if(end==std::string_view::npos||end==begin)return false;
+        const auto name=descriptor.substr(begin,end-begin);
+        if(name.find_first_of(".;[")!=std::string_view::npos||name.front()=='/'||name.back()=='/'||name.find("//")!=std::string_view::npos)return false;
+        position=end+1;
+    }else if(type!='B'&&type!='C'&&type!='D'&&type!='F'&&type!='I'&&type!='J'&&type!='S'&&type!='Z')return false;
+    return position==descriptor.size();
+}
 // Restrict every nested attribute parser to its declared enclosing extent.
 // Reader positions remain absolute class-file offsets.
 struct ReaderExtent {
@@ -264,6 +282,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     std::unordered_set<const JvmMember *> visible_annotations_seen,invisible_annotations_seen;
     std::unordered_set<const JvmMember *> visible_parameter_annotations_seen,invisible_parameter_annotations_seen,annotation_defaults_seen;
     std::size_t annotation_items=0;
+    using LocalVariableKey=std::tuple<std::uint16_t,std::uint16_t,std::uint16_t,std::uint16_t,std::uint16_t>;
+    std::unordered_map<const JvmCode *,std::set<LocalVariableKey>> local_variable_entries_seen;
     std::function<Result<std::string>(unsigned)> annotation_value;
     annotation_value=[&](unsigned depth)->Result<std::string>{
         if(depth>64)return Error{ErrorCode::resource_limit,"annotation nesting exceeds 64 levels"};
@@ -307,7 +327,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             if(len>64*1024*1024||attribute_bytes>max_total_attributes-len)return Error{ErrorCode::resource_limit,"classfile attribute data exceeds bounded size limits"};attribute_bytes+=len;
             auto an=utf8(name_ix);if(!an)return an.error();const auto start=r.p;if(len>r.b.size()-r.p)return malformed("attribute extent exceeds its enclosing owner");
             ReaderExtent extent{r,r.b};r.b=r.b.first(start+len);
-            if(!class_level&&(an.value()=="NestHost"||an.value()=="NestMembers"||an.value()=="PermittedSubclasses"||an.value()=="Record"||an.value()=="Module"||an.value()=="ModulePackages"||an.value()=="ModuleMainClass"))return malformed("class-level attribute appears on a member or Code attribute list");
+            if(!class_level&&(an.value()=="NestHost"||an.value()=="NestMembers"||an.value()=="PermittedSubclasses"||an.value()=="Record"||an.value()=="Module"||an.value()=="ModulePackages"||an.value()=="ModuleMainClass"||an.value()=="SourceFile"))return malformed("class-level attribute appears on a member or Code attribute list");
             if(an.value()=="ConstantValue"){
                 if(!member||method||class_level||code_owner)
                     return malformed("ConstantValue attribute appears outside a field attribute list");
@@ -354,6 +374,30 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 const auto code_bytes=bytes.subspan(static_cast<std::size_t>(code_owner->file_begin.value),code_owner->code_size);
                 auto table=read_stack_map_table(r,md,*member,*code_owner,code_bytes,stop,expanded_verification_entries,stack_map_frames);
                 if(!table)return table.error();code_owner->stack_map_table=std::move(table.value());
+            }else if(an.value()=="LineNumberTable"){
+                if(!code_owner||!member)return malformed("LineNumberTable appears outside a Code attribute");
+                std::uint16_t entries=0;if(len<2||!r.u2(entries)||std::uint64_t(entries)*4+2!=len)return malformed("LineNumberTable length does not match its entries");
+                if(code_owner->line_numbers&&entries>65535-code_owner->line_numbers->size())return Error{ErrorCode::resource_limit,"aggregate LineNumberTable entries exceed 65535 per Code attribute"};
+                if(!code_owner->line_numbers)code_owner->line_numbers.emplace();
+                code_owner->line_numbers->reserve(code_owner->line_numbers->size()+entries);
+                for(unsigned i=0;i<entries;++i){JvmLineNumber line;if(!r.u2(line.start_pc)||!r.u2(line.line_number)||line.start_pc>=code_owner->code_size)return malformed("invalid LineNumberTable code offset");code_owner->line_numbers->push_back(line);}
+            }else if(an.value()=="LocalVariableTable"){
+                if(!code_owner||!member)return malformed("LocalVariableTable appears outside a Code attribute");
+                std::uint16_t entries=0;if(len<2||!r.u2(entries)||std::uint64_t(entries)*10+2!=len)return malformed("LocalVariableTable length does not match its entries");
+                if(code_owner->local_variables&&entries>65535-code_owner->local_variables->size())return Error{ErrorCode::resource_limit,"aggregate LocalVariableTable entries exceed 65535 per Code attribute"};
+                if(!code_owner->local_variables)code_owner->local_variables.emplace();
+                auto &locals=*code_owner->local_variables;locals.reserve(locals.size()+entries);
+                for(unsigned i=0;i<entries;++i){JvmLocalVariable local;
+                    if(!r.u2(local.start_pc)||!r.u2(local.length)||!r.u2(local.name_index)||!r.u2(local.descriptor_index)||!r.u2(local.slot))return malformed("truncated LocalVariableTable entry");
+                    if(local.start_pc>=code_owner->code_size||std::uint32_t(local.start_pc)+local.length>code_owner->code_size||local.slot>=code_owner->max_locals)return malformed("LocalVariableTable entry exceeds Code bounds");
+                    auto name=utf8(local.name_index),descriptor=utf8(local.descriptor_index);if(!name)return name.error();if(!descriptor)return descriptor.error();
+                    if(!valid_field_descriptor(descriptor.value()))return malformed("LocalVariableTable entry has an invalid field descriptor");
+                    if((descriptor.value()[0]=='J'||descriptor.value()[0]=='D')&&local.slot+1>=code_owner->max_locals)return malformed("category-2 local variable exceeds Code.max_locals");
+                    local.name=std::move(name.value());local.descriptor=std::move(descriptor.value());
+                    auto &seen=local_variable_entries_seen[code_owner];
+                    if(!seen.emplace(local.start_pc,local.length,local.name_index,local.descriptor_index,local.slot).second)return malformed("duplicate LocalVariableTable entry");
+                    locals.push_back(std::move(local));
+                }
             }else if(method&&member&&an.value()=="Exceptions"){
                 if(member->declared_exceptions)return malformed("duplicate Exceptions attribute");
                 std::uint16_t exception_count=0;
@@ -376,9 +420,13 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 code.file_begin={code_off}; code.max_stack=ms; code.max_locals=ml; code.code_size=cl;
                 code.exception_table.reserve(ec);
                 for(unsigned k=0;k<ec;++k){JvmExceptionHandler e;if(!r.u2(e.start_pc)||!r.u2(e.end_pc)||!r.u2(e.handler_pc)||!r.u2(e.catch_type)||e.start_pc>=e.end_pc||e.end_pc>cl||e.handler_pc>=cl)return malformed("invalid Code exception handler range");if(e.catch_type){auto c=class_name(e.catch_type);if(!c)return c.error();}code.exception_table.push_back(e);}
-                auto nested=attributes(false,member,false,&code);if(!nested)return nested.error();
+                auto nested=attributes(false,member,false,&code);local_variable_entries_seen.erase(&code);if(!nested)return nested.error();
                 if(r.p!=start+len)return malformed("Code attribute length does not match its parsed structure");
                 member->code=std::move(code);
+            }else if(class_level&&an.value()=="SourceFile"){
+                if(md.source_file)return malformed("duplicate SourceFile attribute");
+                std::uint16_t index=0;if(len!=2||!r.u2(index))return malformed("SourceFile attribute must contain one UTF-8 index");
+                auto source=utf8(index);if(!source)return source.error();md.source_file=std::move(source.value());
             }else if(class_level&&an.value()=="NestHost"){
                 if(have_nest_members)return malformed("class cannot declare both NestHost and NestMembers");
                 if(have_nest_host)return malformed("duplicate NestHost attribute");

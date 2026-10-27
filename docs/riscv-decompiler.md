@@ -41,6 +41,14 @@ values or flags.
 Other Zfa conversion and rounding instructions, including FROUND/FROUNDNX,
 remain unsupported.
 
+Zfa `FLI.S` and `FLI.D` decode the complete five-bit immediate selector table
+from the FMV encoding with `rs2=1`. The selector is retained as an immediate,
+not a fictitious GPR dependency. Lifting maps each selector to its exact IEEE
+binary32 or binary64 bit pattern, including the format-specific minimum normal,
+positive infinity, and canonical quiet NaN. FLI writes only its FPR destination
+and does not read or update `frm` or `fflags`. FLI.H/Q and the other Zfa
+rounding/minimum families remain unsupported.
+
 Encodings and effects follow the official
 [F extension](https://docs.riscv.org/reference/isa/v20260120/unpriv/f-st-ext.html),
 [D extension](https://docs.riscv.org/reference/isa/v20260120/unpriv/d-st-ext.html),

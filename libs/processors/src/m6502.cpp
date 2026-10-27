@@ -200,10 +200,10 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     case 0x9a: return transfer(Opcode::m6502_txs, x, s, false);
 
     // Stack operations and processor flags.
-    case 0x48: implied(Opcode::m6502_pha); i.register_reads = {a, s}; i.register_writes = {s}; return finish(1);
-    case 0x08: implied(Opcode::m6502_php); i.register_reads = {p, s}; i.register_writes = {s}; return finish(1);
-    case 0x68: implied(Opcode::m6502_pla); i.register_reads = {s}; i.register_writes = {a, s, p}; return finish(1);
-    case 0x28: implied(Opcode::m6502_plp); i.register_reads = {s}; i.register_writes = {s, p}; return finish(1);
+    case 0x48: implied(Opcode::m6502_pha); i.register_reads = {a, s}; i.register_writes = {s}; i.memory_write = true; return finish(1);
+    case 0x08: implied(Opcode::m6502_php); i.register_reads = {p, s}; i.register_writes = {s}; i.memory_write = true; return finish(1);
+    case 0x68: implied(Opcode::m6502_pla); i.register_reads = {s}; i.register_writes = {a, s, p}; i.memory_read = true; return finish(1);
+    case 0x28: implied(Opcode::m6502_plp); i.register_reads = {s}; i.register_writes = {s, p}; i.memory_read = true; return finish(1);
     case 0x18: implied(Opcode::m6502_clc); i.register_reads = {p}; i.register_writes = {p}; return finish(1);
     case 0x38: implied(Opcode::m6502_sec); i.register_reads = {p}; i.register_writes = {p}; return finish(1);
     case 0x58: implied(Opcode::m6502_cli); i.register_reads = {p}; i.register_writes = {p}; return finish(1);

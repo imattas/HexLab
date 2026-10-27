@@ -16,6 +16,15 @@ struct JvmExceptionHandler {
     std::uint16_t start_pc = 0, end_pc = 0, handler_pc = 0, catch_type = 0;
     bool operator==(const JvmExceptionHandler &) const = default;
 };
+struct JvmLineNumber {
+    std::uint16_t start_pc = 0, line_number = 0;
+    bool operator==(const JvmLineNumber &) const = default;
+};
+struct JvmLocalVariable {
+    std::uint16_t start_pc = 0, length = 0, name_index = 0, descriptor_index = 0, slot = 0;
+    std::string name, descriptor;
+    bool operator==(const JvmLocalVariable &) const = default;
+};
 // Annotation element values use a lossless, validated JVM-style textual form
 // (for example `enum(Lx;#NAME)` or `[const(I:3),... ]`).
 struct JvmAnnotationElement { std::string name, value; bool operator==(const JvmAnnotationElement &) const = default; };
@@ -62,6 +71,8 @@ struct JvmCode {
     std::uint16_t max_stack = 0, max_locals = 0;
     std::uint32_t code_size = 0;
     std::vector<JvmExceptionHandler> exception_table;
+    std::optional<std::vector<JvmLineNumber>> line_numbers;
+    std::optional<std::vector<JvmLocalVariable>> local_variables;
     // Distinguishes an absent attribute from an explicitly empty table.
     std::optional<JvmStackMapTable> stack_map_table;
     bool operator==(const JvmCode &) const = default;
@@ -130,6 +141,7 @@ struct JvmHierarchyClass {
 struct JvmMetadata {
     std::uint16_t minor_version = 0, major_version = 0, access_flags = 0, this_class = 0, super_class = 0;
     std::string class_name, super_name;
+    std::optional<std::string> source_file;
     // Empty identity means the defining loader is unknown. In that state only
     // same-class-name proofs are possible; hierarchy traversal is disabled.
     std::string defining_loader;

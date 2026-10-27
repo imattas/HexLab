@@ -455,7 +455,9 @@ enum class Opcode {
     // Zfa FCVTMOD.W.D, appended to preserve serialized opcode IDs.
     rv_fcvtmod_w_d,
     ppc_fmadd, ppc_fmsub, ppc_fnmadd, ppc_fnmsub,
-    ppc_fmadds, ppc_fmsubs, ppc_fnmadds, ppc_fnmsubs
+    ppc_fmadds, ppc_fmsubs, ppc_fnmadds, ppc_fnmsubs,
+    // Scalar Zfa load-immediate floating constants; append for cache stability.
+    rv_fli_s, rv_fli_d
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
