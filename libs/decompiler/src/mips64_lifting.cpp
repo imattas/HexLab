@@ -476,6 +476,20 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
         effect.register_writes = instruction.register_writes;
         return effect;
     }
+    if ((op == Opcode::mips64_madd || op == Opcode::mips64_maddu ||
+         op == Opcode::mips64_msub || op == Opcode::mips64_msubu) && items.size() == 2) {
+        const char *name = op == Opcode::mips64_madd ? "mips64.madd.word.s32.hilo64" :
+                           op == Opcode::mips64_maddu ? "mips64.madd.word.u32.hilo64" :
+                           op == Opcode::mips64_msub ? "mips64.msub.word.s32.hilo64" :
+                                                       "mips64.msub.word.u32.hilo64";
+        Intrinsic effect{name, {}, IntrinsicMemoryEffect::none};
+        effect.operands.push_back(unary("trunc32", operand(items[0]), 32));
+        effect.operands.push_back(unary("trunc32", operand(items[1]), 32));
+        effect.operands.push_back(reg(RegisterOperand{RegisterBank::mips_hilo, 0, 64, false}));
+        effect.operands.push_back(reg(RegisterOperand{RegisterBank::mips_hilo, 1, 64, false}));
+        effect.register_writes = instruction.register_writes;
+        return effect;
+    }
     if ((op == Opcode::mips64_mfhi || op == Opcode::mips64_mflo) && destination && items.size() == 1) {
         const RegisterOperand source{RegisterBank::mips_hilo,
             static_cast<std::uint8_t>(op == Opcode::mips64_mfhi ? 0 : 1), 64, false};
