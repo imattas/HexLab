@@ -40,7 +40,27 @@ std::optional<X87Binary80Value> fold_x87_unary(const UnaryValue &unary, ValueTyp
     X87UnaryArithmetic operation;
     if (unary.operation == "x87_fchs") operation = X87UnaryArithmetic::change_sign;
     else if (unary.operation == "x87_fabs") operation = X87UnaryArithmetic::absolute;
-    else return {};
+    else if (unary.operation == "x87_sqrt") {
+        const auto exponent = operand->value.sign_exponent & 0x7fffu;
+        const bool negative = (operand->value.sign_exponent & 0x8000u) != 0;
+        // Do not fold denormals, NaNs, infinities, negative nonzero inputs, or
+        // noncanonical encodings: their value/retirement depends on exception
+        // masks and exact special-value rules. For positive normal values, a
+        // folded result is sound only if every valid PC/RC setting agrees.
+        if (exponent == 0 || exponent == 0x7fffu || negative) return {};
+        std::optional<X87Binary80> common;
+        for (const std::uint16_t precision : {0u, 2u, 3u}) {
+            for (std::uint16_t rounding = 0; rounding < 4; ++rounding) {
+                const std::uint16_t control = static_cast<std::uint16_t>(0x007fu |
+                    (precision << 8) | (rounding << 10)); // mask all exceptions
+                const auto evaluated = evaluate_x87_square_root({operand->value, control, 0});
+                if (!evaluated || !evaluated->completed || !evaluated->value) return {};
+                if (common && *common != *evaluated->value) return {};
+                common = *evaluated->value;
+            }
+        }
+        return common ? std::optional<X87Binary80Value>{X87Binary80Value{*common}} : std::nullopt;
+    } else return {};
     return X87Binary80Value{evaluate_x87_unary(operand->value, 0, operation).value};
 }
 

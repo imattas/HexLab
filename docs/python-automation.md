@@ -698,7 +698,7 @@ for a non-daemon thread that never exits.
 
 Scripts can apply up to 4096 names, comments, and bookmark edits through one `ProjectSession` batch. The native layer validates each command against the preceding projected state and commits the combined delta as one durable history step; a failure leaves the project unchanged. Pass the edit revision captured while building a manifest so stale work fails with a conflict before commit. `apply_annotations(rows, group=..., expected_revision=...)` accepts dictionaries containing `location` and any of `name`, `comment`, or `bookmark`; `bookmark=None` removes the existing bookmark. Names require virtual addresses, while comments and bookmarks may use virtual addresses or file offsets. The batch's combined text is capped at 16 MiB.
 
-`libs/automation/examples/import_annotations.py` imports a JSON array with bounded manifest size and row count. Before opening the project for editing, it reports all conflicting repeated assignments to the same name, comment, or bookmark at one location, with both manifest row indices. Repeated non-empty names assigned to different virtual addresses in one address space are reported the same way. Any reported conflict aborts the import before a project is opened, so the manifest cannot silently overwrite its own earlier values. Example:
+`libs/automation/examples/import_annotations.py` imports a JSON array with bounded manifest size and row count. Before opening the project for editing, it reports all conflicting repeated assignments to the same name, comment, or bookmark at one location, with both manifest row indices. Repeated non-empty names assigned to different virtual addresses in one address space are reported the same way. Any manifest conflict aborts before a project is opened, so the manifest cannot silently overwrite its own earlier values. `--merge replace` (the default) applies manifest values over existing project fields, subject to native batch validation. `--merge preserve` fills only empty name/comment fields and absent bookmarks, and skips attempted replacements/removals while reporting how many fields it skipped. It also preserves a name already used elsewhere in the same address space. Preserve mode uses the bounded project snapshot; it refuses projects with more than 4096 existing annotations or bookmarks rather than making decisions from truncated data. Example:
 
 ```json
 [
@@ -707,7 +707,7 @@ Scripts can apply up to 4096 names, comments, and bookmark edits through one `Pr
 ]
 ```
 
-Run it with `hexlab_python import_annotations.py project.hxproj annotations.json`. The helper pins the import to the project's current edit revision and saves after a successful one-step import. Conflicts against annotations already in the project, and other invalid commands, are still rejected by native batch validation; the batch remains atomic and makes no partial edits.
+Run it with `hexlab_python import_annotations.py project.hxproj annotations.json --merge preserve` to fill gaps without replacing existing notes. The helper pins the filtered import to the project's current edit revision and saves after a successful one-step import. Invalid commands and replace-mode conflicts are rejected by native batch validation; the batch remains atomic and makes no partial edits. A preserve import with no fields to add exits without creating a history step.
 
 For mixed project commands, use `Project.apply_batch()` to combine annotations,
 patches, code/data definitions, function/chunk decisions, user references,
