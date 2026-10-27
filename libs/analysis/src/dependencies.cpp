@@ -14,6 +14,13 @@ Result<std::shared_ptr<const DependencyIndex>> DependencyIndex::create(std::span
             if(stop.stop_requested())return Error{ErrorCode::canceled,"Dependency indexing canceled"};
             std::sort(fact.prerequisites.begin(),fact.prerequisites.end());fact.prerequisites.erase(std::unique(fact.prerequisites.begin(),fact.prerequisites.end()),fact.prerequisites.end());
             for(auto key:fact.prerequisites){if(stop.stop_requested())return Error{ErrorCode::canceled,"Dependency indexing canceled"};if(!keys.contains(key))return Error{ErrorCode::invalid_argument,"Dependency references an unknown fact"};index->dependents_[key].push_back(fact.fact);}
+            std::sort(fact.decisions.begin(),fact.decisions.end());
+            fact.decisions.erase(std::unique(fact.decisions.begin(),fact.decisions.end()),fact.decisions.end());
+            for(auto id:fact.decisions){
+                if(stop.stop_requested())return Error{ErrorCode::canceled,"Dependency indexing canceled"};
+                if(!id)return Error{ErrorCode::invalid_argument,"Dependency references a zero decision identity"};
+                index->decision_facts_[id].push_back(fact.fact);
+            }
             for(auto range:fact.reads.ranges()){
                 if(stop.stop_requested())return Error{ErrorCode::canceled,"Dependency indexing canceled"};
                 auto end=checked_add(range.begin.value,range.size);if(!end)return end.error();
@@ -56,5 +63,32 @@ Result<std::vector<FactKey>> DependencyIndex::affected(const ReadSet& ranges,std
         while(!pending.empty()){if(stop.stop_requested())return Error{ErrorCode::canceled,"Dependency invalidation canceled"};const auto key=pending.front();pending.pop_front();auto found=dependents_.find(key);if(found==dependents_.end())continue;for(auto dependent:found->second){if(stop.stop_requested())return Error{ErrorCode::canceled,"Dependency invalidation canceled"};if(visited.insert(dependent).second)pending.push_back(dependent);}}
         return std::vector<FactKey>{visited.begin(),visited.end()};
     }catch(const std::bad_alloc&){return Error{ErrorCode::resource_limit,"Cannot allocate dependency closure"};}
+}
+Result<std::vector<FactKey>> DependencyIndex::affected_decisions(
+    std::span<const std::uint64_t> decisions,std::stop_token stop)const{
+    if(stop.stop_requested())return Error{ErrorCode::canceled,"Decision invalidation canceled"};
+    try{
+        std::set<FactKey> visited;std::deque<FactKey> pending;
+        for(auto id:decisions){
+            if(stop.stop_requested())return Error{ErrorCode::canceled,"Decision invalidation canceled"};
+            if(!id)return Error{ErrorCode::invalid_argument,"Zero decision identity cannot be invalidated"};
+            auto found=decision_facts_.find(id);
+            if(found==decision_facts_.end())continue;
+            for(auto fact:found->second){
+                if(stop.stop_requested())return Error{ErrorCode::canceled,"Decision invalidation canceled"};
+                if(visited.insert(fact).second)pending.push_back(fact);
+            }
+        }
+        while(!pending.empty()){
+            if(stop.stop_requested())return Error{ErrorCode::canceled,"Decision invalidation canceled"};
+            const auto key=pending.front();pending.pop_front();
+            auto found=dependents_.find(key);if(found==dependents_.end())continue;
+            for(auto dependent:found->second){
+                if(stop.stop_requested())return Error{ErrorCode::canceled,"Decision invalidation canceled"};
+                if(visited.insert(dependent).second)pending.push_back(dependent);
+            }
+        }
+        return std::vector<FactKey>{visited.begin(),visited.end()};
+    }catch(const std::bad_alloc&){return Error{ErrorCode::resource_limit,"Cannot allocate decision invalidation closure"};}
 }
 }

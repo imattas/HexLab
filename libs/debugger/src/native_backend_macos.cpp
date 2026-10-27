@@ -118,6 +118,14 @@ bool read_u64(const RegisterValue& reg, const char* name, std::uint64_t& value) 
     std::memcpy(&value, reg.bytes.data(), sizeof(value));
     return true;
 }
+#if defined(__arm64__) || defined(__aarch64__)
+bool read_u32(const RegisterValue& reg, const char* name, std::uint32_t& value) {
+    if (reg.name != name) return false;
+    if (reg.bytes.size() != sizeof(value)) return false;
+    std::memcpy(&value, reg.bytes.data(), sizeof(value));
+    return true;
+}
+#endif
 
 #if defined(__x86_64__)
 struct FloatRegisterField { const char* name; std::size_t offset; std::size_t width; const char* group; };
@@ -1152,8 +1160,12 @@ private:
         if (kr != KERN_SUCCESS) return mach_error("thread_get_state AArch64", kr);
         if (count != ARM_THREAD_STATE64_COUNT)
             return Error{ErrorCode::malformed, "incomplete Darwin AArch64 general register state"};
-        for (unsigned i = 0; i < 29; ++i) add_register(out, ("x" + std::to_string(i)).c_str(), state.__x[i]);
-        add_register(out, "x29", state.__fp); add_register(out, "x30", state.__lr);
+        for (unsigned i = 0; i < 29; ++i) {
+            add_register(out, ("x" + std::to_string(i)).c_str(), state.__x[i]);
+            add_register(out, ("w" + std::to_string(i)).c_str(), static_cast<std::uint32_t>(state.__x[i]));
+        }
+        add_register(out, "x29", state.__fp); add_register(out, "w29", static_cast<std::uint32_t>(state.__fp));
+        add_register(out, "x30", state.__lr); add_register(out, "w30", static_cast<std::uint32_t>(state.__lr));
         add_register(out, "sp", state.__sp); add_register(out, "pc", state.__pc); add_register(out, "cpsr", state.__cpsr);
         arm_neon_state64_t neon{};
         mach_msg_type_number_t neon_count = ARM_NEON_STATE64_COUNT;
@@ -1248,15 +1260,29 @@ private:
         if (neon_count != ARM_NEON_STATE64_COUNT)
             return Error{ErrorCode::malformed, "incomplete Darwin AArch64 NEON register state before write"};
         auto neon_after = neon_before;
+        std::array<bool, 31> written_x{};
         for (const auto& reg : values) {
             bool matched = false;
-            for (unsigned i = 0; i < 29; ++i) {
-                const auto name = "x" + std::to_string(i);
-                std::uint64_t value{};
-                if (read_u64(reg, name.c_str(), value)) { state.__x[i] = value; matched = true; break; }
+            for (unsigned i = 0; i < 31; ++i) {
+                const auto x_name = "x" + std::to_string(i);
+                const auto w_name = "w" + std::to_string(i);
+                std::uint64_t x_value{};
+                std::uint32_t w_value{};
+                if (read_u64(reg, x_name.c_str(), x_value)) {
+                    if (written_x[i]) return Error{ErrorCode::invalid_argument, "duplicate Darwin AArch64 register alias"};
+                    if (i < 29) state.__x[i] = x_value;
+                    else if (i == 29) state.__fp = x_value;
+                    else state.__lr = x_value;
+                    written_x[i] = true; matched = true; break;
+                }
+                if (read_u32(reg, w_name.c_str(), w_value)) {
+                    if (written_x[i]) return Error{ErrorCode::invalid_argument, "duplicate Darwin AArch64 register alias"};
+                    if (i < 29) state.__x[i] = w_value;
+                    else if (i == 29) state.__fp = w_value;
+                    else state.__lr = w_value;
+                    written_x[i] = true; matched = true; break;
+                }
             }
-            if (!matched && read_u64(reg, "x29", state.__fp)) matched = true;
-            if (!matched && read_u64(reg, "x30", state.__lr)) matched = true;
             if (!matched && read_u64(reg, "sp", state.__sp)) matched = true;
             if (!matched && read_u64(reg, "pc", state.__pc)) matched = true;
             if (!matched && reg.name == "cpsr" && reg.bytes.size() == sizeof(state.__cpsr)) {

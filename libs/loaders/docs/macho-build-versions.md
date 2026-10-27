@@ -18,3 +18,10 @@ rendered as `major.minor.patch`; platform and tool IDs are intentionally shown
 as numbers. These declarations describe the build target only. They do not
 select a runtime, validate an SDK, or prove that code is compatible with the
 reported platform.
+
+`LC_SOURCE_VERSION` is retained separately as a packed 64-bit source version
+and decoded into its A.B.C.D.E fields (24 bits for A, 10 bits for each
+remaining component). The parser requires the exact 16-byte command size and
+charges the record to the metadata budget. CLI inspection prints both the
+decoded components and the original packed word. This identifies source
+version metadata; it does not validate a source revision or build provenance.

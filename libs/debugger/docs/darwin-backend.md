@@ -131,9 +131,12 @@ stage both contexts and attempt to restore the previous floating-point context
 if the subsequent general-context commit fails. A failed rollback is reported
 explicitly. AVX/AVX-512 upper registers are not exposed.
 
-On AArch64, the existing interface exposes `x0` through `x30`, `sp`, `pc`,
-`cpsr`, `v0` through `v31`, `fpsr`, and `fpcr` through the general and NEON Mach
-state flavors. Register values use the native little-endian byte order.
+On AArch64, the interface exposes `x0` through `x30` and their four-byte
+`w0` through `w30` aliases, plus `sp`, `pc`, `cpsr`, `v0` through `v31`,
+`fpsr`, and `fpcr` through the general and NEON Mach state flavors. W reads
+return the low 32 bits; W writes zero-extend into the corresponding X register.
+A batch that writes both aliases of one register is rejected before any Mach
+state is changed. Register values use the native little-endian byte order.
 
 Software breakpoints use x86 `INT3` or aligned AArch64 `BRK #0`, with
 enable/disable, restoration, and displaced-instruction stepping. Hardware

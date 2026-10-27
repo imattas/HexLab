@@ -180,6 +180,24 @@ void build_version(const Reader &reader, const MachOLoadCommand &command, MachOM
     }
     metadata.build_versions.push_back(std::move(row));
 }
+void source_version(const Reader &reader, const MachOLoadCommand &command, MachOMetadata &metadata,
+                    Budget &budget) {
+    require(command.size == 16, "Mach-O LC_SOURCE_VERSION must be 16 bytes");
+    const auto fixed = reader.bytes(command.file_offset - metadata.container.slices[metadata.selected_slice].offset,
+                                    16);
+    MachOSourceVersion row;
+    row.command_index = command.index;
+    row.command = command.command;
+    row.record_file_offset = command.file_offset;
+    row.packed = reader.value(fixed.bytes, 8, 8);
+    row.major = static_cast<std::uint32_t>((row.packed >> 40) & 0xffffff);
+    row.minor = static_cast<std::uint32_t>((row.packed >> 30) & 0x3ff);
+    row.patch = static_cast<std::uint32_t>((row.packed >> 20) & 0x3ff);
+    row.build = static_cast<std::uint32_t>((row.packed >> 10) & 0x3ff);
+    row.prerelease = static_cast<std::uint32_t>(row.packed & 0x3ff);
+    budget.include(sizeof(MachOSourceVersion));
+    metadata.source_versions.push_back(std::move(row));
+}
 void fileset_entry(const Reader &reader, const MachOLoadCommand &command, const MachOSlice &slice,
                    MachOMetadata &metadata, Budget &budget, std::stop_token stop) {
     require(slice.header.is_64 && slice.header.file_type == 0xc,
@@ -1092,7 +1110,7 @@ bool supported_command(std::uint32_t command) {
            command == 0x11 || command == 0x1a || command == 0x26 || command == 0x22 || command == 0x80000022 || command == 0x80000033 ||
            command == 0x80000034 || command == 0x29 || command == 0x1d || command == 0x21 || command == 0x2c ||
            command == 0x32 || command == 0x24 || command == 0x25 || command == 0x2f || command == 0x30 ||
-           command == 0x35;
+           command == 0x2a || command == 0x35;
 }
 void read_commands(const ByteStorage &storage, const Image &image, MachOMetadata &metadata, Budget &budget,
                    std::stop_token stop) {
@@ -1194,6 +1212,8 @@ void read_commands(const ByteStorage &storage, const Image &image, MachOMetadata
         } else if (command.command == 0x32 || command.command == 0x24 || command.command == 0x25 ||
                    command.command == 0x2f || command.command == 0x30) {
             build_version(reader, command, metadata, budget, stop);
+        } else if (command.command == 0x2a) {
+            source_version(reader, command, metadata, budget);
         } else if (command.command == 0x26) {
             function_starts(reader, command, slice, image, metadata, text_base, budget, stop);
         } else if (command.command == 0x35) {
