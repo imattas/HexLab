@@ -179,7 +179,14 @@ denormal/invalid exceptions plus whether an unmasked exception suppresses the K
 result; sticky MXCSR flag updates remain the caller's responsibility. Masked-off
 lanes are neither compared nor allowed to raise exceptions, and the output is
 limited to the active low K bits. Register-source EVEX.b (SAE), destination
-zeroing, and invalid encodings are rejected.
+zeroing, and invalid encodings are rejected. VEX.128/.256 packed floating
+compare-to-vector forms are also decoded and lifted for all 32 immediate
+predicates. They retain vector operands and results, VEX.128 upper-YMM clearing,
+memory reads, and MXCSR input/output dependencies. Their exact lane truth
+tables and exception retirement are not evaluated by the VEX lane helper; the
+compare evaluator described above accepts only EVEX compare-to-K instructions.
+Sticky MXCSR flag updates remain the caller's responsibility; floating
+arithmetic remains an opaque state-aware intrinsic.
 The opcode forms and predicate width follow Intel SDM Vol. 2's `VCMPPS` and
 `VCMPPD` entries (same [manual](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developers-manual.pdf)).
 

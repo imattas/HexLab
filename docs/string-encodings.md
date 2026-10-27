@@ -47,9 +47,16 @@ yield candidates; the result is a code-page interpretation, not locale or
 language classification. Its persisted encoding value is 12, and derived-cache
 version 27 makes earlier payloads recompute.
 
+Windows-1257 adds a Baltic code-page candidate using the Unicode Consortium's
+historical Microsoft [CP1257 mapping table](https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WINDOWS/CP1257.TXT).
+Undefined byte positions break runs; emitted runs need a non-ASCII scalar and
+retain their source extents with UTF-8 previews. The persisted encoding value is
+13, and derived-cache version 28 causes older payloads to recompute. This is a
+heuristic mapping and can produce overlapping interpretations of binary data.
+
 `hexlab_cli disassemble <path> --show-strings` lists candidate encoding names,
 file offsets, extents, and previews. The desktop Strings view uses the same
-Windows-1253, Windows-1255, and Windows-1256 labels.
+Windows-1253, Windows-1255, Windows-1256, and Windows-1257 labels.
 
 All encoding passes use the same file-backed scan domains, string-record budget,
 and cancellation checks. Returned previews are UTF-8, while each record retains

@@ -3447,6 +3447,47 @@ a64_unhandled:
             return effect;
         }
     }
+    if (x86 && instruction.context.mode == ExecutionMode::x86_64 && !instruction.x86_evex &&
+        (instruction.opcode == Opcode::vcmpps || instruction.opcode == Opcode::vcmppd) &&
+        (instruction.vector_bits == 128 || instruction.vector_bits == 256) &&
+        instruction.operands.size() == 4 && !instruction.x86_opmask && !instruction.x86_opmask_zeroing) {
+        const auto width = static_cast<unsigned>(instruction.vector_bits);
+        const auto lane_bits = static_cast<std::uint16_t>(instruction.opcode == Opcode::vcmpps ? 32 : 64);
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
+        const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+        const bool zero_upper = width == 128 && destination &&
+            std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [&](RegisterOperand reg) {
+                    return reg.bank == RegisterBank::ymm && reg.width == 256 && reg.index == destination->index;
+                });
+        if (destination && x86_avx_detail::is_xmm_or_ymm(instruction.operands[0], width) &&
+            x86_avx_detail::is_xmm_or_ymm(instruction.operands[1], width) &&
+            (x86_avx_detail::is_xmm_or_ymm(instruction.operands[2], width) ||
+             (memory && memory->data_width == width)) && predicate &&
+            predicate->encoded_width == 8 && predicate->effective_width == 8 && !predicate->is_signed &&
+            predicate->value < 32 && (!instruction.vector_element_bits || instruction.vector_element_bits == lane_bits) &&
+            (!instruction.vector_bits || instruction.vector_bits == width) && (width != 128 || zero_upper)) {
+            const auto input_type = vector_type(width, TypeKind::floating, lane_bits,
+                static_cast<std::uint8_t>(width / lane_bits));
+            const auto result_type = vector_type(static_cast<std::uint16_t>(zero_upper ? 256 : width),
+                TypeKind::floating, lane_bits,
+                static_cast<std::uint8_t>((zero_upper ? 256 : width) / lane_bits));
+            std::vector<ExpressionPtr> inputs{
+                retag_expr(operands[1], input_type), retag_expr(operands[2], input_type),
+                retag_expr(operands[3], integer_type(8)),
+                reg_expr({RegisterBank::mxcsr, 0, 32, false})};
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_f" +
+                std::to_string(lane_bits) + "x" + std::to_string(width / lane_bits) +
+                "_predicate" + std::to_string(predicate->value) +
+                (zero_upper ? "_zero_upper" : "") + "_mxcsr_control_status", std::move(inputs),
+                memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = result_type;
+            return effect;
+        }
+    }
+
     if (x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
         (instruction.opcode == Opcode::vcmpps || instruction.opcode == Opcode::vcmppd) &&
         (instruction.vector_bits == 128 || instruction.vector_bits == 256 || instruction.vector_bits == 512) &&
