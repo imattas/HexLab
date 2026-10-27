@@ -500,7 +500,9 @@ enum class Opcode {
     // PowerPC condition-register field copy; append for persisted IDs.
     ppc_mcrf,
     // MIPS32 COP1 branch-likely forms; append to preserve persisted IDs.
-    mips_bc1tl, mips_bc1fl
+    mips_bc1tl, mips_bc1fl,
+    // AArch64 extract concatenated registers (EXTR); appended for stable IDs.
+    a64_extr
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

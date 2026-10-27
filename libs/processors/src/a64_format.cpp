@@ -9,6 +9,7 @@ std::string hex(std::uint64_t value) {
 }
 } // namespace
 std::string mnemonic(Opcode opcode, std::uint8_t condition) {
+    if (opcode == Opcode::a64_extr) return "extr";
     if (opcode == Opcode::a64_ldrsw) return "ldrsw";
     if (opcode == Opcode::a64_madd) return "madd";
     if (opcode == Opcode::a64_msub) return "msub";
@@ -48,6 +49,15 @@ std::string mnemonic(Opcode opcode, std::uint8_t condition) {
     return result;
 }
 std::string format(const Instruction &i) {
+    if (i.opcode == Opcode::a64_extr && i.operands.size() == 4) {
+        const auto *dst = std::get_if<RegisterOperand>(&i.operands[0]);
+        const auto *low = std::get_if<RegisterOperand>(&i.operands[1]);
+        const auto *high = std::get_if<RegisterOperand>(&i.operands[2]);
+        const auto *lsb = std::get_if<ImmediateOperand>(&i.operands[3]);
+        if (dst && low && high && lsb)
+            return "extr " + register_name(*dst) + ", " + register_name(*low) + ", " +
+                register_name(*high) + ", #" + hex(lsb->value);
+    }
     if ((i.opcode == Opcode::a64_ccmp || i.opcode == Opcode::a64_ccmn) && i.operands.size() == 3) {
         static constexpr const char *conditions[]{"eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc",
                                                    "hi", "ls", "ge", "lt", "gt", "le", "al", "nv"};

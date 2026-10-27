@@ -383,6 +383,22 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
     for (const auto &row : m.code_signatures)
         out << "  signature command=" << row.command_index << " file=" << macho_hex(row.offset.value)
             << " size=" << row.size << " authentication=unavailable\n";
+    for (const auto &row : m.code_signature_blobs) {
+        out << "    signature-blob signature=" << row.signature << " index=" << row.index
+            << " slot=" << macho_hex(row.slot_type) << " magic=" << macho_hex(row.magic)
+            << " relative=" << macho_hex(row.raw_offset) << " record=file:" << macho_hex(row.record_file_offset)
+            << " size=" << row.size;
+        if (row.code_directory)
+            out << " CodeDirectory-version=" << macho_hex(row.code_directory_version.value_or(0))
+                << " flags=" << macho_hex(row.code_directory_flags.value_or(0))
+                << " code-limit=" << macho_hex(row.code_limit.value_or(0))
+                << " code-slots=" << row.code_slots.value_or(0) << " hash-size=" << unsigned(row.hash_size)
+                << " hash-type=" << unsigned(row.hash_type) << " platform=" << unsigned(row.platform)
+                << " page-size-exp=" << unsigned(row.page_size_exponent);
+        else
+            out << " kind=uninterpreted";
+        out << " verification=unavailable\n";
+    }
     if (image) {
         auto objc = scan_macho_objc_classes(*image, metadata);
         if (!objc) {

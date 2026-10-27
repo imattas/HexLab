@@ -28,3 +28,10 @@ condition instead of guessed operands.
 
 Integer `CCMP`/`CCMN` now chain flag conditions with encoded false-path NZCV
 values; see [AArch64 conditional compares](a64-conditional-compare.md).
+
+`EXTR` is decoded for W/X registers when the `N` bit matches the operation
+width and the shift amount is in range. Pseudocode models the architectural
+`Rn:Rm` concatenation with `Rm` as the low half, then shifts right by `lsb`;
+the W form zero-extends its result to the architectural 64-bit destination.
+The operation does not read or write NZCV. Other bitfield and extract forms
+remain outside this slice.

@@ -46,6 +46,23 @@ bool logical_immediate(Instruction &i, std::uint32_t word, unsigned width) {
 } // namespace
 bool integer(Instruction &i, std::uint32_t word) {
     const unsigned width = (word >> 31) ? 64 : 32;
+    // EXTR extracts a width-sized window from Rn concatenated with Rm.
+    // sf/N must agree, and the 32-bit form reserves imm6[5].
+    if ((word & 0x7fa00000u) == 0x13800000u) {
+        const unsigned n = (word >> 22) & 1;
+        const unsigned lsb = (word >> 10) & 63;
+        if (n != (width == 64 ? 1u : 0u) || lsb >= width)
+            return false;
+        i.opcode = Opcode::a64_extr;
+        operand(i, reg(word & 31, width), OperandAccess::write);
+        operand(i, reg((word >> 5) & 31, width), OperandAccess::read);
+        operand(i, reg((word >> 16) & 31, width), OperandAccess::read);
+        immediate(i, lsb, 6, width);
+        const unsigned destination = word & 31;
+        if (width == 32 && destination != 31)
+            i.register_writes.push_back(reg(destination, 64));
+        return true;
+    }
     // Conditional compare (register/immediate). The mask intentionally omits
     // bit 11 so both forms match: zero selects Rm, one selects imm5. It checks
     // the fixed high pattern and reserved-zero bits 10 and 4. Bit 30 selects
