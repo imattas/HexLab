@@ -570,6 +570,7 @@ std::string operation_name(Opcode opcode) {
     case Opcode::m6502_rla: return "RLA";
     case Opcode::m6502_sre: return "SRE";
     case Opcode::m6502_rra: return "RRA";
+    case Opcode::m6502_isc: return "ISC";
     case Opcode::m6502_cpx: return "CPX"; case Opcode::m6502_cpy: return "CPY";
     case Opcode::m6502_bit: return "BIT"; case Opcode::m6502_inc: return "INC";
     case Opcode::m6502_dec: return "DEC"; case Opcode::m6502_inx: return "INX";
@@ -1608,14 +1609,16 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 return effect;
             }
             if (op == Opcode::m6502_adc || op == Opcode::m6502_sbc ||
-                (op == Opcode::m6502_rra && is_memory(instruction.operands.front()))) {
-                const bool subtract = op == Opcode::m6502_sbc;
+                ((op == Opcode::m6502_rra || op == Opcode::m6502_isc) && is_memory(instruction.operands.front()))) {
+                const bool subtract = op == Opcode::m6502_sbc || op == Opcode::m6502_isc;
                 const auto lhs = reg_expr(accumulator);
                 const bool rra = op == Opcode::m6502_rra;
+                const bool isc = op == Opcode::m6502_isc;
                 const auto old_byte = operands.front();
                 const auto rhs = rra ? binary("or", binary("lshr", old_byte, constant_expr(1, 8)),
                     binary("shl", std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
-                        boolean_binary("bit_extract", status_value, constant_expr(0, 8))}}), constant_expr(7, 8))) : old_byte;
+                        boolean_binary("bit_extract", status_value, constant_expr(0, 8))}}), constant_expr(7, 8))) :
+                    isc ? byte_wrap(binary("add", old_byte, constant_expr(1, 8))) : old_byte;
                 const auto bool_byte = [](ExpressionPtr value) -> ExpressionPtr {
                     return std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", std::move(value)}});
                 };
@@ -1732,10 +1735,11 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 const auto selected_result = binary("select_if", decimal_bit, alternatives);
                 const auto status_alternatives = binary("pair", decimal_status, binary_status);
                 const auto selected_status = binary("select_if", decimal_bit, status_alternatives);
-                Intrinsic effect{rra ? "m6502_rra_ror_then_adc" : subtract ? "m6502_sbc" : "m6502_adc",
-                    rra ? std::vector<ExpressionPtr>{old_byte, rhs, reg_expr(accumulator), status_value} :
+                Intrinsic effect{rra ? "m6502_rra_ror_then_adc" : isc ? "m6502_isc_increment_then_sbc" :
+                    subtract ? "m6502_sbc" : "m6502_adc",
+                    (rra || isc) ? std::vector<ExpressionPtr>{old_byte, rhs, reg_expr(accumulator), status_value} :
                           std::vector<ExpressionPtr>{},
-                    rra ? IntrinsicMemoryEffect::unknown :
+                    (rra || isc) ? IntrinsicMemoryEffect::unknown :
                         instruction.memory_read ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
                 effect.register_writes = {accumulator, status};
                 effect.register_output_values = {selected_result, selected_status};

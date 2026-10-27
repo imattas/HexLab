@@ -10,6 +10,10 @@ unit. `DW_FORM_ref_addr` type references and subprogram
 compile unit in the same `.debug_info` section, including a later unit. All
 units are decoded and indexed before resolution, then resolved in a bounded
 dependency order so target types and function signatures are available first.
+Integral bitfield members with a positive `DW_AT_bit_size` may omit
+`DW_AT_name`; these remain unnamed fields with their storage position and bit
+range intact in the imported aggregate. Unnamed non-bitfield members remain
+unsupported.
 Ranged subprogram DIEs inherit missing names, return types, and parameter lists
 from same-unit or cross-unit targets; cycles and non-subprogram targets are
 malformed. Cross-unit function inheritance is limited to complete named

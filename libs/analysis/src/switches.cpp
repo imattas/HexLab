@@ -2426,6 +2426,254 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
+std::optional<SwitchSite> ppc32_register_absolute_switch(
+    const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
+    const std::vector<std::shared_ptr<const InstructionFact>> &facts,
+    std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
+    std::stop_token stop) {
+    // PPC32 indexed absolute-pointer form:
+    //   ADDIS/ORI tableBase; MULLI index, selector, 4 (or SLWI by 2);
+    //   LWZX target, tableBase, index;
+    //   MTCTR target; BCTR.
+    // This deliberately handles linked images with literal instruction
+    // immediates. Relocation-paired HA/LO table bases need a separate proof.
+    if (dispatch_index < 4 || dispatch_index >= facts.size() || stop.stop_requested() ||
+        !facts[dispatch_index])
+        return {};
+    const auto &dispatch = facts[dispatch_index]->instruction;
+    if (dispatch.context.architecture != Architecture::powerpc ||
+        dispatch.context.mode != ExecutionMode::ppc32 || dispatch.opcode != Opcode::ppc_bcctr ||
+        dispatch.flow != FlowKind::jump || dispatch.operands.size() < 2)
+        return {};
+    const auto ctr_read = std::any_of(dispatch.register_reads.begin(), dispatch.register_reads.end(),
+        [](const RegisterOperand &reg) { return reg.bank == RegisterBank::ppc_ctr && reg.width == 32; });
+    if (!ctr_read || !facts[dispatch_index - 1] || !facts[dispatch_index - 2])
+        return {};
+    const auto &move_to_ctr = facts[dispatch_index - 1]->instruction;
+    const auto mtctr_end = analysis_detail::continuation_address(move_to_ctr);
+    const auto dispatch_target = move_to_ctr.operands.size() == 2
+        ? register_operand(move_to_ctr, 1) : nullptr;
+    if (move_to_ctr.context != dispatch.context || move_to_ctr.opcode != Opcode::ppc_mtctr ||
+        move_to_ctr.flow != FlowKind::fallthrough || !mtctr_end || mtctr_end.value() != dispatch.address ||
+        !dispatch_target || dispatch_target->bank != RegisterBank::ppc_gpr || dispatch_target->width != 32 ||
+        dispatch_target->index == 0 || !facts[dispatch_index - 2])
+        return {};
+    const auto &terminal_load = facts[dispatch_index - 2]->instruction;
+    const auto load_end = analysis_detail::continuation_address(terminal_load);
+    const auto *loaded_register = terminal_load.operands.empty() ? nullptr : register_operand(terminal_load, 0);
+    if (terminal_load.context != dispatch.context || terminal_load.opcode != Opcode::ppc_lwzx ||
+        terminal_load.flow != FlowKind::fallthrough || !load_end || load_end.value() != move_to_ctr.address ||
+        !loaded_register || !same_register(loaded_register, dispatch_target) || terminal_load.operands.size() != 2)
+        return {};
+
+    struct Value {
+        std::optional<Address> constant;
+        std::optional<Address> table_base;
+        std::optional<RegisterOperand> selector;
+        std::uint64_t scale = 1;
+        Address scale_instruction{};
+        bool has_scale_instruction = false;
+    };
+    std::map<std::uint32_t, Value> registers;
+    const auto erase_written = [&](const Instruction &instruction) {
+        for (const auto &written : instruction.register_writes)
+            if (written.bank == RegisterBank::ppc_gpr && written.width == 32)
+                registers.erase(written.index);
+    };
+    const auto decoded_immediate_is_unrelocated = [&](const Instruction &instruction, std::uint32_t operand) {
+        if (!relocations)
+            return true;
+        auto resolution = relocations->operand(instruction, operand, stop);
+        return resolution && !resolution.value().relocated();
+    };
+    const auto add32 = [&](Address base, std::int64_t delta) {
+        return Address{base.space, static_cast<std::uint32_t>(base.offset + static_cast<std::uint64_t>(delta))};
+    };
+
+    for (std::size_t index = 0; index < dispatch_index - 1; ++index) {
+        if (stop.stop_requested() || !facts[index])
+            return {};
+        const auto &instruction = facts[index]->instruction;
+        if (instruction.context != dispatch.context || instruction.flow != FlowKind::fallthrough ||
+            instruction.delay_slots)
+            return {};
+        if (index) {
+            if (!facts[index - 1])
+                return {};
+            const auto previous_end = analysis_detail::continuation_address(facts[index - 1]->instruction);
+            if (!previous_end || previous_end.value() != instruction.address)
+                return {};
+        }
+        const auto *destination = instruction.operands.empty() ? nullptr : register_operand(instruction, 0);
+        const auto valid_destination = [&](const RegisterOperand *reg) {
+            return reg && reg->bank == RegisterBank::ppc_gpr && reg->width == 32 && reg->index != 0;
+        };
+
+        if (instruction.opcode == Opcode::ppc_addis && instruction.operands.size() == 3 &&
+            valid_destination(destination)) {
+            const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+            const auto *source = register_operand(instruction, 1);
+            const bool zero_base = std::get_if<ImmediateOperand>(&instruction.operands[1]) != nullptr &&
+                std::get<ImmediateOperand>(instruction.operands[1]).value == 0;
+            std::optional<Address> base;
+            if (zero_base)
+                base = Address{dispatch.address.space, 0};
+            else if (source && source->bank == RegisterBank::ppc_gpr && source->width == 32 && source->index) {
+                if (const auto found = registers.find(source->index); found != registers.end())
+                    base = found->second.constant;
+            }
+            if (immediate && immediate->effective_width == 32 && immediate->is_signed && base &&
+                base->space == dispatch.address.space && decoded_immediate_is_unrelocated(instruction, 2)) {
+                const auto signed_value = std::bit_cast<std::int64_t>(immediate->value);
+                erase_written(instruction);
+                registers[destination->index] = Value{add32(*base, signed_value)};
+            } else {
+                erase_written(instruction);
+            }
+            continue;
+        }
+        if (instruction.opcode == Opcode::ppc_addi && instruction.operands.size() == 3 &&
+            valid_destination(destination)) {
+            const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+            const auto *source = register_operand(instruction, 1);
+            const bool zero_base = std::get_if<ImmediateOperand>(&instruction.operands[1]) != nullptr &&
+                std::get<ImmediateOperand>(instruction.operands[1]).value == 0;
+            std::optional<Address> base;
+            if (zero_base)
+                base = Address{dispatch.address.space, 0};
+            else if (source && source->bank == RegisterBank::ppc_gpr && source->width == 32 && source->index) {
+                if (const auto found = registers.find(source->index); found != registers.end())
+                    base = found->second.constant;
+            }
+            if (immediate && immediate->effective_width == 32 && immediate->is_signed && base &&
+                base->space == dispatch.address.space && decoded_immediate_is_unrelocated(instruction, 2)) {
+                const auto signed_value = std::bit_cast<std::int64_t>(immediate->value);
+                erase_written(instruction);
+                registers[destination->index] = Value{add32(*base, signed_value)};
+            } else {
+                erase_written(instruction);
+            }
+            continue;
+        }
+        if (instruction.opcode == Opcode::ppc_ori && instruction.operands.size() == 3 &&
+            valid_destination(destination)) {
+            const auto *source = register_operand(instruction, 1);
+            const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+            std::optional<Address> base;
+            if (source && source->bank == RegisterBank::ppc_gpr && source->width == 32) {
+                if (!source->index)
+                    base = Address{dispatch.address.space, 0};
+                else if (const auto found = registers.find(source->index); found != registers.end())
+                    base = found->second.constant;
+            }
+            if (immediate && immediate->encoded_width == 16 && immediate->effective_width == 32 &&
+                !immediate->is_signed && immediate->value <= 0xffff && base &&
+                base->space == dispatch.address.space && decoded_immediate_is_unrelocated(instruction, 2)) {
+                const auto target = Address{base->space, base->offset | immediate->value};
+                erase_written(instruction);
+                registers[destination->index] = Value{target};
+            } else {
+                erase_written(instruction);
+            }
+            continue;
+        }
+        const bool multiply_scale = instruction.opcode == Opcode::ppc_mulli &&
+                                    instruction.operands.size() == 3;
+        const bool shift_scale = instruction.opcode == Opcode::ppc_rlwinm &&
+                                 instruction.operands.size() == 5;
+        if ((multiply_scale || shift_scale) && valid_destination(destination)) {
+            const auto *source = register_operand(instruction, 1);
+            std::optional<Value> value;
+            bool exact_scale = false;
+            if (multiply_scale) {
+                const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+                exact_scale = immediate && immediate->effective_width == 32 && immediate->is_signed &&
+                    std::bit_cast<std::int64_t>(immediate->value) == 4 &&
+                    decoded_immediate_is_unrelocated(instruction, 2);
+            } else {
+                const auto *shift = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+                const auto *mask_begin = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+                const auto *mask_end = std::get_if<ImmediateOperand>(&instruction.operands[4]);
+                exact_scale = shift && mask_begin && mask_end && shift->value == 2 &&
+                    mask_begin->value == 0 && mask_end->value == 29;
+            }
+            if (exact_scale && source && source->bank == RegisterBank::ppc_gpr &&
+                source->width == 32 && source->index) {
+                Value scaled;
+                scaled.selector = *source;
+                scaled.scale = 4;
+                scaled.scale_instruction = instruction.address;
+                scaled.has_scale_instruction = true;
+                value = std::move(scaled);
+            }
+            erase_written(instruction);
+            if (value)
+                registers[destination->index] = std::move(*value);
+            continue;
+        }
+        if (instruction.opcode == Opcode::ppc_lwzx && instruction.operands.size() == 2 &&
+            valid_destination(destination)) {
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+            std::optional<Value> loaded;
+            if (memory && memory->data_width == 32 && memory->address_width == 32 && memory->base &&
+                memory->index && memory->scale == 1) {
+                const auto base = registers.find(memory->base->index);
+                const auto index_value = registers.find(memory->index->index);
+                if (memory->base->bank == RegisterBank::ppc_gpr && memory->base->width == 32 &&
+                    memory->index->bank == RegisterBank::ppc_gpr && memory->index->width == 32 &&
+                    base != registers.end() && base->second.constant &&
+                    base->second.constant->space == dispatch.address.space && index_value != registers.end() &&
+                    index_value->second.selector && index_value->second.has_scale_instruction &&
+                    index_value->second.scale == 4) {
+                    Value table_value;
+                    table_value.table_base = add32(*base->second.constant, memory->displacement);
+                    table_value.selector = index_value->second.selector;
+                    table_value.scale = index_value->second.scale;
+                    table_value.scale_instruction = index_value->second.scale_instruction;
+                    table_value.has_scale_instruction = true;
+                    loaded = std::move(table_value);
+                }
+            }
+            erase_written(instruction);
+            if (loaded)
+                registers[destination->index] = std::move(*loaded);
+            continue;
+        }
+        erase_written(instruction);
+    }
+
+    const auto loaded = registers.find(dispatch_target->index);
+    if (loaded == registers.end() || !loaded->second.table_base || !loaded->second.selector ||
+        !loaded->second.has_scale_instruction || loaded->second.scale != 4 ||
+        same_register(&*loaded->second.selector, dispatch_target) ||
+        !file_backed_range(image, *loaded->second.table_base, 4, false))
+        return {};
+    SwitchSite site;
+    site.dispatch = dispatch.address;
+    site.table = *loaded->second.table_base;
+    site.selector = *loaded->second.selector;
+    site.scale = 4;
+    (void)function;
+    (void)snapshot;
+    (void)guards;
+    const auto scan_limit = max_entries;
+    for (std::size_t index = 0; index < scan_limit; ++index) {
+        if (stop.stop_requested())
+            return {};
+        const auto target = table_target(image, site.table, index, 4, false, relocations, stop);
+        if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
+            site.complete = false;
+            site.incomplete_reason = "table entry is unreadable, unresolved, or not executable PPC32 code";
+            break;
+        }
+        site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
+                              target->relocation_rows, target->dyld_classic_rows, target->dyld_chained_rows});
+    }
+    if (site.cases.size() == max_entries)
+        site.complete = false;
+    return site.cases.size() >= 2 ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
+}
+
 std::optional<SwitchSite> riscv_indexed_relative_switch(
     const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
@@ -2669,6 +2917,19 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
             if (!fact)
                 continue;
             const auto &instruction = fact->instruction;
+            if (instruction.context.architecture == Architecture::powerpc &&
+                instruction.context.mode == ExecutionMode::ppc32 && instruction.opcode == Opcode::ppc_bcctr &&
+                instruction.flow == FlowKind::jump) {
+                auto ppc_switch = ppc32_register_absolute_switch(image, function, snapshot,
+                    found->second->instructions, fact_index, guards, relocations, stop);
+                if (stop.stop_requested())
+                    return Error{ErrorCode::canceled, "Switch analysis canceled"};
+                if (ppc_switch) {
+                    result.complete = result.complete && ppc_switch->complete;
+                    result.sites.push_back(std::move(*ppc_switch));
+                }
+                continue;
+            }
             if ((instruction.context.architecture == Architecture::mips64 && instruction.context.mode == ExecutionMode::mips64 ||
                  instruction.context.architecture == Architecture::mips32 && instruction.context.mode == ExecutionMode::mips32) &&
                 instruction.opcode == Opcode::mips_jr && instruction.flow == FlowKind::jump) {

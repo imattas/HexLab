@@ -278,6 +278,11 @@ void validate_pointer_bits(const MachODyldChainedOrigin &v) {
                             static_cast<std::uint32_t>(target - (UINT64_C(0x4000000) + v.max_valid_pointer) / 2),
                         "Owned generic32 scalar restoration differs from original word");
         }
+    } else if (format == 5) {
+        require(raw <= UINT32_MAX && p.field_size == 4 && p.stride == 4 && !p.authenticated && !p.bind &&
+                    p.next == ((raw >> 26) & 0x3f) && p.target == (raw & UINT64_C(0x03ffffff)) &&
+                    !p.high8 && !p.target_is_offset && !p.non_pointer,
+                "Owned firmware32 pointer differs from original word");
     } else if (format == 8 || format == 11) {
         require(p.field_size == 8 && p.stride == (format == 8 ? 4 : 1) && !p.bind &&
                     p.authenticated == bool(raw >> 63) && p.next == ((raw >> 51) & 0xfff) &&
@@ -550,7 +555,9 @@ void validate_dyld_provenance(const MachODyldReferenceProvenance &v) {
                 require(!r.binding && !p.import_row, "Owned chained binding lacks import source");
             if (r.reason == R::resolved) {
                 require(!p.bind && !p.authenticated && !p.non_pointer && p.complete && chain.starts_complete &&
-                            p.field_size == (c.is_64 ? 8 : 4) && !h.version && c.order == ByteOrder::little && p.target,
+                            p.field_size == (c.is_64 ? 8 : 4) &&
+                            !((chain.pointer_format == 3 || chain.pointer_format == 5) == c.is_64) && !h.version &&
+                            c.order == ByteOrder::little && p.target,
                         "Unsupported chained pointer claims resolution");
                 auto target = *p.target | (std::uint64_t(p.high8) << 56);
                 if (p.target_is_offset) {

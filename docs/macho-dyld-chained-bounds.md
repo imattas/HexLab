@@ -52,9 +52,10 @@ The 32-bit cache (format 4) and firmware (format 5) pointer formats retain
 their bounded 30-bit/2-bit and 26-bit/6-bit target/next fields respectively,
 and follow their 4-byte-stride chains. Format 4 is cache-relative and remains
 unresolved without a cache mapping context. Apple defines format 5's 26-bit
-target as a VM address, so the parser records it as a direct target without
-adding an invented base. The current resolver does not yet resolve format 5.
-These formats are accepted only in 32-bit slices.
+target as a VM address. The resolver returns it directly when it maps into the
+selected image; otherwise it reports an unmapped target. It does not invent a
+base or widen the encoded 26-bit target. These formats are accepted only in
+32-bit slices.
 
 The parser applies these hard limits before allocating symbol strings or
 following chain records:
