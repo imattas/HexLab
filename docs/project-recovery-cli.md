@@ -32,8 +32,11 @@ hexlab_cli project recovery restore .\projects\.hexlab-save-abc.tmp --output .\r
 
 Restore re-discovers and validates the artifact in its containing directory,
 then the database API checks its kind and UUID again before copying it through
-the checked Save As path. The new project receives a fresh UUID. The artifact
-is retained unchanged. Existing output files are refused unless `--replace` is
+the checked Save As path. Recovery candidates also pin the edit, byte, and
+decision revisions seen during discovery; if a caller delays restoration and
+the candidate changes in the meantime, restore returns a conflict instead of
+copying a different project state. The new project receives a fresh UUID. The
+artifact is retained unchanged. Existing output files are refused unless `--replace` is
 explicitly supplied; output paths that alias protected source or project files
 are rejected by the database publication layer.
 

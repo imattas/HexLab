@@ -21,6 +21,13 @@ remain in metadata and are not attached to another thread. Duplicate standard
 An exception context is retained independently of the thread context; neither
 is substituted for the other.
 
+Module CodeView records recognize bounded RSDS and NB10 identities. RSDS
+retains the 16-byte PDB GUID and age; NB10 retains its timestamp and age. Both
+retain the NUL-terminated PDB path as raw bytes because the format does not
+identify a character encoding. The path is capped at 4,096 bytes, charged to
+the metadata budget, and shown in the CLI module summary. Unknown CodeView
+signatures remain opaque through the original record RVA and size.
+
 Thread and exception register contexts use the SystemInfo architecture and
 require a matching architecture family in `ContextFlags`. Unknown architectures
 and mismatches retain raw evidence and diagnostics without guessing registers.
@@ -59,8 +66,9 @@ extent is validated even when only a prefix is decoded. Decoding is capped at
 Context allocations, register bytes and strings are charged to the 64 MiB
 metadata budget. Stream, thread, memory and module counts remain independently
 bounded. Thread/context processing checks cancellation between records. The CLI
-summary lists at most 256 threads, includes captured names when available, and
-prints wide register values from their captured bytes.
+summary lists at most 256 threads and modules, includes captured thread names,
+prints wide register values from their captured bytes, and reports parsed PDB
+identity metadata.
 
 The legacy ARM64 layout follows the Breakpad `MDRawContextARM64_Old` format,
 also described as `CONTEXT_ARM64_OLD` by [minidump-common](https://docs.rs/minidump-common/latest/minidump_common/format/struct.CONTEXT_ARM64_OLD.html).

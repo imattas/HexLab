@@ -1205,7 +1205,7 @@ class Project:
     def bookmark(self, location, label="", *, remove=False, group=0):
         return self._call("bookmark", _location(location), label, remove, group)
 
-    def apply_annotations(self, rows, *, group=0, expected_revision=None):
+    def apply_annotations(self, rows, *, group=0, expected_revision=None, merge="replace"):
         """Atomically import a bounded batch of names, comments, and bookmarks.
 
         Each row is a mapping with ``location`` and any of ``name``,
@@ -1213,8 +1213,44 @@ class Project:
         bookmark; a string sets its label. All operations are validated against
         one projected state and committed as one persistent history step.
         Capture ``snapshot()['edit_revision']`` while planning and pass it as
-        ``expected_revision`` to reject a stale manifest.
+        ``expected_revision`` to reject a stale manifest. ``merge='replace'``
+        applies provided fields (the default); ``merge='preserve'`` fills only
+        empty name/comment fields and absent bookmarks. Preserve mode requires
+        a complete snapshot of no more than 4096 existing annotations and
+        bookmarks, so it never treats truncated state as absent.
         """
+        if merge not in ("replace", "preserve"):
+            raise ValueError("merge must be 'replace' or 'preserve'")
+        current = None
+        existing_annotations = {}
+        existing_bookmarks = set()
+        existing_names = {}
+        if merge == "preserve":
+            current = self.snapshot()
+            if expected_revision is None:
+                expected_revision = current["edit_revision"]
+            annotation_rows = current["annotations"]
+            bookmark_rows = current["bookmarks"]
+            if (current["annotation_count"] > len(annotation_rows) or
+                    current["bookmark_count"] > len(bookmark_rows)):
+                raise ValueError("merge='preserve' requires at most 4096 existing annotations and bookmarks")
+
+            def key_of(location):
+                if isinstance(location, Address):
+                    return ("va", location.space, location.offset)
+                if isinstance(location, FileOffset):
+                    return ("file", location.offset)
+                if isinstance(location, tuple) and location:
+                    return location
+                raise ValueError("project snapshot contains an unsupported annotation location")
+
+            for annotation in annotation_rows:
+                key = key_of(annotation["location"])
+                existing_annotations[key] = annotation
+                if key[0] == "va" and annotation["name"]:
+                    existing_names[(key[1], annotation["name"])] = key
+            for bookmark in bookmark_rows:
+                existing_bookmarks.add(key_of(bookmark["location"]))
         commands = []
         text_bytes = 0
         row_count = 0
@@ -1231,12 +1267,14 @@ class Project:
             if unknown:
                 raise ValueError("unknown annotation fields: " + ", ".join(sorted(unknown)))
             location = _location(row["location"])
+            location_key = location
+            row_commands = []
             for field in ("name", "comment", "bookmark"):
                 if field not in row:
                     continue
                 value = row[field]
                 if field == "bookmark" and value is None:
-                    commands.append(("bookmark", location, "", True))
+                    row_commands.append(("bookmark", location, "", True))
                 else:
                     if not isinstance(value, str):
                         raise TypeError(field + " must be text" + (" or None" if field == "bookmark" else ""))
@@ -1244,13 +1282,40 @@ class Project:
                     if text_bytes > 16 * 1024 * 1024:
                         raise ValueError("annotation import text exceeds 16 MiB")
                     if field == "bookmark":
-                        commands.append(("bookmark", location, value, False))
+                        row_commands.append(("bookmark", location, value, False))
                     else:
-                        commands.append((field, location, value))
-                if len(commands) > 4096:
+                        row_commands.append((field, location, value))
+                if len(commands) + len(row_commands) > 4096:
                     raise ValueError("annotation import expands to more than 4096 edits")
+            if merge == "preserve":
+                current_annotation = existing_annotations.get(location_key, {})
+                for command in row_commands:
+                    field, _, value, *extra = command
+                    if field == "bookmark":
+                        if location_key in existing_bookmarks or extra[0]:
+                            continue
+                    elif current_annotation.get(field):
+                        continue
+                    elif value == "":
+                        continue
+                    elif field == "name" and isinstance(row["location"], Address):
+                        previous = existing_names.get((row["location"].space, value))
+                        if previous is not None and previous != location_key:
+                            continue
+                    commands.append(command)
+            else:
+                commands.extend(row_commands)
+            if len(commands) > 4096:
+                raise ValueError("annotation import expands to more than 4096 edits")
         if row_count == 0:
             raise ValueError("annotation import requires at least one row")
+        if not commands and merge == "preserve":
+            if expected_revision is None:
+                expected_revision = current["edit_revision"]
+            _unsigned(expected_revision, "expected_revision")
+            if expected_revision != current["edit_revision"]:
+                raise ValueError("expected_revision does not match the preserve snapshot")
+            return current
         if not commands:
             raise ValueError("annotation import contains no edits")
         if len(commands) > 4096:
@@ -1258,6 +1323,9 @@ class Project:
         if expected_revision is None:
             expected_revision = self.snapshot()["edit_revision"]
         _unsigned(expected_revision, "expected_revision")
+        if (merge == "preserve" and
+                expected_revision != current["edit_revision"]):
+            raise ValueError("expected_revision does not match the preserve snapshot")
         return self._call("apply_annotations", commands, group, expected_revision)
 
     def apply_batch(self, operations, *, group=0, expected_revision=None, cancel=None):

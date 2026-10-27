@@ -128,7 +128,14 @@ struct RotatedBackup { SavedProject backup; std::uint64_t created_unix_ms=0; };
 struct BackupListing { std::vector<RotatedBackup> backups; bool complete=true; };
 struct BackupPruneResult { std::size_t remaining=0, removed=0; bool retention_satisfied=true; };
 enum class RecoveryArtifactKind {interrupted_save,previous_version};
-struct ProjectRecoveryCandidate {std::filesystem::path path;ProjectUuid uuid;RecoveryArtifactKind kind;};
+struct ProjectRecoveryCandidate {
+    std::filesystem::path path;
+    ProjectUuid uuid;
+    RecoveryArtifactKind kind;
+    // Discovery pins the user-edit revisions so delayed restore requests fail
+    // if the candidate changed after the read-only scan.
+    ProjectRevisions revisions;
+};
 struct StateDelta;
 struct CommitAck {ProjectRevisions revisions;std::uint64_t history_cursor;};
 

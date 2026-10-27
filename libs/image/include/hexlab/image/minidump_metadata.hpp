@@ -1,6 +1,7 @@
 #pragma once
 #include "hexlab/core/address.hpp"
 #include "hexlab/core/byte_reader.hpp"
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -24,6 +25,11 @@ struct MinidumpModule {
     std::uint32_t image_size = 0, checksum = 0, timestamp = 0;
     std::string name;
     std::uint32_t cv_record_size = 0, cv_record_rva = 0;
+    // RSDS and NB10 CodeView identities retain the exact PDB path bytes because
+    // CodeView does not identify the path's character encoding.
+    std::string codeview_kind, pdb_path;
+    std::array<std::byte, 16> pdb_guid{};
+    std::uint32_t pdb_age = 0, pdb_timestamp = 0;
     bool operator==(const MinidumpModule &) const = default;
 };
 struct MinidumpUnloadedModule {

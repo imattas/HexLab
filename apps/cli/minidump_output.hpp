@@ -69,6 +69,32 @@ inline void minidump_description(std::ostream &out, const ImageMetadata &metadat
     }
     if (dump.threads.size() > count)
         out << "  (" << dump.threads.size() - count << " additional threads omitted from CLI summary)\n";
+    constexpr std::size_t max_modules = 256;
+    const auto module_count = std::min(dump.modules.size(), max_modules);
+    for (std::size_t i = 0; i < module_count; ++i) {
+        const auto &module = dump.modules[i];
+        out << "  Module " << module.name << " base=0x" << std::hex << module.image_base
+            << " size=0x" << module.image_size << std::dec;
+        if (module.codeview_kind == "RSDS") {
+            out << " pdb=RSDS guid=";
+            constexpr char hex[] = "0123456789abcdef";
+            for (const auto byte : module.pdb_guid) {
+                const auto value = std::to_integer<unsigned>(byte);
+                out << hex[value >> 4] << hex[value & 15];
+            }
+            out << " age=" << module.pdb_age;
+        } else if (module.codeview_kind == "NB10") {
+            out << " pdb=NB10 timestamp=0x" << std::hex << module.pdb_timestamp << std::dec
+                << " age=" << module.pdb_age;
+        }
+        if (!module.pdb_path.empty()) {
+            out << " path=";
+            minidump_quoted_text(out, module.pdb_path);
+        }
+        out << '\n';
+    }
+    if (dump.modules.size() > module_count)
+        out << "  (" << dump.modules.size() - module_count << " additional modules omitted from CLI summary)\n";
     if (dump.exception) {
         const auto name = std::lower_bound(dump.thread_names.begin(), dump.thread_names.end(), dump.exception->thread_id,
             [](const auto &row, std::uint32_t id) { return row.thread_id < id; });
