@@ -217,6 +217,28 @@ std::optional<std::uint32_t> decode_windows1255(unsigned byte) {
     if(!scalar)return {};
     return scalar;
 }
+std::optional<std::uint32_t> decode_windows1256(unsigned byte) {
+    // Windows-1256 mapping from Unicode's historical Microsoft vendor table.
+    static constexpr std::uint16_t high[128]={
+        0x20ac,0x067e,0x201a,0x0192,0x201e,0x2026,0x2020,0x2021,
+        0x02c6,0x2030,0x0679,0x2039,0x0152,0x0686,0x0698,0x0688,
+        0x06af,0x2018,0x2019,0x201c,0x201d,0x2022,0x2013,0x2014,
+        0x06a9,0x2122,0x0691,0x203a,0x0153,0x200c,0x200d,0x06ba,
+        0x00a0,0x060c,0x00a2,0x00a3,0x00a4,0x00a5,0x00a6,0x00a7,
+        0x00a8,0x00a9,0x06be,0x00ab,0x00ac,0x00ad,0x00ae,0x00af,
+        0x00b0,0x00b1,0x00b2,0x00b3,0x00b4,0x00b5,0x00b6,0x00b7,
+        0x00b8,0x00b9,0x061b,0x00bb,0x00bc,0x00bd,0x00be,0x061f,
+        0x06c1,0x0621,0x0622,0x0623,0x0624,0x0625,0x0626,0x0627,
+        0x0628,0x0629,0x062a,0x062b,0x062c,0x062d,0x062e,0x062f,
+        0x0630,0x0631,0x0632,0x0633,0x0634,0x0635,0x0636,0x00d7,
+        0x0637,0x0638,0x0639,0x063a,0x0640,0x0641,0x0642,0x0643,
+        0x00e0,0x0644,0x00e2,0x0645,0x0646,0x0647,0x0648,0x00e7,
+        0x00e8,0x00e9,0x00ea,0x00eb,0x0649,0x064a,0x00ee,0x00ef,
+        0x064b,0x064c,0x064d,0x064e,0x00f4,0x064f,0x0650,0x00f7,
+        0x0651,0x00f9,0x0652,0x00fb,0x00fc,0x200e,0x200f,0x06d2};
+    if(byte<0x80)return byte;
+    return high[byte-0x80];
+}
 }
 namespace {
 Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& options,
@@ -341,6 +363,16 @@ Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& optio
                 else emit(run,false,StringEncoding::windows1255,range,options,output,true);
             }
             emit(run,false,StringEncoding::windows1255,range,options,output,true);
+            run={};
+            for(auto at=range.begin;at<range.end;++at) {
+                if(((at-range.begin)&4095)==0)check_stop(stop);
+                const auto value=input.byte(at);
+                if(value==0) {emit(run,true,StringEncoding::windows1256,range,options,output,true);continue;}
+                const auto scalar=decode_windows1256(value);
+                if(scalar && printable(*scalar))run.add(at,*scalar,1);
+                else emit(run,false,StringEncoding::windows1256,range,options,output,true);
+            }
+            emit(run,false,StringEncoding::windows1256,range,options,output,true);
         }
     } catch(const BudgetEnd&) {
         output.complete=false;output.diagnostics.push_back({DiagnosticSeverity::warning,"String record budget reached",{}});

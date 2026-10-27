@@ -328,13 +328,18 @@ class Itanium {
             entity = parse_name(d + 1, false);
         }
         if (peek() == '_') {
-            ++at_;
+            // The ABI has two discriminator spellings: _<number> and
+            // __<number>_. The latter is used when the ordinary spelling
+            // would be ambiguous with the following local-name grammar.
+            const bool extended_discriminator = input_.substr(at_, 2) == "__";
+            at_ += extended_discriminator ? 2 : 1;
             const auto begin = at_;
             while (std::isdigit(static_cast<unsigned char>(peek()))) ++at_;
             if (begin == at_) malformed();
             std::size_t discriminator = 0;
             const auto [end, error] = std::from_chars(input_.data() + begin, input_.data() + at_, discriminator);
             if (error != std::errc{} || end != input_.data() + at_) limit();
+            if (extended_discriminator && !take("_")) malformed();
             append(entity.type.base, " [discriminator ");
             append(entity.type.base, std::to_string(discriminator));
             append(entity.type.base, "]");

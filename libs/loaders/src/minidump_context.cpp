@@ -140,9 +140,17 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
             constexpr std::uint64_t xsave_area_in_context = 256;
             constexpr std::size_t xsave_header_in_context = 768;
             constexpr std::size_t xstate_chunk_bytes = 16;
-            const bool xsave_header_valid = bytes.size() >= xsave_header_in_context + 8;
+            const bool xsave_header_valid = bytes.size() >= xsave_header_in_context + 16;
             const auto in_use = xsave_header_valid ? fixed(bytes, xsave_header_in_context, 8) : 0;
+            const auto compacted = xsave_header_valid ? fixed(bytes, xsave_header_in_context + 8, 8) : 0;
+            const bool compacted_format = (compacted & (std::uint64_t{1} << 63)) != 0;
             bool omitted = xstate_context_size == 0 || !xsave_header_valid;
+            if (xsave_header_valid) {
+                // These are the XSAVE header's architectural component bitmaps,
+                // distinct from the OS feature map used to locate payloads.
+                add("xstate_bv", xsave_header_in_context, 8);
+                add("xcomp_bv", xsave_header_in_context + 8, 8);
+            }
             std::uint64_t retained = 0;
             if (xsave_header_valid) {
                 for (std::size_t index = 3; index < 64; ++index) {
@@ -153,6 +161,7 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
                 }
             }
             for (const auto &feature : xstate_features) {
+                if (compacted_format) { omitted = true; continue; }
                 // Features 0 through 2 (legacy FP, SSE, and AVX) are already
                 // represented by the fixed AMD64 CONTEXT fields.
                 if (feature.index < 3) continue;
@@ -185,10 +194,14 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
                 result.diagnostics.emplace_back("AMD64 XSTATE is requested but no validated MiscInfo5 feature map is available");
             } else if (!xsave_header_valid) {
                 result.diagnostics.emplace_back("AMD64 XSTATE header is truncated from the captured context");
+            } else if (compacted_format) {
+                omitted = true;
+                result.diagnostics.emplace_back("AMD64 XSTATE header declares compacted XSAVE format; component payloads are not decoded");
             } else {
                 result.diagnostics.emplace_back("AMD64 XSTATE components are retained as opaque 16-byte chunks; feature semantics remain unsupported");
             }
-            if (omitted) result.diagnostics.emplace_back("Some AMD64 XSTATE feature bytes exceed the validated source extent or 64 KiB capture bound");
+            if (omitted && !compacted_format)
+                result.diagnostics.emplace_back("Some AMD64 XSTATE feature bytes exceed the validated source extent or 64 KiB capture bound");
         }
     } else if (architecture == 5) {
         if (group(2,56,"ARM integer")) {

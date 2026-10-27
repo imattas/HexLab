@@ -31,7 +31,7 @@ The supported fixed little-endian Windows CONTEXT layouts are:
 | Architecture | Captured register groups |
 | --- | --- |
 | x86 | Control (`ebp`, `eip`, `esp`, segments and flags), integer, segments, debug, legacy x87, and extended FXSAVE x87/XMM0-7/MXCSR. Extended storage takes precedence when both floating layouts are present. |
-| AMD64 | Control (`rsp`, `rip`, segments and flags), integer, segments, debug, and fixed x87/XMM0-15/MXCSR floating storage. Both top-level and FXSAVE MXCSR copies are retained. When `CONTEXT_XSTATE` and a validated MiscInfo5 map are present, non-legacy XSAVE components are retained as opaque 16-byte chunks with checked source offsets. |
+| AMD64 | Control (`rsp`, `rip`, segments and flags), integer, segments, debug, and fixed x87/XMM0-15/MXCSR floating storage. Both top-level and FXSAVE MXCSR copies are retained. When `CONTEXT_XSTATE` and the two 64-bit XSAVE bitmap fields are present, `xstate_bv` and `xcomp_bv` expose the in-use and compacted-layout bitmaps; only those 16 header bytes are required for these fields. With a validated MiscInfo5 map, non-legacy components in standard layout are retained as opaque 16-byte chunks with checked source offsets. Compacted-layout payloads are not decoded. |
 | ARM32 | Control (`sp`, `lr`, `pc`, `cpsr`), integer R0-12, FPSCR and D0-31/Q0-15 aliases, and fixed breakpoint/watchpoint registers. |
 | ARM64 | Control (`x29`, `x30`, `sp`, `pc`, `cpsr`), integer X0-28 with X18 retained only when explicitly requested by its separate flag, full or low/high partial NEON V-register storage, FPCR/FPSR when the low/full group is available, and fixed breakpoint/watchpoint registers. |
 | Breakpad ARM64 (`processor_architecture=0x8003`) | Its packed legacy layout and 64-bit ContextFlags are decoded separately: integer/control group includes X0-X30, SP, PC and CPSR; floating group includes FPSR, FPCR and V0-V31. |
@@ -79,7 +79,9 @@ address becomes the image entry.
 
 AVX-512 values beyond the fixed AVX register context are retained as opaque
 feature-ID chunks only; the processor state layouts and execution semantics
-are not decoded. Legacy floating-point, SSE, and AVX feature IDs 0–2 remain in
+are not decoded. `xstate_bv` reports which components are in use, while bit 63
+of `xcomp_bv` identifies compacted layout; HexLab currently reports that
+layout and omits its component payloads. Legacy floating-point, SSE, and AVX feature IDs 0–2 remain in
 the fixed AMD64 context fields. Context XSTATE chunks
 are included only when the MiscInfo5 feature table validates and the checked
 XSAVE-relative range (`256 + feature offset`) is present in the original

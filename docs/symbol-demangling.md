@@ -75,7 +75,8 @@ substitution dictionary to 256 entries and 64 KiB of retained strings by default
 (`max_substitutions` and `max_substitution_bytes`).
 
 Local Itanium names now parse their enclosing function encoding, entity name,
-and decimal discriminator. Lambda closure type names (`Ul...E_`) and numbered
+and both decimal discriminator spellings (`_<number>` and `__<number>_`). The
+discriminator is rendered as a decimal suffix on the local entity. Lambda closure type names (`Ul...E_`) and numbered
 unnamed types (`Ut..._`) are rendered as stable placeholders such as
 `<lambda(int)#0>` and `<unnamed-type#2>`; this preserves the distinction
 between closures without pretending to reconstruct source capture syntax.
@@ -86,7 +87,8 @@ type grammar as ordinary names.
 This is not a complete implementation of either ABI. The Itanium substitutions
 described below, array/function/member-pointer types, and selected template
 parameters are recognized; vendor extensions, local-name discriminator
-variants, expression-valued template arguments beyond the bounded integer
+variants beyond these two discriminator productions, string-literal local
+names, expression-valued template arguments beyond the bounded integer
 expression grammar, and broader operator/type
 encodings remain incomplete, including expression calls/casts,
 template parameter references inside expressions, and unrecognized vendor

@@ -39,9 +39,17 @@ other encodings. Their persisted `StringEncoding` values are appended as 10 and
 11; derived-cache version 26 accepts them while older cache payloads are
 recomputed.
 
+Windows-1256 adds an Arabic Windows-code-page candidate using the Unicode
+Consortium's historical Microsoft [CP1256 mapping table](https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WINDOWS/CP1256.TXT).
+It emits UTF-8 previews with original byte extents and requires a non-ASCII
+scalar. Because this mapping defines every byte, arbitrary binary data can
+yield candidates; the result is a code-page interpretation, not locale or
+language classification. Its persisted encoding value is 12, and derived-cache
+version 27 makes earlier payloads recompute.
+
 `hexlab_cli disassemble <path> --show-strings` lists candidate encoding names,
 file offsets, extents, and previews. The desktop Strings view uses the same
-Windows-1253 and Windows-1255 labels.
+Windows-1253, Windows-1255, and Windows-1256 labels.
 
 All encoding passes use the same file-backed scan domains, string-record budget,
 and cancellation checks. Returned previews are UTF-8, while each record retains

@@ -1127,6 +1127,7 @@ std::string_view string_encoding_label(StringEncoding encoding) {
     case StringEncoding::windows1254: return "Windows-1254";
     case StringEncoding::windows1253: return "Windows-1253";
     case StringEncoding::windows1255: return "Windows-1255";
+    case StringEncoding::windows1256: return "Windows-1256";
     }
     return "unknown";
 }
