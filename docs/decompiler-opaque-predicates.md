@@ -1,7 +1,7 @@
 # Bounded opaque-predicate proofs
 
 The constant simplifier proves pure branch predicates in two stages. It first
-propagates known-zero and known-one bits through supported bitwise operations,
+propagates known-zero and known-one bits through integer `and`, `or`, and `xor`,
 constant shifts, sign/zero extension, truncation, sign-bit/parity operations,
 and fixed-width comparisons. Unsigned and signed comparisons use conservative
 minimum/maximum ranges derived from those known bits. This can prove predicates

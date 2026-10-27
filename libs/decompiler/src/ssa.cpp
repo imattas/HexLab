@@ -450,6 +450,17 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
         }
     for (const auto &block : input.blocks) for (const auto &instruction : block.instructions)
         if (const auto *intrinsic = std::get_if<Intrinsic>(&instruction.statement))
+            if (intrinsic->register_writes.size() > 256)
+                return Error{ErrorCode::resource_limit, "SSA intrinsic outputs exceed their 256-register budget"};
+            else {
+                std::set<Key> outputs;
+                for (const auto reg : intrinsic->register_writes)
+                    if (!reg.width || !outputs.insert(key(reg)).second)
+                        return Error{ErrorCode::invalid_argument,
+                                     "SSA intrinsic outputs contain a zero-width or duplicate register"};
+            }
+    for (const auto &block : input.blocks) for (const auto &instruction : block.instructions)
+        if (const auto *intrinsic = std::get_if<Intrinsic>(&instruction.statement))
             if (!intrinsic->register_output_values.empty() &&
                 intrinsic->register_output_values.size() != intrinsic->register_writes.size())
                 return Error{ErrorCode::invalid_argument, "intrinsic output formulas must match register outputs"};

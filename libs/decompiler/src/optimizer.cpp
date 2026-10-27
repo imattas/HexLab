@@ -339,6 +339,19 @@ std::optional<KnownBits> evaluate_known_bits(const ExpressionPtr &expression,
         const auto left_type = binary->left->type;
         const auto right_type = binary->right->type;
         const bool integers = left_type.kind == TypeKind::integer && right_type.kind == TypeKind::integer;
+        if (integers && left_type == right_type && expression->type == left_type &&
+            left->width == width && right->width == width) {
+            if (binary->operation == "and")
+                return KnownBits{width, (left->zero | right->zero) & mask,
+                                 (left->one & right->one) & mask};
+            if (binary->operation == "or")
+                return KnownBits{width, (left->zero & right->zero) & mask,
+                                 (left->one | right->one) & mask};
+            if (binary->operation == "xor")
+                return KnownBits{width,
+                    ((left->zero & right->zero) | (left->one & right->one)) & mask,
+                    ((left->zero & right->one) | (left->one & right->zero)) & mask};
+        }
         const auto boolean = [](bool value) {
             return KnownBits{1, value ? 0u : 1u, value ? 1u : 0u};
         };
