@@ -11,10 +11,11 @@ Generic `PT_NOTE` records remain available in `ElfMetadata::notes`. Linux
 `CORE`/`LINUX` `NT_PRPSINFO` notes additionally expose the process IDs,
 executable name, and bounded argument string through `ElfMetadata::core`.
 `NT_PRSTATUS` notes expose per-thread IDs and the current signal. Register values
-are decoded for little-endian ELF64 x86-64 and AArch64 cores. x86-64 retains the
-27 Linux gregset entries, and AArch64 retains `x0`–`x30`, `sp`, `pc`, and
-`pstate`. Register-note file offsets point to the source note header; exact
-register names and values live in the structured thread record.
+are decoded for little-endian ELF64 x86-64, AArch64, and RISC-V cores. x86-64
+retains the 27 Linux gregset entries, and AArch64 retains `x0`–`x30`, `sp`, `pc`, and
+`pstate`, and RISC-V retains `pc`, `ra`, `sp`, `gp`, `tp`, `t0`-`t6`,
+`s0`-`s11`, and `a0`-`a7`. Register-note file offsets point to the source note
+header; exact register names and values live in the structured thread record.
 
 ## ELF32 Linux register contexts
 
@@ -53,7 +54,8 @@ Linux register interpretation requires System V or Linux OSABI with ABI version
 zero. ARM accepts the legacy ABI without APCS-26, or EABI versions 4/5. Other ARM
 ABI versions remain generic. MIPS accepts O32 or the legacy zero ABI field with
 `EF_MIPS_ABI2` clear; N32, O64 and EABI variants remain generic. RV32E and
-big-endian i386/RISC-V remain unsupported. Floating ABI choices do not fabricate
+big-endian i386/RISC-V remain unsupported. RV64E is likewise not interpreted.
+Floating ABI choices do not fabricate
 floating-point register contexts.
 
 Each new ELF32 record must have its exact supported length, including the final
@@ -124,6 +126,15 @@ The ELF32 layouts follow Linux's [i386 user register structure](https://github.c
 [MIPS register dump rules](https://github.com/torvalds/linux/blob/master/arch/mips/kernel/process.c),
 and [RISC-V user register structure](https://github.com/torvalds/linux/blob/master/arch/riscv/include/uapi/asm/ptrace.h).
 
-This ELF32 increment received source review only. No tests, generated fixtures
-or builds were run. Public metadata fields were appended, so serial image/loader
-and CLI builds, followed by native core-fixture validation, remain follow-up work.
+ELF64 RISC-V decoding uses the Linux `user_regs_struct` order from the same
+RISC-V UAPI definition. It requires little-endian ELF64, the Linux/System V
+OSABI convention already used for the other Linux thread layouts, ABI version
+zero, and `EF_RISCV_RVE` clear. The 32 stored words begin at the ELF64
+`NT_PRSTATUS` gregset offset of 112 bytes; their field provenance is retained
+like the existing x86-64, AArch64, and ELF32 register records. The parser
+requires a complete 32-word set but does not infer floating-point state or
+interpret extra note bytes as a RISC-V extension.
+
+The ELF32 register-context increment received source review only; no tests,
+generated fixtures or builds were run. The ELF64 RISC-V register-context
+increment also received source review only; no tests or builds were run.

@@ -135,12 +135,19 @@ void read_thread_status(const ElfHeader &header, const ElfNote &note,
                 names.emplace_back("sp");
                 names.emplace_back("pc");
                 names.emplace_back("pstate");
+            } else if (header.machine == 243 && header.order == ByteOrder::little &&
+                       (header.flags & 8u) == 0) {
+                names = {"pc", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1",
+                         "a2", "a3", "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+                         "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"};
             }
             if (names.empty()) {
-                thread.diagnostic = "NT_PRSTATUS register decoding supports little-endian x86-64 and AArch64 only";
+                thread.diagnostic = "NT_PRSTATUS register decoding supports little-endian x86-64, AArch64 "
+                                    "and RISC-V64 only";
             } else {
                 decode_registers(std::move(names), elf64_prstatus_register_offset, 8,
-                    header.machine == 62 ? "linux-x86_64" : "linux-aarch64");
+                    header.machine == 62 ? "linux-x86_64" : header.machine == 183 ? "linux-aarch64" :
+                    "linux-riscv64");
             }
         }
     } else {
