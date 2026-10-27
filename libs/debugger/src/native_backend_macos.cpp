@@ -605,7 +605,20 @@ public:
             const auto info_result = thread_info(thread, THREAD_IDENTIFIER_INFO,
                 reinterpret_cast<thread_info_t>(&info), &info_count);
             if (info_result == KERN_SUCCESS) {
-                out.push_back({info.thread_id, "thread " + std::to_string(info.thread_id),
+                std::string name = "thread " + std::to_string(info.thread_id);
+                // THREAD_EXTENDED_INFO carries the target's optional name.
+                // Keep the numeric fallback when the kernel cannot provide it.
+                thread_extended_info_data_t extended{};
+                mach_msg_type_number_t extended_count = THREAD_EXTENDED_INFO_COUNT;
+                const auto name_result = thread_info(thread, THREAD_EXTENDED_INFO,
+                    reinterpret_cast<thread_info_t>(&extended), &extended_count);
+                if (name_result == KERN_SUCCESS) {
+                    const auto *name_end = std::find(extended.pth_name,
+                        extended.pth_name + sizeof(extended.pth_name), '\0');
+                    if (name_end != extended.pth_name)
+                        name.assign(extended.pth_name, name_end);
+                }
+                out.push_back({info.thread_id, std::move(name),
                                stopped_ && task_suspended_ ? ThreadState::stopped :
                                    (stopped_ ? ThreadState::unknown : ThreadState::running)});
             }
@@ -614,6 +627,16 @@ public:
         vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(list), count * sizeof(thread_t));
         if (out.size() != static_cast<std::size_t>(count))
             return Error{ErrorCode::io, "Could not identify every Darwin thread in the stopped process snapshot"};
+        return out;
+    }
+
+    Result<std::vector<ThreadRunState>> thread_run_states() override {
+        auto snapshot = threads();
+        if (!snapshot) return snapshot.error();
+        std::vector<ThreadRunState> out;
+        out.reserve(snapshot.value().size());
+        for (const auto& thread : snapshot.value())
+            out.push_back({thread.id, thread.state});
         return out;
     }
 

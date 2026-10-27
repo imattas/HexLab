@@ -94,6 +94,9 @@ struct PeTlsDirectory {
 struct PeGuardCfFunction {
     std::uint32_t rva = 0;
     std::vector<std::byte> metadata;
+    // The first optional GFIDS metadata byte has two currently defined bits.
+    // Additional bytes and unknown flag bits remain preserved in metadata.
+    std::optional<std::uint8_t> flags;
     PeRecordSource source;
     bool operator==(const PeGuardCfFunction &) const = default;
 };

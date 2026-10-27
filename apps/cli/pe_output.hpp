@@ -324,6 +324,13 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata) {
             for (std::size_t index = 0; index < count; ++index) {
                 const auto &target = targets[index];
                 out << "    RVA=0x" << std::hex << target.rva << std::dec;
+                if constexpr (requires { target.flags; }) {
+                    if (target.flags) {
+                        out << " gfids-flags=0x" << std::hex << unsigned(*target.flags) << std::dec;
+                        if ((*target.flags & 0x1u) != 0) out << " fid-suppressed";
+                        if ((*target.flags & 0x2u) != 0) out << " export-suppressed";
+                    }
+                }
                 if (!target.source.spans.empty())
                     out << " file=0x" << std::hex << target.source.spans.front().offset.value << std::dec;
                 out << '\n';
