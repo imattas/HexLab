@@ -101,7 +101,6 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
         else throw Failure{{ErrorCode::unsupported, "unsupported ELF relocation in DWARF section (type " + std::to_string(rel.type) + ")"}};
         require(metadata.header.order == ByteOrder::little, "big-endian DWARF relocation is unsupported", ErrorCode::unsupported);
         require(rel.field_size && *rel.field_size == width, "DWARF relocation width is not proven");
-        require(rel.explicit_addend && rel.addend.has_value(), "DWARF relocation requires a proven explicit addend", ErrorCode::unsupported);
         require(rel.symbol_index_validated && rel.symbol_table.has_value(), "DWARF relocation symbol provenance is unavailable", ErrorCode::unsupported);
         const ElfSymbol *symbol = nullptr;
         std::size_t symbol_matches = 0;
@@ -116,14 +115,31 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
                 "DWARF relocation symbol is not a uniquely defined symbol in a valid section", ErrorCode::unsupported);
         auto &target = *bytes_for(*rel.target_section);
         require(rel.offset <= target.size() && width <= target.size() - rel.offset, "DWARF relocation field exceeds target section");
+        std::int64_t addend = 0;
+        if (rel.explicit_addend) {
+            require(rel.addend.has_value(), "DWARF RELA relocation has no explicit addend");
+            addend = *rel.addend;
+        } else {
+            // These ELF32 absolute REL forms encode an unsigned word addend
+            // directly in the target section. Keep the implicit-addend
+            // support limited to forms whose field semantics are unambiguous.
+            const bool unsigned_word_rel = width == 4 &&
+                ((i386 && rel.type == 1) || (arm32 && rel.type == 2) ||
+                 (riscv && !metadata.header.is_64 && rel.type == 1));
+            require(unsigned_word_rel, "unsupported implicit-addend DWARF relocation", ErrorCode::unsupported);
+            std::uint32_t value = 0;
+            for (std::uint8_t i = 0; i < width; ++i)
+                value |= std::uint32_t(target[static_cast<std::size_t>(rel.offset) + i]) << (8 * i);
+            addend = value;
+        }
         const auto max_value = width == 8 ? UINT64_MAX : std::uint64_t(UINT32_MAX);
         std::uint64_t sum = symbol->value;
         if ((x64 && rel.type == 1) || (riscv && rel.type == 2)) {
             // These 64-bit absolute relocations store the ABI-defined low
             // 64 bits of S+A.
-            sum += static_cast<std::uint64_t>(*rel.addend);
-        } else if (x64 && rel.type == 11 && *rel.addend < 0) {
-            const auto magnitude = static_cast<std::uint64_t>(-(*rel.addend + 1)) + 1;
+            sum += static_cast<std::uint64_t>(addend);
+        } else if (x64 && rel.type == 11 && addend < 0) {
+            const auto magnitude = static_cast<std::uint64_t>(-(addend + 1)) + 1;
             require(symbol->value >= magnitude || magnitude - symbol->value <= (std::uint64_t{1} << 31),
                     "R_X86_64_32S DWARF relocation result overflows signed field");
             if (symbol->value >= magnitude) {
@@ -135,14 +151,14 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
                         "R_X86_64_32S DWARF relocation result overflows signed field");
                 sum = std::uint32_t(0u - static_cast<std::uint32_t>(negative_magnitude));
             }
-        } else if (*rel.addend >= 0) {
-            const auto add = static_cast<std::uint64_t>(*rel.addend);
+        } else if (addend >= 0) {
+            const auto add = static_cast<std::uint64_t>(addend);
             require(sum <= max_value && add <= max_value - sum, "DWARF absolute relocation result overflows field");
             sum += add;
             if (x64 && rel.type == 11)
                 require(sum <= INT32_MAX, "R_X86_64_32S DWARF relocation result overflows signed field");
         } else {
-            const auto magnitude = static_cast<std::uint64_t>(-(*rel.addend + 1)) + 1;
+            const auto magnitude = static_cast<std::uint64_t>(-(addend + 1)) + 1;
             require(sum >= magnitude, "DWARF absolute relocation result is negative");
             sum -= magnitude;
         }
