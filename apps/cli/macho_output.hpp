@@ -135,6 +135,10 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
         for (const auto &tool : row.tools)
             out << "    tool id=" << tool.tool << " version=" << macho_version(tool.version) << '\n';
     }
+    for (const auto &row : m.source_versions)
+        out << "  source-version command=" << row.command_index << " version=" << row.major << '.' << row.minor
+            << '.' << row.patch << '.' << row.build << '.' << row.prerelease << " packed=" << macho_hex(row.packed)
+            << " record=file:" << macho_hex(row.record_file_offset) << '\n';
     for (const auto &row : m.segments)
         out << "  segment command=" << row.command_index << " name=" << macho_text(row.name)
             << " address=" << macho_hex(row.address) << " size=" << macho_hex(row.memory_size)

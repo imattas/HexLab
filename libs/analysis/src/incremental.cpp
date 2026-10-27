@@ -4,6 +4,7 @@
 #include "strings_internal.hpp"
 #include <algorithm>
 #include <map>
+#include <type_traits>
 namespace hexlab {
 namespace {
 using function_detail::Failure;
@@ -204,6 +205,34 @@ Result<InvalidationPlan> plan_invalidation(const AnalysisBasis &old, std::span<c
         }
         plan.decisions_changed = decisions != old.decisions;
         plan.reference_decisions_changed = decisions.references != old.decisions.references;
+        std::set<std::uint64_t> changed_decision_ids;
+        const auto collect_changed_ids = [&](const auto &before, const auto &after) {
+            using Decision = typename std::decay_t<decltype(before)>::value_type;
+            std::map<std::uint64_t, Decision> old_by_id, new_by_id;
+            for (const auto &decision : before) {
+                canceled(stop);
+                require(decision.id != 0 && old_by_id.emplace(decision.id, decision).second,
+                        "Prior analysis decisions have invalid or duplicate identities");
+            }
+            for (const auto &decision : after) {
+                canceled(stop);
+                require(decision.id != 0 && new_by_id.emplace(decision.id, decision).second,
+                        "Current analysis decisions have invalid or duplicate identities");
+            }
+            for (const auto &[id, decision] : old_by_id) {
+                canceled(stop);
+                const auto current = new_by_id.find(id);
+                if (current == new_by_id.end() || current->second != decision)
+                    changed_decision_ids.insert(id);
+            }
+            for (const auto &[id, decision] : new_by_id) {
+                canceled(stop);
+                (void)decision;
+                if (!old_by_id.contains(id)) changed_decision_ids.insert(id);
+            }
+        };
+        collect_changed_ids(old.decisions.regions, decisions.regions);
+        collect_changed_ids(old.decisions.functions, decisions.functions);
         if (key.input != old.key.input)
             plan.full_reason = "Original input identity changed";
         else if (key.recipe_fingerprint != old.key.recipe_fingerprint)
@@ -242,6 +271,11 @@ Result<InvalidationPlan> plan_invalidation(const AnalysisBasis &old, std::span<c
                 : take(DependencyIndex::create(old.functions->dependencies, stop));
             for (auto fact : take(index->affected(plan.byte_ranges, stop)))
                 facts.insert(fact);
+            if (!changed_decision_ids.empty()) {
+                const std::vector<std::uint64_t> changed_ids(changed_decision_ids.begin(), changed_decision_ids.end());
+                for (auto fact : take(index->affected_decisions(changed_ids, stop)))
+                    facts.insert(fact);
+            }
             // Definition changes can alter rooted call seeds/shared ownership well beyond
             // an address interval. Rewalk ownership, retaining permitted byte facts.
             if (decisions.regions != old.decisions.regions || decisions.functions != old.decisions.functions)

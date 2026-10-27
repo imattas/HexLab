@@ -19,10 +19,17 @@ public:
     HEXLAB_ANALYSIS_EXPORT static Result<std::shared_ptr<const DependencyIndex>> create(std::span<const FactDependency>,std::stop_token={});
     HEXLAB_ANALYSIS_EXPORT Result<std::vector<FactKey>> affected(FileOffset,std::uint64_t,std::stop_token={})const;
     HEXLAB_ANALYSIS_EXPORT Result<std::vector<FactKey>> affected(const ReadSet&,std::stop_token={})const;
+    // Return facts that directly cite any changed decision identity, plus all
+    // prerequisite dependents. This supports precise invalidation for edits to
+    // an existing region/function decision while additions are handled by the
+    // caller's normal root-discovery policy.
+    HEXLAB_ANALYSIS_EXPORT Result<std::vector<FactKey>> affected_decisions(
+        std::span<const std::uint64_t>, std::stop_token = {}) const;
 private:
     struct ReadInterval {std::uint64_t begin,end;FactKey fact;};
     std::vector<FactDependency> facts_;
     std::map<FactKey,std::vector<FactKey>> dependents_;
+    std::map<std::uint64_t,std::vector<FactKey>> decision_facts_;
     // Sorted read intervals plus a prefix maximum end lets invalidation skip
     // unrelated facts while still finding long reads that start earlier.
     std::vector<ReadInterval> read_intervals_;

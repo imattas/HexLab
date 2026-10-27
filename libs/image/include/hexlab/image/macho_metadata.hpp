@@ -108,6 +108,13 @@ struct MachOBuildVersion {
     std::vector<MachOBuildToolVersion> tools;
     bool operator==(const MachOBuildVersion &) const = default;
 };
+// LC_SOURCE_VERSION packs A.B.C.D.E into 24/10/10/10/10 bits.
+struct MachOSourceVersion {
+    std::uint32_t command_index = 0, command = 0;
+    std::uint64_t record_file_offset = 0, packed = 0;
+    std::uint32_t major = 0, minor = 0, patch = 0, build = 0, prerelease = 0;
+    bool operator==(const MachOSourceVersion &) const = default;
+};
 // A bounded LC_FILESET_ENTRY declaration. Child commands are range-checked,
 // but child images are not mapped or recursively imported into this image.
 struct MachOFileSetEntry {
@@ -403,6 +410,7 @@ struct MachOMetadata {
     std::vector<MachOLibrary> libraries;
     std::vector<MachOCommandString> paths;
     std::vector<MachOBuildVersion> build_versions;
+    std::vector<MachOSourceVersion> source_versions;
     std::vector<MachOFileSetEntry> fileset_entries;
     std::vector<MachOEntry> entries;
     std::vector<MachOInitializer> initializers;

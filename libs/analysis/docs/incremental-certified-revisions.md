@@ -23,3 +23,12 @@ reference rows still costs time and memory proportional to the reference count.
 Dependency-index construction and invalidation closure expansion check the
 stop token while traversing each prerequisite or dependent edge. This keeps
 cancellation responsive even when a single fact has unusually high fan-out.
+
+Region and function decision identities are indexed alongside byte reads.
+Changing or removing an identity invalidates facts that recorded that decision
+and their prerequisite dependents. Added identities are queried as well, while
+new roots and ownership boundaries still use the normal recovery policy.
+Function/block/seed facts are conservatively invalidated when the region or
+function decision set changes, because these changes can affect recovery
+outside the old dependency closure. Instruction decoding remains reusable when
+its bytes and execution context are still valid.
