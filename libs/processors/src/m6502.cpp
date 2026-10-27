@@ -84,7 +84,8 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
                 if (rmw) i.memory_write = true;
             }
         }
-        const bool uses_value = opcode == Opcode::m6502_adc || opcode == Opcode::m6502_sbc ||
+        const bool uses_value = opcode == Opcode::m6502_dcp ||
+            opcode == Opcode::m6502_adc || opcode == Opcode::m6502_sbc ||
             opcode == Opcode::m6502_and || opcode == Opcode::m6502_ora || opcode == Opcode::m6502_eor ||
             opcode == Opcode::m6502_cmp || opcode == Opcode::m6502_cpx || opcode == Opcode::m6502_cpy ||
             opcode == Opcode::m6502_bit;
@@ -109,6 +110,10 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
         return finish(1);
     };
 
+    auto dcp = [&](Mode mode) {
+        return data_op(Opcode::m6502_dcp, mode, a, false, true);
+    };
+
     // Regular ALU family: xx01 encodes the operation in bits 7..5 and the
     // addressing form in bits 4..2. This covers 55 legal NMOS opcodes.
     if ((op & 3) == 1) {
@@ -127,6 +132,15 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     }
 
     switch (op) {
+    // Undocumented NMOS decrement-then-compare family. These byte forms are
+    // stable on the NMOS 6502; the decoder records their combined effects.
+    case 0xc7: return dcp(Mode::zero_page);
+    case 0xd7: return dcp(Mode::zero_page_x);
+    case 0xcf: return dcp(Mode::absolute);
+    case 0xdf: return dcp(Mode::absolute_x);
+    case 0xdb: return dcp(Mode::absolute_y);
+    case 0xc3: return dcp(Mode::indexed_indirect);
+    case 0xd3: return dcp(Mode::indirect_indexed);
     // Logical shifts and rotates (memory and accumulator forms).
     case 0x06: return data_op(Opcode::m6502_asl, Mode::zero_page, {}, false, true);
     case 0x0a: return data_op(Opcode::m6502_asl, Mode::accumulator, a, false, true);

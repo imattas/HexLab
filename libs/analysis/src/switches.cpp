@@ -590,6 +590,7 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                 continue;
             bool exclusive_upper_bound = false;
             bool signed_upper_bound = false;
+            bool mips_strict_upper_bound = false;
             const RegisterOperand *compared_register = nullptr;
             const ImmediateOperand *immediate = nullptr;
             if (x86_mode(context) && compare.opcode == Opcode::cmp && compare.operands.size() == 2 &&
@@ -644,6 +645,37 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                     immediate->encoded_width != 12 || immediate->effective_width != 64 ||
                     !immediate->is_signed || immediate->value == 0 || immediate->value > 2047)
                     continue;
+            } else if ((context.architecture == Architecture::mips32 && context.mode == ExecutionMode::mips32) ||
+                       (context.architecture == Architecture::mips64 && context.mode == ExecutionMode::mips64)) {
+                const auto expected_compare = context.mode == ExecutionMode::mips64
+                    ? Opcode::mips64_sltiu : Opcode::mips_sltiu;
+                if (compare.opcode != expected_compare || compare.operands.size() != 3 ||
+                    branch.opcode != Opcode::mips_beq || branch.operands.size() != 3 ||
+                    branch.delay_slots != 1)
+                    continue;
+                const auto *guard = register_operand(compare, 0);
+                compared_register = register_operand(compare, 1);
+                immediate = std::get_if<ImmediateOperand>(&compare.operands[2]);
+                const auto *left = register_operand(branch, 0);
+                const auto *right = register_operand(branch, 1);
+                const auto width = context.mode == ExecutionMode::mips64 ? 64u : 32u;
+                const bool tests_guard_against_zero =
+                    (same_register(left, guard) && right && right->bank == RegisterBank::mips_gpr &&
+                     right->width == width && right->index == 0) ||
+                    (same_register(right, guard) && left && left->bank == RegisterBank::mips_gpr &&
+                     left->width == width && left->index == 0);
+                if (!guard || !compared_register || !immediate || !tests_guard_against_zero ||
+                    guard->bank != RegisterBank::mips_gpr || guard->width != width || guard->index == 0 ||
+                    *guard == *compared_register || compared_register->bank != RegisterBank::mips_gpr ||
+                    compared_register->width != width || immediate->encoded_width != 16 ||
+                    immediate->effective_width != width || !immediate->is_signed ||
+                    immediate->value == 0 || immediate->value > max_entries)
+                    continue;
+                // SLTIU produces one when selector < bound. BEQ to the default
+                // arm therefore rejects selector >= bound, leaving exactly
+                // [0, bound) for the table. The classic delay slot executes
+                // on both paths and must be a known, side-effect-free op.
+                mips_strict_upper_bound = true;
             } else {
                 continue;
             }
@@ -651,6 +683,18 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
             const auto branch_end = analysis_detail::continuation_address(branch);
             if (!compare_end || compare_end.value() != branch.address || !branch_end)
                 continue;
+
+            if (mips_strict_upper_bound) {
+                if (branch_index + 1 >= instructions.size() || !instructions[branch_index + 1] ||
+                    branch_end.value() != sequence_begin)
+                    continue;
+                const auto &delay_slot = instructions[branch_index + 1]->instruction;
+                const auto slot_address = add_offset(branch.address, branch.byte_length(), image);
+                if (!slot_address || delay_slot.address != *slot_address || delay_slot.context != context ||
+                    delay_slot.flow != FlowKind::fallthrough || delay_slot.delay_slots != 0 ||
+                    !delay_slot.register_writes.empty() || delay_slot.memory_read || delay_slot.memory_write)
+                    continue;
+            }
 
             if (*branch.direct_target == sequence_begin || *branch.direct_target == branch_end.value())
                 continue;

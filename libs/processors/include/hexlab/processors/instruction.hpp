@@ -464,7 +464,9 @@ enum class Opcode {
     mips64_movf_s, mips64_movt_s, mips64_movz_s, mips64_movn_s,
     mips64_movf_d, mips64_movt_d, mips64_movz_d, mips64_movn_d,
     // MIPS64 Release 2 doubleword rotate-right forms; append for stable IDs.
-    mips64_drotr, mips64_drotr32, mips64_drotrv
+    mips64_drotr, mips64_drotr32, mips64_drotrv,
+    // NMOS 6502 undocumented decrement-and-compare family; appended for ID stability.
+    m6502_dcp
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
