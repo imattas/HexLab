@@ -3511,6 +3511,33 @@ a64_unhandled:
 
     const bool x86 = instruction.context.architecture == Architecture::x86 ||
                      instruction.context.architecture == Architecture::x86_64;
+    if (x86 && (instruction.opcode == Opcode::xadd || instruction.opcode == Opcode::cmpxchg) &&
+        instruction.operands.size() == 2) {
+        const auto *destination_memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
+        const auto destination = as_register(instruction.operands[0]);
+        const auto source = as_register(instruction.operands[1]);
+        const auto width = destination ? destination->width : destination_memory ? destination_memory->data_width : 0;
+        if ((width == 8 || width == 16 || width == 32 || width == 64) && source && source->width == width) {
+            std::vector<ExpressionPtr> inputs;
+            if (instruction.opcode == Opcode::cmpxchg) {
+                const auto accumulator = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+                    [width](RegisterOperand reg) { return reg.bank == RegisterBank::gpr && reg.index == 0 && reg.width == width; });
+                if (accumulator == instruction.register_reads.end()) {
+                    Intrinsic fallback{"x86_cmpxchg_unmodeled", operands, IntrinsicMemoryEffect::unknown};
+                    fallback.register_writes = instruction.register_writes;
+                    return fallback;
+                }
+                inputs.push_back(reg_expr(*accumulator));
+            }
+            inputs.push_back(retag_expr(operands[0], integer_type(width)));
+            inputs.push_back(retag_expr(operands[1], integer_type(width)));
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_i" + std::to_string(width),
+                std::move(inputs), destination_memory ? IntrinsicMemoryEffect::unknown : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            if (destination) effect.result_type = integer_type(width);
+            return effect;
+        }
+    }
     // Keep scalar arithmetic as a typed operation with its architectural flag
     // writes attached. A plain Assign/Store loses the fact that arithmetic
     // defines FLAGS and makes subsequent condition-code recovery unsound.
