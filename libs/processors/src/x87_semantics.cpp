@@ -399,6 +399,54 @@ bool wide_any_below(Product128 value, unsigned bit_count) noexcept {
     return (value.lo & low_mask) != 0;
 }
 
+int compare_wide(Product128 left, Product128 right) noexcept {
+    if (left.hi != right.hi) return left.hi < right.hi ? -1 : 1;
+    return left.lo < right.lo ? -1 : left.lo > right.lo ? 1 : 0;
+}
+
+Product128 shift_left_two(Product128 value) noexcept {
+    return {(value.hi << 2) | (value.lo >> 62), value.lo << 2};
+}
+
+Product128 square_root_extension(std::uint64_t significand, bool odd_exponent,
+                                 bool &inexact_tail) noexcept {
+    // Stream pairs from M*2^69 (even exponent) or M*2^70 (odd
+    // exponent). This computes 67 root bits without constructing a 133-bit
+    // radicand: only the 68-bit partial remainder and root are retained.
+    const unsigned appended_zeros = odd_exponent ? 70u : 69u;
+    const auto radicand_bit = [&](int position) noexcept {
+        if (position < 0 || static_cast<unsigned>(position) < appended_zeros ||
+            static_cast<unsigned>(position) >= appended_zeros + 64u) return false;
+        return ((significand >> (static_cast<unsigned>(position) - appended_zeros)) & 1u) != 0;
+    };
+    Product128 root{}, remainder{};
+    for (int pair_index = 0; pair_index < 67; ++pair_index) {
+        unsigned pair = 0;
+        if (!odd_exponent && pair_index == 0) {
+            pair = static_cast<unsigned>(radicand_bit(132));
+        } else {
+            const auto high = 133 - 2 * pair_index;
+            pair = (static_cast<unsigned>(radicand_bit(high)) << 1) |
+                   static_cast<unsigned>(radicand_bit(high - 1));
+        }
+        remainder = shift_left_two(remainder);
+        remainder.lo |= pair;
+        auto trial = shift_left_two(root);
+        trial.lo |= 1;
+        if (compare_wide(remainder, trial) >= 0) {
+            remainder = subtract_wide(remainder, trial);
+            root = shift_left_two(root);
+            root.lo |= 1;
+        } else {
+            root = shift_left_two(root);
+        }
+    }
+    inexact_tail = remainder.hi != 0 || remainder.lo != 0;
+    // The low output bit is sticky beyond the two retained rounding bits.
+    if (inexact_tail) root.lo |= 1;
+    return root;
+}
+
 Product128 multiply_u64(std::uint64_t a, std::uint64_t b) noexcept {
     const std::uint64_t a0 = static_cast<std::uint32_t>(a), a1 = a >> 32;
     const std::uint64_t b0 = static_cast<std::uint32_t>(b), b1 = b >> 32;
@@ -1137,6 +1185,64 @@ std::optional<X87ArithmeticResult> evaluate_x87_divide(const X87DivideRequest &r
     rounding_request.status_word = static_cast<std::uint16_t>(request.status_word |
         (denormal ? fsw_denormal : 0));
     auto result = round_add_sub_result(extended, exponent, negative, rounding_request);
+    if (!result) return {};
+    return result;
+}
+
+std::optional<X87ArithmeticResult>
+evaluate_x87_square_root(const X87SquareRootRequest &request) noexcept {
+    if (((request.control_word >> 8) & 3) == 1) return {};
+    const auto decoded = decode(request.value);
+    if (decoded.kind == Class::unsupported) return {};
+    const auto status = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
+    if (decoded.kind == Class::signaling_nan)
+        return invalid_arithmetic(status, request.control_word, quiet_nan(request.value));
+    if (decoded.kind == Class::quiet_nan) {
+        X87ArithmeticResult result;
+        result.status_word = status;
+        result.value = request.value;
+        return result;
+    }
+    if (decoded.kind == Class::zero) {
+        X87ArithmeticResult result;
+        result.status_word = status;
+        result.value = request.value; // FSQRT preserves the sign of zero.
+        return result;
+    }
+    if (decoded.kind == Class::infinity) {
+        if (decoded.negative)
+            return invalid_arithmetic(status, request.control_word, x87_indefinite());
+        X87ArithmeticResult result;
+        result.status_word = status;
+        result.value = request.value;
+        return result;
+    }
+    if (decoded.negative)
+        return invalid_arithmetic(status, request.control_word, x87_indefinite());
+
+    const bool denormal = decoded.exponent == 0 &&
+                          (decoded.significand & integer_bit) == 0;
+    if (denormal && (request.control_word & fcw_denormal_mask) == 0) {
+        X87ArithmeticResult result;
+        result.status_word = signal_exception(status, fsw_denormal);
+        result.completed = false;
+        return result;
+    }
+
+    const auto normalized = normalize_finite(decoded);
+    const int unbiased_exponent = normalized.exponent - 16383;
+    const bool odd_exponent = (unbiased_exponent % 2) != 0;
+    const int result_unbiased_exponent = unbiased_exponent >= 0
+        ? unbiased_exponent / 2 : (unbiased_exponent - 1) / 2;
+    bool inexact_tail = false;
+    auto extended = square_root_extension(normalized.significand, odd_exponent, inexact_tail);
+
+    X87AddSubtractRequest rounding_request;
+    rounding_request.control_word = request.control_word;
+    rounding_request.status_word = static_cast<std::uint16_t>(request.status_word |
+        (denormal ? fsw_denormal : 0));
+    auto result = round_add_sub_result(extended, result_unbiased_exponent + 16383,
+                                       false, rounding_request);
     if (!result) return {};
     return result;
 }

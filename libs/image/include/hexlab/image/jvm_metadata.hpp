@@ -16,6 +16,10 @@ struct JvmExceptionHandler {
     std::uint16_t start_pc = 0, end_pc = 0, handler_pc = 0, catch_type = 0;
     bool operator==(const JvmExceptionHandler &) const = default;
 };
+// Annotation element values use a lossless, validated JVM-style textual form
+// (for example `enum(Lx;#NAME)` or `[const(I:3),... ]`).
+struct JvmAnnotationElement { std::string name, value; bool operator==(const JvmAnnotationElement &) const = default; };
+struct JvmAnnotation { std::string descriptor; std::vector<JvmAnnotationElement> elements; bool operator==(const JvmAnnotation &) const = default; };
 // Values retain the class-file verification_type_info tag. Long/double are
 // one logical entry occupying two JVM local/operand locations.
 enum class JvmVerificationKind : std::uint8_t {
@@ -67,6 +71,7 @@ struct JvmMember {
     std::string name, descriptor;
     // Exceptions attribute class names, in class-file declaration order.
     std::optional<std::vector<std::string>> declared_exceptions;
+    std::vector<JvmAnnotation> visible_annotations, invisible_annotations;
     std::optional<JvmCode> code;
     bool operator==(const JvmMember &) const = default;
 };
@@ -133,6 +138,7 @@ struct JvmMetadata {
     std::vector<std::string> module_packages;
     std::optional<std::string> module_main_class;
     std::vector<JvmMember> fields, methods;
+    std::vector<JvmAnnotation> visible_annotations, invisible_annotations;
     bool operator==(const JvmMetadata &) const = default;
 };
 } // namespace hexlab

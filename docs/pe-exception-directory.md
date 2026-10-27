@@ -29,8 +29,9 @@ function snapshots preserve the unwind provenance with the root. The validated
 or branch paths that leave the unwind range terminate at a chunk boundary unless
 the user supplied an explicit function-chunk definition for that entry.
 
-The AMD64 loader additionally decodes version-one unwind operations, chained
-records, and validated handler RVAs. It identifies handler names only through
+The AMD64 loader additionally decodes version-one unwind operations and a
+bounded subset of preview version-three operations, chained records, and
+validated handler RVAs. It identifies handler names only through
 exact exports or canonical import jump thunks. A resolved `__C_specific_handler`
 payload is decoded as a bounded count and scope-record table; scope extents must
 fit the owning runtime-function range, and nonzero filter/finally and jump

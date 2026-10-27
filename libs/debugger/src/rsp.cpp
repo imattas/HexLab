@@ -936,9 +936,17 @@ Result<std::vector<std::byte>> Client::read_memory(std::uint64_t address, std::s
     return bytes;
 }
 Status Client::set_breakpoint(std::uint64_t address, BreakpointType type, std::uint8_t size, bool insert, std::stop_token stop) {
-    if (size == 0) return Error{ErrorCode::invalid_argument, "RSP breakpoint size must be nonzero"};
-    const char* kind = type == BreakpointType::software ? "0" : type == BreakpointType::hardware ? "1" :
-        type == BreakpointType::write_watch ? "2" : type == BreakpointType::read_watch ? "3" : "4";
+    if (size == 0 || address > UINT64_MAX - (static_cast<std::uint64_t>(size) - 1))
+        return Error{ErrorCode::invalid_argument, "RSP breakpoint range is empty or overflows the address space"};
+    const char* kind = nullptr;
+    switch (type) {
+    case BreakpointType::software: kind = "0"; break;
+    case BreakpointType::hardware: kind = "1"; break;
+    case BreakpointType::write_watch: kind = "2"; break;
+    case BreakpointType::read_watch: kind = "3"; break;
+    case BreakpointType::access_watch: kind = "4"; break;
+    default: return Error{ErrorCode::invalid_argument, "invalid RSP breakpoint type"};
+    }
     auto response = transact(std::string(insert ? "Z" : "z") + kind + "," + hex_u64(address) + "," + hex_u64(size), stop);
     if (!response) return response.error();
     if (response.value() == "OK") return std::monostate{};

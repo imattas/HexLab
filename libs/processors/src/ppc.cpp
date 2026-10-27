@@ -598,22 +598,31 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
         i.register_reads = {left, right, fpscr()};
         i.register_writes = {field, fpscr()};
-    } else if (op == 63 && (((w >> 1) & 0x3ff) == 14 || ((w >> 1) & 0x3ff) == 15 ||
-                            ((w >> 1) & 0x3ff) == 814 || ((w >> 1) & 0x3ff) == 815 ||
-                            ((w >> 1) & 0x3ff) == 846)) {
+    } else if ((op == 63 && (((w >> 1) & 0x3ff) == 14 || ((w >> 1) & 0x3ff) == 15 ||
+                             ((w >> 1) & 0x3ff) == 142 || ((w >> 1) & 0x3ff) == 143 ||
+                             ((w >> 1) & 0x3ff) == 814 || ((w >> 1) & 0x3ff) == 815 ||
+                             ((w >> 1) & 0x3ff) == 846 || ((w >> 1) & 0x3ff) == 942 ||
+                             ((w >> 1) & 0x3ff) == 943 || ((w >> 1) & 0x3ff) == 974)) ||
+               (op == 59 && ((w >> 1) & 0x3ff) == 846)) {
         // Power ISA Book I 4.6.7.2: exact ten-bit X-form XO, not the
         // five-bit A-form arithmetic selector. Integer payloads remain in FPRs.
         const auto xo = (w >> 1) & 0x3ff;
+        const bool to_integer = op == 63 && xo != 846 && xo != 974;
+        const bool word = xo == 14 || xo == 15 || xo == 142 || xo == 143;
+        const bool single_result = op == 59;
         if (ra != 0)
             return fail(DecodeStatus::invalid, "PowerPC FP conversion has nonzero reserved fields");
-        if (xo >= 814 && !ppc64)
+        if (!word && !ppc64)
             return fail(DecodeStatus::unsupported, "PowerPC doubleword FP conversion requires PPC64 mode");
         i.opcode = xo == 14 ? Opcode::ppc_fctiw : xo == 15 ? Opcode::ppc_fctiwz :
-                   xo == 814 ? Opcode::ppc_fctid : xo == 815 ? Opcode::ppc_fctidz : Opcode::ppc_fcfid;
+                   xo == 142 ? Opcode::ppc_fctiwu : xo == 143 ? Opcode::ppc_fctiwuz :
+                   xo == 814 ? Opcode::ppc_fctid : xo == 815 ? Opcode::ppc_fctidz :
+                   xo == 942 ? Opcode::ppc_fctidu : xo == 943 ? Opcode::ppc_fctiduz :
+                   xo == 974 ? Opcode::ppc_fcfidu : single_result ? Opcode::ppc_fcfids : Opcode::ppc_fcfid;
         const auto destination = fpr(rt, 64), source = fpr(rb, 64);
-        const bool from_integer = xo == 846;
+        const bool from_integer = !to_integer;
         i.operands = {destination, source};
-        // An enabled invalid conversion suppresses the FRT update. FCFID has
+        // An enabled invalid conversion suppresses the FRT update. FCFID* has
         // no invalid-operation case and always produces a rounded FP result.
         i.access = {from_integer ? OperandAccess::write : OperandAccess::read_write, OperandAccess::read};
         i.register_reads = {source, fpscr()};

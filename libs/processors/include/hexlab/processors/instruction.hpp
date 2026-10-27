@@ -431,8 +431,9 @@ enum class Opcode {
     a64_bfm,
     // AVX2 immediate-count packed shifts; append to preserve cache IDs.
     vpsllw, vpslld, vpsllq, vpsrlw, vpsrld, vpsrlq, vpsraw, vpsrad, vpslldq, vpsrldq,
-    // Scalar PowerPC signed FP/integer conversions; preserve persisted IDs.
+    // Scalar PowerPC FP/integer conversions; preserve persisted IDs.
     ppc_fctiw, ppc_fctiwz, ppc_fctid, ppc_fctidz, ppc_fcfid,
+    ppc_fctiwu, ppc_fctiwuz, ppc_fctidu, ppc_fctiduz, ppc_fcfidu, ppc_fcfids,
     // AVX packed signed integer absolute value; preserve persisted opcode IDs.
     vpabsb, vpabsw, vpabsd,
     // MIPS64 conditional trap comparisons; append to preserve persisted IDs.
