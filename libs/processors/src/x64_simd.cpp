@@ -297,6 +297,39 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
         unsupported("VEX opcode map is outside the enabled AVX subset");
     const auto vector_width = static_cast<std::uint16_t>(l ? 256 : 128);
     const auto bank = l ? RegisterBank::ymm : RegisterBank::xmm;
+    if (map == 1 && opcode == 0xc2) {
+        if (pp > 1)
+            invalid("VCMPPS/VCMPPD requires VEX.pp=0/66");
+        const auto lane_bits = static_cast<std::uint16_t>(pp == 0 ? 32 : 64);
+        auto decoded = modrm(state, vector_width, vector_width);
+        auto destination = decoded.reg;
+        destination.bank = bank;
+        destination.width = vector_width;
+        Operand source2 = std::move(decoded.rm);
+        if (auto *reg = std::get_if<RegisterOperand>(&source2)) {
+            reg->bank = bank;
+            reg->width = vector_width;
+            reg->high_byte = false;
+        } else if (auto *memory = std::get_if<MemoryOperand>(&source2)) {
+            memory->data_width = vector_width;
+        }
+        const auto predicate = state.immediate(8, 8, false);
+        if (predicate.value > 31)
+            invalid("VEX VCMP immediate has reserved upper predicate bits");
+        state.i.opcode = pp == 0 ? Opcode::vcmpps : Opcode::vcmppd;
+        state.i.vector_bits = vector_width;
+        state.i.vector_element_bits = lane_bits;
+        if (!l)
+            state.i.register_writes.push_back({RegisterBank::ymm, destination.index, 256, false});
+        constexpr RegisterOperand mxcsr{RegisterBank::mxcsr, 0, 32, false};
+        state.i.register_reads.push_back(mxcsr);
+        state.i.register_writes.push_back(mxcsr);
+        state.operand(destination, OperandAccess::write);
+        state.operand(RegisterOperand{bank, static_cast<std::uint8_t>(vvvv), vector_width, false}, OperandAccess::read);
+        state.operand(std::move(source2), OperandAccess::read);
+        state.operand(predicate, OperandAccess::read);
+        return true;
+    }
     if (map == 2 && opcode >= 0x1c && opcode <= 0x1e) {
         if (pp != 1)
             invalid("VPABS requires VEX.pp=66");

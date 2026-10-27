@@ -33,6 +33,7 @@ const char* string_encoding_name(StringEncoding encoding){
     case StringEncoding::windows1253:return "Windows-1253";
     case StringEncoding::windows1255:return "Windows-1255";
     case StringEncoding::windows1256:return "Windows-1256";
+    case StringEncoding::windows1257:return "Windows-1257";
     }
     return "unknown";
 }

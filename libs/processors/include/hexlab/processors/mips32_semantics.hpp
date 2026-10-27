@@ -40,4 +40,13 @@ struct Mips32DivSResult {
 HEXLAB_PROCESSORS_EXPORT std::optional<Mips32DivSResult>
 evaluate_mips32_div_s(std::uint32_t lhs_bits, std::uint32_t rhs_bits, std::uint32_t fcsr) noexcept;
 
+enum class Mips32FpSignOperation { abs, mov, neg };
+
+// Evaluate the bit-exact MIPS32 COP1 ABS/MOV/NEG operation for an S or D
+// operand. Single-precision inputs and results use the low 32 bits. These
+// operations only alter or preserve the sign bit and do not update FCSR.
+HEXLAB_PROCESSORS_EXPORT std::uint64_t
+evaluate_mips32_fp_sign_operation(Mips32FpSignOperation operation, bool double_precision,
+                                 std::uint64_t operand_bits) noexcept;
+
 } // namespace hexlab

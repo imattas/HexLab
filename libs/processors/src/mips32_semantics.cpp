@@ -231,4 +231,17 @@ std::optional<Mips32DivSResult> evaluate_mips32_div_s(std::uint32_t lhs_bits,
     return result;
 }
 
+std::uint64_t evaluate_mips32_fp_sign_operation(Mips32FpSignOperation operation, bool double_precision,
+                                                std::uint64_t operand_bits) noexcept {
+    const std::uint64_t sign_mask = double_precision ? (std::uint64_t{1} << 63) : (std::uint64_t{1} << 31);
+    const std::uint64_t format_mask = double_precision ? UINT64_MAX : UINT32_MAX;
+    const auto value = operand_bits & format_mask;
+    switch (operation) {
+    case Mips32FpSignOperation::abs: return value & ~sign_mask;
+    case Mips32FpSignOperation::mov: return value;
+    case Mips32FpSignOperation::neg: return value ^ sign_mask;
+    }
+    return value;
+}
+
 } // namespace hexlab

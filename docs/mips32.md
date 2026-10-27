@@ -34,11 +34,14 @@ COP1 likely branches, long-word conversion forms, other formats, and functions
 remain unsupported.
 
 This slice does not evaluate IEEE arithmetic or conversions, runtime rounding
-modes, exception flags, or compare-result truth at runtime. The decompiler
-retains floating operations and conversions as typed `mips.*` intrinsics with
-their decoded FPR/FCSR effects. Conversion intrinsics carry the proper scalar
-result type but do not produce a computed value. Exact rounding and exception
-behavior remain unsupported by the semantic evaluator. Malformed fixed fields
+modes, exception flags, or compare-result truth at runtime. The standalone
+semantic helper evaluates `ABS.S/D`, `MOV.S/D`, and `NEG.S/D` exactly as
+sign-bit operations, preserving all payload bits and leaving FCSR unchanged.
+The decompiler retains floating operations and conversions as typed `mips.*`
+intrinsics with their decoded FPR/FCSR effects. Conversion intrinsics carry
+the proper scalar result type but do not produce a computed value. Exact
+rounding and exception behavior remain unsupported by the semantic evaluator.
+Malformed fixed fields
 (including nonzero unused unary `ft` and reserved compare bits) are invalid;
 recognized but unmodeled formats/functions report unsupported.
 
