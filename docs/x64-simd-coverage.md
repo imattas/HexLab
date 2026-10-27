@@ -11,6 +11,7 @@ families:
 | Packed integer shifts | Variable-count and immediate-count `psllw/d/q`, `psrlw/d/q`, `psraw/d` |
 | Packed integer compare | `pcmpeqb/w/d`, `pcmpgtb/w/d` |
 | Packed integer multiply/min/max | `pmullw`, `pmulhw`, `pmulhuw`, `pmuludq`, `pmaddwd`, `pminub`, `pmaxub`, `pminsw`, `pmaxsw` |
+| SSSE3 horizontal integer arithmetic | `phaddw/d/sw`, `phsubw/d/sw` |
 | Packed integer shuffle | `pshufd` with its encoded byte selector |
 | Scalar moves | `movss`, `movsd` |
 | Scalar arithmetic | `addss`, `addsd`, `subss`, `subsd`, `mulss`, `mulsd`, `divss`, `divsd` |
@@ -45,6 +46,15 @@ carry an implicit whole-MXCSR read/write dependency in the decoded effects and
 typed lift. The lift passes the incoming MXCSR value to the scalar arithmetic
 intrinsic and defines an opaque outgoing MXCSR version. It does not calculate
 rounding, sticky exception flags, or unmasked-exception retirement.
+
+The SSSE3 `PHADDW/D/SW` and `PHSUBW/D/SW` forms use the legacy `66 0F 38`
+map. They read the old XMM destination and the register or 128-bit memory
+source, then write adjacent pair sums or differences from the old destination
+into the lower half and from the explicit source into the upper half. Word and
+dword forms wrap; the `SW` forms saturate signed word results. The packed
+integer evaluator computes these lane results, and the typed lift records
+signed word/dword lane inputs and results. These encodings follow Intel's
+[SSSE3 instruction reference](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf).
 
 Packed comparisons use destructive XMM destinations and do not modify EFLAGS.
 The packed integer execution helper evaluates byte/word/dword/qword wrapping

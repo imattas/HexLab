@@ -566,6 +566,9 @@ std::string operation_name(Opcode opcode) {
     case Opcode::m6502_and: return "AND"; case Opcode::m6502_ora: return "ORA";
     case Opcode::m6502_eor: return "EOR"; case Opcode::m6502_cmp: return "CMP";
     case Opcode::m6502_dcp: return "DCP";
+    case Opcode::m6502_slo: return "SLO";
+    case Opcode::m6502_rla: return "RLA";
+    case Opcode::m6502_sre: return "SRE";
     case Opcode::m6502_cpx: return "CPX"; case Opcode::m6502_cpy: return "CPY";
     case Opcode::m6502_bit: return "BIT"; case Opcode::m6502_inc: return "INC";
     case Opcode::m6502_dec: return "DEC"; case Opcode::m6502_inx: return "INX";
@@ -1765,6 +1768,35 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 const auto negative = boolean_unary("signbit", difference);
                 return write_flags(0x83, {flag_bit(carry, 0), flag_bit(zero, 1),
                                           flag_bit(negative, 7)});
+            }
+            if ((op == Opcode::m6502_slo || op == Opcode::m6502_rla || op == Opcode::m6502_sre) &&
+                is_memory(instruction.operands.front())) {
+                const auto old_byte = operands.front();
+                ExpressionPtr shifted;
+                ExpressionPtr carry_out;
+                if (op == Opcode::m6502_slo || op == Opcode::m6502_rla) {
+                    carry_out = boolean_binary("bit_extract", old_byte, constant_expr(7, 8));
+                    shifted = binary("shl", old_byte, constant_expr(1, 8));
+                    if (op == Opcode::m6502_rla)
+                        shifted = binary("or", shifted,
+                            binary("and", status_value, constant_expr(1, 8)));
+                } else {
+                    carry_out = boolean_binary("bit_extract", old_byte, constant_expr(0, 8));
+                    shifted = binary("lshr", old_byte, constant_expr(1, 8));
+                }
+                shifted = byte_wrap(std::move(shifted));
+                const char *logic = op == Opcode::m6502_slo ? "or" :
+                                    op == Opcode::m6502_rla ? "and" : "xor";
+                const auto accumulator_result = binary(logic, reg_expr(accumulator), shifted);
+                const auto flags = nz_flags(accumulator_result, status_value, carry_out);
+                const char *name = op == Opcode::m6502_slo ? "m6502_slo_shift_then_ora" :
+                                   op == Opcode::m6502_rla ? "m6502_rla_rotate_then_and" :
+                                                             "m6502_sre_shift_then_eor";
+                Intrinsic effect{name, {old_byte, shifted, reg_expr(accumulator), status_value},
+                    IntrinsicMemoryEffect::unknown};
+                effect.register_writes = {accumulator, status};
+                effect.register_output_values = {accumulator_result, flags};
+                return effect;
             }
             if (op == Opcode::m6502_dcp && is_memory(instruction.operands.front())) {
                 const auto decremented = byte_wrap(binary("sub", operands.front(), constant_expr(1, 8)));
@@ -3996,9 +4028,11 @@ a64_unhandled:
         case Opcode::paddw: case Opcode::psubw: case Opcode::paddsw: case Opcode::paddusw:
         case Opcode::psubsw: case Opcode::psubusw: case Opcode::pcmpeqw: case Opcode::pcmpgtw:
         case Opcode::psllw: case Opcode::psrlw: case Opcode::psraw: case Opcode::pmullw:
-        case Opcode::pmulhw: case Opcode::pmulhuw: case Opcode::pminsw: case Opcode::pmaxsw: return 16;
+        case Opcode::pmulhw: case Opcode::pmulhuw: case Opcode::pminsw: case Opcode::pmaxsw:
+        case Opcode::phaddw: case Opcode::phaddsw: case Opcode::phsubw: case Opcode::phsubsw: return 16;
         case Opcode::paddd: case Opcode::psubd: case Opcode::pcmpeqd: case Opcode::pcmpgtd:
-        case Opcode::pslld: case Opcode::psrld: case Opcode::psrad: case Opcode::pmaddwd: return 32;
+        case Opcode::pslld: case Opcode::psrld: case Opcode::psrad: case Opcode::pmaddwd:
+        case Opcode::phaddd: case Opcode::phsubd: return 32;
         case Opcode::paddq: case Opcode::psubq: case Opcode::psllq: case Opcode::psrlq:
         case Opcode::pmuludq: return 64;
         default: return 0;
@@ -4017,7 +4051,8 @@ a64_unhandled:
         case Opcode::pcmpgtb: case Opcode::pcmpgtw: case Opcode::pcmpgtd:
         case Opcode::pmullw: case Opcode::pmulhw: case Opcode::pmulhuw: case Opcode::pmuludq:
         case Opcode::pmaddwd: case Opcode::pminub: case Opcode::pmaxub: case Opcode::pminsw:
-        case Opcode::pmaxsw: return true;
+        case Opcode::pmaxsw: case Opcode::phaddw: case Opcode::phaddd: case Opcode::phaddsw:
+        case Opcode::phsubw: case Opcode::phsubd: case Opcode::phsubsw: return true;
         default: return false;
         }
     };
@@ -4065,11 +4100,15 @@ a64_unhandled:
         if (destination_ok && packed_source_ok) {
             ValueType result_type = vector_shape(instruction.opcode);
             const bool signed_saturating = instruction.opcode == Opcode::paddsb || instruction.opcode == Opcode::paddsw ||
-                instruction.opcode == Opcode::psubsb || instruction.opcode == Opcode::psubsw;
+                instruction.opcode == Opcode::psubsb || instruction.opcode == Opcode::psubsw ||
+                instruction.opcode == Opcode::phaddsw || instruction.opcode == Opcode::phsubsw;
             const bool signed_result = signed_saturating || instruction.opcode == Opcode::pcmpgtb ||
                 instruction.opcode == Opcode::pcmpgtw || instruction.opcode == Opcode::pcmpgtd ||
                 instruction.opcode == Opcode::pmulhw || instruction.opcode == Opcode::pmaddwd ||
-                instruction.opcode == Opcode::pminsw || instruction.opcode == Opcode::pmaxsw;
+                instruction.opcode == Opcode::pminsw || instruction.opcode == Opcode::pmaxsw ||
+                instruction.opcode == Opcode::phaddw || instruction.opcode == Opcode::phaddd ||
+                instruction.opcode == Opcode::phaddsw || instruction.opcode == Opcode::phsubw ||
+                instruction.opcode == Opcode::phsubd || instruction.opcode == Opcode::phsubsw;
             if (signed_result) result_type.is_signed = true;
             std::string suffix;
             if (scalar) {
@@ -4089,7 +4128,10 @@ a64_unhandled:
             const bool signed_lanes = signed_saturating || instruction.opcode == Opcode::pcmpgtb ||
                 instruction.opcode == Opcode::pcmpgtw || instruction.opcode == Opcode::pcmpgtd ||
                 instruction.opcode == Opcode::pmulhw || instruction.opcode == Opcode::pmaddwd ||
-                instruction.opcode == Opcode::pminsw || instruction.opcode == Opcode::pmaxsw;
+                instruction.opcode == Opcode::pminsw || instruction.opcode == Opcode::pmaxsw ||
+                instruction.opcode == Opcode::phaddw || instruction.opcode == Opcode::phaddd ||
+                instruction.opcode == Opcode::phaddsw || instruction.opcode == Opcode::phsubw ||
+                instruction.opcode == Opcode::phsubd || instruction.opcode == Opcode::phsubsw;
             ValueType operand_type = signed_lanes
                 ? vector_type(128, TypeKind::integer, result_type.element_bits, result_type.lanes, true)
                 : result_type;

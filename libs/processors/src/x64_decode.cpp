@@ -243,8 +243,17 @@ DecodeResult decode_scalar(std::span<const std::byte> input, Address address, De
         }
         auto opcode = static_cast<std::uint8_t>(state.take(1));
         bool extended = opcode == 0x0f;
-        if (extended)
+        if (extended) {
             opcode = static_cast<std::uint8_t>(state.take(1));
+            if (opcode == 0x38) {
+                const auto map_opcode = static_cast<std::uint8_t>(state.take(1));
+                if (!simd_0f38(state, map_opcode))
+                    unsupported("Legacy 0F 38 SIMD opcode is outside the enabled SSSE3 subset");
+                std::string reason;
+                finish(state, reason);
+                return {DecodeStatus::decoded, std::move(state.i), std::move(reason)};
+            }
+        }
         const bool f3_bit_count = extended && (opcode == 0xbc || opcode == 0xbd || opcode == 0xb8);
         const bool string_form = !extended && opcode >= 0xa4 && opcode <= 0xaf && !(opcode >= 0xa8 && opcode <= 0xa9);
         const bool simd_form = simd(state, opcode, extended);

@@ -84,13 +84,15 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
                 if (rmw) i.memory_write = true;
             }
         }
-        const bool uses_value = opcode == Opcode::m6502_dcp ||
+        const bool uses_value = opcode == Opcode::m6502_dcp || opcode == Opcode::m6502_slo ||
+            opcode == Opcode::m6502_rla || opcode == Opcode::m6502_sre ||
             opcode == Opcode::m6502_adc || opcode == Opcode::m6502_sbc ||
             opcode == Opcode::m6502_and || opcode == Opcode::m6502_ora || opcode == Opcode::m6502_eor ||
             opcode == Opcode::m6502_cmp || opcode == Opcode::m6502_cpx || opcode == Opcode::m6502_cpy ||
             opcode == Opcode::m6502_bit;
         if (uses_value) i.register_reads.push_back(value);
-        const bool writes_value = opcode == Opcode::m6502_adc || opcode == Opcode::m6502_sbc ||
+        const bool writes_value = opcode == Opcode::m6502_slo || opcode == Opcode::m6502_rla ||
+            opcode == Opcode::m6502_sre || opcode == Opcode::m6502_adc || opcode == Opcode::m6502_sbc ||
             opcode == Opcode::m6502_and || opcode == Opcode::m6502_ora || opcode == Opcode::m6502_eor ||
             opcode == Opcode::m6502_lda || opcode == Opcode::m6502_ldx || opcode == Opcode::m6502_ldy;
         if (writes_value) i.register_writes.push_back(value);
@@ -112,6 +114,9 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
 
     auto dcp = [&](Mode mode) {
         return data_op(Opcode::m6502_dcp, mode, a, false, true);
+    };
+    auto undocumented_rmw = [&](Opcode opcode, Mode mode) {
+        return data_op(opcode, mode, a, false, true, true, opcode == Opcode::m6502_rla);
     };
 
     // Regular ALU family: xx01 encodes the operation in bits 7..5 and the
@@ -141,6 +146,28 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     case 0xdb: return dcp(Mode::absolute_y);
     case 0xc3: return dcp(Mode::indexed_indirect);
     case 0xd3: return dcp(Mode::indirect_indexed);
+    // Stable undocumented NMOS shift/logic combinations, seven forms each.
+    case 0x03: return undocumented_rmw(Opcode::m6502_slo, Mode::indexed_indirect);
+    case 0x07: return undocumented_rmw(Opcode::m6502_slo, Mode::zero_page);
+    case 0x0f: return undocumented_rmw(Opcode::m6502_slo, Mode::absolute);
+    case 0x13: return undocumented_rmw(Opcode::m6502_slo, Mode::indirect_indexed);
+    case 0x17: return undocumented_rmw(Opcode::m6502_slo, Mode::zero_page_x);
+    case 0x1b: return undocumented_rmw(Opcode::m6502_slo, Mode::absolute_y);
+    case 0x1f: return undocumented_rmw(Opcode::m6502_slo, Mode::absolute_x);
+    case 0x23: return undocumented_rmw(Opcode::m6502_rla, Mode::indexed_indirect);
+    case 0x27: return undocumented_rmw(Opcode::m6502_rla, Mode::zero_page);
+    case 0x2f: return undocumented_rmw(Opcode::m6502_rla, Mode::absolute);
+    case 0x33: return undocumented_rmw(Opcode::m6502_rla, Mode::indirect_indexed);
+    case 0x37: return undocumented_rmw(Opcode::m6502_rla, Mode::zero_page_x);
+    case 0x3b: return undocumented_rmw(Opcode::m6502_rla, Mode::absolute_y);
+    case 0x3f: return undocumented_rmw(Opcode::m6502_rla, Mode::absolute_x);
+    case 0x43: return undocumented_rmw(Opcode::m6502_sre, Mode::indexed_indirect);
+    case 0x47: return undocumented_rmw(Opcode::m6502_sre, Mode::zero_page);
+    case 0x4f: return undocumented_rmw(Opcode::m6502_sre, Mode::absolute);
+    case 0x53: return undocumented_rmw(Opcode::m6502_sre, Mode::indirect_indexed);
+    case 0x57: return undocumented_rmw(Opcode::m6502_sre, Mode::zero_page_x);
+    case 0x5b: return undocumented_rmw(Opcode::m6502_sre, Mode::absolute_y);
+    case 0x5f: return undocumented_rmw(Opcode::m6502_sre, Mode::absolute_x);
     // Logical shifts and rotates (memory and accumulator forms).
     case 0x06: return data_op(Opcode::m6502_asl, Mode::zero_page, {}, false, true);
     case 0x0a: return data_op(Opcode::m6502_asl, Mode::accumulator, a, false, true);
