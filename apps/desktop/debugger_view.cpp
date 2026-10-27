@@ -4,6 +4,7 @@
 #include "hexlab/workspace/project.hpp"
 
 #include <wx/button.h>
+#include <wx/clipbrd.h>
 #include <wx/choice.h>
 #include <wx/checkbox.h>
 #include <wx/listctrl.h>
@@ -40,7 +41,7 @@ namespace {
 enum : int { launch_id = wxID_HIGHEST + 220, attach_id, detach_id, terminate_id, wait_id, continue_id, step_id, pass_id,
             add_bp_id, remove_bp_id, apply_project_bp_id, save_breakpoint_rule_id, poll_id, read_memory_id, remote_connect_id, continue_thread_id,
             thread_context_continue_id, thread_context_step_id, thread_context_stop_id,
-            previous_memory_id, next_memory_id, refresh_modules_id, refresh_processes_id,
+            previous_memory_id, next_memory_id, copy_memory_id, refresh_modules_id, refresh_processes_id,
             detach_remote_process_id,
             refresh_memory_regions_id, write_memory_id, write_register_id, navigate_pc_id, navigate_frame_id,
             memory_search_id, cancel_memory_search_id, add_watch_id, remove_watch_id, refresh_watches_id, refresh_auxv_id };
@@ -360,6 +361,7 @@ DebuggerView::DebuggerView(wxWindow *parent, std::unique_ptr<debugger::Backend> 
     memory_controls->Add(make_button(memory_page, "debug-memory-previous", "Previous", previous_memory_id), 0, wxRIGHT, FromDIP(3));
     memory_controls->Add(make_button(memory_page, "debug-read-memory", "Read", read_memory_id), 0, wxRIGHT, FromDIP(3));
     memory_controls->Add(make_button(memory_page, "debug-memory-next", "Next", next_memory_id), 0);
+    memory_controls->Add(make_button(memory_page, "debug-copy-memory-page", "Copy view", copy_memory_id), 0, wxLEFT, FromDIP(3));
     memory_page_box->Add(memory_controls, 0, wxEXPAND | wxBOTTOM, FromDIP(3));
     auto *memory_write_controls = new wxBoxSizer(wxHORIZONTAL);
     memory_write_bytes_ = make_text(memory_page, "debug-memory-write-bytes");
@@ -501,6 +503,7 @@ DebuggerView::DebuggerView(wxWindow *parent, std::unique_ptr<debugger::Backend> 
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { write_register(); }, write_register_id);
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_memory_page(-1); }, previous_memory_id);
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_memory_page(1); }, next_memory_id);
+    Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_memory_page(); }, copy_memory_id);
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { start_memory_search(); }, memory_search_id);
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { cancel_memory_search(); }, cancel_memory_search_id);
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { add_watch_expression(); }, add_watch_id);
@@ -1951,6 +1954,22 @@ void DebuggerView::refresh_memory() {
           } else view->memory_view_->SetValue(wxString::FromUTF8(dump));
       });
     });
+}
+
+void DebuggerView::copy_memory_page() {
+    const auto dump = memory_view_->GetValue();
+    if (dump.empty() || dump.StartsWith("Reading memory...") || dump.StartsWith("Memory read failed:")) {
+        report("There is no completed memory dump to copy.");
+        return;
+    }
+    if (!wxTheClipboard->Open()) {
+        report("The system clipboard is unavailable.");
+        return;
+    }
+    const bool copied = wxTheClipboard->SetData(new wxTextDataObject(dump));
+    wxTheClipboard->Close();
+    report(copied ? "Copied the displayed memory dump to the clipboard." :
+                    "Could not copy the displayed memory dump.");
 }
 
 void DebuggerView::start_memory_search() {

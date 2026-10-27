@@ -10,7 +10,9 @@ thread refreshes its register set. Memory reads are exposed through
 before reaching the backend. Module enumeration is capped at 4096 entries.
 
 The UI offers 64-, 256-, and 1024-byte pages, with previous/next navigation and
-an explicit read action. A stop event refreshes modules and reads the page at
+an explicit read action. **Copy view** copies the currently displayed completed
+memory dump text to the clipboard; it does not issue a new memory read and
+reports when a read is pending or has failed. A stop event refreshes modules and reads the page at
 the event address when one is supplied. Selecting a module navigates to its
 base and reads a page there. Process changes and detach clear stale inspection
 data. Selecting a region navigates to its start and reads a page there. Failed

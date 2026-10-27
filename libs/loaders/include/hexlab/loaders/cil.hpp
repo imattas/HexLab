@@ -44,6 +44,9 @@ struct ManagedMethodAnalysis {
     std::map<std::uint32_t,ManagedMethodSignature> resolved_call_signatures;
     std::map<std::uint32_t,ManagedField> resolved_fields;
     std::map<std::uint32_t,std::string> resolved_exception_type_names;
+    // Exact AssemblyRef identity for external TypeRefs used by catch clauses.
+    // This preserves identity provenance without claiming external assignability.
+    std::map<std::uint32_t,ManagedAssemblyIdentity> resolved_exception_type_assemblies;
     std::shared_ptr<const ManagedTypeCatalog> resolved_exception_types;
     std::shared_ptr<const ManagedUserStringCatalog> resolved_user_strings;
 };

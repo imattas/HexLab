@@ -155,14 +155,17 @@ Result<std::vector<ManagedMethodAnalysis>> inspect_managed_methods(const LoadedI
   if(user_strings)user_string_catalog=std::make_shared<const ManagedUserStringCatalog>(std::move(user_strings.value()));
   else user_string_error=user_strings.error();
   std::map<std::uint32_t,std::string> exception_type_names;
+  std::map<std::uint32_t,ManagedAssemblyIdentity> exception_type_assemblies;
   std::shared_ptr<const ManagedTypeCatalog> exception_type_catalog;
   auto type_catalog=parse_managed_type_catalog(metadata_bytes.value());
   if(type_catalog){
     exception_type_catalog=std::make_shared<const ManagedTypeCatalog>(std::move(type_catalog.value()));
     for(const auto &type:exception_type_catalog->definitions)
       if(!type.full_name.empty())exception_type_names.emplace(type.token,type.full_name);
-    for(const auto &type:exception_type_catalog->references)
+    for(const auto &type:exception_type_catalog->references) {
       if(!type.full_name.empty())exception_type_names.emplace(type.token,type.full_name);
+      if(type.assembly_scope)exception_type_assemblies.emplace(type.token,*type.assembly_scope);
+    }
   }
   std::vector<ManagedMethodAnalysis> result;result.reserve(methods.value().size());
   for(auto& method:methods.value()){
@@ -221,6 +224,8 @@ Result<std::vector<ManagedMethodAnalysis>> inspect_managed_methods(const LoadedI
       if(clause.kind!=CilExceptionKind::catch_clause)continue;
       if(const auto type=exception_type_names.find(clause.class_token);type!=exception_type_names.end())
         analysis.resolved_exception_type_names.emplace(type->first,type->second);
+      if(const auto assembly=exception_type_assemblies.find(clause.class_token);assembly!=exception_type_assemblies.end())
+        analysis.resolved_exception_type_assemblies.emplace(assembly->first,assembly->second);
     }
     analysis.status=ManagedMethodStatus::decoded;result.push_back(std::move(analysis));
   }

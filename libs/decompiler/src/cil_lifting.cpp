@@ -34,6 +34,23 @@ std::string quoted_metadata_name(std::string_view name) {
     quoted.push_back('"');
     return quoted;
 }
+std::string managed_assembly_identity_text(const ManagedAssemblyIdentity &identity) {
+    std::ostringstream text;
+    text << "assembly=" << quoted_metadata_name(identity.name)
+         << ", version=" << identity.major << '.' << identity.minor << '.'
+         << identity.build << '.' << identity.revision
+         << ", culture=" << quoted_metadata_name(identity.culture.empty()
+                ? std::string_view("neutral") : std::string_view(identity.culture))
+         << ", flags=0x" << std::hex << identity.flags
+         << ", " << ((identity.flags & 1u) ? "public_key=" : "public_key_token=") << '"';
+    constexpr char hex[] = "0123456789abcdef";
+    for (const auto byte : identity.public_key_or_token) {
+        const auto value = std::to_integer<unsigned char>(byte);
+        text << hex[value >> 4] << hex[value & 0x0f];
+    }
+    text << '"';
+    return text.str();
+}
 std::string managed_string_literal(std::u16string_view value) {
     constexpr char digits[] = "0123456789abcdef";
     std::string result = "\"";
@@ -1119,8 +1136,15 @@ Result<ManagedCilDecompilation> decompile_managed_method(
             std::ostringstream condition;
             if (const auto type_name = method.resolved_exception_type_names.find(clause.class_token);
                 type_name != method.resolved_exception_type_names.end()) {
-                condition << "exception_matches_type_name(" << quoted_metadata_name(type_name->second)
-                          << ", 0x" << std::hex << clause.class_token << ')';
+                const auto assembly = method.resolved_exception_type_assemblies.find(clause.class_token);
+                if (assembly != method.resolved_exception_type_assemblies.end()) {
+                    condition << "exception_matches_type_identity(" << quoted_metadata_name(type_name->second)
+                              << ", token=0x" << std::hex << clause.class_token << std::dec << ", "
+                              << managed_assembly_identity_text(assembly->second) << ')';
+                } else {
+                    condition << "exception_matches_type_name(" << quoted_metadata_name(type_name->second)
+                              << ", 0x" << std::hex << clause.class_token << ')';
+                }
             } else {
                 condition << "exception_matches_type_token(0x" << std::hex << clause.class_token << ')';
             }
@@ -1653,6 +1677,9 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                         ? "catch_handler_begin token " + std::to_string(clause.class_token)
                         : "catch_handler_begin " + quoted_metadata_name(type_name->second) +
                               " token " + std::to_string(clause.class_token);
+                    if (const auto assembly = method.resolved_exception_type_assemblies.find(clause.class_token);
+                        assembly != method.resolved_exception_type_assemblies.end())
+                        name += " " + managed_assembly_identity_text(assembly->second);
                 } else if (clause.kind == CilExceptionKind::filter) name = "catch_handler_begin filter";
                 else if (clause.kind == CilExceptionKind::fault_clause) name = "fault_handler_begin";
                 else name = "finally_handler_begin";
@@ -2446,6 +2473,9 @@ Result<ManagedCilDecompilation> decompile_managed_method(
             out << "    } catch (type_token(0x" << std::hex << clause.class_token << std::dec << ") exception) {";
             const auto name = method.resolved_exception_type_names.find(clause.class_token);
             if (name != method.resolved_exception_type_names.end()) out << " // " << quoted_metadata_name(name->second);
+            if (const auto assembly = method.resolved_exception_type_assemblies.find(clause.class_token);
+                assembly != method.resolved_exception_type_assemblies.end())
+                out << " " << managed_assembly_identity_text(assembly->second);
             out << '\n';
         } else out << "    } finally {\n";
         emit_indented(bodies[2]);

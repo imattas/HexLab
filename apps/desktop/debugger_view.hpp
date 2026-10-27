@@ -168,6 +168,7 @@ class DebuggerView final : public wxPanel {
     void refresh_locals();
     void write_register();
     void refresh_memory();
+    void copy_memory_page();
     void start_memory_search();
     void cancel_memory_search();
     void write_memory();
