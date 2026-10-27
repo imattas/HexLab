@@ -2,14 +2,28 @@
 #include "hexlab/image/metadata.hpp"
 #include <ostream>
 #include <string>
+#include <string_view>
 
 namespace hexlab::cli {
+inline std::string jvm_safe(std::string_view value) {
+    std::string result;
+    result.reserve(value.size());
+    for (const unsigned char c : value) {
+        if (c == '\n') result += "\\n";
+        else if (c == '\r') result += "\\r";
+        else if (c == '\t') result += "\\t";
+        else if (c < 0x20 || c == 0x7f) result += '?';
+        else result += static_cast<char>(c);
+    }
+    return result;
+}
 inline void jvm_description(std::ostream &out, const ImageMetadata &metadata) {
     if (!metadata.jvm) return;
     const auto &j = *metadata.jvm;
     out << "Java class: " << j.class_name << " version=" << j.major_version << '.' << j.minor_version
         << " access=" << j.access_flags << '\n';
     if(j.source_file)out<<"Source file: "<<*j.source_file<<'\n';
+    if(j.signature)out<<"Class signature: "<<jvm_safe(*j.signature)<<'\n';
     if (!j.super_name.empty()) out << "Superclass: " << j.super_name << '\n';
     out << "Interfaces: " << j.interfaces.size() << " Fields: " << j.fields.size()
         << " Methods: " << j.methods.size() << " Constant pool: " << (j.constant_pool.size() - 1) << '\n';
@@ -25,6 +39,7 @@ inline void jvm_description(std::ostream &out, const ImageMetadata &metadata) {
     }
     for (const auto &method : j.methods) {
         out << "  " << method.name << method.descriptor << " access=" << method.access_flags;
+        if (method.signature) out << " signature=" << jvm_safe(*method.signature);
         if (method.declared_exceptions) {
             out << " throws=";
             for (std::size_t i = 0; i < method.declared_exceptions->size(); ++i) {
@@ -51,6 +66,11 @@ inline void jvm_description(std::ostream &out, const ImageMetadata &metadata) {
         parameter_annotations(method.invisible_parameter_annotations,"invisible");
         if(method.annotation_default)out<<"    annotation default: "<<*method.annotation_default<<'\n';
     }
-    for(const auto &field:j.fields){annotations(field.visible_annotations,"visible","field");annotations(field.invisible_annotations,"invisible","field");}
+    for(const auto &field:j.fields){
+        out << "  Field: " << field.name << ' ' << field.descriptor;
+        if (field.signature) out << " signature=" << jvm_safe(*field.signature);
+        out << '\n';
+        annotations(field.visible_annotations,"visible","field");annotations(field.invisible_annotations,"invisible","field");
+    }
 }
 } // namespace hexlab::cli

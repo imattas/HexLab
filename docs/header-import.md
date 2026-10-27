@@ -273,9 +273,15 @@ unrecognized attributes, and
 unsupported scalar/declarator syntax remain unsupported.
 These errors are returned explicitly; no partial symbol table is returned.
 
-The enum type graph retains every enumerator name and its exact numeric value,
+Enum assignments accept bounded integer constant expressions using the
+supported evaluator above, including references to earlier non-negative
+enumerators in an unscoped enum. For example, `Read = 1 << 2` and `Write = Read
+| 1` are retained as exact values. References to earlier negative values,
+qualified enumerator references, and expressions outside the evaluator subset
+remain unsupported. The enum type graph retains every enumerator name and its exact numeric value,
 including negative signed values and the full signed 64-bit minimum. The same
-values are also returned in the ordered `HeaderImportResult::enum_constants`
+values are also returned in the ordered
+`HeaderImportResult::enum_constants`
 map for convenient lookup. `types::format_enumerators` renders exact stored
 values with signed decimal notation when appropriate. Native project header
 import persists enum bodies alongside typedefs, tags, object declarations, and

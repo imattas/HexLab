@@ -11,7 +11,7 @@ verifies the SHA-1 signature over bytes `[0x20, file_size)` and the Adler-32
 checksum over `[0x0c, file_size)` before interpreting tables.
 Integrity mismatches are rejected with the DEX header field offset (`0x0c` for
 the signature or `0x08` for the checksum) in the diagnostic. Both passes check
-cancellation in bounded chunks. The loader validates the header and map-list bounds, string/type/prototype/
+cancellation in bounded chunks. `DexMetadata::map_items` retains each validated map-list entry in source order as its section type, item count, and file offset; the map list itself is capped at 4,096 entries. This exposes the file directory without interpreting all section contents or synthesizing entries. The loader validates the header and map-list bounds, string/type/prototype/
 field/method/class identifier tables, modified UTF-8 string lengths, encoded
 class-data field/method lists, and each defined method's `code_item` instruction and
 try/catch extents. Ordered typed and catch-all handlers are retained against

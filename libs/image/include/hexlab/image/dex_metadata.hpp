@@ -5,6 +5,12 @@
 #include <vector>
 
 namespace hexlab {
+struct DexMapItem {
+    std::uint16_t type = 0; // DEX map_item type code.
+    std::uint32_t size = 0; // Number of items in the section.
+    std::uint32_t offset = 0; // Section start in the DEX file.
+    bool operator==(const DexMapItem &) const = default;
+};
 struct DexDebugLine {
     std::uint32_t address = 0; // Byte offset in the method-relative address space.
     std::uint32_t line = 0;
@@ -123,6 +129,7 @@ struct DexHiddenApiFlag {
     bool operator==(const DexHiddenApiFlag &) const = default;
 };
 struct DexMetadata {
+    std::vector<DexMapItem> map_items;
     std::vector<DexClassDefinition> classes;
     std::vector<DexMethodDebug> methods;
     std::vector<DexMethodCode> code;

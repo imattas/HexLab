@@ -58,7 +58,9 @@ use `--replace` only when replacing an existing output is intended. See
 [Save a historical project](project-history-save-cli.md).
 
 Inspect validated interrupted saves and retained prior versions with
-`hexlab_cli project recovery list <directory> [--json]`. Restore a listed
+`hexlab_cli project recovery list <directory-or-project-path> [--json]`.
+Passing a project path scans its containing directory, which is useful after
+an open failure. Restore a listed
 artifact to an independent project copy with
 `hexlab_cli project recovery restore <artifact.tmp> --output <project.hxproj>`;
 an existing output requires `--replace`. Discovery is read-only, restore
