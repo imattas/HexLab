@@ -7,6 +7,22 @@ are printed with their module timestamp and source file offset; forwarder
 references are indented beneath the owning module and retain their own source
 offset and timestamp. Absent bound-import data produces no section.
 
+When the COFF header supplies both a symbol-table file offset and a nonzero
+record count, the loader parses the bounded COFF symbol table and following
+string table. Primary symbols retain their name, raw value, section number,
+type, storage class, auxiliary-record count, and source file offset. A symbol
+gets a navigable image address only when its positive section number exists
+and its value falls inside that section's mapped extent. Auxiliary records are
+counted and skipped. The symbol record count is limited to one million, primary symbols to
+262,144, the string table and aggregate decoded names to 16 MiB, and each
+name to 65,536 bytes. CLI output and the
+desktop **COFF symbols** page display up to 4,096 rows; activating a row goes
+to its mapped address or, when unresolved, its file record. Most linked images
+omit this table. Malformed or oversized symbol metadata marks PE metadata
+partial and adds a diagnostic while preserving the already mapped image;
+other PE metadata and explicit rebasing continue through their normal paths.
+COFF bigobj and auxiliary-record-specific semantics are not decoded.
+
 When exception metadata is present, CLI inspection prints bounded AMD64 and
 ARM64 runtime-function rows with source file offsets. AMD64 handler payloads
 identify their handler and payload RVA; decoded FH3 summaries include state,

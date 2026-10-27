@@ -214,6 +214,14 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips64_dins: return "dins";
     case Opcode::mips64_movz: return "movz";
     case Opcode::mips64_movn: return "movn";
+    case Opcode::mips64_movf_s: return "movf.s";
+    case Opcode::mips64_movt_s: return "movt.s";
+    case Opcode::mips64_movz_s: return "movz.s";
+    case Opcode::mips64_movn_s: return "movn.s";
+    case Opcode::mips64_movf_d: return "movf.d";
+    case Opcode::mips64_movt_d: return "movt.d";
+    case Opcode::mips64_movz_d: return "movz.d";
+    case Opcode::mips64_movn_d: return "movn.d";
     case Opcode::mips64_bltzal: return "bltzal";
     case Opcode::mips64_bgezal: return "bgezal";
     case Opcode::mips64_bltzall: return "bltzall";

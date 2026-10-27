@@ -12,6 +12,17 @@
 namespace hexlab {
 enum class PeRuntimeArchitecture : std::uint8_t { arm64, x64_compatible };
 
+struct PeImageCoffSymbol {
+    std::string name;
+    std::uint32_t table_index = 0, value = 0;
+    std::int16_t section_number = 0;
+    std::uint16_t type = 0;
+    std::uint8_t storage_class = 0, auxiliary_count = 0;
+    FileOffset source_file_offset{};
+    std::optional<Address> address;
+    bool operator==(const PeImageCoffSymbol &) const = default;
+};
+
 struct PeCertificateRecord {
     std::uint32_t length = 0;
     std::uint16_t revision = 0, type = 0;
@@ -677,6 +688,7 @@ struct PePdbInlineSite {
     bool operator==(const PePdbInlineSite &) const = default;
 };
 struct PeMetadata {
+    std::vector<PeImageCoffSymbol> coff_symbols;
     std::optional<PeMsvcRttiMetadata> msvc_rtti;
     std::optional<PeCertificateTable> certificate_table;
     std::vector<PeImportSource> imports;

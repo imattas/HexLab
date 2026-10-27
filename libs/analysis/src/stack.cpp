@@ -1183,10 +1183,16 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                     const auto *list = instruction.operands.size() > 1
                                            ? std::get_if<ArmRegisterListOperand>(&instruction.operands[1])
                                            : nullptr;
-                    if (arm32_register(base, 13) && list) {
+                    const bool stack_base = arm32_register(base, 13);
+                    const bool frame_base = state.frame_register >= 0 &&
+                        arm32_register(base, static_cast<std::uint8_t>(state.frame_register));
+                    if ((stack_base || frame_base) && list) {
                         const unsigned count = std::popcount(list->mask);
+                        const auto base_depth = stack_base ? state.stack_depth : state.frame_depth;
                         std::int64_t base_offset = 0;
-                        if (!state.stack_depth.known || !subtract_checked(0, state.stack_depth.value, base_offset) ||
+                        if ((frame_base && instruction.arm && instruction.arm->writeback) ||
+                            (!instruction.memory_read && !instruction.memory_write) ||
+                            !base_depth.known || !subtract_checked(0, base_depth.value, base_offset) ||
                             !instruction.arm || !count) {
                             result.complete = false;
                         } else {
@@ -1198,10 +1204,8 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                             if (!add_checked(base_offset, before, start)) {
                                 result.complete = false;
                             } else {
-                                const auto access = instruction.access.size() > 1 ? instruction.access[1]
-                                                                                  : OperandAccess::address;
-                                const bool read = access == OperandAccess::read || access == OperandAccess::read_write;
-                                const bool written = access == OperandAccess::write || access == OperandAccess::read_write;
+                                const bool read = instruction.memory_read;
+                                const bool written = instruction.memory_write;
                                 for (unsigned reg_index = 0; reg_index < 16; ++reg_index) {
                                     if (!(list->mask & (1u << reg_index)) || (!read && !written)) continue;
                                     std::int64_t offset = 0;
@@ -1228,6 +1232,9 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                                 }
                             }
                         }
+                    } else if (base && base->bank == RegisterBank::arm32_gpr &&
+                               (base->index == 7 || base->index == 11)) {
+                        result.complete = false;
                     }
                 }
                 for (std::size_t i = 0; i < instruction.operands.size(); ++i) {

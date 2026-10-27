@@ -150,6 +150,9 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
     });
 }
 
+} // namespace hexlab::pe_detail
+
+namespace hexlab {
 Result<PeCoffSymbolTable> read_pe_coff_symbols(const LoadedImage &loaded, std::stop_token stop) {
     using namespace pe_detail;
     try {

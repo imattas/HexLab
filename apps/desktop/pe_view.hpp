@@ -17,6 +17,8 @@ class PeView final : public wxPanel {
   private:
     std::shared_ptr<const DocumentSnapshot> document_;
     VirtualTable *directories_ = nullptr;
+    VirtualTable *coff_symbols_ = nullptr;
+    wxStaticText *coff_symbol_status_ = nullptr;
     VirtualTable *resources_ = nullptr;
     wxStaticText *resource_status_ = nullptr;
     VirtualTable *bound_imports_ = nullptr;

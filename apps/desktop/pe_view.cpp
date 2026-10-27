@@ -49,6 +49,13 @@ const char *certificate_type_name(std::uint16_t type) {
 PeView::PeView(wxWindow *parent) : wxPanel(parent) {
     auto *tabs = new wxNotebook(this, wxID_ANY);
     directories_ = new VirtualTable(tabs, "pe-directories", {"#", "Kind", "RVA / file", "Size"});
+    auto *coff_symbol_page = new wxPanel(tabs);
+    coff_symbol_status_ = new wxStaticText(coff_symbol_page, wxID_ANY, "COFF symbols: unavailable");
+    coff_symbols_ = new VirtualTable(coff_symbol_page, "pe-coff-symbols", {"Address / source", "Name", "Section", "Value", "Type / class", "Auxiliary"});
+    auto *coff_symbol_layout = new wxBoxSizer(wxVERTICAL);
+    coff_symbol_layout->Add(coff_symbol_status_, 0, wxEXPAND | wxALL, 4);
+    coff_symbol_layout->Add(coff_symbols_, 1, wxEXPAND);
+    coff_symbol_page->SetSizer(coff_symbol_layout);
     auto *resource_page = new wxPanel(tabs);
     resource_status_ = new wxStaticText(resource_page, wxID_ANY, "Resources: unavailable");
     resources_ = new VirtualTable(resource_page, "pe-resources",
@@ -102,6 +109,7 @@ PeView::PeView(wxWindow *parent) : wxPanel(parent) {
     pdb_inline_ = new VirtualTable(tabs, "pe-pdb-inline", {"Address", "Bytes", "Source", "Inlinee IPI", "Scope / origin", "State"});
     pdb_status_ = new wxStaticText(this, wxID_ANY, "PDB: unavailable");
     tabs->AddPage(directories_, "Data directories");
+    tabs->AddPage(coff_symbol_page, "COFF symbols");
     tabs->AddPage(resource_page, "Resources");
     tabs->AddPage(bound_imports_, "Bound imports");
     tabs->AddPage(certificate_page, "Certificates");
@@ -126,6 +134,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
     const bool pe = metadata && metadata->pe.has_value();
     if (!pe) {
         directories_->populate(0, {});
+        coff_symbols_->populate(0, {});
+        coff_symbol_status_->SetLabel("COFF symbols: unavailable");
         resource_status_->SetLabel("Resources: unavailable");
         resources_->populate(0, {});
         bound_imports_->populate(0, {});
@@ -141,6 +151,7 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         pdb_inline_->populate(0, {}); pdb_inline_->activate = {};
         pdb_status_->SetLabel("PDB: unavailable");
         directories_->activate = {};
+        coff_symbols_->activate = {};
         resources_->activate = {};
         bound_imports_->activate = {};
         certificates_->activate = {};
@@ -171,6 +182,39 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         const auto base = metadata->preferred_base;
         if (entry.location <= UINT64_MAX - base)
             if (navigate) navigate(source_document, Address{{0}, base + entry.location});
+    };
+
+    constexpr std::size_t coff_symbol_display_limit = 4096;
+    const auto &coff_symbols = metadata->pe->coff_symbols;
+    const auto shown_coff_symbols = std::min(coff_symbol_display_limit, coff_symbols.size());
+    coff_symbol_status_->SetLabel(wxString::Format("COFF symbols: %llu%s",
+        static_cast<unsigned long long>(coff_symbols.size()),
+        coff_symbols.size() > shown_coff_symbols ? " (display limited to 4096 rows)" : ""));
+    coff_symbols_->populate(shown_coff_symbols, [metadata](std::size_t row, int column) {
+        if (!metadata->pe || row >= metadata->pe->coff_symbols.size()) return wxString{};
+        const auto &item = metadata->pe->coff_symbols[row];
+        switch (column) {
+        case 0: return item.address ? wxString::Format("0x%llX", static_cast<unsigned long long>(item.address->offset))
+                                    : wxString::Format("file:0x%llX", static_cast<unsigned long long>(item.source_file_offset.value));
+        case 1: return text(item.name);
+        case 2: return wxString::Format("%d", static_cast<int>(item.section_number));
+        case 3: return wxString::Format("0x%08X", item.value);
+        case 4: return wxString::Format("0x%04X / %u", item.type, static_cast<unsigned>(item.storage_class));
+        default: return wxString::Format("%u", static_cast<unsigned>(item.auxiliary_count));
+        }
+    });
+    coff_symbols_->activate = [this, source_document, metadata, shown_coff_symbols](std::size_t row) {
+        if (row >= shown_coff_symbols || !metadata->pe || !navigate) return;
+        const auto &item = metadata->pe->coff_symbols[row];
+        if (item.address) {
+            const auto loaded = source_document->project ? source_document->project->loaded : nullptr;
+            const auto base = loaded && loaded->load_base ? *loaded->load_base : metadata->preferred_base;
+            if (item.address->offset >= metadata->preferred_base) {
+                const auto rebased = checked_add(base, item.address->offset - metadata->preferred_base);
+                if (rebased) { navigate(source_document, Address{item.address->space, rebased.value()}); return; }
+            }
+        }
+        navigate(source_document, Location{item.source_file_offset});
     };
 
     constexpr std::size_t resource_display_limit = 4096;
