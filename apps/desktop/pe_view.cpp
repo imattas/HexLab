@@ -60,7 +60,7 @@ PeView::PeView(wxWindow *parent) : wxPanel(parent) {
     resource_status_ = new wxStaticText(resource_page, wxID_ANY, "Resources: unavailable");
     resources_ = new VirtualTable(resource_page, "pe-resources",
         {"Type", "Name", "Language", "RVA", "Size", "Code page", "Data entry", "Payload file",
-         "Version strings", "Record"});
+         "Decoded strings", "Record"});
     auto *resource_layout = new wxBoxSizer(wxVERTICAL);
     resource_layout->Add(resource_status_, 0, wxEXPAND | wxALL, 4);
     resource_layout->Add(resources_, 1, wxEXPAND);
@@ -247,23 +247,35 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
             return item.payload.empty() ? wxString("unavailable")
                 : location_text(Location{item.payload.front().offset});
         case 8: {
-            if (!item.version_info) return wxString{};
             wxString summary;
-            constexpr std::string_view shown[] = {
-                "FileDescription", "CompanyName", "ProductName", "OriginalFilename", "InternalName"};
-            for (const auto &entry : item.version_info->strings) {
-                bool visible = false;
-                for (const auto key : shown)
-                    if (std::string_view(entry.key) == key) { visible = true; break; }
-                if (!visible || entry.value.empty() || entry.value.size() > 512) continue;
-                if (!summary.empty()) summary += "; ";
-                summary += text(entry.key + "=" + entry.value);
-                if (summary.length() >= 512) {
-                    summary = summary.Left(512);
-                    summary += "...";
-                    break;
+            if (item.version_info) {
+                constexpr std::string_view shown[] = {
+                    "FileDescription", "CompanyName", "ProductName", "OriginalFilename", "InternalName"};
+                for (const auto &entry : item.version_info->strings) {
+                    bool visible = false;
+                    for (const auto key : shown)
+                        if (std::string_view(entry.key) == key) { visible = true; break; }
+                    if (!visible || entry.value.empty() || entry.value.size() > 512) continue;
+                    if (!summary.empty()) summary += "; ";
+                    summary += text(entry.key + "=" + entry.value);
+                    if (summary.length() >= 512) {
+                        summary = summary.Left(512);
+                        summary += "...";
+                        break;
+                    }
                 }
             }
+            if (item.string_table)
+                for (const auto &entry : item.string_table->entries) {
+                    if (entry.value.empty()) continue;
+                    if (!summary.empty()) summary += "; ";
+                    summary += wxString::Format("#%u=", entry.id) + text(entry.value);
+                    if (summary.length() >= 512) {
+                        summary = summary.Left(512);
+                        summary += "...";
+                        break;
+                    }
+                }
             return summary;
         }
         default: return wxString::Format("%u", item.data_entry.index);

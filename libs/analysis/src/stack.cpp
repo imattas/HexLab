@@ -354,6 +354,34 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         state.frame_register = -1;
         return true;
     }
+    // At x86-64 function entry, the call ABI guarantees RSP is 8 mod 16.
+    // Model common low-bit clearing masks when this determines the exact
+    // resulting entry-relative depth.
+    if (instruction.context.architecture == Architecture::x86_64 &&
+        instruction.context.mode == ExecutionMode::x86_64 &&
+        instruction.opcode == Opcode::bit_and && is_gpr(first, 4) && first->width == 64 &&
+        instruction.operands.size() == 2) {
+        const auto mask = immediate_value(instruction, 1);
+        std::int64_t alignment = 0;
+        if (mask) {
+            switch (*mask) {
+            case -2: alignment = 2; break;
+            case -4: alignment = 4; break;
+            case -8: alignment = 8; break;
+            case -16: alignment = 16; break;
+            default: break;
+            }
+        }
+        if (!alignment || !state.stack_depth.known) {
+            state.stack_depth = {};
+            state.supported = false;
+            return true;
+        }
+        auto remainder = (8 % alignment - state.stack_depth.value % alignment) % alignment;
+        if (remainder < 0) remainder += alignment;
+        if (!add(state.stack_depth, remainder)) return false;
+        return true;
+    }
     if (instruction.opcode == Opcode::mov && is_gpr(first, 5) && is_gpr(second, 4)) {
         state.frame_depth = state.stack_depth;
         state.frame_register = 5;

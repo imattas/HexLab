@@ -539,6 +539,18 @@ struct PeVersionInfo {
     bool string_tables_complete = true;
     bool operator==(const PeVersionInfo &) const = default;
 };
+struct PeResourceString {
+    std::uint32_t id = 0;
+    std::string value;
+    PeRecordSource source;
+    bool operator==(const PeResourceString &) const = default;
+};
+struct PeStringTable {
+    std::vector<PeResourceString> entries;
+    PeRecordSource source;
+    bool complete = true;
+    bool operator==(const PeStringTable &) const = default;
+};
 struct PeManifestAssemblyIdentity {
     std::optional<std::string> type, name, version, processor_architecture, public_key_token, language;
     PeRecordSource source;
@@ -562,6 +574,8 @@ struct PeResource {
     std::optional<PeVersionInfo> version_info;
     // Decoded bounded application identity and UAC request from RT_MANIFEST.
     std::optional<PeManifestInfo> manifest_info;
+    // Decoded bounded UTF-16 entries from RT_STRING blocks.
+    std::optional<PeStringTable> string_table;
     bool operator==(const PeResource &) const = default;
 };
 struct PeCodeViewIdentity {

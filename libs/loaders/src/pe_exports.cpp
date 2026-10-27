@@ -489,6 +489,74 @@ std::optional<PeManifestInfo> parse_manifest(const ImageReader &reader, const Pe
     if (!saw_root || !stack.empty()) return incomplete();
     return result;
 }
+
+std::optional<PeStringTable> parse_string_table(const ImageReader &reader, const PeResource &resource,
+                                                std::uint64_t &remaining_budget,
+                                                std::size_t &remaining_rows) {
+    if (!resource.size) return {};
+    constexpr std::uint64_t per_resource_limit = 1024 * 1024;
+    const auto bounded_size = std::min<std::uint64_t>({resource.size, per_resource_limit, remaining_budget});
+    if (!bounded_size) return {};
+    remaining_budget -= bounded_size;
+    const auto raw = reader.bytes(resource.data_rva, static_cast<std::size_t>(bounded_size));
+    PeStringTable table;
+    table.source = {resource.data_entry.index, reader.sources(resource.data_rva, bounded_size)};
+    const auto incomplete = [&]() -> std::optional<PeStringTable> {
+        table.complete = false;
+        remaining_rows -= table.entries.size();
+        return table;
+    };
+    if (resource.size > bounded_size || remaining_rows < 16)
+        table.complete = false;
+    const auto count = std::min<std::size_t>(16, remaining_rows);
+    table.entries.reserve(count);
+    const auto u16 = [&](std::size_t at) -> std::optional<std::uint16_t> {
+        if (at > raw.size() || raw.size() - at < 2) return {};
+        return static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(raw[at]) |
+                                         (std::uint16_t{std::to_integer<std::uint8_t>(raw[at + 1])} << 8));
+    };
+    std::size_t cursor = 0;
+    if (!count) return incomplete();
+    const std::uint64_t first_id = resource.name.id && *resource.name.id
+        ? (std::uint64_t{*resource.name.id} - 1) * 16 : UINT64_MAX;
+    if (first_id == UINT64_MAX || first_id + count - 1 > UINT32_MAX)
+        return incomplete();
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto length = u16(cursor);
+        if (!length) return incomplete();
+        const auto record_at = cursor;
+        cursor += 2;
+        if (*length > (raw.size() - cursor) / 2) return incomplete();
+        std::string value;
+        value.reserve(std::size_t{*length} * 3);
+        for (std::uint16_t unit_index = 0; unit_index < *length; ++unit_index) {
+            auto codepoint = *u16(cursor);
+            cursor += 2;
+            if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
+                if (unit_index + 1 >= *length || cursor > raw.size() || raw.size() - cursor < 2)
+                    return incomplete();
+                const auto low = *u16(cursor);
+                if (low < 0xdc00 || low > 0xdfff) return incomplete();
+                cursor += 2;
+                ++unit_index;
+                codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
+            } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) {
+                return incomplete();
+            }
+            append_utf8(value, codepoint);
+        }
+        PeResourceString row;
+        row.id = static_cast<std::uint32_t>(first_id + index);
+        row.value = std::move(value);
+        row.source = {resource.data_entry.index, reader.sources(resource.data_rva + record_at, cursor - record_at)};
+        table.entries.push_back(std::move(row));
+    }
+    remaining_rows -= count;
+    if (std::any_of(raw.begin() + static_cast<std::ptrdiff_t>(cursor), raw.end(),
+                    [](std::byte value) { return value != std::byte{0}; }))
+        table.complete = false;
+    return table;
+}
 }
 
 Result<std::size_t> read_exports(const Image& image,const Directory& directory,ImageMetadata& metadata,std::stop_token stop) {
@@ -566,6 +634,8 @@ Result<std::size_t> read_resources(const Image& image,const Directory& directory
         std::size_t total=0;
         std::uint64_t version_parse_budget = 16u * 1024u * 1024u;
         std::uint64_t manifest_parse_budget = 16u * 1024u * 1024u;
+        std::uint64_t string_parse_budget = 16u * 1024u * 1024u;
+        std::size_t string_row_budget = 65536;
         std::vector<PeResourceIdentifier> path;
         std::set<std::uint32_t> active;
         auto source=[&](std::uint64_t at,std::uint64_t size,std::uint32_t index=0) {
@@ -642,6 +712,8 @@ Result<std::size_t> read_resources(const Image& image,const Directory& directory
                         resource.version_info = parse_version_info(r, resource, version_parse_budget);
                     else if (resource.type.id == 24)
                         resource.manifest_info = parse_manifest(r, resource, manifest_parse_budget);
+                    else if (resource.type.id == 6)
+                        resource.string_table = parse_string_table(r, resource, string_parse_budget, string_row_budget);
                     metadata.pe->resources.push_back(std::move(resource));
                 }
             }

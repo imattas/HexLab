@@ -93,6 +93,34 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata) {
                 out << "  PE version string tables: incomplete or exceeded bounded inspection budget\n";
             ++emitted_versions;
         }
+        std::size_t emitted_string_tables = 0, emitted_resource_strings = 0;
+        for (const auto &resource : metadata.pe->resources) {
+            if (!resource.string_table) continue;
+            if (emitted_string_tables == 256) {
+                out << "PE RT_STRING tables: output limited to 256 resources\n";
+                break;
+            }
+            const auto &table = *resource.string_table;
+            out << "PE RT_STRING table=" << (resource.name.id ? std::to_string(*resource.name.id) : "?")
+                << " language=" << (resource.language.id ? std::to_string(*resource.language.id) : "?")
+                << " entries=" << table.entries.size()
+                << (table.complete ? " complete" : " incomplete");
+            if (!table.source.spans.empty())
+                out << " file:0x" << std::hex << table.source.spans.front().offset.value << std::dec;
+            out << '\n';
+            for (const auto &entry : table.entries) {
+                if (emitted_resource_strings == 4096) {
+                    out << "  PE RT_STRING entries: output limited to 4096 strings\n";
+                    break;
+                }
+                out << "  PE string id=" << entry.id << " value=\"" << escape_pe_version_text(entry.value) << '"';
+                if (!entry.source.spans.empty())
+                    out << " file:0x" << std::hex << entry.source.spans.front().offset.value << std::dec;
+                out << '\n';
+                ++emitted_resource_strings;
+            }
+            ++emitted_string_tables;
+        }
         std::size_t emitted_manifests = 0, emitted_manifest_dependencies = 0;
         for (const auto &resource : metadata.pe->resources) {
             if (!resource.manifest_info) continue;

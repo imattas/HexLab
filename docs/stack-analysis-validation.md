@@ -97,6 +97,14 @@ Direct memory operands based on `sp` (`x2`) or the tracked `s0/fp` register then
 produce the same entry-SP-relative slots. Other writes to `sp` or tracked `s0`
 invalidate the corresponding relation.
 
+For x86-64, `AND RSP, -A` recognizes low-bit clearing masks for A = 2, 4, 8,
+or 16. It uses the ABI entry invariant `RSP % 16 == 8` to compute exact
+entry-relative depth after alignment, so later stack slots remain comparable
+with pre-alignment slots. Other masks, 32-bit ESP writes, and alignment when
+the incoming depth is unknown retain the conservative partial result. This
+assumes a normally called x86-64 function entry; custom entry points with a
+different stack alignment are not inferred.
+
 For PowerPC32/64, constant `ADDI r1,r1,imm` adjustments and the stack update
 forms (`STWU`/`STDU` and immediate load-update instructions) track the entry-SP
 depth. `OR r31,r1,r1` and constant `ADDI` relations establish or restore the
