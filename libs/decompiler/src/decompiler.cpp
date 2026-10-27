@@ -569,6 +569,7 @@ std::string operation_name(Opcode opcode) {
     case Opcode::m6502_slo: return "SLO";
     case Opcode::m6502_rla: return "RLA";
     case Opcode::m6502_sre: return "SRE";
+    case Opcode::m6502_rra: return "RRA";
     case Opcode::m6502_cpx: return "CPX"; case Opcode::m6502_cpy: return "CPY";
     case Opcode::m6502_bit: return "BIT"; case Opcode::m6502_inc: return "INC";
     case Opcode::m6502_dec: return "DEC"; case Opcode::m6502_inx: return "INX";
@@ -700,6 +701,7 @@ std::string operation_name(Opcode opcode) {
     case Opcode::pminsw: return "pminsw";
     case Opcode::pmaxsw: return "pmaxsw";
     case Opcode::pshufd: return "pshufd";
+    case Opcode::pshufb: return "pshufb";
     case Opcode::pcmpeqb: return "pcmpeqb";
     case Opcode::pcmpeqw: return "pcmpeqw";
     case Opcode::pcmpeqd: return "pcmpeqd";
@@ -1605,10 +1607,15 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 effect.register_output_values = {result, new_status};
                 return effect;
             }
-            if (op == Opcode::m6502_adc || op == Opcode::m6502_sbc) {
+            if (op == Opcode::m6502_adc || op == Opcode::m6502_sbc ||
+                (op == Opcode::m6502_rra && is_memory(instruction.operands.front()))) {
                 const bool subtract = op == Opcode::m6502_sbc;
                 const auto lhs = reg_expr(accumulator);
-                const auto rhs = operands.front();
+                const bool rra = op == Opcode::m6502_rra;
+                const auto old_byte = operands.front();
+                const auto rhs = rra ? binary("or", binary("lshr", old_byte, constant_expr(1, 8)),
+                    binary("shl", std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                        boolean_binary("bit_extract", status_value, constant_expr(0, 8))}}), constant_expr(7, 8))) : old_byte;
                 const auto bool_byte = [](ExpressionPtr value) -> ExpressionPtr {
                     return std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", std::move(value)}});
                 };
@@ -1618,7 +1625,8 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 const auto extend = [](ExpressionPtr value) -> ExpressionPtr {
                     return std::make_shared<Expression>(Expression{integer_type(9), UnaryValue{"zext", std::move(value)}});
                 };
-                const auto carry_in = boolean_binary("bit_extract", status_value, constant_expr(0, 8));
+                const auto carry_in = rra ? boolean_binary("bit_extract", old_byte, constant_expr(0, 8)) :
+                    boolean_binary("bit_extract", status_value, constant_expr(0, 8));
                 auto right = rhs;
                 if (subtract)
                     right = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"bitnot", rhs}});
@@ -1724,8 +1732,11 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 const auto selected_result = binary("select_if", decimal_bit, alternatives);
                 const auto status_alternatives = binary("pair", decimal_status, binary_status);
                 const auto selected_status = binary("select_if", decimal_bit, status_alternatives);
-                Intrinsic effect{subtract ? "m6502_sbc" : "m6502_adc",
-                    {}, instruction.memory_read ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                Intrinsic effect{rra ? "m6502_rra_ror_then_adc" : subtract ? "m6502_sbc" : "m6502_adc",
+                    rra ? std::vector<ExpressionPtr>{old_byte, rhs, reg_expr(accumulator), status_value} :
+                          std::vector<ExpressionPtr>{},
+                    rra ? IntrinsicMemoryEffect::unknown :
+                        instruction.memory_read ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
                 effect.register_writes = {accumulator, status};
                 effect.register_output_values = {selected_result, selected_status};
                 return effect;
@@ -4020,11 +4031,29 @@ a64_unhandled:
         }
     }
 
+    if (x86 && instruction.opcode == Opcode::pshufb && instruction.operands.size() == 2) {
+        const auto destination = as_register(instruction.operands[0]);
+        const auto *source_memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        const auto source = as_register(instruction.operands[1]);
+        const bool destination_ok = destination && destination->bank == RegisterBank::xmm && destination->width == 128;
+        const bool source_ok = (source && source->bank == RegisterBank::xmm && source->width == 128) ||
+                               (source_memory && source_memory->data_width == 128);
+        if (destination_ok && source_ok) {
+            const auto value_type = vector_type(128, TypeKind::integer, 8, 16);
+            Intrinsic effect{"x86_pshufb_i8x16",
+                {retag_expr(operands[0], value_type), retag_expr(operands[1], value_type)},
+                source_memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = value_type;
+            return effect;
+        }
+    }
+
     const auto packed_lane_bits = [](Opcode opcode) -> std::uint16_t {
         switch (opcode) {
         case Opcode::paddb: case Opcode::psubb: case Opcode::paddsb: case Opcode::paddusb:
         case Opcode::psubsb: case Opcode::psubusb: case Opcode::pcmpeqb: case Opcode::pcmpgtb:
-        case Opcode::pminub: case Opcode::pmaxub: return 8;
+        case Opcode::pminub: case Opcode::pmaxub: case Opcode::pshufb: return 8;
         case Opcode::paddw: case Opcode::psubw: case Opcode::paddsw: case Opcode::paddusw:
         case Opcode::psubsw: case Opcode::psubusw: case Opcode::pcmpeqw: case Opcode::pcmpgtw:
         case Opcode::psllw: case Opcode::psrlw: case Opcode::psraw: case Opcode::pmullw:
@@ -4052,7 +4081,7 @@ a64_unhandled:
         case Opcode::pmullw: case Opcode::pmulhw: case Opcode::pmulhuw: case Opcode::pmuludq:
         case Opcode::pmaddwd: case Opcode::pminub: case Opcode::pmaxub: case Opcode::pminsw:
         case Opcode::pmaxsw: case Opcode::phaddw: case Opcode::phaddd: case Opcode::phaddsw:
-        case Opcode::phsubw: case Opcode::phsubd: case Opcode::phsubsw: return true;
+        case Opcode::phsubw: case Opcode::phsubd: case Opcode::phsubsw: case Opcode::pshufb: return true;
         default: return false;
         }
     };

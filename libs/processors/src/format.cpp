@@ -572,6 +572,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::phaddsw: return "phaddsw"; case Opcode::phsubw: return "phsubw";
     case Opcode::phsubd: return "phsubd"; case Opcode::phsubsw: return "phsubsw";
     case Opcode::pshufd: return "pshufd";
+    case Opcode::pshufb: return "pshufb";
     default: break;
     }
     if (op >= Opcode::rv_lui && op <= Opcode::rv_remuw) {
@@ -786,6 +787,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::m6502_slo) return "slo";
     if (op == Opcode::m6502_rla) return "rla";
     if (op == Opcode::m6502_sre) return "sre";
+    if (op == Opcode::m6502_rra) return "rra";
     const auto index = static_cast<std::size_t>(op);
     return index < std::size(names) ? names[index] : "?opcode";
 }

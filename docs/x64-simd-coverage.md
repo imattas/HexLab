@@ -12,7 +12,7 @@ families:
 | Packed integer compare | `pcmpeqb/w/d`, `pcmpgtb/w/d` |
 | Packed integer multiply/min/max | `pmullw`, `pmulhw`, `pmulhuw`, `pmuludq`, `pmaddwd`, `pminub`, `pmaxub`, `pminsw`, `pmaxsw` |
 | SSSE3 horizontal integer arithmetic | `phaddw/d/sw`, `phsubw/d/sw` |
-| Packed integer shuffle | `pshufd` with its encoded byte selector |
+| Packed integer shuffle | `pshufd` with its encoded byte selector; SSSE3 `pshufb` |
 | Scalar moves | `movss`, `movsd` |
 | Scalar arithmetic | `addss`, `addsd`, `subss`, `subsd`, `mulss`, `mulsd`, `divss`, `divsd` |
 | AVX packed floating decoder | VEX.128/.256 `vmovups`, `vaddps/pd`, `vsubps/pd`, `vmulps/pd`, `vdivps/pd`, `vxorps/pd`, `vandps/pd`; EVEX.128/.256/.512 `vaddps/pd`, `vsubps/pd`, `vmulps/pd`, `vdivps/pd` |
@@ -55,6 +55,15 @@ dword forms wrap; the `SW` forms saturate signed word results. The packed
 integer evaluator computes these lane results, and the typed lift records
 signed word/dword lane inputs and results. These encodings follow Intel's
 [SSSE3 instruction reference](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf).
+
+Legacy SSSE3 `PSHUFB` uses `66 0F 38 00 /r`. The old XMM destination supplies
+the 16 data bytes, while the register or 128-bit memory operand supplies 16
+control bytes. Each control byte selects a byte from the old destination with
+its low four bits; setting its high bit writes zero. Selection remains within
+the single 128-bit vector. Decode effects mark the destination read/write and
+the explicit source read, and the typed lift retains the 16-byte vector shape.
+The packed integer evaluator implements both low-nibble selection and
+high-bit-zeroing.
 
 Packed comparisons use destructive XMM destinations and do not modify EFLAGS.
 The packed integer execution helper evaluates byte/word/dword/qword wrapping

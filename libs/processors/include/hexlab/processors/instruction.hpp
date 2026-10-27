@@ -471,8 +471,12 @@ enum class Opcode {
     mips_ext, mips_ins,
     // Stable undocumented NMOS 6502 shift/logical RMW families.
     m6502_slo, m6502_rla, m6502_sre,
+    // Stable undocumented NMOS 6502 rotate-then-add family.
+    m6502_rra,
     // Legacy SSSE3 horizontal integer operations; append for persisted IDs.
-    phaddw, phaddd, phaddsw, phsubw, phsubd, phsubsw
+    phaddw, phaddd, phaddsw, phsubw, phsubd, phsubsw,
+    // SSSE3 byte shuffle; appended to preserve persisted opcode IDs.
+    pshufb
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

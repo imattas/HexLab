@@ -2078,9 +2078,8 @@ private:
                         if(!take(","))break;
                         continue;
                     }
-                    if(d.name.empty())fail(ErrorCode::unsupported,"unnamed nonzero bitfields are unsupported");
                     if(width>storage_bits)fail(ErrorCode::unsupported,"bitfield width exceeds its declared storage type");
-                    if(!member_names.insert(d.name).second)fail(ErrorCode::conflict,"duplicate aggregate field '"+d.name+"'");
+                    if(!d.name.empty()&&!member_names.insert(d.name).second)fail(ErrorCode::conflict,"duplicate aggregate field '"+d.name+"'");
                     auto al=packed?std::uint64_t{1}:d.type->alignment();
                     if(packed_member)al=member_alignment.value_or(1);else if(member_alignment)al=std::max(al,*member_alignment);
                     if(pack_cap_&&!member_alignment)al=std::min(al,pack_cap_);

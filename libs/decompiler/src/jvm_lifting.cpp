@@ -716,7 +716,18 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             if(op==0xa7||op==0xc8){if(!i.direct_target)return no("goto target unavailable");emit(*fact,Branch{"true",i.direct_target,{}});continue;}
             if(op>=0xac&&op<=0xb0){const auto type=op==0xac?int32():op==0xad?int64():op==0xae?fp32():op==0xaf?fp64():ref32();auto v=pop(type);if(!v)return v.error();if(!stack.empty())return no("return leaves extra operand-stack values");emit(*fact,Return{v.value()});continue;}
             if(op==0xb1){if(!stack.empty())return no("void return leaves operand-stack values");emit(*fact,Return{});continue;}
-            if(op==0xbf){auto exception=pop(ref32());if(!exception)return exception.error();if(!stack.empty())return no("athrow leaves extra operand-stack values");Intrinsic effect;effect.name="jvm_athrow";effect.operands.push_back(exception.value());effect.memory_effect=IntrinsicMemoryEffect::none;emit(*fact,std::move(effect));continue;}
+            if(op==0xbf){
+                if(ix+1!=src.instructions.size())return no("athrow is not block-terminating");
+                auto exception=pop(ref32());if(!exception)return exception.error();
+                if(!stack.empty())return no("athrow leaves extra operand-stack values");
+                if(references){
+                    const auto ref=identity(exception.value());
+                    if(ref&&(ref->kind==JvmVerificationKind::uninitialized||ref->kind==JvmVerificationKind::uninitialized_this))
+                        return no("athrow uses an uninitialized verifier value");
+                }
+                Intrinsic effect;effect.name="jvm_athrow";effect.operands.push_back(exception.value());effect.memory_effect=IntrinsicMemoryEffect::none;
+                emit(*fact,std::move(effect));continue;
+            }
             if(op>=0xb2&&op<=0xb5){
                 if(!metadata)return no("field access requires JVM constant-pool metadata");
                 auto index=imm(i);if(!index)return no("field constant-pool index unavailable");
