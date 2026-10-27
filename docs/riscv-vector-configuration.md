@@ -252,3 +252,7 @@ requires 128-bit lane values and remains symbolic. Destination group alignment
 and overlap cannot be validated because the lane API receives no physical
 register group identities; implementation-specific vector limits also remain
 outside the model.
+
+## Integer reduction subset
+
+The decoder recognizes unmasked integer `vredsum.vs`, `vredand.vs`, `vredor.vs`, `vredxor.vs`, `vredminu.vs`, `vredmin.vs`, `vredmaxu.vs`, and `vredmax.vs` in the OPMVV encoding class. `vm` must be one; `.vv` and scalar-seed interpretations are not accepted. The explicit operands are `vd, vs2, vs1`: `vs1[0]` is the seed and `vs2` supplies the reduction elements. The destination remains a vector register, since the operation writes element zero and has tail/prestart preservation dependencies. The instruction also reads `vl`, `vtype`, and `vstart`, and resets `vstart` through the common vector effect path. The bounded configuration evaluator supports SEW 8/16/32/64 and LMUL m1/2/4/8 and mf2/mf4/mf8; it rejects unsupported SEW/LMUL encodings. Decoder validation is encoding-class exact but cannot validate dynamic vtype or register-group alignment without configuration state. Masked reductions, widening reductions, and floating-point reductions remain unsupported.

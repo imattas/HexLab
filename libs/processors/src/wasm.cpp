@@ -158,6 +158,17 @@ DecodeResult decode_wasm(std::span<const std::byte> bytes, Address at) {
         const unsigned immediate_count = subopcode == 8 || subopcode == 10 ? 2 : 1;
         for (unsigned n = 0; n < immediate_count; ++n)
             if (!require_u(32)) return decode_leb_result(last_leb_result);
+    } else if (op == 0xd0) {
+        mnemonic = "ref.null";
+        std::int64_t heap_type = 0;
+        const auto result = sleb(bytes, position, 33, heap_type);
+        if (result != LebResult::ok) return decode_leb_result(result);
+        if (heap_type != -16) return fail(DecodeStatus::unsupported, "only ref.null funcref is supported");
+    } else if (op == 0xd1) {
+        mnemonic = "ref.is_null";
+    } else if (op == 0xd2) {
+        mnemonic = "ref.func";
+        if (!require_u(32)) return decode_leb_result(last_leb_result);
     } else if (op == 0x41 || op == 0x42) {
         mnemonic = op == 0x41 ? "i32.const" : "i64.const";
         const auto result = add_s(op == 0x41 ? 32 : 64, op == 0x41 ? 32 : 64);

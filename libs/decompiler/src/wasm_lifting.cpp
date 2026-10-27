@@ -16,12 +16,14 @@ using Stack = std::vector<ExpressionPtr>;
 
 ValueType integer(unsigned bits, bool sign = false) { return {TypeKind::integer, static_cast<std::uint16_t>(bits), sign}; }
 ValueType floating(unsigned bits) { return {TypeKind::floating, static_cast<std::uint16_t>(bits), false}; }
+ValueType funcref() { return {TypeKind::pointer, 32, false}; }
 std::optional<ValueType> wasm_value_type(std::uint8_t code) {
     switch (code) {
     case 0x7f: return integer(32);
     case 0x7e: return integer(64);
     case 0x7d: return floating(32);
     case 0x7c: return floating(64);
+    case 0x70: return funcref();
     default: return {};
     }
 }
@@ -633,7 +635,9 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 }
                 continue;
             }
-            if(op==0x41||op==0x42||op==0x43||op==0x44){stack.push_back(op==0x41?integer(32):op==0x42?integer(64):op==0x43?floating(32):floating(64));}
+            if(op==0xd0||op==0xd2){stack.push_back(funcref());}
+            else if(op==0xd1){auto v=shape_pop(stack,funcref());if(!v)return v.error();stack.push_back(integer(32));}
+            else if(op==0x41||op==0x42||op==0x43||op==0x44){stack.push_back(op==0x41?integer(32):op==0x42?integer(64):op==0x43?floating(32):floating(64));}
             else if(auto info=numeric(op)){for(unsigned p=0;p<info->pops;++p){auto v=shape_pop(stack,info->input);if(!v)return v.error();}stack.push_back(info->output);}
             else if(auto cv=conversion(op)){auto v=shape_pop(stack,cv->input);if(!v)return v.error();stack.push_back(cv->output);}
             else if(auto ext=sign_extension(op)){auto v=shape_pop(stack,ext->type);if(!v)return v.error();stack.push_back(ext->type);}
@@ -742,6 +746,9 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             }
         }
         for(std::size_t n=begin;n<finish;++n){const auto *fact=code[n];const auto &i=fact->instruction;const auto op=std::to_integer<std::uint8_t>(i.bytes[0]);
+            if(op==0xd0){stack.push_back(constant(0,funcref()));continue;}
+            if(op==0xd2){auto index=immediate(i);if(!index)return unsupported("ref.func index unavailable");stack.push_back(unary("wasm_ref_func_"+std::to_string(*index),constant(0,funcref()),funcref()));continue;}
+            if(op==0xd1){auto value=pop(funcref());if(!value)return value.error();stack.push_back(unary("wasm_ref_is_null",value.value(),integer(32)));continue;}
             if(op==0x41||op==0x42||op==0x43||op==0x44){auto v=immediate(i);if(!v)return unsupported("constant immediate unavailable");stack.push_back(constant(*v,op==0x41?integer(32):op==0x42?integer(64):op==0x43?floating(32):floating(64)));continue;}
             if(op==0x00){emit(n,Intrinsic{"wasm_unreachable",{},IntrinsicMemoryEffect::none});break;}
             if(op==0x01)continue;

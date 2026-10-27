@@ -79,7 +79,7 @@ struct Reader {
     bool value_type(std::uint8_t *decoded = nullptr) {
         std::uint8_t type = 0;
         if (!byte(type)) return false;
-        if (type != 0x7f && type != 0x7e && type != 0x7d && type != 0x7c) return false;
+        if (type != 0x7f && type != 0x7e && type != 0x7d && type != 0x7c && type != 0x70) return false;
         if (decoded) *decoded = type;
         return true;
     }
@@ -1105,6 +1105,26 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
             } else {
                 unsupported = true;
                 return fail("bulk-memory subopcode is outside the enabled subset");
+            }
+        } else if (op >= 0xd0 && op <= 0xd2) {
+            if (op == 0xd0) {
+                std::int64_t heap_type = 0;
+                if (!code.sleb(33, heap_type) || heap_type != -16) return fail("ref.null supports only funcref");
+                if (!push(0x70)) return fail("operand stack limit exceeded");
+            } else if (op == 0xd1) {
+                if (!pop(0x70) || !push(0x7f)) return fail("ref.is_null requires funcref");
+            } else {
+                if (!code.uleb(index) || index >= metadata.function_type_indices.size()) return fail("ref.func function index out of range");
+                const bool declared = std::any_of(metadata.exports.begin(), metadata.exports.end(),
+                    [index](const WasmExport &entry) {
+                        return entry.kind == WasmExternalKind::function && entry.index == index;
+                    }) || std::any_of(metadata.element_segments.begin(), metadata.element_segments.end(),
+                    [index](const WasmElementSegment &segment) {
+                        return std::find(segment.function_indices.begin(), segment.function_indices.end(), index) !=
+                               segment.function_indices.end();
+                    });
+                if (!declared) return fail("ref.func function is not declared outside a function body");
+                if (!push(0x70)) return fail("operand stack limit exceeded");
             }
         } else if (op >= 0xc0 && op <= 0xc4) {
             const std::uint8_t type = op <= 0xc1 ? std::uint8_t{0x7f} : std::uint8_t{0x7e};

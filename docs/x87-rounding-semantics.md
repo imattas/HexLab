@@ -66,12 +66,24 @@ stays below the subnormal rounding boundary even after cancellation shifts.
 Subnormal results are rounded from that unrounded extended value in one step;
 no host float or double rounding is used.
 
+`evaluate_x87_divide` applies special operand rules as well as exact finite
+quotient evaluation. Signed zero divided by finite/infinity yields signed
+zero; finite divided by infinity yields signed zero; infinity divided by
+finite/zero yields signed infinity; and nonzero finite divided by zero raises
+ZE, returning infinity only when ZE is masked. `0/0` and `infinity/infinity`
+raise IE and produce the x87 indefinite value only when IE is masked. NaNs use
+the shared x87 source-selection and signaling rules. Reverse division swaps
+both values and classifications before applying the same rules. Denormal input
+and masked or unmasked exception behavior remain explicit; stack/TOP effects
+are handled by the caller.
+
 QNaNs propagate without IE. Masked SNaNs are quieted and raise IE; x87 NaN
 source selection uses the SDM's QNaN preference and larger-significand rule.
 Masked unsupported encodings and invalid arithmetic combinations return the
 x87 floating-point indefinite QNaN. The modeled invalid arithmetic cases are
 opposite-signed infinities for addition, like-signed infinities for
-subtraction, and zero multiplied by infinity. Unmasked IE sets IE/ES/B and
+subtraction, zero multiplied by infinity, zero divided by zero, and infinity
+divided by infinity. Unmasked IE sets IE/ES/B and
 returns no destination value. Ordinary infinities and finite-plus-infinity
 results retain their architectural signs.
 

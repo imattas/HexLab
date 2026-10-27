@@ -155,9 +155,10 @@ struct X87DivideRequest {
     std::uint16_t control_word = 0x037f;
     std::uint16_t status_word = 0;
 };
-// Evaluate finite, nonzero binary80 FDIV/FDIVR operands using exact quotient
-// bits, x87 precision/rounding control, gradual underflow, and exception
-// masks. Zero, infinity, NaN, and unsupported encodings fail closed.
+// Evaluate binary80 FDIV/FDIVR finite, zero, infinity, and NaN operands using
+// exact quotient bits, x87 precision/rounding control, gradual underflow, and
+// invalid/zero-divide/denormal exception masks. Unsupported encodings fail
+// closed.
 HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
 evaluate_x87_divide(const X87DivideRequest &request) noexcept;
 

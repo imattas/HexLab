@@ -188,3 +188,5 @@ Atomic encodings and ordering behavior follow the ratified [A extension
 specification, version 2.1](https://docs.riscv.org/reference/isa/unpriv/a-st-ext.html).
 
 
+
+The integer reduction subset now includes unmasked `vredsum.vs`, `vredand.vs`, `vredor.vs`, `vredxor.vs`, `vredminu.vs`, `vredmin.vs`, `vredmaxu.vs`, and `vredmax.vs` OPMVV forms. Their scalar seed remains typed as vector-register element data, destination and configuration dependencies are retained, and masked encodings are rejected. The generic decompiler emits named reduction intrinsics. Dynamic vtype shape and register-group alignment are not checked at decode time.
