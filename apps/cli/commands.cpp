@@ -1137,6 +1137,7 @@ std::string_view string_encoding_label(StringEncoding encoding) {
     case StringEncoding::dos437: return "DOS-437";
     case StringEncoding::dos850: return "DOS-850";
     case StringEncoding::iso8859_15: return "ISO-8859-15";
+    case StringEncoding::iso8859_9: return "ISO-8859-9";
     }
     return "unknown";
 }

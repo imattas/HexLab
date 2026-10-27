@@ -10,6 +10,9 @@ The kind selector separates runtime relocation and file-inspection diagnostics
 from the general loader diagnostic queue. **Loader diagnostics** keeps the full
 diagnostic set together; the two additional choices isolate each source class
 when a binary reports many unrelated loader findings.
+The status line breaks the visible queue down into error, warning, and info
+counts, so the current filter and function scope show their severity mix at a
+glance.
 
 Select a row to navigate the linked listing, bytes and graph views. **Previous**
 and **Next** move through the visible queue and navigate to each finding's

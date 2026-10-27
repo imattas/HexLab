@@ -143,6 +143,7 @@ Search uses the effective patched bytes and current decoded operands:
 
 ```powershell
 ./hexlab_cli.exe project search code.hxproj --kind bytes --pattern '48 8B ?? A? ?F' --limit 100
+./hexlab_cli.exe project search code.hxproj --kind bytes --pattern '48 8B ?? A? ?F' --limit 100 --json
 ./hexlab_cli.exe project search code.hxproj --kind text --text HELLO --encoding utf16le
 ./hexlab_cli.exe project search code.hxproj --kind immediate --value -1 --width 64 --signed
 ```
@@ -150,5 +151,7 @@ Search uses the effective patched bytes and current decoded operands:
 Text encoding is explicit: `ascii`, `utf8` or `utf16le`. Immediate queries require width 8, 16, 32 or 64 and default to unsigned interpretation. A sign-extended 64-bit `-1` differs from an 8-bit `255` operand. Byte/text results carry canonical file offsets and attach an address only for a unique contiguous mapping. Immediate results identify the operand and preserve separate file ranges for instructions whose backing is split.
 
 A bounded search page can finish before the input ends. Pass the printed `Continuation` value back with `--cursor` and the same query/options. A changed byte/decision revision, recipe or analysis configuration rejects that continuation. `--candidate-budget` limits scan work; `--limit` limits returned hits. Reference paging uses `--offset` and `--limit`. Partial decoded facts remain explicitly partial even when their search page is exhausted.
+
+`project search --json` emits one `hexlab.project-search.v1` object. File offsets and addresses are hexadecimal strings, unavailable addresses and operands are JSON `null`, disjoint immediate backing is retained in `file_ranges`, and `next` contains the continuation token for the next bounded page. `complete` reports whether the page exhausted the query; `source_complete` independently reports whether the analyzed input facts were complete. The command retains exit code 3 for an incomplete page or source.
 
 Exit status is 0 for success, 1 for IO/unsupported/read-only/conflict errors, 2 for invalid arguments, and 3 for partial analysis or another result page. `--instruction-budget` and `--string-budget` select analysis bounds. Broader instruction sets and formats remain under development; see [instruction coverage](x64-coverage.csv) and [capabilities](capabilities.csv).

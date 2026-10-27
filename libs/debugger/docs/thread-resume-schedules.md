@@ -96,10 +96,11 @@ it accepts suppression or redelivery of the pending event owner's signal.
 Windows freezes the affected process while a debug event is pending. The backend
 enumerates all target threads with a 4,096-thread cap and requires a complete
 Toolhelp enumeration. Before acknowledging a filtered continuation, it opens
-handles for every unselected peer and acquires exactly one extra suspend count
-per peer. Failure rolls back acquired counts; failed rollback counts and handles
-remain owned for cleanup retry. It never resets or drains suspend counts owned
-by the application or another tool. Selected threads keep any independent
+handles with only `THREAD_SUSPEND_RESUME` access for every unselected peer and
+acquires exactly one extra suspend count per peer. It does not request thread
+query rights for this operation. Failure rolls back acquired counts; failed
+rollback counts and handles remain owned for cleanup retry. It never resets or
+drains suspend counts owned by the application or another tool. Selected threads keep any independent
 application-owned suspension, so acceptance does not promise they will execute.
 
 `ContinueDebugEvent` releases the pending debug stop while unselected peers stay

@@ -539,6 +539,20 @@ struct PeVersionInfo {
     bool string_tables_complete = true;
     bool operator==(const PeVersionInfo &) const = default;
 };
+struct PeManifestAssemblyIdentity {
+    std::optional<std::string> type, name, version, processor_architecture, public_key_token, language;
+    PeRecordSource source;
+    bool operator==(const PeManifestAssemblyIdentity &) const = default;
+};
+struct PeManifestInfo {
+    std::optional<PeManifestAssemblyIdentity> application_identity;
+    std::vector<PeManifestAssemblyIdentity> dependencies;
+    std::optional<std::string> requested_execution_level;
+    std::optional<bool> ui_access;
+    PeRecordSource source;
+    bool complete = true;
+    bool operator==(const PeManifestInfo &) const = default;
+};
 struct PeResource {
     PeResourceIdentifier type, name, language;
     std::uint32_t data_rva = 0, size = 0, code_page = 0;
@@ -546,6 +560,8 @@ struct PeResource {
     std::vector<PeSourceSpan> payload;
     // Decoded only for canonical RT_VERSION / VS_VERSION_INFO payloads.
     std::optional<PeVersionInfo> version_info;
+    // Decoded bounded application identity and UAC request from RT_MANIFEST.
+    std::optional<PeManifestInfo> manifest_info;
     bool operator==(const PeResource &) const = default;
 };
 struct PeCodeViewIdentity {

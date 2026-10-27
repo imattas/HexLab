@@ -106,8 +106,15 @@ struct Calculator {
         case Kind::structure: {
             if (!type.size())
                 return unsupported("incomplete structure has no object layout");
-            if (type.members().empty())
-                return unsupported("empty structures have ABI-specific layout and are unsupported");
+            if (type.members().empty()) {
+                // With no members there is no placement to recompute. Preserve
+                // the complete extent/alignment recorded by the source type
+                // producer (for example DWARF or CodeView) rather than
+                // guessing an ABI-specific empty-class rule.
+                result.size = *type.size();
+                result.alignment = type.alignment();
+                return result;
+            }
             std::uint64_t cursor = 0;
             std::uint64_t aggregate_alignment = 1;
             const auto aggregate_cap = type.packing_alignment()

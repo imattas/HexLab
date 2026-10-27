@@ -70,7 +70,7 @@ std::string utf8(const wxString &value) {
     return {encoded.data(), encoded.length()};
 }
 wxString kind_name(ExchangeRecordKind kind) {
-    switch (kind) { case ExchangeRecordKind::annotation:return "Annotations"; case ExchangeRecordKind::bookmark:return "Bookmarks"; case ExchangeRecordKind::reference:return "References"; case ExchangeRecordKind::region:return "Code/data regions"; case ExchangeRecordKind::function:return "Functions"; case ExchangeRecordKind::type_definition:return "Type definitions"; case ExchangeRecordKind::type_assignment:return "Type assignments"; case ExchangeRecordKind::debug_variable:return "Debug variables"; }
+    switch (kind) { case ExchangeRecordKind::annotation:return "Annotations"; case ExchangeRecordKind::bookmark:return "Bookmarks"; case ExchangeRecordKind::reference:return "References"; case ExchangeRecordKind::region:return "Code/data regions"; case ExchangeRecordKind::function:return "Functions"; case ExchangeRecordKind::type_definition:return "Type definitions"; case ExchangeRecordKind::type_assignment:return "Type assignments"; case ExchangeRecordKind::debug_variable:return "Debug variables"; case ExchangeRecordKind::project_breakpoint:return "Project breakpoints"; }
     return "Records";
 }
 Result<std::vector<std::byte>> read_exchange(const std::filesystem::path& path) {
@@ -85,8 +85,8 @@ Result<bool> write_exchange(const ProjectSnapshot& project,const std::filesystem
     output.write(reinterpret_cast<const char*>(bytes.value().data()),static_cast<std::streamsize>(bytes.value().size()));if(!output)return Error{ErrorCode::io,"Cannot write complete exchange file"};return true;
 }
 wxString import_summary(const ExchangeImport& plan) {
-    wxString result=wxString::Format("Ready to import %zu annotations, %zu bookmarks, %zu references, %zu regions, %zu functions, %zu type definitions, %zu type assignments, and %zu debug variables.\nSkipped identical records: %zu.\n\n",
-      plan.annotations,plan.bookmarks,plan.references,plan.regions,plan.functions,plan.type_definitions,plan.type_assignments,plan.debug_variables,plan.skipped);
+    wxString result=wxString::Format("Ready to import %zu annotations, %zu bookmarks, %zu references, %zu regions, %zu functions, %zu type definitions, %zu type assignments, %zu debug variables, and %zu project breakpoints.\nSkipped identical records: %zu.\n\n",
+      plan.annotations,plan.bookmarks,plan.references,plan.regions,plan.functions,plan.type_definitions,plan.type_assignments,plan.debug_variables,plan.project_breakpoints,plan.skipped);
     if(plan.conflicts.empty())return result+"No conflicts.";
     result+=wxString::Format("Conflicts: %zu\n",plan.conflicts.size());std::map<std::pair<int,int>,std::size_t> counts;
     for(auto& conflict:plan.conflicts)counts[{static_cast<int>(conflict.kind),static_cast<int>(conflict.resolution)}]++;

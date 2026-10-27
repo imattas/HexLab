@@ -391,6 +391,19 @@ std::optional<std::uint32_t> decode_iso8859_15(unsigned byte) {
         0x00f8,0x00f9,0x00fa,0x00fb,0x00fc,0x00fd,0x00fe,0x00ff};
     return decode_high_byte_table(byte, high);
 }
+std::optional<std::uint32_t> decode_iso8859_9(unsigned byte) {
+    // ISO/IEC 8859-9 is Latin-1 with six Turkish-letter replacements.
+    // C1 bytes map to controls and are split by printable().
+    switch (byte) {
+    case 0xd0: return 0x011e; // capital G with breve
+    case 0xdd: return 0x0130; // capital I with dot above
+    case 0xde: return 0x015e; // capital S with cedilla
+    case 0xf0: return 0x011f; // small g with breve
+    case 0xfd: return 0x0131; // small dotless i
+    case 0xfe: return 0x015f; // small s with cedilla
+    default: return byte;
+    }
+}
 }
 namespace {
 Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& options,
@@ -580,6 +593,7 @@ Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& optio
             scan_single_byte(StringEncoding::dos437, decode_dos437);
             scan_single_byte(StringEncoding::dos850, decode_dos850);
             scan_single_byte(StringEncoding::iso8859_15, decode_iso8859_15);
+            scan_single_byte(StringEncoding::iso8859_9, decode_iso8859_9);
         }
     } catch(const BudgetEnd&) {
         output.complete=false;output.diagnostics.push_back({DiagnosticSeverity::warning,"String record budget reached",{}});

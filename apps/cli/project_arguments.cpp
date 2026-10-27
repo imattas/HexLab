@@ -548,6 +548,7 @@ Arguments parse(std::span<const std::wstring_view> args) {
         auto fingerprint = take(search_query_fingerprint(*result.query));
         result.search_limits.max_results = std::size_t(options.count(L"--limit", 256));
         result.search_limits.max_candidates = options.count(L"--candidate-budget", 1048576);
+        result.search_json = options.flag(L"--json");
         if (options.contains(L"--cursor")) {
             result.cursor = parse_cursor(options.pop(L"--cursor"));
             require(result.cursor->query_fingerprint == fingerprint, "Continuation belongs to another query");

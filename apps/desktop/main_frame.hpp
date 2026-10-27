@@ -22,6 +22,8 @@ enum Command {
     browse_navigation_history_id,
     previous_marker_id,
     next_marker_id,
+    previous_function_id,
+    next_function_id,
     copy_address_id,
     copy_bytes_id,
     copy_text_id,

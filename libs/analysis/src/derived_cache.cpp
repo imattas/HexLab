@@ -523,7 +523,7 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
     auto records = in.count(31);
     for (size_t i = 0; i < records; ++i) {
         auto kind = in.number(1);
-        require(kind <= static_cast<unsigned>(StringEncoding::iso8859_15), "Unknown cached string encoding");
+        require(kind <= static_cast<unsigned>(StringEncoding::iso8859_9), "Unknown cached string encoding");
         StringRecord record{};
         record.encoding = static_cast<StringEncoding>(kind);
         record.preview = in.text(1024);

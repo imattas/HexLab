@@ -486,7 +486,9 @@ enum class Opcode {
     // MIPS64 pre-Release 6 SPECIAL2 word multiply-accumulate operations.
     mips64_madd, mips64_maddu, mips64_msub, mips64_msubu,
     // Scalar Zfa quiet comparisons; appended to preserve serialized IDs.
-    rv_fleq_s, rv_fltq_s, rv_fleq_d, rv_fltq_d
+    rv_fleq_s, rv_fltq_s, rv_fleq_d, rv_fltq_d,
+    // MIPS64 SPECIAL2 word multiply-to-GPR form; append for stable IDs.
+    mips64_mul
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

@@ -329,6 +329,7 @@ wxString string_encoding_name(StringEncoding encoding) {
     case StringEncoding::dos437: return "DOS-437";
     case StringEncoding::dos850: return "DOS-850";
     case StringEncoding::iso8859_15: return "ISO-8859-15";
+    case StringEncoding::iso8859_9: return "ISO-8859-9";
     }
     return "Unknown";
 }
@@ -2786,6 +2787,36 @@ struct MainFrame::Impl {
         else
             log(next ? "No next annotation or bookmark" : "No previous annotation or bookmark");
     }
+    std::optional<Address> selected_virtual_address() {
+        if (!shown || !shown->image) return {};
+        auto location = action_location();
+        if (!location) return {};
+        if (const auto *address = std::get_if<Address>(&*location)) return *address;
+        auto mapped = shown->image->to_address(std::get<FileOffset>(*location));
+        return mapped ? std::optional<Address>(mapped.value()) : std::nullopt;
+    }
+    std::optional<Address> adjacent_function(Address current, bool next) const {
+        if (!shown || !shown->project || !shown->project->functions) return {};
+        std::optional<Address> destination;
+        for (const auto &function : shown->project->functions->functions) {
+            if (!function || function->entry.space != current.space) continue;
+            const auto candidate = function->entry;
+            if (next) {
+                if (candidate.offset <= current.offset ||
+                    (destination && destination->offset <= candidate.offset)) continue;
+            } else if (candidate.offset >= current.offset ||
+                       (destination && destination->offset >= candidate.offset)) continue;
+            destination = candidate;
+        }
+        return destination;
+    }
+    void navigate_function(bool next) {
+        const auto current = selected_virtual_address();
+        const auto destination = current ? adjacent_function(*current, next) : std::nullopt;
+        if (destination) frame.Navigate(Location{*destination});
+        else log(next ? "No next recovered function in this address space"
+                      : "No previous recovered function in this address space");
+    }
     void update_navigation(wxUpdateUIEvent &event) {
         bool enabled = false;
         wxString reason = "Open a document first";
@@ -2824,6 +2855,20 @@ struct MainFrame::Impl {
                 const bool next = event.GetId() == next_marker_id;
                 enabled = adjacent_marker(marker_locations(), state().selection(), next).has_value();
                 reason = next ? "No next annotation or bookmark" : "No previous annotation or bookmark";
+                break;
+            }
+            case previous_function_id:
+            case next_function_id: {
+                const auto current = selected_virtual_address();
+                const bool next = event.GetId() == next_function_id;
+                const auto project = document->project;
+                enabled = current && project && project->functions &&
+                          (project->status == DerivedStatus::fresh ||
+                           project->status == DerivedStatus::incomplete) &&
+                          adjacent_function(*current, next).has_value();
+                reason = current ? (next ? "No next recovered function in this address space"
+                                         : "No previous recovered function in this address space")
+                                 : "Select a mapped virtual address first";
                 break;
             }
             case copy_address_id:
@@ -2929,6 +2974,8 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     nav->Append(browse_navigation_history_id, "Browse History...");
     nav->Append(previous_marker_id, "Previous Annotation / Bookmark\tAlt+Up");
     nav->Append(next_marker_id, "Next Annotation / Bookmark\tAlt+Down");
+    nav->Append(previous_function_id, "Previous Function\tCtrl+Alt+Up");
+    nav->Append(next_function_id, "Next Function\tCtrl+Alt+Down");
     nav->Append(next_page_id, "Next Listing Page\tCtrl+Down");
     menus->Append(nav, "&Navigate");
     auto *edit = new wxMenu;
@@ -4186,6 +4233,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     const int navigation_ids[] = {
         wxID_OPEN, open_raw_id, open_project_id, analysis_options_id, wxID_CLOSE,    cancel_id,    jump_id,
         follow_id, back_id,     forward_id,      browse_navigation_history_id, previous_marker_id, next_marker_id,
+        previous_function_id, next_function_id,
         copy_address_id, copy_bytes_id, copy_text_id, next_page_id, incoming_references_id, outgoing_references_id};
     for (int id : navigation_ids)
         Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent &event) { impl_->update_navigation(event); }, id);
@@ -4215,6 +4263,8 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     Bind(wxEVT_MENU, [this](wxCommandEvent &event) {
         impl_->navigate_marker(event.GetId() == next_marker_id);
     }, next_marker_id);
+    Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->navigate_function(false); }, previous_function_id);
+    Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->navigate_function(true); }, next_function_id);
     Bind(
         wxEVT_MENU,
         [this](wxCommandEvent &) {

@@ -5814,7 +5814,9 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
                  decoded.opcode == Opcode::mips64_teq || decoded.opcode == Opcode::mips64_tne ||
                  decoded.opcode == Opcode::mips64_tgei || decoded.opcode == Opcode::mips64_tgeiu ||
                  decoded.opcode == Opcode::mips64_tlti || decoded.opcode == Opcode::mips64_tltiu ||
-                 decoded.opcode == Opcode::mips64_teqi || decoded.opcode == Opcode::mips64_tnei)) {
+                 decoded.opcode == Opcode::mips64_teqi || decoded.opcode == Opcode::mips64_tnei ||
+                 decoded.opcode == Opcode::mips64_dadd || decoded.opcode == Opcode::mips64_daddi ||
+                 decoded.opcode == Opcode::mips64_dsub)) {
                 if (const auto *trap = std::get_if<Intrinsic>(&statement);
                     trap && !trap->operands.empty() &&
                     trap->name.find("_conditional_trap") != std::string::npos) {

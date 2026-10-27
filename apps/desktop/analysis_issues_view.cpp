@@ -756,6 +756,18 @@ void AnalysisIssuesView::render() {
                                            static_cast<unsigned long long>(visible_rows_.size()));
         if (visible_rows_.size() != rows_.size())
             status += wxString::Format(" of %llu", static_cast<unsigned long long>(rows_.size()));
+        std::size_t errors = 0, warnings = 0, info = 0;
+        for (const auto index : visible_rows_) {
+            switch (rows_[index].severity) {
+            case DiagnosticSeverity::error: ++errors; break;
+            case DiagnosticSeverity::warning: ++warnings; break;
+            case DiagnosticSeverity::info: ++info; break;
+            }
+        }
+        status += wxString::Format("; %llu errors, %llu warnings, %llu info",
+                                   static_cast<unsigned long long>(errors),
+                                   static_cast<unsigned long long>(warnings),
+                                   static_cast<unsigned long long>(info));
         if (scope_entry_) status += "; pinned function scope";
         if (capped_)
             status += "; view bounded to 20,000 findings (at most 2,048 each from loader, runtime relocation, type import, and decompiler) and 100,000 functions";

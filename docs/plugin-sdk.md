@@ -540,6 +540,10 @@ if (active.query(document) == HEXLAB_ACTIVE_DOCUMENT_OK) {
 
 The host may return `HEXLAB_ACTIVE_DOCUMENT_STALE` if the active document or its project revisions changed between query and use.
 
+The standalone [`active-document-cpp` example](../examples/plugins/active-document-cpp/README.md)
+demonstrates an action that reads a bounded prefix from the active effective
+file view and handles stale tokens.
+
 ## Active debugger session (ABI 1.17)
 
 ABI 1.17 appends `active_debugger_api` to `HexLabHostApi`; older host-table prefixes are unchanged. `ActiveDebuggerClient` in `sdk.hpp` is a non-owning wrapper. Its `query` returns the desktop debugger state, optional process identity, and a value-only token combining a unique session ID, session/stop generations, and the active document token. A token becomes stale when the target resumes, a debugger session is replaced, or the active document changes or reopens. Query again after any stale response.

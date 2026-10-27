@@ -2613,7 +2613,7 @@ private:
                 if (std::find(selected.begin(), selected.end(), static_cast<ThreadId>(entry.th32ThreadID)) != selected.end())
                     found_selected.push_back(entry.th32ThreadID);
                 else {
-                    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+                    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID);
                     if (!thread) { failure = win_error("OpenThread for thread resume"); failed = true; break; }
                     candidates.push_back(thread);
                 }

@@ -10,6 +10,13 @@ Clear **Pin context** to resume following the current workspace selection. Pin s
 
 Pinning retains a location, not an obsolete analysis snapshot. Project updates refresh the query from the current immutable reference index. Pending or unavailable analysis clears the navigable rows, and the pane reports the analysis state. If a refreshed page is now empty, browsing returns to its first page; a selected reference is restored only when its identity still exists on that page. Queries remain bounded to 256 rows and use the existing indexed snapshot service; the new actions perform no decoding, file loading, or analysis on the GUI thread.
 
+Use **Filter page** to narrow the currently displayed reference page by a
+case-insensitive substring. It searches all visible row fields, including
+source, target, kind, evidence, association, and endpoint context. The status
+line reports the number of matches on the page and the total query count.
+Filtering does not alter the underlying query or page offset; use Previous or
+Next to inspect other pages.
+
 ELF references derived from a validated primary vtable slot are labeled **ELF vtable slot**. Only slots with one validated executable target produce these address references; unresolved, ambiguous, null, and non-executable slots remain absent.
 
 Validation for this increment is limited to source-only MSVC compilation. No tests, linking, or GUI interaction were performed; keyboard delivery, native menu layout, and runtime multi-document browsing still require later interactive verification.

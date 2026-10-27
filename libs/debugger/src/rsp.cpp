@@ -1056,6 +1056,20 @@ Result<std::vector<std::byte>> Client::read_memory(std::uint64_t address, std::s
     if (bytes.value().size() != size) return Error{ErrorCode::malformed, "RSP memory reply has unexpected length"};
     return bytes;
 }
+Result<std::uint32_t> Client::memory_crc32(std::uint64_t address, std::uint64_t length, std::stop_token stop) {
+    if (length == 0 || address > UINT64_MAX - length)
+        return Error{ErrorCode::invalid_argument, "RSP CRC range is empty or overflows the address space"};
+    auto response = transact("qCRC:" + hex_u64(address) + "," + hex_u64(length), stop);
+    if (!response) return response.error();
+    if (response.value().empty())
+        return Error{ErrorCode::unsupported, "remote does not support qCRC"};
+    if (response.value().front() != 'C' || response.value().size() < 2 || response.value().size() > 9)
+        return Error{ErrorCode::malformed, "invalid RSP qCRC reply"};
+    std::uint32_t crc = 0;
+    if (!parse_hex(std::string_view(response.value()).substr(1), crc))
+        return Error{ErrorCode::malformed, "invalid hexadecimal RSP qCRC value"};
+    return crc;
+}
 Status Client::set_breakpoint(std::uint64_t address, BreakpointType type, std::uint8_t size, bool insert, std::stop_token stop) {
     if (size == 0 || address > UINT64_MAX - (static_cast<std::uint64_t>(size) - 1))
         return Error{ErrorCode::invalid_argument, "RSP breakpoint range is empty or overflows the address space"};
