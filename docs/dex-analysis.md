@@ -206,3 +206,13 @@ remain unresolved; no dequickening, inline-method expansion, runtime-version
 selection, or optimized-container validation is performed. Standard DEX
 `invoke-polymorphic` and `invoke-custom` opcodes at `0xfa`–`0xfd` keep their
 standard interpretation.
+
+# Optimized object initializer invoke
+
+The legacy optimized DEX opcode `invoke-object-init/range` (`0xf0`) is decoded
+using its encoded 35c register-list form. It retains the method index and
+argument-word reads, has a three-code-unit width, and is classified as a
+call with conservative memory read/write effects. As with other optimized
+opcodes, this is for optimized/odex bytecode; ordinary DEX files should not
+contain it. Register-list sizes above five are rejected and register IDs above
+v255 remain unsupported by the shared typed operand model.

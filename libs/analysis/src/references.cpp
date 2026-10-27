@@ -2316,22 +2316,53 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
                 const auto *dst = riscv_register(instruction, 0);
                 const auto *lhs = riscv_register(instruction, 1);
                 const auto *rhs = instruction.opcode == Opcode::rv_slli_uw ? nullptr : riscv_register(instruction, 2);
-                std::optional<Address> target;
+                std::optional<RiscvAddressValue> left;
+                std::optional<RiscvAddressValue> right;
                 std::optional<RiscvAddressValue> definition;
-                // Address facts track mapped pointers, not arbitrary integer
-                // indices. Propagate only the exact zero-index form where the
-                // shifted operand is architectural x0 and rs2 is a known base.
-                if (lhs && !lhs->index && lhs->width == width && rhs && rhs->index && rhs->width == width) {
-                    if (const auto base = registers.find(rhs->index); base != registers.end() &&
-                        base->second.address.space == instruction.address.space &&
-                        riscv_target_segment(*image, base->second.address, OperandAccess::address)) {
-                        target = base->second.address;
-                        definition = riscv_definition(*target, fact->id, &base->second);
+                const bool word_unsigned = instruction.opcode == Opcode::rv_add_uw ||
+                    instruction.opcode == Opcode::rv_sh1add_uw || instruction.opcode == Opcode::rv_sh2add_uw ||
+                    instruction.opcode == Opcode::rv_sh3add_uw || instruction.opcode == Opcode::rv_slli_uw;
+                const bool immediate_shift = instruction.opcode == Opcode::rv_slli_uw;
+                const auto shift = immediate_shift ? riscv_unsigned_immediate(instruction, 2, 6)
+                    : std::optional<std::uint64_t>{instruction.opcode == Opcode::rv_sh1add ||
+                        instruction.opcode == Opcode::rv_sh1add_uw ? 1u :
+                        instruction.opcode == Opcode::rv_sh2add || instruction.opcode == Opcode::rv_sh2add_uw ? 2u :
+                        instruction.opcode == Opcode::rv_sh3add || instruction.opcode == Opcode::rv_sh3add_uw ? 3u : 0u};
+                const auto value_for = [&](const RegisterOperand *reg) -> std::optional<RiscvAddressValue> {
+                    if (!reg || reg->bank != RegisterBank::riscv_gpr || reg->width != width) return std::nullopt;
+                    if (!reg->index) return RiscvAddressValue{Address{instruction.address.space, 0}};
+                    const auto found = registers.find(reg->index);
+                    if (found == registers.end() || found->second.address.space != instruction.address.space)
+                        return std::nullopt;
+                    return found->second;
+                };
+                if (lhs && lhs->width == width && dst && dst->index && dst->width == width && shift) {
+                    left = value_for(lhs);
+                    if (!immediate_shift) right = value_for(rhs);
+                    if (left && (immediate_shift || right) && (!word_unsigned || width == 64)) {
+                        const auto mask = width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
+                        const auto shifted_input = word_unsigned
+                            ? static_cast<std::uint64_t>(static_cast<std::uint32_t>(left->address.offset))
+                            : left->address.offset & mask;
+                        const auto shifted = (shifted_input << *shift) & mask;
+                        std::uint64_t value = shifted;
+                        if (right) value = (value + (right->address.offset & mask)) & mask;
+                        const Address target{instruction.address.space, value};
+                        if (right) definition = riscv_binary_definition(target, fact->id, *left, *right);
+                        else definition = riscv_definition(target, fact->id, &*left);
                     }
                 }
                 erase_written();
-                if (dst && dst->index && dst->width == width && target && definition)
+                if (dst && dst->index && dst->width == width && definition) {
                     registers[dst->index] = std::move(*definition);
+                    const auto &target = registers[dst->index].address;
+                    if (riscv_target_segment(*image, target, OperandAccess::address)) {
+                        result.immediate_targets[{fact->id, 2}] = target;
+                        auto result_value = registers[dst->index];
+                        result_value.tails.clear();
+                        record_producers({fact->id, 2}, fact->id, result_value);
+                    }
+                }
                 propagated = true;
             }
 

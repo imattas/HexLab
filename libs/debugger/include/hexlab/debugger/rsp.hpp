@@ -86,6 +86,11 @@ public:
     Result<std::vector<std::uint64_t>> enumerate_threads(std::stop_token = {});
     // Returns validated wire IDs without dropping the process component of pPID.TID.
     Result<std::vector<std::string>> enumerate_thread_ids(std::stop_token = {});
+    // Reads the optional qThreadExtraInfo description for one concrete thread.
+    // Empty response means the remote does not provide extra thread info.
+    Result<std::optional<std::string>> read_thread_extra_info(std::string_view thread_id,
+        std::size_t limit = 4096, std::chrono::milliseconds timeout = std::chrono::seconds(3),
+        std::stop_token = {});
     Result<std::vector<std::byte>> read_registers(std::stop_token = {});
     // Reads a bounded qXfer:features:read annex. Empty response means unsupported.
     Result<std::optional<std::string>> read_feature_annex(std::string_view annex = "target.xml",
