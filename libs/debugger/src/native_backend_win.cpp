@@ -990,8 +990,10 @@ public:
             return Error{ErrorCode::unsupported, "Windows schedules support one event-thread step or a continue-only thread subset"};
         if (steps)
             return single_step_event(sequence, ContinueStatus::handled);
-        if (owner_action->kind != ThreadResumeKind::continue_execution)
-            return Error{ErrorCode::unsupported, "Windows continue schedules must resume the pending event owner"};
+        // ContinueDebugEvent always releases the event-owning thread. When its
+        // requested action is stop, continue_selected_threads acquires our
+        // suspend count for that owner (along with every omitted peer) before
+        // acknowledging the event, so the selected peers can run alone.
         return continue_selected_threads(sequence, runnable, ContinueStatus::handled);
     }
 

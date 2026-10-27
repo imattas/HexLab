@@ -52,7 +52,7 @@ retain the owned event, with no retry as an unfiltered continuation.
 | --- | --- | --- |
 | Linux x86/x64 | One selected thread continues or steps; multiple selected threads may continue while others stay stopped. One schedule may single-step the pending event owner while other selected threads continue, or step one non-owner while the event owner remains stopped and other peers continue. | Every traced thread must be stopped. Deferred-event owners cannot be rescheduled. A pending software-breakpoint step-over limits runnable selection; multi-thread schedules through that breakpoint are rejected. Mixed schedules support at most one step; multiple steps remain unsupported. |
 | Linux AArch64 | One selected thread continues or steps; a multi-thread schedule may combine one single-step action with any number of continue actions. The event owner can remain stopped when another thread runs. A scheduled action may preserve/redeliver its queued signal by default or suppress it with `signal_disposition = handled`; `not_handled` explicitly requests redelivery. | Every traced thread must be stopped. At most one single-step may be outstanding; a later schedule cannot resume that step thread or issue another step until its event is collected. Pending software/hardware execute-breakpoint step-over still limits the schedule to one runnable thread. |
-| Windows | The event thread steps alone, or a continue-only subset including the event owner runs. Unselected peers retain one debugger-owned suspend count. | Foreign-thread steps, a held event owner with other runnable threads, mixed step/continue, multiple steps and an active displaced software-breakpoint step reject. ARM32 stepping remains unsupported. A Windows ARM64 execute-breakpoint step-over cannot run a multi-thread subset. |
+| Windows | The event thread steps alone, or a continue-only subset runs while all other threads stay suspended. The event owner may be explicitly stopped while selected peers continue; unselected threads retain one debugger-owned suspend count. | Foreign-thread steps, mixed step/continue, multiple steps and an active displaced software-breakpoint step reject. ARM32 stepping remains unsupported. A Windows ARM64 execute-breakpoint step-over cannot run a multi-thread subset. |
 | Darwin | One exact continue or step action for a target proven to contain one thread. | Process-wide ptrace cannot implement multithread schedules; the existing Mach-thread census and stop-identity restrictions remain conservative. |
 
 The Linux x86-64 mixed schedule issues peer continuations first, the pending
@@ -103,11 +103,13 @@ by the application or another tool. Selected threads keep any independent
 application-owned suspension, so acceptance does not promise they will execute.
 
 `ContinueDebugEvent` releases the pending debug stop while unselected peers stay
-held. At the next debug event, the process is frozen again before the owned
-counts are released. Global continue, detach, termination and handle cleanup use
-the same ownership bookkeeping. Per-thread run snapshots report held peers as
-stopped; outside a pending event they leave other threads unknown rather than
-guessing about unrelated suspend counts. These mechanics use the documented
+held. If the event owner is explicitly stopped, its debugger-owned suspend count
+is acquired before `ContinueDebugEvent`, so it remains held alongside omitted
+threads while selected peers run. At the next debug event, the process is frozen
+again before the owned counts are released. Global continue, detach, termination
+and handle cleanup use the same ownership bookkeeping. Per-thread run snapshots
+report held peers as stopped; outside a pending event they leave other threads
+unknown rather than guessing about unrelated suspend counts. These mechanics use the documented
 [Windows debugging-event suspension rules](https://learn.microsoft.com/windows/win32/debug/debugging-events)
 and [ContinueDebugEvent](https://learn.microsoft.com/windows/win32/api/debugapi/nf-debugapi-continuedebugevent).
 
