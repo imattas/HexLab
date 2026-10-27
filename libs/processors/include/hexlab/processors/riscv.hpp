@@ -98,7 +98,9 @@ enum class RiscvOpcode {
     // Zfa minimum/maximum-number variants.
     fminm_s, fmaxm_s, fminm_d, fmaxm_d,
     // Quiet scalar comparisons; appended to preserve decoder IDs.
-    fleq_s, fltq_s, fleq_d, fltq_d
+    fleq_s, fltq_s, fleq_d, fltq_d,
+    // Zifencei instruction-cache synchronization, appended for stable IDs.
+    fence_i
 };
 
 struct RiscvRegister {

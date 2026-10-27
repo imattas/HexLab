@@ -490,7 +490,9 @@ enum class Opcode {
     // MIPS64 SPECIAL2 word multiply-to-GPR form; append for stable IDs.
     mips64_mul,
     // NMOS 6502 undocumented AND-immediate aliases; appended for stable IDs.
-    m6502_anc
+    m6502_anc,
+    // RISC-V Zifencei instruction-cache synchronization.
+    rv_fence_i
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

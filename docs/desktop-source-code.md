@@ -31,6 +31,11 @@ content. The debug format does not always provide an exact end address for a
 line, so address selection uses the nearest preceding source row in the same
 address space; this is a best-effort mapping for optimized code and gaps.
 
+Source text with a UTF-8 BOM is displayed without the marker. UTF-16LE and
+UTF-16BE files are decoded when they have the matching byte-order mark; invalid
+surrogate pairs and odd-length UTF-16 files are reported as unavailable. Files
+without a BOM are treated as UTF-8.
+
 When a source line has several distinct machine addresses, **Previous address**
 and **Next address** move through those mappings in address order. The selected
 address stays synchronized with disassembly, bytes, pseudocode, and the graph.

@@ -1984,11 +1984,9 @@ public:
     Result<Breakpoint> add_hardware_breakpoint(std::uint64_t address, BreakpointKind kind, std::uint8_t size) override {
         if (!process_) return Error{ErrorCode::invalid_argument, "no debug target is attached"};
         const auto architecture = target_architecture();
-        if (architecture == Architecture::arm)
-            return Error{ErrorCode::unsupported, "Windows ARM32 hardware breakpoint ownership and hit attribution are not implemented"};
         if (architecture != Architecture::x86 && architecture != Architecture::x86_64 &&
-            architecture != Architecture::arm64)
-            return Error{ErrorCode::unsupported, "hardware breakpoints require a supported x86, x64, or ARM64 target context"};
+            architecture != Architecture::arm && architecture != Architecture::arm64)
+            return Error{ErrorCode::unsupported, "hardware breakpoints require a supported x86, x64, ARM32, or ARM64 target context"};
         if (architecture == Architecture::arm64) {
 #if !defined(_M_ARM64)
             return Error{ErrorCode::unsupported, "this debugger build cannot access Windows ARM64 debug registers; rebuild for ARM64"};

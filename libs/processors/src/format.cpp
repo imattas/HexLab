@@ -603,6 +603,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         return csr_names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_csrrw)];
     }
     if (op == Opcode::rv_fcvtmod_w_d) return "fcvtmod.w.d";
+    if (op == Opcode::rv_fence_i) return "fence.i";
     if (op == Opcode::rv_fli_s) return "fli.s";
     if (op == Opcode::rv_fli_d) return "fli.d";
     if (op == Opcode::rv_fround_s) return "fround.s";

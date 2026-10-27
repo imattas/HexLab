@@ -30,9 +30,11 @@ For a rotating set, pass a stable base filename. HexLab creates timestamped
 siblings such as `sample.backup-017...-<random-token>.hxproj`; the base file
 itself is not overwritten. Listing validates candidates against the open
 project UUID. Pruning retains the newest requested count and removes only
-validated siblings for that UUID. Scans are bounded to 8,192 directory entries,
-64 candidates, and 1 GiB of candidate bytes; an incomplete scan performs no
-pruning and reports incomplete retention.
+siblings for that UUID whose schema, embedded input, patches, and complete
+forward/inverse history audit validate. Scans are bounded to 8,192 directory
+entries, 64 candidates, 1 GiB of candidate bytes, 65,536 history entries, and
+512 MiB of history payload across the scan. An incomplete scan or history audit
+performs no pruning and reports incomplete retention.
 
 ```text
 hexlab_cli project backup rotate sample.hxproj --base backups/sample.hxproj --retain 8
@@ -40,10 +42,12 @@ hexlab_cli project backup list sample.hxproj --base backups/sample.hxproj --json
 hexlab_cli project backup prune sample.hxproj --base backups/sample.hxproj --retain 8
 ```
 
-Rotation publishes and validates the new backup before pruning older entries.
-If candidate validation, directory scanning, or deletion is incomplete, extra
-backups may remain and the command returns exit code 3. Listing returns exit 3
-when the bounded scan is incomplete.
+Rotation publishes the new backup, fully validates the bounded candidate set,
+then prunes older entries. This keeps the just-created generation even when
+its timestamp ties an existing generation. If candidate validation, directory
+scanning, or deletion is incomplete, extra backups may remain and the command
+returns exit code 3. Listing returns exit 3 when the bounded scan or history
+audit is incomplete.
 
 Restore into an existing project in place with:
 

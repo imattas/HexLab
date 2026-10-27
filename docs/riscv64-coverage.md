@@ -19,7 +19,9 @@ without a decoder mode rather than decoded as fixed-width code.
 HexLab includes a bounded, static decoder for RV64I base integer ISA (version
 2.1), integer multiplication/division extension M (version 2.0), atomic
 extension A (version 2.1), and the integer RV64C subset (version 2.0). The
-decoder accepts mixed 16-bit and
+Zifencei `FENCE.I` instruction is also decoded and formatted when its canonical
+encoding is present; it has no explicit operands in the current instruction
+model. The decoder accepts mixed 16-bit and
 32-bit instruction encodings in RV64IC mode and models
 register, immediate, base-plus-displacement memory, and PC-relative operands.
 It records register reads and writes, memory direction, and control-flow class

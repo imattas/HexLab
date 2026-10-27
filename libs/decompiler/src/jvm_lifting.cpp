@@ -77,7 +77,12 @@ Result<DynamicCallSite> cp_dynamic_call_site(const JvmMetadata &metadata, std::u
     if (!descriptor) return descriptor.error();
     return DynamicCallSite{std::move(name.value()), std::move(descriptor.value()), dynamic.first};
 }
-std::optional<std::string> string_concat_recipe(const JvmMetadata &metadata,const DynamicCallSite &site) {
+struct StringConcatRecipe {
+    std::string escaped;
+    std::size_t dynamic_markers = 0;
+    std::size_t constant_markers = 0;
+};
+std::optional<StringConcatRecipe> string_concat_recipe(const JvmMetadata &metadata,const DynamicCallSite &site) {
     if(!metadata.bootstrap_methods||site.bootstrap_index>=metadata.bootstrap_methods->size())return{};
     const auto &bootstrap=(*metadata.bootstrap_methods)[site.bootstrap_index];
     const auto handle_index=bootstrap.method_handle_index;
@@ -99,14 +104,23 @@ std::optional<std::string> string_concat_recipe(const JvmMetadata &metadata,cons
     auto recipe=cp_utf8(metadata,constant.first);if(!recipe)return{};
     // Escape for a stable, single-line symbolic intrinsic name; \\u0001 and \\u0002
     // retain the JVM recipe's dynamic-argument and bootstrap-constant markers.
-    std::string encoded;encoded.reserve(recipe.value().size());
+    StringConcatRecipe result;
+    // Count the actual control-byte markers before escaping. Counting their
+    // textual spellings after escaping would mistake a literal "\\x01" or
+    // "\\x02" in the recipe for a JVM marker.
+    for (const unsigned char c : recipe.value()) {
+        if (c == 0x01) ++result.dynamic_markers;
+        else if (c == 0x02) ++result.constant_markers;
+    }
+    auto &encoded = result.escaped;
+    encoded.reserve(recipe.value().size());
     for(unsigned char c:recipe.value()){
         if(c=='\\')encoded+="\\\\";else if(c=='\"')encoded+="\\\"";
         else if(c=='\n')encoded+="\\n";else if(c=='\r')encoded+="\\r";else if(c=='\t')encoded+="\\t";
         else if(c<0x20){constexpr char hex[]="0123456789abcdef";encoded+="\\x";encoded+=hex[c>>4];encoded+=hex[c&15];}
         else encoded+=static_cast<char>(c);
     }
-    return encoded;
+    return result;
 }
 std::optional<std::string> string_concat_bootstrap_constants(
     const JvmMetadata &metadata, const JvmBootstrapMethod &bootstrap) {
@@ -893,11 +907,10 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                     call.name+=" bsm_handle#"+std::to_string(bootstrap.method_handle_index)+" bsm_args=";
                     for(std::size_t n=0;n<bootstrap.argument_indices.size();++n){if(n)call.name+=",";call.name+="#"+std::to_string(bootstrap.argument_indices[n]);}
                     if(auto recipe=string_concat_recipe(*metadata,site.value())){
-                        const auto marker_count=[&](std::string_view marker){std::size_t count=0,pos=0;while((pos=recipe->find(marker,pos))!=std::string::npos){++count;pos+=marker.size();}return count;};
-                        const auto dynamic_markers=marker_count("\\x01");
-                        const auto constant_markers=marker_count("\\x02");
+                        const auto dynamic_markers=recipe->dynamic_markers;
+                        const auto constant_markers=recipe->constant_markers;
                         if(dynamic_markers==signature.value().parameters.size()&&constant_markers+1==bootstrap.argument_indices.size()) {
-                            call.name+=" concat_recipe=\""+*recipe+"\"";
+                            call.name+=" concat_recipe=\""+recipe->escaped+"\"";
                             if (constant_markers) {
                                 if (auto constants = string_concat_bootstrap_constants(*metadata, bootstrap))
                                     call.name += " concat_constants=[" + *constants + "]";

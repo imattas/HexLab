@@ -158,6 +158,8 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
     else if (opcode_index >= 360 && opcode_index <= 363)
         opcode = std::array{Opcode::rv_fleq_s, Opcode::rv_fltq_s,
                             Opcode::rv_fleq_d, Opcode::rv_fltq_d}[opcode_index - 360];
+    else if (source.opcode == RiscvOpcode::fence_i)
+        opcode = Opcode::rv_fence_i;
     else
         return {DecodeStatus::invalid, {}, "RV64 opcode has no generic representation"};
 
