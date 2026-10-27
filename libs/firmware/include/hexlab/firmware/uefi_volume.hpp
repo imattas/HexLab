@@ -75,6 +75,14 @@ struct UefiFfsFile {
     std::vector<UefiFfsSection> sections;
     std::string section_diagnostic;
 };
+struct UefiFirmwareVolumeExtensionEntry {
+    std::uint16_t type = 0;
+    std::uint16_t size = 0;
+    // Offsets are relative to the beginning of the containing firmware volume.
+    std::uint64_t volume_offset = 0;
+    std::uint64_t payload_offset = 0;
+    std::uint64_t payload_size = 0;
+};
 struct UefiFirmwareVolume {
     std::array<std::uint8_t, 16> file_system_guid{};
     std::uint64_t file_offset = 0;
@@ -83,6 +91,9 @@ struct UefiFirmwareVolume {
     std::uint16_t header_length = 0;
     std::uint8_t revision = 0;
     bool header_checksum_valid = false;
+    std::optional<std::array<std::uint8_t, 16>> extended_header_name_guid;
+    std::optional<std::uint32_t> extended_header_size;
+    std::vector<UefiFirmwareVolumeExtensionEntry> extension_entries;
     std::vector<UefiFfsFile> files;
 };
 struct UefiVolumeParseOptions {

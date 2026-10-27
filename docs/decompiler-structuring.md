@@ -422,3 +422,13 @@ the exit's phi inputs. Longer, shared, branched, or side-entered paths retain
 the existing fallback. This extends HexLab's bounded region walk using the
 same region-first structuring principle visible in Ghidra's native
 [`blockaction.cc`](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/blockaction.cc); no Ghidra source is copied.
+
+Nested pre-tested child loops also accept conditional continue edges that pass
+through up to 256 phi-free cleanup blocks before returning to the child header.
+The cleanup chain must be single-entry, unconditional, and free of side entries,
+returns, switches, and memory phis. Its final block must be an actual CFG
+predecessor of the header. The child header's register phis are validated
+against the cleanup tail and ordinary latch edges, and their parallel copies
+are emitted after the guarded cleanup statements immediately before `continue`.
+Direct conditional continues remain the zero-block case; ambiguous or
+side-entered cleanup paths retain the existing fallback.

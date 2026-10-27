@@ -448,6 +448,7 @@ void project_usage(std::ostream &out) {
            "         save save-as export functions references switches stack graph search signatures signature-apply signature-create flirt flirt-apply fingerprints fingerprint-create recognition-evidence methods managed-types fields\n"
            "         exchange export|import <project> --output/--input <file> [--conflict fail|skip|replace]\n"
            "         types export|import <project> --output/--input <file> [--replace] [--replace-assignments] [--skip-assignments-on-mismatch]\n"
+           "         types verify <type-library-file>\n"
            "history audit: read-only paginated integrity check; --verify-replay also reverses the applied branch to empty state (max 4096 steps/64 MiB); JSON emits one summary; exit 3 means resume available\n"
            "history preview: read-only bounded replay to an exact step; reports current and preview record counts without changing the project; exit 3 means target differs from current cursor\n"
            "history save: publishes an independent project at an exact step with full undo/redo history; source stays unchanged\n"
@@ -511,6 +512,14 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
     }
     try {
         auto args = parse(arguments);
+        if (args.action == L"types-verify") {
+            const auto bundle = take(read_type_library_file(args.type_library_input));
+            out << "Verified type library: " << bundle.entries.size() << " definitions, "
+                << bundle.assignments.size() << " assignments";
+            if (bundle.source_identity) out << ", source identity present";
+            out << "\n";
+            return 0;
+        }
         if (args.action == L"history-audit")
             return run_history_audit(args, out, err);
         if (args.action == L"history-preview")

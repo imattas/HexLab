@@ -13,6 +13,7 @@ constexpr std::array<std::uint8_t, 16> ffs2_guid{
 constexpr std::array<std::uint8_t, 16> ffs3_guid{
     0x7a,0xc0,0x73,0x54,0xcb,0x3d,0xca,0x4d,0xbd,0x6f,0x1e,0x96,0x89,0xe7,0x34,0x9a};
 constexpr std::uint64_t max_header_bytes = 16ull * 1024 * 1024;
+constexpr std::size_t max_fv_extension_entries = 65536;
 constexpr std::uint32_t section_compression = 0x01;
 constexpr std::uint32_t section_guid_defined = 0x02;
 constexpr std::uint32_t section_disposable = 0x03;
@@ -782,6 +783,7 @@ Result<UefiFirmwareVolume> parse_volume(std::span<const std::byte> bytes, std::s
 
     std::uint64_t mapped_bytes = 0;
     bool map_terminated = false;
+    std::size_t block_map_end = 0;
     for (std::size_t p = fixed; p + 8 <= header_length; p += 8) {
         const auto count = u32(bytes, start + p);
         const auto block_size = u32(bytes, start + p + 4);
@@ -789,6 +791,7 @@ Result<UefiFirmwareVolume> parse_volume(std::span<const std::byte> bytes, std::s
             if (count != 0 || block_size != 0)
                 return Error{ErrorCode::malformed, "UEFI firmware volume block map has a partial terminator"};
             map_terminated = true;
+            block_map_end = p + 8;
             break;
         }
         if (std::uint64_t(count) > (UINT64_MAX - mapped_bytes) / block_size)
@@ -797,6 +800,41 @@ Result<UefiFirmwareVolume> parse_volume(std::span<const std::byte> bytes, std::s
     }
     if (!map_terminated || mapped_bytes != fv_length)
         return Error{ErrorCode::malformed, "UEFI firmware volume block map does not match its declared length"};
+
+    const auto extended_header_offset = u16(bytes, start + 52);
+    if (extended_header_offset != 0) {
+        const auto ext = static_cast<std::size_t>(extended_header_offset);
+        constexpr std::size_t ext_header_fixed = 20;
+        if ((ext & 3u) != 0 || ext < block_map_end || ext > header_length ||
+            header_length - ext < ext_header_fixed)
+            return Error{ErrorCode::malformed, "UEFI firmware-volume extended-header offset is invalid"};
+        const auto ext_size = u32(bytes, start + ext + 16);
+        if (ext_size < ext_header_fixed || ext_size > header_length - ext)
+            return Error{ErrorCode::malformed, "UEFI firmware-volume extended-header size is invalid"};
+        std::array<std::uint8_t, 16> name_guid{};
+        for (std::size_t i = 0; i < name_guid.size(); ++i)
+            name_guid[i] = u8(bytes, start + ext + i);
+        volume.extended_header_name_guid = name_guid;
+        volume.extended_header_size = ext_size;
+
+        std::size_t entry = ext + ext_size;
+        while (entry < header_length) {
+            const auto remaining = header_length - entry;
+            const auto tail = bytes.subspan(start + entry, remaining);
+            if (all_value(tail, 0)) break; // zero-filled header alignment padding
+            if (remaining < 4)
+                return Error{ErrorCode::malformed, "UEFI firmware-volume extension entry header is truncated"};
+            const auto entry_size = u16(bytes, start + entry);
+            const auto entry_type = u16(bytes, start + entry + 2);
+            if (entry_size < 4 || entry_size > remaining)
+                return Error{ErrorCode::malformed, "UEFI firmware-volume extension entry size is invalid"};
+            if (volume.extension_entries.size() >= max_fv_extension_entries)
+                return Error{ErrorCode::resource_limit, "UEFI firmware-volume extension-entry limit exceeded"};
+            volume.extension_entries.push_back({entry_type, entry_size, entry,
+                                                entry + 4, static_cast<std::uint64_t>(entry_size - 4u)});
+            entry += entry_size;
+        }
+    }
 
     const std::uint8_t erased = (volume.attributes & 0x800u) ? 0xff : 0x00;
     std::uint64_t cursor = (std::uint64_t(header_length) + 7u) & ~std::uint64_t{7};
