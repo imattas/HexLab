@@ -276,22 +276,29 @@ phi-free return block and a phi-free single-successor setup chain into the
 switch; it keeps setup and guard effects in their original order and nests the
 switch only on the non-returning path. Prefix blocks must have no phis and one
 unambiguous successor each. Distinct case/default arms must each follow a
-disjoint straight-line path to a return, or converge on one terminal return
-join.
-An entry switch also accepts phi-free case-target chains where a case falls
-through directly into another case target and every chain ends at the same
-terminal return. Each target's labels are emitted immediately before that
-target's statements, so both direct dispatch and sequential fallthrough enter
-the correct block. The recognizer requires disjoint linear chains, exact
-predecessors, and no extra blocks; cycles, multiple fallthrough predecessors,
-phis, guarded/setup dispatches, and non-return continuations use the existing
-region or state-machine formatter.
+disjoint straight-line path to a return, or converge on one shared linear
+suffix ending in a terminal return.
+An entry switch also accepts case-target chains where a case falls through
+directly into another case target. Chains may terminate separately or merge
+into a common linear suffix ending at a terminal return. Every shared block
+must occur at the same suffix position on every path. The recognizer requires
+exact predecessor/phi coverage and no unrecognized blocks; cycles, branched
+suffixes, guarded/setup dispatches, and non-return continuations use the
+existing region or state-machine formatter.
 Shared-join arms receive edge-specific SSA phi assignments and explicit
 `break` statements. Conditional or nested arms proceed to the general region
-or state-machine formatter. Incomplete tables and dispatches without an
-authoritative default continue through the label/goto fallback. This keeps
-numbered cases tied to recovered table indexes instead of guessing from
-successor order.
+or state-machine formatter. The fast path also accepts a common linear suffix
+after the switch join, provided each path shares exactly the same suffix and
+it ends in a terminal return. It validates register-phi inputs for every
+path-edge and emits the corresponding parallel copies inside each case or
+once along the common suffix. Whole-memory and partition-memory phis must
+also have exactly the derived predecessor inputs; these internal tokens need
+no extra C statement because the original memory operations remain in place.
+Branched or side-entered suffixes, malformed phi inputs, and unrecognized
+blocks retain the region/state-machine fallback. Incomplete tables and
+dispatches without an authoritative default continue through the label/goto
+fallback. This keeps numbered cases tied to recovered table indexes instead
+of guessing from successor order.
 
 All switch metadata is validated before any structuring path consumes it.
 Every case value must be unique, the selector and default must be present,

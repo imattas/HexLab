@@ -792,6 +792,10 @@ bool decode_fp_op(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
     else if (operation == 0x10) { static constexpr RiscvOpcode ops[2][3]{{RiscvOpcode::fsgnj_s,RiscvOpcode::fsgnjn_s,RiscvOpcode::fsgnjx_s},{RiscvOpcode::fsgnj_d,RiscvOpcode::fsgnjn_d,RiscvOpcode::fsgnjx_d}}; if(f3<3) ok=plain(ops[d][f3]); }
     else if (operation == 0x14) { if(f3<2) ok=plain(d?(f3?RiscvOpcode::fmax_d:RiscvOpcode::fmin_d):(f3?RiscvOpcode::fmax_s:RiscvOpcode::fmin_s),true); }
     else if (operation == 0x50) { if(f3>=1 && f3<=2) { ok=plain(d?(f3==2?RiscvOpcode::feq_d:RiscvOpcode::flt_d):(f3==2?RiscvOpcode::feq_s:RiscvOpcode::flt_s),true); dst_fp=false; src1_fp=src2_fp=true; } else if(f3==0){ok=plain(d?RiscvOpcode::fle_d:RiscvOpcode::fle_s,true);dst_fp=false;} }
+    else if (operation == 0x60 && d && rs2 == 8 && f3 == 1) {
+        ok = set(RiscvOpcode::fcvtmod_w_d, true, true, false);
+        dst_fp = false; unary = true;
+    }
     else if (operation == 0x70 && rs2==0 && (f3==0 || f3==1) && (!d || f3==1 || xlen==64)) { ok=plain(d?(f3?RiscvOpcode::fclass_d:RiscvOpcode::fmv_x_d):(f3?RiscvOpcode::fclass_s:RiscvOpcode::fmv_x_w)); dst_fp=false; unary=true; }
     else if (operation == 0x78 && rs2==0 && f3==0 && (!d || xlen==64)) { ok=plain(d?RiscvOpcode::fmv_d_x:RiscvOpcode::fmv_w_x); src1_fp=false; unary=true; }
     else if ((operation==0x60 || operation==0x68) && rs2<=3 && (rs2<2 || xlen==64)) {

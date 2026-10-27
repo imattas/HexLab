@@ -33,6 +33,8 @@ Result<UefiCapsule> parse_uefi_fmp_capsule(std::span<const std::byte> bytes,
     result.image_size = u32(bytes, 24);
     if (result.header_size < 28 || result.header_size > result.image_size || result.image_size > bytes.size())
         return malformed("EFI capsule header or declared image size is inconsistent with the input");
+    result.header_extension_size = result.header_size - 28;
+    result.trailing_size = bytes.size() - result.image_size;
     // UEFI 2.10 §23.3.3 requires POPULATE_SYSTEM_TABLE to be clear for FMP
     // capsules. Keep the other capsule flags intact for metadata presentation.
     if (result.flags & 0x00020000u)

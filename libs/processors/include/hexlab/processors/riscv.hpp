@@ -88,7 +88,9 @@ enum class RiscvOpcode {
     vfsqrt_v, vfclass_v,
     // RVV reciprocal estimate operations; append for stable serialized IDs.
     vfrsqrt7_v, vfrec7_v,
-    vredsum, vredand, vredor, vredxor, vredminu, vredmin, vredmaxu, vredmax
+    vredsum, vredand, vredor, vredxor, vredminu, vredmin, vredmaxu, vredmax,
+    // Scalar Zfa conversion appended to preserve existing opcode IDs.
+    fcvtmod_w_d
 };
 
 struct RiscvRegister {

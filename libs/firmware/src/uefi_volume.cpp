@@ -23,7 +23,12 @@ constexpr std::uint16_t guid_processing_required = 0x0001;
 constexpr std::size_t max_section_text_units = 4096;
 constexpr std::uint8_t ffs_attribute_checksum = 0x40;
 constexpr std::uint8_t ffs_fixed_checksum = 0xaa;
+constexpr std::uint8_t ffs_state_header_construction = 0x01;
+constexpr std::uint8_t ffs_state_header_valid = 0x02;
 constexpr std::uint8_t ffs_state_data_valid = 0x04;
+constexpr std::uint8_t ffs_state_marked_for_update = 0x08;
+constexpr std::uint8_t ffs_state_deleted = 0x10;
+constexpr std::uint8_t ffs_state_header_invalid = 0x20;
 
 std::uint8_t u8(std::span<const std::byte> b, std::size_t at) {
     return std::to_integer<std::uint8_t>(b[at]);
@@ -46,6 +51,16 @@ bool all_value(std::span<const std::byte> b, std::uint8_t v) {
 }
 bool all_padding(std::span<const std::byte> bytes, std::uint8_t erased) {
     return all_value(bytes, erased) || all_value(bytes, 0x00) || all_value(bytes, 0xff);
+}
+
+UefiFfsFileDisposition classify_ffs_state(std::uint8_t state) {
+    if (state & ffs_state_header_invalid) return UefiFfsFileDisposition::header_invalid;
+    if (state & ffs_state_deleted) return UefiFfsFileDisposition::deleted;
+    if (state & ffs_state_marked_for_update) return UefiFfsFileDisposition::marked_for_update;
+    if (state & ffs_state_data_valid) return UefiFfsFileDisposition::data_valid;
+    if (state & ffs_state_header_valid) return UefiFfsFileDisposition::header_valid;
+    if (state & ffs_state_header_construction) return UefiFfsFileDisposition::construction;
+    return UefiFfsFileDisposition::unrecognized_state;
 }
 
 bool parse_section_utf16(std::span<const std::byte> bytes, std::u16string &text,
@@ -821,6 +836,8 @@ Result<UefiFirmwareVolume> parse_volume(std::span<const std::byte> bytes, std::s
         }
         const auto physical_state = u8(bytes, file_start + 23);
         const auto state = static_cast<std::uint8_t>(physical_state ^ erased);
+        if (state & 0xc0u)
+            return Error{ErrorCode::malformed, "UEFI FFS reserved state bits do not match erase polarity"};
         const bool header_checksum_valid = file_header_sum == 0;
         if ((state & 0x02u) != 0 && !header_checksum_valid)
             return Error{ErrorCode::integrity, "UEFI FFS header checksum is invalid"};
@@ -835,12 +852,15 @@ Result<UefiFirmwareVolume> parse_volume(std::span<const std::byte> bytes, std::s
         file.type = u8(bytes, file_start + 18);
         file.attributes = attributes;
         file.state = state;
+        file.disposition = classify_ffs_state(state);
         file.header_size = static_cast<std::uint8_t>(header_size);
         file.header_checksum_valid = header_checksum_valid;
         std::string section_error;
         const auto file_data_begin = file_start + static_cast<std::size_t>(header_size);
         const auto file_data = bytes.subspan(file_data_begin, static_cast<std::size_t>(file.data_size));
-        if ((state & ffs_state_data_valid) != 0) {
+        const bool file_data_valid = (state & ffs_state_data_valid) != 0 &&
+            (state & (ffs_state_deleted | ffs_state_header_invalid)) == 0;
+        if (file_data_valid) {
             std::uint8_t expected_checksum = ffs_fixed_checksum;
             if ((attributes & ffs_attribute_checksum) != 0) {
                 std::uint8_t sum = 0;
@@ -850,9 +870,13 @@ Result<UefiFirmwareVolume> parse_volume(std::span<const std::byte> bytes, std::s
             }
             file.data_checksum_valid = u8(bytes, file_start + 17) == expected_checksum;
         }
-        if (!parse_section_stream(file_data, file_data_begin, erased, max_sections, max_section_depth,
-                                  section_count, file.sections, 0, {}, section_error, decode_budget))
-            file.section_diagnostic = std::move(section_error);
+        if (file_data_valid) {
+            if (!parse_section_stream(file_data, file_data_begin, erased, max_sections, max_section_depth,
+                                      section_count, file.sections, 0, {}, section_error, decode_budget))
+                file.section_diagnostic = std::move(section_error);
+        } else {
+            file.section_diagnostic = "file data is not in the EFI_FILE_DATA_VALID state; sections were not parsed";
+        }
         volume.files.push_back(std::move(file));
 
         if (file_size > UINT64_MAX - cursor - 7u)

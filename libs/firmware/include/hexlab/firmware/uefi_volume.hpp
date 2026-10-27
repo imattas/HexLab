@@ -21,6 +21,15 @@ enum class UefiSectionDisposition : std::uint8_t {
     malformed_nested_payload
 };
 enum class UefiSectionOffsetSpace : std::uint8_t { file, decompressed };
+enum class UefiFfsFileDisposition : std::uint8_t {
+    construction,
+    header_valid,
+    data_valid,
+    marked_for_update,
+    deleted,
+    header_invalid,
+    unrecognized_state
+};
 struct UefiFfsSection {
     // Offsets are absolute input offsets in `file` space and relative to the
     // decompressed stream in `decompressed` space. parent_index identifies
@@ -56,6 +65,7 @@ struct UefiFfsFile {
     std::uint8_t type = 0;
     std::uint8_t attributes = 0;
     std::uint8_t state = 0;
+    UefiFfsFileDisposition disposition = UefiFfsFileDisposition::unrecognized_state;
     std::uint8_t header_size = 0;
     bool header_checksum_valid = false;
     // Present only when EFI_FILE_DATA_VALID is set in the normalized state.
