@@ -2,7 +2,26 @@
 namespace hexlab::a64_detail {
 bool data(Instruction &i, std::uint32_t word) {
     const unsigned width = (word >> 31) ? 64 : 32;
-    if ((word & 0x3a000000u) == 0x28000000u && ((word >> 26) & 1u) == 0) {
+    if ((word & 0x3b000000u) == 0x18000000u) {
+        // Integer literal loads use the address of this instruction as PC,
+        // with a signed imm19 scaled by four (no page alignment).
+        const auto opc = word >> 30;
+        if ((word & 0x04000000u) || opc == 3)
+            return false; // SIMD/FP literals and PRFM are outside this slice.
+        const bool signed_word = opc == 2;
+        const unsigned data_width = signed_word ? 32 : opc == 1 ? 64 : 32;
+        const auto displacement = signed_value((word >> 5) & 0x7ffffu, 19) * 4;
+        i.opcode = signed_word ? Opcode::a64_ldrsw : Opcode::a64_ldr;
+        operand(i, reg(word & 31, signed_word || data_width == 64 ? 64 : 32), OperandAccess::write);
+        MemoryOperand memory;
+        memory.data_width = static_cast<std::uint16_t>(data_width);
+        memory.address_width = 64;
+        memory.ip_relative = true;
+        memory.displacement = displacement;
+        memory.resolved_address = target(i.address, displacement);
+        operand(i, memory, OperandAccess::read);
+        i.memory_read = true;
+    } else if ((word & 0x3a000000u) == 0x28000000u && ((word >> 26) & 1u) == 0) {
         const auto opc = word >> 30;
         const auto mode = (word >> 23) & 3u;
         if ((opc != 0 && opc != 2) || mode == 0)

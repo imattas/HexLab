@@ -52,23 +52,40 @@ if not isinstance(document, list) or len(document) > 4096:
     parser.error("manifest must be an array with at most 4096 rows")
 rows = []
 names_by_space = {}
+fields_by_location = {}
+conflicts = []
 for index, item in enumerate(document):
     if not isinstance(item, dict) or "location" not in item:
         parser.error(f"row {index} must be an object with location")
     row = {key: item[key] for key in ("name", "comment", "bookmark") if key in item}
     row["location"] = location(item["location"])
+    address = row["location"]
+    location_key = (("va", address.space, address.offset) if isinstance(address, hexlab.Address)
+                    else ("file_offset", address.offset))
+    for field, value in row.items():
+        if field == "location":
+            continue
+        key = (location_key, field)
+        previous = fields_by_location.get(key)
+        if previous is not None and previous[0] != value:
+            conflicts.append(
+                f"{field} conflict at {location_key}: rows {previous[1]} and {index} "
+                f"specify different values"
+            )
+        fields_by_location[key] = (value, index)
     if isinstance(row.get("name"), str) and row["name"]:
-        address = row["location"]
         if isinstance(address, hexlab.Address):
             key = (address.space, row["name"])
             previous = names_by_space.get(key)
             if previous is not None and previous[0] != address.offset:
-                parser.error(
+                conflicts.append(
                     f"name conflict '{row['name']}' in address space {address.space}: "
                     f"rows {previous[1]} and {index} target different addresses"
                 )
             names_by_space[key] = (address.offset, index)
     rows.append(row)
+if conflicts:
+    parser.error("manifest contains conflicting edits: " + "; ".join(conflicts))
 with hexlab.Project.open(args.project, readonly=False) as project:
     revision = project.snapshot()["edit_revision"]
     updated = project.apply_annotations(rows, group=args.group, expected_revision=revision)

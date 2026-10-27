@@ -2723,7 +2723,8 @@ a64_unhandled:
             return effect;
         }
         if ((op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) || op == Opcode::rv_fcvtmod_w_d ||
-            op == Opcode::rv_fli_s || op == Opcode::rv_fli_d) {
+            op == Opcode::rv_fli_s || op == Opcode::rv_fli_d ||
+            (op >= Opcode::rv_fround_s && op <= Opcode::rv_froundnx_d)) {
             if (auto converted = lift_riscv_fp_conversion(instruction, operands)) return *converted;
             if ((op == Opcode::rv_flw || op == Opcode::rv_fld) && dst && operands.size() >= 2) {
                 auto loaded = *operands[1];

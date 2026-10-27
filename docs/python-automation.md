@@ -698,7 +698,7 @@ for a non-daemon thread that never exits.
 
 Scripts can apply up to 4096 names, comments, and bookmark edits through one `ProjectSession` batch. The native layer validates each command against the preceding projected state and commits the combined delta as one durable history step; a failure leaves the project unchanged. Pass the edit revision captured while building a manifest so stale work fails with a conflict before commit. `apply_annotations(rows, group=..., expected_revision=...)` accepts dictionaries containing `location` and any of `name`, `comment`, or `bookmark`; `bookmark=None` removes the existing bookmark. Names require virtual addresses, while comments and bookmarks may use virtual addresses or file offsets. The batch's combined text is capped at 16 MiB.
 
-`libs/automation/examples/import_annotations.py` imports a JSON array with bounded manifest size and row count. Example:
+`libs/automation/examples/import_annotations.py` imports a JSON array with bounded manifest size and row count. Before opening the project for editing, it reports all conflicting repeated assignments to the same name, comment, or bookmark at one location, with both manifest row indices. Repeated non-empty names assigned to different virtual addresses in one address space are reported the same way. Any reported conflict aborts the import before a project is opened, so the manifest cannot silently overwrite its own earlier values. Example:
 
 ```json
 [
@@ -707,7 +707,7 @@ Scripts can apply up to 4096 names, comments, and bookmark edits through one `Pr
 ]
 ```
 
-Run it with `hexlab_python import_annotations.py project.hxproj annotations.json`. The helper pins the import to the project's current edit revision and saves after a successful one-step import. Before opening the project for editing, it detects repeated non-empty names assigned to different addresses in the same address space and reports the conflicting manifest row indices. A name already used by an existing project annotation, or any other invalid command, is still rejected by native batch validation; the batch remains atomic and makes no partial edits.
+Run it with `hexlab_python import_annotations.py project.hxproj annotations.json`. The helper pins the import to the project's current edit revision and saves after a successful one-step import. Conflicts against annotations already in the project, and other invalid commands, are still rejected by native batch validation; the batch remains atomic and makes no partial edits.
 
 For mixed project commands, use `Project.apply_batch()` to combine annotations,
 patches, code/data definitions, function/chunk decisions, user references,

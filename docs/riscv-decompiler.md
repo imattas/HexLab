@@ -38,15 +38,20 @@ into `fflags` like `FCVT.W.D`. The intrinsic keeps modulo-2^32 behavior visible
 to downstream analysis, including the specified zero result for NaN and
 infinity; it remains opaque and the lifter does not calculate conversion
 values or flags.
-Other Zfa conversion and rounding instructions, including FROUND/FROUNDNX,
-remain unsupported.
+Zfa `FROUND.S/D` and `FROUNDNX.S/D` use the FCVT.S.D/FCVT.D.S encoding
+families with `rs2=4/5`, respectively. They preserve the S/D source and
+destination types, validate and retain `rm`, and use `frm` only for `rm=111`.
+The typed intrinsics preserve round-to-integral behavior; symbolic accrued
+flags are bounded to NV for FROUND and NV/NX for FROUNDNX. Exact values,
+signaling-NaN detection, and whether an input changes after rounding remain
+unevaluated.
 
 Zfa `FLI.S` and `FLI.D` decode the complete five-bit immediate selector table
 from the FMV encoding with `rs2=1`. The selector is retained as an immediate,
 not a fictitious GPR dependency. Lifting maps each selector to its exact IEEE
 binary32 or binary64 bit pattern, including the format-specific minimum normal,
 positive infinity, and canonical quiet NaN. FLI writes only its FPR destination
-and does not read or update `frm` or `fflags`. FLI.H/Q and the other Zfa
+and does not read or update `frm` or `fflags`. FLI.H/Q and the remaining Zfa
 rounding/minimum families remain unsupported.
 
 Encodings and effects follow the official
