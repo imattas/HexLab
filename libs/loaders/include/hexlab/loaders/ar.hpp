@@ -18,6 +18,12 @@ struct ArMember {
     FileOffset data_offset;
     std::uint64_t size = 0;
     ArMemberKind kind = ArMemberKind::regular;
+    // Metadata from the fixed-width ar header. Mode is stored as its numeric
+    // octal value (for example, 0644 is represented as decimal 420).
+    std::uint64_t timestamp = 0;
+    std::uint32_t uid = 0;
+    std::uint32_t gid = 0;
+    std::uint32_t mode = 0;
 };
 
 struct ArSymbol {

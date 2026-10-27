@@ -985,6 +985,8 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
             for (std::size_t i = 0; i < archive.members.size(); ++i) {
                 const auto &member = archive.members[i];
                 out << "Member: " << i << " name=" << safe_text(member.name) << " size=" << member.size
+                    << " timestamp=" << member.timestamp << " uid=" << member.uid << " gid=" << member.gid
+                    << " mode=0" << std::oct << member.mode << std::dec
                     << " kind=" << (member.kind == ArMemberKind::regular ? "regular"
                                     : member.kind == ArMemberKind::symbol_index ? "symbol-index" : "long-name-table") << '\n';
             }
