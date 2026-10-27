@@ -102,6 +102,11 @@ public:
     // Reads the standard qXfer operating-system process-list object.
     Result<std::optional<std::string>> read_processes_annex(
         std::size_t limit = 1024 * 1024, std::size_t chunk = 4096, std::stop_token = {});
+    // Reads the executable path for the selected process (or current process
+    // when no PID is supplied) through qXfer:exec-file:read.
+    Result<std::optional<std::string>> read_exec_file_annex(
+        std::optional<std::uint64_t> process = {}, std::size_t limit = 16 * 1024,
+        std::size_t chunk = 1024, std::stop_token = {});
     // Reads the binary qXfer auxiliary-vector object under independent byte and chunk limits.
     Result<std::optional<std::vector<std::byte>>> read_auxv_annex(
         std::size_t limit = 1024 * 1024, std::size_t chunk = 4096, std::stop_token = {});

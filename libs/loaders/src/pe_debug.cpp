@@ -14,6 +14,7 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
         require(count <= record_limit, "PE debug directory exceeds record budget");
         std::vector<PeCodeViewIdentity> codeview;
         std::vector<PeDebugDirectoryEntry> entries;
+        std::vector<PeFpoRecord> fpo_records;
         for (std::uint32_t index = 0; index < count; ++index) {
             canceled(stop);
             const auto at = std::uint64_t{directory.location} + std::uint64_t{index} * 28;
@@ -40,6 +41,67 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
                 }
             }
             entries.push_back(entry);
+            if (type == 3) { // IMAGE_DEBUG_TYPE_FPO, legacy x86 frame metadata.
+                require(metadata.machine == 0x14c,
+                        "PE FPO debug records are only supported for x86 images", ErrorCode::unsupported);
+                require(entry.data_size % 16 == 0, "PE FPO debug payload has a partial 16-byte record");
+                const auto fpo_count = entry.data_size / 16;
+                require(fpo_count <= record_limit - fpo_records.size(),
+                        "PE FPO record count exceeds inspection budget", ErrorCode::resource_limit);
+                std::vector<std::byte> payload;
+                if (entry.raw_offset) {
+                    FileReader file_reader(*image.storage());
+                    const auto raw_payload = file_reader.bytes(entry.raw_offset, entry.data_size, "FPO debug payload");
+                    payload.assign(raw_payload.bytes.begin(), raw_payload.bytes.end());
+                } else if (entry.data_size) {
+                    payload = r.bytes(entry.data_rva, entry.data_size);
+                }
+                std::uint64_t previous_end = fpo_records.empty() ? 0 :
+                    std::uint64_t{fpo_records.back().begin_rva} + fpo_records.back().code_size;
+                for (std::uint32_t row = 0; row < fpo_count; ++row) {
+                    canceled(stop);
+                    const auto offset = std::size_t{row} * 16;
+                    const auto u16 = [&](std::size_t at) {
+                        return static_cast<std::uint16_t>(std::to_integer<unsigned>(payload[at]) |
+                            (std::to_integer<unsigned>(payload[at + 1]) << 8));
+                    };
+                    const auto u32 = [&](std::size_t at) {
+                        return std::to_integer<std::uint32_t>(payload[at]) |
+                            (std::to_integer<std::uint32_t>(payload[at + 1]) << 8) |
+                            (std::to_integer<std::uint32_t>(payload[at + 2]) << 16) |
+                            (std::to_integer<std::uint32_t>(payload[at + 3]) << 24);
+                    };
+                    PeFpoRecord record;
+                    record.begin_rva = u32(offset);
+                    record.code_size = u32(offset + 4);
+                    record.local_dwords = u32(offset + 8);
+                    record.parameter_dwords = u16(offset + 12);
+                    const auto flags = u16(offset + 14);
+                    record.prolog_size = static_cast<std::uint8_t>(flags & 0xffu);
+                    record.saved_register_count = static_cast<std::uint8_t>((flags >> 8) & 7u);
+                    record.has_seh = ((flags >> 11) & 1u) != 0;
+                    record.uses_base_pointer = ((flags >> 12) & 1u) != 0;
+                    require(((flags >> 13) & 1u) == 0,
+                            "PE FPO record has a nonzero reserved bit");
+                    record.frame_kind = static_cast<PeFpoFrameKind>((flags >> 14) & 3u);
+                    require(record.code_size != 0 && record.prolog_size <= record.code_size,
+                            "PE FPO record has an empty function or oversized prolog");
+                    const auto end_rva = std::uint64_t{record.begin_rva} + record.code_size;
+                    require(end_rva <= metadata.image_size &&
+                                (fpo_records.empty() || record.begin_rva >= previous_end),
+                            "PE FPO records overlap or exceed the image");
+                    const auto address = r.address(record.begin_rva);
+                    const auto *segment = image.segment_at(address);
+                    require(segment && segment->executable && r.initialized_extent(record.begin_rva) >= record.code_size,
+                            "PE FPO function range is not initialized executable code");
+                    if (entry.raw_offset)
+                        record.source = {row, {{FileOffset{std::uint64_t{entry.raw_offset} + offset}, 16}}};
+                    else
+                        record.source = {row, r.sources(std::uint64_t{entry.data_rva} + offset, 16)};
+                    fpo_records.push_back(std::move(record));
+                    previous_end = end_rva;
+                }
+            }
             if (type != 2) continue; // IMAGE_DEBUG_TYPE_CODEVIEW
             const auto data_size = entry.data_size;
             const auto raw_offset = entry.raw_offset;
@@ -72,7 +134,7 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
             identity.record = {{{raw_offset}, data_size}};
             codeview.push_back(std::move(identity));
         }
-        const auto count_read = codeview.size();
+        const auto count_read = codeview.size() + fpo_records.size();
         if (metadata.pe) {
             metadata.pe->debug_directories.insert(metadata.pe->debug_directories.end(),
                                                    std::make_move_iterator(entries.begin()),
@@ -80,6 +142,9 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
             metadata.pe->codeview.insert(metadata.pe->codeview.end(),
                                          std::make_move_iterator(codeview.begin()),
                                          std::make_move_iterator(codeview.end()));
+            metadata.pe->fpo_records.insert(metadata.pe->fpo_records.end(),
+                                            std::make_move_iterator(fpo_records.begin()),
+                                            std::make_move_iterator(fpo_records.end()));
         }
         return count_read;
     });

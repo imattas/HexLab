@@ -1103,6 +1103,7 @@ public:
         threads_xml_advertised_ = false;
         osdata_advertised_ = false;
         auxv_advertised_ = false;
+        exec_file_advertised_ = false;
         const auto xml_feature = features.value().features.find("qXfer:features:read");
         if (xml_feature != features.value().features.end() && xml_feature->second != "-") {
             target_xml_advertised_ = true;
@@ -1124,6 +1125,8 @@ public:
         osdata_advertised_ = osdata != features.value().features.end() && osdata->second != "-";
         const auto auxv = features.value().features.find("qXfer:auxv:read");
         auxv_advertised_ = auxv != features.value().features.end() && auxv->second != "-";
+        const auto exec_file = features.value().features.find("qXfer:exec-file:read");
+        exec_file_advertised_ = exec_file != features.value().features.end() && exec_file->second != "-";
         auto initial = client_->read_stop_reply_optional();
         if (!initial) { client_.reset(); transport_.reset(); return initial.error(); }
         remote_process_id_.reset();
@@ -1344,7 +1347,8 @@ public:
             client_.reset(); transport_.reset(); pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
             expected_step_threads_.clear(); legacy_expected_step_ = false; terminated_ = true; remote_process_id_.reset();
             breakpoints_.clear(); target_.reset(); target_xml_advertised_ = false; libraries_advertised_ = false;
-            memory_map_advertised_ = false; threads_xml_advertised_ = false; auxv_advertised_ = false; multiprocess_supported_ = false;
+            memory_map_advertised_ = false; threads_xml_advertised_ = false; auxv_advertised_ = false;
+            exec_file_advertised_ = false; multiprocess_supported_ = false;
             extended_mode_supported_ = false;
             non_stop_mode_ = false;
         }
@@ -1379,7 +1383,8 @@ public:
         remote_thread_tokens_.clear(); thread_token_ids_.clear(); thread_run_states_.clear(); next_thread_token_ = 1;
         inferiors_.clear();
         breakpoints_.clear(); target_.reset(); target_xml_advertised_ = false; libraries_advertised_ = false;
-        memory_map_advertised_ = false; threads_xml_advertised_ = false; auxv_advertised_ = false; multiprocess_supported_ = false;
+        memory_map_advertised_ = false; threads_xml_advertised_ = false; auxv_advertised_ = false;
+        exec_file_advertised_ = false; multiprocess_supported_ = false;
         extended_mode_supported_ = false;
         non_stop_mode_ = false;
         remote_process_id_.reset(); terminated_ = false;
@@ -1775,6 +1780,15 @@ public:
         result.reserve(descriptions.value().size());
         for (const auto &process : descriptions.value()) {
             auto name = process.command.empty() ? "process " + std::to_string(process.id) : process.command;
+            const bool selected = remote_process_id_ && process.id == *remote_process_id_;
+            const bool single_current = !multiprocess_supported_ && !remote_process_id_ &&
+                descriptions.value().size() == 1;
+            if (exec_file_advertised_ && (selected || single_current)) {
+                const auto pid = selected ? remote_process_id_ : std::optional<std::uint64_t>{};
+                auto executable = client_->read_exec_file_annex(pid);
+                if (!executable) return executable.error();
+                if (executable.value() && !executable.value()->empty()) name = std::move(*executable.value());
+            }
             result.push_back({process.id, std::move(name), target_ ? target_->architecture : Architecture::unknown});
         }
         return result;
@@ -2026,6 +2040,7 @@ private:
     bool threads_xml_advertised_ = false;
     bool osdata_advertised_ = false;
     bool auxv_advertised_ = false;
+    bool exec_file_advertised_ = false;
     bool multiprocess_supported_ = false;
     bool extended_mode_supported_ = false;
     bool non_stop_mode_ = false;

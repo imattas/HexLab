@@ -113,6 +113,12 @@ Result<TypePtr> primitive(std::uint32_t index) {
     if (index == 0x33) return Type::boolean(8, 8);
     if (index == 0x40) return Type::floating("float", 4, 4);
     if (index == 0x41) return Type::floating("double", 8, 8);
+    // CodeView's direct REAL80/REAL128 primitive indices carry their storage
+    // size independently of the target's C++ `long double` spelling. Preserve
+    // that encoded width; use a conservative power-of-two alignment capped at
+    // 16 because LF_POINTER/simple-type records do not carry ABI alignment.
+    if (index == 0x42) return Type::floating("long double (80-bit)", 10, 8);
+    if (index == 0x43) return Type::floating("__float128", 16, 16);
     return Error{ErrorCode::unsupported, "PDB import encountered an unsupported CodeView primitive type"};
 }
 

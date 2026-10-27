@@ -552,6 +552,19 @@ struct PeDebugDirectoryEntry {
     std::vector<PeSourceSpan> raw_data;
     bool operator==(const PeDebugDirectoryEntry &) const = default;
 };
+enum class PeFpoFrameKind : std::uint8_t { fpo, trap, task_state, non_fpo };
+// Legacy x86 IMAGE_DEBUG_TYPE_FPO row. Local and parameter counts retain the
+// format's DWORD units; no unwind execution is inferred from this metadata.
+struct PeFpoRecord {
+    std::uint32_t begin_rva = 0, code_size = 0;
+    std::uint32_t local_dwords = 0;
+    std::uint16_t parameter_dwords = 0;
+    std::uint8_t prolog_size = 0, saved_register_count = 0;
+    bool has_seh = false, uses_base_pointer = false;
+    PeFpoFrameKind frame_kind = PeFpoFrameKind::fpo;
+    PeRecordSource source;
+    bool operator==(const PeFpoRecord &) const = default;
+};
 // A PDB C13 line row after optional section-to-RVA mapping. The original
 // section coordinate and module/file provenance remain available even when
 // the PE/PDB identity or section mapping cannot be established.
@@ -677,6 +690,7 @@ struct PeMetadata {
     std::vector<PeResource> resources;
     std::vector<PeCodeViewIdentity> codeview;
     std::vector<PeDebugDirectoryEntry> debug_directories;
+    std::vector<PeFpoRecord> fpo_records;
     std::vector<PeSourceLine> source_lines;
     PePdbStatus pdb_status = PePdbStatus::unavailable;
     std::string pdb_path;
