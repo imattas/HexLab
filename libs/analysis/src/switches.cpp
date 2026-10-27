@@ -625,6 +625,12 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                 compared_register = register_operand(compare, 0);
                 immediate = std::get_if<ImmediateOperand>(&compare.operands[1]);
                 exclusive_upper_bound = branch.condition == 8;
+            } else if (context.architecture == Architecture::arm && context.mode == ExecutionMode::a32 &&
+                       compare.opcode == Opcode::a32_cmp && compare.operands.size() == 2 &&
+                       branch.opcode == Opcode::a32_b && (branch.condition == 2 || branch.condition == 8)) {
+                compared_register = register_operand(compare, 0);
+                immediate = std::get_if<ImmediateOperand>(&compare.operands[1]);
+                exclusive_upper_bound = branch.condition == 8;
             } else if (context.architecture == Architecture::riscv64 && context.mode == ExecutionMode::rv64 &&
                        compare.opcode == Opcode::rv_sltiu && compare.operands.size() == 3 &&
                        branch.opcode == Opcode::rv_beq && branch.operands.size() == 3) {
@@ -2900,6 +2906,70 @@ std::optional<SwitchSite> thumb_table_branch_switch(
         return site;
     return {};
 }
+
+std::optional<SwitchSite> a32_pc_indexed_ldr_switch(
+    const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
+    const std::vector<std::shared_ptr<const InstructionFact>> &facts,
+    std::size_t dispatch_index, SwitchGuardContext &guards, std::stop_token stop) {
+    if (dispatch_index >= facts.size() || !facts[dispatch_index] || stop.stop_requested())
+        return {};
+    const auto &dispatch = facts[dispatch_index]->instruction;
+    if (dispatch.context.architecture != Architecture::arm || dispatch.context.mode != ExecutionMode::a32 ||
+        dispatch.opcode != Opcode::a32_ldr || dispatch.flow != FlowKind::jump || dispatch.condition != 14 ||
+        dispatch.operands.size() != 2 || !dispatch.arm || !dispatch.arm->writes_pc)
+        return {};
+    const auto *destination = register_operand(dispatch, 0);
+    const auto *memory = std::get_if<ArmMemoryOperand>(&dispatch.operands[1]);
+    const auto *offset = memory ? std::get_if<ArmShiftedRegisterOperand>(&memory->offset) : nullptr;
+    if (!destination || destination->bank != RegisterBank::arm32_gpr || destination->index != 15 ||
+        destination->width != 32 || !memory || memory->base.bank != RegisterBank::arm32_gpr ||
+        memory->base.index != 15 || memory->base.width != 32 || !offset ||
+        offset->source.bank != RegisterBank::arm32_gpr || offset->source.index == 15 ||
+        offset->source.width != 32 || offset->shift != ArmShift::lsl || offset->amount != 2 ||
+        offset->amount_register || !memory->add || !memory->pre_index || memory->writeback ||
+        memory->data_width != 32 || memory->sign_extend || memory->resolved_address)
+        return {};
+
+    // In A32, the architectural PC operand is the current instruction address
+    // plus eight. This exact unshifted-register variant reads a contiguous
+    // array of 32-bit absolute ARM destinations. Bit-zero interworking entries
+    // are intentionally rejected; proving mixed-mode target contexts needs a
+    // separate mode-aware CFG treatment.
+    const auto table = add_offset(dispatch.address, 8, image);
+    if (!table || !file_backed_range(image, *table, 4, false))
+        return {};
+    SwitchSite site;
+    site.dispatch = dispatch.address;
+    site.table = *table;
+    site.selector = offset->source;
+    site.scale = 4;
+    site.entry_encoding = SwitchEntryEncoding::absolute_pointer;
+    if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
+                                               dispatch.address, dispatch.address, dispatch.context, guards, stop)) {
+        site.case_count = bound->case_count;
+        site.default_target = bound->default_target;
+    }
+    const auto scan_limit = site.case_count ? *site.case_count : max_entries;
+    for (std::size_t index = 0; index < scan_limit; ++index) {
+        if (stop.stop_requested())
+            return {};
+        const auto raw = unsigned_table_entry(image, site.table, index, 4);
+        if (!raw || (*raw & 3) != 0) {
+            site.complete = false;
+            break;
+        }
+        const Address target{dispatch.address.space, *raw};
+        if (!decodes_at(image, dispatch.context, target, stop)) {
+            site.complete = false;
+            break;
+        }
+        site.cases.push_back({static_cast<std::uint32_t>(index), target});
+    }
+    if (!site.case_count && site.cases.size() == max_entries)
+        site.complete = false;
+    return site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1)
+        ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
+}
 } // namespace
 
 static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, const FunctionRecord &function,
@@ -3030,6 +3100,19 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
                 if (a64_switch) {
                     result.complete = result.complete && a64_switch->complete;
                     result.sites.push_back(std::move(*a64_switch));
+                }
+                continue;
+            }
+            if (instruction.context.architecture == Architecture::arm &&
+                instruction.context.mode == ExecutionMode::a32 && instruction.opcode == Opcode::a32_ldr &&
+                instruction.flow == FlowKind::jump) {
+                auto arm_switch = a32_pc_indexed_ldr_switch(image, function, snapshot,
+                    found->second->instructions, fact_index, guards, stop);
+                if (stop.stop_requested())
+                    return Error{ErrorCode::canceled, "Switch analysis canceled"};
+                if (arm_switch) {
+                    result.complete = result.complete && arm_switch->complete;
+                    result.sites.push_back(std::move(*arm_switch));
                 }
                 continue;
             }
