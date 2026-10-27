@@ -382,6 +382,56 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
                        row.classlist_index, row.class_address->offset, *row.instance_size);
 
     }
+    // Category declarations have their own source records and provenance. Keep
+    // them as separate incomplete aggregates: merging category methods into a
+    // class layout would falsely attribute those declarations to class_ro_t.
+    std::unordered_map<std::string, std::size_t> category_name_counts;
+    for (const auto &category : scan.categories) {
+        if (category.name && category.name_status == "resolved" && category.target_class_name &&
+            category.target_class_link_status == "linked")
+            ++category_name_counts[*category.target_class_name + "\n" + *category.name];
+    }
+    for (std::size_t index = 0; index < scan.categories.size(); ++index) {
+        const auto &category = scan.categories[index];
+        if (!category.complete || !category.address || category.pointer_status != "resolved" ||
+            !category.name || category.name_status != "resolved" || !category.target_class_name ||
+            category.target_class_link_status != "linked") {
+            plan.skipped.push_back("Category record #" + std::to_string(index) +
+                                   " lacks a complete validated record, name, or scanned target class");
+            continue;
+        }
+        if (category_name_counts[*category.target_class_name + "\n" + *category.name] != 1) {
+            plan.skipped.push_back("Category " + *category.target_class_name + "(" + *category.name +
+                                   ") is ambiguous across runtime records");
+            continue;
+        }
+        auto instance_methods = make_methods(category.instance_methods, false);
+        auto class_methods = make_methods(category.class_methods, true);
+        if (!instance_methods || !class_methods) {
+            plan.skipped.push_back("Category " + *category.name + " has too many parsed methods for project storage");
+            continue;
+        }
+        if (instance_methods->empty() && class_methods->empty()) {
+            plan.skipped.push_back("Category " + *category.name + " has no parsed method signatures to import");
+            continue;
+        }
+        auto type_name = "ObjC2.Category." + objc_type_component(*category.target_class_name) + "." +
+                         objc_type_component(*category.name);
+        auto incomplete = types::Type::incomplete_aggregate(types::Kind::structure, type_name);
+        auto with_instance = incomplete
+            ? types::Type::with_methods(incomplete.value(), std::move(*instance_methods))
+            : hexlab::Result<types::TypePtr>(incomplete.error());
+        auto with_class = with_instance
+            ? types::Type::with_methods(with_instance.value(), std::move(*class_methods))
+            : hexlab::Result<types::TypePtr>(with_instance.error());
+        if (!with_class) {
+            plan.skipped.push_back("Category " + *category.name + " methods cannot form a project type");
+            continue;
+        }
+        const auto section = "categorylist section #" + std::to_string(category.categorylist_section);
+        add_definition(std::move(type_name), with_class.value(), section, category.categorylist_index,
+                       category.address->offset, 1);
+    }
     return plan;
 }
 

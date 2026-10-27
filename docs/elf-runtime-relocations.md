@@ -52,6 +52,10 @@ with these types:
 | PPC64 | `R_PPC64_GLOB_DAT` | 20 | `S + A` (low 64 bits) |
 | PPC64 | `R_PPC64_JMP_SLOT` | 21 | `S` |
 | PPC64 | `R_PPC64_RELATIVE` | 22 | `B + A` |
+| s390x | `R_390_64` | 22 | `S + A` (low 64 bits) |
+| s390x | `R_390_GLOB_DAT` | 10 | `S + A` (low 64 bits) |
+| s390x | `R_390_JMP_SLOT` | 11 | `S` |
+| s390x | `R_390_RELATIVE` | 12 | `B + A` |
 | RISC-V LP64 | `R_RISCV_32` | 1 | `S + A` (unsigned 32-bit field) |
 | RISC-V LP64 | `R_RISCV_64` | 2 | `S + A` (low 64 bits) |
 | RISC-V LP64 | `R_RISCV_RELATIVE` | 3 | `B + A` |
@@ -115,6 +119,19 @@ interpreted. External symbols use the
 same exact caller-supplied dependency and GNU-version binding rules as other
 supported symbol relocations; big-endian PPC64 and other PPC64 dynamic
 relocation types remain skipped.
+
+The s390x profile applies big-endian ELF64 `ET_DYN` dynamic RELA records for
+`R_390_RELATIVE`, `R_390_64`, `R_390_GLOB_DAT`, and `R_390_JMP_SLOT`.
+`RELATIVE` requires symbol index zero and uses checked `B + A`; `64` and
+`GLOB_DAT` use `S + A` with the ABI's low-64-bit result, while `JMP_SLOT`
+writes `S` and ignores its RELA addend. Each target must be an aligned,
+complete eight-byte field in writable initialized load memory, and its
+file-backed provenance must agree with the original image. Defined symbols
+must resolve inside the image or be absolute; undefined symbols require the
+same exact caller-supplied dependency and version binding used by other
+supported symbol relocations. s390x REL records, little-endian s390x, TLS,
+COPY, IFUNC, instruction relocations, and other relocation types remain
+unapplied.
 
 ELF64 pointer relocations and `R_X86_64_64` targets must be complete
 eight-byte fields in writable, initialized load memory. The x86-64 `PC32`,

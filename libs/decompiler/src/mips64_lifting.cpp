@@ -90,7 +90,27 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
             op == Opcode::mips64_tlti ? "mips64_tlti_conditional_trap" :
             op == Opcode::mips64_tltiu ? "mips64_tltiu_conditional_trap" :
             op == Opcode::mips64_teqi ? "mips64_teqi_conditional_trap" : "mips64_tnei_conditional_trap";
-        return intrinsic(instruction, name, IntrinsicMemoryEffect::none);
+        if (items.size() < 2)
+            return Intrinsic{"mips64_malformed_conditional_trap", {}, IntrinsicMemoryEffect::unknown};
+        const bool unsigned_compare = op == Opcode::mips64_tgeu || op == Opcode::mips64_tltu ||
+            op == Opcode::mips64_tgeiu || op == Opcode::mips64_tltiu;
+        const char *comparison = (op == Opcode::mips64_tge || op == Opcode::mips64_tgeu ||
+            op == Opcode::mips64_tgei || op == Opcode::mips64_tgeiu)
+            ? (unsigned_compare ? "uge" : "sge")
+            : (op == Opcode::mips64_tlt || op == Opcode::mips64_tltu ||
+               op == Opcode::mips64_tlti || op == Opcode::mips64_tltiu)
+                ? (unsigned_compare ? "ult" : "slt")
+                : (op == Opcode::mips64_teq || op == Opcode::mips64_teqi) ? "eq" : "ne";
+        auto condition = std::make_shared<Expression>(Expression{
+            integer(1), BinaryValue{comparison, operand(items[0]), operand(items[1])}});
+        Intrinsic result{name, {std::move(condition)}, IntrinsicMemoryEffect::none};
+        result.register_writes = instruction.register_writes;
+        // Register-register forms carry a third, non-predicate software trap
+        // code operand. The immediate encodings have no such field.
+        if (items.size() == 3) result.operands.push_back(operand(items[2]));
+        else if (items.size() != 2)
+            return Intrinsic{"mips64_malformed_conditional_trap", {}, IntrinsicMemoryEffect::unknown};
+        return result;
     }
 
     const auto fp_memory = [](ExpressionPtr address, std::uint16_t bits) -> ExpressionPtr {

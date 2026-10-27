@@ -422,11 +422,14 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             const bool x64 = metadata.header.machine == 62;
             const bool x32 = !metadata.header.is_64 && x64 && metadata.header.order == ByteOrder::little;
             const bool ppc64 = metadata.header.machine == 21;
+            const bool s390x = metadata.header.is_64 && metadata.header.machine == 22;
             const bool riscv = metadata.header.machine == 243;
             const bool riscv64 = riscv && metadata.header.is_64;
             const bool riscv32 = riscv && !metadata.header.is_64;
-            const auto relative_type = i386 || x64 ? 8u : arm32 ? 23u : ppc64 ? 22u : riscv ? 3u : 1027u;
-            const auto jump_slot_type = i386 || x64 ? 7u : arm32 ? 22u : ppc64 ? 21u : riscv ? 5u : 1026u;
+            const auto relative_type = i386 || x64 ? 8u : arm32 ? 23u : ppc64 ? 22u :
+                                       s390x ? 12u : riscv ? 3u : 1027u;
+            const auto jump_slot_type = i386 || x64 ? 7u : arm32 ? 22u : ppc64 ? 21u :
+                                        s390x ? 11u : riscv ? 5u : 1026u;
             const bool x32_relative = x32 && relocation.type == 8 &&
                                       relocation.kind == ElfRelocationKind::base_relative;
             const bool x32_relative64 = x32 && relocation.type == 38 &&
@@ -435,7 +438,9 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                                          ((metadata.header.is_64 &&
                                            (metadata.header.machine == 62 || metadata.header.machine == 183 || ppc64 || riscv64)) ||
                                           i386 || arm32 || riscv32 || x32_relative || x32_relative64);
-            if (!packed_relative && !ordinary_subset) {
+            const bool s390x_subset = s390x && metadata.header.order == ByteOrder::big;
+            const bool supported_architecture = ordinary_subset || s390x_subset;
+            if (!packed_relative && !supported_architecture) {
                 skip(index, "Ordinary REL/RELA runtime relocations are unsupported for this ELF class, byte order, or architecture");
                 continue;
             }
@@ -443,10 +448,14 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 skip(index, "PPC64 runtime relocation support requires RELA explicit addends");
                 continue;
             }
+            if (!packed_relative && s390x && !relocation.explicit_addend) {
+                skip(index, "s390x runtime relocation support requires big-endian RELA explicit addends");
+                continue;
+            }
             const bool relative = relocation.kind == ElfRelocationKind::base_relative &&
                                   (packed_relative || relocation.type == relative_type || x32_relative64);
             const bool symbol_slot = (!riscv &&
-                                      ((relocation.type == (arm32 ? 21u : i386 || x64 ? 6u : 1025u) &&
+                                      ((relocation.type == (arm32 ? 21u : s390x ? 10u : i386 || x64 ? 6u : 1025u) &&
                                         relocation.kind == ElfRelocationKind::global_data) ||
                                        (relocation.type == jump_slot_type &&
                                         relocation.kind == ElfRelocationKind::jump_slot))) ||
@@ -456,6 +465,10 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                                         relocation.kind == ElfRelocationKind::global_data;
             const bool ppc64_abs64 = ppc64 && relocation.type == 38 &&
                                      relocation.kind == ElfRelocationKind::absolute;
+            const bool s390x_abs64 = s390x && relocation.type == 22 &&
+                                     relocation.kind == ElfRelocationKind::absolute;
+            const bool s390x_glob_dat = s390x && relocation.type == 10 &&
+                                        relocation.kind == ElfRelocationKind::global_data;
             const bool riscv_32 = riscv && relocation.type == 1 &&
                                   relocation.kind == ElfRelocationKind::absolute;
             const bool riscv_64 = riscv64 && relocation.type == 2 &&
@@ -501,7 +514,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 !x64_64 && !x64_pc32 && !x64_32 && !x64_32s &&
                 !aarch64_abs64 && !aarch64_abs32 && !aarch64_abs16 &&
                 !aarch64_prel64 && !aarch64_prel32 && !aarch64_prel16 &&
-                !ppc64_glob_dat && !ppc64_abs64) {
+                !ppc64_glob_dat && !ppc64_abs64 && !s390x_glob_dat && !s390x_abs64) {
                 skip(index, i386
                     ? "Supported dynamic types are R_386_32, R_386_PC32, R_386_RELATIVE, R_386_GLOB_DAT, and R_386_JMP_SLOT"
                     : arm32
@@ -511,6 +524,8 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                                : "Supported dynamic types are R_RISCV_RELATIVE, R_RISCV_32, and R_RISCV_JUMP_SLOT")
                     : x64
                     ? "Supported dynamic types are R_X86_64_64, PC32, 32, 32S, RELATIVE, GLOB_DAT, and JUMP_SLOT"
+                    : s390x
+                    ? "Supported dynamic types are big-endian R_390_RELATIVE, R_390_64, R_390_GLOB_DAT, and R_390_JMP_SLOT"
                     : ppc64
                     ? "Supported dynamic types are R_PPC64_RELATIVE, GLOB_DAT, JMP_SLOT, and ADDR64"
                     : "Supported dynamic types are R_AARCH64_ABS64/32/16, PREL64/32/16, RELATIVE, GLOB_DAT, and JUMP_SLOT");
@@ -683,13 +698,15 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                         value = tagged_symbol;
                     }
                 } else if (symbol_with_addend || aarch64_abs64 || aarch64_abs32 || aarch64_abs16 ||
-                           aarch64_prel64 || aarch64_prel32 || aarch64_prel16 || ppc64_glob_dat || ppc64_abs64) {
+                           aarch64_prel64 || aarch64_prel32 || aarch64_prel16 || ppc64_glob_dat || ppc64_abs64 ||
+                           s390x_glob_dat || s390x_abs64) {
                     if (!relocation.addend) {
                         const auto relocation_name = aarch64_abs64 ? "R_AARCH64_ABS64" :
                             aarch64_abs32 ? "R_AARCH64_ABS32" : aarch64_abs16 ? "R_AARCH64_ABS16" :
                             aarch64_prel64 ? "R_AARCH64_PREL64" : aarch64_prel32 ? "R_AARCH64_PREL32" :
                             aarch64_prel16 ? "R_AARCH64_PREL16" :
                             ppc64_glob_dat ? "R_PPC64_GLOB_DAT" : ppc64_abs64 ? "R_PPC64_ADDR64" :
+                            s390x_glob_dat ? "R_390_GLOB_DAT" : s390x_abs64 ? "R_390_64" :
                             riscv_32 ? "R_RISCV_32" : "R_RISCV_64";
                         skip(index, std::string(relocation_name) +
                                         (relocation.explicit_addend ? " relocation addend is unavailable"
@@ -798,6 +815,10 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
             }
             if (!packed_relative && ppc64 && (relocation.place->offset & 7) != 0) {
                 skip(index, "PPC64 dynamic relocation target is not 8-byte aligned");
+                continue;
+            }
+            if (!packed_relative && s390x && (relocation.place->offset & 7) != 0) {
+                skip(index, "s390x dynamic relocation target is not 8-byte aligned");
                 continue;
             }
             if (arm32 && (relocation.place->offset & 3) != 0) {

@@ -98,12 +98,21 @@ Result<StopReply> parse_stop(std::string_view s) {
         if (colon != std::string_view::npos) {
             std::string key(item.substr(0, colon)), val(item.substr(colon + 1));
             if (key == "thread" && !parse_thread_id(val, result.thread)) return Error{ErrorCode::malformed, "invalid RSP stop thread"};
+            // Watchpoint reasons carry an address, not arbitrary opaque text.
+            // Validate here so malformed stop packets cannot be mistaken for
+            // owned watchpoint hits later in the backend.
+            if (key == "watch" || key == "rwatch" || key == "awatch") {
+                std::uint64_t address = 0;
+                if (val.empty() || val.size() > 16 || !parse_hex(val, address) || result.fields.contains(key))
+                    return Error{ErrorCode::malformed, "invalid or duplicate RSP watchpoint stop address"};
+            }
             if (key == "process") {
                 std::uint64_t process = 0;
                 if (val.size() > 16 || !parse_hex(val, process) || !process || result.fields.contains(key))
                     return Error{ErrorCode::malformed, "invalid RSP stop process"};
             }
-            result.fields.emplace(std::move(key), std::move(val));
+            if (!result.fields.emplace(std::move(key), std::move(val)).second)
+                return Error{ErrorCode::malformed, "duplicate RSP stop field"};
         }
         if (end == std::string_view::npos) break; fields.remove_prefix(end + 1);
     }

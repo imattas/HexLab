@@ -245,6 +245,10 @@ For targets identified as AArch64 by target XML, execute size `1` in the shared
 API becomes instruction kind `4` in `Z1`/`z1`; software `Z0`/`z0` likewise uses
 four bytes. Watchpoint sizes remain byte lengths. Stop replies with a watchpoint
 reason and an address within an enabled owned range populate `breakpoint_ids`.
+The stop parser accepts `watch`, `rwatch`, and `awatch` reason values only as
+one to sixteen hexadecimal digits and rejects duplicate stop fields (including
+duplicate watchpoint reasons). A malformed reason therefore fails the stop
+transaction instead of reaching breakpoint ownership matching.
 Execute/software hits require an explicit matching reason and `pc` address;
 generic traps or replies without an address do not guess ownership.
 
