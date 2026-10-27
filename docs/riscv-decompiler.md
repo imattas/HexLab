@@ -31,16 +31,29 @@ discards only the integer result; possible status effects remain. The intrinsic
 retains architectural clipping and NaN semantics without evaluating host C++
 casts or inventing a floating exception trap.
 
+The Zfa `FCVTMOD.W.D` conversion is decoded only for its fixed-RTZ encoding
+(`rs2=8`, `rm=RTZ`) and lifted as a typed opaque conversion. Its 32-bit signed
+modular result is sign-extended to XLEN, while its NV/NX effects accumulate
+into `fflags` like `FCVT.W.D`. The intrinsic keeps modulo-2^32 behavior visible
+to downstream analysis, including the specified zero result for NaN and
+infinity; it remains opaque and the lifter does not calculate conversion
+values or flags.
+Other Zfa conversion and rounding instructions, including FROUND/FROUNDNX,
+remain unsupported.
+
 Encodings and effects follow the official
 [F extension](https://docs.riscv.org/reference/isa/v20260120/unpriv/f-st-ext.html),
 [D extension](https://docs.riscv.org/reference/isa/v20260120/unpriv/d-st-ext.html),
+[Zfa extension](https://docs.riscv.org/reference/isa/v20260120/unpriv/zfa.html),
 and [RV32/64G listings](https://docs.riscv.org/reference/isa/v20260120/unpriv/rv-32-64g.html).
 All forms use OP-FP `0x53`. FCVT integer destinations use funct7 `0x60/0x61`
 (S/D source), integer sources use `0x68/0x69` (S/D destination), and rs2
 `0/1/2/3` selects W/WU/L/LU. FCVT.S.D uses funct7 `0x20`, rs2=1;
 FCVT.D.S uses `0x21`, rs2=0. FCLASS.S/D use funct7 `0x70/0x71`, rs2=0,
 funct3=1. W/WU and S/D precision conversions work at either XLEN; L/LU
-forms require RV64.
+forms require RV64. Zfa `FCVTMOD.W.D` is also accepted on RV32/RV64 when D
+is available; its encoding uses funct7 `0x61`, rs2=8, and the sole legal rm
+value RTZ (1).
 
 Floating-result intrinsics carry an explicit 32- or 64-bit result type into type recovery. Only FPR destinations receive that floating fact; integer results and `fflags` remain separate effects.
 

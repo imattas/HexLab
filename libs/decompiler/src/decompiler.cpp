@@ -2684,7 +2684,7 @@ a64_unhandled:
             effect.register_writes = instruction.register_writes;
             return effect;
         }
-        if (op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) {
+        if ((op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) || op == Opcode::rv_fcvtmod_w_d) {
             if (auto converted = lift_riscv_fp_conversion(instruction, operands)) return *converted;
             if ((op == Opcode::rv_flw || op == Opcode::rv_fld) && dst && operands.size() >= 2) {
                 auto loaded = *operands[1];
@@ -6548,7 +6548,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     current = &block;
                     break;
                 }
-            if (!current || current == switch_entry || !current->phis.empty())
+            if (!current || current == switch_entry)
                 return {};
             std::vector<const LiftedBlock *> path;
             std::set<std::uint64_t> visited;
@@ -6558,8 +6558,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         return current == prefix_block;
                     })))
                     return {};
-                if (!visited.insert(current->id.value).second || current->switch_dispatch ||
-                    (!current->phis.empty() && !has_only_terminal_return(*current)))
+                if (!visited.insert(current->id.value).second || current->switch_dispatch)
                     return {};
                 path.push_back(current);
                 if (has_only_terminal_return(*current)) break;
@@ -6598,64 +6597,99 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 ++path_use_count[block->id.value];
                 covered_blocks.insert(block->id.value);
             }
-        std::vector<std::uint64_t> common_blocks;
-        for (const auto &[block, count] : path_use_count)
-            if (count > 1) common_blocks.push_back(block);
-        const bool terminal_arms = common_blocks.empty();
-        const LiftedBlock *join = nullptr;
-        if (!terminal_arms) {
-            if (common_blocks.size() != 1)
-                return {};
-            const auto join_id = common_blocks.front();
-            for (const auto &path : paths)
-                if (path.back()->id.value != join_id || path.size() < 2)
-                    return {};
-            const auto found = std::find_if(function.blocks.begin(), function.blocks.end(), [&](const auto &block) {
-                return block.id.value == join_id;
-            });
-            if (found == function.blocks.end())
-                return {};
-            join = &*found;
-            if (targets.contains({join->begin.space.value, join->begin.offset}))
-                return {};
+        std::vector<const LiftedBlock *> shared_suffix;
+        std::vector<std::size_t> shared_suffix_begin(paths.size(), 0);
+        if (!paths.empty()) {
+            for (std::size_t index = 0; index < paths.front().size(); ++index) {
+                if (path_use_count[paths.front()[index]->id.value] <= 1) continue;
+                shared_suffix_begin[0] = index;
+                shared_suffix.assign(paths.front().begin() + static_cast<std::ptrdiff_t>(index), paths.front().end());
+                break;
+            }
         }
-        std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> join_phi_copies;
-        if (terminal_arms) {
-            if (std::any_of(paths.begin(), paths.end(), [&](const auto &path) {
-                    return std::any_of(path.begin(), path.end(), [&](const auto *block) {
-                        return path_use_count[block->id.value] != 1;
-                    });
-                }))
-                return {};
-        } else {
-            if (!join || join == switch_entry || !has_only_terminal_return(*join))
-                return {};
-            for (const auto &phi : join->phis) {
-                if (phi.inputs.size() != paths.size())
-                    return {};
-                for (const auto &path : paths) {
-                    const auto *tail = path[path.size() - 2];
-                    const auto input = std::find_if(phi.inputs.begin(), phi.inputs.end(), [&](const auto &candidate) {
-                        return candidate.predecessor == tail->id;
-                    });
-                    if (input == phi.inputs.end())
-                        return {};
-                    join_phi_copies[tail->id.value].emplace_back(
-                        register_name(phi.destination, phi.version),
-                        register_name(phi.destination, input->version));
+        const bool terminal_arms = shared_suffix.empty();
+        if (!terminal_arms) {
+            for (std::size_t path_index = 0; path_index < paths.size(); ++path_index) {
+                const auto &path = paths[path_index];
+                const auto first = std::find_if(path.begin(), path.end(), [&](const auto *block) {
+                    return path_use_count[block->id.value] > 1;
+                });
+                if (first == path.end()) return {};
+                const auto begin = static_cast<std::size_t>(std::distance(path.begin(), first));
+                if (path.size() - begin != shared_suffix.size()) return {};
+                shared_suffix_begin[path_index] = begin;
+                for (std::size_t suffix_index = 0; suffix_index < shared_suffix.size(); ++suffix_index)
+                    if (path[begin + suffix_index]->id != shared_suffix[suffix_index]->id) return {};
+            }
+            if (shared_suffix.front() == switch_entry) return {};
+        } else if (std::any_of(paths.begin(), paths.end(), [&](const auto &path) {
+                       return std::any_of(path.begin(), path.end(), [&](const auto *block) {
+                           return path_use_count[block->id.value] != 1;
+                       });
+                   })) {
+            return {};
+        }
+
+        // Each arm is a proven linear path. Derive its exact incoming-edge set
+        // and lower every register phi on that edge, including phis before the
+        // shared suffix and in its later blocks. A malformed or extra input
+        // keeps the lossless fallback instead of inventing a merge value.
+        using PhiEdge = std::pair<std::uint64_t, std::uint64_t>;
+        std::map<std::uint64_t, std::set<std::uint64_t>> path_predecessors;
+        for (const auto &path : paths) {
+            std::uint64_t predecessor = switch_entry->id.value;
+            for (const auto *block : path) {
+                path_predecessors[block->id.value].insert(predecessor);
+                predecessor = block->id.value;
+            }
+        }
+        std::map<PhiEdge, std::vector<std::pair<std::string, std::string>>> phi_edge_copies;
+        std::set<std::uint64_t> validated_phi_blocks;
+        for (const auto &path : paths) {
+            for (const auto *block : path) {
+                if (!validated_phi_blocks.insert(block->id.value).second) continue;
+                const auto &expected = path_predecessors.at(block->id.value);
+                for (const auto &phi : block->phis) {
+                    if (phi.inputs.size() != expected.size()) return {};
+                    std::set<std::uint64_t> seen_inputs;
+                    for (const auto &input : phi.inputs) {
+                        if (!expected.contains(input.predecessor.value) ||
+                            !seen_inputs.insert(input.predecessor.value).second) return {};
+                        phi_edge_copies[{input.predecessor.value, block->id.value}].emplace_back(
+                            register_name(phi.destination, phi.version),
+                            register_name(phi.destination, input.version));
+                    }
                 }
+                const auto valid_memory_inputs = [&](const auto &inputs) {
+                    if (inputs.size() != expected.size()) return false;
+                    std::set<std::uint64_t> seen_inputs;
+                    for (const auto &input : inputs)
+                        if (!expected.contains(input.predecessor.value) ||
+                            !seen_inputs.insert(input.predecessor.value).second) return false;
+                    return true;
+                };
+                if (block->memory_phi && !valid_memory_inputs(block->memory_phi->inputs)) return {};
+                std::set<std::string> partition_names;
+                for (const auto &phi : block->memory_partition_phis)
+                    if (phi.partition.empty() || !partition_names.insert(phi.partition).second ||
+                        !valid_memory_inputs(phi.inputs)) return {};
             }
         }
         if (covered_blocks.size() != function.blocks.size())
             return {};
-        auto emit_switch_path = [&](const std::vector<const LiftedBlock *> &path, unsigned switch_indent) {
+        auto emit_switch_path = [&](const std::vector<const LiftedBlock *> &path,
+                                    std::size_t shared_begin, unsigned switch_indent) {
             const auto body_indent = switch_indent + 4;
-            const auto end = terminal_arms ? path.size() : path.size() - 1;
-            for (std::size_t i = 0; i < end; ++i)
+            const auto end = terminal_arms ? path.size() : shared_begin;
+            std::uint64_t predecessor = switch_entry->id.value;
+            for (std::size_t i = 0; i < end; ++i) {
+                emit_parallel_copies(out, phi_edge_copies[{predecessor, path[i]->id.value}], body_indent);
                 emit_block(*path[i], body_indent, true);
+                predecessor = path[i]->id.value;
+            }
             if (!terminal_arms) {
-                const auto *tail = path[end - 1];
-                emit_parallel_copies(out, join_phi_copies[tail->id.value], body_indent);
+                const auto *shared = path[shared_begin];
+                emit_parallel_copies(out, phi_edge_copies[{predecessor, shared->id.value}], body_indent);
                 out << std::string(body_indent, ' ') << "break;\n";
             }
         };
@@ -6667,14 +6701,19 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 out << std::string(indent, ' ') << "case 0x" << std::hex << item.value << std::dec << ":\n";
                 const auto target_key = std::pair{item.target.space.value, item.target.offset};
                 const auto path_index = static_cast<std::size_t>(std::distance(targets.begin(), targets.find(target_key)));
-                emit_switch_path(paths[path_index], indent);
+                emit_switch_path(paths[path_index], shared_suffix_begin[path_index], indent);
             }
             out << std::string(indent, ' ') << "default:\n";
             const auto default_key = std::pair{dispatch.default_target->space.value, dispatch.default_target->offset};
             const auto default_index = static_cast<std::size_t>(std::distance(targets.begin(), targets.find(default_key)));
-            emit_switch_path(paths[default_index], indent);
+            emit_switch_path(paths[default_index], shared_suffix_begin[default_index], indent);
             out << std::string(indent, ' ') << "}\n";
-            if (join) emit_block(*join, indent);
+            for (std::size_t suffix_index = 0; suffix_index < shared_suffix.size(); ++suffix_index) {
+                if (suffix_index != 0)
+                    emit_parallel_copies(out, phi_edge_copies[{shared_suffix[suffix_index - 1]->id.value,
+                                                               shared_suffix[suffix_index]->id.value}], indent);
+                emit_block(*shared_suffix[suffix_index], indent, true);
+            }
         };
         out << "function " << address_label(function.entry) << "() {\n";
         if (switch_guard) {

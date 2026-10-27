@@ -35,6 +35,18 @@ const char *section_type_name(std::uint8_t value) {
     default: return "unknown";
     }
 }
+const char *ffs_disposition_name(firmware::UefiFfsFileDisposition value) {
+    switch (value) {
+    case firmware::UefiFfsFileDisposition::construction: return "construction";
+    case firmware::UefiFfsFileDisposition::header_valid: return "header-valid";
+    case firmware::UefiFfsFileDisposition::data_valid: return "data-valid";
+    case firmware::UefiFfsFileDisposition::marked_for_update: return "marked-for-update";
+    case firmware::UefiFfsFileDisposition::deleted: return "deleted";
+    case firmware::UefiFfsFileDisposition::header_invalid: return "header-invalid";
+    case firmware::UefiFfsFileDisposition::unrecognized_state: return "unrecognized";
+    }
+    return "unrecognized";
+}
 void append_utf8(std::string &out, std::uint32_t codepoint) {
     if (codepoint <= 0x7f) {
         out.push_back(static_cast<char>(codepoint));
@@ -152,6 +164,7 @@ int run_uefi_firmware_cli(std::span<const std::wstring_view> args, std::ostream 
                     << " size=" << hex_value(entry.size)
                     << " header=" << hex_value(entry.header_size)
                     << " state=" << hex_value(entry.state)
+                    << " disposition=" << ffs_disposition_name(entry.disposition)
                     << " data-offset=" << hex_value(volume.file_offset + entry.data_offset)
                     << " data-size=" << hex_value(entry.data_size)
                     << " header-checksum=" << (entry.header_checksum_valid ? "valid" : "not-valid")
@@ -227,6 +240,8 @@ int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &
         out << "Format: UEFI FMP Capsule\n"
             << "Capsule: guid=" << firmware::uefi_guid_string(capsule.capsule_guid)
             << " header-size=" << hex_value(capsule.header_size)
+            << " header-extension-offset=" << hex_value(capsule.header_extension_offset)
+            << " header-extension-size=" << hex_value(capsule.header_extension_size)
             << " flags=" << hex_value(capsule.flags)
             << " image-size=" << hex_value(capsule.image_size) << '\n'
             << "FMP: version=" << capsule.fmp_version
@@ -250,8 +265,8 @@ int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &
             }
             out << '\n';
         }
-        if (capsule.image_size < view.bytes.size())
-            out << "Trailing bytes: " << (view.bytes.size() - capsule.image_size) << '\n';
+        if (capsule.trailing_size != 0)
+            out << "Trailing bytes: " << capsule.trailing_size << '\n';
         out << "Payload contents were not extracted or executed.\n";
         return 0;
     } catch (const std::exception &error) {

@@ -28,8 +28,13 @@ struct UefiCapsuleItem {
 struct UefiCapsule {
     std::array<std::uint8_t, 16> capsule_guid{};
     std::uint32_t header_size = 0;
+    // Bytes between the fixed EFI_CAPSULE_HEADER and HeaderSize are retained
+    // as an opaque extension. Offsets are relative to the capsule input.
+    std::uint64_t header_extension_offset = 28;
+    std::uint64_t header_extension_size = 0;
     std::uint32_t flags = 0;
     std::uint32_t image_size = 0;
+    std::uint64_t trailing_size = 0;
     std::uint32_t fmp_version = 0;
     std::uint16_t embedded_driver_count = 0;
     std::uint16_t payload_count = 0;

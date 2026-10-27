@@ -145,6 +145,8 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
     else if (opcode_index >= 341 && opcode_index <= 348)
         opcode = std::array{Opcode::rv_vredsum, Opcode::rv_vredand, Opcode::rv_vredor, Opcode::rv_vredxor,
             Opcode::rv_vredminu, Opcode::rv_vredmin, Opcode::rv_vredmaxu, Opcode::rv_vredmax}[opcode_index - 341];
+    else if (opcode_index == 349)
+        opcode = Opcode::rv_fcvtmod_w_d;
     else
         return {DecodeStatus::invalid, {}, "RV64 opcode has no generic representation"};
 

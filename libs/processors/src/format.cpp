@@ -572,6 +572,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         static constexpr const char *csr_names[]{"csrrw", "csrrs", "csrrc", "csrrwi", "csrrsi", "csrrci"};
         return csr_names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_csrrw)];
     }
+    if (op == Opcode::rv_fcvtmod_w_d) return "fcvtmod.w.d";
     if (op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) {
         static constexpr const char *fp_names[]{
             "flw","fld","fsw","fsd","fadd.s","fsub.s","fmul.s","fdiv.s","fsqrt.s","fsgnj.s","fsgnjn.s","fsgnjx.s","fmin.s","fmax.s","fmadd.s","fmsub.s","fnmsub.s","fnmadd.s","feq.s","flt.s","fle.s","fclass.s","fcvt.w.s","fcvt.wu.s","fcvt.l.s","fcvt.lu.s","fcvt.s.w","fcvt.s.wu","fcvt.s.l","fcvt.s.lu","fmv.x.w","fmv.w.x",
