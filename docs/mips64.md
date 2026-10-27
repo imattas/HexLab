@@ -11,6 +11,13 @@ The word forms inspect the low 32 bits and the architecture requires that
 their source be a sign-extended word for predictable results. That runtime
 source constraint is not checked. Release 6's recoded SPECIAL forms are not
 decoded because this processor context does not select an ISA revision.
+The same SPECIAL2 table decodes pre-Release 6 word `MADD`, `MADDU`, `MSUB`,
+and `MSUBU`, requiring zero `rd` and shift fields. Their facts read both GPR
+inputs and HI/LO, and write HI/LO. The lifter retains low-word inputs and the
+64-bit accumulator pair in named typed intrinsics; runtime word-value
+constraints, exact HI/LO result extension, and arithmetic evaluation remain
+unmodeled. ISA revision selection is unavailable, so these legacy encodings
+are accepted in the generic MIPS64 context.
 
 The MIPS64 Release 2 SPECIAL3 decoder recognizes DEXT/DEXTM/DEXTU and
 DINS/DINSM/DINSU. It validates each instruction's position and field-size

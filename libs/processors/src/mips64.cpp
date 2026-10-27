@@ -360,6 +360,15 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
     } else if (op == 0x1c) {
         // Pre-Release 6 SPECIAL2 count-leading forms. In these encodings the
         // architecture requires rt == rd for compliant software.
+        if (funct == 0x00 || funct == 0x01 || funct == 0x04 || funct == 0x05) {
+            if (rd || shamt) return invalid("Reserved MIPS64 SPECIAL2 multiply-accumulate encoding");
+            i.opcode = funct == 0x00 ? Opcode::mips64_madd : funct == 0x01 ? Opcode::mips64_maddu :
+                       funct == 0x04 ? Opcode::mips64_msub : Opcode::mips64_msubu;
+            i.operands = {reg(rs), reg(rt)};
+            i.access = {OperandAccess::read, OperandAccess::read};
+            i.register_reads = {reg(rs), reg(rt), hi, lo};
+            i.register_writes = {hi, lo};
+        } else {
         Opcode opcode;
         switch (funct) {
         case 0x20: opcode = Opcode::mips_clz; break;
@@ -375,6 +384,7 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         i.access = {OperandAccess::write, OperandAccess::read};
         if (rs) i.register_reads = {reg(rs)};
         if (rd) i.register_writes = {reg(rd)};
+        }
     } else if (op == 0x1f) {
         // MIPS64 Release 2 SPECIAL3 doubleword extract/insert fields. The
         // three encodings divide the architectural field range into the

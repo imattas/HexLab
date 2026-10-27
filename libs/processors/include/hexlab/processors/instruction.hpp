@@ -480,7 +480,9 @@ enum class Opcode {
     // Legacy SSSE3 horizontal integer operations; append for persisted IDs.
     phaddw, phaddd, phaddsw, phsubw, phsubd, phsubsw,
     // SSSE3 byte shuffle; appended to preserve persisted opcode IDs.
-    pshufb
+    pshufb,
+    // MIPS64 pre-Release 6 SPECIAL2 word multiply-accumulate operations.
+    mips64_madd, mips64_maddu, mips64_msub, mips64_msubu
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
