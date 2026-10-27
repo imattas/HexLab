@@ -1,4 +1,4 @@
-hexlab_add_library(loaders SOURCES src/detect.cpp src/recipe.cpp src/raw.cpp src/ar.cpp src/ar_elf.cpp src/ar_coff.cpp src/ar_macho.cpp src/elf_link.cpp src/elf32_link.cpp src/coff_link.cpp src/macho_link.cpp src/pe_headers.cpp src/elf_headers.cpp src/macho_headers.cpp
+hexlab_add_library(loaders SOURCES src/detect.cpp src/recipe.cpp src/raw.cpp src/ar.cpp src/ar_elf.cpp src/ar_coff.cpp src/ar_macho.cpp src/elf_link.cpp src/elf_dependency_resolution.cpp src/elf32_link.cpp src/coff_link.cpp src/macho_link.cpp src/pe_headers.cpp src/elf_headers.cpp src/macho_headers.cpp
   src/pe_imports.cpp src/pe_bound_imports.cpp src/pe_delay_imports.cpp src/pe_certificates.cpp src/pe_exports.cpp src/pe_relocations.cpp src/pe_tls.cpp src/pe_load_config.cpp src/pe_chpe.cpp src/x86_raw_profile.cpp src/x86_profile_codec.cpp src/arm_raw_profile.cpp
   src/pe_exceptions.cpp src/pe_rtti.cpp src/minidump.cpp
   src/segmented_raw.cpp src/elf_sections.cpp src/elf_core.cpp src/elf_image.cpp src/elf_symbols.cpp src/elf_symbol_versions.cpp src/elf_relocations.cpp

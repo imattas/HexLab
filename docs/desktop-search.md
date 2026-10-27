@@ -12,6 +12,16 @@ for every document with a continuation. Closing a document removes its rows;
 editing a source invalidates only that document's cached matches. Search work
 continues on the analysis pool, not the GUI thread.
 
+With all-open-documents search active, **Find Next** advances through the
+active document's loaded results, then checks the other open searchable
+documents in tab order. It loads the next page of the first document that has
+more results and follows its first new match. **Find Previous** moves backward
+through loaded results and then checks other documents in reverse tab order,
+starting at the last loaded result in an unvisited document. If no other
+loaded result is available while a search page is pending, Find Next reports
+that it is waiting; use it again after the page completes. Single-document
+search keeps its existing per-document Find Next/Previous behavior.
+
 Literal text searches encode their UTF-8 input as ASCII, UTF-8, UTF-16LE,
 UTF-16BE, UTF-32LE, or UTF-32BE. UTF-16 queries encode supplementary Unicode
 characters as surrogate pairs; UTF-32 queries encode each Unicode scalar in the

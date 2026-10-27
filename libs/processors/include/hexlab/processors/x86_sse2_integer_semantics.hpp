@@ -2,6 +2,7 @@
 
 #include "hexlab/processors/instruction.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -30,6 +31,11 @@ inline void store_lane(std::array<std::byte, 16> &value, unsigned offset,
     for (unsigned i = 0; i < width / 8; ++i)
         value[offset + i] = static_cast<std::byte>(lane >> (i * 8));
 }
+inline std::int64_t signed_lane(std::uint64_t value, unsigned width) noexcept {
+    const auto sign = UINT64_C(1) << (width - 1);
+    return (value & sign) ? static_cast<std::int64_t>(value) - static_cast<std::int64_t>(UINT64_C(1) << width)
+                          : static_cast<std::int64_t>(value);
+}
 inline bool supported(Opcode opcode) noexcept {
     switch (opcode) {
     case Opcode::paddb: case Opcode::paddw: case Opcode::paddd: case Opcode::paddq:
@@ -45,6 +51,9 @@ inline bool supported(Opcode opcode) noexcept {
     case Opcode::phaddw: case Opcode::phaddd: case Opcode::phaddsw:
     case Opcode::phsubw: case Opcode::phsubd: case Opcode::phsubsw:
     case Opcode::pshufb:
+    case Opcode::pminub: case Opcode::pmaxub: case Opcode::pminsw: case Opcode::pmaxsw:
+    case Opcode::pmullw: case Opcode::pmulhw: case Opcode::pmulhuw:
+    case Opcode::pmuludq: case Opcode::pmaddwd:
         return true;
     default: return false;
     }
@@ -103,12 +112,17 @@ inline std::optional<X86Sse2PackedIntegerResult> evaluate_x86_sse2_packed_intege
     case Opcode::paddw: case Opcode::psubw: case Opcode::paddsw: case Opcode::paddusw:
     case Opcode::psubsw: case Opcode::psubusw: case Opcode::pcmpeqw: case Opcode::pcmpgtw:
     case Opcode::psllw: case Opcode::psrlw: case Opcode::psraw:
+    case Opcode::pminsw: case Opcode::pmaxsw: case Opcode::pmullw: case Opcode::pmulhw:
+    case Opcode::pmulhuw:
     case Opcode::phaddw: case Opcode::phaddsw: case Opcode::phsubw: case Opcode::phsubsw:
         lane_bits = 16; break;
     case Opcode::phaddd: case Opcode::phsubd:
         lane_bits = 32; break;
+    case Opcode::pmuludq: lane_bits = 64; break;
+    case Opcode::pmaddwd: lane_bits = 32; break;
     case Opcode::paddb: case Opcode::psubb: case Opcode::paddsb: case Opcode::paddusb:
     case Opcode::psubsb: case Opcode::psubusb: case Opcode::pcmpeqb: case Opcode::pcmpgtb:
+    case Opcode::pminub: case Opcode::pmaxub:
         lane_bits = 8; break;
     default: break;
     }
@@ -139,6 +153,28 @@ inline std::optional<X86Sse2PackedIntegerResult> evaluate_x86_sse2_packed_intege
                 }
                 store_lane(result.bytes, half * 8 + pair * lane_bytes, lane_bits, value);
             }
+        }
+        return result;
+    }
+    // These instructions widen or select lanes and therefore cannot use the
+    // ordinary one-result-per-input-lane loop below.
+    if (op == Opcode::pmuludq) {
+        for (unsigned lane = 0; lane < 2; ++lane) {
+            const auto offset = lane * 8;
+            const auto product = load_lane(left, offset, 32) * load_lane(right, offset, 32);
+            store_lane(result.bytes, offset, 64, product);
+        }
+        return result;
+    }
+    if (op == Opcode::pmaddwd) {
+        for (unsigned lane = 0; lane < 4; ++lane) {
+            const auto offset = lane * 4;
+            const auto a0 = signed_lane(load_lane(left, offset, 16), 16);
+            const auto a1 = signed_lane(load_lane(left, offset + 2, 16), 16);
+            const auto b0 = signed_lane(load_lane(right, offset, 16), 16);
+            const auto b1 = signed_lane(load_lane(right, offset + 2, 16), 16);
+            const auto sum = static_cast<std::int64_t>(a0) * b0 + static_cast<std::int64_t>(a1) * b1;
+            store_lane(result.bytes, lane * 4, 32, static_cast<std::uint64_t>(sum));
         }
         return result;
     }
@@ -180,6 +216,21 @@ inline std::optional<X86Sse2PackedIntegerResult> evaluate_x86_sse2_packed_intege
             value = (a + b) & lane_mask;
         else if (op == Opcode::psubd || op == Opcode::psubq || op == Opcode::psubb || op == Opcode::psubw)
             value = (a - b) & lane_mask;
+        else if (op == Opcode::pminub) value = std::min(a, b);
+        else if (op == Opcode::pmaxub) value = std::max(a, b);
+        else if (op == Opcode::pminsw || op == Opcode::pmaxsw) {
+            const auto signed_a = signed_lane(a, 16);
+            const auto signed_b = signed_lane(b, 16);
+            value = static_cast<std::uint16_t>(op == Opcode::pminsw
+                ? std::min(signed_a, signed_b) : std::max(signed_a, signed_b));
+        }
+        else if (op == Opcode::pmullw) value = (a * b) & lane_mask;
+        else if (op == Opcode::pmulhuw) value = ((a * b) >> 16) & lane_mask;
+        else if (op == Opcode::pmulhw) {
+            const auto product = static_cast<std::int32_t>(signed_lane(a, 16)) *
+                                 static_cast<std::int32_t>(signed_lane(b, 16));
+            value = static_cast<std::uint32_t>(product) >> 16;
+        }
         else if (op == Opcode::paddusb || op == Opcode::paddusw)
             value = a + b > lane_mask ? lane_mask : a + b;
         else if (op == Opcode::psubusb || op == Opcode::psubusw)

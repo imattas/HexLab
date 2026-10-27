@@ -52,6 +52,8 @@ class SessionController final : public wxEvtHandler {
     Result<bool> more_results(DocumentId, bool follow = false);
     Result<bool> find_next(DocumentId);
     Result<bool> find_previous(DocumentId);
+    Result<bool> find_next_all(DocumentId);
+    Result<bool> find_previous_all(DocumentId);
     bool search_pending(DocumentId) const;
     bool read_pending(DocumentId) const;
     Result<bool> request_graph(DocumentId, std::optional<Location>, GraphKind, std::size_t call_depth = 1);
