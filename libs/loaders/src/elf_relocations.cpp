@@ -203,6 +203,7 @@ Field field(const ElfHeader &header, std::uint32_t type) {
     }
     if (header.machine == 22 && header.is_64) {
         switch (type) {
+        case 5: return {K::pc_relative, 4}; // R_390_PC32
         case 10: return {K::global_data, 8}; // R_390_GLOB_DAT
         case 11: return {K::jump_slot, 8}; // R_390_JMP_SLOT
         case 12: return {K::base_relative, 8}; // R_390_RELATIVE

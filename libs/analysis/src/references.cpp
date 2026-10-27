@@ -249,6 +249,13 @@ std::optional<std::int64_t> riscv_signed_immediate(const Instruction &instructio
     if (!value || value->encoded_width != width || !value->is_signed) return {};
     return std::bit_cast<std::int64_t>(value->value);
 }
+std::optional<std::uint64_t> riscv_unsigned_immediate(const Instruction &instruction, std::size_t index,
+                                                       std::uint8_t width) {
+    if (index >= instruction.operands.size()) return {};
+    const auto *value = std::get_if<ImmediateOperand>(&instruction.operands[index]);
+    if (!value || value->encoded_width != width || value->is_signed) return {};
+    return value->value;
+}
 const RegisterOperand *riscv_register(const Instruction &instruction, std::size_t index) {
     if (index >= instruction.operands.size()) return nullptr;
     const auto *reg = std::get_if<RegisterOperand>(&instruction.operands[index]);
@@ -2118,6 +2125,51 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
                     registers[dst->index] = std::move(*definition);
                     if (riscv_target_segment(*image, *target, OperandAccess::address))
                         result.immediate_targets[{fact->id, 2}] = *target;
+                }
+                propagated = true;
+            } else if ((instruction.opcode == Opcode::rv_slli || instruction.opcode == Opcode::rv_srli ||
+                        instruction.opcode == Opcode::rv_srai) && instruction.operands.size() == 3) {
+                const auto *dst = riscv_register(instruction, 0);
+                const auto *src = riscv_register(instruction, 1);
+                const auto shift = riscv_unsigned_immediate(instruction, 2,
+                    instruction.opcode == Opcode::rv_slli || width == 64 ? 6 : 5);
+                std::optional<RiscvAddressValue> definition;
+                std::uint64_t value = 0;
+                bool known = false;
+                const auto mask = width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
+                if (src && src->width == width && shift && *shift < width) {
+                    const RiscvAddressValue *base = nullptr;
+                    if (!src->index) {
+                        base = nullptr;
+                        known = true;
+                    } else if (const auto found = registers.find(src->index); found != registers.end() &&
+                               found->second.address.space == instruction.address.space) {
+                        base = &found->second;
+                        known = true;
+                    }
+                    if (known) {
+                        const auto input = base ? base->address.offset & mask : 0;
+                        if (instruction.opcode == Opcode::rv_slli) value = (input << *shift) & mask;
+                        else if (instruction.opcode == Opcode::rv_srli) value = input >> *shift;
+                        else if (width == 32) {
+                            const auto signed_input = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(input));
+                            value = static_cast<std::uint32_t>(signed_input >> *shift);
+                        } else {
+                            const auto signed_input = std::bit_cast<std::int64_t>(input);
+                            value = static_cast<std::uint64_t>(signed_input >> *shift);
+                        }
+                        const Address target{base ? base->address.space : instruction.address.space, value & mask};
+                        definition = riscv_definition(target, fact->id, base);
+                        if (dst && dst->index && dst->width == width && base &&
+                            riscv_target_segment(*image, target, OperandAccess::address))
+                            record_producers({fact->id, 2}, fact->id, *base);
+                    }
+                }
+                erase_written();
+                if (dst && dst->index && dst->width == width && definition) {
+                    registers[dst->index] = std::move(*definition);
+                    if (riscv_target_segment(*image, registers[dst->index].address, OperandAccess::address))
+                        result.immediate_targets[{fact->id, 2}] = registers[dst->index].address;
                 }
                 propagated = true;
             } else if (instruction.operands.size() == 3 &&

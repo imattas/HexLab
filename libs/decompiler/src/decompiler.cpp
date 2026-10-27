@@ -4020,6 +4020,8 @@ a64_unhandled:
                 for (const auto &operand : operands)
                     typed_operands.push_back(retag_expr(operand, operand_type));
             }
+            if (x86_scalar_arithmetic)
+                typed_operands.push_back(reg_expr(RegisterOperand{RegisterBank::mxcsr, 0, 32, false}));
 
             Intrinsic effect{"x86_" + operation_name(instruction.opcode) + suffix,
                              std::move(typed_operands),

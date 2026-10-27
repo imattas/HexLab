@@ -31,6 +31,18 @@ only runs containing a non-ASCII scalar, retain original file/address extents,
 and use UTF-8 previews. These mappings are heuristic; overlapping
 interpretations are retained.
 
+Windows-1253 and Windows-1255 add Greek and Hebrew Windows-code-page
+candidates. Both use explicit fixed tables, end a candidate at undefined byte
+positions, require at least one non-ASCII scalar, and retain the original byte
+extent with a UTF-8 preview. They are heuristic candidates and may overlap the
+other encodings. Their persisted `StringEncoding` values are appended as 10 and
+11; derived-cache version 26 accepts them while older cache payloads are
+recomputed.
+
+`hexlab_cli disassemble <path> --show-strings` lists candidate encoding names,
+file offsets, extents, and previews. The desktop Strings view uses the same
+Windows-1253 and Windows-1255 labels.
+
 All encoding passes use the same file-backed scan domains, string-record budget,
 and cancellation checks. Returned previews are UTF-8, while each record retains
 the source byte length and encoding identity.

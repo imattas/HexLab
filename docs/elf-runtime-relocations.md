@@ -53,6 +53,7 @@ with these types:
 | PPC64 | `R_PPC64_JMP_SLOT` | 21 | `S` |
 | PPC64 | `R_PPC64_RELATIVE` | 22 | `B + A` |
 | s390x | `R_390_64` | 22 | `S + A` (low 64 bits) |
+| s390x | `R_390_PC32` | 5 | `S + A - P` (low 32 bits) |
 | s390x | `R_390_GLOB_DAT` | 10 | `S + A` (low 64 bits) |
 | s390x | `R_390_JMP_SLOT` | 11 | `S` |
 | s390x | `R_390_RELATIVE` | 12 | `B + A` |
@@ -121,11 +122,17 @@ supported symbol relocations; big-endian PPC64 and other PPC64 dynamic
 relocation types remain skipped.
 
 The s390x profile applies big-endian ELF64 `ET_DYN` dynamic RELA records for
-`R_390_RELATIVE`, `R_390_64`, `R_390_GLOB_DAT`, and `R_390_JMP_SLOT`.
+`R_390_PC32`, `R_390_RELATIVE`, `R_390_64`, `R_390_GLOB_DAT`, and
+`R_390_JMP_SLOT`.
 `RELATIVE` requires symbol index zero and uses checked `B + A`; `64` and
 `GLOB_DAT` use `S + A` with the ABI's low-64-bit result, while `JMP_SLOT`
-writes `S` and ignores its RELA addend. Each target must be an aligned,
-complete eight-byte field in writable initialized load memory, and its
+writes `S` and ignores its RELA addend. `PC32` computes `S + A - P`, requires
+signed-32-bit representability and an even result, then stores the ABI word32
+value in a complete four-byte field, as specified by the
+[zSeries ELF ABI](https://refspecs.linuxfoundation.org/ELF/zSeries/lzsabi0_zSeries/x1633.html); it requires a valid
+runtime place and exact symbol resolution but no eight-byte alignment. The
+other four types require aligned, complete eight-byte fields in writable
+initialized load memory, and their
 file-backed provenance must agree with the original image. Defined symbols
 must resolve inside the image or be absolute; undefined symbols require the
 same exact caller-supplied dependency and version binding used by other

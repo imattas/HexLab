@@ -40,6 +40,12 @@ double precision. Long mode supports XMM0–XMM15 through REX register fields;
 truncated, malformed prefix combinations are invalid, and instructions outside
 the implemented subset remain unsupported.
 
+Legacy scalar `ADDSS/ADDSD`, `SUBSS/SUBSD`, `MULSS/MULSD`, and `DIVSS/DIVSD`
+carry an implicit whole-MXCSR read/write dependency in the decoded effects and
+typed lift. The lift passes the incoming MXCSR value to the scalar arithmetic
+intrinsic and defines an opaque outgoing MXCSR version. It does not calculate
+rounding, sticky exception flags, or unmasked-exception retirement.
+
 Packed comparisons use destructive XMM destinations and do not modify EFLAGS.
 The packed integer execution helper evaluates byte/word/dword/qword wrapping
 add/sub, byte/word signed and unsigned saturating add/sub, bitwise logic, and

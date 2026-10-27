@@ -92,15 +92,6 @@ bool immediate_packed_shift(State &state, std::uint8_t opcode) {
         else invalid("Reserved immediate packed qword-shift group");
     }
     state.i.opcode = operation;
-    if (opcode == 0x58 || opcode == 0x5c || opcode == 0x59) {
-        // Packed FP arithmetic consumes MXCSR control bits and may set its
-        // sticky exception flags. Keep the whole architectural register as
-        // an implicit read/write dependency until bit-level MXCSR semantics
-        // are available.
-        constexpr RegisterOperand mxcsr{RegisterBank::mxcsr, 0, 32, false};
-        state.i.register_reads.push_back(mxcsr);
-        state.i.register_writes.push_back(mxcsr);
-    }
     state.operand(std::move(decoded.rm), OperandAccess::read_write);
     state.operand(state.immediate(8, 8, false), OperandAccess::read);
     return true;
@@ -219,6 +210,17 @@ bool simd(State &state, std::uint8_t opcode, bool extended) {
     require_prefix(state, prefix);
     auto decoded = vector_modrm(state, memory_width);
     state.i.opcode = operation;
+    if (operation == Opcode::addss || operation == Opcode::addsd ||
+        operation == Opcode::subss || operation == Opcode::subsd ||
+        operation == Opcode::mulss || operation == Opcode::mulsd ||
+        operation == Opcode::divss || operation == Opcode::divsd) {
+        // Scalar SSE arithmetic reads MXCSR controls and may set sticky
+        // exception flags. Keep a whole-register dependency until those
+        // control and exception effects are evaluated precisely.
+        constexpr RegisterOperand mxcsr{RegisterBank::mxcsr, 0, 32, false};
+        state.i.register_reads.push_back(mxcsr);
+        state.i.register_writes.push_back(mxcsr);
+    }
     if (move) {
         if (store) {
             state.operand(std::move(decoded.rm), OperandAccess::write);
