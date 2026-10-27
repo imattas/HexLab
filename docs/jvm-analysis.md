@@ -18,8 +18,20 @@ attributes are accepted only on method declarations, duplicate occurrences
 are rejected, and their payloads must be consumed exactly within the declared
 attribute extent. CLI summaries show declaration and parameter annotation
 visibility, owner, descriptor, and element count, and print annotation default
-values. Type annotations and annotations nested in record-component attribute
-lists are not yet retained.
+values. Runtime-visible and runtime-invisible type annotations are retained on
+classes, fields, methods, and Code attributes. Their target_info bytes are
+preserved in class-file order, type paths are decoded and validated, and Code
+targets are checked against code length, local slots, and exception-table size.
+The CLI shows visibility, owner, target type, path length, descriptor, and
+element count. Type annotations nested in record-component attribute lists are
+not yet retained.
+
+Field `ConstantValue` attributes are retained after strict field-owner,
+uniqueness, payload-length, constant-pool-tag, and descriptor checks. Numeric
+values preserve their raw constant-pool bits; string values expose the resolved
+modified-UTF-8 text. CLI field summaries show the value, with numeric values in
+hexadecimal to preserve NaN payloads and signed zero. The metadata remains
+partial only for other unsupported attributes.
 
 Source and Code debug metadata includes the class-level `SourceFile`, each
 method's optional `LineNumberTable`, and `LocalVariableTable`. The loader

@@ -2517,6 +2517,35 @@ a64_unhandled:
         if (!instruction.operands.empty()) {
             const auto destination = as_register(instruction.operands[0]);
             const auto op = instruction.opcode;
+            if (destination && destination->bank == RegisterBank::mips_gpr &&
+                (op == Opcode::mips_ext || op == Opcode::mips_ins) && operands.size() >= 4) {
+                if (destination->index == 0) return Intrinsic{"nop", {}, IntrinsicMemoryEffect::none};
+                const auto *position_field = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+                const auto *size_field = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+                if (position_field && size_field) {
+                    const unsigned position = static_cast<unsigned>(position_field->value);
+                    const unsigned size = static_cast<unsigned>(size_field->value);
+                    const std::uint64_t field_mask = size == 32 ? UINT32_MAX : ((UINT64_C(1) << size) - 1);
+                    if (op == Opcode::mips_ext) {
+                        auto shifted = std::make_shared<Expression>(Expression{integer_type(32),
+                            BinaryValue{"shr", operands[1], constant_expr(position, 32)}});
+                        auto masked = std::make_shared<Expression>(Expression{integer_type(32),
+                            BinaryValue{"and", std::move(shifted), constant_expr(field_mask, 32)}});
+                        return Assign{*destination, std::move(masked)};
+                    }
+                    const std::uint32_t shifted_mask = static_cast<std::uint32_t>(field_mask << position);
+                    auto preserved = std::make_shared<Expression>(Expression{integer_type(32),
+                        BinaryValue{"and", operands[0], constant_expr(~shifted_mask, 32)}});
+                    auto inserted_field = std::make_shared<Expression>(Expression{integer_type(32),
+                        BinaryValue{"and", operands[1], constant_expr(field_mask, 32)}});
+                    if (position)
+                        inserted_field = std::make_shared<Expression>(Expression{integer_type(32),
+                            BinaryValue{"shl", std::move(inserted_field), constant_expr(position, 32)}});
+                    auto merged = std::make_shared<Expression>(Expression{integer_type(32),
+                        BinaryValue{"or", std::move(preserved), std::move(inserted_field)}});
+                    return Assign{*destination, std::move(merged)};
+                }
+            }
             if (destination && destination->bank == RegisterBank::mips_gpr && instruction.operands.size() >= 2 &&
                 (op == Opcode::mips_lb || op == Opcode::mips_lh || op == Opcode::mips_lw ||
                  op == Opcode::mips_lbu || op == Opcode::mips_lhu)) {

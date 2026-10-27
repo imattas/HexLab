@@ -466,7 +466,9 @@ enum class Opcode {
     // MIPS64 Release 2 doubleword rotate-right forms; append for stable IDs.
     mips64_drotr, mips64_drotr32, mips64_drotrv,
     // NMOS 6502 undocumented decrement-and-compare family; appended for ID stability.
-    m6502_dcp
+    m6502_dcp,
+    // MIPS32 Release 2 SPECIAL3 variable bitfield operations.
+    mips_ext, mips_ins
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

@@ -17,10 +17,12 @@ bounded to 512 MiB of archive bytes and 100,000 entries. Names are limited to
 content is capped at 4 GiB. Class extraction verifies the output length and
 CRC before parsing.
 
-The class-file parser validates `ConstantValue` attribute placement, exact
-length, constant-pool kind, and compatibility with the field descriptor.
-Constant values are not yet retained on the field metadata, so class metadata
-is reported incomplete when a `ConstantValue` attribute is present.
+The class-file parser validates `ConstantValue` attribute placement, uniqueness,
+exact length, constant-pool kind, and compatibility with the field descriptor.
+Field metadata retains the constant-pool tag and raw numeric bits; string
+constants retain their resolved modified-UTF-8 text. The CLI reports these
+values beside their fields, using hexadecimal bits for numeric values so NaN
+payloads and signed zero remain unambiguous.
 
 This first JAR path inspects one class at a time. It does not resolve
 multi-release JAR selection, manifests, class paths, dependency graphs, or
