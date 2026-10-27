@@ -262,6 +262,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     bool have_module_packages=false,have_module_main_class=false;
     bool have_class_visible_annotations=false,have_class_invisible_annotations=false;
     std::unordered_set<const JvmMember *> visible_annotations_seen,invisible_annotations_seen;
+    std::unordered_set<const JvmMember *> visible_parameter_annotations_seen,invisible_parameter_annotations_seen,annotation_defaults_seen;
     std::size_t annotation_items=0;
     std::function<Result<std::string>(unsigned)> annotation_value;
     annotation_value=[&](unsigned depth)->Result<std::string>{
@@ -334,6 +335,19 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 if(duplicate)return malformed("duplicate annotation attribute");
                 auto &target=class_level?(an.value()=="RuntimeVisibleAnnotations"?md.visible_annotations:md.invisible_annotations):(an.value()=="RuntimeVisibleAnnotations"?member->visible_annotations:member->invisible_annotations);
                 auto parsed=read_annotations(target);if(!parsed)return parsed.error();
+            }else if(an.value()=="RuntimeVisibleParameterAnnotations"||an.value()=="RuntimeInvisibleParameterAnnotations"){
+                if(class_level||!member||!method||code_owner)return malformed("parameter annotation attribute appears outside a method declaration");
+                const bool visible=an.value()=="RuntimeVisibleParameterAnnotations";
+                auto &owners=visible?visible_parameter_annotations_seen:invisible_parameter_annotations_seen;
+                if(!owners.insert(member).second)return malformed("duplicate parameter annotation attribute");
+                std::uint8_t parameters=0;if(!r.u1(parameters))return malformed("truncated parameter annotation count");
+                std::vector<std::vector<JvmAnnotation>> parsed(parameters);
+                for(auto &parameter:parsed){auto result=read_annotations(parameter);if(!result)return result.error();}
+                (visible?member->visible_parameter_annotations:member->invisible_parameter_annotations)=std::move(parsed);
+            }else if(an.value()=="AnnotationDefault"){
+                if(class_level||!member||!method||code_owner)return malformed("AnnotationDefault appears outside a method declaration");
+                if(!annotation_defaults_seen.insert(member).second)return malformed("duplicate AnnotationDefault attribute");
+                auto value=annotation_value(0);if(!value)return value.error();member->annotation_default=std::move(value.value());
             }else if(an.value()=="StackMapTable"){
                 if(!code_owner||!member)return malformed("StackMapTable appears outside a Code attribute");
                 if(code_owner->stack_map_table)return malformed("duplicate StackMapTable attribute");

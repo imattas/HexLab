@@ -436,6 +436,49 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         converted.result_type = result->type;
         return converted;
     }
+    if (ops.size() == 4 && dst && dst->bank == RegisterBank::ppc_fpr &&
+        (i.opcode == Opcode::ppc_fmadd || i.opcode == Opcode::ppc_fmsub ||
+         i.opcode == Opcode::ppc_fnmadd || i.opcode == Opcode::ppc_fnmsub ||
+         i.opcode == Opcode::ppc_fmadds || i.opcode == Opcode::ppc_fmsubs ||
+         i.opcode == Opcode::ppc_fnmadds || i.opcode == Opcode::ppc_fnmsubs)) {
+        const auto *multiplicand = std::get_if<R>(&ops[1]);
+        const auto *multiplier = std::get_if<R>(&ops[2]);
+        const auto *addend = std::get_if<R>(&ops[3]);
+        const bool single = i.opcode == Opcode::ppc_fmadds || i.opcode == Opcode::ppc_fmsubs ||
+                            i.opcode == Opcode::ppc_fnmadds || i.opcode == Opcode::ppc_fnmsubs;
+        const std::uint16_t bits = single ? 32 : 64;
+        const R status{RegisterBank::ppc_fpscr, 0, 32, false};
+        const R record{RegisterBank::ppc_cr, 1, 4, false};
+        const auto valid_source = [bits](const R *r) {
+            return r && r->bank == RegisterBank::ppc_fpr && r->width == bits && r->index < 32 && !r->high_byte;
+        };
+        const bool writes_record = std::find(i.register_writes.begin(), i.register_writes.end(), record) !=
+                                   i.register_writes.end();
+        std::vector<R> expected_reads;
+        if (valid_source(multiplicand) && valid_source(multiplier) && valid_source(addend))
+            expected_reads = {*multiplicand, *multiplier, *addend, status};
+        std::vector<R> expected_writes{*dst, status};
+        if (writes_record) expected_writes.push_back(record);
+        if (dst->width != bits || dst->index >= 32 || dst->high_byte || !valid_source(multiplicand) ||
+            !valid_source(multiplier) || !valid_source(addend) || i.register_reads != expected_reads ||
+            i.register_writes != expected_writes || i.memory_read || i.memory_write)
+            return effect(i, "ppc_malformed_fp_fused_arithmetic");
+        const char *name = i.opcode == Opcode::ppc_fmadd || i.opcode == Opcode::ppc_fmadds ? "fmadd" :
+                           i.opcode == Opcode::ppc_fmsub || i.opcode == Opcode::ppc_fmsubs ? "fmsub" :
+                           i.opcode == Opcode::ppc_fnmadd || i.opcode == Opcode::ppc_fnmadds ? "fnmadd" : "fnmsub";
+        const auto type = floating(bits);
+        const auto next_status = std::make_shared<Expression>(Expression{integer(32),
+            UnknownValue{std::string("ppc_fpscr_after_") + name}});
+        Intrinsic fused{std::string("ppc_") + name + (single ? "_single" : "_double"),
+            {operand(ops[1]), operand(ops[2]), operand(ops[3]), reg(status)}, IntrinsicMemoryEffect::none};
+        fused.register_writes = i.register_writes;
+        fused.result_type = type;
+        fused.register_output_values.push_back(std::make_shared<Expression>(Expression{type,
+            UnknownValue{std::string("ppc_fused_result_") + name}}));
+        fused.register_output_values.push_back(next_status);
+        if (writes_record) fused.register_output_values.push_back(ppc_fpscr_record_cr1(next_status));
+        return fused;
+    }
     if (ops.size() == 3 && dst && dst->bank == RegisterBank::ppc_fpr &&
         (i.opcode == Opcode::ppc_fadds || i.opcode == Opcode::ppc_fsubs ||
          i.opcode == Opcode::ppc_fmuls || i.opcode == Opcode::ppc_fdivs ||

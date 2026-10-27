@@ -453,7 +453,9 @@ enum class Opcode {
     // RVV integer reductions, appended to preserve serialized IDs.
     rv_vredsum, rv_vredand, rv_vredor, rv_vredxor, rv_vredminu, rv_vredmin, rv_vredmaxu, rv_vredmax,
     // Zfa FCVTMOD.W.D, appended to preserve serialized opcode IDs.
-    rv_fcvtmod_w_d
+    rv_fcvtmod_w_d,
+    ppc_fmadd, ppc_fmsub, ppc_fnmadd, ppc_fnmsub,
+    ppc_fmadds, ppc_fmsubs, ppc_fnmadds, ppc_fnmsubs
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

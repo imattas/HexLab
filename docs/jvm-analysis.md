@@ -9,10 +9,17 @@ The classfile loader retains `RuntimeVisibleAnnotations` and
 descriptors and element names are resolved from the constant pool. Element
 values are validated recursively and kept in a stable textual form; constant
 and string entries identify their original constant-pool indices. Nesting is
-limited to 64 levels and aggregate annotation items to 65,536. CLI summaries
-show each annotation's visibility, declaration owner, descriptor, and element
-count. Parameter annotations, type annotations, annotation defaults, and
-annotations nested in record-component attribute lists are not yet retained.
+limited to 64 levels and aggregate annotation items to 65,536. Method
+`RuntimeVisibleParameterAnnotations` and
+`RuntimeInvisibleParameterAnnotations` are also retained as ordered per-
+parameter vectors, including empty parameter entries. `AnnotationDefault` is
+retained in the same stable textual value form as annotation elements. These
+attributes are accepted only on method declarations, duplicate occurrences
+are rejected, and their payloads must be consumed exactly within the declared
+attribute extent. CLI summaries show declaration and parameter annotation
+visibility, owner, descriptor, and element count, and print annotation default
+values. Type annotations and annotations nested in record-component attribute
+lists are not yet retained.
 
 Class metadata also retains `Record` component names and descriptors (including a component's optional generic `Signature`), `NestHost`/`NestMembers`, and `PermittedSubclasses`. These attributes validate their declared extents and every referenced constant-pool entry. Each supported class attribute may appear at most once; list counts are bounded at 8192. Unknown nested Record component attributes are extent-checked and mark metadata incomplete. This metadata is descriptive: it does not yet synthesize Java record methods, prove nestmate access, or link permitted classes across classfiles.
 The CLI's class summary prints these retained attributes and record component signatures.
