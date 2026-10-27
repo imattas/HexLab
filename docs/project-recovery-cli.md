@@ -33,6 +33,11 @@ Restore one listed artifact to an independent project:
 hexlab_cli project recovery restore .\projects\.hexlab-save-abc.tmp --output .\recovered.hxproj
 ```
 
+Add `--json` to emit a schema-versioned success object containing `restored`,
+the published project `path` and fresh `uuid`, the `source_artifact` path, and
+`source_retained: true`. The success object is emitted only after publication
+succeeds; failures remain CLI errors and do not produce a success object.
+
 Restore re-discovers and validates the artifact in its containing directory,
 then the database API checks its kind and UUID again before copying it through
 the checked Save As path. Recovery candidates also pin the edit, byte, and

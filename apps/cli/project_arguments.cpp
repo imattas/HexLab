@@ -265,6 +265,7 @@ Arguments parse(std::span<const std::wstring_view> args) {
     } else if (result.action == L"recovery-restore") {
         result.output = path_from_wide(options.needed(L"--output"));
         result.replace = options.flag(L"--replace");
+        result.recovery_json = options.flag(L"--json");
     } else if (result.action == L"backup") {
         result.output = path_from_wide(options.needed(L"--output"));
         result.replace = options.flag(L"--replace");

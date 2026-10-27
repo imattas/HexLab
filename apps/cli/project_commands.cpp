@@ -185,6 +185,13 @@ int run_recovery_restore(const project_detail::Arguments &args, std::ostream &ou
     require(found != candidates.end(), "Path is not a fully validated HexLab recovery artifact");
     const auto policy = args.replace ? database::ReplacePolicy::replace_existing : database::ReplacePolicy::fail_if_exists;
     const auto restored = take(database::ProjectStore::recover_candidate(*found, args.output, policy, {}));
+    if (args.recovery_json) {
+        out << "{\"schema_version\":1,\"restored\":true,\"path\":"
+            << json_string(path_utf8(restored.path)) << ",\"uuid\":"
+            << json_string(uuid_text(restored.uuid)) << ",\"source_artifact\":"
+            << json_string(path_utf8(found->path)) << ",\"source_retained\":true}\n";
+        return 0;
+    }
     out << "Recovered project: " << escape(path_utf8(restored.path)) << " uuid=" << uuid_text(restored.uuid)
         << " (source artifact retained)\n";
     return 0;
@@ -453,7 +460,7 @@ void project_usage(std::ostream &out) {
            "           [--expected-edit N] [--max-steps N] [--max-bytes N] [--replace] [--json]\n"
            "       hexlab_cli project recovery list <directory> [--json]\n"
            "       hexlab_cli project recovery list <project.hxproj> [--json]\n"
-           "       hexlab_cli project recovery restore <artifact.tmp> --output <project.hxproj> [--replace]\n"
+           "       hexlab_cli project recovery restore <artifact.tmp> --output <project.hxproj> [--replace] [--json]\n"
            "       hexlab_cli project backup <project.hxproj> --output <backup.hxproj> [--replace]\n"
            "       hexlab_cli project backup restore <backup.hxproj> --output <new-project.hxproj> [--replace]\n"
            "       hexlab_cli project backup list <project.hxproj> --base <backup-name.hxproj> [--json]\n"
@@ -470,7 +477,7 @@ void project_usage(std::ostream &out) {
            "history preview: read-only bounded replay to an exact step; reports current and preview record counts without changing the project; exit 3 means target differs from current cursor\n"
            "history save: publishes an independent project at an exact step with full undo/redo history; source stays unchanged\n"
            "recovery list: read-only scan for fully validated interrupted saves and retained previous versions; a project path scans its directory\n"
-           "recovery restore: revalidates an artifact and publishes an independent project copy; source artifact stays intact\n"
+           "recovery restore: revalidates an artifact and publishes an independent project copy; --json emits the published path and UUID; source artifact stays intact\n"
            "backup project: writes a consistent read-only SQLite snapshot while preserving project UUID and history\n"
            "backup restore: validates the backup and creates an independent project with a new UUID; the backup is retained\n"
            "backup rotate/prune: only same-UUID, validated generated siblings are pruned; incomplete bounded scans preserve files and return exit 3\n"
