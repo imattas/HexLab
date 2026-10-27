@@ -715,6 +715,25 @@ bool identifier_char(char value) {
            (value >= '0' && value <= '9') || value == '_';
 }
 
+void collect_register_uses(const decompiler::ExpressionPtr &expression,
+                           std::map<std::string, std::vector<Address>> &uses, Address at) {
+    if (!expression) return;
+    std::visit([&](const auto &value) {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, decompiler::RegisterValue>) {
+            if (value.version) uses[register_token(value.reg, value.version)].push_back(at);
+        } else if constexpr (std::is_same_v<T, decompiler::MemoryValue>) {
+            if (value.base && value.base_version) uses[register_token(*value.base, value.base_version)].push_back(at);
+            if (value.index && value.index_version) uses[register_token(*value.index, value.index_version)].push_back(at);
+        } else if constexpr (std::is_same_v<T, decompiler::UnaryValue>) {
+            collect_register_uses(value.operand, uses, at);
+        } else if constexpr (std::is_same_v<T, decompiler::BinaryValue>) {
+            collect_register_uses(value.left, uses, at);
+            collect_register_uses(value.right, uses, at);
+        }
+    }, expression->value);
+}
+
 std::string render_user_variables(const decompiler::LiftedFunction &function, std::string rendered,
                                   const ProjectSnapshot *project,
                                   std::vector<PseudocodeVariableEdit> &variables,
@@ -722,6 +741,7 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
                                   const std::map<std::string, std::string> &local_names,
                                   const std::map<std::string, std::string> &local_comments) {
     std::map<std::string, Address> definitions;
+    std::map<std::string, std::vector<Address>> uses;
     std::set<std::string> ambiguous;
     const auto define = [&](RegisterOperand reg, std::optional<std::uint32_t> version, Address at) {
         if (!version) return;
@@ -731,16 +751,30 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
     for (const auto &block : function.blocks) for (const auto &instruction : block.instructions) {
         std::visit([&](const auto &statement) {
             using T = std::decay_t<decltype(statement)>;
-            if constexpr (std::is_same_v<T, decompiler::Assign>)
+            if constexpr (std::is_same_v<T, decompiler::Assign>) {
                 define(statement.destination, statement.destination_version, instruction.origin.address);
-            else if constexpr (std::is_same_v<T, decompiler::Call>) {
+                collect_register_uses(statement.value, uses, instruction.origin.address);
+            } else if constexpr (std::is_same_v<T, decompiler::Store>) {
+                collect_register_uses(statement.address, uses, instruction.origin.address);
+                collect_register_uses(statement.value, uses, instruction.origin.address);
+            } else if constexpr (std::is_same_v<T, decompiler::Call>) {
+                collect_register_uses(statement.indirect_target, uses, instruction.origin.address);
+                for (const auto &input : statement.register_inputs)
+                    if (input.version) uses[register_token(input.reg, input.version)].push_back(instruction.origin.address);
                 for (std::size_t i = 0; i < statement.register_output_versions.size() && i < statement.register_writes.size(); ++i)
                     define(statement.register_writes[i], statement.register_output_versions[i], instruction.origin.address);
                 if (statement.return_register &&
                     std::find(statement.register_writes.begin(), statement.register_writes.end(),
                               *statement.return_register) == statement.register_writes.end())
                     define(*statement.return_register, statement.return_version, instruction.origin.address);
+            } else if constexpr (std::is_same_v<T, decompiler::Branch>) {
+                collect_register_uses(statement.predicate, uses, instruction.origin.address);
+                collect_register_uses(statement.indirect_target, uses, instruction.origin.address);
+            } else if constexpr (std::is_same_v<T, decompiler::Return>) {
+                collect_register_uses(statement.value, uses, instruction.origin.address);
             } else if constexpr (std::is_same_v<T, decompiler::Intrinsic>) {
+                for (const auto &operand : statement.operands)
+                    collect_register_uses(operand, uses, instruction.origin.address);
                 if (statement.register_writes.size() == statement.register_output_versions.size())
                     for (std::size_t i = 0; i < statement.register_writes.size(); ++i)
                         define(statement.register_writes[i], statement.register_output_versions[i], instruction.origin.address);
@@ -750,6 +784,16 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
     for (const auto &token : ambiguous) definitions.erase(token);
     std::map<std::string, std::string> replacements;
     for (const auto &[token, address] : definitions) {
+        auto access_sites = std::move(uses[token]);
+        access_sites.push_back(address);
+        std::sort(access_sites.begin(), access_sites.end(), [](Address left, Address right) {
+            return address_identity(left) < address_identity(right);
+        });
+        access_sites.erase(std::unique(access_sites.begin(), access_sites.end()), access_sites.end());
+        // The project command bounds a single edit to 4096 unique addresses.
+        // Keep larger identities visible, but disable edits rather than applying
+        // a partial rename/type assignment.
+        const bool safely_editable = access_sites.size() <= 4096;
         const auto *annotation = project ? annotation_at(*project, address) : nullptr;
         const auto *assignment = project ? type_assignment(*project, address) : nullptr;
         const auto *definition = assignment ? type_definition(*project, assignment->type_id) : nullptr;
@@ -757,7 +801,8 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
         if (definition) display += " /* " + (definition->type->name().empty()
                                                    ? types::format(*definition->type) : definition->type->name()) + " */";
         replacements.emplace(token, display);
-        variables.push_back({token, address, annotation && !annotation->name.empty() ? annotation->name : token});
+        variables.push_back({token, address, annotation && !annotation->name.empty() ? annotation->name : token,
+                             safely_editable, false, safely_editable ? std::move(access_sites) : std::vector<Address>{}});
     }
     for (const auto &[token, display] : replacements) {
         std::size_t position = 0;
