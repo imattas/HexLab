@@ -37,6 +37,11 @@ field. An authenticated rebase remains a raw image-relative offset; the
 runtime resolver deliberately does not turn it into a usable pointer because
 it cannot produce or validate a PAC.
 
+CLI and desktop chain-pointer views label the encoded authentication key as
+IA, IB, DA, or DB and show its numeric encoding, diversity value, and
+address-diversity bit. These labels describe stored metadata only; they do not
+indicate that the pointer's PAC was checked or applied.
+
 ARM64e segmented format 14 stores an 8-byte field with a 4-byte chain stride.
 The parser retains the lower 32-bit target payload (4-bit segment index plus
 28-bit segment offset), the 12-bit next field, and authenticated diversity,

@@ -6,6 +6,10 @@ wxString number(std::uint64_t v) { return wxString::Format("0x%llx", static_cast
 wxString dec(std::uint64_t v) { return wxString::Format("%llu", static_cast<unsigned long long>(v)); }
 wxString state(bool complete) { return complete ? "complete" : "partial"; }
 wxString field(const char *name, std::uint64_t v) { return wxString(name) + "=" + number(v) + " "; }
+wxString pac_key(std::uint8_t key) {
+    static const char *const names[] = {"IA", "IB", "DA", "DB"};
+    return key < 4 ? wxString(names[key]) : wxString("unknown");
+}
 wxString rtti_target_state(MachOEhFrameRttiTargetState value) {
     switch (value) {
     case MachOEhFrameRttiTargetState::unresolved: return "unresolved";
@@ -229,10 +233,14 @@ wxString macho_metadata_cell(const DocumentSnapshot &doc, const MachOMetadataRow
                                       : wxString()) +
                                  (format == 13
                                       ? field("shared-cache-target-offset", r.target.value_or(0)) +
-                                            (r.authenticated ? field("key", r.key) : field("high8", r.high8)) +
+                                            (r.authenticated ? wxString() : field("high8", r.high8)) +
                                             "cache base unresolved "
                                       : wxString()) +
                                  (r.bind ? "bind " : "rebase ") + (r.authenticated ? "authenticated " : "") +
+                                 (r.authenticated ? "pac-key=" + pac_key(r.key) + " " + field("key-bits", r.key) +
+                                                       field("diversity", r.diversity) +
+                                                       field("address-diversity", r.address_diversity)
+                                                  : wxString()) +
                                  (r.non_pointer ? "non-pointer " : "") + state(r.complete);
     }
     case MachOMetadataKind::data_in_code_table: {
