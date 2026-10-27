@@ -46,6 +46,19 @@ struct UefiCapsuleList {
     std::size_t total_item_count = 0;
     std::vector<UefiCapsule> capsules;
 };
+struct UefiJsonCapsule {
+    std::array<std::uint8_t, 16> capsule_guid{};
+    std::uint32_t header_size = 0;
+    std::uint64_t header_extension_offset = 28;
+    std::uint64_t header_extension_size = 0;
+    std::uint32_t flags = 0;
+    std::uint32_t image_size = 0;
+    std::uint64_t trailing_size = 0;
+    std::uint32_t json_header_version = 0;
+    std::uint32_t capsule_id = 0;
+    std::uint32_t payload_size = 0;
+    std::uint64_t payload_offset = 0;
+};
 struct UefiCapsuleParseOptions {
     std::uint64_t max_input_bytes = 512ull * 1024 * 1024;
     std::size_t max_items = 4096;
@@ -61,4 +74,7 @@ HEXLAB_FIRMWARE_EXPORT Result<UefiCapsule> parse_uefi_fmp_capsule(
 HEXLAB_FIRMWARE_EXPORT Result<UefiCapsuleList> parse_uefi_fmp_capsule_list(
     std::span<const std::span<const std::byte>> capsules,
     UefiCapsuleParseOptions options = {}, std::stop_token stop = {});
+// Parses the standard EFI JSON capsule envelope. The JSON payload remains opaque.
+HEXLAB_FIRMWARE_EXPORT Result<UefiJsonCapsule> parse_uefi_json_capsule(
+    std::span<const std::byte> bytes, UefiCapsuleParseOptions options = {}, std::stop_token stop = {});
 } // namespace hexlab::firmware

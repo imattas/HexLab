@@ -41,7 +41,7 @@ struct X86EvexFloatCompareResult {
     std::uint8_t active_bits = 0;
     bool invalid_operation = false;
     bool denormal_operand = false;
-    // An unmasked #I or #D suppresses retirement of the K-register result.
+    // An unmasked #I or #D suppresses retirement unless embedded SAE is set.
     bool completed = true;
     bool operator==(const X86EvexFloatCompareResult &) const = default;
 };
@@ -898,8 +898,9 @@ inline std::optional<X86EvexFloatCompareResult> evaluate_x86_evex_float_compare(
         }
         if (match) result.mask |= UINT64_C(1) << lane;
     }
-    result.completed = !(result.invalid_operation && !(mxcsr & (UINT32_C(1) << 7))) &&
-        !(result.denormal_operand && !(mxcsr & (UINT32_C(1) << 8)));
+    result.completed = instruction.x86_evex_sae ||
+        (!(result.invalid_operation && !(mxcsr & (UINT32_C(1) << 7))) &&
+         !(result.denormal_operand && !(mxcsr & (UINT32_C(1) << 8))));
     return result;
 }
 

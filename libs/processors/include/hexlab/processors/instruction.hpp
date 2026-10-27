@@ -636,6 +636,8 @@ struct Instruction {
     // EVEX.b memory tuple broadcast for the supported packed FP arithmetic
     // subset. The memory operand width is one lane, replicated by the op.
     bool x86_evex_broadcast = false;
+    // EVEX.b embedded suppress-all-exceptions decoration on packed compares.
+    bool x86_evex_sae = false;
     std::optional<std::uint8_t> x86_opmask;
     bool x86_opmask_zeroing = false;
     bool memory_read = false, memory_write = false;

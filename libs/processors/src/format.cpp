@@ -1035,6 +1035,8 @@ std::string format_instruction(const Instruction &i) {
     }
     if (i.riscv_vector_masked)
         out += ", v0.t";
+    if (i.x86_evex_sae)
+        out += " {sae}";
     return out;
 }
 } // namespace hexlab

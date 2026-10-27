@@ -25,7 +25,7 @@ families:
 | AVX2 dword multiply and multiply-add | VEX.128/.256 `vpmulld`, `vpmuldq`, `vpmuludq`, `vpmaddwd`, `vpmaddubsw` |
 | AVX2 horizontal integer arithmetic | VEX.128/.256 `vphaddw/d/sw`, `vphsubw/d/sw` |
 | AVX2 lane routing and narrowing | VEX.128/.256 `vpunpcklbw/lwd/ldq/lqdq`, `vpunpckhbw/hwd/hdq/hqdq`, `vpacksswb/ssdw/uswb/usdw`, `vpshufb` |
-| AVX-512 packed compare to mask | EVEX.128/.256/.512 `vpcmpb/w/d/q` and `vpcmpub/uw/ud/uq`, with immediate predicates 0-7 |
+| AVX-512 packed compare to mask | EVEX.128/.256/.512 `vpcmpb/w/d/q` and `vpcmpub/uw/ud/uq`, with immediate predicates 0-7; floating `vcmpps/pd` supports broadcast memory input or register-source SAE |
 
 The intended typed model uses 128-bit XMM register operands, 128-bit packed
 memory operands, and 32-/64-bit scalar memory operands. Read/write access on
@@ -169,8 +169,10 @@ instruction families, reserved encodings, and unsupported EVEX maps. This follow
 EVEX packed floating compare-to-mask now decodes `VCMPPS` and `VCMPPD` at
 128/256/512-bit widths with all 32 immediate predicates, K0-K7 destinations,
 optional execution masks, vector or memory sources, and 32/64-bit memory
-broadcast. The decoder records MXCSR status effects and the typed decompiler
-retains the predicate, source shapes, mask, broadcast marker, and K result.
+broadcast. Register-source EVEX.b selects embedded SAE; it suppresses MXCSR
+exception-state writes while preserving the MXCSR control read used for DAZ.
+The typed decompiler retains the predicate, source shapes, mask, broadcast or
+SAE marker, and K result.
 The pure lane evaluator implements all 32 predicate truth tables directly from
 binary32/binary64 bit patterns, including signed-zero equivalence, ordered and
 unordered NaN results, signaling-NaN behavior, and predicate-dependent quiet-
@@ -178,8 +180,11 @@ NaN invalid exceptions. It honors MXCSR.DAZ for subnormal inputs and reports
 denormal/invalid exceptions plus whether an unmasked exception suppresses the K
 result; sticky MXCSR flag updates remain the caller's responsibility. Masked-off
 lanes are neither compared nor allowed to raise exceptions, and the output is
-limited to the active low K bits. Register-source EVEX.b (SAE), destination
-zeroing, and invalid encodings are rejected. VEX.128/.256 packed floating
+limited to the active low K bits. Embedded SAE permits the K result to retire
+even when the corresponding exceptions are unmasked; the helper still reports
+the comparison's invalid/denormal conditions, and callers must suppress sticky
+status updates for SAE. Destination zeroing and invalid encodings are rejected.
+VEX.128/.256 packed floating
 compare-to-vector forms are also decoded and lifted for all 32 immediate
 predicates. They retain vector operands and results, VEX.128 upper-YMM clearing,
 memory reads, and MXCSR input/output dependencies. Their exact lane truth
