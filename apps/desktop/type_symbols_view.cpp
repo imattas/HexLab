@@ -193,12 +193,10 @@ void TypeSymbolsView::portable_type_library() {
                 static_cast<types::LibraryDeclarationKind>(row.declaration_kind)});
         }
         for (const auto &assignment : project_->state->user->type_assignments) {
-            const auto *address = std::get_if<Address>(&assignment.location);
-            if (!address) { wxMessageBox("An assignment uses a non-address location and cannot be exported.", "Type Library", wxOK | wxICON_ERROR, this); return; }
             const auto found = std::find_if(project_->state->user->types.begin(), project_->state->user->types.end(),
                 [&](const auto &row) { return row.id == assignment.type_id; });
             if (found == project_->state->user->types.end()) { wxMessageBox("An assignment refers to a missing type definition.", "Type Library", wxOK | wxICON_ERROR, this); return; }
-            bundle.assignments.push_back({*address, found->name});
+            bundle.assignments.push_back({assignment.location, found->name});
         }
         auto bytes = types::encode_library_bundle(bundle, portable_type_library_limit);
         if (!bytes) { wxMessageBox(wxString::FromUTF8(bytes.error().message), "Type Library", wxOK | wxICON_ERROR, this); return; }
@@ -211,7 +209,7 @@ void TypeSymbolsView::portable_type_library() {
         if (!written) { wxMessageBox(wxString::FromUTF8(written.error().message), "Type Library", wxOK | wxICON_ERROR, this); return; }
         auto published = publication.value()->publish();
         if (!published) { wxMessageBox(wxString::FromUTF8(published.error().message), "Type Library", wxOK | wxICON_ERROR, this); return; }
-        wxMessageBox(wxString::Format("Exported %llu type definitions and %llu address assignments.",
+        wxMessageBox(wxString::Format("Exported %llu type definitions and %llu assignments.",
             static_cast<unsigned long long>(bundle.entries.size()), static_cast<unsigned long long>(bundle.assignments.size())),
             "Type Library", wxOK | wxICON_INFORMATION, this);
         return;
@@ -243,7 +241,7 @@ void TypeSymbolsView::portable_type_library() {
     std::size_t assignment_same = 0, assignment_conflicts = 0;
     if (identity_matches) for (const auto &assignment : bundle.assignments) {
         auto found = std::find_if(project_->state->user->type_assignments.begin(), project_->state->user->type_assignments.end(),
-            [&](const auto &row) { return row.location == Location{assignment.location}; });
+            [&](const auto &row) { return row.location == assignment.location; });
         if (found == project_->state->user->type_assignments.end()) continue;
         auto target = std::find_if(project_->state->user->types.begin(), project_->state->user->types.end(), [&](const auto &row) { return row.id == found->type_id; });
         if (target != project_->state->user->types.end() && target->name == assignment.type_name) ++assignment_same;
@@ -276,7 +274,7 @@ void TypeSymbolsView::portable_type_library() {
     }
     if (identity_matches) for (const auto &assignment : bundle.assignments) {
         auto current = std::find_if(project_->state->user->type_assignments.begin(), project_->state->user->type_assignments.end(),
-            [&](const auto &row) { return row.location == Location{assignment.location}; });
+            [&](const auto &row) { return row.location == assignment.location; });
         if (current != project_->state->user->type_assignments.end()) {
             auto target = std::find_if(project_->state->user->types.begin(), project_->state->user->types.end(), [&](const auto &row) { return row.id == current->type_id; });
             if (target != project_->state->user->types.end() && target->name == assignment.type_name) continue;

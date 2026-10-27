@@ -42,7 +42,7 @@ struct PortableTypeDefinition {
     // the legacy explicit replacement contract, guarded by name/entity identity.
     std::optional<database::TypeDefinition> expected_existing;
 };
-struct PortableTypeAssignment {Address location;std::string type_name;};
+struct PortableTypeAssignment {Location location;std::string type_name;};
 struct ImportPortableTypes {std::vector<PortableTypeDefinition> definitions;std::vector<PortableTypeAssignment> assignments;};
 struct PortableDebugVariable {
     Address function_entry{};

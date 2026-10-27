@@ -49,9 +49,7 @@ Result<bool> write_type_library_file(const ProjectSnapshot &snapshot, const std:
         auto found = std::find_if(snapshot.state->user->types.begin(), snapshot.state->user->types.end(),
             [&](const auto &row) { return row.id == assignment.type_id; });
         if (found == snapshot.state->user->types.end()) return Error{ErrorCode::integrity, "Type assignment refers to missing definition"};
-        const auto *address = std::get_if<Address>(&assignment.location);
-        if (!address) return Error{ErrorCode::integrity, "Type assignment has a non-address location"};
-        bundle.assignments.push_back({*address, found->name});
+        bundle.assignments.push_back({assignment.location, found->name});
     }
     auto bytes = types::encode_library_bundle(bundle);
     if (!bytes) return bytes.error();

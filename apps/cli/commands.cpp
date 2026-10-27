@@ -716,12 +716,13 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
 }
 int firmware_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
     if (args.size() == 2 && args[1] == L"--help") {
-        out << "Usage: hexlab_cli firmware inspect <path> --format ihex|srec|uefi|uefi-capsule\n";
+        out << "Usage: hexlab_cli firmware inspect <path> --format ihex|srec|uefi|uefi-capsule\n"
+            << "       UEFI capsule lists: hexlab_cli firmware inspect <path> [<path> ...] --format uefi-capsule\n";
         return 0;
     }
     if (args.size() == 4 && args[0] == L"inspect" && args[2] == L"--format" && args[3] == L"uefi")
         return run_uefi_firmware_cli(args, out, err);
-    if (args.size() == 4 && args[0] == L"inspect" && args[2] == L"--format" && args[3] == L"uefi-capsule")
+    if (args.size() >= 4 && args[0] == L"inspect" && args[args.size() - 2] == L"--format" && args.back() == L"uefi-capsule")
         return run_uefi_capsule_cli(args, out, err);
     try {
         if (args.size() != 4 || args[0] != L"inspect" || args[2] != L"--format")
@@ -739,20 +740,30 @@ int firmware_command(std::span<const std::wstring_view> args, std::ostream &out,
         if (!read) throw std::runtime_error(read.error().message);
         auto view = std::move(read.value());
         std::string_view text(reinterpret_cast<const char *>(view.bytes.data()), view.bytes.size());
-        auto parsed_image = load_firmware(text, FirmwareLoadOptions{format});
-        if (!parsed_image) throw std::runtime_error(parsed_image.error().message);
-        auto loaded = std::move(parsed_image.value());
-        const auto &data = *loaded.metadata.firmware;
-        out << "Format: " << loaded.metadata.format << '\n'
-            << "Data bytes: " << loaded.metadata.image_size << '\n'
+        auto loaded = load_firmware(text, FirmwareLoadOptions{format});
+        if (!loaded) throw std::runtime_error(loaded.error().message);
+        const auto &data = *loaded.value().metadata.firmware;
+        out << "Format: " << loaded.value().metadata.format << '\n'
+            << "Data bytes: " << loaded.value().metadata.image_size << '\n'
             << "Records: " << data.records.size() << '\n';
         if (data.has_start_address) out << "Start address: " << hex(data.start_address) << '\n';
+        if (format == firmware::Format::motorola_s_record) {
+            auto parsed_srec = firmware::parse_s_record(text);
+            if (!parsed_srec) throw std::runtime_error(parsed_srec.error().message);
+            if (parsed_srec.value().has_s_record_header) {
+                out << "S0 header: SourceLine=" << parsed_srec.value().s_record_header_provenance.line
+                    << " Record=" << parsed_srec.value().s_record_header_provenance.record_index << " Bytes=";
+                for (const auto byte : parsed_srec.value().s_record_header)
+                    out << std::hex << std::setw(2) << std::setfill('0') << std::to_integer<unsigned>(byte);
+                out << std::dec << std::setfill(' ') << '\n';
+            }
+        }
         out << "Segments:\n";
         for (const auto &record : data.records)
             out << "  " << hex(record.address.offset) << " Size=" << hex(record.size)
                 << " SourceLine=" << record.source_line << " Record=" << record.record_index
                 << " Backing=" << hex(record.packed_file_offset.value) << '\n';
-        for (const auto &diagnostic : loaded.diagnostics)
+        for (const auto &diagnostic : loaded.value().diagnostics)
             out << "warning: " << safe_text(diagnostic.message) << '\n';
         return 0;
     } catch (const ArgumentError &error) { err << error.message << '\n'; return 2; }

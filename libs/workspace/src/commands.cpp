@@ -576,7 +576,7 @@ Result<database::StateDelta> validate_command(const ProjectSnapshot &snapshot, c
                                     "Portable declaration content changed after import planning", ErrorCode::conflict);
                     }
                     for (const auto &assignment : value.assignments) {
-                        check_location(snapshot, Location{assignment.location});
+                        check_location(snapshot, assignment.location);
                         require(!assignment.type_name.empty() &&
                                     (incoming_names.contains(assignment.type_name) || std::any_of(user.types.begin(), user.types.end(), [&](const auto &row) { return row.name == assignment.type_name; })),
                                 "Portable type assignment refers to an unknown type");
@@ -603,7 +603,7 @@ Result<database::StateDelta> validate_command(const ProjectSnapshot &snapshot, c
                         const auto type_id = type != imported_ids.end() ? type->second :
                             std::find_if(user.types.begin(), user.types.end(), [&](const auto &row) { return row.name == assignment.type_name; })->id;
                         auto &rows = user.type_assignments;
-                        auto found = std::find_if(rows.begin(), rows.end(), [&](const auto &row) { return row.location == Location{assignment.location}; });
+                        auto found = std::find_if(rows.begin(), rows.end(), [&](const auto &row) { return row.location == assignment.location; });
                         if (found != rows.end() && found->type_id == type_id) continue;
                         TypeAssignment row{found == rows.end() ? allocate() : found->id, assignment.location, type_id};
                         change(rows, found, std::optional<TypeAssignment>{std::move(row)});

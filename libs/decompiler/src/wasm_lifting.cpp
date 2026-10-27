@@ -877,6 +877,16 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     ? binary("add", address.value(), constant(args.value().second, integer(32)), integer(32))
                     : address.value();
 
+                // Wasm traps when the complete access extends beyond the
+                // current memory. Memory size is runtime state, so retain the
+                // exact access width in a named predicate instead of
+                // pretending the bounds check can be evaluated statically.
+                const auto access_bytes = info->access_type.bits / 8;
+                lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
+                    "WebAssembly memory access out of bounds",
+                    unary("wasm_memory_access_out_of_bounds_length_" +
+                          std::to_string(access_bytes), effective_address, integer(32))});
+
                 // The common MemoryValue requires a register base. A reserved
                 // Wasm stack pseudo-register carries the exact effective i32
                 // address, preserving its wrapping addition and SSA inputs.
