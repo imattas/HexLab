@@ -46,6 +46,10 @@ RSDS CodeView records additionally expose the decoded GUID, age, and PDB path
 through `codeview`. Invalid payload locations make PE metadata partial while
 leaving the mapped image available.
 
+Recognized POGO (`IMAGE_DEBUG_TYPE_POGO`) payloads additionally expose their
+LTCG/PGU signature and bounded code/data block names, RVAs, sizes, and source
+provenance; see [PE POGO debug records](pe-pogo.md).
+
 The desktop metadata notebook adds a **PE** page with separate virtual tables
 for data directories, bound-import records, load configuration, and
 certificate-table records. Directory activation navigates

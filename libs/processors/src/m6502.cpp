@@ -119,6 +119,17 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
         return data_op(opcode, mode, a, false, true, true,
                        opcode == Opcode::m6502_rla || opcode == Opcode::m6502_rra || opcode == Opcode::m6502_isc);
     };
+    auto las = [&]() -> DecodeResult {
+        const auto length = sized_mode(Mode::absolute_y);
+        if (!begin(Opcode::m6502_las, length))
+            return bad(DecodeStatus::truncated, "6502 operand bytes are truncated");
+        i.operands.emplace_back(memory(Mode::absolute_y));
+        i.access = {OperandAccess::read};
+        i.register_reads = {y, s, p};
+        i.register_writes = {a, x, s, p};
+        i.memory_read = true;
+        return finish(length);
+    };
 
     // Regular ALU family: xx01 encodes the operation in bits 7..5 and the
     // addressing form in bits 4..2. This covers 55 legal NMOS opcodes.
@@ -155,6 +166,8 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     case 0xf7: return undocumented_rmw(Opcode::m6502_isc, Mode::zero_page_x);
     case 0xfb: return undocumented_rmw(Opcode::m6502_isc, Mode::absolute_y);
     case 0xff: return undocumented_rmw(Opcode::m6502_isc, Mode::absolute_x);
+    // Unofficial load-and-stack-mask opcode has one NMOS absolute,Y form.
+    case 0xbb: return las();
     // Stable undocumented NMOS shift/logic combinations, seven forms each.
     case 0x03: return undocumented_rmw(Opcode::m6502_slo, Mode::indexed_indirect);
     case 0x07: return undocumented_rmw(Opcode::m6502_slo, Mode::zero_page);

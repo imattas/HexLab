@@ -418,6 +418,32 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata) {
             }
         }
     }
+    if (metadata.pe && !metadata.pe->pogo_data.empty()) {
+        std::size_t emitted = 0, payloads_printed = 0;
+        out << "PE POGO profile records: " << metadata.pe->pogo_data.size() << " payloads\n";
+        for (const auto &payload : metadata.pe->pogo_data) {
+            if (payloads_printed >= 4096) break;
+            ++payloads_printed;
+            const char *signature = payload.signature == 0x4c544347u ? "LTCG" : "PGU";
+            out << "  signature=" << signature << " entries=" << payload.entries.size() << '\n';
+            for (const auto &record : payload.entries) {
+                if (emitted >= 4096) break;
+                out << "    RVA=0x" << std::hex << record.rva << " size=0x" << record.size << std::dec
+                    << " name=\"" << escape_pe_version_text(record.name) << '\"';
+                if (!record.source.spans.empty())
+                    out << " file=0x" << std::hex << record.source.spans.front().offset.value << std::dec;
+                out << '\n';
+                ++emitted;
+            }
+            if (emitted >= 4096) break;
+        }
+        std::size_t total = 0;
+        for (const auto &payload : metadata.pe->pogo_data) total += payload.entries.size();
+        if (emitted < total) out << "  POGO entry output limited to 4096 rows; omitted=" << total - emitted << '\n';
+        if (payloads_printed < metadata.pe->pogo_data.size())
+            out << "  POGO payload output limited to 4096 rows; omitted="
+                << metadata.pe->pogo_data.size() - payloads_printed << '\n';
+    }
     if (metadata.pe && metadata.pe->pdb_status != PePdbStatus::unavailable) {
         const auto status = metadata.pe->pdb_status == PePdbStatus::matched ? "matched" :
                             metadata.pe->pdb_status == PePdbStatus::missing ? "missing" :

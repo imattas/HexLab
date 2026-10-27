@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <bit>
 #include <charconv>
+#include <functional>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -109,28 +110,75 @@ std::uint64_t project_pointer_size(const ProjectSnapshot &project) {
 std::string member_type_name(const types::TypePtr &type,
                              const std::vector<database::TypeDefinition> &definitions) {
     if (!type) return {};
+    const auto has_qualified = [&](const auto &self, const types::TypePtr &current) -> bool {
+        if (!current) return false;
+        if (current->kind() == types::Kind::qualified) return true;
+        if ((current->kind() == types::Kind::pointer || current->kind() == types::Kind::array) && current->element())
+            return self(self, current->element());
+        return false;
+    };
+    const auto has_overaligned_array = [&](const auto &self, const types::TypePtr &current) -> bool {
+        if (!current) return false;
+        if (current->kind() == types::Kind::array && current->element() &&
+            current->alignment() != current->element()->alignment()) return true;
+        if ((current->kind() == types::Kind::pointer || current->kind() == types::Kind::array ||
+             current->kind() == types::Kind::qualified) && current->element())
+            return self(self, current->element());
+        return false;
+    };
+    if (has_qualified(has_qualified, type) || has_overaligned_array(has_overaligned_array, type)) {
+        const auto encode = [&](const auto &self, const types::TypePtr &current) -> std::string {
+            const auto definition = std::find_if(definitions.begin(), definitions.end(), [&](const auto &item) {
+                return item.type && item.type->id() == current->id();
+            });
+            if (definition != definitions.end())
+                return "N" + std::to_string(definition->name.size()) + ":" + definition->name;
+            if (current->kind() == types::Kind::named_reference)
+                return "N" + std::to_string(current->name().size()) + ":" + current->name();
+            if (current->kind() == types::Kind::pointer && current->element())
+                return "P" + std::to_string(current->size().value_or(0)) + "," +
+                       std::to_string(current->alignment()) + "(" + self(self, current->element()) + ")";
+            if (current->kind() == types::Kind::array && current->element())
+                return "A" + std::to_string(current->count()) + "," + std::to_string(current->alignment()) +
+                       "(" + self(self, current->element()) + ")";
+            if (current->kind() == types::Kind::qualified && current->element())
+                return "Q" + std::to_string(current->qualifiers()) + "(" + self(self, current->element()) + ")";
+            return "N" + std::to_string(current->name().size()) + ":" + current->name();
+        };
+        return "$" + encode(encode, type);
+    }
     const auto direct = std::find_if(definitions.begin(), definitions.end(), [&](const auto &item) {
         return item.type && item.type->id() == type->id();
     });
     if (direct != definitions.end()) return direct->name;
-
-    auto base = type;
-    std::size_t pointer_depth = 0;
-    while (base && base->kind() == types::Kind::pointer && base->element()) {
-        ++pointer_depth;
-        base = base->element();
-    }
-    std::string name;
-    if (base && base->kind() == types::Kind::named_reference) {
-        name = base->name();
-    } else if (base) {
-        const auto found = std::find_if(definitions.begin(), definitions.end(), [&](const auto &item) {
-            return item.type && item.type->id() == base->id();
+    const auto render = [&](const auto &self, const types::TypePtr &current) -> std::string {
+        if (!current) return {};
+        const auto definition = std::find_if(definitions.begin(), definitions.end(), [&](const auto &item) {
+            return item.type && item.type->id() == current->id();
         });
-        name = found != definitions.end() ? found->name : base->name();
-    }
-    name.append(pointer_depth, '*');
-    return name;
+        if (definition != definitions.end()) return definition->name;
+        if (current->kind() == types::Kind::named_reference) return current->name();
+        if (current->kind() == types::Kind::pointer && current->element())
+            return self(self, current->element()) + "*";
+        if (current->kind() == types::Kind::array && current->element())
+            return self(self, current->element()) + "[" +
+                   (current->count() ? std::to_string(current->count()) : std::string{}) + "]";
+        if (current->kind() == types::Kind::qualified && current->element()) {
+            std::string qualifier;
+            if (current->qualifiers() & static_cast<std::uint8_t>(types::Qualifier::const_)) qualifier += "const ";
+            if (current->qualifiers() & static_cast<std::uint8_t>(types::Qualifier::volatile_)) qualifier += "volatile ";
+            if (current->qualifiers() & static_cast<std::uint8_t>(types::Qualifier::restrict_)) qualifier += "restrict ";
+            qualifier.pop_back();
+            const auto base = self(self, current->element());
+            return current->element()->kind() == types::Kind::pointer ? base + " " + qualifier
+                                                                      : qualifier + " " + base;
+        }
+        const auto found = std::find_if(definitions.begin(), definitions.end(), [&](const auto &item) {
+            return item.type && item.type->id() == current->id();
+        });
+        return found != definitions.end() ? found->name : current->name();
+    };
+    return render(render, type);
 }
 
 std::uint64_t choice_width(const wxChoice &choice) {
@@ -452,6 +500,174 @@ std::optional<TypeEditorResult> show_type_editor(
             bool has_deferred_by_value = false;
             const auto pointer_bytes = choice_width(*member_pointer_width);
             auto resolve_member_type = [&](std::string type_name) -> types::TypePtr {
+                if (type_name.starts_with('$')) {
+                    if (type_name.size() > 4096) {
+                        problem = "Encoded member type exceeds 4096 bytes.";
+                        return {};
+                    }
+                    std::size_t cursor = 1;
+                    std::function<types::TypePtr(std::size_t)> parse_encoded = [&](std::size_t depth) -> types::TypePtr {
+                        if (depth >= 64 || cursor >= type_name.size()) {
+                            problem = "Encoded member type is truncated or nested too deeply.";
+                            return {};
+                        }
+                        const auto tag = type_name[cursor++];
+                        std::uint64_t value = 0;
+                        if (tag == 'N') {
+                            const auto digits = cursor;
+                            while (cursor < type_name.size() && type_name[cursor] >= '0' && type_name[cursor] <= '9')
+                                ++cursor;
+                            if (digits == cursor) {
+                                problem = "Encoded member type has an invalid name length.";
+                                return {};
+                            }
+                            std::size_t length = 0;
+                            const auto parsed = std::from_chars(type_name.data() + digits,
+                                                                type_name.data() + cursor, length);
+                            if (parsed.ec != std::errc{} || cursor >= type_name.size() || type_name[cursor++] != ':' ||
+                                length > 512 || length > type_name.size() - cursor) {
+                                problem = "Encoded member type has an invalid name length.";
+                                return {};
+                            }
+                            auto name = type_name.substr(cursor, length);
+                            cursor += length;
+                            const auto found = std::find_if(definitions.begin(), definitions.end(), [&](const auto &item) {
+                                return item.name == name && (!original || item.id != original->id);
+                            });
+                            if (found != definitions.end()) return found->type;
+                            auto reference = types::Type::named_reference(std::move(name));
+                            if (!reference) { problem = reference.error().message; return {}; }
+                            return std::move(reference.value());
+                        }
+                        std::uint64_t pointer_size = 0, pointer_alignment = 0, array_alignment = 0;
+                        if (tag == 'P') {
+                            const auto size_begin = cursor;
+                            while (cursor < type_name.size() && type_name[cursor] >= '0' && type_name[cursor] <= '9') ++cursor;
+                            if (size_begin == cursor || cursor >= type_name.size() || type_name[cursor++] != ',') {
+                                problem = "Encoded pointer type has an invalid size.";
+                                return {};
+                            }
+                            auto parsed_size = std::from_chars(type_name.data() + size_begin,
+                                                               type_name.data() + cursor - 1, pointer_size);
+                            const auto alignment_begin = cursor;
+                            while (cursor < type_name.size() && type_name[cursor] >= '0' && type_name[cursor] <= '9') ++cursor;
+                            if (parsed_size.ec != std::errc{} || alignment_begin == cursor) {
+                                problem = "Encoded pointer type has an invalid alignment.";
+                                return {};
+                            }
+                            auto parsed_alignment = std::from_chars(type_name.data() + alignment_begin,
+                                                                    type_name.data() + cursor, pointer_alignment);
+                            if (parsed_alignment.ec != std::errc{}) {
+                                problem = "Encoded pointer type has an invalid alignment.";
+                                return {};
+                            }
+                        } else if (tag == 'A') {
+                            const auto count_begin = cursor;
+                            while (cursor < type_name.size() && type_name[cursor] >= '0' && type_name[cursor] <= '9') ++cursor;
+                            if (count_begin == cursor || cursor >= type_name.size() || type_name[cursor++] != ',') {
+                                problem = "Encoded array type has an invalid count.";
+                                return {};
+                            }
+                            const auto parsed_count = std::from_chars(type_name.data() + count_begin,
+                                                                      type_name.data() + cursor - 1, value);
+                            const auto alignment_begin = cursor;
+                            while (cursor < type_name.size() && type_name[cursor] >= '0' && type_name[cursor] <= '9') ++cursor;
+                            if (parsed_count.ec != std::errc{} || alignment_begin == cursor) {
+                                problem = "Encoded array type has an invalid alignment.";
+                                return {};
+                            }
+                            const auto parsed_alignment = std::from_chars(type_name.data() + alignment_begin,
+                                                                           type_name.data() + cursor, array_alignment);
+                            if (parsed_alignment.ec != std::errc{} || array_alignment == 0) {
+                                problem = "Encoded array type has an invalid alignment.";
+                                return {};
+                            }
+                        } else {
+                            const auto digits = cursor;
+                            while (cursor < type_name.size() && type_name[cursor] >= '0' && type_name[cursor] <= '9')
+                                ++cursor;
+                            if (digits == cursor) {
+                                problem = "Encoded member type has an invalid constructor value.";
+                                return {};
+                            }
+                            const auto parsed = std::from_chars(type_name.data() + digits,
+                                                                type_name.data() + cursor, value);
+                            if (parsed.ec != std::errc{}) {
+                                problem = "Encoded member type has an invalid constructor value.";
+                                return {};
+                            }
+                        }
+                        if (cursor >= type_name.size() || type_name[cursor++] != '(') {
+                            problem = "Encoded member type has an invalid constructor.";
+                            return {};
+                        }
+                        auto element = parse_encoded(depth + 1);
+                        if (!element || cursor >= type_name.size() || type_name[cursor++] != ')') {
+                            if (problem.empty()) problem = "Encoded member type has an unterminated constructor.";
+                            return {};
+                        }
+                        if (tag == 'P') {
+                            auto pointer = types::Type::pointer(std::move(element), pointer_size, pointer_alignment);
+                            if (!pointer) { problem = pointer.error().message; return {}; }
+                            return std::move(pointer.value());
+                        }
+                        if (tag == 'A') {
+                            auto array = types::Type::array(std::move(element), value);
+                            if (!array) { problem = array.error().message; return {}; }
+                            auto aligned = types::Type::with_alignment(std::move(array.value()), array_alignment);
+                            if (!aligned) { problem = aligned.error().message; return {}; }
+                            return std::move(aligned.value());
+                        }
+                        if (tag == 'Q') {
+                            if (value > UINT8_MAX) { problem = "Encoded member qualifier mask is invalid."; return {}; }
+                            auto qualified = types::Type::qualified(std::move(element), static_cast<std::uint8_t>(value));
+                            if (!qualified) { problem = qualified.error().message; return {}; }
+                            return std::move(qualified.value());
+                        }
+                        problem = "Encoded member type has an unknown constructor.";
+                        return {};
+                    };
+                    auto encoded_type = parse_encoded(0);
+                    if (!encoded_type || cursor != type_name.size()) {
+                        if (problem.empty()) problem = "Encoded member type has trailing data.";
+                        return {};
+                    }
+                    return encoded_type;
+                }
+                bool flexible_array = false;
+                if (type_name.size() >= 2 && type_name.ends_with("[]")) {
+                    type_name.resize(type_name.size() - 2);
+                    flexible_array = true;
+                }
+                std::uint8_t element_qualifiers = 0, pointer_qualifiers = 0;
+                const auto qualifier = [](std::string_view word) -> std::uint8_t {
+                    if (word == "const") return static_cast<std::uint8_t>(types::Qualifier::const_);
+                    if (word == "volatile") return static_cast<std::uint8_t>(types::Qualifier::volatile_);
+                    if (word == "restrict") return static_cast<std::uint8_t>(types::Qualifier::restrict_);
+                    return 0;
+                };
+                std::istringstream type_fields(type_name);
+                std::vector<std::string> type_words;
+                for (std::string word; type_fields >> word;) type_words.push_back(std::move(word));
+                std::size_t first = 0, last = type_words.size();
+                while (first < last) {
+                    const auto bits = qualifier(type_words[first]);
+                    if (!bits) break;
+                    element_qualifiers |= bits;
+                    ++first;
+                }
+                while (last > first) {
+                    const auto bits = qualifier(type_words[last - 1]);
+                    if (!bits) break;
+                    pointer_qualifiers |= bits;
+                    --last;
+                }
+                std::ostringstream base_name;
+                for (std::size_t i = first; i < last; ++i) {
+                    if (i != first) base_name << ' ';
+                    base_name << type_words[i];
+                }
+                type_name = base_name.str();
                 std::size_t pointer_depth = 0;
                 while (!type_name.empty() && type_name.back() == '*') {
                     type_name.pop_back();
@@ -475,6 +691,14 @@ std::optional<TypeEditorResult> show_type_editor(
                     }
                     member_type = std::move(forward.value());
                 }
+                if (element_qualifiers) {
+                    auto qualified = types::Type::qualified(member_type, element_qualifiers);
+                    if (!qualified) {
+                        problem = qualified.error().message;
+                        return {};
+                    }
+                    member_type = std::move(qualified.value());
+                }
                 if (pointer_depth && !pointer_bytes) {
                     problem = "Select a valid pointer width for inline pointer members.";
                     return {};
@@ -491,25 +715,70 @@ std::optional<TypeEditorResult> show_type_editor(
                     }
                     member_type = std::move(pointer.value());
                 }
-                if (pointer_depth == 0 && !member_type->size()) has_deferred_by_value = true;
+                if (pointer_qualifiers) {
+                    auto qualified = types::Type::qualified(member_type, pointer_qualifiers);
+                    if (!qualified) {
+                        problem = qualified.error().message;
+                        return {};
+                    }
+                    member_type = std::move(qualified.value());
+                }
+                if (flexible_array) {
+                    auto array = types::Type::array(member_type, 0);
+                    if (!array) {
+                        problem = array.error().message;
+                        return {};
+                    }
+                    member_type = std::move(array.value());
+                }
+                if (pointer_depth == 0 && !flexible_array && !member_type->size()) has_deferred_by_value = true;
                 return member_type;
             };
             while (problem.empty() && std::getline(lines, line)) {
                 if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
                 if (members.size() >= 4096) { problem = "Aggregate is limited to 4096 members."; break; }
                 std::istringstream fields(line);
-                std::string member_name, type_name, offset_text, width_text, bit_offset_text, extra;
-                if (!(fields >> member_name >> type_name) || (!is_union && !(fields >> offset_text))) {
+                std::vector<std::string> columns;
+                for (std::string column; fields >> column;) columns.push_back(std::move(column));
+                if (columns.size() < (is_union ? 2u : 3u)) {
                     problem = is_union ? "Each union line must contain: name type_name [bit_width bit_offset]." :
                                          "Each structure line must contain: name type_name byte_offset [bit_width bit_offset].";
                     break;
                 }
-                const bool has_width = static_cast<bool>(fields >> width_text);
-                const bool has_bit_offset = static_cast<bool>(fields >> bit_offset_text);
-                if (has_width != has_bit_offset || static_cast<bool>(fields >> extra)) {
-                    problem = "Bitfield members need both bit_width and bit_offset; no extra columns are allowed.";
-                    break;
+                const auto numeric = [](const std::string &text) {
+                    std::uint64_t value = 0;
+                    return parse_number(text, value);
+                };
+                std::string member_name = columns.front(), offset_text, width_text, bit_offset_text;
+                bool has_width = false;
+                std::size_t type_end = columns.size();
+                if (is_union) {
+                    if (columns.size() >= 4 && numeric(columns[columns.size() - 2]) && numeric(columns.back())) {
+                        has_width = true;
+                        width_text = columns[columns.size() - 2];
+                        bit_offset_text = columns.back();
+                        type_end -= 2;
+                    }
+                } else {
+                    if (columns.size() >= 5 && numeric(columns[columns.size() - 3]) &&
+                        numeric(columns[columns.size() - 2]) && numeric(columns.back())) {
+                        has_width = true;
+                        offset_text = columns[columns.size() - 3];
+                        width_text = columns[columns.size() - 2];
+                        bit_offset_text = columns.back();
+                        type_end -= 3;
+                    } else {
+                        offset_text = columns.back();
+                        --type_end;
+                    }
                 }
+                if (type_end <= 1) { problem = "Member type name is empty."; break; }
+                std::ostringstream type_name_builder;
+                for (std::size_t i = 1; i < type_end; ++i) {
+                    if (i != 1) type_name_builder << ' ';
+                    type_name_builder << columns[i];
+                }
+                auto type_name = type_name_builder.str();
                 std::uint64_t offset = 0;
                 if (!is_union && !parse_number(offset_text, offset)) { problem = "Invalid member byte offset."; break; }
                 std::optional<std::uint32_t> bit_width, bit_offset;
@@ -525,9 +794,15 @@ std::optional<TypeEditorResult> show_type_editor(
                 }
                 auto member_type = resolve_member_type(std::move(type_name));
                 if (!member_type) { if (problem.empty()) problem = "Member type could not be resolved."; break; }
+                auto layout_member_type = member_type;
+                while (layout_member_type && layout_member_type->kind() == types::Kind::qualified &&
+                       layout_member_type->element())
+                    layout_member_type = layout_member_type->element();
+                const bool flexible_array = layout_member_type && layout_member_type->kind() == types::Kind::array &&
+                                            layout_member_type->count() == 0 && !layout_member_type->size();
                 const auto member_size = member_type->size().value_or(0);
                 if (offset > UINT64_MAX - member_size) { problem = "Member extent overflows."; break; }
-                if (!member_size) {
+                if (!member_size && !flexible_array) {
                     if (offset == UINT64_MAX) { problem = "Forward member minimum extent overflows."; break; }
                     deferred_minimum_extent = std::max(deferred_minimum_extent, offset + 1);
                 }

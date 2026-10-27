@@ -15,6 +15,9 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
         std::vector<PeCodeViewIdentity> codeview;
         std::vector<PeDebugDirectoryEntry> entries;
         std::vector<PeFpoRecord> fpo_records;
+        std::vector<PePogoData> pogo_data;
+        std::size_t pogo_entry_count = 0;
+        std::size_t pogo_name_bytes = 0;
         for (std::uint32_t index = 0; index < count; ++index) {
             canceled(stop);
             const auto at = std::uint64_t{directory.location} + std::uint64_t{index} * 28;
@@ -102,6 +105,97 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
                     previous_end = end_rva;
                 }
             }
+            if (type == 13) { // IMAGE_DEBUG_TYPE_POGO.
+                constexpr std::uint32_t signature_ltcg = 0x4c544347u; // "LTCG"
+                constexpr std::uint32_t signature_pgu = 0x50475500u; // "PGU\0"
+                constexpr std::size_t payload_limit = 16u * 1024u * 1024u;
+                require(entry.data_size <= payload_limit,
+                        "PE POGO payload exceeds inspection budget", ErrorCode::resource_limit);
+                require(entry.data_size >= 4, "PE POGO payload is shorter than its signature");
+                std::vector<std::byte> payload;
+                if (entry.raw_offset) {
+                    FileReader file_reader(*image.storage());
+                    const auto raw_payload = file_reader.bytes(entry.raw_offset, entry.data_size, "POGO debug payload");
+                    payload.assign(raw_payload.bytes.begin(), raw_payload.bytes.end());
+                } else {
+                    payload = r.bytes(entry.data_rva, entry.data_size);
+                }
+                const auto u32 = [&](std::size_t at) {
+                    return std::to_integer<std::uint32_t>(payload[at]) |
+                        (std::to_integer<std::uint32_t>(payload[at + 1]) << 8) |
+                        (std::to_integer<std::uint32_t>(payload[at + 2]) << 16) |
+                        (std::to_integer<std::uint32_t>(payload[at + 3]) << 24);
+                };
+                PePogoData data;
+                data.signature = u32(0);
+                if (data.signature != signature_ltcg && data.signature != signature_pgu)
+                    continue; // Preserve unrecognized POGO variants as generic debug payloads.
+                if (entry.raw_offset)
+                    data.signature_source = {0, {{FileOffset{entry.raw_offset}, 4}}};
+                else
+                    data.signature_source = {0, r.sources(entry.data_rva, 4)};
+                std::size_t cursor = 4;
+                while (cursor < payload.size()) {
+                    canceled(stop);
+                    const auto remaining = payload.size() - cursor;
+                    if (remaining <= 3 && std::all_of(payload.begin() + static_cast<std::ptrdiff_t>(cursor), payload.end(),
+                                                       [](std::byte value) { return value == std::byte{0}; }))
+                        break;
+                    require(remaining >= 10, "PE POGO entry has no complete RVA, size, and name");
+                    const auto rva = u32(cursor);
+                    const auto size = u32(cursor + 4);
+                    const auto name_begin = cursor + 8;
+                    const auto name_end = std::find(payload.begin() + static_cast<std::ptrdiff_t>(name_begin),
+                                                    payload.end(), std::byte{0});
+                    require(name_end != payload.end(), "PE POGO entry name is unterminated");
+                    const auto name_size = static_cast<std::size_t>(name_end -
+                        (payload.begin() + static_cast<std::ptrdiff_t>(name_begin)));
+                    require(name_size != 0, "PE POGO entry name is empty");
+                    require(name_size <= 65536 && name_size <= 16u * 1024u * 1024u - pogo_name_bytes,
+                            "PE POGO aggregate name budget exceeded", ErrorCode::resource_limit);
+                    require(pogo_entry_count < record_limit,
+                            "PE POGO entry count exceeds inspection budget", ErrorCode::resource_limit);
+                    require(rva <= metadata.image_size && size <= metadata.image_size - rva,
+                            "PE POGO code/data range exceeds the image");
+                    if (size) {
+                        auto covered_rva = std::uint64_t{rva};
+                        auto remaining = std::uint64_t{size};
+                        while (remaining) {
+                            const auto address = r.address(covered_rva);
+                            const auto *segment = image.segment_at(address);
+                            require(segment && address.offset >= segment->begin.offset,
+                                    "PE POGO code/data range is not fully mapped");
+                            const auto within = address.offset - segment->begin.offset;
+                            require(within < segment->size,
+                                    "PE POGO code/data range is not fully mapped");
+                            const auto extent = std::min(remaining, segment->size - within);
+                            require(extent != 0, "PE POGO code/data range mapping is empty");
+                            covered_rva += extent;
+                            remaining -= extent;
+                        }
+                    }
+                    const auto raw_end = static_cast<std::size_t>(name_end - payload.begin()) + 1;
+                    require(raw_end <= std::numeric_limits<std::size_t>::max() - 3,
+                            "PE POGO entry alignment overflows", ErrorCode::overflow);
+                    const auto next = (raw_end + 3) & ~std::size_t{3};
+                    require(next <= payload.size(), "PE POGO entry padding exceeds payload");
+                    PePogoEntry record;
+                    record.rva = rva;
+                    record.size = size;
+                    record.name.assign(reinterpret_cast<const char *>(payload.data() + name_begin), name_size);
+                    if (entry.raw_offset)
+                        record.source = {static_cast<std::uint32_t>(pogo_entry_count),
+                            {{FileOffset{std::uint64_t{entry.raw_offset} + cursor}, next - cursor}}};
+                    else
+                        record.source = {static_cast<std::uint32_t>(pogo_entry_count),
+                            r.sources(std::uint64_t{entry.data_rva} + cursor, next - cursor)};
+                    data.entries.push_back(std::move(record));
+                    ++pogo_entry_count;
+                    pogo_name_bytes += name_size;
+                    cursor = next;
+                }
+                pogo_data.push_back(std::move(data));
+            }
             if (type != 2) continue; // IMAGE_DEBUG_TYPE_CODEVIEW
             const auto data_size = entry.data_size;
             const auto raw_offset = entry.raw_offset;
@@ -134,7 +228,7 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
             identity.record = {{{raw_offset}, data_size}};
             codeview.push_back(std::move(identity));
         }
-        const auto count_read = codeview.size() + fpo_records.size();
+        const auto count_read = codeview.size() + fpo_records.size() + pogo_entry_count;
         if (metadata.pe) {
             metadata.pe->debug_directories.insert(metadata.pe->debug_directories.end(),
                                                    std::make_move_iterator(entries.begin()),
@@ -145,6 +239,9 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
             metadata.pe->fpo_records.insert(metadata.pe->fpo_records.end(),
                                             std::make_move_iterator(fpo_records.begin()),
                                             std::make_move_iterator(fpo_records.end()));
+            metadata.pe->pogo_data.insert(metadata.pe->pogo_data.end(),
+                                          std::make_move_iterator(pogo_data.begin()),
+                                          std::make_move_iterator(pogo_data.end()));
         }
         return count_read;
     });
