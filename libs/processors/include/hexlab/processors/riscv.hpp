@@ -96,7 +96,9 @@ enum class RiscvOpcode {
     // Zfa round-to-integral forms, appended for stable decoder IDs.
     fround_s, froundnx_s, fround_d, froundnx_d,
     // Zfa minimum/maximum-number variants.
-    fminm_s, fmaxm_s, fminm_d, fmaxm_d
+    fminm_s, fmaxm_s, fminm_d, fmaxm_d,
+    // Quiet scalar comparisons; appended to preserve decoder IDs.
+    fleq_s, fltq_s, fleq_d, fltq_d
 };
 
 struct RiscvRegister {

@@ -65,6 +65,13 @@ changes. A tracking set records which bytes were read, while
 `metadata_complete` states whether the supported metadata was fully interpreted.
 Each guarantee is independent and requires loader-specific validation.
 
+The ELF loader keeps its constructed image on the same tracked storage used
+by its table and metadata readers. This matters for optional runtime
+relocations: implicit addends are read through the image's storage, and those
+target bytes contribute to the returned relocated view just as parser reads
+contribute to ordinary ELF metadata. Those accesses are therefore included in
+`metadata_reads` before the loader certifies the dependency set as complete.
+
 Workspace byte revisions are monotonic project revisions, not content hashes.
 For patch edits, the workspace compares the old and new effective bytes inside
 the union of old and new patch extents and supplies the resulting exact changed

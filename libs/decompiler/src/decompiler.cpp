@@ -143,6 +143,10 @@ ValueType vector_type(std::uint16_t bits, TypeKind element_kind = TypeKind::unkn
     return {TypeKind::vector, bits, element_signed, element_kind, element_bits, lanes};
 }
 std::string riscv_fp_name(Opcode op) {
+    if (op == Opcode::rv_fleq_s) return "fleq.s";
+    if (op == Opcode::rv_fltq_s) return "fltq.s";
+    if (op == Opcode::rv_fleq_d) return "fleq.d";
+    if (op == Opcode::rv_fltq_d) return "fltq.d";
     static constexpr const char *names[]{
         "flw","fld","fsw","fsd","fadd.s","fsub.s","fmul.s","fdiv.s","fsqrt.s","fsgnj.s","fsgnjn.s","fsgnjx.s","fmin.s","fmax.s","fmadd.s","fmsub.s","fnmsub.s","fnmadd.s","feq.s","flt.s","fle.s","fclass.s","fcvt.w.s","fcvt.wu.s","fcvt.l.s","fcvt.lu.s","fcvt.s.w","fcvt.s.wu","fcvt.s.l","fcvt.s.lu","fmv.x.w","fmv.w.x",
         "fadd.d","fsub.d","fmul.d","fdiv.d","fsqrt.d","fsgnj.d","fsgnjn.d","fsgnjx.d","fmin.d","fmax.d","fmadd.d","fmsub.d","fnmsub.d","fnmadd.d","feq.d","flt.d","fle.d","fclass.d","fcvt.w.d","fcvt.wu.d","fcvt.l.d","fcvt.lu.d","fcvt.d.w","fcvt.d.wu","fcvt.d.l","fcvt.d.lu","fcvt.s.d","fcvt.d.s","fmv.x.d","fmv.d.x"};
@@ -2860,6 +2864,7 @@ a64_unhandled:
             return effect;
         }
         if ((op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) || op == Opcode::rv_fcvtmod_w_d ||
+            (op >= Opcode::rv_fleq_s && op <= Opcode::rv_fltq_d) ||
             op == Opcode::rv_fli_s || op == Opcode::rv_fli_d ||
             (op >= Opcode::rv_fround_s && op <= Opcode::rv_froundnx_d)) {
             if (auto converted = lift_riscv_fp_conversion(instruction, operands)) return *converted;
@@ -2882,7 +2887,8 @@ a64_unhandled:
                 return Store{std::make_shared<Expression>(std::move(address)), stored};
             }
             std::vector<ExpressionPtr> inputs;
-            const bool single = op <= Opcode::rv_fmv_w_x || op == Opcode::rv_fcvt_d_s || op == Opcode::rv_fmv_x_w;
+            const bool single = op <= Opcode::rv_fmv_w_x || op == Opcode::rv_fcvt_d_s || op == Opcode::rv_fmv_x_w ||
+                                op == Opcode::rv_fleq_s || op == Opcode::rv_fltq_s;
             const bool raw_move = op == Opcode::rv_fmv_x_w || op == Opcode::rv_fmv_x_d ||
                                   op == Opcode::rv_fmv_w_x || op == Opcode::rv_fmv_d_x;
             for (std::size_t n = 1; n < operands.size(); ++n) {
