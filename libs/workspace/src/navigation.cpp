@@ -63,7 +63,7 @@ Result<X86LogicalAddress> parse_x86_logical_address(std::wstring_view text) {
     if (!offset)
         return offset.error();
     if (selector.value() > UINT16_MAX)
-        return Error{ErrorCode::invalid_argument, "Selector exceeds16 bits"};
+        return Error{ErrorCode::invalid_argument, "Selector exceeds 16 bits"};
     return X86LogicalAddress{static_cast<std::uint16_t>(selector.value()), static_cast<std::uint32_t>(offset.value())};
 }
 Result<Address> parse_segment_address(const Image &image, std::wstring_view text) {

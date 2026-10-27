@@ -233,7 +233,11 @@ Result<UefiCapsuleList> parse_uefi_fmp_capsule_list(
         capsule_options.max_embedded_decompressed_bytes = options.max_embedded_decompressed_bytes - embedded_decompressed_used;
         auto parsed = parse_uefi_fmp_capsule(capsule_bytes, capsule_options, stop);
         if (!parsed) return parsed.error();
-        if (result.capsules.empty()) result.capsule_guid = parsed.value().capsule_guid;
+        if (result.capsules.empty()) {
+            result.capsule_guid = parsed.value().capsule_guid;
+        } else if (parsed.value().capsule_guid != result.capsule_guid) {
+            return malformed("FMP capsule list contains differing capsule GUIDs");
+        }
         result.total_input_bytes += capsule_bytes.size();
         result.total_item_count += parsed.value().items.size();
         for (const auto &item : parsed.value().items) {

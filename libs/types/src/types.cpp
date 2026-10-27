@@ -198,7 +198,7 @@ hexlab::Result<TypePtr> Type::aggregate(Kind kind, std::string name, std::vector
         if (member.virtual_base) continue;
         if (flexible && (kind != Kind::structure || member_index == 0 || member_index + 1 != members.size() ||
                          member.bit_width || member.bit_offset))
-            return invalid("flexible array must follow another member and be the final non-bitfield member of a structure");
+            return invalid("flexible array must be the final member of a structure with at least one preceding member");
         const auto member_size = member.type->size().value_or(0);
         if (member.offset > size ||
             (!(zero_width_barrier) && member_size > size - member.offset))
