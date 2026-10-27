@@ -565,6 +565,7 @@ std::string operation_name(Opcode opcode) {
     case Opcode::m6502_adc: return "ADC"; case Opcode::m6502_sbc: return "SBC";
     case Opcode::m6502_and: return "AND"; case Opcode::m6502_ora: return "ORA";
     case Opcode::m6502_eor: return "EOR"; case Opcode::m6502_cmp: return "CMP";
+    case Opcode::m6502_dcp: return "DCP";
     case Opcode::m6502_cpx: return "CPX"; case Opcode::m6502_cpy: return "CPY";
     case Opcode::m6502_bit: return "BIT"; case Opcode::m6502_inc: return "INC";
     case Opcode::m6502_dec: return "DEC"; case Opcode::m6502_inx: return "INX";
@@ -1748,6 +1749,18 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 const auto negative = boolean_unary("signbit", difference);
                 return write_flags(0x83, {flag_bit(carry, 0), flag_bit(zero, 1),
                                           flag_bit(negative, 7)});
+            }
+            if (op == Opcode::m6502_dcp && is_memory(instruction.operands.front())) {
+                const auto decremented = byte_wrap(binary("sub", operands.front(), constant_expr(1, 8)));
+                const auto difference = binary("sub", reg_expr(accumulator), decremented);
+                const auto carry = boolean_binary("uge", reg_expr(accumulator), decremented);
+                const auto flags = nz_flags(difference, status_value, carry);
+                Intrinsic effect{"m6502_dcp_decrement_then_compare",
+                    {operands.front(), decremented, reg_expr(accumulator), status_value},
+                    IntrinsicMemoryEffect::unknown};
+                effect.register_writes = {status};
+                effect.register_output_values = {flags};
+                return effect;
             }
         }
         const auto flag_change = [&](std::uint8_t mask, bool set) -> Statement {

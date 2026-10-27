@@ -239,10 +239,14 @@ that constructs an absolute table base with `LUI`/`ORI` (or bounded
 index and base with `DADDU`, loads an eight-byte target with `LD`, and dispatches
 through `JR`. Each table word must resolve to an executable, decodable target;
 relocation metadata is preserved where available. The scan is capped at 4096
-entries. No MIPS branch-delay-slot guard proof is implemented, so case counts
-and defaults remain unknown and such scans are partial. Other widths, signed
-offset tables, cross-block register propagation, and delay-slot control-flow
-proofs remain unsupported.
+entries. A same-block `SLTIU guard, selector, bound` followed by
+`BEQ guard, $zero, default` proves the strict range `[0, bound)` for either
+MIPS32 or MIPS64. This proof requires a decoded, side-effect-free fallthrough
+delay-slot instruction and setup to begin immediately after that slot; the
+bound must be in `[1, 4096]`. The default target must decode as an executable
+instruction. Other MIPS delay-slot guard forms, delay-slot control flow,
+unsupported base construction, signed-offset tables, and cross-block register
+propagation remain unsupported.
 
 The same constrained register-value analysis now recognizes the corresponding
 MIPS32 O32 absolute-pointer form with a four-byte table entry:
@@ -251,11 +255,11 @@ and `JR`. It accepts only one straight-line block, exact 32-bit GPR operands,
 a distinct nonzero selector/base/target, and file-backed table storage. Each
 entry must resolve from its exact four-byte slot and decode as executable
 MIPS32 code; ELF/Mach-O relocation rows are retained through the existing
-slot resolver. The 4096-entry cap applies. Counts and defaults remain unknown
-because MIPS delay-slot guard proofs are not implemented, and unsupported
-base construction, signed-offset tables, cross-block values, and delay-slot
-control-flow remain outside this recognizer. No test or build was run for this
-extension; runtime recognition remains unverified.
+slot resolver. The 4096-entry cap applies. Without the validated guard,
+counts and defaults remain unknown and scanning is limited to a verified
+prefix. Unsupported base construction, signed-offset tables, cross-block
+values, and delay-slot control flow remain outside this recognizer. No test or
+build was run for this extension; runtime recognition remains unverified.
 
 For project users, `hexlab_cli project switches <project> --at va:<entry>`
 prints deterministic JSON containing the dispatch/table addresses, selector,

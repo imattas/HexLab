@@ -918,9 +918,13 @@ Result<std::vector<UefiFirmwareVolume>> parse_uefi_firmware_volumes(
         if (parsed.value().files.size() > options.max_files - std::min(options.max_files, total_files))
             return Error{ErrorCode::resource_limit, "UEFI firmware image file-count limit exceeded"};
         total_files += parsed.value().files.size();
-        const auto length = static_cast<std::size_t>(parsed.value().length);
         result.push_back(std::move(parsed.value()));
-        cursor += length;
+        // Continue scanning within a valid volume as well. PI firmware-volume
+        // image sections can contain another complete FV, and the full header,
+        // checksum, block-map, and filesystem-GUID validation above keeps
+        // arbitrary signature bytes from being reported as nested volumes.
+        // Global volume/file/section/decompression budgets still apply.
+        ++cursor;
     }
     if (result.empty())
         return Error{ErrorCode::unsupported, "No valid PI firmware volume with FFS2 or FFS3 was found"};

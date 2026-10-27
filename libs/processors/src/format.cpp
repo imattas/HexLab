@@ -777,6 +777,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         "sei", "clv", "cld", "sed", "asl", "lsr", "rol", "ror"};
     if (op >= Opcode::m6502_lda && op <= Opcode::m6502_ror)
         return m6502_names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::m6502_lda)];
+    if (op == Opcode::m6502_dcp) return "dcp";
     const auto index = static_cast<std::size_t>(op);
     return index < std::size(names) ? names[index] : "?opcode";
 }
