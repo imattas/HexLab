@@ -8,7 +8,11 @@ attach exposes the initial stop as a normal debugger event. Continued stops
 are observed through `waitpid`; continue, single-step, and interrupt use
 `PT_CONTINUE`, `PT_STEP`, and `SIGSTOP`.
 
-Thread IDs and registers come from Mach task/thread APIs. While a process-wide
+Thread IDs, optional kernel thread names, and registers come from Mach
+task/thread APIs. Thread names use `THREAD_EXTENDED_INFO`; when the kernel does
+not return a name, the snapshot keeps its `thread <id>` label. Thread-state
+snapshots report the backend's process stop boundary for each listed thread;
+they do not attempt to report scheduler wait/sleep states. While a process-wide
 task suspension is held, register reads and edits address the requested thread
 ID, including in a multi-threaded process. The x86-64 path exposes the 64-bit
 general, x87, and XMM register state; the AArch64 path exposes x0-x30, SP, PC,

@@ -18,6 +18,11 @@ initialized image bytes; long-jump and EH-continuation targets must map to
 initialized executable bytes. All tables are bounded by the image extent and
 the one-million-record loader budget. Malformed table content produces a
 warning and marks PE metadata incomplete.
+When GFIDS entries have optional metadata, the loader names the currently
+defined first-byte flags `FID_SUPPRESSED` (0x1) and `EXPORT_SUPPRESSED` (0x2)
+in CLI output. It retains the raw metadata bytes and unknown bits. Extra bytes
+beyond the first flag byte remain opaque. The loader reports these attributes;
+it does not apply CFG policy or infer OS runtime behavior from them.
 The versioned Guard RF helper fields (`GuardRFFailureRoutine`, its function
 pointer, and `GuardRFVerifyStackPointerFunctionPointer`) are retained as
 normalized RVAs when their complete pointer fields are present and nonzero.

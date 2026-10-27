@@ -1171,6 +1171,26 @@ RegisterReferenceFacts x86_register_reference_facts(const Image *image, const Re
                 }
             }
             if (definition) {
+                // A full-width immediate move is also a common absolute
+                // pointer materialization (especially in hand-written code).
+                // Publish an address xref only when its exact value lands in
+                // mapped image bytes; arbitrary unmapped constants remain
+                // ordinary scalar immediates.
+                const auto *destination = architecture_register(instruction, 0, RegisterBank::gpr, width);
+                if (instruction.opcode == Opcode::mov && instruction.operands.size() == 2 && destination &&
+                    definition->first == destination->index) {
+                    const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[1]);
+                    if (immediate && immediate->effective_width == width &&
+                        (width == 32 || immediate->encoded_width == 64 ||
+                         (immediate->encoded_width == 32 && immediate->is_signed))) {
+                        const Address target{instruction.address.space, truncate(definition->second, width)};
+                        if (mapped_data_range(*image, target, OperandAccess::address, 1)) {
+                            const ReferenceOperandKey key{fact->id, 1};
+                            result.immediate_targets[key] = target;
+                            result.producer_instruction_ids[key] = {fact->id};
+                        }
+                    }
+                }
                 registers[definition->first] = definition->second;
                 state.producers[definition->first] = std::move(definition_producers);
                 state.tails[definition->first] = {fact->id};

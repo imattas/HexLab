@@ -275,6 +275,8 @@ Result<std::size_t> read_load_configuration(const Image& image, const Directory&
                     PeGuardCfFunction function;
                     function.rva = function_rva;
                     function.metadata.assign(entry.begin() + 4, entry.end());
+                    if (!function.metadata.empty())
+                        function.flags = std::to_integer<std::uint8_t>(function.metadata.front());
                     function.source = PeRecordSource{static_cast<std::uint32_t>(i), reader.sources(row, stride)};
                     if (!result.guard_functions.empty())
                         require(result.guard_functions.back().rva < function.rva, "PE Guard CF function table is not strictly ordered");
