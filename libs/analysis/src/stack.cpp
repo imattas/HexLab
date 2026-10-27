@@ -215,12 +215,20 @@ bool record_stack_slot(StackFrameAnalysis &result, std::int64_t offset, std::uin
         const auto unknown_index = static_cast<std::size_t>(unknown - result.slots.begin());
         auto &known = result.slots[slot_index];
         known.address_taken = true;
+        // Re-coalescing moves already-budgeted details. Keep the unique-site
+        // budget exact, subtracting a duplicate when both slots recorded the
+        // same instruction semantics.
         for (const auto address : unknown->accesses)
             if (std::find(known.accesses.begin(), known.accesses.end(), address) == known.accesses.end())
                 known.accesses.push_back(address);
-        for (const auto &detail : unknown->access_details)
-            if (std::find(known.access_details.begin(), known.access_details.end(), detail) == known.access_details.end())
+        for (const auto &detail : unknown->access_details) {
+            if (std::find(known.access_details.begin(), known.access_details.end(), detail) ==
+                known.access_details.end()) {
                 known.access_details.push_back(detail);
+            } else if (detail_count != 0) {
+                --detail_count;
+            }
+        }
         result.slots.erase(unknown);
         if (unknown_index < slot_index)
             --slot_index;

@@ -841,6 +841,41 @@ class Project:
                     raise RuntimeError("reference page cursor did not advance consistently")
                 start = page.next
 
+    def iter_references(self, location, *, page_size=256, max_rows=None, cancel=None):
+        """Yield outgoing references from one location on a captured generation."""
+        return self._iterate_rows("references", page_size, location,
+                                  max_rows=max_rows, cancel=cancel)
+
+    def iter_incoming_references(self, location, *, page_size=256, max_rows=None, cancel=None):
+        """Yield incoming references to one location on a captured generation."""
+        self._check_page_size(page_size)
+        if max_rows is not None:
+            _unsigned(max_rows, "max_rows")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        if max_rows == 0:
+            return
+        with self.capture(cancel=cancel) as reader:
+            start = 0
+            while max_rows is None or start < max_rows:
+                if cancel is not None and cancel.cancelled:
+                    raise AnalysisCancelled("reference iteration canceled")
+                amount = page_size if max_rows is None else min(page_size, max_rows - start)
+                page = reader.incoming_references(location, start=start, count=amount)
+                for row in page.references:
+                    if cancel is not None and cancel.cancelled:
+                        raise AnalysisCancelled("reference iteration canceled")
+                    yield row
+                if cancel is not None and cancel.cancelled:
+                    raise AnalysisCancelled("reference iteration canceled")
+                if page.next is None:
+                    return
+                if page.next <= start or page.next != start + len(page.references):
+                    raise RuntimeError("incoming reference page cursor did not advance consistently")
+                start = page.next
+
     def call_graph(self, address, *, max_functions=1024, max_edges=16384,
                    max_instructions=1000000, cancel=None):
         """Walk resolved direct calls reachable from the function containing address.

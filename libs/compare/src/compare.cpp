@@ -182,6 +182,7 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
     const auto &weights = options.weights;
     if (options.minimum_confidence > 100 || options.ambiguity_margin > 100 || options.max_candidate_pairs == 0 ||
         options.max_fingerprint_items == 0 || options.max_call_edges == 0 || options.max_context_edge_visits == 0 ||
+        options.max_semantic_items == 0 ||
         weights.fingerprint_weight > 100 || weights.histogram_weight > 100 ||
         weights.instruction_count_weight > 100 || weights.block_count_weight > 100 ||
         weights.call_count_weight > 100 || weights.same_name_floor > 100 || weights.shape_only_ceiling > 100 ||
@@ -205,9 +206,16 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
     };
     if (!valid_cfgs(old_functions) || !valid_cfgs(new_functions))
         return Error{ErrorCode::invalid_argument, "function CFG edge target is outside its block list"};
-    std::uint64_t fingerprint_items = 0, histogram_items = 0, call_edges = 0;
+    std::uint64_t fingerprint_items = 0, histogram_items = 0, call_edges = 0, semantic_items = 0;
+    const auto count_semantics = [&](const auto &items, std::size_t expected) -> bool {
+        if ((!items.empty() && items.size() != expected) ||
+            items.size() > options.max_semantic_items - semantic_items) return false;
+        semantic_items += items.size();
+        return true;
+    };
     const auto count_fingerprints = [&](auto functions) -> bool {
         for (const auto &fn : functions) {
+            if (!count_semantics(fn.instruction_semantics, fn.instruction_fingerprints.size())) return false;
             if (fn.instruction_fingerprints.size() > options.max_fingerprint_items - fingerprint_items) return false;
             fingerprint_items += fn.instruction_fingerprints.size();
             if (fn.cfg_fingerprints.size() > options.max_fingerprint_items - fingerprint_items) return false;
@@ -216,6 +224,12 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
             fingerprint_items += fn.cfg_blocks.size();
             for (std::size_t source = 0; source < fn.cfg_blocks.size(); ++source) {
                 const auto &block = fn.cfg_blocks[source];
+                if ((!block.instruction_semantics.empty() &&
+                     (!block.instruction_fingerprints_available ||
+                      block.instruction_semantics.size() != block.instruction_fingerprints.size())) ||
+                    block.instruction_semantics.size() > options.max_semantic_items - semantic_items)
+                    return false;
+                semantic_items += block.instruction_semantics.size();
                 if (block.successors.size() > options.max_fingerprint_items - fingerprint_items) return false;
                 fingerprint_items += block.successors.size();
                 if ((!block.instruction_fingerprints_available && !block.instruction_fingerprints.empty()) ||
@@ -233,7 +247,7 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
         return true;
     };
     if (!count_fingerprints(old_functions) || !count_fingerprints(new_functions))
-        return Error{ErrorCode::invalid_argument, "function feature budget exceeded"};
+        return Error{ErrorCode::invalid_argument, "function feature or semantic-record budget exceeded"};
     const bool refine = call_edges != 0 && options.max_call_graph_rounds != 0;
     const auto phases = 1ull + (refine ? options.max_call_graph_rounds : 0);
     if (pair_count > UINT64_MAX / phases)

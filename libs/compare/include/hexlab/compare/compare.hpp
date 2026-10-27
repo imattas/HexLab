@@ -157,8 +157,7 @@ struct FunctionMatchOptions {
     // Total adjacency items examined during refinement across all candidates.
     std::uint64_t max_context_edge_visits = 64'000'000;
     std::uint32_t max_call_graph_rounds = 16; // zero disables graph refinement
-    // Total opcode-histogram buckets across both images. Appended to preserve
-    // positional aggregate initialization of the existing options.
+    // Total opcode-histogram buckets across both images.
     std::uint64_t max_opcode_histogram_items = 16'000'000;
     // Appended to preserve existing aggregate initializers. Defaults retain
     // the original matching score calibration.
@@ -168,6 +167,9 @@ struct FunctionMatchOptions {
     std::uint64_t max_cfg_comparison_items = 64'000'000;
     // Total retained bottom-k instruction-adjacency hashes across both images.
     std::uint64_t max_sequence_items = 4'000'000;
+    // Aggregate instruction semantic records retained on functions and CFG
+    // blocks. Appended to preserve positional aggregate initialization.
+    std::uint64_t max_semantic_items = 16'000'000;
 };
 HEXLAB_COMPARE_EXPORT Result<std::vector<FunctionMatch>> match_functions_detailed(
     std::span<const FunctionFeature> old_functions, std::span<const FunctionFeature> new_functions,

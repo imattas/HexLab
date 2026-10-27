@@ -163,7 +163,8 @@ retain their existing cancellation paths.
 
 For scripts that need a complete table walk, `iter_functions()`,
 `iter_instructions()`, `iter_segments()`, `iter_strings()`, `iter_annotations()`,
-`iter_types()`, `iter_type_assignments()`, and `iter_all_references()` yield rows page by page instead of retaining the whole
+`iter_types()`, `iter_type_assignments()`, `iter_references(location)`,
+`iter_incoming_references(location)`, and `iter_all_references()` yield rows page by page instead of retaining the whole
 table in memory. Each accepts `page_size` from 1 through 4096 (default 256).
 They use the same native page queries and stale-analysis checks as the explicit
 page methods. General workspace iterators now capture one immutable workspace
@@ -174,6 +175,12 @@ between pages and before each row. Omitted cancellation uses the desktop console
 token. Stack-slot, block, and block-instruction iterators follow the same rules.
 Cancellation raises `AnalysisCancelled`; native page construction remains
 synchronous and may finish before cancellation is observed.
+
+`iter_references(location)` and `iter_incoming_references(location)` provide the
+same bounded, cancellable traversal for one xref source or destination. They pin
+one workspace capture for the full generator lifetime, so a patch or reanalysis
+cannot mix reference generations between pages. The incoming form follows its
+native `ReferencePage` cursor and returns only the reference rows.
 
 `capture(expected_revision=None, cancel=None)` returns an independent read-only
 `Project` owner for consistent reads across different tables and byte chunks.
