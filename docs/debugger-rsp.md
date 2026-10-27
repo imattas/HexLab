@@ -1,5 +1,15 @@
 # GDB Remote Serial Protocol packet handling
 
+When the remote does not provide `qXfer:threads:read` XML, the thread list uses
+`qThreadExtraInfo,<thread-id>` to replace synthetic thread labels with the
+stub's hex-encoded descriptions. Empty replies keep the synthetic label. Each
+description is capped at 4 KiB, and at most the first 64 enumerated threads
+are queried per refresh, with a shared two-second deadline; larger lists retain
+synthetic labels for the rest. An empty response or a non-cancellation request
+error stops further optional queries for that refresh. Malformed hex and
+embedded NUL descriptions are rejected; other ASCII control bytes are replaced
+with spaces before the label reaches the UI.
+
 ## Launching on a connected remote target
 
 In a live RSP session, the existing **Launch** command can start a new remote

@@ -741,6 +741,42 @@ Result<std::vector<std::string>> Client::enumerate_thread_ids(std::stop_token st
     }
     return Error{ErrorCode::resource_limit, "RSP thread enumeration page limit exceeded"};
 }
+Result<std::optional<std::string>> Client::read_thread_extra_info(std::string_view thread_id,
+    std::size_t limit, std::chrono::milliseconds timeout, std::stop_token stop) {
+    if (limit == 0 || limit > 64 * 1024 || timeout <= std::chrono::milliseconds::zero() ||
+        timeout > std::chrono::minutes(1) || thread_id.empty() || thread_id.size() > 34)
+        return Error{ErrorCode::invalid_argument, "invalid RSP thread-info bounds or ID"};
+    std::uint64_t thread = 0;
+    if (!parse_thread_id(thread_id, thread) || thread == 0 ||
+        thread_id.find_first_not_of("p.0123456789abcdefABCDEF") != std::string_view::npos)
+        return Error{ErrorCode::invalid_argument, "qThreadExtraInfo requires a concrete thread ID"};
+    if (thread_id.starts_with('p')) {
+        const auto dot = thread_id.find('.');
+        std::uint64_t process = 0;
+        if (dot == std::string_view::npos || !parse_hex(thread_id.substr(1, dot - 1), process) || process == 0)
+            return Error{ErrorCode::invalid_argument, "qThreadExtraInfo requires a concrete process ID"};
+    }
+    auto response = transact_until("qThreadExtraInfo," + std::string(thread_id),
+                                   std::chrono::steady_clock::now() + timeout, stop);
+    if (!response) return response.error();
+    if (response.value().empty()) return std::optional<std::string>{};
+    if (response.value().size() > limit * 2)
+        return Error{ErrorCode::resource_limit, "RSP thread extra-info exceeds configured limit"};
+    auto bytes = decode_hex(response.value());
+    if (!bytes) return bytes.error();
+    std::string description;
+    description.reserve(bytes.value().size());
+    for (const auto byte : bytes.value()) {
+        const auto value = std::to_integer<unsigned char>(byte);
+        if (value < 0x20 || value == 0x7f) {
+            if (value == 0) return Error{ErrorCode::malformed, "RSP thread extra-info contains an embedded NUL"};
+            description.push_back(' ');
+        } else {
+            description.push_back(static_cast<char>(value));
+        }
+    }
+    return std::optional<std::string>(std::move(description));
+}
 Result<std::vector<std::byte>> Client::read_registers(std::stop_token stop) {
     auto response = transact("g", stop); if (!response) return response.error(); return decode_hex(response.value());
 }

@@ -1760,12 +1760,29 @@ public:
         }
         auto ids = client_->enumerate_thread_ids(); if (!ids) return ids.error();
         std::vector<ThreadInfo> result; result.reserve(ids.value().size());
-        for (const auto& id : ids.value()) {
+        const auto extra_info_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        bool probe_extra_info = true;
+        for (std::size_t index = 0; index < ids.value().size(); ++index) {
+            const auto& id = ids.value()[index];
             if (!valid_thread_wire_id(id)) return Error{ErrorCode::malformed, "remote thread list contains a non-concrete thread ID"};
             if (!thread_belongs_to_session(id)) continue;
             const auto token = thread_token(id);
             const auto state = thread_run_states_.try_emplace(id, ThreadState::unknown).first;
-            result.push_back({token, "thread " + id, state->second});
+            std::string name = "thread " + id;
+            // Keep per-thread descriptions bounded on large targets.
+            if (index < 64 && probe_extra_info) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    extra_info_deadline - std::chrono::steady_clock::now());
+                if (remaining <= std::chrono::milliseconds::zero()) {
+                    probe_extra_info = false;
+                } else {
+                    auto extra = client_->read_thread_extra_info(id, 4096, remaining);
+                    if (extra && extra.value() && !extra.value()->empty()) name = std::move(*extra.value());
+                    else if (!extra && extra.error().code == ErrorCode::canceled) return extra.error();
+                    else probe_extra_info = false;
+                }
+            }
+            result.push_back({token, std::move(name), state->second});
         }
         if (result.empty()) return unsupported("remote thread list contains no threads in the session process");
         return result;
