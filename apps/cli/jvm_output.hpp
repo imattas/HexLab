@@ -11,6 +11,8 @@ inline void jvm_description(std::ostream &out, const ImageMetadata &metadata) {
     if (!j.super_name.empty()) out << "Superclass: " << j.super_name << '\n';
     out << "Interfaces: " << j.interfaces.size() << " Fields: " << j.fields.size()
         << " Methods: " << j.methods.size() << " Constant pool: " << (j.constant_pool.size() - 1) << '\n';
+    const auto annotations=[&](const auto &items,const char *visibility,const char *owner){for(const auto &annotation:items)out<<visibility<<" annotation "<<owner<<": "<<annotation.descriptor<<" elements="<<annotation.elements.size()<<'\n';};
+    annotations(j.visible_annotations,"visible","class");annotations(j.invisible_annotations,"invisible","class");
     if (j.nest_host) out << "Nest host: " << *j.nest_host << '\n';
     for (const auto &name : j.nest_members) out << "Nest member: " << name << '\n';
     for (const auto &name : j.permitted_subclasses) out << "Permitted subclass: " << name << '\n';
@@ -33,6 +35,8 @@ inline void jvm_description(std::ostream &out, const ImageMetadata &metadata) {
                              << " exceptions=" << method.code->exception_table.size();
         else out << " native/abstract";
         out << '\n';
+        annotations(method.visible_annotations,"visible","method");annotations(method.invisible_annotations,"invisible","method");
     }
+    for(const auto &field:j.fields){annotations(field.visible_annotations,"visible","field");annotations(field.invisible_annotations,"invisible","field");}
 }
 } // namespace hexlab::cli

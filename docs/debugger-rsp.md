@@ -232,6 +232,13 @@ an architecture accepted by GDB's `set architecture` command
 ([GDB target-description format](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Target-Description-Format.html)).
 
 Remote hardware execute and data watchpoints retain owned IDs, kind and size.
+RSP has no standard `qSupported` feature token for individual watchpoint kinds,
+so support is negotiated by sending the requested `Z2`, `Z3`, or `Z4` tuple:
+`OK` records ownership, while the protocol's empty unsupported-packet response
+returns `unsupported` and records no local breakpoint. The backend sends the
+requested byte length unchanged; the stub remains responsible for accepting or
+rejecting the target's alignment and hardware range constraints. The public
+RSP client also rejects zero-length and address-overflowing tuples before I/O.
 The common `DebugSession::set_breakpoint_enabled` operation sends `z` to
 disable or `Z` to re-enable the exact owned tuple, preserving its local ID.
 Duplicate wire tuples (including hardware/execute aliases) report conflict

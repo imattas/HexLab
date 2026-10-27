@@ -395,6 +395,12 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::ppc_fctid: return "fctid";
     case Opcode::ppc_fctidz: return "fctidz";
     case Opcode::ppc_fcfid: return "fcfid";
+    case Opcode::ppc_fctiwu: return "fctiwu";
+    case Opcode::ppc_fctiwuz: return "fctiwuz";
+    case Opcode::ppc_fctidu: return "fctidu";
+    case Opcode::ppc_fctiduz: return "fctiduz";
+    case Opcode::ppc_fcfidu: return "fcfidu";
+    case Opcode::ppc_fcfids: return "fcfids";
     case Opcode::ppc_vaddubm: return "vaddubm";
     case Opcode::ppc_vadduhm: return "vadduhm";
     case Opcode::ppc_vadduwm: return "vadduwm";
@@ -809,7 +815,10 @@ std::string format_instruction(const Instruction &i) {
         std::string out = opcode_name(i.opcode, i.condition);
         if ((i.opcode == Opcode::ppc_fctiw || i.opcode == Opcode::ppc_fctiwz ||
              i.opcode == Opcode::ppc_fctid || i.opcode == Opcode::ppc_fctidz ||
-             i.opcode == Opcode::ppc_fcfid) &&
+             i.opcode == Opcode::ppc_fcfid || i.opcode == Opcode::ppc_fctiwu ||
+             i.opcode == Opcode::ppc_fctiwuz || i.opcode == Opcode::ppc_fctidu ||
+             i.opcode == Opcode::ppc_fctiduz || i.opcode == Opcode::ppc_fcfidu ||
+             i.opcode == Opcode::ppc_fcfids) &&
             std::find(i.register_writes.begin(), i.register_writes.end(),
                       RegisterOperand{RegisterBank::ppc_cr, 1, 4, false}) != i.register_writes.end())
             out += ".";

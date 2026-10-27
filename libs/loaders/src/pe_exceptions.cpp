@@ -320,140 +320,297 @@ Result<std::size_t> read_exception_directory(const Image &image, const Directory
             info.version = static_cast<std::uint8_t>(version_flags & 7u);
             info.flags = static_cast<std::uint8_t>(version_flags >> 3);
             info.size_of_prolog = std::to_integer<std::uint8_t>(header[1]);
-            const auto code_count = std::to_integer<std::uint8_t>(header[2]);
-            const auto frame = std::to_integer<std::uint8_t>(header[3]);
-            info.frame_register = static_cast<std::uint8_t>(frame & 0x0fu);
-            info.frame_offset = static_cast<std::uint8_t>(frame >> 4);
-            require(info.version == 1, "AMD64 UNWIND_INFO version is unsupported", ErrorCode::unsupported);
-            require(function_begin < function_end &&
-                        info.size_of_prolog <= function_end - function_begin,
-                    "AMD64 UNWIND_INFO prolog exceeds its runtime-function extent");
-            require((info.flags & ~7u) == 0,
-                    "AMD64 UNWIND_INFO has reserved flags");
-            require((info.flags & 4u) == 0 || (info.flags & 3u) == 0,
-                    "AMD64 UNWIND_INFO flags combine chain and handler modes");
-            require(!info.frame_register || nonvolatile_register(info.frame_register),
-                    "AMD64 UNWIND_INFO frame register is not nonvolatile");
-            require(info.frame_register || info.frame_offset == 0,
-                    "AMD64 UNWIND_INFO has a frame offset without a frame register");
             const auto codes_rva = std::uint64_t{unwind_rva} + 4;
-            reader.array(codes_rva, code_count, 2);
-            std::uint8_t previous_code_offset = 0xff;
-            bool has_frame_pointer_operation = false;
-            for (std::uint16_t slot = 0; slot < code_count;) {
-                const auto slot_rva = codes_rva + std::uint64_t{slot} * 2;
-                const auto code = reader.bytes(slot_rva, 2);
-                const auto code_offset = std::to_integer<std::uint8_t>(code[0]);
-                const auto operation_info = std::to_integer<std::uint8_t>(code[1]);
-                const auto operation = operation_info & 0x0fu;
-                const auto operation_info_value = operation_info >> 4;
-                require(code_offset <= info.size_of_prolog && code_offset <= previous_code_offset,
-                        "AMD64 UNWIND_CODE offsets are invalid or out of order");
-                previous_code_offset = code_offset;
-
-                PeUnwindOperation decoded;
-                decoded.code_offset = code_offset;
-                std::uint16_t consumed_slots = 1;
-                switch (operation) {
-                case 0: // UWOP_PUSH_NONVOL
-                    require(nonvolatile_register(operation_info_value),
-                            "UWOP_PUSH_NONVOL names a volatile or invalid register");
-                    decoded.kind = PeUnwindOperationKind::push_nonvolatile;
-                    decoded.register_number = operation_info_value;
-                    decoded.stack_size = 8;
-                    break;
-                case 1: // UWOP_ALLOC_LARGE
-                    decoded.kind = PeUnwindOperationKind::allocate_stack;
-                    if (operation_info_value == 0) {
-                        consumed_slots = 2;
-                        require(slot + consumed_slots <= code_count,
-                                "UWOP_ALLOC_LARGE is missing its scaled operand slot");
-                        const auto operand = reader.bytes(slot_rva + 2, 2);
-                        const auto units = static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(operand[0]) |
-                                                                      (std::to_integer<std::uint8_t>(operand[1]) << 8));
-                        decoded.stack_size = units * 8u;
-                    } else if (operation_info_value == 1) {
-                        consumed_slots = 3;
-                        require(slot + consumed_slots <= code_count,
-                                "UWOP_ALLOC_LARGE is missing its unscaled operand slots");
-                        decoded.stack_size = reader.integer<std::uint32_t>(static_cast<std::uint64_t>(slot_rva + 2));
-                    } else {
-                        require(false, "UWOP_ALLOC_LARGE has an invalid OpInfo value");
-                    }
-                    require(decoded.stack_size != 0 && (decoded.stack_size & 7u) == 0,
-                            "UWOP_ALLOC_LARGE stack size is zero or unaligned");
-                    break;
-                case 2: // UWOP_ALLOC_SMALL
-                    decoded.kind = PeUnwindOperationKind::allocate_stack;
-                    decoded.stack_size = static_cast<std::uint32_t>(operation_info_value) * 8u + 8u;
-                    break;
-                case 3: // UWOP_SET_FPREG
-                    require(operation_info_value == 0 && info.frame_register != 0 &&
-                                !has_frame_pointer_operation,
-                            "UWOP_SET_FPREG has invalid OpInfo, frame-register, or duplicate encoding");
-                    has_frame_pointer_operation = true;
-                    decoded.kind = PeUnwindOperationKind::set_frame_pointer;
-                    decoded.register_number = info.frame_register;
-                    decoded.stack_offset = std::uint32_t{info.frame_offset} * 16u;
-                    break;
-                case 4: // UWOP_SAVE_NONVOL
-                case 5: // UWOP_SAVE_NONVOL_FAR
-                    require(nonvolatile_register(operation_info_value),
-                            "UWOP_SAVE_NONVOL names a volatile or invalid register");
-                    decoded.kind = PeUnwindOperationKind::save_nonvolatile;
-                    decoded.register_number = operation_info_value;
-                    consumed_slots = operation == 4 ? 2 : 3;
-                    require(slot + consumed_slots <= code_count,
-                            "UWOP_SAVE_NONVOL is missing its offset operand slots");
-                    if (operation == 4) {
-                        const auto operand = reader.bytes(slot_rva + 2, 2);
-                        const auto units = static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(operand[0]) |
-                                                                      (std::to_integer<std::uint8_t>(operand[1]) << 8));
-                        decoded.stack_offset = units * 8u;
-                    } else {
-                        decoded.stack_offset = reader.integer<std::uint32_t>(slot_rva + 2);
-                        require((decoded.stack_offset & 7u) == 0,
-                                "UWOP_SAVE_NONVOL_FAR offset is not eight-byte aligned");
-                    }
-                    break;
-                case 8: // UWOP_SAVE_XMM128
-                case 9: // UWOP_SAVE_XMM128_FAR
-                    decoded.kind = PeUnwindOperationKind::save_xmm128;
-                    decoded.register_number = operation_info_value;
-                    require(decoded.register_number >= 6 && decoded.register_number <= 15,
-                            "UWOP_SAVE_XMM128 names a volatile or invalid register");
-                    consumed_slots = operation == 8 ? 2 : 3;
-                    require(slot + consumed_slots <= code_count,
-                            "UWOP_SAVE_XMM128 is missing its offset operand slots");
-                    if (operation == 8) {
-                        const auto operand = reader.bytes(slot_rva + 2, 2);
-                        const auto units = static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(operand[0]) |
-                                                                      (std::to_integer<std::uint8_t>(operand[1]) << 8));
-                        decoded.stack_offset = units * 16u;
-                    } else {
-                        decoded.stack_offset = reader.integer<std::uint32_t>(slot_rva + 2);
-                        require((decoded.stack_offset & 15u) == 0,
-                                "UWOP_SAVE_XMM128_FAR offset is not sixteen-byte aligned");
-                    }
-                    break;
-                case 10: // UWOP_PUSH_MACHFRAME
-                    require(operation_info_value <= 1,
-                            "UWOP_PUSH_MACHFRAME has an invalid OpInfo value");
-                    decoded.kind = PeUnwindOperationKind::push_machine_frame;
-                    decoded.machine_frame_has_error_code = operation_info_value != 0;
-                    decoded.stack_size = decoded.machine_frame_has_error_code ? 48u : 40u;
-                    break;
-                default:
-                    require(false, "AMD64 UNWIND_CODE operation is unsupported", ErrorCode::unsupported);
+            std::uint64_t tail_rva = 0;
+            if (info.version == 3) {
+                require((info.flags & ~7u) == 0,
+                        "AMD64 UNWIND_INFO_V3 uses reserved or unsupported large-prolog flags",
+                        ErrorCode::unsupported);
+                require((info.flags & 4u) == 0 || (info.flags & 3u) == 0,
+                        "AMD64 UNWIND_INFO_V3 flags combine chain and handler modes");
+                const auto operation_count_and_epilogs = std::to_integer<std::uint8_t>(header[3]);
+                const auto operation_count = static_cast<std::uint8_t>(operation_count_and_epilogs & 0x1fu);
+                const auto epilog_count = static_cast<std::uint8_t>(operation_count_and_epilogs >> 5);
+                require(epilog_count == 0,
+                        "AMD64 UNWIND_INFO_V3 epilog descriptors are unsupported", ErrorCode::unsupported);
+                require(function_begin < function_end &&
+                            info.size_of_prolog <= function_end - function_begin,
+                        "AMD64 UNWIND_INFO_V3 prolog exceeds its runtime-function extent");
+                const auto payload_words = std::to_integer<std::uint8_t>(header[2]);
+                const auto payload_size = std::uint64_t{payload_words} * 2;
+                const auto payload_end = codes_rva + payload_size;
+                if (payload_size) reader.array(codes_rva, 1, payload_size);
+                require(operation_count <= payload_size,
+                        "AMD64 UNWIND_INFO_V3 prolog IP-offset array exceeds its payload");
+                std::vector<std::uint8_t> code_offsets;
+                code_offsets.reserve(operation_count);
+                std::uint8_t previous_offset = 0xff;
+                for (std::uint8_t i = 0; i < operation_count; ++i) {
+                    const auto offset = reader.integer<std::uint8_t>(codes_rva + i);
+                    require(offset <= info.size_of_prolog && offset <= previous_offset,
+                            "AMD64 UNWIND_INFO_V3 prolog IP offsets are invalid or out of order");
+                    previous_offset = offset;
+                    code_offsets.push_back(offset);
                 }
-                decoded.source = {slot, reader.sources(slot_rva, std::uint64_t{consumed_slots} * 2)};
-                info.operations.push_back(std::move(decoded));
-                slot = static_cast<std::uint16_t>(slot + consumed_slots);
-            }
-            require((info.frame_register != 0) == has_frame_pointer_operation,
-                    "AMD64 UNWIND_INFO frame register and UWOP_SET_FPREG presence disagree");
+                auto wod_cursor = codes_rva + operation_count;
+                const auto wod_end = payload_end;
+                bool has_frame_pointer_operation = false;
+                for (std::uint8_t i = 0; i < operation_count; ++i) {
+                    canceled(stop);
+                    require(wod_cursor < wod_end, "AMD64 UNWIND_INFO_V3 WOD pool is truncated");
+                    const auto wod_start = wod_cursor;
+                    const auto first = reader.integer<std::uint8_t>(wod_cursor);
+                    PeUnwindOperation decoded;
+                    decoded.code_offset = code_offsets[i];
+                    std::size_t wod_size = 0;
+                    if (first == 0x00) { // WOD_SET_FPREG
+                        wod_size = 2;
+                        decoded.kind = PeUnwindOperationKind::set_frame_pointer;
+                    } else if (first == 0x01) { // WOD_ALLOC_HUGE
+                        wod_size = 5;
+                        decoded.kind = PeUnwindOperationKind::allocate_stack;
+                    } else if (first == 0x02) { // WOD_ALLOC_LARGE
+                        wod_size = 3;
+                        decoded.kind = PeUnwindOperationKind::allocate_stack;
+                    } else if (first == 0x03) {
+                        require(false, "AMD64 UNWIND_INFO_V3 canonical-frame WOD is unsupported",
+                                ErrorCode::unsupported);
+                    } else if ((first & 0x07u) == 0x04u) { // WOD_PUSH
+                        wod_size = 1;
+                        decoded.kind = PeUnwindOperationKind::push_nonvolatile;
+                        decoded.register_number = static_cast<std::uint8_t>(first >> 3);
+                        decoded.stack_size = 8;
+                        require(decoded.register_number < 16 && nonvolatile_register(decoded.register_number),
+                                "AMD64 UNWIND_INFO_V3 push WOD names an unsupported register",
+                                ErrorCode::unsupported);
+                    } else if ((first & 0x07u) == 0x05u) { // WOD_SAVE_NONVOL_FAR
+                        wod_size = 5;
+                        decoded.kind = PeUnwindOperationKind::save_nonvolatile;
+                        decoded.register_number = static_cast<std::uint8_t>(first >> 3);
+                        require(decoded.register_number < 16 && nonvolatile_register(decoded.register_number),
+                                "AMD64 UNWIND_INFO_V3 save WOD names an unsupported register",
+                                ErrorCode::unsupported);
+                    } else if ((first & 0x07u) == 0x06u) { // WOD_SAVE_NONVOL
+                        wod_size = 3;
+                        decoded.kind = PeUnwindOperationKind::save_nonvolatile;
+                        decoded.register_number = static_cast<std::uint8_t>(first >> 3);
+                        require(decoded.register_number < 16 && nonvolatile_register(decoded.register_number),
+                                "AMD64 UNWIND_INFO_V3 save WOD names an unsupported register",
+                                ErrorCode::unsupported);
+                    } else if ((first & 0x0fu) == 0x08u) { // WOD_ALLOC_SMALL
+                        wod_size = 1;
+                        decoded.kind = PeUnwindOperationKind::allocate_stack;
+                        decoded.stack_size = static_cast<std::uint32_t>(first >> 4) * 8u + 8u;
+                    } else if ((first & 0x0fu) == 0x09u) { // WOD_SAVE_XMM128_FAR
+                        wod_size = 5;
+                        decoded.kind = PeUnwindOperationKind::save_xmm128;
+                        decoded.register_number = static_cast<std::uint8_t>(first >> 4);
+                    } else if ((first & 0x0fu) == 0x0au) { // WOD_SAVE_XMM128
+                        wod_size = 3;
+                        decoded.kind = PeUnwindOperationKind::save_xmm128;
+                        decoded.register_number = static_cast<std::uint8_t>(first >> 4);
+                    } else if ((first & 0x3fu) == 0x20u) {
+                        require(false, "AMD64 UNWIND_INFO_V3 APX PUSH2 WOD is unsupported",
+                                ErrorCode::unsupported);
+                    } else {
+                        require(false, "AMD64 UNWIND_INFO_V3 WOD opcode is unsupported",
+                                ErrorCode::unsupported);
+                    }
+                    require(wod_size != 0, "AMD64 UNWIND_INFO_V3 WOD has no supported encoding",
+                            ErrorCode::unsupported);
+                    require(wod_size <= wod_end - wod_cursor,
+                            "AMD64 UNWIND_INFO_V3 WOD is truncated");
+                    if (decoded.kind == PeUnwindOperationKind::set_frame_pointer) {
+                        require(wod_size == 2 && !has_frame_pointer_operation,
+                                "AMD64 UNWIND_INFO_V3 has a duplicate or malformed frame-pointer WOD");
+                        const auto operand = reader.integer<std::uint8_t>(wod_cursor + 1);
+                        decoded.register_number = static_cast<std::uint8_t>(operand & 0x0fu);
+                        info.frame_register = decoded.register_number;
+                        info.frame_offset = static_cast<std::uint8_t>(operand >> 4);
+                        require(nonvolatile_register(info.frame_register),
+                                "AMD64 UNWIND_INFO_V3 frame-pointer WOD names a volatile register");
+                        decoded.stack_offset = std::uint32_t{info.frame_offset} * 16u;
+                        has_frame_pointer_operation = true;
+                    } else if (decoded.kind == PeUnwindOperationKind::allocate_stack) {
+                        if (first == 0x01) decoded.stack_size = reader.integer<std::uint32_t>(wod_cursor + 1);
+                        else if (first == 0x02)
+                            decoded.stack_size = std::uint32_t{reader.integer<std::uint16_t>(wod_cursor + 1)} * 8u;
+                        require(decoded.stack_size != 0 && (decoded.stack_size & 7u) == 0,
+                                "AMD64 UNWIND_INFO_V3 stack allocation is zero or unaligned");
+                    } else if (decoded.kind == PeUnwindOperationKind::save_nonvolatile) {
+                        if ((first & 0x07u) == 0x05u) {
+                            decoded.stack_offset = reader.integer<std::uint32_t>(wod_cursor + 1);
+                            require((decoded.stack_offset & 7u) == 0,
+                                    "AMD64 UNWIND_INFO_V3 far register-save offset is unaligned");
+                        } else {
+                            decoded.stack_offset = std::uint32_t{reader.integer<std::uint16_t>(wod_cursor + 1)} * 8u;
+                        }
+                    } else if (decoded.kind == PeUnwindOperationKind::save_xmm128) {
+                        require(decoded.register_number >= 6 && decoded.register_number <= 15,
+                                "AMD64 UNWIND_INFO_V3 XMM WOD names a volatile or invalid register");
+                        if ((first & 0x0fu) == 0x09u) {
+                            decoded.stack_offset = reader.integer<std::uint32_t>(wod_cursor + 1);
+                            require((decoded.stack_offset & 15u) == 0,
+                                    "AMD64 UNWIND_INFO_V3 far XMM-save offset is unaligned");
+                        } else {
+                            decoded.stack_offset = std::uint32_t{reader.integer<std::uint16_t>(wod_cursor + 1)} * 16u;
+                        }
+                    }
+                    auto sources = reader.sources(codes_rva + i, 1);
+                    auto wod_sources = reader.sources(wod_start, wod_size);
+                    sources.insert(sources.end(), wod_sources.begin(), wod_sources.end());
+                    decoded.source = {i, std::move(sources)};
+                    info.operations.push_back(std::move(decoded));
+                    wod_cursor += wod_size;
+                }
+                if (wod_cursor < wod_end) {
+                    const auto padding = reader.bytes(wod_cursor,
+                        static_cast<std::size_t>(wod_end - wod_cursor));
+                    require(std::all_of(padding.begin(), padding.end(),
+                                [](std::byte value) { return value == std::byte{0}; }),
+                            "AMD64 UNWIND_INFO_V3 payload has nonzero bytes after its declared WODs");
+                }
+                require((info.frame_register != 0) == has_frame_pointer_operation,
+                        "AMD64 UNWIND_INFO_V3 frame-register and WOD presence disagree");
+                if (!info.frame_register)
+                    require(info.frame_offset == 0,
+                            "AMD64 UNWIND_INFO_V3 has a frame offset without a frame register");
+                tail_rva = (payload_end + 3u) & ~std::uint64_t{3};
+            } else {
+                const auto code_count = std::to_integer<std::uint8_t>(header[2]);
+                const auto frame = std::to_integer<std::uint8_t>(header[3]);
+                info.frame_register = static_cast<std::uint8_t>(frame & 0x0fu);
+                info.frame_offset = static_cast<std::uint8_t>(frame >> 4);
+                require(info.version == 1, "AMD64 UNWIND_INFO version is unsupported", ErrorCode::unsupported);
+                require(function_begin < function_end &&
+                            info.size_of_prolog <= function_end - function_begin,
+                        "AMD64 UNWIND_INFO prolog exceeds its runtime-function extent");
+                require((info.flags & ~7u) == 0,
+                        "AMD64 UNWIND_INFO has reserved flags");
+                require((info.flags & 4u) == 0 || (info.flags & 3u) == 0,
+                        "AMD64 UNWIND_INFO flags combine chain and handler modes");
+                require(!info.frame_register || nonvolatile_register(info.frame_register),
+                        "AMD64 UNWIND_INFO frame register is not nonvolatile");
+                require(info.frame_register || info.frame_offset == 0,
+                        "AMD64 UNWIND_INFO has a frame offset without a frame register");
+                reader.array(codes_rva, code_count, 2);
+                std::uint8_t previous_code_offset = 0xff;
+                bool has_frame_pointer_operation = false;
+                for (std::uint16_t slot = 0; slot < code_count;) {
+                    const auto slot_rva = codes_rva + std::uint64_t{slot} * 2;
+                    const auto code = reader.bytes(slot_rva, 2);
+                    const auto code_offset = std::to_integer<std::uint8_t>(code[0]);
+                    const auto operation_info = std::to_integer<std::uint8_t>(code[1]);
+                    const auto operation = operation_info & 0x0fu;
+                    const auto operation_info_value = static_cast<std::uint8_t>(operation_info >> 4);
+                    require(code_offset <= info.size_of_prolog && code_offset <= previous_code_offset,
+                            "AMD64 UNWIND_CODE offsets are invalid or out of order");
+                    previous_code_offset = code_offset;
 
-            const auto tail_rva = codes_rva + std::uint64_t{code_count + (code_count & 1u)} * 2;
+                    PeUnwindOperation decoded;
+                    decoded.code_offset = code_offset;
+                    std::uint16_t consumed_slots = 1;
+                    switch (operation) {
+                    case 0: // UWOP_PUSH_NONVOL
+                        require(nonvolatile_register(operation_info_value),
+                                "UWOP_PUSH_NONVOL names a volatile or invalid register");
+                        decoded.kind = PeUnwindOperationKind::push_nonvolatile;
+                        decoded.register_number = operation_info_value;
+                        decoded.stack_size = 8;
+                        break;
+                    case 1: // UWOP_ALLOC_LARGE
+                        decoded.kind = PeUnwindOperationKind::allocate_stack;
+                        if (operation_info_value == 0) {
+                            consumed_slots = 2;
+                            require(slot + consumed_slots <= code_count,
+                                    "UWOP_ALLOC_LARGE is missing its scaled operand slot");
+                            const auto operand = reader.bytes(slot_rva + 2, 2);
+                            const auto units = static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(operand[0]) |
+                                                                          (std::to_integer<std::uint8_t>(operand[1]) << 8));
+                            decoded.stack_size = units * 8u;
+                        } else if (operation_info_value == 1) {
+                            consumed_slots = 3;
+                            require(slot + consumed_slots <= code_count,
+                                    "UWOP_ALLOC_LARGE is missing its unscaled operand slots");
+                            decoded.stack_size = reader.integer<std::uint32_t>(static_cast<std::uint64_t>(slot_rva + 2));
+                        } else {
+                            require(false, "UWOP_ALLOC_LARGE has an invalid OpInfo value");
+                        }
+                        require(decoded.stack_size != 0 && (decoded.stack_size & 7u) == 0,
+                                "UWOP_ALLOC_LARGE stack size is zero or unaligned");
+                        break;
+                    case 2: // UWOP_ALLOC_SMALL
+                        decoded.kind = PeUnwindOperationKind::allocate_stack;
+                        decoded.stack_size = static_cast<std::uint32_t>(operation_info_value) * 8u + 8u;
+                        break;
+                    case 3: // UWOP_SET_FPREG
+                        require(operation_info_value == 0 && info.frame_register != 0 &&
+                                    !has_frame_pointer_operation,
+                                "UWOP_SET_FPREG has invalid OpInfo, frame-register, or duplicate encoding");
+                        has_frame_pointer_operation = true;
+                        decoded.kind = PeUnwindOperationKind::set_frame_pointer;
+                        decoded.register_number = info.frame_register;
+                        decoded.stack_offset = std::uint32_t{info.frame_offset} * 16u;
+                        break;
+                    case 4: // UWOP_SAVE_NONVOL
+                    case 5: // UWOP_SAVE_NONVOL_FAR
+                        require(nonvolatile_register(operation_info_value),
+                                "UWOP_SAVE_NONVOL names a volatile or invalid register");
+                        decoded.kind = PeUnwindOperationKind::save_nonvolatile;
+                        decoded.register_number = operation_info_value;
+                        consumed_slots = operation == 4 ? 2 : 3;
+                        require(slot + consumed_slots <= code_count,
+                                "UWOP_SAVE_NONVOL is missing its offset operand slots");
+                        if (operation == 4) {
+                            const auto operand = reader.bytes(slot_rva + 2, 2);
+                            const auto units = static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(operand[0]) |
+                                                                          (std::to_integer<std::uint8_t>(operand[1]) << 8));
+                            decoded.stack_offset = units * 8u;
+                        } else {
+                            decoded.stack_offset = reader.integer<std::uint32_t>(slot_rva + 2);
+                            require((decoded.stack_offset & 7u) == 0,
+                                    "UWOP_SAVE_NONVOL_FAR offset is not eight-byte aligned");
+                        }
+                        break;
+                    case 8: // UWOP_SAVE_XMM128
+                    case 9: // UWOP_SAVE_XMM128_FAR
+                        decoded.kind = PeUnwindOperationKind::save_xmm128;
+                        decoded.register_number = operation_info_value;
+                        require(decoded.register_number >= 6 && decoded.register_number <= 15,
+                                "UWOP_SAVE_XMM128 names a volatile or invalid register");
+                        consumed_slots = operation == 8 ? 2 : 3;
+                        require(slot + consumed_slots <= code_count,
+                                "UWOP_SAVE_XMM128 is missing its offset operand slots");
+                        if (operation == 8) {
+                            const auto operand = reader.bytes(slot_rva + 2, 2);
+                            const auto units = static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(operand[0]) |
+                                                                          (std::to_integer<std::uint8_t>(operand[1]) << 8));
+                            decoded.stack_offset = units * 16u;
+                        } else {
+                            decoded.stack_offset = reader.integer<std::uint32_t>(slot_rva + 2);
+                            require((decoded.stack_offset & 15u) == 0,
+                                    "UWOP_SAVE_XMM128_FAR offset is not sixteen-byte aligned");
+                        }
+                        break;
+                    case 10: // UWOP_PUSH_MACHFRAME
+                        require(operation_info_value <= 1,
+                                "UWOP_PUSH_MACHFRAME has an invalid OpInfo value");
+                        decoded.kind = PeUnwindOperationKind::push_machine_frame;
+                        decoded.machine_frame_has_error_code = operation_info_value != 0;
+                        decoded.stack_size = decoded.machine_frame_has_error_code ? 48u : 40u;
+                        break;
+                    default:
+                        require(false, "AMD64 UNWIND_CODE operation is unsupported", ErrorCode::unsupported);
+                    }
+                    decoded.source = {slot, reader.sources(slot_rva, std::uint64_t{consumed_slots} * 2)};
+                    info.operations.push_back(std::move(decoded));
+                    slot = static_cast<std::uint16_t>(slot + consumed_slots);
+                }
+                require((info.frame_register != 0) == has_frame_pointer_operation,
+                        "AMD64 UNWIND_INFO frame register and UWOP_SET_FPREG presence disagree");
+
+                tail_rva = codes_rva + std::uint64_t{code_count + (code_count & 1u)} * 2;
+            }
             const auto flags_source = [&](std::uint64_t rva, std::uint64_t size, std::uint32_t index) {
                 return PeRecordSource{index, reader.sources(rva, size)};
             };

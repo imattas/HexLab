@@ -1,5 +1,16 @@
 # x87 Rounding Semantics
 
+`evaluate_x87_square_root` evaluates FSQRT for nonnegative finite binary80
+values, signed zero, infinities, and NaNs. It generates a 67-bit square-root
+significand with an integer digit-by-digit algorithm, uses the exact residual
+as sticky information, and performs one rounding step using FCW precision and
+rounding modes. Subnormal inputs observe the denormal-operand mask; negative
+nonzero values and signaling NaNs raise invalid, while quiet NaNs propagate.
+The evaluator reports status and retirement effects but does not model x87
+stack tags/TOP, pending exception delivery, or decompiler constant folding.
+Special-value and exception cases follow Intel's [FSQRT instruction
+reference](https://cdrdv2-public.intel.com/774492/325383-sdm-vol-2abcd.pdf).
+
 `evaluate_x87_round_to_integral` evaluates the numeric and status effects of
 FRNDINT for finite normal/subnormal values, pseudo-denormals, and infinities.
 It selects

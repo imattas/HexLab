@@ -352,13 +352,22 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         return statement;
     }
     if (i.opcode == Opcode::ppc_fctiw || i.opcode == Opcode::ppc_fctiwz ||
-        i.opcode == Opcode::ppc_fctid || i.opcode == Opcode::ppc_fctidz || i.opcode == Opcode::ppc_fcfid) {
+        i.opcode == Opcode::ppc_fctid || i.opcode == Opcode::ppc_fctidz || i.opcode == Opcode::ppc_fcfid ||
+        i.opcode == Opcode::ppc_fctiwu || i.opcode == Opcode::ppc_fctiwuz ||
+        i.opcode == Opcode::ppc_fctidu || i.opcode == Opcode::ppc_fctiduz ||
+        i.opcode == Opcode::ppc_fcfidu || i.opcode == Opcode::ppc_fcfids) {
         const auto *source = ops.size() == 2 ? std::get_if<R>(&ops[1]) : nullptr;
         const R status{RegisterBank::ppc_fpscr, 0, 32, false};
         const R record{RegisterBank::ppc_cr, 1, 4, false};
-        const bool from_integer = i.opcode == Opcode::ppc_fcfid;
-        const bool word = i.opcode == Opcode::ppc_fctiw || i.opcode == Opcode::ppc_fctiwz;
-        const bool truncate = i.opcode == Opcode::ppc_fctiwz || i.opcode == Opcode::ppc_fctidz;
+        const bool from_integer = i.opcode == Opcode::ppc_fcfid || i.opcode == Opcode::ppc_fcfidu || i.opcode == Opcode::ppc_fcfids;
+        const bool word = i.opcode == Opcode::ppc_fctiw || i.opcode == Opcode::ppc_fctiwz ||
+                          i.opcode == Opcode::ppc_fctiwu || i.opcode == Opcode::ppc_fctiwuz;
+        const bool truncate = i.opcode == Opcode::ppc_fctiwz || i.opcode == Opcode::ppc_fctidz ||
+                              i.opcode == Opcode::ppc_fctiwuz || i.opcode == Opcode::ppc_fctiduz;
+        const bool unsigned_conversion = i.opcode == Opcode::ppc_fctiwu || i.opcode == Opcode::ppc_fctiwuz ||
+                                         i.opcode == Opcode::ppc_fctidu || i.opcode == Opcode::ppc_fctiduz ||
+                                         i.opcode == Opcode::ppc_fcfidu;
+        const bool single_result = i.opcode == Opcode::ppc_fcfids;
         const auto valid_fpr = [](const R *r) {
             return r && r->bank == RegisterBank::ppc_fpr && r->width == 64 && r->index < 32 && !r->high_byte;
         };
@@ -374,23 +383,25 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
                                                  OperandAccess::read} ||
             i.register_reads != expected_reads || i.register_writes != expected_writes)
             return effect(i, "ppc_malformed_fp_conversion_effects");
-        const char *name = from_integer ? "ppc_fcfid" : word ? (truncate ? "ppc_fctiwz" : "ppc_fctiw") :
-                                                          (truncate ? "ppc_fctidz" : "ppc_fctid");
-        const ValueType signed_payload{TypeKind::integer, static_cast<std::uint16_t>(word ? 32 : 64), true};
+        const char *name = from_integer ? (single_result ? "ppc_fcfids" : unsigned_conversion ? "ppc_fcfidu" : "ppc_fcfid") :
+            word ? (unsigned_conversion ? (truncate ? "ppc_fctiwuz" : "ppc_fctiwu") : (truncate ? "ppc_fctiwz" : "ppc_fctiw")) :
+                   (unsigned_conversion ? (truncate ? "ppc_fctiduz" : "ppc_fctidu") : (truncate ? "ppc_fctidz" : "ppc_fctid"));
+        const ValueType integer_payload{TypeKind::integer, static_cast<std::uint16_t>(word ? 32 : 64), !unsigned_conversion};
         auto input = from_integer
-            ? std::make_shared<Expression>(Expression{signed_payload, RegisterValue{*source, {}}}) : reg(*source);
+            ? std::make_shared<Expression>(Expression{ValueType{TypeKind::integer, 64, !unsigned_conversion}, RegisterValue{*source, {}}}) : reg(*source);
         ExpressionPtr result;
         if (from_integer) {
             // This is a signed integer payload in FRB, not an FP bit pattern
             // to numerically reinterpret. RN controls rounding to binary64.
-            result = std::make_shared<Expression>(Expression{floating(64),
-                BinaryValue{"ppc_i64_to_f64_rn", input, reg(status)}});
+            const auto operation = std::string(unsigned_conversion ? "ppc_u64_to_f" : "ppc_i64_to_f") +
+                                  (single_result ? "32_rn_widen_f64" : "64_rn");
+            result = std::make_shared<Expression>(Expression{floating(64), BinaryValue{operation, input, reg(status)}});
         } else {
             // Named operations define NaN -> signed minimum and saturate
             // out-of-range values after rounding, unlike an ordinary cast.
-            const auto operation = std::string("ppc_f64_to_i") + (word ? "32_" : "64_") +
+            const auto operation = std::string("ppc_f64_to_") + (unsigned_conversion ? "u" : "i") + (word ? "32_" : "64_") +
                                    (truncate ? "rtz_saturate" : "rn_saturate");
-            result = std::make_shared<Expression>(Expression{signed_payload,
+            result = std::make_shared<Expression>(Expression{integer_payload,
                 BinaryValue{operation, input, reg(status)}});
             if (word) {
                 auto undefined_high = std::make_shared<Expression>(Expression{integer(32),
@@ -401,8 +412,12 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
             // VE suppresses FRT writes for NaN/out-of-range conversions.
             // Keep the old raw FPR bits and the source/FPSCR predicate in the
             // expression, including when FRT aliases FRB.
-            auto invalid = predicate(word ? (truncate ? "ppc_fctiwz_invalid_enabled" : "ppc_fctiw_invalid_enabled") :
-                                            (truncate ? "ppc_fctidz_invalid_enabled" : "ppc_fctid_invalid_enabled"),
+            const auto invalid_name = unsigned_conversion ?
+                (word ? (truncate ? "ppc_fctiwuz_invalid_enabled" : "ppc_fctiwu_invalid_enabled") :
+                        (truncate ? "ppc_fctiduz_invalid_enabled" : "ppc_fctidu_invalid_enabled")) :
+                (word ? (truncate ? "ppc_fctiwz_invalid_enabled" : "ppc_fctiw_invalid_enabled") :
+                        (truncate ? "ppc_fctidz_invalid_enabled" : "ppc_fctid_invalid_enabled"));
+            auto invalid = predicate(invalid_name,
                                      input, reg(status));
             auto preserve_mask = unary("sext", invalid, 64);
             auto previous = std::make_shared<Expression>(Expression{integer(64), RegisterValue{*dst, {}}});

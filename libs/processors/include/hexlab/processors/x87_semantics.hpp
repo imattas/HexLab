@@ -161,6 +161,18 @@ struct X87DivideRequest {
 HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
 evaluate_x87_divide(const X87DivideRequest &request) noexcept;
 
+struct X87SquareRootRequest {
+    X87Binary80 value;
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+};
+// Evaluate nonnegative finite binary80 FSQRT inputs and signed zero using an
+// exact integer square-root with guard/round/sticky bits and the shared x87
+// precision, rounding, denormal, and exception handling. NaN/infinity and
+// negative nonzero inputs are handled only where their exact result is known.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
+evaluate_x87_square_root(const X87SquareRootRequest &request) noexcept;
+
 enum class X87UnaryArithmetic : std::uint8_t { change_sign, absolute };
 struct X87UnaryResult {
     X87Binary80 value;
