@@ -66,7 +66,10 @@ struct SwitchAnalysis {
 // no intervening writes, calls, unknown facts, or control-flow changes. The
 // latter interprets signed 32-bit entries relative to the table base. An
 // adjacent CMP of the exact selector and JA/JAE may prove an unsigned
-// case count (including one-case tables) and supply a default target. The
+// case count (including one-case tables) and supply a default target. x86
+// also recognizes a signed lower/upper CMP guard pair with a shared default
+// and exact in-place subtraction of the lower bound before indexing; its
+// inclusive span supplies the count. The
 // in-range edge may reach setup through a bounded acyclic CFG region when
 // every known incoming path preserves the selector and passes that edge.
 // Calls, unknown effects, alternate entries, bypasses, and cyclic proof

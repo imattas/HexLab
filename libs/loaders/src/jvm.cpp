@@ -248,6 +248,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     }
     const auto utf8=[&](std::uint16_t ix)->Result<std::string>{if(!ix||ix>=md.constant_pool.size()||md.constant_pool[ix].tag!=1)return malformed("constant-pool reference is not CONSTANT_Utf8");return md.constant_pool[ix].text;};
     const auto class_name=[&](std::uint16_t ix)->Result<std::string>{if(!ix||ix>=md.constant_pool.size()||md.constant_pool[ix].tag!=7)return malformed("class index is not CONSTANT_Class");return utf8(static_cast<std::uint16_t>(md.constant_pool[ix].first));};
+    const auto module_name=[&](std::uint16_t ix)->Result<std::string>{if(!ix||ix>=md.constant_pool.size()||md.constant_pool[ix].tag!=19)return malformed("module index is not CONSTANT_Module");return utf8(static_cast<std::uint16_t>(md.constant_pool[ix].first));};
+    const auto package_name=[&](std::uint16_t ix)->Result<std::string>{if(!ix||ix>=md.constant_pool.size()||md.constant_pool[ix].tag!=20)return malformed("package index is not CONSTANT_Package");return utf8(static_cast<std::uint16_t>(md.constant_pool[ix].first));};
     std::uint16_t n=0;if(!r.u2(md.access_flags)||!r.u2(md.this_class)||!r.u2(md.super_class))return malformed("truncated class declaration");
     auto cn=class_name(md.this_class);if(!cn)return cn.error();md.class_name=std::move(cn.value());
     if(md.super_class){auto sn=class_name(md.super_class);if(!sn)return sn.error();md.super_name=std::move(sn.value());}
@@ -256,6 +258,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     std::uint64_t attribute_bytes=0;bool metadata_complete=true;
     std::size_t expanded_verification_entries=0,stack_map_frames=0;
     bool have_record=false,have_nest_host=false,have_nest_members=false,have_permitted_subclasses=false;
+    bool have_module_packages=false,have_module_main_class=false;
     std::function<Result<bool>(bool,JvmMember*,bool,JvmCode*)> attributes;
     attributes=[&](bool method,JvmMember *member,bool class_level,JvmCode *code_owner)->Result<bool>{
         std::uint16_t count=0;if(!r.u2(count))return malformed("truncated attributes_count");
@@ -264,7 +267,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             if(len>64*1024*1024||attribute_bytes>max_total_attributes-len)return Error{ErrorCode::resource_limit,"classfile attribute data exceeds bounded size limits"};attribute_bytes+=len;
             auto an=utf8(name_ix);if(!an)return an.error();const auto start=r.p;if(len>r.b.size()-r.p)return malformed("attribute extent exceeds its enclosing owner");
             ReaderExtent extent{r,r.b};r.b=r.b.first(start+len);
-            if(!class_level&&(an.value()=="NestHost"||an.value()=="NestMembers"||an.value()=="PermittedSubclasses"||an.value()=="Record"))return malformed("class-level attribute appears on a member or Code attribute list");
+            if(!class_level&&(an.value()=="NestHost"||an.value()=="NestMembers"||an.value()=="PermittedSubclasses"||an.value()=="Record"||an.value()=="Module"||an.value()=="ModulePackages"||an.value()=="ModuleMainClass"))return malformed("class-level attribute appears on a member or Code attribute list");
             if(an.value()=="StackMapTable"){
                 if(!code_owner||!member)return malformed("StackMapTable appears outside a Code attribute");
                 if(code_owner->stack_map_table)return malformed("duplicate StackMapTable attribute");
@@ -356,6 +359,71 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 }
                 if(r.p!=record_end)return malformed("Record attribute length does not match its components");
                 have_record=true;
+            }else if(class_level&&an.value()=="Module"){
+                if(md.module)return malformed("duplicate Module attribute");
+                if(md.major_version<53||md.class_name!="module-info"||(md.access_flags&0x8000)==0)
+                    return malformed("Module attribute requires a Java 9 module-info class");
+                JvmModule module;
+                std::uint16_t module_index=0,version_index=0,count=0;
+                if(!r.u2(module_index)||!r.u2(module.flags)||!r.u2(version_index))return malformed("truncated Module header");
+                auto name=module_name(module_index);if(!name)return name.error();module.name=std::move(name.value());
+                if(module.flags&~std::uint16_t{0x9020})return malformed("Module attribute contains reserved module flags");
+                if(version_index){auto version=utf8(version_index);if(!version)return version.error();module.version=std::move(version.value());}
+                std::size_t module_items=0;
+                const auto claim_items=[&](std::uint16_t items){if(items>8192-module_items)return false;module_items+=items;return true;};
+                if(!r.u2(count)||!claim_items(count))return malformed("invalid Module requires count");
+                module.required_modules.reserve(count);
+                for(unsigned i=0;i<count;++i){
+                    std::uint16_t index=0,flags=0,version=0;
+                    if(!r.u2(index)||!r.u2(flags)||!r.u2(version))return malformed("truncated Module requires entry");
+                    auto required=module_name(index);if(!required)return required.error();
+                    if(flags&~std::uint16_t{0x9060})return malformed("Module requires entry contains reserved flags");
+                    JvmModuleRequire entry;entry.module=std::move(required.value());entry.flags=flags;
+                    if(version){auto version_name=utf8(version);if(!version_name)return version_name.error();entry.version=std::move(version_name.value());}
+                    module.required_modules.push_back(std::move(entry));
+                }
+                const auto read_exports=[&](std::vector<JvmModuleExport> &entries,std::string_view label)->Result<bool>{
+                    std::uint16_t items=0;if(!r.u2(items)||!claim_items(items))return malformed("invalid Module "+std::string(label)+" count");
+                    entries.reserve(items);
+                    for(unsigned i=0;i<items;++i){
+                        std::uint16_t index=0,flags=0,to_count=0;
+                        if(!r.u2(index)||!r.u2(flags)||!r.u2(to_count))return malformed("truncated Module "+std::string(label)+" entry");
+                        auto package=package_name(index);if(!package)return package.error();
+                        if(flags&~std::uint16_t{0x9000}||!claim_items(to_count))return malformed("invalid Module "+std::string(label)+" flags or target count");
+                        JvmModuleExport entry;entry.package_name=std::move(package.value());entry.flags=flags;entry.to_modules.reserve(to_count);
+                        for(unsigned target=0;target<to_count;++target){std::uint16_t target_index=0;if(!r.u2(target_index))return malformed("truncated Module "+std::string(label)+" target list");auto target_name=module_name(target_index);if(!target_name)return target_name.error();entry.to_modules.push_back(std::move(target_name.value()));}
+                        entries.push_back(std::move(entry));
+                    }
+                    return true;
+                };
+                auto exports=read_exports(module.exports,"exports");if(!exports)return exports.error();
+                auto opens=read_exports(module.opens,"opens");if(!opens)return opens.error();
+                if(!r.u2(count)||!claim_items(count))return malformed("invalid Module uses count");
+                module.uses.reserve(count);
+                for(unsigned i=0;i<count;++i){std::uint16_t index=0;if(!r.u2(index))return malformed("truncated Module uses entry");auto used=class_name(index);if(!used)return used.error();module.uses.push_back(std::move(used.value()));}
+                if(!r.u2(count)||!claim_items(count))return malformed("invalid Module provides count");
+                module.provides.reserve(count);
+                for(unsigned i=0;i<count;++i){
+                    std::uint16_t service_index=0,with_count=0;
+                    if(!r.u2(service_index)||!r.u2(with_count))return malformed("truncated Module provides entry");
+                    auto service=class_name(service_index);if(!service)return service.error();
+                    if(!with_count||!claim_items(with_count))return malformed("invalid Module provider count");
+                    JvmModuleProvide entry;entry.service=std::move(service.value());entry.implementations.reserve(with_count);
+                    for(unsigned implementation=0;implementation<with_count;++implementation){std::uint16_t index=0;if(!r.u2(index))return malformed("truncated Module provider class index");auto name=class_name(index);if(!name)return name.error();entry.implementations.push_back(std::move(name.value()));}
+                    module.provides.push_back(std::move(entry));
+                }
+                md.module=std::move(module);
+            }else if(class_level&&an.value()=="ModulePackages"){
+                if(have_module_packages)return malformed("duplicate ModulePackages attribute");
+                if(md.major_version<53||md.class_name!="module-info"||(md.access_flags&0x8000)==0||len<2)return malformed("ModulePackages requires a Java 9 module-info class");
+                std::uint16_t count=0;if(!r.u2(count)||count>8192||std::uint64_t(count)*2+2!=len)return malformed("invalid ModulePackages count or length");
+                md.module_packages.reserve(count);
+                for(unsigned i=0;i<count;++i){std::uint16_t index=0;if(!r.u2(index))return malformed("truncated ModulePackages entry");auto name=package_name(index);if(!name)return name.error();md.module_packages.push_back(std::move(name.value()));}
+                have_module_packages=true;
+            }else if(class_level&&an.value()=="ModuleMainClass"){
+                if(have_module_main_class)return malformed("duplicate ModuleMainClass attribute");
+                if(md.major_version<53||md.class_name!="module-info"||(md.access_flags&0x8000)==0||len!=2)return malformed("ModuleMainClass requires one class index in a Java 9 module-info class");
+                std::uint16_t index=0;if(!r.u2(index))return malformed("truncated ModuleMainClass attribute");auto name=class_name(index);if(!name)return name.error();md.module_main_class=std::move(name.value());have_module_main_class=true;
             }else{
                 if(an.value()!="ConstantValue"&&an.value()!="Exceptions"&&an.value()!="Signature"&&an.value()!="SourceFile"&&an.value()!="Synthetic"&&an.value()!="Deprecated"&&an.value()!="LineNumberTable"&&an.value()!="LocalVariableTable")metadata_complete=false;
                 if(!r.skip(len))return malformed("truncated attribute payload");
@@ -371,6 +439,11 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     };
     auto f=members(md.fields,false);if(!f)return f.error();auto m=members(md.methods,true);if(!m)return m.error();
     auto class_attrs=attributes(false,nullptr,true,nullptr);if(!class_attrs)return class_attrs.error();if(r.p!=bytes.size())return malformed("trailing bytes after classfile attributes");
+    if((have_module_packages||have_module_main_class)&&!md.module)return malformed("ModulePackages and ModuleMainClass require a Module attribute");
+    if(md.access_flags&0x8000){
+        if(md.major_version<53||md.class_name!="module-info"||!md.module||md.super_class||!md.interfaces.empty()||!md.fields.empty()||!md.methods.empty())
+            return malformed("ACC_MODULE class must be a Java 9 module-info class with a Module attribute and no supertype, interfaces, fields, or methods");
+    }
     ImageLayout layout{{{0},32,1,ByteOrder::big},Architecture::jvm,ExecutionMode::jvm,{}, {}};
     layout.domains.reserve(md.methods.size());layout.segments.reserve(md.methods.size());
     for(std::size_t i=0;i<md.methods.size();++i)if(md.methods[i].code){

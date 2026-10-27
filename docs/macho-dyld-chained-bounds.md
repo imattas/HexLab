@@ -64,6 +64,11 @@ following chain records:
   declared fixup page. Multi-start entries must terminate within the bounded
   segment-start record.
 
+The fixed chained header, import table, symbol pool, starts-in-image offset
+array, and each segment-start record are also checked as disjoint bounded
+ranges. Import/symbol ranges are checked when their encodings are recognized;
+unsupported import encodings remain incomplete and are not interpreted.
+
 Uncompressed and zlib-compressed symbol pools are decoded. Compressed pool
 expansion is capped at 16 MiB per stream, each imported name at 64 KiB, and
 the entire compressed input must be consumed with no trailing bytes. Names
