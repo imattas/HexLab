@@ -209,10 +209,14 @@ standard interpretation.
 
 # Optimized object initializer invoke
 
-The legacy optimized DEX opcode `invoke-object-init/range` (`0xf0`) is decoded
-using its encoded 35c register-list form. It retains the method index and
-argument-word reads, has a three-code-unit width, and is classified as a
-call with conservative memory read/write effects. As with other optimized
-opcodes, this is for optimized/odex bytecode; ordinary DEX files should not
-contain it. Register-list sizes above five are rejected and register IDs above
-v255 remain unsupported by the shared typed operand model.
+Optimized opcode `0xf0` has runtime-version-dependent encodings. Android API
+14+ names it `invoke-object-init/range` and uses 3rc with exactly one receiver
+word and a 16-bit starting register. Older API levels name it
+`invoke-direct-empty` and use 35c with one packed receiver register. When the
+runtime version is unavailable, HexLab distinguishes these legal forms by
+the encoded count byte and rejects encodings that do not describe exactly one
+receiver. Both forms retain the method index and receiver read, use three
+code units, and are classified as calls with conservative memory read/write
+effects. As with other optimized opcodes, ordinary DEX files should not
+contain them; optimized-container and runtime-version validation are not
+performed. The versioned forms follow the [AOSP Dalvik opcode history](https://android.googlesource.com/platform/external/smali/%2B/edc88aff44ff80f969df61725a992680cd0c464c/).
