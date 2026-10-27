@@ -2,7 +2,7 @@
 
 This is a dated requirements inventory for the full HexLab goal, not a completion report. It supplements the broad `capabilities.csv` and the encoding-specific `x64-coverage.csv`. Sources were checked on 2026-10-19. No proprietary implementation or processor-module source was copied.
 
-`reference-matrix.csv` contains 147 normalized obligations: 83 processor entries, 37 format entries, 12 decompiler choices and 15 debugger interface identifiers. These counts describe our rows, not an assertion about the number of processors or packaged backends in IDA. `reference-sources.csv` maps every source ID to a publisher, URL, retrieval date and limitation.
+`reference-matrix.csv` contains 148 normalized obligations: 84 processor entries, 37 format entries, 12 decompiler choices and 15 debugger interface identifiers. These counts describe our rows, not an assertion about the number of processors or packaged backends in IDA. `reference-sources.csv` maps every source ID to a publisher, URL, retrieval date and limitation.
 
 `processor-variant-matrix.csv` expands the highest-variance processor families into 85 concrete generation, execution-mode, core-family, and extension obligations. It covers ARM/AArch64, x86/x64, MIPS, PowerPC/POWER, Hexagon, and RISC-V. Every child is marked `not_assessed`; the family-level state does not imply child support. This is a first variant pass, not an exhaustive audit of all processor families or every extension combination.
 

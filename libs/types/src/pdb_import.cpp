@@ -111,6 +111,7 @@ Result<TypePtr> primitive(std::uint32_t index) {
     if (index == 0x31) return Type::boolean(2, 2);
     if (index == 0x32) return Type::boolean(4, 4);
     if (index == 0x33) return Type::boolean(8, 8);
+    if (index == 0x34) return Type::boolean(16, 16);
     if (index == 0x40) return Type::floating("float", 4, 4);
     if (index == 0x41) return Type::floating("double", 8, 8);
     // CodeView's direct REAL80/REAL128 primitive indices carry their storage

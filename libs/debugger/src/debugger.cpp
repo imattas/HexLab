@@ -832,19 +832,27 @@ Status DebugSession::set_breakpoint_hit_count(BreakpointId id, std::uint64_t cou
     return std::monostate{};
 }
 Status DebugSession::set_breakpoint_condition(BreakpointId id, std::string condition) {
+    if (!impl_->backend || !impl_->process ||
+        (impl_->state != SessionState::running && impl_->state != SessionState::stopped))
+        return invalid_state("set_breakpoint_condition");
     if (condition.size() > 256) return Error{ErrorCode::resource_limit, "condition exceeds 256 characters"};
     const auto found=std::find_if(impl_->breakpoints.begin(),impl_->breakpoints.end(),[id](const auto& bp){return bp.id==id;});
     if(found==impl_->breakpoints.end())return Error{ErrorCode::invalid_argument,"breakpoint id is not owned by this debug session"};
     found->condition=std::move(condition); return std::monostate{};
 }
 Status DebugSession::set_breakpoint_logpoint(BreakpointId id, bool enabled) {
+    if (!impl_->backend || !impl_->process ||
+        (impl_->state != SessionState::running && impl_->state != SessionState::stopped))
+        return invalid_state("set_breakpoint_logpoint");
     const auto found=std::find_if(impl_->breakpoints.begin(),impl_->breakpoints.end(),[id](const auto& bp){return bp.id==id;});
     if(found==impl_->breakpoints.end())return Error{ErrorCode::invalid_argument,"breakpoint id is not owned by this debug session"};
     found->logpoint=enabled; return std::monostate{};
 }
 Status DebugSession::set_breakpoint_logpoint(BreakpointId id, bool enabled, std::string message) {
+    if (!impl_->backend || !impl_->process ||
+        (impl_->state != SessionState::running && impl_->state != SessionState::stopped))
+        return invalid_state("set_breakpoint_logpoint");
     if (message.size() > 1024) return Error{ErrorCode::resource_limit, "logpoint message exceeds 1024 bytes"};
-    if (!impl_->backend || impl_->state == SessionState::detached) return invalid_state("set_breakpoint_logpoint");
     const auto found = std::find_if(impl_->breakpoints.begin(), impl_->breakpoints.end(),
         [id](const Breakpoint& breakpoint) { return breakpoint.id == id; });
     if (found == impl_->breakpoints.end()) return Error{ErrorCode::invalid_argument, "unknown breakpoint ID"};
