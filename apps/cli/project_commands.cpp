@@ -604,13 +604,13 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
                     require(target != current.snapshot->state->user->types.end() || available.contains(assignment.type_name),
                             "Type assignment refers to missing definition " + assignment.type_name);
                     auto existing = std::find_if(current.snapshot->state->user->type_assignments.begin(), current.snapshot->state->user->type_assignments.end(),
-                        [&](const auto &row) { return row.location == Location{assignment.location}; });
+                        [&](const auto &row) { return row.location == assignment.location; });
                     if (existing != current.snapshot->state->user->type_assignments.end()) {
                         auto old_type = std::find_if(current.snapshot->state->user->types.begin(), current.snapshot->state->user->types.end(),
                             [&](const auto &row) { return row.id == existing->type_id; });
                         const std::string old_name = old_type == current.snapshot->state->user->types.end() ? std::string{} : old_type->name;
                         require(old_name == assignment.type_name || args.type_replace_assignments,
-                                "Type assignment conflict at " + location(Location{assignment.location}) + "; use --replace-assignments to replace it");
+                                "Type assignment conflict at " + location(assignment.location) + "; use --replace-assignments to replace it");
                     }
                     command.assignments.push_back({assignment.location, assignment.type_name});
                 }

@@ -20,6 +20,8 @@ hexlab_cli firmware inspect firmware.hex --format ihex
 hexlab_cli firmware inspect firmware.s19 --format srec
 ```
 
+S-record inspection also reports the retained S0 payload as hexadecimal bytes with its source line and record index. The regular sparse-segment report and start-address warnings continue to come from the loader adapter.
+
 The adapter keeps records at their target addresses as separate sparse image segments; it does not fill address gaps with synthetic bytes. The packed in-memory backing store is an implementation detail. Each record retains its source line, record index, packed backing offset, target address, and length in firmware metadata. A declared start address appears as an image entry only when it is covered by data; otherwise it remains in metadata with a warning. Firmware record files do not identify a CPU, so this inspection workflow leaves architecture and execution mode unknown and does not claim disassembly support.
 
 Firmware can also be imported into self-contained projects with an explicit format:

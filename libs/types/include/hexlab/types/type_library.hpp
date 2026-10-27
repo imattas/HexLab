@@ -27,7 +27,7 @@ struct LibrarySourceIdentity {
     bool operator==(const LibrarySourceIdentity &) const = default;
 };
 struct LibraryAssignment {
-    Address location;
+    Location location;
     std::string type_name;
     bool operator==(const LibraryAssignment &) const = default;
 };
