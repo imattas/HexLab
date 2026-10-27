@@ -11,6 +11,10 @@ inline std::string macho_hex(std::uint64_t value) {
     out << "0x" << std::hex << value;
     return out.str();
 }
+inline const char *macho_pac_key(std::uint8_t key) {
+    constexpr const char *names[] = {"IA", "IB", "DA", "DB"};
+    return key < 4 ? names[key] : "unknown";
+}
 inline std::string macho_text(std::string_view text) {
     std::ostringstream out;
     for (unsigned char ch : text) {
@@ -329,8 +333,11 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
             out << " import-row=" << *row.import_row;
         if (row.scalar_value)
             out << " scalar=" << macho_hex(*row.scalar_value);
-        out << " addend=" << row.addend << " key=" << unsigned(row.key) << " diversity=" << row.diversity
-            << " address-diversity=" << row.address_diversity << '\n';
+        out << " addend=" << row.addend;
+        if (row.authenticated)
+            out << " pac-key=" << macho_pac_key(row.key) << '(' << unsigned(row.key) << ')'
+                << " diversity=" << row.diversity << " address-diversity=" << row.address_diversity;
+        out << '\n';
     }
     out << "Mach-O protections: complete=" << m.protections_complete << '\n';
     for (std::size_t n = 0; n < m.data_in_code_tables.size(); ++n) {
