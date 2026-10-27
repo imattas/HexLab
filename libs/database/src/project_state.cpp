@@ -233,7 +233,7 @@ Result<std::vector<ProjectRecoveryCandidate>> ProjectStore::discover_recovery_ca
             if(!opened){if(stop.stop_requested()||opened.error().code==ErrorCode::canceled)return opened.error();continue;}
             auto snapshot=opened.value()->snapshot();
             if(!snapshot)continue;
-            candidates.push_back({opened.value()->path(),snapshot.value()->uuid,kind});
+            candidates.push_back({opened.value()->path(),snapshot.value()->uuid,kind,snapshot.value()->revisions});
         }
         std::sort(candidates.begin(),candidates.end(),[](const auto& left,const auto& right){return left.path.native()<right.path.native();});
         return candidates;
@@ -254,6 +254,7 @@ Result<SavedProject> ProjectStore::recover_candidate(const ProjectRecoveryCandid
         auto source=detail::take(open(candidate.path,ProjectMode::read_only,stop));
         auto state=detail::take(source->snapshot());
         if(state->uuid!=candidate.uuid)return Error{ErrorCode::conflict,"Recovery artifact identity changed after discovery"};
+        if(state->revisions!=candidate.revisions)return Error{ErrorCode::conflict,"Recovery artifact changed after discovery"};
         // Save As repeats schema, embedded-input and publication validation,
         // assigns a fresh UUID, and leaves the original artifact untouched.
         return source->save_as(destination,policy,stop);

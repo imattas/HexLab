@@ -2610,38 +2610,47 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                         result.immediate_targets[{fact->id, 2}] = *target;
                 }
                 propagated = true;
-            } else if (instruction.opcode == Opcode::a64_orr &&
-                       (instruction.operands.size() == 3 || instruction.operands.size() == 4)) {
-                // The common MOV register alias is ORR Rd, ZR, Rm, LSL #0.
-                // Accept the symmetric zero-register form as well, but do not
-                // approximate shifted ORR as a pointer copy.
+            } else if ((instruction.opcode == Opcode::a64_and || instruction.opcode == Opcode::a64_orr ||
+                        instruction.opcode == Opcode::a64_eor || instruction.opcode == Opcode::a64_ands) &&
+                       instruction.operands.size() == 3) {
+                // Propagate exact unshifted logical-register results. Shifted
+                // operands carry an extra decoded operand and remain opaque.
                 const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
                 const auto *left = std::get_if<RegisterOperand>(&instruction.operands[1]);
                 const auto *right = std::get_if<RegisterOperand>(&instruction.operands[2]);
-                const auto no_shift = instruction.operands.size() == 3 ||
-                                      immediate_value(instruction, 3) == std::optional<std::uint64_t>{0};
-                const auto valid_gpr = [](const RegisterOperand *reg) {
-                    return reg && reg->bank == RegisterBank::arm64_gpr && reg->index != 31 &&
-                           (reg->width == 32 || reg->width == 64);
+                const auto valid_source = [](const RegisterOperand *reg, std::uint16_t width) {
+                    return reg && reg->width == width && (width == 32 || width == 64) &&
+                           ((reg->bank == RegisterBank::arm64_gpr && reg->index != 31) ||
+                            (reg->bank == RegisterBank::arm64_zero && reg->index == 31));
                 };
-                const RegisterOperand *source = nullptr;
-                if (destination && left && left->bank == RegisterBank::arm64_zero && valid_gpr(right))
-                    source = right;
-                else if (destination && right && right->bank == RegisterBank::arm64_zero && valid_gpr(left))
-                    source = left;
+                const bool valid_destination = destination && destination->bank == RegisterBank::arm64_gpr &&
+                    destination->index != 31 && (destination->width == 32 || destination->width == 64);
                 std::optional<Address> value;
-                if (valid_gpr(destination) && source && destination->width == source->width && no_shift) {
-                    if (const auto found = registers.find(source->index); found != registers.end() &&
-                        found->second.space == instruction.address.space) {
-                        auto offset = found->second.offset;
+                if (valid_destination && valid_source(left, destination->width) &&
+                    valid_source(right, destination->width)) {
+                    const auto read_value = [&](const RegisterOperand &reg) -> std::optional<std::uint64_t> {
+                        if (reg.bank == RegisterBank::arm64_zero) return UINT64_C(0);
+                        const auto found = registers.find(reg.index);
+                        if (found == registers.end() || found->second.space != instruction.address.space) return {};
+                        return found->second.offset;
+                    };
+                    const auto lhs = read_value(*left);
+                    const auto rhs = read_value(*right);
+                    if (lhs && rhs) {
+                        auto result_value = instruction.opcode == Opcode::a64_and ||
+                                            instruction.opcode == Opcode::a64_ands ? (*lhs & *rhs) :
+                                            instruction.opcode == Opcode::a64_eor ? (*lhs ^ *rhs) : (*lhs | *rhs);
                         if (destination->width == 32)
-                            offset &= UINT64_C(0xffffffff);
-                        value = Address{found->second.space, offset};
+                            result_value &= UINT64_C(0xffffffff);
+                        value = Address{instruction.address.space, result_value};
                     }
                 }
                 erase_written();
-                if (destination && value)
+                if (valid_destination && value) {
                     registers[destination->index] = *value;
+                    if (riscv_target_segment(*image, *value, OperandAccess::address))
+                        result.immediate_targets[{fact->id, 2}] = *value;
+                }
                 propagated = true;
             }
             if (!propagated) {

@@ -79,6 +79,48 @@ Result<std::string> utf8(std::uint64_t rva, const ByteStorage &storage, std::uin
     }
     return out;
 }
+Result<bool> parse_codeview(MinidumpModule &module, const ByteStorage &storage, std::uint64_t &budget) {
+    constexpr std::uint64_t rsds = 0x53445352, nb10 = 0x3031424e;
+    constexpr std::size_t max_path_bytes = 4096;
+    if (module.cv_record_size < 4) return false;
+    auto signature = read(storage, module.cv_record_rva, 4);
+    if (!signature) return signature.error();
+    const auto kind = u(signature.value().bytes, 0, 4);
+    if (kind != rsds && kind != nb10) return false;
+
+    const std::size_t fixed_size = kind == rsds ? 24 : 16;
+    if (module.cv_record_size <= fixed_size)
+        return Error{ErrorCode::malformed, "Minidump CodeView identity is truncated"};
+    const auto path_bytes = std::min<std::uint64_t>(
+        std::uint64_t(module.cv_record_size) - fixed_size, max_path_bytes + 1);
+    const auto record_size = fixed_size + static_cast<std::size_t>(path_bytes);
+    if (budget > max_metadata_bytes - std::min<std::uint64_t>(max_metadata_bytes, record_size))
+        return Error{ErrorCode::resource_limit, "Minidump metadata exceeds its byte budget"};
+    budget += record_size;
+    auto record = read(storage, module.cv_record_rva, record_size);
+    if (!record) return record.error();
+
+    const auto path_begin = record.value().bytes.begin() + static_cast<std::ptrdiff_t>(fixed_size);
+    const auto path_end = path_begin + static_cast<std::ptrdiff_t>(path_bytes);
+    const auto terminator = std::find(path_begin, path_end, std::byte{0});
+    if (terminator == path_end) {
+        if (path_bytes == max_path_bytes + 1)
+            return Error{ErrorCode::resource_limit, "Minidump CodeView PDB path exceeds its limit"};
+        return Error{ErrorCode::malformed, "Minidump CodeView PDB path is unterminated"};
+    }
+    module.codeview_kind = kind == rsds ? "RSDS" : "NB10";
+    module.pdb_path.assign(reinterpret_cast<const char *>(record.value().bytes.data() + fixed_size),
+                           static_cast<std::size_t>(terminator - path_begin));
+    if (kind == rsds) {
+        for (std::size_t i = 0; i < module.pdb_guid.size(); ++i)
+            module.pdb_guid[i] = record.value().bytes[4 + i];
+        module.pdb_age = static_cast<std::uint32_t>(u(record.value().bytes, 20, 4));
+    } else {
+        module.pdb_timestamp = static_cast<std::uint32_t>(u(record.value().bytes, 8, 4));
+        module.pdb_age = static_cast<std::uint32_t>(u(record.value().bytes, 12, 4));
+    }
+    return true;
+}
 struct StreamRow { std::uint32_t type, size, rva; };
 struct Region { std::uint64_t begin, size, file; };
 struct Protection { std::uint64_t begin, end; std::uint32_t protect, state, type; };
@@ -349,6 +391,10 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                     return Error{ErrorCode::overflow, "Minidump module image range overflows"};
                 if (module.cv_record_size && !extent(module.cv_record_rva, module.cv_record_size, storage->size()))
                     return Error{ErrorCode::malformed, "Minidump module CodeView record is outside the input"};
+                if (module.cv_record_size) {
+                    auto parsed = parse_codeview(module, *storage, budget);
+                    if (!parsed) return parsed.error();
+                }
                 metadata.modules.push_back(std::move(module));
             }
             budget += count * sizeof(MinidumpModule);

@@ -54,5 +54,14 @@ project.apply_batch(
 )
 ```
 
-The older `apply_annotations()` API remains available for manifests containing
-only names, comments, and bookmarks. It keeps its existing input format.
+`Project.apply_annotations()` remains convenient for manifests containing only
+names, comments, and bookmarks. Its existing input format supports
+`merge="replace"` (the default) or `merge="preserve"`. Preserve mode fills only
+empty names/comments and absent bookmarks, ignores clear/removal requests, and
+does not replace a name already used in the same address space. It reads a
+complete project snapshot and refuses to merge if more than 4096 annotations
+or bookmarks exist, because omitted rows cannot safely be treated as absent.
+Pass `expected_revision` to pin that snapshot; if all requested fields are
+already populated, preserve mode returns the unchanged snapshot without adding
+a history step. Use `Project.apply_batch()` for references, types, patches,
+regions, functions, and other mixed project edits.
