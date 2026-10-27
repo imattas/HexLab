@@ -45,8 +45,9 @@ by-value cycles remain unlayoutable and are reported rather than guessed.
 A final structure member can be written with a `[]` suffix to author a C-style
 flexible array, for example `payload byte[] 4`. The element type must have a
 complete size; inline pointer elements such as `items Node*[] 8` are supported.
-The flexible member must follow another structure member, cannot appear in a
-union, contributes no fixed tail size, and uses its element type's alignment.
+The flexible member must be the final physical member and follow another
+structure member; it cannot appear in a union. A bitfield cannot follow it.
+It contributes no fixed tail size and uses its element type's alignment.
 The type editor preserves this form when reopening the aggregate. Fixed arrays
 remain independently authorable as named project types with a positive count.
 For imported flexible-array types with nested qualifiers, the editor uses a
