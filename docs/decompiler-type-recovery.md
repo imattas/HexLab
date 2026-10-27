@@ -100,7 +100,11 @@ same-width, zero-displacement register copies. If signed and unsigned
 operations use the same value, the scalar type is left unknown; explicit
 prototype constraints still take precedence. This does not infer signedness
 for operands nested inside an expression or infer signedness from machine
-condition flags.
+condition flags. MIPS32 `mult`/`multu` and `div`/`divu` intrinsic operands also
+provide signed/unsigned evidence for their direct register inputs. As with the
+other operators, mixed interpretations suppress the inferred signedness, and
+only proven same-width copies carry the evidence onward. This does not infer a
+signed type for HI/LO results from the operation alone.
 
 Vector lane metadata (`element_kind`, `element_bits`, and `lanes`) now produces
 an immutable homogeneous vector type when its total width matches the IR value.

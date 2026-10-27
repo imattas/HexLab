@@ -20,6 +20,10 @@ allocation. The existing logical DWARF section identity and offsets remain the
 source provenance presented to DWARF import; compressed-byte-to-DWARF-offset
 mapping is not available.
 
-Relocations in debug sections are not applied. The lower-level symbols APIs
-continue to accept already materialized section bytes and do not perform ELF
-section decompression themselves.
+Relocations into compressed debug sections are rejected because relocation
+offsets address the stored representation while DWARF import consumes expanded
+bytes. For uncompressed ET_REL debug sections, the ELF loader applies the
+bounded explicit-addend absolute relocation subset documented in
+[DWARF v5 import](dwarf-v5-import.md#elf-dwarf-data-relocations). The lower-level
+symbols APIs continue to accept already materialized section bytes and do not
+perform ELF section decompression or ELF relocation processing themselves.

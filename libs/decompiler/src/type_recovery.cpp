@@ -1417,6 +1417,14 @@ static Result<TypeRecoveryResult> recover_types_impl(
         return Error{ErrorCode::invalid_argument, "type recovery prototype must be a function type"};
     std::map<Key, Fact> facts;
     std::map<Key, std::optional<bool>> division_signedness;
+    const auto record_division_operand = [&](const ExpressionPtr &operand, bool is_signed) {
+        if (!operand) return;
+        const auto *value = std::get_if<RegisterValue>(&operand->value);
+        if (!value) return;
+        const auto operand_key = key(value->reg, value->version);
+        auto [found, inserted] = division_signedness.emplace(operand_key, is_signed);
+        if (!inserted && found->second && *found->second != is_signed) found->second.reset();
+    };
     // ABI snapshots describe liveness, not evidence that a callee consumes
     // every argument register. Only actual reads or known parameter uses count.
     std::set<Key> parameter_evidence;
@@ -1433,14 +1441,6 @@ static Result<TypeRecoveryResult> recover_types_impl(
     };
     auto register_expr=[&](const ExpressionPtr &e, auto &&self)->void {
         if (!e) return;
-        const auto record_division_operand = [&](const ExpressionPtr &operand, bool is_signed) {
-            if (!operand) return;
-            const auto *value = std::get_if<RegisterValue>(&operand->value);
-            if (!value) return;
-            const auto operand_key = key(value->reg, value->version);
-            auto [found, inserted] = division_signedness.emplace(operand_key, is_signed);
-            if (!inserted && found->second && *found->second != is_signed) found->second.reset();
-        };
         std::visit([&](const auto &x) {
             using T=std::decay_t<decltype(x)>;
             if constexpr(std::is_same_v<T,RegisterValue>) {
@@ -1560,6 +1560,15 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 register_expr(s.predicate,register_expr); register_expr(s.indirect_target,register_expr);
             }
             else if constexpr(std::is_same_v<T,Intrinsic>) {
+                // MIPS mult/div are represented as HI/LO-producing intrinsics,
+                // so their signedness is not visible to the BinaryValue path.
+                // Retain the operation's interpretation on direct SSA inputs;
+                // the common copy propagation below handles renamed operands.
+                const bool signed_mips_arithmetic = s.name == "mips.mult.s32" || s.name == "mips.div.s32";
+                const bool unsigned_mips_arithmetic = s.name == "mips.mult.u32" || s.name == "mips.div.u32";
+                if (signed_mips_arithmetic || unsigned_mips_arithmetic)
+                    for (const auto &operand : s.operands)
+                        record_division_operand(operand, signed_mips_arithmetic);
                 for(const auto &e:s.operands) register_expr(e,register_expr);
                 // Scalar RISC-V conversion outputs are typed individually:
                 // integer/FPR results and accrued FCSR flags must never share
