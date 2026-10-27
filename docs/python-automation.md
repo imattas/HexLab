@@ -707,7 +707,7 @@ Scripts can apply up to 4096 names, comments, and bookmark edits through one `Pr
 ]
 ```
 
-Run it with `hexlab_python import_annotations.py project.hxproj annotations.json`. The helper pins the import to the project's current edit revision and saves after a successful one-step import. A repeated name at another address or any invalid command rejects the whole batch.
+Run it with `hexlab_python import_annotations.py project.hxproj annotations.json`. The helper pins the import to the project's current edit revision and saves after a successful one-step import. Before opening the project for editing, it detects repeated non-empty names assigned to different addresses in the same address space and reports the conflicting manifest row indices. A name already used by an existing project annotation, or any other invalid command, is still rejected by native batch validation; the batch remains atomic and makes no partial edits.
 
 For mixed project commands, use `Project.apply_batch()` to combine annotations,
 patches, code/data definitions, function/chunk decisions, user references,

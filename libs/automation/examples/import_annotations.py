@@ -51,11 +51,23 @@ except (UnicodeDecodeError, json.JSONDecodeError) as error:
 if not isinstance(document, list) or len(document) > 4096:
     parser.error("manifest must be an array with at most 4096 rows")
 rows = []
+names_by_space = {}
 for index, item in enumerate(document):
     if not isinstance(item, dict) or "location" not in item:
         parser.error(f"row {index} must be an object with location")
     row = {key: item[key] for key in ("name", "comment", "bookmark") if key in item}
     row["location"] = location(item["location"])
+    if isinstance(row.get("name"), str) and row["name"]:
+        address = row["location"]
+        if isinstance(address, hexlab.Address):
+            key = (address.space, row["name"])
+            previous = names_by_space.get(key)
+            if previous is not None and previous[0] != address.offset:
+                parser.error(
+                    f"name conflict '{row['name']}' in address space {address.space}: "
+                    f"rows {previous[1]} and {index} target different addresses"
+                )
+            names_by_space[key] = (address.offset, index)
     rows.append(row)
 with hexlab.Project.open(args.project, readonly=False) as project:
     revision = project.snapshot()["edit_revision"]
