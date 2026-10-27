@@ -90,7 +90,9 @@ enum class RiscvOpcode {
     vfrsqrt7_v, vfrec7_v,
     vredsum, vredand, vredor, vredxor, vredminu, vredmin, vredmaxu, vredmax,
     // Scalar Zfa conversion appended to preserve existing opcode IDs.
-    fcvtmod_w_d
+    fcvtmod_w_d,
+    // Scalar Zfa immediate floating constants; appended for numeric ID stability.
+    fli_s, fli_d
 };
 
 struct RiscvRegister {

@@ -21,6 +21,19 @@ visibility, owner, descriptor, and element count, and print annotation default
 values. Type annotations and annotations nested in record-component attribute
 lists are not yet retained.
 
+Source and Code debug metadata includes the class-level `SourceFile`, each
+method's optional `LineNumberTable`, and `LocalVariableTable`. The loader
+retains line start offsets and source line numbers, and local names, validated
+field descriptors, slots, and live ranges. Tables preserve absence versus an
+explicitly empty table, aggregate legal repeated attributes, and require exact
+payload lengths. Aggregate rows are capped at 65,535 per table kind and Code
+attribute; duplicate local-variable entries are rejected across all tables
+for that Code attribute. Line/local offsets and local slots are checked against the owning Code array
+and `max_locals` (including the second slot of long/double locals). These
+checks bound the referenced bytecode region, but do not prove that an offset
+lands on an instruction boundary. `LocalVariableTypeTable`,
+`SourceDebugExtension`, and generic local signatures remain unsupported.
+
 Class metadata also retains `Record` component names and descriptors (including a component's optional generic `Signature`), `NestHost`/`NestMembers`, and `PermittedSubclasses`. These attributes validate their declared extents and every referenced constant-pool entry. Each supported class attribute may appear at most once; list counts are bounded at 8192. Unknown nested Record component attributes are extent-checked and mark metadata incomplete. This metadata is descriptive: it does not yet synthesize Java record methods, prove nestmate access, or link permitted classes across classfiles.
 The CLI's class summary prints these retained attributes and record component signatures.
 

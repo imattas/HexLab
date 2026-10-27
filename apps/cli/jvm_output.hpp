@@ -9,6 +9,7 @@ inline void jvm_description(std::ostream &out, const ImageMetadata &metadata) {
     const auto &j = *metadata.jvm;
     out << "Java class: " << j.class_name << " version=" << j.major_version << '.' << j.minor_version
         << " access=" << j.access_flags << '\n';
+    if(j.source_file)out<<"Source file: "<<*j.source_file<<'\n';
     if (!j.super_name.empty()) out << "Superclass: " << j.super_name << '\n';
     out << "Interfaces: " << j.interfaces.size() << " Fields: " << j.fields.size()
         << " Methods: " << j.methods.size() << " Constant pool: " << (j.constant_pool.size() - 1) << '\n';
@@ -37,6 +38,10 @@ inline void jvm_description(std::ostream &out, const ImageMetadata &metadata) {
         else out << " native/abstract";
         out << '\n';
         annotations(method.visible_annotations,"visible","method");annotations(method.invisible_annotations,"invisible","method");
+        if(method.code){
+            if(method.code->line_numbers)for(const auto &line:*method.code->line_numbers)out<<"    line "<<line.line_number<<" at +0x"<<std::hex<<line.start_pc<<std::dec<<'\n';
+            if(method.code->local_variables)for(const auto &local:*method.code->local_variables)out<<"    local "<<local.name<<' '<<local.descriptor<<" slot="<<local.slot<<" range=["<<local.start_pc<<','<<std::uint32_t(local.start_pc)+local.length<<")\n";
+        }
         const auto parameter_annotations=[&](const auto &parameters,const char *visibility){
             if(!parameters)return;
             for(std::size_t i=0;i<parameters->size();++i)
