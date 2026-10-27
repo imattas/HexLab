@@ -55,7 +55,7 @@ class PseudocodeView final : public wxPanel {
     wxButton *rename_function_ = nullptr, *rename_local_ = nullptr, *comment_local_ = nullptr, *edit_comment_ = nullptr;
     wxButton *rename_variable_ = nullptr, *assign_type_ = nullptr;
     wxButton *definition_ = nullptr, *previous_use_ = nullptr, *next_use_ = nullptr;
-    wxButton *copy_pseudocode_ = nullptr, *save_pseudocode_ = nullptr;
+    wxButton *copy_pseudocode_ = nullptr, *copy_excerpt_ = nullptr, *save_pseudocode_ = nullptr;
     wxStaticText *variable_status_ = nullptr;
     std::vector<Address> rows_;
     struct SourceOriginLine {
@@ -109,6 +109,7 @@ class PseudocodeView final : public wxPanel {
     void go_to_definition();
     void move_occurrence(bool next);
     void copy_pseudocode();
+    void copy_addressed_excerpt();
     void save_pseudocode();
     std::vector<std::pair<long, long>> variable_occurrences(std::size_t) const;
     const PseudocodeVariableEdit *editable_variable() const;

@@ -869,12 +869,15 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     next_use_->SetName("pseudocode-next-occurrence");
     copy_pseudocode_ = new wxButton(this, wxID_ANY, "Copy pseudocode");
     copy_pseudocode_->SetName("pseudocode-copy");
+    copy_excerpt_ = new wxButton(this, wxID_ANY, "Copy selection with addresses");
+    copy_excerpt_->SetName("pseudocode-copy-addressed-selection");
+    copy_excerpt_->SetToolTip("Copy selected pseudocode lines with their mapped instruction origins.");
     save_pseudocode_ = new wxButton(this, wxID_ANY, "Save pseudocode...");
     save_pseudocode_->SetName("pseudocode-save");
     variable_status_ = new wxStaticText(this, wxID_ANY, "Select a variable in source or the table",
                                        wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
     variable_status_->SetName("pseudocode-variable-status");
-    for (auto *button : {definition_, previous_use_, next_use_, copy_pseudocode_, save_pseudocode_})
+    for (auto *button : {definition_, previous_use_, next_use_, copy_pseudocode_, copy_excerpt_, save_pseudocode_})
         navigation->Add(button, 0, wxRIGHT, FromDIP(4));
     navigation->Add(variable_status_, 1, wxALIGN_CENTER_VERTICAL);
     layout->Add(navigation, 0, wxEXPAND | wxALL, FromDIP(4));
@@ -957,6 +960,7 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     previous_use_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_occurrence(false); });
     next_use_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_occurrence(true); });
     copy_pseudocode_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_pseudocode(); });
+    copy_excerpt_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_addressed_excerpt(); });
     save_pseudocode_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { save_pseudocode(); });
     const auto deferred_selection = [this] {
         const auto id = document_;
@@ -980,6 +984,42 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
 void PseudocodeView::copy_pseudocode() {
     if (!model_ready_ || source_->GetValue().empty() || !wxTheClipboard->Open()) return;
     wxTheClipboard->SetData(new wxTextDataObject(source_->GetValue()));
+    wxTheClipboard->Close();
+}
+
+void PseudocodeView::copy_addressed_excerpt() {
+    if (!model_ready_) return;
+    long selection_begin = 0, selection_end = 0;
+    source_->GetSelection(&selection_begin, &selection_end);
+    if (selection_end <= selection_begin || !wxTheClipboard->Open()) return;
+
+    wxString excerpt;
+    const auto value = source_->GetValue();
+    long begin_column = 0, begin_line = 0, end_column = 0, end_line = 0;
+    if (!source_->PositionToXY(selection_begin, &begin_column, &begin_line) ||
+        !source_->PositionToXY(selection_end - 1, &end_column, &end_line)) {
+        wxTheClipboard->Close();
+        return;
+    }
+    (void)begin_column;
+    (void)end_column;
+    for (long line_number = begin_line; line_number <= end_line; ++line_number) {
+        const auto line = source_->GetLineText(line_number);
+        const auto line_begin = source_->XYToPosition(0, line_number);
+        const auto line_end = source_->XYToPosition(static_cast<long>(line.length()), line_number);
+        if (line_begin < 0 || line_end < line_begin) continue;
+        const auto clipped_begin = std::max(selection_begin, line_begin);
+        const auto clipped_end = std::min(selection_end, line_end);
+        if (clipped_end <= clipped_begin) continue;
+        if (!excerpt.empty()) excerpt += '\n';
+        if (const auto *origin = source_origin_at(line_begin, line_end)) {
+            excerpt += "/* ";
+            excerpt += location_text(origin->address, rendered_image_);
+            excerpt += " */ ";
+        }
+        excerpt += value.Mid(clipped_begin, clipped_end - clipped_begin);
+    }
+    if (!excerpt.empty()) wxTheClipboard->SetData(new wxTextDataObject(excerpt));
     wxTheClipboard->Close();
 }
 
@@ -1671,6 +1711,9 @@ void PseudocodeView::update_variable_actions() {
     const bool pseudocode_available = model_ready_ && !source_->GetValue().empty();
     copy_pseudocode_->Enable(pseudocode_available);
     save_pseudocode_->Enable(pseudocode_available);
+    long selection_begin = 0, selection_end = 0;
+    source_->GetSelection(&selection_begin, &selection_end);
+    copy_excerpt_->Enable(pseudocode_available && selection_end > selection_begin);
     const auto *link = model_ready_ && selected_variable_ && *selected_variable_ < variable_links_.size()
                            ? &variable_links_[*selected_variable_] : nullptr;
     definition_->Enable(link != nullptr);

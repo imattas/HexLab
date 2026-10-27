@@ -397,3 +397,31 @@ Interworking pointers with bit zero set are rejected because their Thumb target
 context cannot be represented by this A32-only recovery path. Other A32
 indexed-load forms, conditional loads, and PC-relative setup sequences are
 unsupported.
+
+## AArch64 unsigned byte-offset tables
+
+The separate-code-base recognizer also accepts this exact compact form:
+
+```text
+ADR[P] Xtable, table
+LDRB   Woffset, [Xtable, Wselector, UXTW]
+ADR    Xcode, code_base
+ADD    Xtarget, Xcode, Xoffset, LSL #2
+BR     Xtarget
+```
+
+The table entries are unsigned one-byte offsets from `code_base`, scaled by
+four by the final ADD. The byte load writes Woffset, whose zero-extension
+defines Xoffset for the final 64-bit ADD. Recognition requires the contiguous
+same-block sequence, the exact UXTW unshifted byte load, the 32-bit loaded
+offset, the explicit ADD shift of two, distinct base/selector/target registers, and executable decoded
+targets. An ADRP table base may use the same exact ELF RELA pair resolution as
+the existing AArch64 switch forms. Entries are read from file-backed bytes and
+the scan remains bounded to 4096 unless a complete CFG guard proves a smaller
+case count. Missing or invalid entries stop the scan and preserve only the
+verified prefix. This format has no per-entry relocation interpretation; the
+table-base relocation provenance remains available independently.
+
+No build or tests were run for this addition; runtime recognition remains
+unverified. Wider unsigned offsets, other scale factors, intervening
+instructions, and alternate target-base arithmetic remain unsupported.
