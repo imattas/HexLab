@@ -87,11 +87,15 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
         const bool x64 = metadata.header.machine == 62;
         const bool a64 = metadata.header.machine == 183;
         const bool riscv = metadata.header.machine == 243;
+        const bool i386 = metadata.header.machine == 3;
+        const bool arm32 = metadata.header.machine == 40;
         std::uint8_t width = 0;
         if (x64 && rel.type == 1) width = 8;          // R_X86_64_64
         else if (x64 && (rel.type == 10 || rel.type == 11)) width = 4; // R_X86_64_32/32S
         else if (a64 && rel.type == 257) width = 8;  // R_AARCH64_ABS64
         else if (a64 && rel.type == 258) width = 4;  // R_AARCH64_ABS32
+        else if (i386 && rel.type == 1) width = 4;   // R_386_32
+        else if (arm32 && rel.type == 2) width = 4;  // R_ARM_ABS32
         else if (riscv && rel.type == 1) width = 4;  // R_RISCV_32
         else if (riscv && rel.type == 2 && metadata.header.is_64) width = 8; // R_RISCV_64
         else throw Failure{{ErrorCode::unsupported, "unsupported ELF relocation in DWARF section (type " + std::to_string(rel.type) + ")"}};

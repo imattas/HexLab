@@ -244,6 +244,19 @@ and defaults remain unknown and such scans are partial. Other widths, signed
 offset tables, cross-block register propagation, and delay-slot control-flow
 proofs remain unsupported.
 
+The same constrained register-value analysis now recognizes the corresponding
+MIPS32 O32 absolute-pointer form with a four-byte table entry:
+`LUI`/`ORI` (and checked `ADDIU` adjustments), `SLL` by two, `ADDU`, `LW`,
+and `JR`. It accepts only one straight-line block, exact 32-bit GPR operands,
+a distinct nonzero selector/base/target, and file-backed table storage. Each
+entry must resolve from its exact four-byte slot and decode as executable
+MIPS32 code; ELF/Mach-O relocation rows are retained through the existing
+slot resolver. The 4096-entry cap applies. Counts and defaults remain unknown
+because MIPS delay-slot guard proofs are not implemented, and unsupported
+base construction, signed-offset tables, cross-block values, and delay-slot
+control-flow remain outside this recognizer. No test or build was run for this
+extension; runtime recognition remains unverified.
+
 For project users, `hexlab_cli project switches <project> --at va:<entry>`
 prints deterministic JSON containing the dispatch/table addresses, selector,
 scale, entry encoding, case indices and targets, optional `case_count` and `default_target`
