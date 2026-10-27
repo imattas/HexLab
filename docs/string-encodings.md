@@ -70,10 +70,19 @@ non-ASCII scalar. Its persisted encoding value is 15, and derived-cache version
 30 causes older payloads to recompute. As with other legacy encodings, these
 are heuristic interpretations and can overlap.
 
+ISO-8859-5 adds Cyrillic single-byte candidates using the Unicode Consortium's
+[8859-5 mapping table](https://www.unicode.org/Public/MAPPINGS/ISO8859/8859-5.TXT).
+The fixed mapping preserves the standard's control positions, which the
+printable-scalar filter uses to split runs; emitted candidates need at least one
+non-ASCII scalar and retain the original byte extent with a UTF-8 preview. Its
+persisted encoding value is 16, and derived-cache version 31 recomputes older
+payloads. These are heuristic byte interpretations rather than language
+classification.
+
 `hexlab_cli disassemble <path> --show-strings` lists candidate encoding names,
 file offsets, extents, and previews. The desktop Strings view uses the same
-Windows-1253, Windows-1255, Windows-1256, Windows-1257, Windows-1258, and
-ISO-8859-2 labels.
+Windows-1253, Windows-1255, Windows-1256, Windows-1257, Windows-1258,
+ISO-8859-2, and ISO-8859-5 labels.
 
 All encoding passes use the same file-backed scan domains, string-record budget,
 and cancellation checks. Returned previews are UTF-8, while each record retains

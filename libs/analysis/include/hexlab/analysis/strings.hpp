@@ -30,7 +30,7 @@ enum class StringEncoding : std::uint8_t {
     ascii = 0, utf16le = 1, utf8 = 2, utf16be = 3, utf32le = 4, utf32be = 5,
     windows1252 = 6, windows1251 = 7, windows1250 = 8, windows1254 = 9,
     windows1253 = 10, windows1255 = 11, windows1256 = 12, windows1257 = 13,
-    windows1258 = 14, iso8859_2 = 15
+    windows1258 = 14, iso8859_2 = 15, iso8859_5 = 16
 };
 struct StringRecord {
     StringEncoding encoding;

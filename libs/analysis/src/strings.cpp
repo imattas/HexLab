@@ -311,6 +311,19 @@ std::optional<std::uint32_t> decode_iso8859_2(unsigned byte) {
     if(byte<0x80)return byte;
     return high[byte-0x80];
 }
+std::optional<std::uint32_t> decode_iso8859_5(unsigned byte) {
+    // ISO/IEC 8859-5:1999 to Unicode, following the Unicode Consortium's
+    // 8859-5.TXT mapping. C1 controls are preserved and filtered by printable().
+    if (byte < 0xa0) return byte;
+    if (byte == 0xa0) return 0x00a0;
+    if (byte <= 0xac) return 0x0401 + (byte - 0xa1);
+    if (byte == 0xad) return 0x00ad;
+    if (byte <= 0xef) return 0x040e + (byte - 0xae);
+    if (byte == 0xf0) return 0x2116;
+    if (byte <= 0xfc) return 0x0451 + (byte - 0xf1);
+    if (byte == 0xfd) return 0x00a7;
+    return 0x045e + (byte - 0xfe);
+}
 }
 namespace {
 Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& options,
@@ -475,6 +488,16 @@ Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& optio
                 else emit(run,false,StringEncoding::iso8859_2,range,options,output,true);
             }
             emit(run,false,StringEncoding::iso8859_2,range,options,output,true);
+            run={};
+            for(auto at=range.begin;at<range.end;++at) {
+                if(((at-range.begin)&4095)==0)check_stop(stop);
+                const auto value=input.byte(at);
+                if(value==0) {emit(run,true,StringEncoding::iso8859_5,range,options,output,true);continue;}
+                const auto scalar=decode_iso8859_5(value);
+                if(scalar && printable(*scalar))run.add(at,*scalar,1);
+                else emit(run,false,StringEncoding::iso8859_5,range,options,output,true);
+            }
+            emit(run,false,StringEncoding::iso8859_5,range,options,output,true);
         }
     } catch(const BudgetEnd&) {
         output.complete=false;output.diagnostics.push_back({DiagnosticSeverity::warning,"String record budget reached",{}});
