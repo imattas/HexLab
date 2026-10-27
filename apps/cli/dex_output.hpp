@@ -1,5 +1,6 @@
 #pragma once
 #include "hexlab/image/metadata.hpp"
+#include <algorithm>
 #include <iomanip>
 #include <ostream>
 #include <string_view>
@@ -20,6 +21,44 @@ inline std::string dex_safe(std::string_view value) {
 inline void dex_description(std::ostream &out, const ImageMetadata &metadata) {
     if (!metadata.dex) return;
     const auto &dex = *metadata.dex;
+    constexpr std::size_t max_classes = 256;
+    constexpr std::size_t max_members_per_class = 128;
+    out << "DEX class definitions: " << dex.classes.size() << '\n';
+    const auto class_count = std::min(dex.classes.size(), max_classes);
+    for (std::size_t i = 0; i < class_count; ++i) {
+        const auto &definition = dex.classes[i];
+        out << "  class type#" << definition.class_index << " flags=0x" << std::hex
+            << definition.access_flags << std::dec;
+        if (definition.superclass_index) out << " superclass=type#" << *definition.superclass_index;
+        else out << " superclass=<none>";
+        out << " interfaces=" << definition.interface_indices.size()
+            << " static-fields=" << definition.static_fields.size()
+            << " instance-fields=" << definition.instance_fields.size()
+            << " direct-methods=" << definition.direct_methods.size()
+            << " virtual-methods=" << definition.virtual_methods.size() << '\n';
+        const auto fields = [&](std::string_view label, const auto &items) {
+            const auto shown = std::min(items.size(), max_members_per_class);
+            for (std::size_t member = 0; member < shown; ++member)
+                out << "    " << label << " field#" << items[member].field_index
+                    << " flags=0x" << std::hex << items[member].access_flags << std::dec << '\n';
+            if (shown < items.size()) out << "    " << label << " fields omitted=" << (items.size() - shown) << '\n';
+        };
+        const auto methods = [&](std::string_view label, const auto &items) {
+            const auto shown = std::min(items.size(), max_members_per_class);
+            for (std::size_t member = 0; member < shown; ++member) {
+                const auto &method = items[member];
+                out << "    " << label << " method#" << method.method_index
+                    << " flags=0x" << std::hex << method.access_flags << std::dec
+                    << " code-offset=0x" << std::hex << method.code_offset << std::dec << '\n';
+            }
+            if (shown < items.size()) out << "    " << label << " methods omitted=" << (items.size() - shown) << '\n';
+        };
+        fields("static", definition.static_fields);
+        fields("instance", definition.instance_fields);
+        methods("direct", definition.direct_methods);
+        methods("virtual", definition.virtual_methods);
+    }
+    if (class_count < dex.classes.size()) out << "  classes omitted=" << (dex.classes.size() - class_count) << '\n';
     out << "DEX debug methods: " << dex.methods.size() << '\n';
     for (const auto &method : dex.methods) {
         out << "  method #" << method.method_index << " line-start=" << method.line_start
