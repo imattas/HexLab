@@ -219,6 +219,16 @@ and the process list at 4,096 entries. Missing command columns fall back to
 enumeration as unsupported; listing does not attach to or change the selected
 remote process.
 
+If the stub also advertises `qXfer:exec-file:read`, the process list enriches
+the selected process name with its full target-side executable path. Multiprocess
+sessions query the selected hexadecimal PID; a single-process session uses the
+empty annex for the current inferior. The transfer uses bounded `m`/`l` chunks,
+rejects zero-progress, malformed, embedded-NUL, and oversized replies, and does
+not query every listed process. An unsupported or empty annex keeps the existing
+`command`/`process <pid>` label. The path is target-side metadata and does not
+load that executable or change the host image being analyzed. This follows the
+[GDB executable-file read packet](https://sourceware.org/gdb/current/onlinedocs/gdb.html/General-Query-Packets.html).
+
 Remote target XML architecture names are mapped conservatively to HexLab's
 architecture enum for x86/x86-64, AArch32/AArch64, RV32/RV64, MIPS32/MIPS64,
 and PowerPC. Variant suffixes are accepted only for the corresponding GDB

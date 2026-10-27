@@ -882,6 +882,42 @@ Result<std::optional<std::string>> Client::read_processes_annex(std::size_t limi
     }
     return Error{ErrorCode::resource_limit, "RSP process annex exceeds configured limit"};
 }
+Result<std::optional<std::string>> Client::read_exec_file_annex(std::optional<std::uint64_t> process,
+    std::size_t limit, std::size_t chunk, std::stop_token stop) {
+    const auto packet_limit = std::min(max_packet_, peer_packet_size_);
+    if ((process && *process == 0) || limit == 0 || limit > 1024 * 1024 || chunk == 0 ||
+        chunk > 64 * 1024 || packet_limit < 64)
+        return Error{ErrorCode::invalid_argument, "invalid RSP executable-file annex bounds or process ID"};
+    const auto bounded_chunk = std::min(chunk, packet_limit / 2);
+    const auto process_token = process ? hex_u64(*process) : std::string{};
+    std::string result;
+    for (std::size_t offset = 0; offset <= limit;) {
+        const auto request_size = std::min(bounded_chunk, limit - std::min(offset, limit));
+        if (offset == limit && request_size == 0)
+            return Error{ErrorCode::resource_limit, "RSP executable-file path exceeds configured limit"};
+        auto response = transact("qXfer:exec-file:read:" + process_token + ":" +
+            hex_u64(offset) + "," + hex_u64(request_size), stop);
+        if (!response) return response.error();
+        if (response.value().empty()) {
+            if (offset == 0) return std::optional<std::string>{};
+            return Error{ErrorCode::malformed, "RSP executable-file annex ended without final marker"};
+        }
+        const char marker = response.value().front();
+        if (marker != 'm' && marker != 'l')
+            return Error{ErrorCode::malformed, "invalid RSP executable-file annex marker"};
+        const auto count = response.value().size() - 1;
+        if (count > request_size || count > limit - result.size())
+            return Error{ErrorCode::resource_limit, "RSP executable-file chunk exceeds configured limit"};
+        if (response.value().find('\0', 1) != std::string::npos)
+            return Error{ErrorCode::malformed, "RSP executable-file path contains an embedded NUL"};
+        result.append(response.value().data() + 1, count);
+        if (marker == 'l') return std::optional<std::string>(std::move(result));
+        if (count == 0 || offset > std::numeric_limits<std::size_t>::max() - count)
+            return Error{ErrorCode::malformed, "RSP executable-file annex made no progress"};
+        offset += count;
+    }
+    return Error{ErrorCode::resource_limit, "RSP executable-file path exceeds configured limit"};
+}
 Result<std::optional<std::vector<std::byte>>> Client::read_auxv_annex(
     std::size_t limit, std::size_t chunk, std::stop_token stop) {
     const auto packet_limit = std::min(max_packet_, peer_packet_size_);
