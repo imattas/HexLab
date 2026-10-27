@@ -10,6 +10,8 @@ The parser also handles standard and extended PI section headers, records offset
 
 The volume, file, state, section, compression, and GUID-defined section layouts follow the [UEFI PI Specification 1.10, Firmware Storage Code Definitions](https://uefi.org/specs/PI/1.10/V3_Code_Definitions.html) and the [TianoCore EDK II PI volume definitions](https://github.com/tianocore/edk2/blob/master/MdePkg/Include/Pi/PiFirmwareVolume.h). Section offsets point into the original input file; a section's payload range excludes its common header and, for compression or GUID-defined sections, the corresponding section-specific header.
 
+Firmware-volume extended headers are now parsed when `ExtHeaderOffset` is nonzero. The parser validates four-byte alignment, placement after the block-map terminator, bounded header size, and each following variable-length extension entry. The volume retains its optional FV-name GUID and raw entry type, size, and volume-relative payload range; unknown entry types are preserved without interpretation. Zero-filled header alignment tail bytes are accepted. The entry count is capped at 65,536 in addition to the existing header-size bound. These fields are available in the library model; the current CLI summary does not render extension-entry details.
+
 ## CLI
 
 ```text

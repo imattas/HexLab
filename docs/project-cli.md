@@ -22,7 +22,7 @@ The selected path is persisted in the project load recipe. The loader validates 
 
 Segmented raw inputs use `--format raw --profile mapping.profile`; see [x86 profiles](x86-profiles.md). Project commands accept `seg:<selector>:<offset>` with hexadecimal coordinates resolved against the embedded profile. Domain identity remains separate from canonical file offsets.
 
-Portable types, source origins, and source-compatible symbolic assignments can be exchanged with `project types export/import`; see [type libraries](type-library.md) for identity and conflict options.
+Portable types, source origins, and source-compatible symbolic assignments can be exchanged with `project types export/import`; `project types verify` checks a bundle without opening a project. See [type libraries](type-library.md) for identity and conflict options.
 
 ARM/Thumb raw inputs use `--format raw --arm-profile mapping.profile`. The profile
 declares physical code/data ranges and entry state; it replaces `--arch`, `--base`

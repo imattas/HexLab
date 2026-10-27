@@ -7518,6 +7518,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<std::pair<const LiftedBlock *, bool>> conditional_breaks;
             std::map<std::uint64_t, std::vector<const LiftedBlock *>> conditional_break_paths;
             std::vector<std::pair<const LiftedBlock *, bool>> conditional_continues;
+            std::map<std::uint64_t, std::vector<const LiftedBlock *>> conditional_continue_paths;
         };
         struct LoopSwitchArm {
             Address target{};
@@ -8312,14 +8313,47 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                 }
                                 const auto *inner_condition = terminal_conditional(*inner_current);
                                 if (inner_condition) {
-                                    // A direct conditional edge to this child
-                                    // header is a continue at the child depth.
-                                    // Trace only the other edge; its statements
-                                    // still execute before the ordinary latch.
-                                    const bool true_continue = inner_condition->true_target ==
-                                        std::optional<Address>{body->begin};
-                                    const bool false_continue = inner_condition->false_target ==
-                                        std::optional<Address>{body->begin};
+                                    // A conditional edge may reach the child
+                                    // header through a bounded phi-free cleanup
+                                    // chain. Emit that chain under the continue
+                                    // predicate before applying header phis.
+                                    const auto trace_child_continue_path = [&](const std::optional<Address> &target)
+                                        -> std::optional<std::vector<const LiftedBlock *>> {
+                                        if (!target) return std::nullopt;
+                                        std::vector<const LiftedBlock *> path;
+                                        if (*target == body->begin) return path;
+                                        auto *cursor = find_block(*target);
+                                        auto predecessor = inner_current->id.value;
+                                        std::set<std::uint64_t> seen;
+                                        while (cursor && cursor != body && cursor != candidate.exit &&
+                                               cursor != header && cursor != entry && cursor != exit_block &&
+                                               !loop_body_ids.contains(cursor->id.value) &&
+                                               !inner_ids.contains(cursor->id.value) && path.size() < 256 &&
+                                               seen.insert(cursor->id.value).second) {
+                                            if (!cursor->phis.empty() || cursor->switch_dispatch ||
+                                                contains_return(*cursor) || !has_only_simple_statements(*cursor) ||
+                                                cursor->memory_phi || !cursor->memory_partition_phis.empty() ||
+                                                cursor->successors.size() != 1 ||
+                                                !cursor->successors.front().target ||
+                                                (cursor->successors.front().kind != BlockEdgeKind::jump &&
+                                                 cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                                                !has_unconditional_edge(*cursor, *cursor->successors.front().target) ||
+                                                diamond_predecessors[cursor->id.value] !=
+                                                    std::set<std::uint64_t>{predecessor})
+                                                return std::nullopt;
+                                            path.push_back(cursor);
+                                            predecessor = cursor->id.value;
+                                            cursor = find_block(*cursor->successors.front().target);
+                                        }
+                                        if (cursor != body ||
+                                            !diamond_predecessors[body->id.value].contains(predecessor))
+                                            return std::nullopt;
+                                        return path;
+                                    };
+                                    const auto true_continue_path = trace_child_continue_path(inner_condition->true_target);
+                                    const auto false_continue_path = trace_child_continue_path(inner_condition->false_target);
+                                    const bool true_continue = true_continue_path.has_value();
+                                    const bool false_continue = false_continue_path.has_value();
                                     if (true_continue != false_continue && inner_current->phis.empty()) {
                                         const Address continuation_address = true_continue ?
                                             *inner_condition->false_target : *inner_condition->true_target;
@@ -8334,6 +8368,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                             candidate.body.push_back(inner_current);
                                             inner_ids.insert(inner_current->id.value);
                                             candidate.conditional_continues.emplace_back(inner_current, true_continue);
+                                            const auto &continue_path = true_continue ? *true_continue_path :
+                                                *false_continue_path;
+                                            candidate.conditional_continue_paths.emplace(inner_current->id.value,
+                                                continue_path);
+                                            for (const auto *path_block : continue_path)
+                                                inner_ids.insert(path_block->id.value);
                                             inner_current = continuation;
                                             continue;
                                         }
@@ -8508,7 +8548,11 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                 const bool has_latch_predecessor = header_predecessors.contains(inner_latch->id.value);
                                 std::set<std::uint64_t> child_backedges{inner_latch->id.value};
                                 for (const auto &[branch, _] : candidate.conditional_continues)
-                                    child_backedges.insert(branch->id.value);
+                                {
+                                    const auto path = candidate.conditional_continue_paths.find(branch->id.value);
+                                    child_backedges.insert(path == candidate.conditional_continue_paths.end() ||
+                                        path->second.empty() ? branch->id.value : path->second.back()->id.value);
+                                }
                                 const bool has_all_backedges = std::all_of(child_backedges.begin(), child_backedges.end(),
                                     [&](auto predecessor) { return header_predecessors.contains(predecessor); });
                                 for (const auto predecessor : child_backedges) header_predecessors.erase(predecessor);
@@ -8579,6 +8623,10 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         loop_body_ids.insert(body->id.value);
                         for (const auto *inner_block : nested.body) loop_body_ids.insert(inner_block->id.value);
                         for (const auto &[branch_id, path] : nested.conditional_break_paths) {
+                            (void)branch_id;
+                            for (const auto *path_block : path) loop_body_ids.insert(path_block->id.value);
+                        }
+                        for (const auto &[branch_id, path] : nested.conditional_continue_paths) {
                             (void)branch_id;
                             for (const auto *path_block : path) loop_body_ids.insert(path_block->id.value);
                         }
@@ -8923,7 +8971,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             const auto condition = branch_condition_text(*branch);
                             out << "            if (" << (conditional_continue->second ? condition :
                                 "!(" + condition + ")") << ") {\n";
-                            if (const auto copies = region.backedge_phi_copies.find(inner_block->id.value);
+                            const auto path = region.conditional_continue_paths.find(inner_block->id.value);
+                            const auto path_blocks = path == region.conditional_continue_paths.end()
+                                ? std::vector<const LiftedBlock *>{} : path->second;
+                            for (const auto *path_block : path_blocks) emit_block(*path_block, 16, true);
+                            const auto *backedge = path_blocks.empty() ? inner_block : path_blocks.back();
+                            if (const auto copies = region.backedge_phi_copies.find(backedge->id.value);
                                 copies != region.backedge_phi_copies.end())
                                 emit_parallel_copies(out, copies->second, 16);
                             out << "                continue;\n            }\n";

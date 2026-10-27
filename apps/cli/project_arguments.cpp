@@ -196,8 +196,8 @@ Arguments parse(std::span<const std::wstring_view> args) {
         result.path = path_from_wide(args[2]);
         option_start = 3;
     } else if (args[0] == L"types") {
-        require(args.size() >= 3 && (args[1] == L"export" || args[1] == L"import"), "Types requires export or import and a project path");
-        result.action = args[1] == L"export" ? L"types-export" : L"types-import";
+        require(args.size() >= 3 && (args[1] == L"export" || args[1] == L"import" || args[1] == L"verify"), "Types requires export, import, or verify and a project/type-library path");
+        result.action = args[1] == L"export" ? L"types-export" : args[1] == L"import" ? L"types-import" : L"types-verify";
         result.path = path_from_wide(args[2]);
         option_start = 3;
     } else {
@@ -302,6 +302,8 @@ Arguments parse(std::span<const std::wstring_view> args) {
         result.type_library_input = path_from_wide(options.needed(L"--input"));
         result.type_skip_assignments_on_mismatch = options.flag(L"--skip-assignments-on-mismatch");
         result.type_replace_assignments = options.flag(L"--replace-assignments");
+    } else if (result.action == L"types-verify") {
+        result.type_library_input = result.path;
     } else if (result.action == L"create") {
         require(!result.readonly, "Cannot create a read-only project");
         result.replace = options.flag(L"--replace");
