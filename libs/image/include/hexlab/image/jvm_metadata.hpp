@@ -89,8 +89,35 @@ struct JvmLocalVariableType {
 };
 // Annotation element values use a lossless, validated JVM-style textual form
 // (for example `enum(Lx;#NAME)` or `[const(I:3),... ]`).
-struct JvmAnnotationElement { std::string name, value; bool operator==(const JvmAnnotationElement &) const = default; };
-struct JvmAnnotation { std::string descriptor; std::vector<JvmAnnotationElement> elements; bool operator==(const JvmAnnotation &) const = default; };
+// Typed element_value tree. Indices refer to the owning metadata constant pool;
+// numeric constants retain their exact raw bits there rather than being rounded.
+struct JvmAnnotationValue {
+    std::uint8_t tag = 0;
+    // Primitive/string/class constant, enum type, or nested annotation type.
+    std::uint16_t constant_pool_index = 0;
+    std::uint16_t enum_name_index = 0;
+    // Arrays retain ordered children. Nested annotations additionally retain
+    // one element-name UTF-8 pool index for every child, in declaration order.
+    std::vector<JvmAnnotationValue> children;
+    std::vector<std::uint16_t> element_name_indices;
+    FileOffset file_begin{};
+    std::uint32_t byte_size = 0; // Complete element_value including its tag.
+    bool operator==(const JvmAnnotationValue &) const = default;
+};
+struct JvmAnnotationElement {
+    std::string name, value;
+    std::optional<JvmAnnotationValue> encoded_value;
+    std::uint16_t name_index = 0;
+    bool operator==(const JvmAnnotationElement &) const = default;
+};
+struct JvmAnnotation {
+    std::string descriptor;
+    std::vector<JvmAnnotationElement> elements;
+    std::uint16_t type_index = 0;
+    FileOffset file_begin{};
+    std::uint32_t byte_size = 0;
+    bool operator==(const JvmAnnotation &) const = default;
+};
 // Type annotations preserve the target_info encoding and validated type path
 // in class-file order, alongside the decoded annotation payload.
 struct JvmTypeAnnotation {
@@ -178,6 +205,7 @@ struct JvmMember {
     std::optional<std::vector<std::vector<JvmAnnotation>>> visible_parameter_annotations, invisible_parameter_annotations;
     // AnnotationDefault uses the same validated textual encoding as element values.
     std::optional<std::string> annotation_default;
+    std::optional<JvmAnnotationValue> annotation_default_value;
     std::vector<JvmTypeAnnotation> visible_type_annotations, invisible_type_annotations;
     std::vector<JvmOpaqueAttribute> opaque_attributes;
     std::optional<JvmCode> code;

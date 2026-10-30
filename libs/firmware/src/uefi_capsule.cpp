@@ -483,6 +483,8 @@ Result<UefiCapsule> parse_fmp_impl(std::span<const std::byte> bytes, UefiCapsule
                 item.fmp_payload_header_size = header_size;
                 item.firmware_version = u32(bytes, header + 8);
                 item.lowest_supported_firmware_version = u32(bytes, header + 12);
+                if (item.lowest_supported_firmware_version > item.firmware_version)
+                    return malformed("FMP payload lowest-supported version exceeds its firmware version");
                 item.firmware_image_offset += header_size;
             }
 

@@ -1676,6 +1676,51 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         ProjectCommand command=method=="rename"?ProjectCommand{Rename{at,std::move(value)}}:ProjectCommand{Comment{at,std::move(value)}};
         return encode_snapshot(*take(p.execute(command,group)));
     }
+    if(method=="import_annotation_rows"){
+        count(values,5);
+        auto* source=argument(values,0);
+        if(!PyList_Check(source) && !PyTuple_Check(source))invalid("Annotation rows must be a list or tuple");
+        const auto row_count=PySequence_Size(source);
+        if(row_count<=0 || row_count>static_cast<Py_ssize_t>(automation::maximum_page))
+            invalid("Annotation import requires 1..4096 rows");
+        const auto policy=text(argument(values,1));
+        if(policy!="replace" && policy!="preserve")invalid("Unknown annotation merge policy");
+        const auto merge=policy=="replace"?automation::AnnotationMerge::replace:automation::AnnotationMerge::preserve;
+        const auto group=number(argument(values,2));
+        std::optional<std::uint64_t> expected;
+        if(argument(values,3)!=Py_None)expected=number(argument(values,3));
+        std::stop_token stop;if(argument(values,4)!=Py_None)stop=stop_source(argument(values,4)).get_token();
+        std::vector<automation::AnnotationImportRow> rows;rows.reserve(static_cast<std::size_t>(row_count));
+        std::size_t text_bytes=0,fields=0;
+        auto checked_text=[&](PyObject* value){
+            Py_ssize_t length=0;const auto* data=PyUnicode_AsUTF8AndSize(value,&length);if(!data)throw PythonFailure{};
+            if(length<0 || static_cast<std::size_t>(length)>16*1024*1024-text_bytes)
+                invalid("Annotation import text exceeds 16 MiB");
+            text_bytes+=static_cast<std::size_t>(length);
+            return std::string(data,static_cast<std::size_t>(length));
+        };
+        for(Py_ssize_t i=0;i<row_count;++i){
+            if(stop.stop_requested())throw NativeFailure{{ErrorCode::canceled,"Annotation import canceled while decoding rows"}};
+            auto* input=sequence_item(source,i);
+            if(!PyTuple_Check(input) || PyTuple_Size(input)!=5)invalid("Malformed annotation import row");
+            automation::AnnotationImportRow row{location(tuple_item(input,0)),{},{},{}};
+            if(tuple_item(input,1)!=Py_None){row.name=checked_text(tuple_item(input,1));++fields;}
+            if(tuple_item(input,2)!=Py_None){row.comment=checked_text(tuple_item(input,2));++fields;}
+            if(boolean(tuple_item(input,3))){
+                const auto remove=tuple_item(input,4)==Py_None;
+                row.bookmark=automation::AnnotationBookmarkImport{remove?std::string{}:checked_text(tuple_item(input,4)),remove};
+                ++fields;
+            }
+            if(fields>automation::maximum_page)invalid("Annotation import exceeds 4096 supplied fields");
+            rows.push_back(std::move(row));
+        }
+        const auto result=take(without_gil([&]{return p.import_annotations(rows,merge,group,expected,stop);}));
+        Object out(PyDict_New());set(out,"snapshot",encode_snapshot(*result.snapshot));
+        set(out,"applied",integer(result.applied));set(out,"skipped",integer(result.skipped));
+        set(out,"planned_edits",integer(result.applied));set(out,"expected_revision",integer(result.expected_revision));
+        set(out,"result_revision",integer(result.result_revision));set(out,"committed",PyBool_FromLong(result.committed));
+        return out.release();
+    }
     if(method=="apply_annotations"){
         count(values,4);auto* rows=argument(values,0);auto group=number(argument(values,1));
         if(!PyList_Check(rows)&&!PyTuple_Check(rows))invalid("Annotation batch must be a list or tuple");

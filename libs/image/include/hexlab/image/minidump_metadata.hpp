@@ -292,12 +292,22 @@ struct MinidumpLinuxAuxvEntry {
     std::uint8_t word_size = 0;
     bool operator==(const MinidumpLinuxAuxvEntry &) const = default;
 };
+struct MinidumpLinuxStringRecord {
+    std::string value;
+    FileOffset record_file_offset{};
+    bool operator==(const MinidumpLinuxStringRecord &) const = default;
+};
 struct MinidumpLinuxTextStream {
     std::uint32_t stream_type = 0, declared_size = 0;
     FileOffset stream_file_offset{};
-    // Breakpad Linux streams are retained byte-for-byte because cmdline and
-    // environ use NUL separators and maps/cpuinfo have platform-specific text.
+    // Breakpad Linux streams retain their bounded original bytes. Cmdline and
+    // environ also expose validated NUL-delimited records; maps exposes rows.
     std::vector<std::byte> captured_bytes;
+    // Populated only for Breakpad cmdline/environ streams. Records are
+    // NUL-delimited and retain their starting byte offset, including empty
+    // records between delimiters.
+    std::vector<MinidumpLinuxStringRecord> nul_separated_records;
+    bool nul_separated_records_complete = true;
     // Populated only for Breakpad's Linux maps stream. Invalid rows remain in
     // captured_bytes and make maps_complete false.
     std::vector<MinidumpLinuxMemoryMap> memory_maps;

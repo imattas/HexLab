@@ -161,7 +161,10 @@ in the capsule.
 After any authentication prefix, the parser recognizes the optional EDK II
 `FMP_PAYLOAD_HEADER` when the `MSS1` signature is present. It validates the
 declared header size and reports its range, firmware version, and lowest
-supported firmware version. `firmware-image-offset` points past this wrapper;
+supported firmware version. A lowest-supported version greater than the
+payload firmware version is rejected as malformed during capsule parsing, so
+invalid rollback metadata cannot pass through inventory without an explicit
+policy-evaluation request. `firmware-image-offset` points past this wrapper;
 embedded firmware-volume and nested-capsule scans begin there. The original
 `payload-offset` remains the start of update data after authentication, so both
 wrapper provenance and the contained firmware start are explicit. The header's

@@ -2,7 +2,11 @@
 
 The Mach-O inspection CLI reports a bounded Objective-C class-list view for
 little-endian 32-bit ObjC2 and 64-bit images. It scans regular, file-backed `__objc_classlist`
-sections and retains each class-list section ordinal, slot address, and index.
+and `__objc_nlclslist` sections and retains each class-list section ordinal,
+slot address, and index. These lists may refer to the same class object; rows are
+deduplicated by the resolved class address while preserving every list origin.
+The non-lazy list therefore adds provenance and covers classes represented only
+there without creating duplicate class records.
 
 Pointer fields are resolved with the existing Mach-O relocation and dyld
 resolver. A resolved rebase or relocation is preferred. Raw slot bytes are

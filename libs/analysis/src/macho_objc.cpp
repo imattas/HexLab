@@ -823,7 +823,7 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
     Budget budget{limits, scan, stop, pointer_bytes, !slice.header.is_64 && slice.header.cpu_type == 12, arm64_32};
     std::vector<const MachOSection *> classlists;
     for (const auto &section : macho.sections)
-        if (section.name == "__objc_classlist") classlists.push_back(&section);
+        if (section.name == "__objc_classlist" || section.name == "__objc_nlclslist") classlists.push_back(&section);
         else if (pointer_bytes == 4 && section.segment_name == "__OBJC" && section.size) {
             scan.complete = false;
             if (scan.reason.empty()) scan.reason = "Legacy Objective-C 1 __OBJC runtime records are unsupported";

@@ -58,9 +58,11 @@ project.apply_batch(
 names, comments, and bookmarks. Its existing input format supports
 `merge="replace"` (the default) or `merge="preserve"`. Preserve mode fills only
 empty names/comments and absent bookmarks, ignores clear/removal requests, and
-does not replace a name already used in the same address space. It reads a
-complete project snapshot and refuses to merge if more than 4096 annotations
-or bookmarks exist, because omitted rows cannot safely be treated as absent.
+does not replace a name already used in the same address space. It plans
+against the complete native project state and refuses to merge if more than
+65,536 existing annotations or more than 65,536 existing bookmarks exist,
+because omitted rows cannot safely be treated as absent. Incoming batches are
+limited to 4096 rows/fields and 16 MiB of supplied text.
 Pass `expected_revision` to pin that snapshot; if all requested fields are
 already populated, preserve mode returns the unchanged snapshot without adding
 a history step. Pass `return_report=True` to receive the resulting snapshot,

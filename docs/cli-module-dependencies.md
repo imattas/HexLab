@@ -27,8 +27,12 @@ Graph mode is bounded to 4,096 supplied images, 100,000 raw and unique
 dependency rows, 16 MiB of dependency-name bytes, and 64 recursive levels.
 Ambiguous-provider ID display is capped at 100,000 IDs across the report. The
 summary reports the number of expanded nodes and whether supplied files were
-unreachable or beyond the depth limit. Malformed or missing images report the
-loader diagnostic and stop the command.
+unreachable or beyond the depth limit. A fixed-size diagnostic rollup counts
+unresolved and weak-unresolved edges, ambiguous edges, partial searches and
+their unsupported/escaped/error path counts, incompatible providers,
+depth-limited rows, cycles, and already-expanded edges. Counts cover reachable
+rows displayed by the graph and are bounded by the graph row cap. Malformed or
+missing images report the loader diagnostic and stop the command.
 
 Without `--discover`, graph mode uses only the supplied file set. PE dependency
 edges are case-insensitive and retain only providers with a compatible known

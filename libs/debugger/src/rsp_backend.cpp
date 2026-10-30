@@ -2078,6 +2078,11 @@ public:
             source.user_id, source.group_id, source.device_type, source.size, source.block_size,
             source.blocks, source.access_time, source.modification_time, source.change_time};
     }
+    Result<std::vector<std::byte>> read_remote_symlink(std::string_view path, std::size_t maximum_size,
+        std::stop_token stop) override {
+        if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
+        return client_->read_remote_symlink(path, maximum_size, stop);
+    }
     Result<std::vector<std::byte>> run_remote_monitor_command(std::string_view command,
         std::stop_token stop) override {
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
@@ -2506,6 +2511,8 @@ public:
         std::stop_token stop) override { return active().read_remote_file(path, maximum_size, stop); }
     Result<RemoteFileInfo> stat_remote_file(std::string_view path, bool follow_symlinks,
         std::stop_token stop) override { return active().stat_remote_file(path, follow_symlinks, stop); }
+    Result<std::vector<std::byte>> read_remote_symlink(std::string_view path, std::size_t maximum_size,
+        std::stop_token stop) override { return active().read_remote_symlink(path, maximum_size, stop); }
     Result<std::vector<std::byte>> run_remote_monitor_command(std::string_view command,
         std::stop_token stop) override { return active().run_remote_monitor_command(command, stop); }
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread) override { return active().read_registers(thread); }

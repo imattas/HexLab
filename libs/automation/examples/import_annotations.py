@@ -1,4 +1,4 @@
-﻿"""Import a bounded JSON or CSV batch of project names, comments, and bookmarks.
+"""Import a bounded JSON or CSV batch of project names, comments, and bookmarks.
 
 Usage: hexlab_python import_annotations.py project.hxproj annotations.json|annotations.csv [--format json|csv] [--merge replace|preserve]
        hexlab_python import_annotations.py project.hxproj output.csv --export
@@ -214,76 +214,23 @@ if conflicts:
     parser.error("manifest contains conflicting edits: " + "; ".join(conflicts))
 
 
-def existing_location_key(value):
-    # Project snapshots use compact tagged tuples; manifests use dictionaries.
-    if isinstance(value, tuple) and len(value) == 3 and value[0] == "va":
-        return ("va", value[1], value[2])
-    if isinstance(value, tuple) and len(value) == 2 and value[0] == "file":
-        return ("file_offset", value[1])
-    raise ValueError("project snapshot contains an unsupported annotation location")
-
-
+# Merge planning uses the full native state rather than the bounded Python
+# snapshot, so large existing annotation tables are not mistaken for missing rows.
 with hexlab.Project.open(args.project, readonly=False) as project:
     snapshot = project.snapshot()
     revision = snapshot["edit_revision"]
-    skipped_fields = 0
-    if args.merge == "preserve":
-        annotations = snapshot["annotations"]
-        bookmarks = snapshot["bookmarks"]
-        # The preview is deliberately bounded. Never infer that a field is
-        # absent when the project snapshot was truncated.
-        if (snapshot["annotation_count"] > len(annotations) or
-                snapshot["bookmark_count"] > len(bookmarks)):
-            parser.error("--merge preserve requires at most 4096 existing annotations and bookmarks")
-        current_annotations = {}
-        current_bookmarks = set()
-        names_in_project = {}
-        for current in annotations:
-            key = existing_location_key(current["location"])
-            current_annotations[key] = current
-            if key[0] == "va" and current["name"]:
-                names_in_project[(key[1], current["name"])] = key
-        for current in bookmarks:
-            current_bookmarks.add(existing_location_key(current["location"]))
-
-        merged_rows = []
-        for row in rows:
-            address = row["location"]
-            key = (("va", address.space, address.offset) if isinstance(address, hexlab.Address)
-                   else ("file_offset", address.offset))
-            current = current_annotations.get(key, {})
-            merged = {"location": address}
-            for field in ("name", "comment", "bookmark"):
-                if field not in row:
-                    continue
-                value = row[field]
-                has_current = (key in current_bookmarks if field == "bookmark"
-                               else bool(current.get(field)))
-                if has_current:
-                    skipped_fields += 1
-                    continue
-                if field == "name" and value:
-                    old_location = names_in_project.get((address.space, value))
-                    if old_location is not None and old_location != key:
-                        skipped_fields += 1
-                        continue
-                if field in ("name", "comment") and value == "":
-                    skipped_fields += 1
-                    continue
-                # A missing bookmark has nothing to remove; omit it so the
-                # projected batch contains only real additions.
-                if field == "bookmark" and value is None:
-                    skipped_fields += 1
-                    continue
-                merged[field] = value
-            if len(merged) > 1:
-                merged_rows.append(merged)
-        rows = merged_rows
-        if not rows:
-            print("no annotation changes; skipped", skipped_fields, "fields")
-            raise SystemExit(0)
-
-    updated = project.apply_annotations(rows, group=args.group, expected_revision=revision)
-    project.save()
-    print("applied", len(rows), "of", manifest_row_count, "rows; skipped", skipped_fields,
-          "fields; edit revision", updated["edit_revision"], "history cursor", updated["history_cursor"])
+    if not rows:
+        print("manifest contains no annotation rows")
+        raise SystemExit(0)
+    try:
+        report = project.apply_annotations(
+            rows, group=args.group, expected_revision=revision,
+            merge=args.merge, return_report=True)
+        if report["committed"]:
+            project.save()
+    except (ValueError, TypeError, hexlab.Error, hexlab.AnalysisCancelled) as error:
+        parser.error("annotation import failed: " + str(error))
+    updated = report["snapshot"]
+    print("processed", manifest_row_count, "rows; applied", report["applied"],
+          "fields; skipped", report["skipped"], "fields; committed", report["committed"],
+          "edit revision", report["result_revision"], "history cursor", updated["history_cursor"])

@@ -4,6 +4,16 @@
 
 HexLab already parses Intel HEX and Motorola S-record text as sparse addressable records. UEFI firmware images instead contain binary firmware volumes with flat FFS file records, so the inventory stays a metadata parser over the original byte span. It recognizes PI revision-2 firmware volumes embedded at arbitrary offsets, including nested volumes contained in an outer volume's file data, validates bounded headers and FFS2/FFS3 block maps, then walks aligned FFS headers and reports file GUIDs, kinds, sizes, states, and payload offsets. Each reported offset is absolute within the original input. It does not copy or map file payloads into synthetic segments. This makes the inventory useful for inspecting firmware blobs while avoiding unsupported assumptions about CPU mapping, capsule layout, or section semantics.
 
+When a complete child FV is wholly contained in the file-space payload of an
+`EFI_SECTION_FIRMWARE_VOLUME_IMAGE` section (`0x17`), that section records the
+child's zero-based index in the vector returned by
+`parse_uefi_firmware_volumes`. The relationship is emitted only after the child
+passes the normal FV header, checksum, block-map, and file-system-GUID checks.
+It provides section-to-volume provenance for callers; it does not extract,
+rewrite, or map the child image. Sections inside decompressed streams retain
+their decompressed offset space and are not linked to original-input volume
+offsets.
+
 The parser caps source bytes, number of volumes (including nested ones), total number of files, total number of sections, and nested section depth, and accepts a stop token. The scanner continues through the enclosing FV's bytes after recording it so a complete nested FV can be independently validated and inventoried. The CLI renders at most 4,096 file entries and 16,384 section entries while retaining full inventory counts. FFS state bytes are normalized for the volume erase polarity and exposed both raw and as a disposition (`construction`, `header-valid`, `data-valid`, `marked-for-update`, `deleted`, `header-invalid`, or `unrecognized`). Reserved state bits must match erase polarity. Section parsing and data-checksum validation are performed only when the data-valid state is set and the file is neither deleted nor header-invalid; incomplete, deleted, and invalid files remain listed with their offsets and state but their payload is left uninterpreted. A marked-for-update file with valid data is still parsed, since its data-valid state is complete.
 
 Each file also reports the required data-start alignment decoded from the FFS alignment attribute (1 byte through 16 MiB). The parser checks the data offset relative to the beginning of the firmware volume, as required by PI, and reports `alignment=not-valid` plus a file diagnostic when the recorded placement violates that requirement. The file and its section inventory remain visible for forensic inspection.

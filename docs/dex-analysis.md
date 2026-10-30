@@ -393,10 +393,22 @@ not numeric overflow or runtime value constraints. Array opcodes validate
 reference/index and broad element categories, while `aget-wide`/`aput-wide`
 remain long/double agnostic. Field descriptor checks apply to standard field
 identifier opcodes; optimized quick/volatile forms are not linked to field
-descriptors. Invoke checks validate receiver category and argument categories
-when a method prototype is available, including standard polymorphic/custom
-call-site prototypes when retained metadata resolves them. They do not prove
-class assignability, access, dispatch target identity, constructor
+descriptors. Invoke checks validate argument categories when a method
+prototype is available, including standard polymorphic/custom call-site
+prototypes when retained metadata resolves them. For ordinary method-ID
+invokes, tracked receiver types are checked against the method owner through
+locally defined superclass and interface edges. Array receivers follow
+reference-array covariance and the standard `Object`, `Cloneable`, and
+`Serializable` supertypes. Each hierarchy walk is capped at 4096 visited
+types. Known incompatible receivers are rejected. If local metadata cannot
+prove a tracked receiver's relation, its exact type fact is dropped after the
+call and only its broad reference category remains; the receiver is therefore
+unverified at that call. Unknown register types remain conservative; reference
+joins retain an exact type only when both incoming facts agree or one fact is
+null. External hierarchy gaps are kept unresolved instead of being treated as
+either a proven match or a malformed DEX. The pass does not resolve
+external class definitions, infer common supertypes at joins, validate
+field-owner receivers, or prove access, dispatch target identity, constructor
 uninitialized-object rules, or quick/inline call signatures. Exception-state
 propagation from each protected instruction and the complete Dalvik verifier
 lattice also remain unsupported.

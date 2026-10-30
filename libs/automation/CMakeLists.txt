@@ -56,7 +56,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 option(HEXLAB_ENABLE_PYTHON_AUTOMATION "Build the trusted CPython automation script runner and console" OFF)
-hexlab_add_library(automation SOURCES src/api.cpp src/history.cpp src/debug_info.cpp src/workflow_state.cpp
+hexlab_add_library(automation SOURCES src/api.cpp src/history.cpp src/debug_info.cpp src/workflow_state.cpp src/annotation_import.cpp
   DEPENDS hexlab::workspace hexlab::database hexlab::analysis hexlab::loaders
           hexlab::processors hexlab::types hexlab::image hexlab::symbols hexlab::firmware hexlab::core hexlab::decompiler)
 
@@ -143,3 +143,4 @@ install(DIRECTORY examples/ DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/example
   PATTERN "*.cpp" EXCLUDE)
 install(FILES examples/resume_inventory.cpp DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/examples/native")
 install(FILES README-workflow-state.md DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
+install(FILES README-annotation-import.md DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")

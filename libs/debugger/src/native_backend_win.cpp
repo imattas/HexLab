@@ -1436,9 +1436,18 @@ public:
                 return bp.enabled && bp.kind == BreakpointKind::execute && bp.address == address;
             });
         }();
+        const auto arm64_software_breakpoint_hit = [&] {
+            if (target_architecture() != Architecture::arm64 ||
+                pending_->dwDebugEventCode != EXCEPTION_DEBUG_EVENT ||
+                pending_->u.Exception.ExceptionRecord.ExceptionCode != EXCEPTION_BREAKPOINT ||
+                disposition != ContinueStatus::handled) return false;
+            const auto address = reinterpret_cast<std::uintptr_t>(pending_->u.Exception.ExceptionRecord.ExceptionAddress);
+            const auto found = breakpoints_.find(address);
+            return found != breakpoints_.end() && found->second.enabled;
+        }();
         const bool x86_step = target_architecture() == Architecture::x86 || target_architecture() == Architecture::x86_64;
         if (steps && (steps != 1 || owner_action->kind != ThreadResumeKind::single_step ||
-                      (runnable.size() != 1 && !arm64_execute_hit && !x86_step)))
+                      (runnable.size() != 1 && !arm64_execute_hit && !arm64_software_breakpoint_hit && !x86_step)))
             return Error{ErrorCode::unsupported, "Windows schedules support one event-thread step or a continue-only thread subset; x86/x64 steps and ARM64 execute-breakpoint step-over may also continue selected peers"};
         if (steps && disposition == ContinueStatus::not_handled)
             return Error{ErrorCode::unsupported,
@@ -3138,7 +3147,12 @@ private:
                 return Error{ErrorCode::io, "ARM64 step thread is absent from its resume set and rollback failed"};
             return Error{ErrorCode::invalid_argument, "ARM64 step thread must remain in the selected resume set"};
         }
-        auto suspended = suspend_unselected_threads(selected);
+        // A software breakpoint is process-wide. Keep every peer held while
+        // its trap instruction is temporarily removed, even when the caller
+        // selected those peers to continue after the step event.
+        const auto suspension_selection = displaced_breakpoint
+            ? std::span<const ThreadId>(owner_only) : selected;
+        auto suspended = suspend_unselected_threads(suspension_selection);
         if (!suspended) {
             if (displaced_breakpoint) stepping_breakpoint_.clear();
             auto restored = restore_arm64_step_context(thread_id, original_pc, original_cpsr);

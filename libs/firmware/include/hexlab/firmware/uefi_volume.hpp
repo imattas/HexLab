@@ -50,6 +50,10 @@ struct UefiFfsSection {
     std::optional<std::array<std::uint8_t, 16>> definition_guid;
     std::optional<std::uint16_t> definition_data_offset;
     std::optional<std::uint16_t> definition_attributes;
+    // Indices into the result of parse_uefi_firmware_volumes for complete,
+    // independently validated FVs contained in this FV_IMAGE payload. Only
+    // file-space payloads can carry original-input offsets here.
+    std::vector<std::size_t> embedded_volume_indices;
     std::optional<std::uint32_t> guided_crc32;
     std::optional<bool> guided_crc32_valid;
     std::optional<std::array<std::uint8_t, 16>> freeform_subtype_guid;
