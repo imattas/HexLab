@@ -1,6 +1,7 @@
 #include "project_exchange_cli.hpp"
 #include "hexlab/image/file_publication.hpp"
 #include "hexlab/workspace/project_exchange.hpp"
+#include <algorithm>
 #include <span>
 #include <fstream>
 

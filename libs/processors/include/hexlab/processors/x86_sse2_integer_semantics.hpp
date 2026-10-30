@@ -472,9 +472,11 @@ inline std::optional<X86Sse2PackedIntegerResult> evaluate_x86_ssse3_absolute_ins
     X86Sse2PackedIntegerResult result;
     result.lane_bits = static_cast<std::uint8_t>(lane_bits);
     for (unsigned offset = 0; offset < 16; offset += lane_bits / 8) {
-        const auto value = signed_lane(load_lane(source, offset, lane_bits), lane_bits);
+        const auto value = x86_sse2_integer_detail::signed_lane(
+            x86_sse2_integer_detail::load_lane(source, offset, lane_bits), lane_bits);
         const auto magnitude = value < 0 ? -value : value;
-        store_lane(result.bytes, offset, lane_bits, static_cast<std::uint64_t>(magnitude));
+        x86_sse2_integer_detail::store_lane(result.bytes, offset, lane_bits,
+                                            static_cast<std::uint64_t>(magnitude));
     }
     return result;
 }
