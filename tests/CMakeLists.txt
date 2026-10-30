@@ -425,6 +425,9 @@ add_test(NAME segmented_recovery COMMAND hexlab_segmented_recovery_tests)
 target_link_libraries(hexlab_project_derived_cache_tests PRIVATE hexlab::workspace)
 target_include_directories(hexlab_project_derived_cache_tests PRIVATE "${PROJECT_SOURCE_DIR}/libs/database/src")
 target_compile_definitions(hexlab_project_derived_cache_tests PRIVATE HEXLAB_DATABASE_TESTING)
+if(MSVC)
+  target_compile_options(hexlab_project_derived_cache_tests PRIVATE /bigobj)
+endif()
 add_test(NAME project_derived_cache COMMAND hexlab_project_derived_cache_tests
   "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/derived_v1.hxdc"
   "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/derived_v2.hxdc"

@@ -753,15 +753,15 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
             {static_cast<DiagnosticSeverity>(severity), std::move(message), in.optional_address()});
     }
     auto stack_count = in.count(14);
-    require(stack_count <= snapshot->functions.size(), "Cached stack frame table exceeds function count");
+    require(stack_count <= out.proposal.functions->functions.size(), "Cached stack frame table exceeds function count");
     std::size_t total_stack_access_details = 0;
     std::size_t total_stack_call_arguments = 0;
     for (size_t i = 0; i < stack_count; ++i) {
         FunctionStackRecord record;
         record.function = {in.number()};
-        require(record.function.value != 0 &&
-                    (i == 0 || out.proposal.stack_frames.back().function.value < record.function.value),
-                "Cached stack frame identities are not sorted and unique");
+        require(i < out.proposal.functions->functions.size() && record.function.value != 0 &&
+                    record.function == out.proposal.functions->functions[i]->id,
+                "Cached stack frame identity differs from function order");
         record.frame.complete = in.flag();
         if (in.flag()) record.frame.maximum_stack_allocation_bytes = in.number();
         auto slots = in.count(17);
