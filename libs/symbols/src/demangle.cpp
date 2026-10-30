@@ -1,5 +1,6 @@
 #include "hexlab/symbols/demangle.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cctype>
 #include <cstdint>
@@ -1054,9 +1055,96 @@ class Msvc {
             return checked(owner + " `vcall thunk' (vftable byte offset " +
                            std::to_string(vtable_offset) + ", " + call + ")");
         }
+        if (code == 'C') return string_literal();
         if (code == 'G' || code == 'E')
             return checked(deleting_destructor(code == 'G' ? "`scalar deleting destructor'" : "`vector deleting destructor'"));
         throw Failure{DemangleStatus::unsupported};
+    }
+    std::string string_literal() {
+        // ??_C@_0<len><crc>@<encoded bytes>@ is the compiler's pooled
+        // string-literal symbol. The CRC covers the full literal, while the
+        // spelling may contain only the encoded prefix, so retain it as
+        // metadata and never claim to validate it here.
+        if (!take('@') || !take('_') || at_ >= s_.size())
+            throw Failure{DemangleStatus::malformed};
+        const char character_kind = s_[at_++];
+        if (character_kind != '0' && character_kind != '1')
+            throw Failure{DemangleStatus::unsupported};
+        const auto byte_length = number();
+        if (byte_length == 0 || byte_length > 1024 * 1024)
+            throw Failure{DemangleStatus::resource_limit};
+        const auto crc_end = s_.find('@', at_);
+        if (crc_end == std::string_view::npos || crc_end == at_)
+            throw Failure{DemangleStatus::malformed};
+        at_ = crc_end + 1;
+
+        std::string decoded;
+        decoded.reserve(std::min<std::size_t>(byte_length, 128));
+        auto nibble = [&](char c) -> unsigned {
+            if (c < 'A' || c > 'P') throw Failure{DemangleStatus::malformed};
+            return static_cast<unsigned>(c - 'A');
+        };
+        auto one_byte = [&]() -> unsigned char {
+            if (at_ >= s_.size()) throw Failure{DemangleStatus::malformed};
+            const char c = s_[at_++];
+            if (c != '?') return static_cast<unsigned char>(c);
+            if (at_ >= s_.size()) throw Failure{DemangleStatus::malformed};
+            const char escape = s_[at_++];
+            if (escape == '$') {
+                if (s_.size() - at_ < 2) throw Failure{DemangleStatus::malformed};
+                const unsigned value = (nibble(s_[at_]) << 4) | nibble(s_[at_ + 1]);
+                at_ += 2;
+                return static_cast<unsigned char>(value);
+            }
+            if (escape >= '0' && escape <= '9') {
+                static constexpr std::string_view punctuation = ",/\\:. \n\t'-";
+                return static_cast<unsigned char>(punctuation[static_cast<std::size_t>(escape - '0')]);
+            }
+            if (escape >= 'a' && escape <= 'z') return static_cast<unsigned char>(0xE1 + escape - 'a');
+            if (escape >= 'A' && escape <= 'Z') return static_cast<unsigned char>(0xC1 + escape - 'A');
+            throw Failure{DemangleStatus::malformed};
+        };
+        auto escape_byte = [&](unsigned char c) {
+            switch (c) {
+            case 0: decoded += "\\0"; break;
+            case '\\': decoded += "\\\\"; break;
+            case '"': decoded += "\\\""; break;
+            case '\n': decoded += "\\n"; break;
+            case '\r': decoded += "\\r"; break;
+            case '\t': decoded += "\\t"; break;
+            default:
+                if (c >= 0x20 && c < 0x7f) decoded.push_back(static_cast<char>(c));
+                else {
+                    static constexpr char hex[] = "0123456789ABCDEF";
+                    decoded += "\\x"; decoded.push_back(hex[c >> 4]); decoded.push_back(hex[c & 15]);
+                }
+            }
+        };
+        std::size_t encoded_bytes = 0;
+        while (at_ < s_.size() && peek() != '@') {
+            if (++encoded_bytes > 128) throw Failure{DemangleStatus::resource_limit};
+            const auto first = one_byte();
+            if (character_kind == '1') {
+                if (at_ >= s_.size() || peek() == '@') throw Failure{DemangleStatus::malformed};
+                const auto second = one_byte();
+                const auto wide = static_cast<std::uint16_t>((first << 8) | second);
+                escape_byte(static_cast<unsigned char>(wide >> 8));
+                escape_byte(static_cast<unsigned char>(wide));
+                ++encoded_bytes;
+            } else {
+                escape_byte(first);
+            }
+        }
+        if (!take('@') || at_ != s_.size()) throw Failure{DemangleStatus::malformed};
+        if (character_kind == '1' && (byte_length & 1)) throw Failure{DemangleStatus::malformed};
+        const bool truncated = byte_length > encoded_bytes;
+        std::string result = std::string(character_kind == '1' ? "wchar_t" : "char") +
+                             " string literal \"" + decoded + (truncated ? "..." : "") +
+                             "\" (" + std::to_string(byte_length) + " bytes" +
+                             (truncated ? ", truncated" : "") + ")";
+        if (result.size() > limits_.max_output_bytes)
+            throw Failure{DemangleStatus::resource_limit};
+        return result;
     }
     std::string deleting_destructor(std::string_view function_name) {
         const auto owner = qualified_type_name(1);
