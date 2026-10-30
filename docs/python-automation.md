@@ -870,8 +870,12 @@ including types. The Python API uses detached `TypeSpec` values for named
 definitions and address assignments instead of exposing native type graph
 pointers. Python returns detached decompilation results rather than mutable IR
 objects. Archive metadata and bounded regular-member reads are available in C++
-and Python; extraction, project creation from a member, archive writing, and
-event subscriptions remain unbound.
+and Python. `Archive.extract_member(index, destination, max_bytes=...,
+chunk_size=..., cancel=...)` streams a regular member into a temporary file
+beside the destination, then publishes it without replacing an existing path.
+A read failure or cancellation removes the temporary file; byte and chunk
+limits bound extraction work. Project creation directly from an archive member,
+archive writing, and event subscriptions remain unbound.
 Large snapshot annotation/bookmark arrays are intentionally truncated to4096;
 their explicit total counts disclose that limit. Scripts have no implicit
 transaction; each ordinary mutator persists as its own history step.

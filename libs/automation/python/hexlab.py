@@ -2709,6 +2709,63 @@ class Archive:
         for offset in range(0, member.size, chunk_size):
             yield self.read_member(index, offset, min(chunk_size, member.size - offset))
 
+    def extract_member(self, index, destination, *, max_bytes=256 * 1024 * 1024,
+                       chunk_size=256 * 1024, cancel=None):
+        """Atomically extract one regular member to a new file.
+
+        The destination must not exist. Bytes are staged in its directory and
+        published with an exclusive hard link, so failures and cancellation do
+        not leave a truncated destination behind.
+        """
+        _unsigned(index, "index")
+        _unsigned(max_bytes, "max_bytes", 1024 * 1024 * 1024)
+        _unsigned(chunk_size, "chunk_size", 1024 * 1024)
+        if max_bytes == 0 or chunk_size == 0:
+            raise ValueError("max_bytes and chunk_size must be greater than zero")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        member = next((row for row in self.members(start=index, count=1)
+                       if row.index == index), None)
+        if member is None:
+            raise IndexError("archive member index is out of range")
+        if member.kind != "regular":
+            raise ValueError("only regular archive members can be extracted")
+        if member.size > max_bytes:
+            raise ValueError("archive member exceeds max_bytes")
+        destination = os.path.abspath(os.fspath(destination))
+        if os.path.lexists(destination):
+            raise FileExistsError(destination)
+        if cancel is not None and cancel.cancelled:
+            raise AnalysisCancelled("archive member extraction canceled")
+
+        temporary_fd, temporary_path = tempfile.mkstemp(
+            prefix=".hexlab-ar-extract-", dir=os.path.dirname(destination) or ".")
+        try:
+            with os.fdopen(temporary_fd, "wb") as stream:
+                temporary_fd = None
+                for offset in range(0, member.size, chunk_size):
+                    if cancel is not None and cancel.cancelled:
+                        raise AnalysisCancelled("archive member extraction canceled")
+                    amount = min(chunk_size, member.size - offset)
+                    data = self.read_member(index, offset, amount)
+                    if len(data) != amount:
+                        raise OSError("archive member returned a short read")
+                    stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("archive member extraction canceled")
+            os.link(temporary_path, destination)
+            return {"path": destination, "bytes": member.size,
+                    "member_index": index}
+        finally:
+            if temporary_fd is not None:
+                os.close(temporary_fd)
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+
 
 class HistoricalState:
     """Immutable exact-step user state and effective file bytes.
