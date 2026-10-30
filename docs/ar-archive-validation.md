@@ -85,7 +85,7 @@ The linked ET_REL form is an analysis artifact using merged section-relative sym
 
 Thin archives retain external member names and declared sizes. The library exposes an opt-in ArThinMemberResolver callback for callers that already have an archive-root/path policy. The loader does not access the filesystem or interpret paths. A resolver result must have exactly the declared member size; extraction still observes the configured byte cap and cancellation token.
 
-For applications that want the standard contained-directory policy, `make_ar_thin_member_resolver(root, limits)` creates a reusable resolver rooted at the explicitly supplied directory. It accepts only valid UTF-8 relative member paths, rejects absolute/rooted paths, drive/stream colons, empty/dot/dot-dot components, and performs no basename fallback or implicit search. Reads use the opened file handle: Windows checks the final handle path remains beneath the opened root (including reparse-point targets), while POSIX walks with `openat` and refuses symlinks in path components. Only regular files are snapshotted. The resolver caches each stored path for its lifetime and enforces configurable cumulative-byte, unique-path, and path-length caps (defaults: 512 MiB, 100,000, and 4096 bytes). `open_ar_member` then verifies the snapshot length exactly matches the archive member's declared size. Applications with different policies can still supply their own `ArThinMemberResolver`.
+For applications that want the standard contained-directory policy, `make_ar_thin_member_resolver(root, limits)` creates a reusable resolver rooted at the explicitly supplied directory. It accepts only valid UTF-8 relative member paths, rejects absolute/rooted paths, drive/stream colons, empty/dot/dot-dot components, and performs no basename fallback or implicit search. Reads use the opened file handle: Windows checks the final handle path remains beneath the opened root (including reparse-point targets), while POSIX walks with `openat` and refuses symlinks in path components. Only regular files are snapshotted. The resolver caches each stored path for its lifetime and enforces configurable cumulative-byte, unique-path, and path-length caps (defaults: 512 MiB, 100,000, and 4096 bytes). `open_ar_member` then verifies the snapshot length exactly matches the archive member's declared size. `extract_ar_member(storage, member, resolver)` applies the same exact-size check, extraction byte cap, bounded reads, and cancellation behavior to a thin external member. Applications with different policies can still supply their own `ArThinMemberResolver`.
 
 The fixed-point selector accepts summaries for both regular and external thin
 members. Callers resolve each thin member with the resolver overload of
@@ -108,6 +108,8 @@ paths, drive/stream colons, NULs and dot/dot-dot components are rejected.
 Backslashes are treated as separators. The original stored member name remains
 the archive identity, including when the root is separate from the archive's
 directory.
+
+`archive extract` resolves only the selected external member, checks its snapshot against the declared member size, then applies the standard extraction byte and output overwrite limits. It does not eagerly read unrelated thin members.
 
 On Windows, the CLI opens the root and member handles, validates the member's
 final handle path is below the root's final handle path, and reads from that

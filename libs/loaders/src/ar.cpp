@@ -974,6 +974,8 @@ Result<std::vector<std::byte>> extract_ar_member(const ByteStorage &storage, con
 Result<std::vector<std::byte>> extract_ar_member(
     std::shared_ptr<const ByteStorage> storage, const ArMember &member,
     const ArThinMemberResolver &resolver, std::stop_token stop, ArLimits limits) {
+    if (stop.stop_requested())
+        return Error{ErrorCode::canceled, "ar operation canceled"};
     if (member.kind != ArMemberKind::thin_external) {
         if (!storage) return Error{ErrorCode::invalid_argument, "ar member extraction requires source storage"};
         return extract_ar_member(*storage, member, stop, limits);
