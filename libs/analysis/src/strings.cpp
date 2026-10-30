@@ -8,6 +8,7 @@
 namespace hexlab {
 namespace {
 #include "strings_cp932_table.inc"
+#include "strings_gbk_table.inc"
 struct ScanFailure {Error error;};
 struct BudgetEnd {};
 struct WorkBudgetEnd {};
@@ -151,6 +152,20 @@ std::optional<std::uint32_t> decode_windows932_pair(unsigned lead, unsigned trai
     else
         return {};
     const auto scalar = cp932_pair_table[lead_index * 188 + trail_index];
+    return scalar ? std::optional<std::uint32_t>{scalar} : std::nullopt;
+}
+std::optional<std::uint32_t> decode_windows936_single(unsigned byte) {
+    if (byte < 0x80) return byte;
+    if (byte == 0x80) return 0x20ac;
+    return {};
+}
+std::optional<std::uint32_t> decode_windows936_pair(unsigned lead, unsigned trail) {
+    if (lead < 0x81 || lead > 0xfe) return {};
+    std::size_t trail_index = 0;
+    if (trail >= 0x40 && trail <= 0x7e) trail_index = trail - 0x40;
+    else if (trail >= 0x80 && trail <= 0xfe) trail_index = 63 + trail - 0x80;
+    else return {};
+    const auto scalar = gbk_pair_table[(lead - 0x81) * 190 + trail_index];
     return scalar ? std::optional<std::uint32_t>{scalar} : std::nullopt;
 }
 struct Utf8Unit { std::uint32_t scalar=0; unsigned length=0; };
@@ -1039,6 +1054,36 @@ Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& optio
                 else {emit(run,false,StringEncoding::windows932,range,options,output,true);++at;}
             }
             emit(run,false,StringEncoding::windows932,range,options,output,true);
+            const auto gbk_first_record = output.records.size();
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> strict_utf8_extents;
+            for (const auto& record : output.records)
+                if (record.encoding == StringEncoding::utf8)
+                    strict_utf8_extents.emplace_back(record.file_offset.value, record.byte_length);
+            run={};
+            for(auto at=range.begin;at<range.end;) {
+                if(((at-range.begin)&4095)==0)check_stop(stop);
+                const auto first=input.byte(at);
+                if(first==0) {emit(run,true,StringEncoding::windows936,range,options,output,true);++at;continue;}
+                std::optional<std::uint32_t> scalar;
+                unsigned length=1;
+                if(first>=0x81 && first<=0xfe) {
+                    if(range.end-at>=2) {
+                        scalar=decode_windows936_pair(first,input.byte(at+1));
+                        if(scalar) length=2;
+                    }
+                } else scalar=decode_windows936_single(first);
+                if(scalar && printable(*scalar)) {run.add(at,*scalar,length);at+=length;}
+                else {emit(run,false,StringEncoding::windows936,range,options,output,true);++at;}
+            }
+            emit(run,false,StringEncoding::windows936,range,options,output,true);
+            // A strict UTF-8 candidate is direct evidence for those same bytes;
+            // do not also label its exact extent as a GBK reinterpretation.
+            output.records.erase(std::remove_if(output.records.begin()+static_cast<std::ptrdiff_t>(gbk_first_record),
+                                                output.records.end(),[&](const StringRecord& record) {
+                if(record.encoding!=StringEncoding::windows936)return false;
+                return std::find(strict_utf8_extents.begin(),strict_utf8_extents.end(),
+                    std::pair{record.file_offset.value,record.byte_length})!=strict_utf8_extents.end();
+            }),output.records.end());
             run={};
             for(auto at=range.begin;at<range.end;++at) {
                 if(((at-range.begin)&4095)==0)check_stop(stop);

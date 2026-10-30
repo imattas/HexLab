@@ -20,6 +20,18 @@ source of ASCII-only records. This heuristic can produce overlapping candidates
 when arbitrary binary data resembles text; overlapping candidates are retained
 instead of silently choosing an encoding.
 
+Windows-936 (GBK) adds a bounded multibyte candidate for legacy Simplified
+Chinese data. The lead/trail byte ranges use a fixed 126-by-190 mapping table
+generated from Python's `gbk` codec, with the single-byte 0x80 euro mapping
+handled separately. Invalid pairs and non-printable values split runs; emitted
+candidates need at least one non-ASCII scalar, retain original file/address
+extents, and produce UTF-8 previews. A candidate with the exact same extent as
+a strict UTF-8 result is suppressed, so valid UTF-8 text is not re-labeled as
+GBK. Encoding ID 44 is appended, and derived-cache version 93 recomputes older
+scans. The mapping is provenance for the byte-to-Unicode interpretation; this
+is still a heuristic candidate and does not infer locale or language. Arbitrary
+binary may still produce overlapping legacy-codepage candidates.
+
 Windows-1251 is scanned as a second single-byte heuristic, with an explicit
 fixed mapping for Cyrillic letters and punctuation. Its undefined byte 0x98
 ends a candidate. As with Windows-1252, emitted candidates must contain a

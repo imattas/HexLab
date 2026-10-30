@@ -28,7 +28,7 @@ set(thin_output "${ARTIFACTS}/thin/extracted.bin")
 file(REMOVE "${thin_output}" "${ARTIFACTS}/thin/no-root.bin")
 execute_process(COMMAND "${CLI}" archive extract "${thin_archive}" --member 0
   --output "${ARTIFACTS}/thin/no-root.bin" RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 10)
-if(NOT "${status}" STREQUAL "1" OR NOT stderr MATCHES "--thin-root")
+if(NOT "${status}" STREQUAL "2" OR NOT stderr MATCHES "--thin-root")
   message(FATAL_ERROR "Thin extraction without an explicit root should be rejected: status=${status}; stderr=${stderr}")
 endif()
 execute_process(COMMAND "${CLI}" archive extract "${thin_archive}" --member 0 --output "${thin_output}"

@@ -715,7 +715,8 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
     auto records = in.count(31);
     for (size_t i = 0; i < records; ++i) {
         auto kind = in.number(1);
-        const auto maximum_string_encoding = version >= 89 ? StringEncoding::windows932 :
+        const auto maximum_string_encoding = version >= 93 ? StringEncoding::windows936 :
+            version >= 89 ? StringEncoding::windows932 :
             version >= 75 ? StringEncoding::ebcdic_cp1140 :
             version >= 72 ? StringEncoding::ebcdic_cp1047 :
             version >= 68 ? StringEncoding::ebcdic_cp500 :
