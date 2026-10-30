@@ -157,7 +157,8 @@ void function_starts(const Reader &reader, const MachOLoadCommand &command, cons
     std::size_t cursor = 0;
     while (cursor < bytes.bytes.size()) {
         canceled(stop);
-        const auto record = cursor, delta = uleb(bytes.bytes, cursor);
+        const auto record = cursor;
+        const auto delta = uleb(bytes.bytes, cursor);
         if (!delta) {
             terminated = true;
             break;
