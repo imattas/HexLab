@@ -1,5 +1,6 @@
 #pragma once
 #include "hexlab/image/metadata.hpp"
+#include "hexlab/analysis/dependencies.hpp"
 #include <optional>
 #include <string>
 namespace hexlab::desktop {
@@ -9,5 +10,6 @@ struct AnalysisIssueDiagnostic {
     std::string message;
     std::optional<Address> address;
     std::optional<Address> function_entry;
+    std::optional<AnalysisKey> source_key;
 };
 }

@@ -20,8 +20,12 @@ word and source location. It does not interpret unwind opcodes, personality
 routines, exception data, or recover caller registers. Relocatable ET_REL
 tables are skipped because their PREL31 relocations have not been applied.
 
-An exidx row proves an entry, but does not provide an exact body extent. The
-analysis therefore does not use the next row as a function end and does not
-constrain decoding to a guessed range. DWARF FDE ranges remain a separate
-source when available. Malformed or unsupported EHABI tables produce loader
-diagnostics and do not become roots.
+An exidx row proves an entry. For adjacent accepted rows, analysis uses the
+next start as an ownership bound only when both entries are in the same
+initialized executable segment and the complete interval is file-backed code.
+The final row has no inferred extent because its successor may be a linker
+sentinel or lie outside mapped code. Rows whose adjacent range crosses a
+segment or initialized-byte boundary remain roots without a chunk bound.
+DWARF FDE ranges remain an independent, potentially more precise source when
+available. Malformed or unsupported EHABI tables produce loader diagnostics
+and do not become roots.

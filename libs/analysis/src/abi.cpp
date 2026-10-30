@@ -6,6 +6,7 @@
 #include <functional>
 #include <limits>
 #include <set>
+#include <utility>
 
 namespace hexlab {
 namespace {
@@ -897,11 +898,16 @@ AbiSignatureClassification classify_vectorcall(CallingConvention convention,
 struct AapcsHfa {
     std::uint64_t element_size = 0;
     std::vector<std::uint64_t> offsets;
+    const types::Type *vector_element = nullptr;
 };
 
 bool gather_aapcs_hfa(const types::Type &type, std::uint64_t base,
-                      const types::TypeLayout &layout, AapcsHfa &out) {
+                      const types::TypeLayout &layout, AapcsHfa &out,
+                      types::Abi abi) {
+    if (type.kind() == types::Kind::qualified && type.element())
+        return gather_aapcs_hfa(*type.element(), base, layout, out, abi);
     if (type.kind() == types::Kind::floating) {
+        if (out.vector_element) return false;
         const auto size = type.size().value_or(0);
         if (size != 2 && size != 4 && size != 8 && size != 16) return false;
         if (out.element_size && out.element_size != size) return false;
@@ -915,15 +921,32 @@ bool gather_aapcs_hfa(const types::Type &type, std::uint64_t base,
         }
         return true;
     }
+    // AAPCS64 also passes homogeneous vector aggregates in the SIMD register
+    // bank. Keep this separate from floating HFAs: vector elements are whole
+    // vector values and must have the same lane type and shape.
+    if (abi == types::Abi::aarch64 && type.kind() == types::Kind::vector) {
+        const auto width = aapcs64_vector_width(type);
+        if (!width || (out.element_size && !out.vector_element) ||
+            (out.element_size && out.element_size != *width) ||
+            (out.vector_element && out.vector_element->size() != type.size())) return false;
+        if (!out.vector_element) out.vector_element = &type;
+        out.element_size = *width;
+        if (std::find(out.offsets.begin(), out.offsets.end(), base) == out.offsets.end()) {
+            if (out.offsets.size() == 4) return false;
+            out.offsets.push_back(base);
+        }
+        return true;
+    }
+    if (type.kind() == types::Kind::vector) return false;
     if (type.kind() == types::Kind::array) {
         if (!type.element() || !type.count()) return false;
-        auto element_layout = types::layout(*type.element(), types::Abi::aarch64);
+        auto element_layout = types::layout(*type.element(), abi);
         if (!element_layout) return false;
         for (std::uint64_t i = 0; i < type.count(); ++i) {
             if (element_layout.value().size && i > (std::numeric_limits<std::uint64_t>::max() - base) / element_layout.value().size)
                 return false;
             if (!gather_aapcs_hfa(*type.element(), base + i * element_layout.value().size,
-                                  element_layout.value(), out)) return false;
+                                  element_layout.value(), out, abi)) return false;
         }
         return true;
     }
@@ -931,18 +954,19 @@ bool gather_aapcs_hfa(const types::Type &type, std::uint64_t base,
     for (std::size_t i = 0; i < type.members().size(); ++i) {
         const auto &member = type.members()[i];
         if (!member.type || member.bit_width || i >= layout.members.size()) return false;
-        auto child_layout = types::layout(*member.type, types::Abi::aarch64);
+        auto child_layout = types::layout(*member.type, abi);
         if (!child_layout || !gather_aapcs_hfa(*member.type, base + layout.members[i].offset,
-                                               child_layout.value(), out)) return false;
+                                               child_layout.value(), out, abi)) return false;
     }
     return true;
 }
 
-std::optional<AapcsHfa> aapcs_hfa(const types::Type &type) {
-    auto object_layout = types::layout(type, types::Abi::aarch64);
+std::optional<AapcsHfa> aapcs_hfa(const types::Type &type,
+                                 types::Abi abi = types::Abi::aarch64) {
+    auto object_layout = types::layout(type, abi);
     if (!object_layout) return std::nullopt;
     AapcsHfa result;
-    if (!gather_aapcs_hfa(type, 0, object_layout.value(), result) || result.offsets.empty() ||
+    if (!gather_aapcs_hfa(type, 0, object_layout.value(), result, abi) || result.offsets.empty() ||
         result.offsets.size() > 4) return std::nullopt;
     return result;
 }
@@ -950,6 +974,15 @@ std::optional<AapcsHfa> aapcs_hfa(const types::Type &type) {
 std::string aapcs_fp_register(std::size_t index, std::uint64_t size) {
     const char *prefix = size == 2 ? "H" : size == 4 ? "S" : size == 8 ? "D" : "Q";
     return std::string(prefix) + std::to_string(index);
+}
+
+std::string aapcs_hfa_register(const AapcsHfa &hfa, std::size_t index) {
+    return hfa.vector_element ? "V" + std::to_string(index) : aapcs_fp_register(index, hfa.element_size);
+}
+
+std::string aapcs32_fp_register(std::size_t index, std::uint64_t size) {
+    // AAPCS32 carries IEEE half values in the low bits of an S register.
+    return std::string(size == 8 ? "D" : "S") + std::to_string(index);
 }
 
 Scalar aapcs_scalar(const types::Type &type) {
@@ -997,14 +1030,6 @@ AbiSignatureClassification classify_aapcs64(const types::Type &function_type) {
 
     const auto &parameters = function_type.parameters();
     out.arguments.reserve(parameters.size());
-    if (function_type.variadic()) {
-        out.result = unsupported("AAPCS64 variadic signatures are unsupported");
-        out.complete = false;
-        for (std::size_t i = 0; i < parameters.size(); ++i)
-            out.arguments.push_back(unsupported("AAPCS64 variadic argument placement is unsupported"));
-        return out;
-    }
-
     const auto &return_type = *function_type.result_type();
     if (return_type.kind() == types::Kind::void_type) {
         out.result = {};
@@ -1013,7 +1038,7 @@ AbiSignatureClassification classify_aapcs64(const types::Type &function_type) {
         if (!layout) out.result = unsupported(layout.error().message);
         else if (auto hfa = aapcs_hfa(return_type)) {
             for (std::size_t i = 0; i < hfa->offsets.size(); ++i)
-                out.result.locations.push_back(reg_location(aapcs_fp_register(i, hfa->element_size),
+                out.result.locations.push_back(reg_location(aapcs_hfa_register(*hfa, i),
                                                               hfa->element_size, hfa->offsets[i]));
         } else if (layout.value().size > 16) {
             out.hidden_result_pointer = {true, {}, {
@@ -1087,7 +1112,7 @@ AbiSignatureClassification classify_aapcs64(const types::Type &function_type) {
                 if (simd + hfa->offsets.size() <= 8) {
                     AbiValueLocation value;
                     for (std::size_t i = 0; i < hfa->offsets.size(); ++i)
-                        value.locations.push_back(reg_location(aapcs_fp_register(simd++, hfa->element_size),
+                        value.locations.push_back(reg_location(aapcs_hfa_register(*hfa, simd++),
                                                               hfa->element_size, hfa->offsets[i]));
                     out.arguments.push_back(std::move(value));
                 } else {
@@ -1148,9 +1173,9 @@ AbiSignatureClassification classify_aapcs64(const types::Type &function_type) {
     return out;
 }
 
-AbiSignatureClassification classify_aapcs32(const types::Type &function_type) {
+AbiSignatureClassification classify_aapcs32(const types::Type &function_type, bool vfp_variant = false) {
     AbiSignatureClassification out;
-    out.convention = CallingConvention::aapcs32;
+    out.convention = vfp_variant ? CallingConvention::aapcs32_vfp : CallingConvention::aapcs32;
     out.pointer_size = 4;
     out.stack_alignment = 8;
     out.stack_slot_size = 4;
@@ -1162,6 +1187,8 @@ AbiSignatureClassification classify_aapcs32(const types::Type &function_type) {
 
     const auto &parameters = function_type.parameters();
     out.arguments.reserve(parameters.size());
+    // AAPCS32 mandates the base PCS for variadic functions, including results.
+    const bool use_vfp = vfp_variant && !function_type.variadic();
     const auto &return_type = unqualified(*function_type.result_type());
     if (return_type.kind() == types::Kind::void_type) {
         out.result = {};
@@ -1173,6 +1200,14 @@ AbiSignatureClassification classify_aapcs32(const types::Type &function_type) {
             out.result = unsupported(object.error().message);
         } else if (return_type.kind() == types::Kind::array) {
             out.result = unsupported("array result types are not valid function results");
+        } else if (use_vfp && aapcs_hfa(return_type, types::Abi::aarch32) &&
+                   (aapcs_hfa(return_type, types::Abi::aarch32)->element_size == 2 ||
+                    aapcs_hfa(return_type, types::Abi::aarch32)->element_size == 4 ||
+                    aapcs_hfa(return_type, types::Abi::aarch32)->element_size == 8)) {
+            const auto hfa = *aapcs_hfa(return_type, types::Abi::aarch32);
+            for (std::size_t i = 0; i < hfa.offsets.size(); ++i)
+                out.result.locations.push_back(reg_location(aapcs32_fp_register(i, hfa.element_size),
+                    hfa.element_size, hfa.offsets[i]));
         } else if (object.value().size <= 4) {
             out.result = {true, {}, {reg_location("R0", object.value().size, 0, 4)}};
         } else {
@@ -1186,6 +1221,8 @@ AbiSignatureClassification classify_aapcs32(const types::Type &function_type) {
         const auto scalar = scalar_type(return_type, 4);
         if (!scalar.supported) {
             out.result = unsupported(scalar.reason);
+        } else if (use_vfp && scalar.floating && (scalar.size == 2 || scalar.size == 4 || scalar.size == 8)) {
+            out.result = {true, {}, {reg_location(aapcs32_fp_register(0, scalar.size), scalar.size)}};
         } else if (scalar.size <= 4) {
             out.result = {true, {}, {reg_location("R0", scalar.size, 0, 4)}};
         } else if (scalar.size == 8) {
@@ -1199,6 +1236,9 @@ AbiSignatureClassification classify_aapcs32(const types::Type &function_type) {
 
     std::size_t ncrn = out.result.indirect ? 1 : 0;
     std::uint64_t nsaa = 0;
+    std::uint16_t vfp_used_s = 0;
+    bool vfp_unavailable = false;
+    bool cprc_preceding_failed = false;
     bool placement_known = out.result.supported;
     const auto append_word_locations = [&](AbiValueLocation &value, std::uint64_t value_size,
                                            std::uint64_t slot_size, std::uint64_t first_offset,
@@ -1241,6 +1281,64 @@ AbiSignatureClassification classify_aapcs32(const types::Type &function_type) {
             continue;
         }
         const bool aggregate = type.kind() == types::Kind::structure || type.kind() == types::Kind::union_type;
+        if (use_vfp) {
+            std::optional<AapcsHfa> cprc;
+            if (aggregate) {
+                cprc = aapcs_hfa(type, types::Abi::aarch32);
+                if (cprc && cprc->element_size != 2 && cprc->element_size != 4 && cprc->element_size != 8)
+                    cprc.reset();
+            }
+            else if (type.kind() == types::Kind::floating &&
+                     (type.size().value_or(0) == 2 || type.size().value_or(0) == 4 || type.size().value_or(0) == 8))
+                cprc = AapcsHfa{type.size().value(), {0}, nullptr};
+            if (cprc) {
+                auto object = types::layout(type, types::Abi::aarch32);
+                const auto slots_per_element = cprc->element_size == 8 ? 2u : 1u;
+                const auto needed = static_cast<unsigned>(cprc->offsets.size()) * slots_per_element;
+                unsigned first = 0;
+                bool found = !vfp_unavailable;
+                if (found) {
+                    for (first = 0; first + needed <= 16; ++first) {
+                        if (slots_per_element == 2 && (first & 1)) continue;
+                        const auto mask = static_cast<std::uint16_t>(((1u << needed) - 1u) << first);
+                        if (!(vfp_used_s & mask)) break;
+                    }
+                    found = first + needed <= 16;
+                }
+                AbiValueLocation value;
+                if (found) {
+                    const auto mask = static_cast<std::uint16_t>(((1u << needed) - 1u) << first);
+                    vfp_used_s |= mask;
+                    for (std::size_t i = 0; i < cprc->offsets.size(); ++i) {
+                        const auto reg = cprc->element_size == 8 ? first / 2 + i : first + i;
+                        value.locations.push_back(reg_location(aapcs32_fp_register(reg, cprc->element_size),
+                            cprc->element_size, cprc->offsets[i]));
+                    }
+                } else {
+                    vfp_unavailable = true;
+                    cprc_preceding_failed = true;
+                    if (!object) {
+                        out.arguments.push_back(unsupported(object.error().message));
+                        out.complete = placement_known = false;
+                        continue;
+                    }
+                    const auto size = aggregate ? object.value().size : cprc->element_size;
+                    const auto alignment = std::max<std::uint64_t>(4, aggregate ? object.value().alignment : cprc->element_size);
+                    const auto stack_at = align_stack(nsaa, alignment);
+                    const auto rounded = (size + 3) & ~std::uint64_t(3);
+                    if (stack_at == std::numeric_limits<std::uint64_t>::max() || rounded > std::numeric_limits<std::uint64_t>::max() - stack_at) {
+                        out.arguments.push_back(unsupported("AAPCS32 VFP stack candidate placement overflows"));
+                        out.complete = placement_known = false;
+                        continue;
+                    }
+                    for (std::uint64_t offset = 0; offset < size; offset += 4)
+                        value.locations.push_back(stack_location(stack_at + offset, std::min<std::uint64_t>(4, size - offset), 4, offset, 4));
+                    nsaa = stack_at + rounded;
+                }
+                out.arguments.push_back(std::move(value));
+                continue;
+            }
+        }
         std::uint64_t value_size = 0;
         std::uint64_t alignment = 4;
         if (aggregate) {
@@ -1292,7 +1390,7 @@ AbiSignatureClassification classify_aapcs32(const types::Type &function_type) {
         // AAPCS32 C.5 permits at most one composite argument to straddle the
         // final core registers and the stack, and only while no earlier value
         // has consumed stack argument space.
-        if (aggregate && available && nsaa == 0) {
+        if (aggregate && available && nsaa == 0 && !cprc_preceding_failed) {
             AbiValueLocation value{true, {}, {}};
             append_word_locations(value, value_size, slot_size, 0, ncrn, available, 0);
             const auto register_bytes = static_cast<std::uint64_t>(available) * 4;
@@ -1877,6 +1975,89 @@ AbiSignatureClassification classify_mips_n32(const types::Type &function_type) {
     out.stack_argument_bytes = stack;
     return out;
 }
+
+AbiSignatureClassification classify_mips_o32(const types::Type &function_type) {
+    AbiSignatureClassification out;
+    out.convention = CallingConvention::mips_o32;
+    out.pointer_size = 4;
+    out.stack_alignment = 8;
+    out.stack_slot_size = 4;
+    if (function_type.kind() != types::Kind::function || !function_type.result_type()) {
+        out.complete = false;
+        out.result = unsupported("input type is not a function signature");
+        return out;
+    }
+    if (function_type.variadic()) {
+        out.complete = false;
+        out.result = unsupported("variadic MIPS O32 classification is unsupported");
+        for (std::size_t i = 0; i < function_type.parameters().size(); ++i)
+            out.arguments.push_back(unsupported("variadic MIPS O32 parameter placement is unsupported"));
+        return out;
+    }
+
+    const auto integer_scalar = [](const types::Type &source, bool allow_void) -> std::pair<std::uint64_t, std::string> {
+        const auto &type = unqualified(source);
+        if (allow_void && type.kind() == types::Kind::void_type) return {0, {}};
+        const auto size = type.size().value_or(0);
+        switch (type.kind()) {
+        case types::Kind::boolean:
+        case types::Kind::integer:
+        case types::Kind::enumeration:
+            if (size == 1 || size == 2 || size == 4) return {size, {}};
+            return {0, "MIPS O32 integer scalar must be 8, 16, or 32 bits"};
+        case types::Kind::pointer:
+            if (size == 4) return {size, {}};
+            return {0, "pointer size does not match MIPS O32"};
+        default:
+            return {0, "MIPS O32 slice supports only integer, enum, boolean, pointer, and void-result types"};
+        }
+    };
+
+    const auto [result_size, result_error] = integer_scalar(*function_type.result_type(), true);
+    if (!result_error.empty()) {
+        out.result = unsupported(result_error);
+        out.complete = false;
+    } else if (result_size) {
+        out.result.locations.push_back(reg_location("V0", result_size, 0, 4));
+    }
+
+    std::uint64_t argument_word = 0;
+    std::uint64_t stack_cursor = 16; // O32's four-word caller-provided argument home area.
+    bool placement_known = out.result.supported;
+    for (const auto &parameter : function_type.parameters()) {
+        if (!placement_known) {
+            out.arguments.push_back(unsupported("preceding value makes MIPS O32 placement indeterminate"));
+            continue;
+        }
+        if (!parameter.type) {
+            out.arguments.push_back(unsupported("parameter has no type"));
+            out.complete = placement_known = false;
+            continue;
+        }
+        const auto [size, error] = integer_scalar(*parameter.type, false);
+        if (!error.empty()) {
+            out.arguments.push_back(unsupported(error));
+            out.complete = placement_known = false;
+            continue;
+        }
+        AbiValueLocation argument;
+        if (argument_word < 4) {
+            argument.locations.push_back(reg_location("A" + std::to_string(argument_word), size, 0, 4));
+        } else {
+            if (stack_cursor > std::numeric_limits<std::uint64_t>::max() - 4) {
+                out.arguments.push_back(unsupported("MIPS O32 stack argument extent overflows"));
+                out.complete = placement_known = false;
+                continue;
+            }
+            argument.locations.push_back(stack_location(stack_cursor, size, 4, 0, 4));
+            stack_cursor += 4;
+        }
+        ++argument_word;
+        out.arguments.push_back(std::move(argument));
+    }
+    out.stack_argument_bytes = stack_cursor - 16;
+    return out;
+}
 } // namespace
 
 AbiSignatureClassification classify_abi_signature(CallingConvention convention,
@@ -1887,16 +2068,12 @@ AbiSignatureClassification classify_abi_signature(CallingConvention convention,
         return classify_mips_n64(function_type);
     if (convention == CallingConvention::mips_n32)
         return classify_mips_n32(function_type);
-    if (convention == CallingConvention::mips_o32) {
-        AbiSignatureClassification out; out.convention = convention; out.complete = false;
-        out.result = unsupported("Linux MIPS O32 ABI classification is not implemented");
-        if (function_type.kind() == types::Kind::function)
-            for (std::size_t i = 0; i < function_type.parameters().size(); ++i)
-                out.arguments.push_back(unsupported("MIPS O32 parameter placement is unsupported"));
-        return out;
-    }
+    if (convention == CallingConvention::mips_o32)
+        return classify_mips_o32(function_type);
     if (is_vectorcall(convention))
         return classify_vectorcall(convention, function_type);
+    if (convention == CallingConvention::aapcs32_vfp)
+        return classify_aapcs32(function_type, true);
     if (convention == CallingConvention::aapcs32)
         return classify_aapcs32(function_type);
     if (convention == CallingConvention::aapcs64)
@@ -2238,6 +2415,11 @@ AbiSignatureClassification classify_abi_signature(const types::Type &function_ty
             return unsupported_declared("aapcs32 is only modeled for AArch32 targets");
         selected = CallingConvention::aapcs32;
         break;
+    case FunctionConvention::aapcs32_vfp:
+        if (platform_default != CallingConvention::aapcs32)
+            return unsupported_declared("aapcs32_vfp is only modeled for AArch32 targets");
+        selected = CallingConvention::aapcs32_vfp;
+        break;
     case FunctionConvention::mips_n64:
         if (platform_default != CallingConvention::mips_n64)
             return unsupported_declared("mips_n64 is only modeled for Linux MIPS64 N64 targets");
@@ -2323,12 +2505,17 @@ AbiSignatureClassification classify_abi_method(CallingConvention convention,
 AbiSignatureClassification classify_abi_call(
     CallingConvention convention, const types::Type &function_type,
     std::span<const types::TypePtr> actual_argument_types) {
+    const bool aapcs32_call = convention == CallingConvention::aapcs32 ||
+                              convention == CallingConvention::aapcs32_vfp;
+    const bool aapcs64_call = convention == CallingConvention::aapcs64;
+    const bool x86_32_fastcall_call = convention == CallingConvention::x86_32_fastcall;
+    const std::uint64_t call_pointer_size = aapcs32_call || x86_32_fastcall_call ? 4 : 8;
     const auto failure = [&](std::string reason) {
         AbiSignatureClassification out;
         out.convention = convention;
-        out.pointer_size = 8;
-        out.stack_alignment = 16;
-        out.stack_slot_size = 8;
+        out.pointer_size = static_cast<std::uint8_t>(call_pointer_size);
+        out.stack_alignment = static_cast<std::uint8_t>(aapcs32_call ? 8 : x86_32_fastcall_call ? 4 : 16);
+        out.stack_slot_size = static_cast<std::uint8_t>(aapcs32_call || x86_32_fastcall_call ? 4 : 8);
         if (convention == CallingConvention::windows_x64) out.shadow_space = 32;
         out.complete = false;
         out.result = unsupported(reason);
@@ -2341,8 +2528,9 @@ AbiSignatureClassification classify_abi_call(
         return failure("call-site ABI input is not a complete function type");
     if (!function_type.variadic())
         return failure("call-site ABI classification requires a variadic function type");
-    if (convention != CallingConvention::sysv_x86_64 && convention != CallingConvention::windows_x64)
-        return failure("call-site variadic classification supports only SysV AMD64 and Microsoft x64");
+    if (convention != CallingConvention::sysv_x86_64 && convention != CallingConvention::windows_x64 &&
+        !aapcs32_call && !aapcs64_call && !x86_32_fastcall_call)
+        return failure("call-site variadic classification supports SysV AMD64, Microsoft x64, AAPCS32/AAPCS64, and x86 fastcall");
     constexpr std::size_t max_call_arguments = 4096;
     if (actual_argument_types.size() > max_call_arguments)
         return failure("variadic call-site argument count exceeds 4096");
@@ -2365,15 +2553,15 @@ AbiSignatureClassification classify_abi_call(
             if (!argument_type)
                 return failure("variadic call-site argument has no type");
             const auto &actual = unqualified(*argument_type);
-            if (actual.kind() == types::Kind::vector)
+            if (actual.kind() == types::Kind::vector && !aapcs64_call)
                 return failure("variadic vector arguments require target-specific promotion and register-save metadata");
             if (actual.kind() == types::Kind::array) {
                 if (!actual.element()) return failure("variadic array argument has no element type");
-                auto pointer = types::Type::pointer(actual.element(), 8, 8);
+                auto pointer = types::Type::pointer(actual.element(), call_pointer_size, call_pointer_size);
                 if (!pointer) return failure(pointer.error().message);
                 argument_type = std::move(pointer.value());
             } else if (actual.kind() == types::Kind::function) {
-                auto pointer = types::Type::pointer(argument_type, 8, 8);
+                auto pointer = types::Type::pointer(argument_type, call_pointer_size, call_pointer_size);
                 if (!pointer) return failure(pointer.error().message);
                 argument_type = std::move(pointer.value());
             } else if (actual.kind() == types::Kind::boolean ||
@@ -2382,7 +2570,11 @@ AbiSignatureClassification classify_abi_call(
                 auto promoted = types::Type::integer("int", 4, 4, true);
                 if (!promoted) return failure(promoted.error().message);
                 argument_type = std::move(promoted.value());
-            } else if (actual.kind() == types::Kind::floating && actual.size() == 4) {
+            } else if (actual.kind() == types::Kind::floating &&
+                       (actual.size() == 4 || (aapcs64_call && actual.size() == 2))) {
+                // AAPCS64's C mapping additionally promotes __fp16 to double
+                // at variadic call sites; the type model identifies it by its
+                // two-byte floating width.
                 auto promoted = types::Type::floating("double", 8, 8);
                 if (!promoted) return failure(promoted.error().message);
                 argument_type = std::move(promoted.value());
@@ -2393,14 +2585,23 @@ AbiSignatureClassification classify_abi_call(
                                    std::move(argument_type)});
     }
 
+    // AAPCS32 variadic functions always use the base PCS, even when their
+    // source declaration carries the VFP variant qualifier.
+    // Variadic Microsoft x86 fastcall uses the caller-cleaned stack convention;
+    // fastcall register arguments cannot be used because the callee has no
+    // declaration for the unnamed argument count.
+    const auto effective_convention = aapcs32_call ? CallingConvention::aapcs32 :
+        x86_32_fastcall_call ? CallingConvention::x86_32_cdecl : convention;
+    const auto concrete_convention = aapcs32_call ? types::FunctionConvention::aapcs32
+                                                   : function_type.function_convention();
     auto concrete_type = types::Type::function(function_type.result_type(), std::move(call_parameters),
-                                                false, function_type.function_convention());
+                                                false, concrete_convention);
     if (!concrete_type) return failure(concrete_type.error().message);
-    auto out = classify_abi_signature(convention, *concrete_type.value());
+    auto out = classify_abi_signature(effective_convention, *concrete_type.value());
     if (out.arguments.size() != actual_argument_types.size())
         return failure("ABI classifier returned an inconsistent call-site argument count");
 
-    if (convention == CallingConvention::windows_x64) {
+    if (effective_convention == CallingConvention::windows_x64) {
         static constexpr const char *gpr_names[] = {"RCX", "RDX", "R8", "R9"};
         const auto positional_bias = out.result.indirect ? std::size_t{1} : std::size_t{0};
         for (std::size_t index = 0; index < actual_argument_types.size(); ++index) {
@@ -2419,7 +2620,7 @@ AbiSignatureClassification classify_abi_call(
             duplicate.duplicate = true;
             locations.push_back(std::move(duplicate));
         }
-    } else if (out.complete) {
+    } else if (effective_convention == CallingConvention::sysv_x86_64 && out.complete) {
         std::array<bool, 8> used_xmm{};
         for (const auto &argument : out.arguments) {
             for (const auto &location : argument.locations) {

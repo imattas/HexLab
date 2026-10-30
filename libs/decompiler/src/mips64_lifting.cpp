@@ -70,9 +70,9 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
         return Assign{*destination, std::move(value)};
     };
 
-    if (op == Opcode::mips_jr && instruction.flow == FlowKind::ret)
+    if ((op == Opcode::mips_jr || op == Opcode::mips64_jr_hb) && instruction.flow == FlowKind::ret)
         return Return{items.empty() ? ExpressionPtr{} : operand(items.front())};
-    if (op == Opcode::mips_jr && instruction.flow == FlowKind::jump) {
+    if ((op == Opcode::mips_jr || op == Opcode::mips64_jr_hb) && instruction.flow == FlowKind::jump) {
         Branch branch{"true", {}, {}};
         if (!items.empty()) branch.indirect_target = operand(items.front());
         return branch;
@@ -155,6 +155,36 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
         effect.register_writes = instruction.register_writes;
         if (unaligned_load) effect.result_type = integer(64);
         return effect;
+    }
+
+    if ((op == Opcode::mips_ext || op == Opcode::mips_ins) && items.size() == 4 && destination &&
+        destination->bank == RegisterBank::mips_gpr) {
+        const auto *position_operand = std::get_if<ImmediateOperand>(&items[2]);
+        const auto *size_operand = std::get_if<ImmediateOperand>(&items[3]);
+        if (!position_operand || !size_operand || position_operand->value >= 32 ||
+            size_operand->value == 0 || size_operand->value > 32 ||
+            position_operand->value + size_operand->value > 32)
+            return std::nullopt;
+        const auto position = static_cast<unsigned>(position_operand->value);
+        const auto size = static_cast<unsigned>(size_operand->value);
+        const std::uint64_t low_mask = size == 32 ? UINT32_MAX : ((std::uint64_t{1} << size) - 1);
+        ExpressionPtr word;
+        if (op == Opcode::mips_ext) {
+            word = binary("and", binary("shr", operand(items[1]), constant(position, 64), 64),
+                          constant(low_mask, 64), 64);
+        } else {
+            const auto field_mask = low_mask << position;
+            const auto preserved = binary("and", operand(items[0]),
+                constant(static_cast<std::uint32_t>(~field_mask), 64), 64);
+            auto inserted = binary("and", operand(items[1]), constant(low_mask, 64), 64);
+            if (position) inserted = binary("shl", std::move(inserted), constant(position, 64), 64);
+            word = binary("or", std::move(preserved), std::move(inserted), 64);
+            word = binary("and", std::move(word), constant(UINT32_MAX, 64), 64);
+        }
+        // These MIPS32 instructions produce a 32-bit word; MIPS64 sign
+        // extends that word into the destination GPR.
+        word = std::make_shared<Expression>(Expression{integer(32), std::move(word->value)});
+        return assign(unary("sext", std::move(word), 64));
     }
 
     if (op >= Opcode::mips64_dextm && op <= Opcode::mips64_dins) {
@@ -381,6 +411,39 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
         if (op <= Opcode::mips_neg_d) effect.result_type = floating(64);
         effect.register_writes = instruction.register_writes;
         return effect;
+    }
+    if (op == Opcode::mips64_movf || op == Opcode::mips64_movt) {
+        const auto *source = items.size() == 3 ? std::get_if<RegisterOperand>(&items[1]) : nullptr;
+        const auto *cc = items.size() == 3 ? std::get_if<ImmediateOperand>(&items[2]) : nullptr;
+        const auto valid_gpr = [](const RegisterOperand *value) {
+            return value && value->bank == RegisterBank::mips_gpr && value->width == 64 &&
+                value->index < 32 && !value->high_byte;
+        };
+        const RegisterOperand fcsr{RegisterBank::mips_fcsr, 0, 32, false};
+        if (!valid_gpr(destination) || !valid_gpr(source) || !cc || cc->value > 7 ||
+            cc->encoded_width != 3 || cc->effective_width != 32 || cc->is_signed ||
+            instruction.condition != cc->value || instruction.memory_read || instruction.memory_write ||
+            instruction.flow != FlowKind::fallthrough || instruction.delay_slots)
+            return intrinsic(instruction, "mips64_malformed_integer_fcc_move", IntrinsicMemoryEffect::none);
+        std::vector<RegisterOperand> expected_reads;
+        if (destination->index) expected_reads.push_back(*destination);
+        if (source->index) expected_reads.push_back(*source);
+        expected_reads.push_back(fcsr);
+        const auto expected_writes = destination->index ? std::vector<RegisterOperand>{*destination}
+                                                       : std::vector<RegisterOperand>{};
+        if (instruction.register_reads != expected_reads || instruction.register_writes != expected_writes ||
+            instruction.access != std::vector<OperandAccess>{OperandAccess::read_write,
+                OperandAccess::read, OperandAccess::read})
+            return intrinsic(instruction, "mips64_malformed_integer_fcc_move_effects", IntrinsicMemoryEffect::none);
+        // FCC0 is FCSR[23], while FCC1..FCC7 occupy FCSR[25]..FCSR[31].
+        // The full-width source/old destination are bit copies, not word ops.
+        const auto bit = cc->value == 0 ? 23u : 24u + static_cast<unsigned>(cc->value);
+        auto selected_bit = binary("and", reg(fcsr), constant(UINT64_C(1) << bit, 32), 32);
+        auto condition = predicate(op == Opcode::mips64_movt ? "ne" : "eq", selected_bit, constant(0, 32));
+        auto choices = binary("pair", reg(*source), reg(*destination), 64);
+        auto value = std::make_shared<Expression>(Expression{integer(64),
+            BinaryValue{"select_if", std::move(condition), std::move(choices)}});
+        return assign(std::move(value));
     }
     if (op >= Opcode::mips64_movf_s && op <= Opcode::mips64_movn_d) {
         const bool is_double = op >= Opcode::mips64_movf_d;
@@ -675,6 +738,27 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
                 return assign(binary(shift, src1, amount, 64));
             }
             break;
+        case Opcode::mips64_wsbh: {
+            const auto word = unary("trunc32", src1, 32);
+            const auto result = binary("or",
+                binary("shl", binary("and", word, constant(UINT64_C(0x00ff00ff), 32), 32), constant(8, 32), 32),
+                binary("shr", binary("and", word, constant(UINT64_C(0xff00ff00), 32), 32), constant(8, 32), 32), 32);
+            return assign(unary("sext", result, 64));
+        }
+        case Opcode::mips64_seb:
+            return assign(binary("sar", binary("shl", src1, constant(56, 64), 64), constant(56, 64), 64));
+        case Opcode::mips64_seh:
+            return assign(binary("sar", binary("shl", src1, constant(48, 64), 64), constant(48, 64), 64));
+        case Opcode::mips64_dsbh:
+            return assign(binary("or",
+                binary("shl", binary("and", src1, constant(UINT64_C(0x00ff00ff00ff00ff), 64), 64), constant(8, 64), 64),
+                binary("shr", binary("and", src1, constant(UINT64_C(0xff00ff00ff00ff00), 64), 64), constant(8, 64), 64), 64));
+        case Opcode::mips64_dshd:
+            return assign(binary("or",
+                binary("or", binary("shl", src1, constant(48, 64), 64),
+                    binary("shl", binary("and", src1, constant(UINT64_C(0x00000000ffff0000), 64), 64), constant(16, 64), 64), 64),
+                binary("or", binary("shr", binary("and", src1, constant(UINT64_C(0x0000ffff00000000), 64), 64), constant(16, 64), 64),
+                    binary("shr", src1, constant(48, 64), 64), 64), 64));
         case Opcode::mips64_drotr: case Opcode::mips64_drotr32: case Opcode::mips64_drotrv:
             if (src2) {
                 const auto amount = binary("and", src2, constant(63, 64), 64);
@@ -683,6 +767,17 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
                 const auto right = binary("shr", src1, amount, 64);
                 const auto left = binary("shl", src1, reverse_amount, 64);
                 return assign(binary("or", right, left, 64));
+            }
+            break;
+        case Opcode::mips64_rotr: case Opcode::mips64_rotrv:
+            if (src2) {
+                const auto source = unary("trunc32", src1, 32);
+                const auto amount = binary("and", unary("trunc32", src2, 32), constant(31, 32), 32);
+                const auto reverse_amount = binary("and",
+                    binary("sub", constant(32, 32), amount, 32), constant(31, 32), 32);
+                const auto right = binary("shr", source, amount, 32);
+                const auto left = binary("shl", source, reverse_amount, 32);
+                return assign(unary("sext", binary("or", right, left, 32), 64));
             }
             break;
         case Opcode::mips_sll: case Opcode::mips_srl: case Opcode::mips_sra:

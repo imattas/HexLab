@@ -87,6 +87,12 @@ project's small revision header once per second and reload a changed head on
 their owner thread. The normal refresh verifies project UUID and embedded
 input identity before publishing, then preserves navigation when the selected
 location remains valid. New conflict-inbox entries are visible when the
-proposal window is refreshed; they do not force a project-state reload. This is
-local shared-file collaboration and does not provide a network notification
-transport.
+proposal window is refreshed; they do not force a project-state reload. While
+the proposal window is open, it also polls SQLite's connection-local
+`data_version` once per second. A commit from another database connection
+triggers a refresh of both the project head and pending inbox, so new proposals
+and resolutions from another HexLab process appear without a manual refresh.
+The token is sampled before reading state so a commit racing the refresh is
+noticed on the next poll. Poll failures are retried quietly on the next tick.
+This is local shared-file collaboration and does not provide a network
+notification transport.

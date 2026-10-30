@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define HEXLAB_PLUGIN_ABI_MAJOR 1u
-#define HEXLAB_PLUGIN_ABI_MINOR 23u
+#define HEXLAB_PLUGIN_ABI_MINOR 35u
 #define HEXLAB_PLUGIN_QUERY_SYMBOL "hexlab_plugin_query"
 #define HEXLAB_EXTENSION_API_VERSION 1u
 #define HEXLAB_PLUGIN_MAX_EXTENSION_INPUT 32u
@@ -187,7 +187,8 @@ typedef int32_t (*HexLabProcessorSemanticDecodeV3)(void* extension_context, uint
    host-owned; conversion finishes under the module lock after callback return.
    No plugin pointers survive. Integer arithmetic wraps to width bits (8/16/32/64).
    is_signed is 0 or 1 and must agree across an operation and its inputs. ABI
-   1.23 through 1.25 append operations only; the record API version and layout stay fixed,
+   1.23 through 1.25 append operations, 1.26 adds complete x86 FLAGS formulas,
+   1.27 adds bit-count operations, 1.28 adds byte swapping, and 1.29 adds modular negation; the record API version and layout stay fixed,
    and the host capability minor negotiates the expanded operation set. */
 #define HEXLAB_SCALAR_IR_API_VERSION 1u
 #define HEXLAB_SCALAR_IR_MAX_NODES 32u
@@ -224,7 +225,15 @@ typedef enum HexLabScalarIROperation {
     HEXLAB_SCALAR_IR_ASHR = 22,
     /* ABI 1.25: rotates with count reduced modulo operand width. */
     HEXLAB_SCALAR_IR_ROL = 23,
-    HEXLAB_SCALAR_IR_ROR = 24
+    HEXLAB_SCALAR_IR_ROR = 24,
+    /* ABI 1.27: zero input returns the operand width for CLZ and CTZ. */
+    HEXLAB_SCALAR_IR_CLZ = 25,
+    HEXLAB_SCALAR_IR_CTZ = 26,
+    HEXLAB_SCALAR_IR_POPCOUNT = 27,
+    /* ABI 1.28: reverse byte order across the declared integer width. */
+    HEXLAB_SCALAR_IR_BSWAP = 28,
+    /* ABI 1.29: width-wrapping two's-complement negation. */
+    HEXLAB_SCALAR_IR_NEG = 29
 } HexLabScalarIROperation;
 
 typedef struct HexLabScalarIRNode {
@@ -243,7 +252,9 @@ typedef struct HexLabScalarIROutput {
 typedef struct HexLabInstructionIR {
     uint32_t struct_size, api_version, node_count, output_count, reserved0, reserved1;
     /* Must be opaque, unconditional fallthrough with no memory/writeback,
-       delay slots, flags, IP, hidden effects or partial-register outputs. */
+       delay slots, IP, hidden effects or partial-register outputs. The only
+       supported status effect is an explicitly declared complete x86 FLAGS
+       register read/write represented by register leaves and outputs. */
     HexLabSemanticInstructionV3 semantic;
     HexLabScalarIRNode nodes[HEXLAB_SCALAR_IR_MAX_NODES];
     HexLabScalarIROutput outputs[HEXLAB_SCALAR_IR_MAX_OUTPUTS];
@@ -303,6 +314,36 @@ typedef int32_t (*HexLabRegisterMenuAction)(void* host_context, const char* menu
                                             void* action_context, void (*invoke)(void* action_context));
 struct HexLabCapability;
 
+/* ABI 1.33: host-owned, plugin-ID-scoped opaque state. Values live for the
+   PluginManager lifetime and survive module unload/reload, but are not saved
+   to project or host configuration files. Mutations use per-key revisions. */
+#define HEXLAB_PLUGIN_STATE_API_VERSION 1u
+#define HEXLAB_PLUGIN_STATE_MAX_KEY 128u
+#define HEXLAB_PLUGIN_STATE_MAX_VALUE 65536u
+enum {
+    HEXLAB_PLUGIN_STATE_OK = 0,
+    HEXLAB_PLUGIN_STATE_INVALID = -1,
+    HEXLAB_PLUGIN_STATE_FAILED = -2,
+    HEXLAB_PLUGIN_STATE_NOT_FOUND = -3,
+    HEXLAB_PLUGIN_STATE_CONFLICT = -4,
+    HEXLAB_PLUGIN_STATE_BUFFER_TOO_SMALL = -5,
+    HEXLAB_PLUGIN_STATE_LIMIT = -6
+};
+typedef struct HexLabPluginStateApi {
+    uint32_t struct_size, api_version;
+    void* host_context;
+    /* Key syntax is ASCII [A-Za-z0-9._-], length 1..128. A zero-capacity
+       read reports required bytes and revision without writing output. */
+    int32_t (*get)(void* host_context, const char* key, uint32_t capacity,
+                   uint8_t* output, uint32_t* required, uint64_t* revision);
+    /* expected_revision=0 creates a new key. Each successful set/erase
+       increments the key revision. Erased keys retain their revision. */
+    int32_t (*set)(void* host_context, const char* key, uint64_t expected_revision,
+                   const uint8_t* value, uint32_t size, uint64_t* new_revision);
+    int32_t (*erase)(void* host_context, const char* key, uint64_t expected_revision,
+                     uint64_t* new_revision);
+} HexLabPluginStateApi;
+
 /* All strings and arrays passed across this ABI are borrowed for the duration
    of the callback. No C++ object, allocator, exception, or STL type crosses it. */
 typedef struct HexLabHostApi {
@@ -334,12 +375,24 @@ typedef struct HexLabHostApi {
     /* Optional ABI 1.20. Independently versioned host service contracts. */
     const struct HexLabCapability* declared_capabilities;
     uint32_t declared_capability_count;
+    /* Optional ABI 1.33. Plugin-ID-scoped opaque state; check table size and
+       API version before use. */
+    const HexLabPluginStateApi* plugin_state_api;
 } HexLabHostApi;
 
 #define HEXLAB_PROJECT_API_VERSION 1u
 #define HEXLAB_PROJECT_MAX_PAGE 4096u
 #define HEXLAB_PROJECT_MAX_PATH 32768u
 #define HEXLAB_PROJECT_MAX_READ (1024u * 1024u)
+#define HEXLAB_PROJECT_MAX_ANNOTATION_BATCH 4096u
+
+/* ABI 1.28 project undo/redo results. A stale revision never moves history. */
+enum {
+    HEXLAB_PROJECT_HISTORY_OK = 0,
+    HEXLAB_PROJECT_HISTORY_INVALID = -1,
+    HEXLAB_PROJECT_HISTORY_FAILED = -2,
+    HEXLAB_PROJECT_HISTORY_STALE = -3
+};
 typedef enum HexLabProjectLocationKind {
     HEXLAB_PROJECT_LOCATION_ADDRESS = 0,
     HEXLAB_PROJECT_LOCATION_FILE = 1
@@ -351,6 +404,19 @@ typedef struct HexLabProjectLocation {
     uint32_t reserved;
     uint64_t offset;
 } HexLabProjectLocation;
+typedef enum HexLabProjectAnnotationEditKind {
+    HEXLAB_PROJECT_EDIT_RENAME = 0,
+    HEXLAB_PROJECT_EDIT_COMMENT = 1,
+    HEXLAB_PROJECT_EDIT_BOOKMARK = 2
+} HexLabProjectAnnotationEditKind;
+typedef struct HexLabProjectAnnotationEdit {
+    uint32_t struct_size;
+    uint32_t kind;
+    HexLabProjectLocation location;
+    uint32_t flags; /* Bookmark: bit 0 removes the bookmark. Zero for other kinds. */
+    uint32_t reserved;
+    const char* value; /* Borrowed UTF-8, copied before the callback returns. */
+} HexLabProjectAnnotationEdit;
 typedef enum HexLabProjectFormat {
     HEXLAB_PROJECT_FORMAT_AUTO = 0,
     HEXLAB_PROJECT_FORMAT_PE = 1,
@@ -364,6 +430,8 @@ typedef struct HexLabProjectSummary {
     uint64_t function_count;
     uint64_t instruction_count;
     uint64_t input_size;
+    /* Optional tail; read only when struct_size reaches this field. */
+    uint64_t edit_revision;
 } HexLabProjectSummary;
 typedef struct HexLabFunction {
     uint32_t struct_size;
@@ -373,6 +441,15 @@ typedef struct HexLabFunction {
     uint8_t complete;
     uint8_t reserved[7];
 } HexLabFunction;
+/* ABI 1.29. A code address can be owned by multiple recovered functions
+   (for example shared tails); each row identifies one owner and its entry. */
+typedef struct HexLabFunctionOwner {
+    uint32_t struct_size;
+    uint32_t address_space;
+    uint64_t function_id;
+    uint64_t entry;
+    uint8_t reserved[8];
+} HexLabFunctionOwner;
 typedef struct HexLabInstruction {
     uint32_t struct_size;
     uint32_t address_space;
@@ -381,6 +458,17 @@ typedef struct HexLabInstruction {
     uint8_t bytes[15];
     char text[256];
 } HexLabInstruction;
+#define HEXLAB_PROJECT_INSTRUCTION_TEXT_CAPACITY 1024u
+/* ABI 1.30 paged instruction record. The original HexLabInstruction remains
+   unchanged for older modules; this tail carries a longer formatted text. */
+typedef struct HexLabInstructionText {
+    uint32_t struct_size;
+    uint32_t address_space;
+    uint64_t address;
+    uint8_t length;
+    uint8_t bytes[15];
+    char text[HEXLAB_PROJECT_INSTRUCTION_TEXT_CAPACITY];
+} HexLabInstructionText;
 typedef enum HexLabReferenceTargetKind {
     HEXLAB_REFERENCE_TARGET_NONE = 0,
     HEXLAB_REFERENCE_TARGET_LOCATION = 1,
@@ -415,6 +503,22 @@ typedef struct HexLabString {
     uint8_t reserved[2];
     char preview[256];
 } HexLabString;
+#define HEXLAB_PROJECT_STRING_PREVIEW_CAPACITY 1024u
+/* ABI 1.32 string record. The original HexLabString remains unchanged; this
+   record exposes up to 1023 bytes of the analysis preview. */
+typedef struct HexLabStringText {
+    uint32_t struct_size;
+    uint32_t encoding;
+    uint64_t file_offset;
+    uint64_t address;
+    uint64_t characters;
+    uint64_t byte_length;
+    uint32_t address_space;
+    uint8_t has_address;
+    uint8_t terminated;
+    uint8_t reserved[2];
+    char preview[HEXLAB_PROJECT_STRING_PREVIEW_CAPACITY];
+} HexLabStringText;
 /* ABI 1.13 native C type authoring. Header includes are rejected unless the
    host later provides an explicit include resolver. */
 #define HEXLAB_PROJECT_MAX_HEADER_BYTES (4u * 1024u * 1024u)
@@ -424,6 +528,8 @@ typedef struct HexLabHeaderImportOptions {
     uint32_t struct_size;
     uint8_t pointer_bytes, char_bytes, short_bytes, int_bytes;
     uint8_t long_bytes, long_long_bytes, float_bytes, double_bytes;
+    /* Optional ABI 1.35 tail. Zero floating alignments mean natural-width. */
+    uint8_t long_double_bytes, float_alignment, double_alignment, long_double_alignment;
 } HexLabHeaderImportOptions;
 typedef struct HexLabHeaderImportSummary {
     uint32_t struct_size;
@@ -552,6 +658,39 @@ typedef struct HexLabProjectApi {
     int32_t (*block_successors)(void* host_context, void* project, uint64_t block_id,
                                 uint64_t start, uint32_t capacity,
                                 HexLabBlockSuccessor* output, uint32_t* written);
+    /* Optional atomic rename/comment/bookmark batch. The expected revision is
+       checked before validation and commit; every edit is one undoable group. */
+    int32_t (*annotation_batch)(void* host_context, void* project,
+                                uint64_t expected_edit_revision, uint64_t group,
+                                const HexLabProjectAnnotationEdit* edits, uint32_t count);
+    /* Optional ABI 1.28. Move one durable history group on a writable handle.
+       Pass the latest summary edit_revision; query summary again after success.
+       History changes can invalidate derived facts and previously returned IDs. */
+    int32_t (*undo)(void* host_context, void* project, uint64_t expected_edit_revision);
+    int32_t (*redo)(void* host_context, void* project, uint64_t expected_edit_revision);
+    /* Optional ABI 1.29. Page all recovered function owners for one address. */
+    int32_t (*function_owners)(void* host_context, void* project,
+                               uint32_t address_space, uint64_t address,
+                               uint64_t start, uint32_t capacity,
+                               HexLabFunctionOwner* output, uint32_t* written);
+    /* Optional ABI 1.30. Same instruction pages with up to 1023 UTF-8 text
+       bytes plus terminator; old 256-byte callbacks remain unchanged. */
+    int32_t (*instructions_text)(void* host_context, void* project, uint64_t start,
+                                 uint32_t capacity, HexLabInstructionText* output,
+                                 uint32_t* written);
+    int32_t (*block_instructions_text)(void* host_context, void* project, uint64_t block_id,
+                                       uint64_t start, uint32_t capacity,
+                                       HexLabInstructionText* output, uint32_t* written);
+    /* Optional ABI 1.32. String pages with previews up to 1023 bytes. */
+    int32_t (*strings_text)(void* host_context, void* project, uint64_t start,
+                            uint32_t capacity, HexLabStringText* output, uint32_t* written);
+    /* Optional ABI 1.34. Page outgoing references whose source is inside the
+       half-open virtual range [begin, begin + size). */
+    int32_t (*outgoing_references_range)(void* host_context, void* project,
+                                         uint32_t begin_space, uint64_t begin,
+                                         uint64_t size, uint64_t start,
+                                         uint32_t capacity, HexLabReference* output,
+                                         uint32_t* written);
 } HexLabProjectApi;
 
 /* Optional host-owned debugger service. Sessions and all returned data remain
@@ -676,6 +815,22 @@ typedef struct HexLabDebugEvent {
     uint8_t reserved[2];
     char message[HEXLAB_DEBUGGER_NAME_CAPACITY];
 } HexLabDebugEvent;
+#define HEXLAB_DEBUGGER_EVENT_MESSAGE_CAPACITY 4097u
+/* ABI 1.31 event record. The original 256-byte HexLabDebugEvent remains
+   unchanged; this separate record can retain up to 4096 message bytes. */
+typedef struct HexLabDebugEventText {
+    uint32_t struct_size;
+    uint32_t kind;
+    uint64_t sequence;
+    uint64_t process;
+    uint64_t thread;
+    uint64_t address;
+    uint32_t code;
+    uint8_t first_chance_present;
+    uint8_t first_chance;
+    uint8_t reserved[2];
+    char message[HEXLAB_DEBUGGER_EVENT_MESSAGE_CAPACITY];
+} HexLabDebugEventText;
 typedef struct HexLabDebugBreakpoint {
     uint32_t struct_size;
     uint32_t kind;
@@ -752,6 +907,9 @@ typedef struct HexLabDebuggerApi {
                                        uint64_t id, uint8_t enabled, const char* message);
     int32_t (*breakpoint_rule)(void* host_context, void* session,
                                uint64_t id, HexLabDebugBreakpointRule* output);
+    /* Optional ABI 1.31. Same event wait with up to 4096 message bytes. */
+    int32_t (*wait_event_text)(void* host_context, void* session, uint32_t timeout_ms,
+                               HexLabDebugEventText* event);
 } HexLabDebuggerApi;
 
 /* ABI 1.15: ephemeral active-document access. Tokens identify one active

@@ -6,7 +6,7 @@ constexpr int references_kind=1;
 std::vector<std::byte> cache_key(const AnalysisKey& key){
     std::vector<std::byte> bytes{std::byte{1},std::byte{references_kind}};
     const auto append=[&](std::span<const std::byte> value){bytes.insert(bytes.end(),value.begin(),value.end());};
-    append(encode_u64(key.input.size));append(key.input.sha256);append(encode_u64(key.byte_revision));append(encode_u64(key.decision_revision));append(key.recipe_fingerprint);append(key.engine_fingerprint);return bytes;
+    append(encode_u64(key.input.size));append(key.input.sha256);append(encode_u64(key.byte_revision));append(encode_u64(key.decision_revision));append(key.recipe_fingerprint);append(key.engine_fingerprint);if(key.external_input_fingerprint){bytes.push_back(std::byte{1});append(*key.external_input_fingerprint);}return bytes;
 }
 bool matches(const ProjectState& state,const AnalysisKey& key){
     if(state.input!=key.input || state.revisions.bytes!=key.byte_revision || state.revisions.decisions!=key.decision_revision)return false;
@@ -23,7 +23,8 @@ Result<CacheLookup> ProjectStore::load_reference_cache(const AnalysisKey& key,st
         if(!next.value())return miss(CacheStatus::absent,"No reference cache exists for this source key");
         const auto kind=row->integer(0),version=row->integer(1),size=row->integer(2);
         if(!kind || !version || !size)return miss(CacheStatus::corrupt,"Reference cache scalar types are invalid");
-        if(kind.value()!=references_kind || version.value()!=reference_cache_version)return miss(CacheStatus::incompatible,"Reference cache kind or engine version is incompatible");
+        if(kind.value()!=references_kind || (version.value()!=14 && version.value()!=reference_cache_version))return miss(CacheStatus::incompatible,"Reference cache kind or engine version is incompatible");
+        if(version.value()==14 && key.external_input_fingerprint)return miss(CacheStatus::stale,"Legacy reference cache has no external-input identity");
         if(size.value()<40 || static_cast<uint64_t>(size.value())>reference_payload_limit)return miss(CacheStatus::corrupt,"Reference cache payload extent is invalid");
         auto payload=row->blob(3);if(!payload)return miss(CacheStatus::corrupt,"Reference cache payload is not a readable blob");
         auto index=decode_reference_index(payload.value(),stop);if(!index){if(index.error().code==ErrorCode::canceled)return index.error();return CacheLookup{CacheStatus::corrupt,{},"Reference cache recompute required: "+index.error().message};}

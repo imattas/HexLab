@@ -4,9 +4,18 @@
 #include <span>
 #include <string_view>
 namespace hexlab {
+struct ProcessorVariantCoverage {
+    // Representative implemented families; this list is intentionally
+    // non-exhaustive and does not imply whole-ISA support.
+    std::span<const std::string_view> instruction_families;
+    // Bounded downstream features currently wired for the variant.
+    std::span<const std::string_view> analysis;
+    std::span<const std::string_view> decompiler;
+    std::span<const std::string_view> debugger;
+};
 struct ProcessorCapabilities {
     bool can_decode = false;
-    std::uint8_t max_instruction_bytes = 0;
+    std::uint32_t max_instruction_bytes = 0;
     std::string_view display_name, reason;
 };
 struct ProcessorVariantInfo {
@@ -14,6 +23,7 @@ struct ProcessorVariantInfo {
     DecodeContext context;
     ProcessorCapabilities capabilities;
     bool byte_order_applicable = true;
+    ProcessorVariantCoverage coverage;
 };
 // Static decoder support only, not decompiler/debugger or full-ISA coverage.
 HEXLAB_PROCESSORS_EXPORT ProcessorCapabilities processor_capabilities(DecodeContext) noexcept;

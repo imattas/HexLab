@@ -61,6 +61,7 @@ void read_segments(const ByteStorage &, MachOMetadata &, Budget &, std::stop_tok
 void read_protections(const ByteStorage &, const Image &, MachOMetadata &, ImageLayout &, Budget &, std::stop_token);
 void map_segments(const MachOMetadata &, ImageLayout &, Budget &, std::stop_token);
 void read_symbols(const ByteStorage &, const Image &, MachOMetadata &, Budget &, std::stop_token);
+void read_indirect_symbol_bindings(MachOMetadata &, Budget &, std::stop_token);
 Result<bool> read_source_lines(const ByteStorage &, const Image &, MachOMetadata &, Budget &, std::stop_token);
 void read_commands(const ByteStorage &, const Image &, MachOMetadata &, Budget &, std::stop_token);
 bool supported_command(std::uint32_t);

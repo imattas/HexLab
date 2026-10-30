@@ -8,6 +8,10 @@ struct EvaluatedLocationPiece {
     bool available = false;
     EvaluatedLocationKind kind = EvaluatedLocationKind::memory;
     std::uint64_t value = 0; // address, register number, or scalar value by kind
+    // Exact bytes for a wide DW_OP_implicit_value fragment. Scalar evaluator
+    // results leave this empty; byte order is the target byte order supplied
+    // when evaluating the expression.
+    std::vector<std::uint8_t> bytes;
     std::uint64_t bit_size = 0;
     std::uint64_t source_bit_offset = 0;
     std::uint64_t destination_bit_offset = 0;

@@ -46,6 +46,21 @@ bool logical_immediate(Instruction &i, std::uint32_t word, unsigned width) {
 } // namespace
 bool integer(Instruction &i, std::uint32_t word) {
     const unsigned width = (word >> 31) ? 64 : 32;
+    // Data-processing one-source bit/byte operations. Bits 15:10 select
+    // RBIT/REV*/CLZ/CLS; Rd/Rn occupy the low ten bits.
+    if ((word & 0x7ff00000u) == 0x5ac00000u) {
+        const unsigned operation = (word >> 10) & 0x3f;
+        if (operation == 4 || operation == 5) {
+            i.opcode = operation == 4 ? Opcode::a64_clz : Opcode::a64_cls;
+        } else {
+            if (operation > 3 || (operation == 3 && width != 64)) return false;
+            i.opcode = operation == 0 ? Opcode::a64_rbit : operation == 1 ? Opcode::a64_rev16 :
+                       operation == 2 && width == 64 ? Opcode::a64_rev32 : Opcode::a64_rev;
+        }
+        operand(i, reg(word & 31, width), OperandAccess::write);
+        operand(i, reg((word >> 5) & 31, width), OperandAccess::read);
+        return true;
+    }
     // EXTR extracts a width-sized window from Rn concatenated with Rm.
     // sf/N must agree, and the 32-bit form reserves imm6[5].
     if ((word & 0x7fa00000u) == 0x13800000u) {
@@ -100,6 +115,23 @@ bool integer(Instruction &i, std::uint32_t word) {
             i.register_writes.push_back(reg(destination, 64));
         return true;
     }
+    // Add/subtract with carry. ADC and SBC consume the incoming C bit;
+    // ADCS/SBCS additionally replace NZCV with the arithmetic result flags.
+    if ((word & 0x1fe0fc00u) == 0x1a000000u) {
+        const bool subtract = (word & 0x40000000u) != 0;
+        const bool set_flags = (word & 0x20000000u) != 0;
+        i.opcode = subtract ? (set_flags ? Opcode::a64_sbcs : Opcode::a64_sbc)
+                            : (set_flags ? Opcode::a64_adcs : Opcode::a64_adc);
+        const auto rd = static_cast<unsigned>(word & 31);
+        operand(i, reg(rd, width), OperandAccess::write);
+        operand(i, reg((word >> 5) & 31, width), OperandAccess::read);
+        operand(i, reg((word >> 16) & 31, width), OperandAccess::read);
+        i.register_reads.push_back(nzcv);
+        if (set_flags) i.register_writes.push_back(nzcv);
+        if (width == 32 && rd != 31)
+            i.register_writes.push_back(reg(rd, 64));
+        return true;
+    }
     // AArch64 two-source integer division. The architecture defines division
     // by zero as zero; the decompiler keeps the operation explicit.
     const auto division_encoding = word & 0x7fe0fc00u;
@@ -146,6 +178,31 @@ bool integer(Instruction &i, std::uint32_t word) {
             i.register_writes.push_back(reg(word & 31, 64));
         return true;
     }
+    // ADD/SUB extended-register forms use Rm's option field to select
+    // UXTB/UXTH/UXTW/UXTX or their signed counterparts. Keep them in the
+    // same typed operand shape as shifted-register forms; the encoded word
+    // remains available to consumers that need the extension details.
+    if ((word & 0x1f200000u) == 0x0b200000u) {
+        const auto option = (word >> 13) & 7;
+        const auto amount = (word >> 10) & 7;
+        if (amount > 4 || (width == 32 && (option == 3 || option == 7)))
+            return false;
+        const bool set_flags = ((word >> 29) & 1) != 0;
+        const bool subtract = ((word >> 30) & 1) != 0;
+        const auto rm_width = (option == 3 || option == 7) ? 64u : 32u;
+        i.opcode = subtract ? (set_flags ? Opcode::a64_subs : Opcode::a64_sub)
+                            : (set_flags ? Opcode::a64_adds : Opcode::a64_add);
+        operand(i, reg(word & 31, width, !set_flags), OperandAccess::write);
+        operand(i, reg((word >> 5) & 31, width, true), OperandAccess::read);
+        operand(i, reg((word >> 16) & 31, rm_width), OperandAccess::read);
+        if (amount)
+            operand(i, ImmediateOperand{amount, 3, static_cast<std::uint16_t>(width), false, {}},
+                    OperandAccess::read);
+        if (set_flags)
+            i.register_writes.push_back(nzcv);
+        return true;
+    }
+
     const auto shift = (word >> 22) & 3;
     const auto amount = (word >> 10) & 63;
     const bool add_sub = (word & 0x1f200000u) == 0x0b000000u;

@@ -30,8 +30,9 @@ memory map return the empty unsupported reply.
 ## Region metadata
 
 Each native region becomes one XML `memory` element. Writable regions use
-the standard `ram` type; other regions use `rom`. HexLab adds two properties
-to preserve information that those standard types cannot express:
+the standard `ram` type; other regions use `rom`, except flash regions which
+retain the standard `flash` type. HexLab adds properties to preserve
+information that standard types cannot express:
 
 ```xml
 <memory-map>
@@ -43,6 +44,11 @@ to preserve information that those standard types cannot express:
     <property name="permissions">---</property>
     <property name="hexlab-type">private/reserved</property>
   </memory>
+  <memory type="flash" start="0x20000000" length="0x10000">
+    <property name="blocksize">0x1000</property>
+    <property name="permissions">r--</property>
+    <property name="hexlab-type">flash</property>
+  </memory>
 </memory-map>
 ```
 
@@ -51,8 +57,12 @@ or `-`. These flags override type-derived defaults in the HexLab client.
 This preserves execute-only, guarded, reserved, and inaccessible regions
 without making them eligible for readable-memory search. `hexlab-type`
 preserves the native descriptive label, including paths and an empty
-label. XML entities in labels are escaped by the server and decoded by
-the client.
+label. The standard `blocksize` property is retained for flash regions when
+available. Its hexadecimal value must be nonzero, no larger than the region,
+and divide the region extent; the region start must also be block aligned.
+Region-validated flash programming rejects an address or length that is not
+aligned to the advertised erase block size before sending erase packets. XML
+entities in labels are escaped by the server and decoded by the client.
 
 Maps from other RSP servers remain supported. Without the properties,
 HexLab retains the previous defaults: every region is readable, only

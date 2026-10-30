@@ -46,12 +46,15 @@ template<class T>void apply_entity(UserState& user,const EntityChange<T>& change
     }
     else rows.push_back(*change.after);
 }
-void apply_delta(UserState& user,const StateDelta& delta,uint64_t& next,bool restore){
+void apply_delta(UserState& user,const StateDelta& delta,uint64_t& next,bool restore,std::stop_token stop={}){
     require(!delta.changes.empty() && delta.changes.size()<=project_record_limit,"Invalid command change count");
-    for(const auto& change:delta.changes)std::visit([&](const auto& row){
+    for(const auto& change:delta.changes){
+        if(stop.stop_requested())throw Failure{{ErrorCode::canceled,"Project history replay canceled"}};
+        std::visit([&](const auto& row){
         if constexpr(std::is_same_v<std::decay_t<decltype(row)>,PatchChange>){conflict(user.patches==row.before,"Patches changed since command validation");user.patches=row.after;}
         else apply_entity(user,row,next,restore);
-    },change);
+        },change);
+    }
     const auto sort=[](auto& rows){std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){return a.id<b.id;});};
     sort(user.annotations);sort(user.bookmarks);sort(user.types);sort(user.type_assignments);sort(user.debug_variables);sort(user.breakpoints);sort(user.decisions.regions);sort(user.decisions.functions);sort(user.decisions.references);take(validate_user_state(user));
 }
@@ -75,13 +78,14 @@ template<class Impl>CommitAck finish(Impl& impl,const ProjectState& before,std::
     detail::write_user_state(*impl.connection,*before.user,*after->user);update_header(*impl.connection,before,*after);
     take(transaction.commit());impl.state=std::move(after);return {impl.state->revisions,impl.state->history_cursor};
 }
-std::shared_ptr<ProjectState> prepare_history(Connection& connection,const ProjectState& before,bool redo){
+std::shared_ptr<ProjectState> prepare_history(Connection& connection,const ProjectState& before,bool redo,std::stop_token stop){
         const auto rows=detail::history_rows(connection);require(before.history_cursor<=rows.size(),"History cursor exceeds durable history");
         if((redo && before.history_cursor==rows.size()) || (!redo && before.history_cursor==0))throw Failure{{ErrorCode::invalid_argument,redo?"No command to redo":"No command to undo"}};
         auto user=std::make_shared<UserState>(*before.user);auto next=before.next_entity;size_t cursor=static_cast<size_t>(before.history_cursor);
         const auto group=rows[redo?cursor:cursor-1].group;
         for(;;){
-            const auto index=redo?cursor:cursor-1;auto delta=detail::read_history(connection,rows[index].step,!redo);apply_delta(*user,delta,next,true);
+            if(stop.stop_requested())throw Failure{{ErrorCode::canceled,"Project history replay canceled"}};
+            const auto index=redo?cursor:cursor-1;auto delta=detail::read_history(connection,rows[index].step,!redo);apply_delta(*user,delta,next,true,stop);
             if(redo)++cursor;else --cursor;
             if(group==0 || (redo?cursor==rows.size():cursor==0) || rows[redo?cursor:cursor-1].group!=group)break;
         }
@@ -90,7 +94,7 @@ std::shared_ptr<ProjectState> prepare_history(Connection& connection,const Proje
 template<class Impl>Result<CommitAck> navigate_history(Impl& impl,uint64_t expected,std::stop_token stop,bool redo){
     return detail::guarded([&]()->Result<CommitAck>{
         std::lock_guard lock(impl.mutex);check_mutation(impl.mode,stop);detail::Cancellation cancellation(*impl.connection,stop);auto transaction=take(Transaction::begin(*impl.connection));auto before=detail::read_state(*impl.connection);check_edit(*before,expected);
-        auto after=prepare_history(*impl.connection,*before,redo);return finish(impl,*before,std::move(after),*transaction,stop);
+        auto after=prepare_history(*impl.connection,*before,redo,stop);return finish(impl,*before,std::move(after),*transaction,stop);
     });
 }
 }
@@ -147,8 +151,11 @@ Result<CommitAck> ProjectStore::commit_resolving_conflict(uint64_t conflict_id,u
 }
 Result<CommitAck> ProjectStore::undo(uint64_t expected,std::stop_token stop){return navigate_history(*impl_,expected,stop,false);}
 Result<CommitAck> ProjectStore::redo(uint64_t expected,std::stop_token stop){return navigate_history(*impl_,expected,stop,true);}
+void detail::apply_history_delta(UserState& user,const StateDelta& delta,uint64_t& next,std::stop_token stop){
+    apply_delta(user,delta,next,true,stop);
+}
 Result<std::shared_ptr<const ProjectState>> ProjectStore::preview_history(uint64_t expected,bool redo,std::stop_token stop){return detail::guarded([&]()->Result<std::shared_ptr<const ProjectState>>{
-    std::lock_guard lock(impl_->mutex);check_mutation(impl_->mode,stop);detail::Cancellation cancellation(*impl_->connection,stop);auto transaction=take(Transaction::begin(*impl_->connection));auto before=detail::read_state(*impl_->connection);check_edit(*before,expected);return std::shared_ptr<const ProjectState>(prepare_history(*impl_->connection,*before,redo));
+    std::lock_guard lock(impl_->mutex);check_mutation(impl_->mode,stop);detail::Cancellation cancellation(*impl_->connection,stop);auto transaction=take(Transaction::begin(*impl_->connection));auto before=detail::read_state(*impl_->connection);check_edit(*before,expected);return std::shared_ptr<const ProjectState>(prepare_history(*impl_->connection,*before,redo,stop));
 });}
 Result<HistoryPreview> detail::project_history_at(Connection& connection,uint64_t expected,uint64_t target,HistoryPreviewLimits limits,std::stop_token stop){
     return detail::guarded([&]()->Result<HistoryPreview>{
@@ -173,7 +180,7 @@ Result<HistoryPreview> detail::project_history_at(Connection& connection,uint64_
             while(cursor!=target){
                 if(stop.stop_requested())return Error{ErrorCode::canceled,"History preview canceled"};
                 auto delta=detail::read_history_bounded(connection,forward?cursor+1:cursor,!forward,remaining);
-                apply_delta(*user,delta,next,true);
+                apply_delta(*user,delta,next,true,stop);
                 for(const auto& patch:user->patches)
                     require(patch.begin.value<=before->input.size && patch.original.size()<=before->input.size-patch.begin.value,"History preview patch exceeds embedded original");
                 take(encode_user_state(*user));

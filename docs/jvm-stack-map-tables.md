@@ -1,10 +1,17 @@
 # JVM StackMapTable metadata
 
-The class-file loader retains `Code`-nested `StackMapTable` attributes in `JvmCode::stack_map_table`. The verifier model is declared alongside `JvmCode` in `hexlab/image/jvm_metadata.hpp` and is also exposed by `hexlab/loaders/jvm.hpp`. An absent optional value means that the attribute was absent; an explicitly empty table remains present with an empty `frames` vector. Loading these records does not certify that the method passes bytecode verification.
+The class-file loader retains `Code`-nested `StackMapTable` attributes in `JvmCode::stack_map_table`. For class-file versions before 50 it also accepts the older `StackMap` attribute and normalizes its full frames into the same model. The verifier model is declared alongside `JvmCode` in `hexlab/image/jvm_metadata.hpp` and is also exposed by `hexlab/loaders/jvm.hpp`. An absent optional value means that neither attribute was present; an explicitly empty attribute remains present with an empty `frames` vector. Loading these records does not certify that the method passes bytecode verification.
 
 `JvmStackMapTable::initial_locals` describes the implicit method-entry locals, derived from the owning method descriptor and its static/instance status. Constructor `this` remains `uninitialized_this` when the class has a superclass. The initial stack is empty. The separate `frames` vector contains encoded entries: each `JvmStackMapFrame` retains its original `frame_type`, `offset_delta`, resolved method-relative `bytecode_offset`, and expanded logical `locals` and `stack`. The first encoded offset uses its delta directly; subsequent offsets advance from the previous encoded frame. An explicit frame at offset zero is retained separately from the implicit initial state. These encodings follow [JVMS 4.7.4](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.4).
 
 All standard forms are parsed: same, same-locals/one-stack-item, their extended forms, chop, append, and full frames. Chop and append operate on logical verification entries. `long_value` and `double_value` each occupy one vector entry and two physical JVM locations; no synthetic trailing `top` is inserted. `local_slots`, `stack_slots`, and `initial_local_slots` report physical counts. Stack vectors are ordered bottom to top. Omitted trailing locals remain omitted rather than being padded to `max_locals`.
+
+Legacy `StackMap` frames encode an absolute bytecode offset and complete locals
+and stack lists. They are stored as full frames (`frame_type == 255`); for
+these rows `offset_delta` carries the encoded absolute offset, and `locals`
+describes the complete frame rather than a delta from the preceding row. The
+legacy attribute is rejected from version 50 onward and cannot coexist with a
+`StackMapTable` on the same method.
 
 `JvmVerificationKind` preserves all nine defined verification tags, including `top`, `null_value`, `uninitialized_this`, and `uninitialized`. An encoded `object` carries its exact nonzero `class_index`; an `uninitialized` value carries its exact `uninitialized_offset`, including zero when appropriate. Implicit reference parameters need not have a corresponding `CONSTANT_Class` entry. Those values have `class_index == 0` and a nonzero `descriptor_length`; `descriptor_offset` and `descriptor_length` select their exact reference or array descriptor in the owning `JvmMember::descriptor`. Inherited locals retain that representation. Initialized implicit `this` uses the class's existing `this_class` index. No constant-pool entries or class identities are synthesized.
 

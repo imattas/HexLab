@@ -4,7 +4,11 @@ The command hexlab_cli modules <binary>... loads supplied images without
 running analysis and prints direct dependency names from parsed metadata. PE
 imports, ELF DT_NEEDED entries, and Mach-O dependency load commands are
 included. Each name is resolved against other supplied file basenames using
-case-insensitive matching.
+case-insensitive matching. Supplied ELF files also advertise a unique,
+unambiguous basename from their `DT_SONAME` entry as a provider alias, so a
+renamed file can still match its declared shared-library name. Conflicting
+distinct `DT_SONAME` values are ignored for that file. This alias match does not
+establish ABI compatibility or loader precedence.
 
 Use hexlab_cli modules --graph <root> <supplied>... to recursively display the
 dependency graph reachable from the first supplied image. The root is also part
@@ -26,13 +30,198 @@ summary reports the number of expanded nodes and whether supplied files were
 unreachable or beyond the depth limit. Malformed or missing images report the
 loader diagnostic and stop the command.
 
-This remains an explicit file-set view, not a system loader simulation. It
-does not search host library paths, discover files recursively from disk,
-validate ABI compatibility, or resolve imported symbols beyond the existing
-supplied-file resolution report. The one-shot command remains available without
+Without `--discover`, graph mode uses only the supplied file set. PE dependency
+edges are case-insensitive and retain only providers with a compatible known
+COFF machine and PE32/PE32+ class; rejected same-name providers are counted on
+unresolved edges. Unknown machine IDs remain eligible because metadata cannot
+establish a mismatch. ELF and Mach-O graph name matching (including ELF
+`DT_SONAME` aliases) does not perform this PE-specific check. The graph does not
+search host library paths or discover
+additional files from disk. The one-shot command remains available without
 the --graph switch.
+
+For a bounded ELF search-path view, graph mode also accepts
+`hexlab_cli modules --sysroot <directory> --graph <root> <supplied>...`.
+With a sysroot, ELF `DT_RUNPATH` (when present) or otherwise `DT_RPATH`
+entries are split on colons and `$ORIGIN`/`${ORIGIN}` are expanded relative
+to the importing object's canonical directory. Candidate paths are
+canonicalized and considered only when they remain below the supplied sysroot
+and exactly identify another supplied file. A declared search path takes
+precedence over basename matching; without one, existing supplied-basename
+behavior applies. Other dynamic-loader tokens, environment variables, default
+system directories, inherited RPATH lookup, and filesystem discovery are not
+implemented. This is a partial path-resolution aid, not full loader precedence.
 
 Examples:
 
     hexlab_cli modules app.exe vendor.dll
     hexlab_cli modules --graph app.exe vendor.dll helper.dll
+
+## Opt-in ELF filesystem discovery
+
+`hexlab_cli modules --sysroot <root-directory> --discover --graph <ELF-root>`
+loads dependency metadata from exact filenames inside an explicit filesystem
+root. Repeat `--search-dir <directory>` to add directories inside that sysroot.
+The command never executes the binaries. It opens no ambient host library
+paths and does not enumerate directory trees. Extra supplied files retain
+input-order node IDs; discovered files follow in deterministic dependency and
+search-directory order. Canonical aliases and symlinks to the same file share
+one provider identity, and canonical paths escaping the root are rejected.
+
+For basename dependencies, the importer contributes its own `DT_RUNPATH`, or
+`DT_RPATH` only when no `DT_RUNPATH` entry exists. Absolute ELF directories
+such as `/usr/lib` are mapped below the sysroot. `$ORIGIN` and `${ORIGIN}`
+expand from the canonical importer's directory. Caller-supplied `$LIB` and
+`$PLATFORM` values can expand anywhere in a path component. A supplied target
+working directory resolves relative paths and empty search components. These
+options make the assumed target environment explicit; HexLab does not guess
+the target loader's token values.
+
+The discovery API validates token forms in the original metadata string before
+expansion. Unknown or malformed `$` tokens remain unsupported, while dollar
+characters that are part of the canonical importer directory after `$ORIGIN`
+expansion are treated as ordinary path characters. Expanded candidates still
+must canonicalize to regular files beneath the explicit sysroot.
+
+For recursive discovery, a `DT_RPATH` directory is carried to dependency
+descendants when its declaring object has no `DT_RUNPATH`; `DT_RUNPATH` applies
+only to that object's direct dependencies. If the same module is reached with
+different inherited RPATH sets, discovery expands it once using the first
+context and marks its outgoing rows partial instead of implying that both
+contexts were resolved.
+Unsupported ancestor `DT_RPATH` entries propagate as partial-search evidence
+to descendant basename dependencies. A module's own `DT_RUNPATH` suppresses
+its own `DT_RPATH` for both direct lookup and inheritance; it does not erase
+RPATH entries inherited from its ancestors.
+
+```text
+hexlab_cli modules --sysroot ./sdk --discover --target-cwd ./sdk/app \
+  --lib-token lib64 --platform-token x86_64 --graph ./sdk/app/bin/tool
+```
+
+The target working directory must be an existing directory inside the
+canonical sysroot. `$LIB` and `$PLATFORM` values are limited to bounded ASCII
+path-token characters. Expanded absolute paths are still canonicalized and
+rejected if they escape the sysroot. Explicit search directories are
+considered alongside dynamic paths. Every
+matching compatible file from the supported search paths is retained; multiple
+matches remain ambiguous rather than asserting dynamic-loader precedence.
+Unsupported search paths and filesystem errors mark even resolved candidate
+edges as partial searches. Only an edge with one
+compatible provider is recursively expanded. `DT_NEEDED` absolute and leading
+ORIGIN paths are also supported directly. Without an explicit target working
+directory, ordinary relative paths and empty search components remain
+unsupported. Unknown tokens remain unsupported.
+
+Each candidate records its canonical path, discovery source and the dynamic
+entry's file offset. `DT_NEEDED` provenance is printed for every discovered
+dependency. Metadata is loaded with the existing document loader, then filtered
+through the same ELF class, byte-order, machine, OSABI and supported
+machine-specific ABI checks as supplied-symbol resolution. Rejected formats
+and ABI candidates are reported explicitly. Malformed candidate files stop the
+command with their loader diagnostic. Missing paths, rejected sysroot escapes,
+unsupported path forms, filesystem errors and depth limits remain visible as
+unresolved graph edges. The existing symbol report also includes the retained
+discovered modules; it remains a supplied-candidate report rather than a
+simulated runtime link map.
+
+Discovery shares the 4,096-module, 100,000-dependency-row, 16-MiB-name and
+64-level graph bounds. It additionally limits the entire traversal to 4,096
+distinct inspected files, one million dynamic metadata entries, 100,000 exact
+path probes, 100,000 candidate records and 16 MiB of candidate path bytes.
+Each importer accepts at most 128 combined dynamic/explicit search directories;
+individual metadata strings are capped at 32 KiB. Budget exhaustion reports a
+limit error without silently truncating resolution. The analysis API
+`discover_elf_dependency_files` exposes this bounded single-importer search,
+its provenance and counters, inherited RPATH entries for caller-managed
+traversal, and cooperative cancellation independently of the CLI.
+
+ELF `DT_AUXILIARY` and GNU `DT_FILTER` names are also returned as separately
+typed inventory rows with their own dynamic-entry offsets and bounded
+sysroot-contained path candidates. CLI graph output labels them explicitly and
+does not fold them into the `DT_NEEDED` dependency edges or recursively expand
+their candidates. This records the declared names and candidate files only;
+it does not model filter symbol lookup, auxiliary fallback, or loader ordering.
+
+Mach-O `--discover --sysroot ... --graph` also walks `LC_LOAD_DYLIB`, weak,
+reexport and upward load commands. It expands `@loader_path` relative to the
+importer, `@executable_path` relative to a supplied root executable, and
+`@rpath` against the accumulated `LC_RPATH` entries in traversal order. Absolute
+install names are rooted below the sysroot; ordinary relative install names
+are interpreted as sysroot-relative paths. Relative `LC_RPATH` values and
+unknown `@` forms remain unsupported. No host dyld cache, default paths or
+ambient directory scans are consulted. Every candidate is canonicalized and
+must remain a regular file inside the explicit sysroot.
+
+Mach-O discovery retains load-command kind, command index/file offset, the
+candidate path source and the supplying `LC_RPATH` command offset. All
+compatible candidate files are shown; multiple providers remain ambiguous.
+Provider slices must match the root's CPU type and subtype, including selecting
+the matching slice from a universal binary when available. Recursive traversal
+is bounded by the same 4,096-file and 64-level graph caps, plus the API's
+metadata/name/path/probe/candidate/RPATH limits. Cycles share canonical module
+identity. If a file is reached with a different inherited `LC_RPATH` context,
+it is expanded once using the first context and outgoing rows are marked
+partial. Weak imports may remain unresolved without making the whole report
+fatal; this inventory does not claim dyld runtime behavior.
+
+The analysis API `discover_macho_dependency_files` exposes bounded single-image
+path discovery, candidate provenance, inherited `LC_RPATH` state and
+cooperative cancellation. It does not inspect binary symbols or claim that a
+matching install name is ABI-compatible beyond the selected CPU slice.
+
+The analysis API `discover_pe_dependency_files` provides a bounded PE
+counterpart for caller-selected search directories: it checks the importer
+directory and explicit directories, performs ASCII case-insensitive DLL leaf
+matching, canonicalizes matches, and rejects files outside the sysroot. The
+API caps dependency names, directories, enumerated directory entries, and
+candidate paths and supports cancellation. Directory entries whose native
+filename falls outside the accepted ASCII import-name subset are skipped
+without converting through the host locale or failing the inventory. The
+`hexlab_cli pe-deps` command
+loads one PE image, reads its imports, and reports matching candidate files:
+
+    hexlab_cli pe-deps --sysroot ./sdk --search-dir ./sdk/bin app.exe
+
+Add `--windows-defaults` to append target-bitness-aware Windows defaults
+inside the explicit sysroot. PE32 images use `Windows/SysWOW64` when present;
+if that directory is absent, `Windows/System32` is used for a 32-bit Windows
+sysroot. PE32+ images use `Windows/System32`. The API accepts an explicit
+`PeDependencyTargetBitness`; callers that leave it unspecified retain the
+legacy `System32` behavior. No host paths or environment variables are
+consulted, and missing default directories are skipped. The inventory rank
+keeps the order: importer directory, caller-supplied search directories in
+argument order, the selected system directory, then `Windows`. Every matching file remains visible with its rank; the lowest rank
+is marked effective and later ranks are marked shadowed. Multiple matches at
+the effective rank remain ambiguous. Candidates within a directory rank are
+ordered by exact ASCII leaf spelling, so case-colliding files do not inherit
+the host filesystem's unspecified directory-iteration order. These ranks describe this offline
+inventory policy and do not model KnownDLLs, API-set redirection, WOW64
+filesystem redirection, side-by-side activation, already-loaded modules, or all
+Windows loader search rules. The command never loads or executes candidates. Each deduplicated module row
+also labels whether it appears in the PE's ordinary import table (`eager`) or
+delay-import table (`delay-load`). If a library appears in both tables, the row
+shows both labels. This is import metadata provenance, not a claim that a
+particular delay-loaded symbol was invoked or resolved at runtime. The API
+accepts parsed `ImportSymbol` rows to preserve these flags; its name-only
+compatibility overload labels names as eager because it has no delay metadata.
+
+It is an inventory primitive; API-set redirection, side-by-side activation,
+and forwarding are not inferred.
+
+This is an offline discovery policy. The target environment beyond the
+explicit working directory and token values, loader cache, default system paths,
+secure-execution rules,
+link-map interposition, weak-zero/copy-relocation behavior, TLS/IFUNC execution,
+relocation application, Mach-O dyld cache lookup, and default-path precedence
+are not modeled.
+Filesystem identity and case handling follow the host filesystem; this is not
+a simulation of a target filesystem's case rules. Path checks describe the
+files observed during the command, not a persistent filesystem snapshot.
+The selected dynamic-entry/token meanings follow [Linux man-pages,
+`ld.so`](https://man7.org/linux/man-pages/man8/ld.so.8.html); full loader search
+precedence is outside the discovery inventory.
+
+    hexlab_cli modules --sysroot ./sdk --discover --search-dir ./sdk/lib --graph ./sdk/bin/app
+
+Repeated `DT_NEEDED` declarations are retained as separate rows, even when their names match. Each row keeps its own dynamic-table file offset and bounded candidate-resolution accounting, so a later duplicate cannot silently lose its provenance.

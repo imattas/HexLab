@@ -2,6 +2,7 @@
 #include "hexlab/analysis/macho_objc_types.hpp"
 #include <algorithm>
 #include <bit>
+#include <functional>
 #include <limits>
 #include <map>
 #include <new>
@@ -16,6 +17,7 @@ struct Budget {
     std::stop_token stop;
     std::uint8_t pointer_bytes = 8;
     bool arm32 = false;
+    bool arm64_32 = false;
     bool consume(std::uint64_t bytes) {
         if (stop.stop_requested()) return false;
         if (bytes > limits.max_metadata_bytes - std::min(scan.metadata_bytes, limits.max_metadata_bytes)) {
@@ -82,7 +84,11 @@ struct Pointer {
 
 bool pointer_domain(const Image &image, Address address, const Budget &budget) {
     const auto *domain = image.space(address.space);
-    return domain && domain->order == ByteOrder::little && domain->width_bits == budget.pointer_bytes * 8 &&
+    if (!domain || domain->order != ByteOrder::little)
+        return false;
+    if (budget.arm64_32)
+        return domain->width_bits == 64 && address.offset <= UINT32_MAX;
+    return domain->width_bits == budget.pointer_bytes * 8 &&
            (budget.pointer_bytes == 8 || address.offset <= UINT32_MAX);
 }
 
@@ -191,7 +197,9 @@ void mark_incomplete(MachOObjCScan &scan, bool &owner_complete, std::string reas
 MachOObjCList parse_list(const Image &image, const RelocationResolver &resolver, Address pointer_slot,
                          unsigned kind, Budget &budget, MachOObjCScan &scan, bool &owner_complete) {
     MachOObjCList output;
+    output.pointer_slot = pointer_slot;
     const auto pointer = pointer_at(image, resolver, pointer_slot, budget);
+    output.pointer_status = pointer.status;
     if (!pointer.address) {
         output.status = pointer.status;
         if (pointer.status != "null") mark_incomplete(scan, owner_complete, "Objective-C metadata contains an unresolved list pointer");
@@ -286,6 +294,10 @@ void mark_incomplete(MachOObjCScan &scan, bool &owner_complete, std::string reas
 }
 
 std::optional<Address> relative_pointer(const Image &image, Address field, Budget &budget, std::string &status) {
+    if (!pointer_domain(image, field, budget)) {
+        status = "relative-field-pointer-width-mismatch";
+        return {};
+    }
     auto raw = read_exact(image, field, 4, budget);
     if (!raw) {
         status = raw.error().code == ErrorCode::canceled ? "canceled" : "relative-offset-unreadable";
@@ -295,6 +307,10 @@ std::optional<Address> relative_pointer(const Image &image, Address field, Budge
     const auto target = add_relative(field, offset);
     if (!target) {
         status = "relative-offset-overflow";
+        return {};
+    }
+    if (!pointer_domain(image, *target, budget)) {
+        status = "relative-target-pointer-width-mismatch";
         return {};
     }
     if (!image.segment_at(*target)) {
@@ -602,6 +618,8 @@ bool decode_properties(const Image &image, const RelocationResolver &resolver, M
         }
         MachOObjCProperty row;
         row.entry = *entry;
+        row.list_address = list.address;
+        row.list_index = i;
         const auto attributes_slot = add(*entry, budget.pointer_bytes);
         if (!attributes_slot) {
             mark_incomplete(scan, owner_complete, "Objective-C property field address overflow");
@@ -729,6 +747,7 @@ bool decode_metaclass(const Image &image, const RelocationResolver &resolver, Ma
         add_incomplete(scan, row, "Objective-C metaclass data describes an unsupported realized/future runtime object");
         return false;
     }
+    row.metaclass_flags = static_cast<std::uint32_t>(read_integer(ro_bytes.value(), 0, 4));
     const auto name_slot = add(ro, class_ro_name_offset);
     const auto methods_slot = add(ro, class_ro_methods_offset);
     if (!name_slot || !methods_slot) {
@@ -779,19 +798,29 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
     const auto &slice = macho.container.slices[macho.selected_slice];
     if (slice.header.order != ByteOrder::little)
         return Error{ErrorCode::unsupported, "Objective-C runtime scan supports little-endian Mach-O only"};
-    if (slice.header.cpu_type & 0x02000000u)
-        return Error{ErrorCode::unsupported, "Objective-C arm64_32 pointer ABI is outside the supported Mach-O layouts"};
-    const std::uint8_t pointer_bytes = slice.header.is_64 ? 8 : 4;
-    if (image.layout().space.width_bits != pointer_bytes * 8 || image.layout().space.order != ByteOrder::little)
+    constexpr std::uint32_t cpu_type_arm64_32 = 0x0200000cu;
+    constexpr std::uint32_t abi64_32_flag = 0x02000000u;
+    const bool arm64_32 = slice.header.cpu_type == cpu_type_arm64_32 && slice.header.is_64;
+    if ((slice.header.cpu_type & abi64_32_flag) && !arm64_32)
+        return Error{ErrorCode::unsupported, "Objective-C supports only the arm64_32 32-bit pointer ABI variant"};
+    const std::uint8_t pointer_bytes = arm64_32 ? 4 : slice.header.is_64 ? 8 : 4;
+    const bool address_domain_matches = arm64_32
+        ? image.layout().space.width_bits == 64 &&
+              (image.layout().architecture == Architecture::unknown ||
+               (image.layout().architecture == Architecture::arm64 && image.layout().mode == ExecutionMode::a64))
+        : image.layout().space.width_bits == pointer_bytes * 8;
+    if (!address_domain_matches || image.layout().space.order != ByteOrder::little)
         return Error{ErrorCode::conflict, "Objective-C selected slice and mapped-image pointer width or byte order disagree"};
-    if (!limits.max_classes || !limits.max_categories || !limits.max_protocols || !limits.max_metadata_bytes || !limits.max_name_bytes || !limits.max_list_entries)
+    if (!limits.max_classes || !limits.max_categories || !limits.max_protocols || !limits.max_metadata_bytes ||
+        !limits.max_name_bytes || !limits.max_list_entries || !limits.max_protocol_inheritance_depth ||
+        !limits.max_protocol_requirement_work)
         return Error{ErrorCode::invalid_argument, "Objective-C scan limits must be nonzero"};
     auto resolver = RelocationResolver::create(image, metadata, stop);
     if (!resolver) return resolver.error();
 
     MachOObjCScan scan;
     scan.pointer_bytes = pointer_bytes;
-    Budget budget{limits, scan, stop, pointer_bytes, !slice.header.is_64 && slice.header.cpu_type == 12};
+    Budget budget{limits, scan, stop, pointer_bytes, !slice.header.is_64 && slice.header.cpu_type == 12, arm64_32};
     std::vector<const MachOSection *> classlists;
     for (const auto &section : macho.sections)
         if (section.name == "__objc_classlist") classlists.push_back(&section);
@@ -951,8 +980,7 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
     }
 
     // Protocol definitions are independent runtime objects. Decode the stable
-    // protocol_t prefix and its list pointers without assuming the optional
-    // size/flags tail introduced by newer runtimes.
+    // protocol_t prefix, then use its size field to guard optional tail fields.
     std::map<MetadataAddressKey, std::size_t> protocols_by_address;
     std::vector<const MachOSection *> protolists;
     for (const auto &section : macho.sections)
@@ -1040,12 +1068,39 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
             row.optional_instance_methods = parse_list(image, resolver.value(), *optional_instance_slot, 1, budget, scan, row.complete);
             row.optional_class_methods = parse_list(image, resolver.value(), *optional_class_slot, 1, budget, scan, row.complete);
             row.instance_properties = parse_list(image, resolver.value(), *properties_slot, 4, budget, scan, row.complete);
+            const auto size_flags_slot = add(*protocol.address, 8ull * pointer_bytes);
+            if (size_flags_slot && backed_readable(image, *size_flags_slot, 8)) {
+                auto size_flags = read_exact(image, *size_flags_slot, 8, budget);
+                if (!size_flags) {
+                    if (size_flags.error().code == ErrorCode::canceled)
+                        return Error{ErrorCode::canceled, "Objective-C metadata scan canceled"};
+                } else {
+                    const auto runtime_size = static_cast<std::uint32_t>(read_integer(size_flags.value(), 0, 4));
+                    const auto minimum_size = 8ull * pointer_bytes + 8;
+                    if (runtime_size >= minimum_size && backed_readable(image, *protocol.address, runtime_size)) {
+                        row.runtime_size = runtime_size;
+                        const auto class_properties_offset = minimum_size + 2ull * pointer_bytes;
+                        const auto class_properties_end = class_properties_offset + pointer_bytes;
+                        if (runtime_size >= class_properties_end) {
+                            const auto class_properties_slot = add(*protocol.address, class_properties_offset);
+                            if (class_properties_slot) {
+                                row.class_properties = parse_list(image, resolver.value(), *class_properties_slot,
+                                    4, budget, scan, row.complete);
+                                row.class_properties_status = row.class_properties.pointer_status;
+                            }
+                        } else {
+                            row.class_properties_status = "not-present-by-runtime-size";
+                        }
+                    }
+                }
+            }
             if (!decode_list(image, resolver.value(), row.adopted_protocols, 2, budget, scan, row.complete) ||
                 !decode_list(image, resolver.value(), row.required_instance_methods, 1, budget, scan, row.complete) ||
                 !decode_list(image, resolver.value(), row.required_class_methods, 1, budget, scan, row.complete) ||
                 !decode_list(image, resolver.value(), row.optional_instance_methods, 1, budget, scan, row.complete) ||
                 !decode_list(image, resolver.value(), row.optional_class_methods, 1, budget, scan, row.complete) ||
-                !decode_list(image, resolver.value(), row.instance_properties, 4, budget, scan, row.complete)) {
+                !decode_list(image, resolver.value(), row.instance_properties, 4, budget, scan, row.complete) ||
+                !decode_list(image, resolver.value(), row.class_properties, 4, budget, scan, row.complete)) {
                 if (stop.stop_requested()) return Error{ErrorCode::canceled, "Objective-C metadata scan canceled"};
             }
             protocols_by_address.try_emplace(address_key(*protocol.address), scan.protocols.size());
@@ -1149,6 +1204,52 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
                 !decode_list(image, resolver.value(), row.instance_properties, 4, budget, scan, row.complete)) {
                 if (stop.stop_requested()) return Error{ErrorCode::canceled, "Objective-C metadata scan canceled"};
             }
+            // category_t gained a trailing classProperties pointer in newer
+            // runtimes. Older records have only six fields, so treat the tail
+            // as optional and recognize it only when it points to a complete,
+            // structurally plausible property list.
+            const auto class_properties_slot = add(*category.address, 6ull * pointer_bytes);
+            if (!class_properties_slot || !backed_readable(image, *category.address, 7ull * pointer_bytes)) {
+                row.class_properties_status = "not-present-by-bounds";
+            } else {
+                row.class_properties.pointer_slot = *class_properties_slot;
+                const auto candidate = pointer_at(image, resolver.value(), *class_properties_slot, budget);
+                row.class_properties.pointer_status = candidate.status;
+                if (!candidate.address) {
+                    row.class_properties_status = candidate.status == "null" ? "not-present" :
+                        candidate.status == "budget" || candidate.status == "canceled" ? candidate.status :
+                        "unresolved-optional-tail";
+                    if (candidate.status == "budget")
+                        add_incomplete(scan, row, "Objective-C optional category class-property scan exceeded its byte budget");
+                    if (candidate.status == "canceled")
+                        return Error{ErrorCode::canceled, "Objective-C metadata scan canceled"};
+                } else if ((candidate.address->offset % 4) == 0 &&
+                           backed_readable(image, *candidate.address, 8)) {
+                    const auto header = read_exact(image, *candidate.address, 8, budget);
+                    if (!header) {
+                        if (header.error().code == ErrorCode::canceled) return header.error();
+                        row.class_properties_status = "optional-tail-header-unreadable";
+                        if (header.error().code == ErrorCode::resource_limit)
+                            add_incomplete(scan, row, "Objective-C optional category class-property scan exceeded its byte budget");
+                    } else {
+                        const auto stride = read_integer(header.value(), 0, 4);
+                        const auto count = read_integer(header.value(), 4, 4);
+                        const auto minimum_stride = 2ull * pointer_bytes;
+                        const bool bounded = stride >= minimum_stride && stride <= 4096 &&
+                            stride % pointer_bytes == 0 && count <= limits.max_list_entries &&
+                            count <= (UINT64_MAX - 8) / stride;
+                        const auto extent = bounded ? 8 + count * stride : 0;
+                        if (bounded && backed_readable(image, *candidate.address, extent)) {
+                            row.class_properties = parse_list(image, resolver.value(), *class_properties_slot,
+                                                              4, budget, scan, row.complete);
+                            row.class_properties_status = row.class_properties.status;
+                            if (!decode_list(image, resolver.value(), row.class_properties, 4,
+                                             budget, scan, row.complete) && stop.stop_requested())
+                                return Error{ErrorCode::canceled, "Objective-C metadata scan canceled"};
+                        } else row.class_properties_status = "not-property-list-or-legacy-tail";
+                    }
+                } else row.class_properties_status = "not-property-list-or-legacy-tail";
+            }
             categories_by_address.try_emplace(address_key(*category.address), scan.categories.size());
             scan.categories.push_back(std::move(row));
         }
@@ -1206,13 +1307,330 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
     }
     for (auto &row : scan.categories) link_protocols(row.protocols);
     for (auto &row : scan.protocols) link_protocols(row.adopted_protocols);
+    // Check required methods for protocols directly adopted by each class,
+    // including those protocols' bounded adopted-protocol contracts. Only
+    // selectors in validated method lists count; superclass methods and
+    // categories outside the scanned image are not guessed.
+    const auto complete_method_list = [](const MachOObjCList &list) {
+        return (list.status == "null" || list.status.ends_with("/extent-validated")) &&
+            std::all_of(list.methods.begin(), list.methods.end(),
+                [](const MachOObjCMethod &method) {
+                    return method.selector.has_value() && method.implementation.has_value();
+                });
+    };
+    const auto complete_protocol_method_list = [](const MachOObjCList &list) {
+        return (list.status == "null" || list.status.ends_with("/extent-validated")) &&
+            std::all_of(list.methods.begin(), list.methods.end(),
+                [](const MachOObjCMethod &method) { return method.selector.has_value(); });
+    };
+    struct ProtocolContract {
+        std::vector<MachOObjCProtocolRequirementResult> requirements;
+        bool complete = false;
+    };
+    std::vector<std::optional<ProtocolContract>> protocol_contracts(scan.protocols.size());
+    std::vector<std::uint8_t> protocol_contract_state(scan.protocols.size(), 0);
+    std::size_t protocol_contract_work = 0;
+    std::function<ProtocolContract(std::size_t, std::size_t)> collect_protocol_contract;
+    collect_protocol_contract = [&](std::size_t index, std::size_t depth) -> ProtocolContract {
+        if (index >= scan.protocols.size() || depth > limits.max_protocol_inheritance_depth)
+            return {};
+        if (protocol_contracts[index]) return *protocol_contracts[index];
+        if (protocol_contract_state[index] == 1) return {}; // adoption cycle
+        protocol_contract_state[index] = 1;
+        const auto &protocol = scan.protocols[index];
+        ProtocolContract contract;
+        contract.complete = protocol.complete &&
+            complete_protocol_method_list(protocol.required_instance_methods) &&
+            complete_protocol_method_list(protocol.required_class_methods) &&
+            (protocol.adopted_protocols.status == "null" ||
+             protocol.adopted_protocols.status.ends_with("/extent-validated"));
+        const auto append_required = [&](const MachOObjCList &list, bool class_method) {
+            for (const auto &method : list.methods) {
+                if (!method.selector) {
+                    contract.complete = false;
+                    continue;
+                }
+                if (protocol_contract_work >= limits.max_protocol_requirement_work) {
+                    contract.complete = false;
+                    continue;
+                }
+                MachOObjCProtocolRequirementResult requirement;
+                requirement.selector = *method.selector;
+                requirement.class_method = class_method;
+                requirement.declaring_protocol_index = index;
+                contract.requirements.push_back(std::move(requirement));
+                ++protocol_contract_work;
+            }
+        };
+        append_required(protocol.required_instance_methods, false);
+        append_required(protocol.required_class_methods, true);
+        for (const auto &adopted : protocol.adopted_protocols.protocol_references) {
+            if (!adopted.definition_index || *adopted.definition_index >= scan.protocols.size()) {
+                contract.complete = false;
+                continue;
+            }
+            auto inherited = collect_protocol_contract(*adopted.definition_index, depth + 1);
+            contract.complete = contract.complete && inherited.complete;
+            for (auto &requirement : inherited.requirements) {
+                if (protocol_contract_work >= limits.max_protocol_requirement_work) {
+                    contract.complete = false;
+                    break;
+                }
+                contract.requirements.push_back(std::move(requirement));
+                ++protocol_contract_work;
+            }
+        }
+        protocol_contract_state[index] = 2;
+        protocol_contracts[index] = contract;
+        return contract;
+    };
+    using SelectorIndex = std::map<std::string, std::vector<std::optional<Address>>, std::less<>>;
+    const auto add_method_candidates = [](SelectorIndex &index, const MachOObjCList &methods) {
+        for (const auto &method : methods.methods) {
+            if (method.selector)
+                index[*method.selector].push_back(method.implementation);
+        }
+    };
+    std::size_t emitted_protocol_requirement_work = 0;
+    const auto check_protocol_requirements = [&](MachOObjCProtocolReference &reference,
+        const ProtocolContract &contract,
+        const SelectorIndex &instance_methods, const SelectorIndex &class_methods,
+        bool fully_checked) {
+        fully_checked = fully_checked && contract.complete;
+        for (const auto &declared : contract.requirements) {
+            if (emitted_protocol_requirement_work >= limits.max_protocol_requirement_work) {
+                fully_checked = false;
+                break;
+            }
+            auto result = declared;
+            const auto &index = result.class_method ? class_methods : instance_methods;
+            const auto found = index.find(result.selector);
+            if (found != index.end() && found->second.size() > 1)
+                result.status = "ambiguous-implementation";
+            else if (found != index.end() && !found->second.empty()) {
+                if (found->second.front()) {
+                    result.implementation = *found->second.front();
+                    result.status = "implemented";
+                } else result.status = "implementation-unresolved";
+            } else result.status = fully_checked ? "missing-in-scanned-image" : "unverified-incomplete-method-lists";
+            reference.requirements.push_back(std::move(result));
+            ++emitted_protocol_requirement_work;
+        }
+        if (reference.requirements.empty() && fully_checked) reference.conformance_status = "no-required-methods";
+        else if (!fully_checked) reference.conformance_status = "partial-method-evidence";
+        else if (std::all_of(reference.requirements.begin(), reference.requirements.end(),
+                     [](const auto &requirement) { return requirement.status == "implemented"; }))
+            reference.conformance_status = "required-methods-present-in-scanned-image";
+        else if (std::any_of(reference.requirements.begin(), reference.requirements.end(),
+                     [](const auto &requirement) { return requirement.status == "ambiguous-implementation"; }))
+            reference.conformance_status = "ambiguous-method-evidence";
+        else reference.conformance_status = "required-methods-missing-from-scanned-image";
+    };
+    for (auto &owner : scan.classes) {
+        SelectorIndex instance_methods, class_methods;
+        bool fully_checked = scan.complete && complete_method_list(owner.methods) &&
+            complete_method_list(owner.class_methods);
+        add_method_candidates(instance_methods, owner.methods);
+        add_method_candidates(class_methods, owner.class_methods);
+        for (const auto index : owner.category_indices) {
+            if (index >= scan.categories.size()) { fully_checked = false; continue; }
+            const auto &category = scan.categories[index];
+            fully_checked = fully_checked && complete_method_list(category.instance_methods) &&
+                complete_method_list(category.class_methods);
+            add_method_candidates(instance_methods, category.instance_methods);
+            add_method_candidates(class_methods, category.class_methods);
+        }
+        for (auto &reference : owner.protocols.protocol_references) {
+            reference.requirements.clear();
+            reference.conformance_status = "protocol-definition-unavailable";
+            if (!reference.definition_index || *reference.definition_index >= scan.protocols.size()) continue;
+            const auto contract = collect_protocol_contract(*reference.definition_index, 1);
+            check_protocol_requirements(reference, contract,
+                instance_methods, class_methods, fully_checked);
+        }
+    }
+    const auto link_backing_ivars = [](MachOObjCList &properties, const MachOObjCClass *owner) {
+        for (auto &property : properties.properties) {
+            property.backing_ivar_index.reset();
+            property.backing_ivar_link_status = property.backing_ivar ? "owner-class-not-scanned" : "not-declared";
+            if (!property.backing_ivar || !owner) continue;
+            std::optional<std::size_t> match;
+            bool ambiguous = false;
+            for (std::size_t index = 0; index < owner->ivars.ivars.size(); ++index) {
+                const auto &ivar = owner->ivars.ivars[index];
+                if (ivar.name && *ivar.name == *property.backing_ivar) {
+                    if (match) { ambiguous = true; break; }
+                    match = index;
+                }
+            }
+            if (ambiguous) {
+                property.backing_ivar_link_status = "ambiguous-ivar-name";
+            } else if (match) {
+                property.backing_ivar_index = *match;
+                property.backing_ivar_link_status = "resolved";
+            } else if (owner->ivars.status == "null" ||
+                       owner->ivars.status.find("extent-validated") != std::string::npos) {
+                property.backing_ivar_link_status = "ivar-not-found";
+            } else {
+                property.backing_ivar_link_status = "ivar-list-incomplete";
+            }
+        }
+    };
+    const auto link_accessors = [&scan](std::vector<MachOObjCProperty> &properties, const MachOObjCList &methods) {
+        const auto complete_method_list = (methods.status == "null" ||
+            methods.status.ends_with("/extent-validated")) &&
+            std::all_of(methods.methods.begin(), methods.methods.end(),
+                [](const auto &method) { return method.selector.has_value(); });
+        std::size_t accessor_method_comparisons = 0;
+        constexpr std::size_t max_accessor_method_comparisons = 200000;
+        bool accessor_method_comparison_budget_exhausted = false;
+        const auto same_type = [](const types::TypePtr &left, const types::TypePtr &right) {
+            if (!left || !right) return false;
+            const auto left_encoding = types::encode(*left);
+            const auto right_encoding = types::encode(*right);
+            return left_encoding && right_encoding && left_encoding.value() == right_encoding.value();
+        };
+        const auto find_method = [&](std::string_view selector, const MachOObjCProperty &property,
+                                     bool setter, std::optional<Address> &address) {
+            if (accessor_method_comparison_budget_exhausted)
+                return std::string("accessor-signature-budget");
+            const MachOObjCMethod *match = nullptr;
+            for (const auto &method : methods.methods) {
+                if (accessor_method_comparisons == max_accessor_method_comparisons) {
+                    accessor_method_comparison_budget_exhausted = true;
+                    scan.complete = false;
+                    if (scan.reason.empty())
+                        scan.reason = "Objective-C property accessor selector comparison budget exhausted";
+                    return std::string("accessor-signature-budget");
+                }
+                ++accessor_method_comparisons;
+                if (!method.selector || *method.selector != selector) continue;
+                if (match) return std::string("ambiguous-selector");
+                match = &method;
+            }
+            if (match && !complete_method_list) return std::string("method-list-incomplete");
+            if (match) {
+                if (!property.type || !match->signature || match->signature->kind() != types::Kind::function)
+                    return std::string("accessor-signature-unavailable");
+                const auto &signature = *match->signature;
+                if ((!setter && signature.parameters().size() != 2) ||
+                    (setter && signature.parameters().size() != 3))
+                    return std::string("accessor-signature-arity-mismatch");
+                if (setter) {
+                    if (signature.result_type()->kind() != types::Kind::void_type ||
+                        !same_type(signature.parameters()[2].type, property.type))
+                        return std::string("accessor-signature-type-mismatch");
+                } else if (!same_type(signature.result_type(), property.type)) {
+                    return std::string("accessor-signature-type-mismatch");
+                }
+                address = match->entry;
+                return std::string("resolved");
+            }
+            return complete_method_list ? std::string("method-not-found") : std::string("method-list-incomplete");
+        };
+        for (auto &property : properties) {
+            property.getter_method.reset();
+            property.setter_method.reset();
+            if (property.attribute_semantics_status != "parsed" &&
+                property.attribute_semantics_status != "parsed-with-unknown-attributes") {
+                property.getter_link_status = "property-attributes-unavailable";
+                property.setter_link_status = "property-attributes-unavailable";
+                continue;
+            }
+            if (!property.name || property.name->empty()) {
+                property.getter_link_status = "property-name-unavailable";
+                property.setter_link_status = property.readonly ? "not-applicable-readonly" : "property-name-unavailable";
+                continue;
+            }
+            const auto selector = property.custom_getter.value_or(*property.name);
+            property.getter_link_status = find_method(selector, property, false, property.getter_method);
+            if (property.readonly) {
+                property.setter_link_status = "not-applicable-readonly";
+            } else {
+                std::string setter;
+                if (property.custom_setter) {
+                    setter = *property.custom_setter;
+                } else {
+                    const auto first = static_cast<unsigned char>(property.name->front());
+                    if (first >= 'a' && first <= 'z') {
+                        setter = "set";
+                        setter.push_back(static_cast<char>(first - 'a' + 'A'));
+                        setter.append(property.name->substr(1));
+                        setter.push_back(':');
+                    } else if ((first >= 'A' && first <= 'Z') || first == '_') {
+                        setter = "set" + *property.name + ":";
+                    } else {
+                        property.setter_link_status = "default-setter-name-unsupported";
+                        continue;
+                    }
+                }
+                property.setter_link_status = find_method(setter, property, true, property.setter_method);
+            }
+        }
+    };
+    for (auto &row : scan.classes)
+        link_accessors(row.properties.properties, row.methods);
+    for (auto &row : scan.categories) {
+        link_accessors(row.instance_properties.properties, row.instance_methods);
+        link_accessors(row.class_properties.properties, row.class_methods);
+    }
+    for (auto &row : scan.classes) link_backing_ivars(row.properties, &row);
+    for (auto &row : scan.categories) {
+        const auto *owner = row.target_class_index && *row.target_class_index < scan.classes.size()
+            ? &scan.classes[*row.target_class_index] : nullptr;
+        link_backing_ivars(row.instance_properties, owner);
+    }
     for (auto &row : scan.classes) {
         if (row.superclass_address) {
             const auto found = class_indices_by_address.find(address_key(*row.superclass_address));
             if (found != class_indices_by_address.end()) {
                 row.superclass_index = found->second;
                 row.superclass_name = scan.classes[found->second].name;
+                row.superclass_link_status = "resolved";
+            } else {
+                row.superclass_link_status = "target-class-not-scanned";
             }
+        } else if (row.superclass_pointer_status == "null") {
+            row.superclass_link_status = "root-class";
+        } else {
+            row.superclass_link_status = row.superclass_pointer_status;
+        }
+    }
+
+    // The direct superclass links form a functional graph. Detect malformed
+    // cycles iteratively so adversarial class counts cannot exhaust the C++
+    // call stack; every link outside the cycle remains individually useful.
+    std::vector<std::uint8_t> hierarchy_state(scan.classes.size(), 0);
+    constexpr auto no_path_position = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> path_position(scan.classes.size(), no_path_position);
+    for (std::size_t start = 0; start < scan.classes.size(); ++start) {
+        if (hierarchy_state[start] != 0) continue;
+        std::vector<std::size_t> path;
+        auto current = start;
+        while (current < scan.classes.size() && hierarchy_state[current] == 0) {
+            hierarchy_state[current] = 1;
+            path_position[current] = path.size();
+            path.push_back(current);
+            const auto next = scan.classes[current].superclass_index;
+            if (!next || *next >= scan.classes.size()) {
+                current = scan.classes.size();
+                break;
+            }
+            current = *next;
+        }
+        if (current < scan.classes.size() && hierarchy_state[current] == 1 &&
+            path_position[current] != no_path_position) {
+            for (std::size_t i = path_position[current]; i < path.size(); ++i) {
+                auto &row = scan.classes[path[i]];
+                row.superclass_link_status = "cycle";
+            }
+            scan.complete = false;
+            if (scan.reason.empty())
+                scan.reason = "Objective-C superclass metadata contains a cycle";
+        }
+        for (const auto index : path) {
+            hierarchy_state[index] = 2;
+            path_position[index] = no_path_position;
         }
     }
     if (stop.stop_requested()) return Error{ErrorCode::canceled, "Objective-C metadata scan canceled"};

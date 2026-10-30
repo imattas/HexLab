@@ -1,12 +1,33 @@
 #pragma once
 
+#include "hexlab/analysis/abi.hpp"
 #include "hexlab/analysis/analysis_export.hpp"
 #include "hexlab/analysis/functions.hpp"
+#include "hexlab/image/metadata.hpp"
 
 #include <cstdint>
 #include <optional>
 
 namespace hexlab {
+
+enum class StackArgumentAbi : std::uint8_t {
+    x86_32_near_call,
+    sysv_x86_64,
+    windows_x64,
+    aapcs64,
+    riscv32,
+    riscv64,
+    // AAPCS32 overflow arguments at or above the callee's entry SP.
+    aapcs32,
+    // MIPS O32 overflow arguments after the four-word argument home area.
+    mips_o32,
+    // PPC64 ELFv2 overflow arguments after the eight-doubleword parameter area.
+    ppc64le_elfv2,
+    // x86-32 stack arguments covered by a consistent `ret imm16` epilogue.
+    x86_32_callee_cleanup,
+    // MIPS N64 overflow arguments beyond the eight 64-bit argument slots.
+    mips_n64
+};
 
 struct StackSlotAccess {
     Address instruction;
@@ -14,6 +35,16 @@ struct StackSlotAccess {
     bool written = false;
     bool address_taken = false;
     bool operator==(const StackSlotAccess &) const = default;
+};
+
+enum class StackCallArgumentSourceKind : std::uint8_t {
+    x86_push, aarch64_store, windows_x64_shadow_store, riscv_store, powerpc_store, mips_store, aapcs32_store
+};
+struct StackSlotCallArgument {
+    Address source_instruction;
+    Address call_instruction;
+    StackCallArgumentSourceKind source_kind = StackCallArgumentSourceKind::x86_push;
+    bool operator==(const StackSlotCallArgument &) const = default;
 };
 
 // A conservative local/argument slot inferred from a direct stack-relative
@@ -30,6 +61,13 @@ struct StackSlot {
     // location list used by existing consumers; this records which locations
     // read, write, or take the slot's address.
     std::vector<StackSlotAccess> access_details;
+    // Caller-side argument/home-area evidence. Each row links the source
+    // stack operation to its immediately following call boundary.
+    std::vector<StackSlotCallArgument> outgoing_call_arguments;
+    // x86-32 cdecl/stdcall-compatible incoming stack argument location. The
+    // return-address cell at entry-SP+0 is intentionally excluded.
+    bool incoming_argument = false;
+    std::optional<StackArgumentAbi> incoming_argument_abi;
     bool operator==(const StackSlot &) const = default;
 };
 
@@ -45,6 +83,13 @@ struct StackFrameAnalysis {
 };
 
 HEXLAB_ANALYSIS_EXPORT Result<StackFrameAnalysis>
-analyze_stack_frame(const FunctionRecord &, const FunctionSnapshot &, std::stop_token);
+analyze_stack_frame(const FunctionRecord &, const FunctionSnapshot &, std::stop_token,
+                    std::optional<CallingConvention> image_default_convention = {});
+
+// Select platform-default x86-64 ABIs from image format, and PPC64 ELFv2 only
+// from its explicit ELF machine, class, endian, and ABI flag evidence. Raw and
+// unknown formats deliberately provide no convention.
+HEXLAB_ANALYSIS_EXPORT std::optional<CallingConvention>
+default_stack_calling_convention(const ImageMetadata &);
 
 } // namespace hexlab

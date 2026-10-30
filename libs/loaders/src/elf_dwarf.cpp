@@ -1,10 +1,16 @@
 #include "elf_internal.hpp"
+#include "hexlab/image/file_storage.hpp"
 #include "hexlab/symbols/dwarf.hpp"
 #include <algorithm>
+#include <bit>
+#include <cctype>
+#include <filesystem>
 #include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
+#include <string_view>
+#include <tuple>
 #include <unordered_set>
 
 namespace hexlab::symbols {
@@ -58,12 +64,18 @@ const ElfSection *debug_section(const ElfMetadata &metadata, std::string_view na
     return found;
 }
 
-// Apply only ordinary absolute data relocations into DWARF sections. These
+// Apply only bounded scalar data relocations into DWARF sections. These
 // sections contain data fields; instruction relocations are deliberately not
 // decoded or rewritten here. ET_REL symbol values are section-relative.
 void relocate_dwarf_data(const ElfMetadata &metadata,
                          const std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> &buffers,
                          std::stop_token stop) {
+    struct Patch {
+        std::uint32_t section;
+        std::uint64_t offset, value;
+        std::uint8_t width;
+    };
+    std::vector<Patch> patches;
     const auto bytes_for = [&](std::uint32_t section) -> std::vector<std::uint8_t> * {
         for (const auto &[index, bytes] : buffers) if (index == section) return bytes;
         return nullptr;
@@ -91,13 +103,19 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
         const bool arm32 = metadata.header.machine == 40;
         std::uint8_t width = 0;
         if (x64 && rel.type == 1) width = 8;          // R_X86_64_64
+        else if (x64 && rel.type == 2) width = 4;     // bounded same-section R_X86_64_PC32
         else if (x64 && (rel.type == 10 || rel.type == 11)) width = 4; // R_X86_64_32/32S
         else if (a64 && rel.type == 257) width = 8;  // R_AARCH64_ABS64
         else if (a64 && rel.type == 258) width = 4;  // R_AARCH64_ABS32
+        else if (a64 && rel.type == 260) width = 8;  // bounded same-section R_AARCH64_PREL64
+        else if (a64 && rel.type == 261) width = 4;  // bounded same-section R_AARCH64_PREL32
         else if (i386 && rel.type == 1) width = 4;   // R_386_32
+        else if (i386 && rel.type == 2) width = 4;   // bounded same-section R_386_PC32
         else if (arm32 && rel.type == 2) width = 4;  // R_ARM_ABS32
+        else if (arm32 && rel.type == 3) width = 4;  // bounded same-section R_ARM_REL32
         else if (riscv && rel.type == 1) width = 4;  // R_RISCV_32
         else if (riscv && rel.type == 2 && metadata.header.is_64) width = 8; // R_RISCV_64
+        else if (riscv && rel.type == 57) width = 4; // bounded same-section R_RISCV_32_PCREL
         else throw Failure{{ErrorCode::unsupported, "unsupported ELF relocation in DWARF section (type " + std::to_string(rel.type) + ")"}};
         require(metadata.header.order == ByteOrder::little, "big-endian DWARF relocation is unsupported", ErrorCode::unsupported);
         require(rel.field_size && *rel.field_size == width, "DWARF relocation width is not proven");
@@ -120,25 +138,52 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
             require(rel.addend.has_value(), "DWARF RELA relocation has no explicit addend");
             addend = *rel.addend;
         } else {
-            // These absolute REL forms encode an addend directly in the
-            // target section. Keep implicit-addend support limited to forms
-            // whose field signedness is unambiguous.
+            // Sample original section bytes. Writes are deferred until all
+            // rows are validated, so another relocation cannot change A.
             const bool unsigned_word_rel = width == 4 &&
-                ((i386 && rel.type == 1) || (arm32 && rel.type == 2) ||
-                 (riscv && !metadata.header.is_64 && rel.type == 1));
-            const bool signed_x64_32s_rel = x64 && rel.type == 11 && width == 4;
-            require(unsigned_word_rel || signed_x64_32s_rel,
+                ((i386 && rel.type == 1) || (arm32 && rel.type == 2));
+            const bool signed_word_rel = width == 4 &&
+                ((x64 && (rel.type == 2 || rel.type == 10 || rel.type == 11)) ||
+                 (i386 && rel.type == 2) || (arm32 && rel.type == 3) ||
+                 (a64 && (rel.type == 258 || rel.type == 261)) ||
+                 (riscv && (rel.type == 1 || rel.type == 57)));
+            const bool signed_wide_rel = width == 8 &&
+                ((x64 && rel.type == 1) || (a64 && (rel.type == 257 || rel.type == 260)) ||
+                 (riscv && metadata.header.is_64 && rel.type == 2));
+            require(unsigned_word_rel || signed_word_rel || signed_wide_rel,
                     "unsupported implicit-addend DWARF relocation", ErrorCode::unsupported);
-            std::uint32_t value = 0;
+            std::uint64_t value = 0;
             for (std::uint8_t i = 0; i < width; ++i)
-                value |= std::uint32_t(target[static_cast<std::size_t>(rel.offset) + i]) << (8 * i);
-            addend = signed_x64_32s_rel && value > INT32_MAX
+                value |= std::uint64_t(target[static_cast<std::size_t>(rel.offset) + i]) << (8 * i);
+            addend = signed_wide_rel ? std::bit_cast<std::int64_t>(value)
+                     : signed_word_rel && value > INT32_MAX
                          ? -1 - static_cast<std::int64_t>(UINT32_MAX - value)
                          : static_cast<std::int64_t>(value);
         }
         const auto max_value = width == 8 ? UINT64_MAX : std::uint64_t(UINT32_MAX);
         std::uint64_t sum = symbol->value;
-        if ((x64 && rel.type == 1) || (riscv && rel.type == 2)) {
+        if ((x64 && rel.type == 2) || (i386 && rel.type == 2) ||
+            (arm32 && rel.type == 3) || (a64 && (rel.type == 260 || rel.type == 261)) ||
+            (riscv && rel.type == 57)) {
+            // Without final section placement, a cross-section PC-relative
+            // value cannot be proven. Same-section offsets cancel P's base.
+            require(symbol->section_index == *rel.target_section && symbol->value <= INT64_MAX &&
+                    rel.offset <= static_cast<std::uint64_t>(INT64_MAX),
+                    "PC-relative DWARF relocation is not same-section or representable", ErrorCode::unsupported);
+            const auto displacement = static_cast<std::int64_t>(symbol->value) -
+                                      static_cast<std::int64_t>(rel.offset);
+            require((addend >= 0 && displacement <= INT64_MAX - addend) ||
+                    (addend < 0 && displacement >= INT64_MIN - addend),
+                    "R_X86_64_PC32 DWARF relocation arithmetic overflows");
+            const auto result = displacement + addend;
+            if (width == 8) {
+                sum = static_cast<std::uint64_t>(result);
+            } else {
+                require(result >= INT32_MIN && result <= INT32_MAX,
+                        "PC-relative DWARF relocation result overflows signed 32-bit field");
+                sum = static_cast<std::uint32_t>(static_cast<std::int32_t>(result));
+            }
+        } else if ((x64 && rel.type == 1) || (a64 && rel.type == 257) || (riscv && rel.type == 2)) {
             // These 64-bit absolute relocations store the ABI-defined low
             // 64 bits of S+A.
             sum += static_cast<std::uint64_t>(addend);
@@ -155,6 +200,19 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
                         "R_X86_64_32S DWARF relocation result overflows signed field");
                 sum = std::uint32_t(0u - static_cast<std::uint32_t>(negative_magnitude));
             }
+        } else if (a64 && rel.type == 258 && addend < 0) {
+            // AAELF64 ABS32 accepts either a signed or unsigned 32-bit
+            // result: -2^31 <= S+A < 2^32.
+            const auto magnitude = static_cast<std::uint64_t>(-(addend + 1)) + 1;
+            if (sum >= magnitude) {
+                sum -= magnitude;
+                require(sum <= UINT32_MAX, "R_AARCH64_ABS32 DWARF relocation result overflows field");
+            } else {
+                const auto negative_magnitude = magnitude - sum;
+                require(negative_magnitude <= (std::uint64_t{1} << 31),
+                        "R_AARCH64_ABS32 DWARF relocation result overflows field");
+                sum = std::uint32_t(0u - static_cast<std::uint32_t>(negative_magnitude));
+            }
         } else if (addend >= 0) {
             const auto add = static_cast<std::uint64_t>(addend);
             require(sum <= max_value && add <= max_value - sum, "DWARF absolute relocation result overflows field");
@@ -165,8 +223,24 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
             const auto magnitude = static_cast<std::uint64_t>(-(addend + 1)) + 1;
             require(sum >= magnitude, "DWARF absolute relocation result is negative");
             sum -= magnitude;
+            require(sum <= max_value, "DWARF absolute relocation result overflows field");
         }
-        put(target, rel.offset, width, sum);
+        require(patches.size() < 1'000'000, "DWARF relocation patch count exceeds limit", ErrorCode::resource_limit);
+        patches.push_back({*rel.target_section, rel.offset, sum, width});
+    }
+    std::sort(patches.begin(), patches.end(), [](const Patch &a, const Patch &b) {
+        return std::tie(a.section, a.offset) < std::tie(b.section, b.offset);
+    });
+    for (std::size_t i = 1; i < patches.size(); ++i) {
+        if ((i & 0x3ffu) == 0) canceled(stop);
+        const auto &previous = patches[i - 1], &current = patches[i];
+        require(previous.section != current.section || current.offset - previous.offset >= previous.width,
+                "Overlapping or composed DWARF relocations are unsupported", ErrorCode::unsupported);
+    }
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        if ((i & 0x3ffu) == 0) canceled(stop);
+        const auto &patch = patches[i];
+        put(*bytes_for(patch.section), patch.offset, patch.width, patch.value);
     }
 }
 const ElfSection *optional_debug_section(const ElfMetadata &metadata, std::string_view a,
@@ -341,7 +415,7 @@ DwarfEmbeddedPackageResolvers read_dwp_resolvers(const ByteStorage &storage, con
             if(!selected_name)names.emplace_back(id,*type_name);
         }
     }
-    // RELA offsets in a DWP refer to the containing ELF section, not to an
+    // REL/RELA offsets in a DWP refer to the containing ELF section, not to an
     // individual CU/TU contribution. Keep full package-section buffers and
     // apply relocations before the package resolver slices contributions.
     std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> relocation_buffers;
@@ -439,28 +513,28 @@ DwarfEmbeddedPackageResolvers read_selected_dwp_resolvers(
     return resolvers;
 }
 
-DwarfPackageResolvers read_dwp_supplementary_resolver(
+DwarfPackageResolvers read_supplementary_object_resolver(
     std::shared_ptr<const ByteStorage> storage, const symbols::DwarfSupplementaryIdentity &application_identity,
     bool application_is_64, ByteOrder application_order, std::uint64_t max_bytes,
     std::uint32_t max_requests, std::stop_token stop) {
     if (!storage) return {};
     require(application_identity.present && !application_identity.supplementary &&
                 !application_identity.checksum.empty(),
-            "DWP supplementary package requires an application .debug_sup checksum", ErrorCode::unsupported);
+            "Supplementary source requires an application .debug_sup checksum", ErrorCode::unsupported);
     auto tracking = take(TrackingStorage::create(storage));
     ElfMetadata metadata;
     metadata.header = take(read_elf_header(*tracking, stop));
     require(metadata.header.is_64 == application_is_64 && metadata.header.order == application_order,
-            "DWP supplementary package class or byte order differs from the application ELF");
+            "Supplementary source class or byte order differs from the application ELF");
     Budget budget;
     budget.limit = std::min(max_bytes, metadata_limit);
     read_tables(*tracking, metadata, budget, stop);
     const auto *sup = debug_section(metadata, ".debug_sup");
-    require(sup && sup->size, "DWP supplementary package has no .debug_sup descriptor", ErrorCode::unsupported);
+    require(sup && sup->size, "Supplementary source has no .debug_sup descriptor", ErrorCode::unsupported);
     const auto sup_bytes = read_debug_bytes(*tracking, metadata, *sup, budget, stop);
     const auto package_identity = read_supplementary_identity(sup_bytes);
     require(package_identity.supplementary && package_identity.checksum == application_identity.checksum,
-            "DWP package identity/checksum does not match the application .debug_sup descriptor");
+            "Supplementary source identity/checksum does not match the application .debug_sup descriptor");
     auto package = std::make_shared<DwarfPackage>();
     if (const auto *index = debug_section(metadata, ".debug_tu_index"); index && index->size)
         package->type_index = read_package_index(*tracking, metadata, *index,
@@ -468,8 +542,101 @@ DwarfPackageResolvers read_dwp_supplementary_resolver(
     if (const auto *index = debug_section(metadata, ".debug_cu_index"); index && index->size)
         package->index = read_package_index(*tracking, metadata, *index,
             symbols::DwarfPackageIndexKind::compile_units, budget, stop);
-    require(package->index || package->type_index,
-            "DWP supplementary package has no CU or TU index", ErrorCode::unsupported);
+        if (!package->index && !package->type_index) {
+        // A non-packaged supplementary ELF addresses DIEs directly in its
+        // .debug_info section. Retain one bounded parse for all references.
+        struct DirectSupplementaryState {
+            std::mutex mutex;
+            std::optional<symbols::ImportResult> imported;
+            std::optional<Error> failure;
+            std::vector<std::uint8_t> info, abbrev, strings, string_offsets, addresses,
+                line_strings, location_lists, locations, range_lists, ranges;
+        };
+        auto state = std::make_shared<DirectSupplementaryState>();
+        const auto load_section = [&](std::string_view name, std::vector<std::uint8_t> &destination) {
+            if (const auto *section = debug_section(metadata, name); section && section->size)
+                destination = read_debug_bytes(*tracking, metadata, *section, budget, stop);
+        };
+        load_section(".debug_info", state->info);
+        load_section(".debug_abbrev", state->abbrev);
+        load_section(".debug_str", state->strings);
+        load_section(".debug_str_offsets", state->string_offsets);
+        load_section(".debug_addr", state->addresses);
+        load_section(".debug_line_str", state->line_strings);
+        load_section(".debug_loclists", state->location_lists);
+        load_section(".debug_loc", state->locations);
+        load_section(".debug_rnglists", state->range_lists);
+        load_section(".debug_ranges", state->ranges);
+        require(!state->info.empty() && !state->abbrev.empty(),
+                "Supplementary ELF has neither DWP indexes nor ordinary DWARF info/abbrev", ErrorCode::unsupported);
+        std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> direct_relocations;
+        const auto add_direct_relocation = [&](std::string_view name, std::vector<std::uint8_t> &bytes) {
+            if (const auto *section = debug_section(metadata, name); section && !bytes.empty())
+                direct_relocations.emplace_back(static_cast<std::uint32_t>(section - metadata.sections.data()), &bytes);
+        };
+        add_direct_relocation(".debug_info", state->info);
+        add_direct_relocation(".debug_abbrev", state->abbrev);
+        add_direct_relocation(".debug_str", state->strings);
+        add_direct_relocation(".debug_str_offsets", state->string_offsets);
+        add_direct_relocation(".debug_addr", state->addresses);
+        add_direct_relocation(".debug_line_str", state->line_strings);
+        add_direct_relocation(".debug_loclists", state->location_lists);
+        add_direct_relocation(".debug_loc", state->locations);
+        add_direct_relocation(".debug_rnglists", state->range_lists);
+        add_direct_relocation(".debug_ranges", state->ranges);
+        relocate_dwarf_data(metadata, direct_relocations, stop);
+        const auto examined = budget.used;
+        symbols::DwarfSections dwarf;
+        dwarf.source_id = "ELF supplementary .debug_info";
+        dwarf.info = state->info;
+        dwarf.abbrev = state->abbrev;
+        dwarf.strings = state->strings;
+        dwarf.string_offsets = state->string_offsets;
+        dwarf.addresses = state->addresses;
+        dwarf.line_strings = state->line_strings;
+        dwarf.location_lists = state->location_lists;
+        dwarf.locations = state->locations;
+        dwarf.range_lists = state->range_lists;
+        dwarf.ranges = state->ranges;
+        dwarf.stop = stop;
+        dwarf.supplementary_identity = package_identity;
+        auto supplementary = [state, dwarf, application_identity, package_identity, stop, examined]
+            (const symbols::DwarfSupplementaryIdentity &requested_identity,
+                                            std::uint64_t die_offset)
+            -> Result<symbols::DwarfSupplementaryType> {
+            try {
+                require(requested_identity == application_identity &&
+                            package_identity.checksum == application_identity.checksum,
+                        "supplementary request identity differs from selected ELF object");
+                require(die_offset < dwarf.info.size(),
+                        "supplementary DIE offset is outside .debug_info", ErrorCode::unsupported);
+                std::lock_guard lock(state->mutex);
+                if (!state->imported && !state->failure) {
+                    auto parsed = symbols::import_dwarf(dwarf);
+                    if (parsed) state->imported = std::move(parsed.value());
+                    else state->failure = parsed.error();
+                }
+                if (state->failure) throw Failure{*state->failure};
+                const symbols::ImportedType *matched = nullptr;
+                for (const auto &type : state->imported->types) {
+                    canceled(stop);
+                    if (type.origin.record_offset != die_offset) continue;
+                    if (matched && matched->type->id() != type.type->id())
+                        throw Failure{{ErrorCode::malformed, "supplementary DIE offset resolves to conflicting types"}};
+                    matched = &type;
+                }
+                require(matched && matched->type,
+                        "supplementary DIE offset does not identify an imported type", ErrorCode::unsupported);
+                return symbols::DwarfSupplementaryType{
+                    requested_identity, matched->type, die_offset, examined, true};
+            } catch (const Failure &failure) {
+                return failure.error;
+            } catch (const std::exception &error) {
+                return Error{ErrorCode::malformed, error.what()};
+            }
+        };
+        return {std::move(supplementary), {}};
+    }
     require((!package->index || package->index->version == 5) &&
                 (!package->type_index || package->type_index->version == 5),
             "DWP supplementary references require version-5 package indexes", ErrorCode::unsupported);
@@ -510,7 +677,7 @@ DwarfPackageResolvers read_dwp_supplementary_resolver(
         }
     }
     // Supplementary DWARF forms can point into relocated package sections too.
-    // Apply RELA to complete section buffers before the index resolver slices
+    // Apply REL/RELA to complete section buffers before the index resolver slices
     // individual CU/TU contributions, exactly as for selected DWP packages.
     relocate_dwarf_data(metadata, relocation_buffers, stop);
     require(budget.used <= max_bytes, "DWP supplementary package exceeds configured byte limit", ErrorCode::resource_limit);
@@ -735,13 +902,15 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
                 ? selected_package.type_signature : embedded_package.type_signature;
         }
         if (!supplementary_bytes.empty()) dwarf_sections.supplementary_identity = read_supplementary_identity(supplementary_bytes);
+        if (dwarf_sections.supplementary_identity.present)
+            metadata.dwarf_supplementary_identity = dwarf_sections.supplementary_identity;
         require(!supplementary_package || dwarf_sections.supplementary_identity.present,
                 "Explicit supplementary DWP was supplied but the ELF has no .debug_sup descriptor",
                 ErrorCode::unsupported);
         auto selected_supplementary_resolver = supplementary_resolver;
         std::shared_ptr<const DwarfPackage> supplementary_type_package;
         if (supplementary_package && dwarf_sections.supplementary_identity.present) {
-            auto package_resolvers = read_dwp_supplementary_resolver(
+            auto package_resolvers = read_supplementary_object_resolver(
                 std::move(supplementary_package), dwarf_sections.supplementary_identity,
                 metadata.header.is_64, metadata.header.order, supplementary_max_bytes,
                 supplementary_max_requests, stop);
@@ -854,11 +1023,371 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
 } // namespace hexlab::elf_detail
 
 namespace hexlab {
+Result<ElfDwpSectionContribution> read_elf_dwp_section_contribution(
+    const ByteStorage &storage, symbols::DwarfPackageIndexKind index_kind,
+    std::uint64_t signature, std::uint32_t section_id, std::stop_token stop,
+    std::uint64_t max_bytes) {
+    using namespace elf_detail;
+    try {
+        require(max_bytes != 0, "DWP contribution byte budget must be nonzero", ErrorCode::invalid_argument);
+        ElfMetadata metadata;
+        metadata.header = take(read_elf_header(storage, stop));
+        require(metadata.header.object_type == 1, "DWP input is not an ELF relocatable object", ErrorCode::unsupported);
+        Budget budget;
+        budget.limit = std::min(max_bytes, metadata_limit);
+        read_tables(storage, metadata, budget, stop);
+
+        const bool compile_units = index_kind == symbols::DwarfPackageIndexKind::compile_units;
+        require(compile_units || index_kind == symbols::DwarfPackageIndexKind::type_units,
+                "invalid DWP package index kind", ErrorCode::invalid_argument);
+        const auto *index_section = compile_units
+            ? optional_debug_section(metadata, ".debug_cu_index", ".debug_cu_index.dwo")
+            : optional_debug_section(metadata, ".debug_tu_index", ".debug_tu_index.dwo");
+        require(index_section && index_section->size, "DWP input has no requested package index", ErrorCode::unsupported);
+        auto index = read_package_index(storage, metadata, *index_section, index_kind, budget, stop);
+
+        std::string_view section_name;
+        if (index->version == 2) {
+            switch (section_id) {
+            case 1: section_name = ".debug_info.dwo"; break;
+            case 2: section_name = ".debug_types.dwo"; break;
+            case 3: section_name = ".debug_abbrev.dwo"; break;
+            case 4: section_name = ".debug_line.dwo"; break;
+            case 5: section_name = ".debug_loc.dwo"; break;
+            case 6: section_name = ".debug_str_offsets.dwo"; break;
+            case 7: section_name = ".debug_macinfo.dwo"; break;
+            case 8: section_name = ".debug_macro.dwo"; break;
+            default: throw Failure{{ErrorCode::unsupported, "unsupported DWP v2 section ID"}};
+            }
+        } else if (index->version == 5) {
+            switch (section_id) {
+            case 1: section_name = ".debug_info.dwo"; break;
+            case 3: section_name = ".debug_abbrev.dwo"; break;
+            case 4: section_name = ".debug_line.dwo"; break;
+            case 5: section_name = ".debug_loclists.dwo"; break;
+            case 6: section_name = ".debug_str_offsets.dwo"; break;
+            case 7: section_name = ".debug_macro.dwo"; break;
+            case 8: section_name = ".debug_rnglists.dwo"; break;
+            case 9: section_name = ".debug_addr.dwo"; break;
+            default: throw Failure{{ErrorCode::unsupported, "unsupported DWP v5 section ID"}};
+            }
+        } else {
+            throw Failure{{ErrorCode::unsupported, "unsupported DWP package index version"}};
+        }
+
+        const auto column_it = std::find(index->section_ids.begin(), index->section_ids.end(), section_id);
+        require(column_it != index->section_ids.end(), "DWP index has no requested contribution column", ErrorCode::unsupported);
+        const auto column = static_cast<std::size_t>(column_it - index->section_ids.begin());
+        const symbols::DwarfPackageIndexRow *row = nullptr;
+        for (std::size_t i = 0; i < index->rows.size(); ++i) {
+            if ((i & 0x3fffu) == 0) canceled(stop);
+            if (index->rows[i].signature != signature) continue;
+            require(row == nullptr, "DWP index contains duplicate package key rows");
+            row = &index->rows[i];
+        }
+        require(row != nullptr, "requested key is absent from DWP package index", ErrorCode::unsupported);
+        require(column < row->sections.size(), "DWP contribution row has invalid shape");
+        const auto &range = row->sections[column];
+        require(range.section_id == section_id && range.size != 0,
+                "requested DWP row has no contribution", ErrorCode::unsupported);
+
+        const auto *contribution_section = optional_debug_section(metadata, section_name);
+        require(contribution_section && contribution_section->size,
+                "DWP contribution section is absent", ErrorCode::unsupported);
+        auto section_bytes = read_debug_bytes(storage, metadata, *contribution_section, budget, stop);
+        require(range.offset <= section_bytes.size() && range.size <= section_bytes.size() - range.offset,
+                "DWP contribution exceeds its package section", ErrorCode::malformed);
+
+        std::vector<std::uint8_t> strings, line_strings;
+        const auto *string_section = optional_debug_section(metadata, ".debug_str.dwo");
+        const auto *line_string_section = optional_debug_section(metadata, ".debug_line_str.dwo");
+        if (string_section && string_section->size)
+            strings = read_debug_bytes(storage, metadata, *string_section, budget, stop);
+        if (line_string_section && line_string_section->size)
+            line_strings = read_debug_bytes(storage, metadata, *line_string_section, budget, stop);
+        std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> relocation_buffers;
+        relocation_buffers.emplace_back(static_cast<std::uint32_t>(contribution_section - metadata.sections.data()), &section_bytes);
+        if (string_section && !strings.empty())
+            relocation_buffers.emplace_back(static_cast<std::uint32_t>(string_section - metadata.sections.data()), &strings);
+        if (line_string_section && !line_strings.empty())
+            relocation_buffers.emplace_back(static_cast<std::uint32_t>(line_string_section - metadata.sections.data()), &line_strings);
+        relocate_dwarf_data(metadata, relocation_buffers, stop);
+
+        budget.include(range.size);
+        budget.include(strings.size());
+        budget.include(line_strings.size());
+        ElfDwpSectionContribution result;
+        result.signature = signature;
+        result.index_kind = index_kind;
+        result.package_index_version = index->version;
+        result.section_id = section_id;
+        result.package_section_offset = range.offset;
+        const auto begin = static_cast<std::size_t>(range.offset);
+        const auto end = begin + static_cast<std::size_t>(range.size);
+        result.bytes.assign(section_bytes.begin() + static_cast<std::ptrdiff_t>(begin),
+                            section_bytes.begin() + static_cast<std::ptrdiff_t>(end));
+        result.strings = std::move(strings);
+        result.line_strings = std::move(line_strings);
+        return result;
+    } catch (const Failure &failure) {
+        return failure.error;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate bounded DWP contribution"};
+    } catch (const std::length_error &) {
+        return Error{ErrorCode::resource_limit, "DWP contribution exceeds container limit"};
+    }
+}
+
+Result<ElfDwpMacroContribution> read_elf_dwp_macro_contribution(
+    const ByteStorage &storage, symbols::DwarfPackageIndexKind index_kind,
+    std::uint64_t signature, std::stop_token stop, std::uint64_t max_bytes) {
+    using namespace elf_detail;
+    try {
+        require(max_bytes != 0, "DWP macro contribution byte budget must be nonzero", ErrorCode::invalid_argument);
+        ElfMetadata metadata;
+        metadata.header = take(read_elf_header(storage, stop));
+        require(metadata.header.object_type == 1, "DWP input is not an ELF relocatable object", ErrorCode::unsupported);
+        Budget budget;
+        budget.limit = std::min(max_bytes, metadata_limit);
+        read_tables(storage, metadata, budget, stop);
+
+        const bool compile_units = index_kind == symbols::DwarfPackageIndexKind::compile_units;
+        require(compile_units || index_kind == symbols::DwarfPackageIndexKind::type_units,
+                "invalid DWP package index kind", ErrorCode::invalid_argument);
+        const auto *index_section = compile_units
+            ? optional_debug_section(metadata, ".debug_cu_index", ".debug_cu_index.dwo")
+            : optional_debug_section(metadata, ".debug_tu_index", ".debug_tu_index.dwo");
+        require(index_section && index_section->size, "DWP input has no requested package index", ErrorCode::unsupported);
+        auto index = read_package_index(storage, metadata, *index_section, index_kind, budget, stop);
+        const auto macro_id = index->version == 2 ? 8u : 7u;
+        const auto macro_column = std::find(index->section_ids.begin(), index->section_ids.end(), macro_id);
+        require(macro_column != index->section_ids.end(), "DWP index has no indexed macro contribution column",
+                ErrorCode::unsupported);
+        const auto column = static_cast<std::size_t>(macro_column - index->section_ids.begin());
+        const symbols::DwarfPackageIndexRow *row = nullptr;
+        for (std::size_t i = 0; i < index->rows.size(); ++i) {
+            if ((i & 0x3fffu) == 0) canceled(stop);
+            if (index->rows[i].signature != signature) continue;
+            require(row == nullptr, "DWP index contains duplicate package key rows");
+            row = &index->rows[i];
+        }
+        require(row != nullptr, "requested key is absent from DWP package index", ErrorCode::unsupported);
+        require(column < row->sections.size(), "DWP macro contribution row has invalid shape");
+        const auto &range = row->sections[column];
+        require(range.section_id == macro_id && range.size != 0, "requested DWP row has no macro contribution",
+                ErrorCode::unsupported);
+
+        const auto macro_name = ".debug_macro.dwo";
+        const auto *macro_section = debug_section(metadata, macro_name);
+        require(macro_section && macro_section->size, "DWP macro section is absent", ErrorCode::unsupported);
+        auto macro_bytes = read_debug_bytes(storage, metadata, *macro_section, budget, stop);
+        require(range.offset <= macro_bytes.size() && range.size <= macro_bytes.size() - range.offset,
+                "DWP macro contribution exceeds its package section", ErrorCode::malformed);
+
+        std::vector<std::uint8_t> strings, line_strings;
+        const auto *string_section = optional_debug_section(metadata, ".debug_str.dwo");
+        const auto *line_string_section = optional_debug_section(metadata, ".debug_line_str.dwo");
+        if (string_section && string_section->size)
+            strings = read_debug_bytes(storage, metadata, *string_section, budget, stop);
+        if (line_string_section && line_string_section->size)
+            line_strings = read_debug_bytes(storage, metadata, *line_string_section, budget, stop);
+        std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> relocation_buffers;
+        const auto add_relocation_buffer = [&](const ElfSection *section, std::vector<std::uint8_t> &bytes) {
+            if (!section || bytes.empty()) return;
+            relocation_buffers.emplace_back(static_cast<std::uint32_t>(section - metadata.sections.data()), &bytes);
+        };
+        add_relocation_buffer(macro_section, macro_bytes);
+        add_relocation_buffer(string_section, strings);
+        add_relocation_buffer(line_string_section, line_strings);
+        relocate_dwarf_data(metadata, relocation_buffers, stop);
+
+        budget.include(range.size);
+        budget.include(strings.size());
+        budget.include(line_strings.size());
+        ElfDwpMacroContribution result;
+        result.signature = signature;
+        result.index_kind = index_kind;
+        result.package_index_version = index->version;
+        result.section_id = macro_id;
+        result.package_section_offset = range.offset;
+        const auto begin = static_cast<std::size_t>(range.offset);
+        const auto end = begin + static_cast<std::size_t>(range.size);
+        result.bytes.assign(macro_bytes.begin() + static_cast<std::ptrdiff_t>(begin),
+                            macro_bytes.begin() + static_cast<std::ptrdiff_t>(end));
+        result.strings = std::move(strings);
+        result.line_strings = std::move(line_strings);
+        return result;
+    } catch (const Failure &failure) {
+        return failure.error;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate DWP macro contribution"};
+    } catch (const std::length_error &) {
+        return Error{ErrorCode::resource_limit, "DWP macro contribution exceeds container limit"};
+    }
+}
+
+Result<ElfDwpLineContribution> read_elf_dwp_line_contribution(
+    const ByteStorage &storage, symbols::DwarfPackageIndexKind index_kind,
+    std::uint64_t signature, std::stop_token stop, std::uint64_t max_bytes) {
+    using namespace elf_detail;
+    try {
+        require(max_bytes != 0, "DWP line contribution byte budget must be nonzero", ErrorCode::invalid_argument);
+        ElfMetadata metadata;
+        metadata.header = take(read_elf_header(storage, stop));
+        require(metadata.header.object_type == 1, "DWP input is not an ELF relocatable object", ErrorCode::unsupported);
+        Budget budget;
+        budget.limit = std::min(max_bytes, metadata_limit);
+        read_tables(storage, metadata, budget, stop);
+
+        const bool compile_units = index_kind == symbols::DwarfPackageIndexKind::compile_units;
+        require(compile_units || index_kind == symbols::DwarfPackageIndexKind::type_units,
+                "invalid DWP package index kind", ErrorCode::invalid_argument);
+        const auto *index_section = compile_units
+            ? optional_debug_section(metadata, ".debug_cu_index", ".debug_cu_index.dwo")
+            : optional_debug_section(metadata, ".debug_tu_index", ".debug_tu_index.dwo");
+        require(index_section && index_section->size, "DWP input has no requested package index", ErrorCode::unsupported);
+        auto index = read_package_index(storage, metadata, *index_section, index_kind, budget, stop);
+        constexpr std::uint32_t line_id = 4;
+        const auto line_column = std::find(index->section_ids.begin(), index->section_ids.end(), line_id);
+        require(line_column != index->section_ids.end(), "DWP index has no indexed line contribution column",
+                ErrorCode::unsupported);
+        const auto column = static_cast<std::size_t>(line_column - index->section_ids.begin());
+        const symbols::DwarfPackageIndexRow *row = nullptr;
+        for (std::size_t i = 0; i < index->rows.size(); ++i) {
+            if ((i & 0x3fffu) == 0) canceled(stop);
+            if (index->rows[i].signature != signature) continue;
+            require(row == nullptr, "DWP index contains duplicate package key rows");
+            row = &index->rows[i];
+        }
+        require(row != nullptr, "requested key is absent from DWP package index", ErrorCode::unsupported);
+        require(column < row->sections.size(), "DWP line contribution row has invalid shape");
+        const auto &range = row->sections[column];
+        require(range.section_id == line_id && range.size != 0, "requested DWP row has no line contribution",
+                ErrorCode::unsupported);
+
+        const auto *line_section = optional_debug_section(metadata, ".debug_line.dwo");
+        require(line_section && line_section->size, "DWP line section is absent", ErrorCode::unsupported);
+        auto line_bytes = read_debug_bytes(storage, metadata, *line_section, budget, stop);
+        require(range.offset <= line_bytes.size() && range.size <= line_bytes.size() - range.offset,
+                "DWP line contribution exceeds its package section", ErrorCode::malformed);
+
+        std::vector<std::uint8_t> strings, line_strings;
+        const auto *string_section = optional_debug_section(metadata, ".debug_str.dwo");
+        const auto *line_string_section = optional_debug_section(metadata, ".debug_line_str.dwo");
+        if (string_section && string_section->size)
+            strings = read_debug_bytes(storage, metadata, *string_section, budget, stop);
+        if (line_string_section && line_string_section->size)
+            line_strings = read_debug_bytes(storage, metadata, *line_string_section, budget, stop);
+        std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t> *>> relocation_buffers;
+        relocation_buffers.emplace_back(static_cast<std::uint32_t>(line_section - metadata.sections.data()), &line_bytes);
+        if (string_section && !strings.empty())
+            relocation_buffers.emplace_back(static_cast<std::uint32_t>(string_section - metadata.sections.data()), &strings);
+        if (line_string_section && !line_strings.empty())
+            relocation_buffers.emplace_back(static_cast<std::uint32_t>(line_string_section - metadata.sections.data()), &line_strings);
+        relocate_dwarf_data(metadata, relocation_buffers, stop);
+
+        budget.include(range.size);
+        budget.include(strings.size());
+        budget.include(line_strings.size());
+        ElfDwpLineContribution result;
+        result.signature = signature;
+        result.index_kind = index_kind;
+        result.package_index_version = index->version;
+        result.section_id = line_id;
+        result.package_section_offset = range.offset;
+        const auto begin = static_cast<std::size_t>(range.offset);
+        const auto end = begin + static_cast<std::size_t>(range.size);
+        result.bytes.assign(line_bytes.begin() + static_cast<std::ptrdiff_t>(begin),
+                            line_bytes.begin() + static_cast<std::ptrdiff_t>(end));
+        result.strings = std::move(strings);
+        result.line_strings = std::move(line_strings);
+        return result;
+    } catch (const Failure &failure) {
+        return failure.error;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate DWP line contribution"};
+    } catch (const std::length_error &) {
+        return Error{ErrorCode::resource_limit, "DWP line contribution exceeds container limit"};
+    }
+}
+
+Result<std::vector<ElfDwpSourceLine>> parse_elf_dwp_line_contribution(
+    const ElfDwpLineContribution &contribution, std::uint8_t address_size, bool little_endian,
+    std::stop_token stop, std::size_t max_rows, std::uint64_t max_bytes) {
+    using namespace elf_detail;
+    try {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "DWP line import canceled"};
+        require(contribution.section_id == 4, "DWP source-line input is not a DW_SECT_LINE contribution",
+                ErrorCode::invalid_argument);
+        require(contribution.package_index_version == 2 || contribution.package_index_version == 5,
+                "unsupported DWP source-line package index version", ErrorCode::unsupported);
+        require(address_size == 4 || address_size == 8,
+                "DWP source-line address size must be 4 or 8", ErrorCode::invalid_argument);
+        require(max_rows != 0 && max_rows <= 1'000'000,
+                "DWP source-line row limit must be 1 through one million", ErrorCode::resource_limit);
+        require(max_bytes != 0 && max_bytes <= 64u * 1024u * 1024u,
+                "DWP source-line byte limit exceeds 64 MiB", ErrorCode::resource_limit);
+        std::uint64_t input_bytes = 0;
+        for (const auto size : {contribution.bytes.size(), contribution.strings.size(),
+                                contribution.line_strings.size()}) {
+            require(size <= max_bytes - input_bytes,
+                    "DWP line contribution and shared strings exceed byte limit", ErrorCode::resource_limit);
+            input_bytes += size;
+        }
+        symbols::DwarfLineSections sections;
+        sections.source_id = "ELF DWP line contribution " + std::to_string(contribution.signature);
+        sections.line = contribution.bytes;
+        sections.address_size = address_size;
+        sections.little_endian = little_endian;
+        sections.max_rows = max_rows;
+        sections.stop = stop;
+        sections.strings = contribution.strings;
+        sections.line_strings = contribution.line_strings;
+        auto units = symbols::import_dwarf_line_v2_v5(sections);
+        if (!units) return units.error();
+
+        std::vector<ElfDwpSourceLine> result;
+        std::uint64_t output_bytes = 0;
+        std::size_t row_count = 0;
+        for (std::size_t unit_index = 0; unit_index < units.value().size(); ++unit_index) {
+            if (stop.stop_requested()) return Error{ErrorCode::canceled, "DWP line import canceled"};
+            const auto &unit = units.value()[unit_index];
+            require(unit_index <= UINT32_MAX, "DWP line unit index exceeds 32-bit range", ErrorCode::resource_limit);
+            for (const auto &row : unit.rows) {
+                if (stop.stop_requested()) return Error{ErrorCode::canceled, "DWP line import canceled"};
+                require(row_count < max_rows, "DWP source-line output exceeds row limit", ErrorCode::resource_limit);
+                require(row.file != 0 && row.file <= unit.files.size(),
+                        "DWP source-line row refers to an absent file", ErrorCode::malformed);
+                const auto &file = unit.files[static_cast<std::size_t>(row.file - 1)];
+                const auto record_size = sizeof(ElfDwpSourceLine) + file.name.size();
+                require(output_bytes <= max_bytes - input_bytes &&
+                            record_size <= max_bytes - input_bytes - output_bytes,
+                        "DWP source-line output exceeds byte limit", ErrorCode::resource_limit);
+                output_bytes += record_size;
+                result.push_back({contribution.signature, contribution.index_kind,
+                    contribution.package_index_version, contribution.package_section_offset,
+                    static_cast<std::uint32_t>(unit_index), unit.version, row.address, file.directory,
+                    row.column, row.line, file.name, row.end_sequence});
+                ++row_count;
+            }
+        }
+        return result;
+    } catch (const Failure &failure) {
+        return failure.error;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate bounded DWP source-line rows"};
+    } catch (const std::length_error &) {
+        return Error{ErrorCode::resource_limit, "DWP source-line output exceeds container limit"};
+    }
+}
+
 Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
                                               const symbols::DwarfSplitUnitRequest &request,
                                               std::stop_token stop,
                                               std::uint64_t max_metadata_bytes,
-                                              symbols::DwarfTypeSignatureResolver type_signature_resolver) {
+                                              symbols::DwarfTypeSignatureResolver type_signature_resolver,
+                                              symbols::DwarfSupplementaryIdentity supplementary_identity,
+                                              symbols::DwarfSupplementaryTypeResolver supplementary_type_resolver) {
     using namespace elf_detail;
     try {
         require(max_metadata_bytes != 0, "ELF DWO metadata budget must be nonzero", ErrorCode::invalid_argument);
@@ -895,6 +1424,8 @@ Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
         dwarf.expected_split_dwo_id = request.dwo_id;
         if (request.address_size) dwarf.expected_split_address_size = request.address_size;
         dwarf.type_signature_resolver = std::move(type_signature_resolver);
+        dwarf.supplementary_identity = std::move(supplementary_identity);
+        dwarf.supplementary_type_resolver = std::move(supplementary_type_resolver);
         const auto copy_optional = [&](std::string_view name, std::vector<std::uint8_t> &target) {
             if (const auto *section = debug_section(metadata, name); section && section->size) {
                 target = read_debug_bytes(storage, metadata, *section, budget, stop);
@@ -991,9 +1522,13 @@ Result<symbols::ImportResult> import_elf_dwo(const ByteStorage &storage,
 symbols::DwarfSplitUnitResolver make_elf_dwo_resolver(ElfDwoStorageResolver resolver,
                                                        std::stop_token stop,
                                                        std::uint64_t max_metadata_bytes,
-                                                       symbols::DwarfTypeSignatureResolver type_signature_resolver) {
+                                                       symbols::DwarfTypeSignatureResolver type_signature_resolver,
+                                                       symbols::DwarfSupplementaryIdentity supplementary_identity,
+                                                       symbols::DwarfSupplementaryTypeResolver supplementary_type_resolver) {
     return [resolver = std::move(resolver), stop, max_metadata_bytes,
-            type_signature_resolver = std::move(type_signature_resolver)]
+            type_signature_resolver = std::move(type_signature_resolver),
+            supplementary_identity = std::move(supplementary_identity),
+            supplementary_type_resolver = std::move(supplementary_type_resolver)]
            (const symbols::DwarfSplitUnitRequest &request)
                -> Result<std::shared_ptr<symbols::ImportResult>> {
         if (!resolver)
@@ -1003,10 +1538,101 @@ symbols::DwarfSplitUnitResolver make_elf_dwo_resolver(ElfDwoStorageResolver reso
         if (!storage) return storage.error();
         if (!storage.value()) return Error{ErrorCode::invalid_argument, "ELF DWO resolver returned null storage"};
         auto imported = import_elf_dwo(*storage.value(), request, stop, max_metadata_bytes,
-                                       type_signature_resolver);
+                                       type_signature_resolver, supplementary_identity,
+                                       supplementary_type_resolver);
         if (!imported) return imported.error();
         return std::make_shared<symbols::ImportResult>(std::move(imported.value()));
     };
+}
+
+Result<symbols::DwarfSplitUnitResolver> make_elf_dwo_directory_resolver(
+    std::filesystem::path directory, std::stop_token stop, ElfDwoDirectoryResolverLimits limits) {
+    if (stop.stop_requested()) return Error{ErrorCode::canceled, "ELF DWO directory resolver creation canceled"};
+    if (directory.empty() || !limits.max_requests || !limits.max_file_bytes ||
+        !limits.max_total_file_bytes || !limits.max_metadata_bytes_per_dwo)
+        return Error{ErrorCode::invalid_argument, "ELF DWO directory resolver requires a directory and nonzero limits"};
+
+    std::error_code ec;
+    const auto root_status = std::filesystem::status(directory, ec);
+    if (ec || !std::filesystem::is_directory(root_status))
+        return Error{ErrorCode::invalid_argument, "ELF DWO search root is not an accessible directory"};
+    const auto canonical_root = std::filesystem::canonical(directory, ec);
+    if (ec) return Error{ErrorCode::io, "Cannot canonicalize ELF DWO search root: " + ec.message()};
+
+    struct DirectoryState {
+        std::mutex mutex;
+        std::uint32_t requests = 0;
+        std::uint64_t total_file_bytes = 0;
+        std::set<std::uint64_t> dwo_ids;
+    };
+    auto state = std::make_shared<DirectoryState>();
+    ElfDwoStorageResolver storage_resolver =
+        [canonical_root, stop, limits, state](const symbols::DwarfSplitUnitRequest &request)
+            -> Result<std::shared_ptr<const ByteStorage>> {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "ELF DWO discovery canceled"};
+        if (!request.dwo_id || (request.address_size != 4 && request.address_size != 8))
+            return Error{ErrorCode::invalid_argument, "ELF DWO lookup requires an exact ID and 4- or 8-byte address size"};
+        {
+            std::lock_guard lock(state->mutex);
+            if (state->requests >= limits.max_requests)
+                return Error{ErrorCode::resource_limit, "ELF DWO directory resolver request limit exceeded"};
+            ++state->requests;
+            if (!state->dwo_ids.insert(request.dwo_id).second)
+                return Error{ErrorCode::malformed, "ELF DWO directory resolver received a duplicate DWO ID"};
+        }
+        const auto separator = request.dwo_name.find_last_of("/\\");
+        const std::string_view leaf = separator == std::string::npos
+            ? std::string_view(request.dwo_name)
+            : std::string_view(request.dwo_name).substr(separator + 1);
+        if (leaf.empty() || leaf == "." || leaf == ".." || leaf.find(':') != std::string_view::npos ||
+            leaf.find('\0') != std::string_view::npos)
+            return Error{ErrorCode::unsupported, "DW_AT_dwo_name has no safe basename for caller-scoped discovery"};
+        auto extension = leaf.substr(leaf.find_last_of('.') == std::string_view::npos
+            ? leaf.size() : leaf.find_last_of('.'));
+        std::string normalized_extension(extension);
+        std::transform(normalized_extension.begin(), normalized_extension.end(), normalized_extension.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (normalized_extension != ".dwo")
+            return Error{ErrorCode::unsupported, "Caller-scoped ELF DWO discovery accepts only `.dwo` basenames"};
+
+        std::filesystem::path leaf_path;
+        try { leaf_path = std::filesystem::u8path(leaf.begin(), leaf.end()); }
+        catch (const std::filesystem::filesystem_error &error) {
+            return Error{ErrorCode::invalid_argument, "Invalid DW_AT_dwo_name basename: " + std::string(error.what())};
+        }
+        if (leaf_path.has_root_name() || leaf_path.has_root_directory() || leaf_path.has_parent_path() ||
+            leaf_path.filename() != leaf_path)
+            return Error{ErrorCode::unsupported, "DW_AT_dwo_name basename is not a single path component"};
+
+        const auto candidate = canonical_root / leaf_path;
+        std::error_code file_error;
+        const auto status = std::filesystem::symlink_status(candidate, file_error);
+        if (file_error == std::errc::no_such_file_or_directory ||
+            (!file_error && status.type() == std::filesystem::file_type::not_found))
+            return Error{ErrorCode::unsupported, "No matching `.dwo` file exists in the caller-selected directory"};
+        if (file_error) return Error{ErrorCode::io, "Cannot inspect ELF DWO candidate: " + file_error.message()};
+        if (std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status))
+            return Error{ErrorCode::unsupported, "ELF DWO candidate must be a regular non-symlink file"};
+        const auto size = std::filesystem::file_size(candidate, file_error);
+        if (file_error) return Error{ErrorCode::io, "Cannot size ELF DWO candidate: " + file_error.message()};
+        if (size > limits.max_file_bytes)
+            return Error{ErrorCode::resource_limit, "ELF DWO candidate exceeds the configured file-size limit"};
+        const auto canonical_candidate = std::filesystem::canonical(candidate, file_error);
+        if (file_error || canonical_candidate.parent_path() != canonical_root)
+            return Error{ErrorCode::unsupported, "ELF DWO candidate resolves outside the caller-selected directory"};
+        auto opened = FileStorage::open(canonical_candidate);
+        if (!opened) return opened.error();
+        if (opened.value()->size() > limits.max_file_bytes)
+            return Error{ErrorCode::resource_limit, "Opened ELF DWO exceeds the configured file-size limit"};
+        {
+            std::lock_guard lock(state->mutex);
+            if (opened.value()->size() > limits.max_total_file_bytes - state->total_file_bytes)
+                return Error{ErrorCode::resource_limit, "ELF DWO aggregate file-size limit exceeded"};
+            state->total_file_bytes += opened.value()->size();
+        }
+        return std::static_pointer_cast<const ByteStorage>(opened.value());
+    };
+    return make_elf_dwo_resolver(std::move(storage_resolver), stop, limits.max_metadata_bytes_per_dwo);
 }
 
 symbols::DwarfTypeSignatureResolver make_elf_dwo_type_signature_resolver(

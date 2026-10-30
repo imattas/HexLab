@@ -19,6 +19,17 @@ instruction, then reinstalls `INT3` when that thread next raises a debug event.
 Unowned breakpoints, including the process's initial loader breakpoint, are
 passed through without rewinding.
 
+For Windows x86/x64 owned-breakpoint steps, setup captures the original RIP/EIP
+before rewinding. If later flag access, trap-flag setup, step-state setup,
+peer suspension, or `ContinueDebugEvent` fails, rollback restores the captured
+instruction pointer together with `INT3` and any changed flags. The original
+event remains pending. This keeps a successful rollback retryable from the
+same post-`INT3` context; reinstalling the trap while leaving RIP/EIP rewound
+would otherwise make the next step re-enter the trap. If register, memory, or
+suspension rollback also fails, the error includes those failures and does not
+claim that the target state was restored. Windows x64 Debug compilation covers
+this path; failure-injection and live WOW64 validation remain pending.
+
 The displaced-step protocol is isolated in a platform-neutral state helper and
 covered by deterministic tests for IP matching, single outstanding step,
 thread matching, retry after a failed rearm, and teardown clearing. A Win32

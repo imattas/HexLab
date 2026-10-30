@@ -1,5 +1,13 @@
 # Firmware record formats
 
+FMP capsule inspection also accepts one explicitly based physical-memory
+capture containing a bounded little-endian scatter/gather descriptor chain:
+`firmware inspect memory.bin --capsule-sg-base 0x100000 --capsule-sg-head 0x101000 --format uefi-capsule`.
+This offline form gathers exactly one persistent FMP capsule and retains both
+logical offsets and descriptor/data capture provenance. See
+[UEFI FMP capsule metadata](../libs/firmware/docs/uefi-fmp-capsule.md#offline-scattergather-capture)
+for validation rules and limits.
+
 `hexlab::firmware` turns Intel HEX and Motorola S-record text into bounded, address-sorted data segments. Each segment keeps its source line and record index, so clients can link displayed bytes and diagnostics back to the input file. The parser does not guess a CPU or apply a target-specific memory map. The separate loader adapter builds a sparse image while preserving those record boundaries.
 
 Intel HEX supports data (00), EOF (01), extended segment address (02), start segment address (03), extended linear address (04), and start linear address (05) records. It verifies each byte checksum, requires a well-formed EOF record, and rejects any later nonblank record.
@@ -8,7 +16,7 @@ Motorola S-record supports S0 headers, S1/S2/S3 data, S5/S6 data-record counts, 
 
 Intel HEX permits at most one type-03/type-05 start-address record. Duplicate start metadata is rejected instead of silently replacing the earlier entry point.
 
-Both parsers reject overlapping data records, malformed/unsupported record types, out-of-bound addresses, and configured record/data limits. `ParseOptions` defaults to at most 512 MiB of data, addresses through `0xffffffff`, and four million records. A `std::stop_token` supports cancellation between records. Errors include a one-based source line when a line is available and use the shared `ErrorCode` taxonomy.
+Both parsers reject overlapping data records, malformed/unsupported record types, out-of-bound addresses, and configured input-line, record, and data limits. `ParseOptions` defaults to at most 512 MiB of data, addresses through `0xffffffff`, and four million physical lines and records. The line limit includes ignored blank lines, bounding work on blank-line-only or heavily padded inputs independently of the nonblank record count. A `std::stop_token` supports cancellation between records. Errors include a one-based source line when a line is available and use the shared `ErrorCode` taxonomy.
 
 The parser deliberately retains each input data record as one `DataSegment`, sorted by address. Adjacent records are not merged, preserving their individual provenance. Empty data records are validated but do not create a segment.
 # Firmware files in the CLI and image model
@@ -37,3 +45,7 @@ Projects embed the original record text, its hash, and the selected format. Reop
 File locations, byte searches, patches, and exports refer to the original text. Memory locations refer to decoded firmware data. A decoded memory byte has no single source-file byte, so previews omit a source offset and virtual-location project exchange remains unavailable. Virtual-address byte patches are supported when the full range is initialized and covered by firmware data records: the project updates each affected record's data and checksum in the original text, preserving the other record text, record ordering, headers, count/start records, and line endings. A single patch may cross adjacent records but cannot cross an address gap or touch more than 65,536 records. The update is same-length and is stored in normal project patch history, so undo/redo and export use the regenerated valid record text. File-offset text patches remain available and are reparsed; malformed edits leave the project in file-only state until a valid text edit or undo restores the mapping. Processor selection, instruction analysis, and automatic format detection remain outside this workflow.
 
 UEFI PI firmware volumes embedded in binary images can be listed as FFS2/FFS3 files with `hexlab_cli firmware inspect <path> --format uefi`. A contiguous EFI Firmware Management Protocol capsule can be inventoried with `hexlab_cli firmware inspect <path> --format uefi-capsule`; the report includes versioned payload descriptors, source offsets, and bounded PI firmware-volume metadata found inside update images without extracting or executing payloads. See [UEFI firmware-volume inventory](uefi-firmware-volume.md) and [UEFI FMP capsule metadata](../libs/firmware/docs/uefi-fmp-capsule.md).
+
+An Intel Firmware Interface Table can be inspected at a caller-supplied file offset with `hexlab_cli firmware inspect <path> --fit-offset <offset> --format fit`. The bounded inventory reports entry type, address, size units, version, per-entry checksum metadata, and whether the header-requested table checksum matches. HexLab does not discover the FIT pointer, map physical component addresses into the file, verify component checksums, or execute/load entries. The selected offset is relative to the beginning of the complete input file; see [Intel FIT inventory](intel-fit.md).
+
+An Intel microcode update can be inspected at an explicit file offset with `hexlab_cli firmware inspect <path> --microcode-offset <offset> --format intel-microcode`. The report includes update header fields, base and extension-table checksum results, and provenance for alternate processor signatures. The encrypted payload remains opaque; HexLab does not discover updates through FIT, select an update for a processor, or apply microcode. See [Intel microcode update inventory](intel-microcode.md).

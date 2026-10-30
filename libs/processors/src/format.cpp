@@ -15,6 +15,33 @@ std::string hex(std::uint64_t value) {
 std::string signed_hex(std::int64_t value) {
     return value < 0 ? "-" + hex(static_cast<std::uint64_t>(-(value + 1)) + 1) : hex(static_cast<std::uint64_t>(value));
 }
+const char *riscv_status_trap_csr_name(std::uint64_t number) noexcept {
+    switch (number) {
+    case 0x100: return "sstatus";
+    case 0x104: return "sie";
+    case 0x105: return "stvec";
+    case 0x106: return "scounteren";
+    case 0x140: return "sscratch";
+    case 0x141: return "sepc";
+    case 0x142: return "scause";
+    case 0x143: return "stval";
+    case 0x144: return "sip";
+    case 0x180: return "satp";
+    case 0x300: return "mstatus";
+    case 0x301: return "misa";
+    case 0x302: return "medeleg";
+    case 0x303: return "mideleg";
+    case 0x304: return "mie";
+    case 0x305: return "mtvec";
+    case 0x306: return "mcounteren";
+    case 0x340: return "mscratch";
+    case 0x341: return "mepc";
+    case 0x342: return "mcause";
+    case 0x343: return "mtval";
+    case 0x344: return "mip";
+    default: return nullptr;
+    }
+}
 std::string memory_text(const MemoryOperand &m, bool address_only) {
     std::string out;
     if (!address_only)
@@ -112,6 +139,11 @@ std::string register_name(const RegisterOperand &r) {
         return r.index < 32 && r.width == 128 ? "v" + std::to_string(r.index) : "?ppc-vr";
     if (r.bank == RegisterBank::ppc_cr)
         return r.width == 32 && r.index == 0 ? "cr" : r.index < 8 && r.width == 4 ? "cr" + std::to_string(r.index) : "?ppc-cr";
+    if (r.bank == RegisterBank::ppc_crbit) {
+        static constexpr const char *bit_names[]{"lt", "gt", "eq", "so"};
+        return r.width == 1 && r.index < 32 ? "cr" + std::to_string(r.index / 4) + "." + bit_names[r.index % 4]
+                                            : "?ppc-crbit";
+    }
     if (r.bank == RegisterBank::ppc_lr)
         return r.index == 0 && (r.width == 32 || r.width == 64) ? "lr" : "?ppc-lr";
     if (r.bank == RegisterBank::ppc_ctr)
@@ -153,6 +185,9 @@ std::string register_name(const RegisterOperand &r) {
         return r.index == 0 && r.width == 4 ? "nzcv" : "?arm-flags";
     if (r.bank == RegisterBank::arm32_gpr)
         return r.index < 16 && r.width == 32 ? "r" + std::to_string(r.index) : "?arm32-register";
+    if (r.bank == RegisterBank::arm32_vfp)
+        return r.index < 32 && (r.width == 32 || r.width == 64)
+            ? std::string(r.width == 64 ? "d" : "s") + std::to_string(r.index) : "?arm32-vfp-register";
     static constexpr const char *names8[]{"al",  "cl",  "dl",   "bl",   "spl",  "bpl",  "sil",  "dil",
                                           "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"};
     static constexpr const char *names16[]{"ax",  "cx",  "dx",   "bx",   "sp",   "bp",   "si",   "di",
@@ -198,6 +233,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::mips_lwc1)];
     }
     switch (op) {
+    case Opcode::mips64_jr_hb: return "jr.hb";
+    case Opcode::mips64_jalr_hb: return "jalr.hb";
     case Opcode::mips64_c_cond_s: return "c.cond.s";
     case Opcode::mips64_c_cond_d: return "c.cond.d";
     case Opcode::mips64_bc1tl: return "bc1tl";
@@ -206,6 +243,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips_bc1fl: return "bc1fl";
     case Opcode::mips_clz: return "clz";
     case Opcode::mips_clo: return "clo";
+    case Opcode::mips_mul: return "mul";
     case Opcode::mips64_dclz: return "dclz";
     case Opcode::mips64_dclo: return "dclo";
     case Opcode::mips64_mul: return "mul";
@@ -216,16 +254,43 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips64_drotr: return "drotr";
     case Opcode::mips64_drotr32: return "drotr32";
     case Opcode::mips64_drotrv: return "drotrv";
+    case Opcode::mips64_rotr: return "rotr";
+    case Opcode::mips64_rotrv: return "rotrv";
     case Opcode::mips64_dextm: return "dextm";
     case Opcode::mips64_dextu: return "dextu";
     case Opcode::mips64_dext: return "dext";
     case Opcode::mips64_dinsm: return "dinsm";
     case Opcode::mips64_dinsu: return "dinsu";
     case Opcode::mips64_dins: return "dins";
+    case Opcode::mips64_dsbh: return "dsbh";
+    case Opcode::mips64_dshd: return "dshd";
+    case Opcode::mips64_wsbh: return "wsbh";
+    case Opcode::mips64_seb: return "seb";
+    case Opcode::mips64_seh: return "seh";
     case Opcode::mips_ext: return "ext";
     case Opcode::mips_ins: return "ins";
+    case Opcode::rdrand: return "rdrand";
+    case Opcode::rdseed: return "rdseed";
+    case Opcode::crc32: return "crc32";
+    case Opcode::comiss: return "comiss";
+    case Opcode::ucomiss: return "ucomiss";
+    case Opcode::comisd: return "comisd";
+    case Opcode::ucomisd: return "ucomisd";
+    case Opcode::movbe: return "movbe";
+    case Opcode::mips64_movf: return "movf";
+    case Opcode::mips64_movt: return "movt";
     case Opcode::mips64_movz: return "movz";
     case Opcode::mips64_movn: return "movn";
+    case Opcode::mips_movf_s: return "movf.s";
+    case Opcode::mips_movt_s: return "movt.s";
+    case Opcode::mips_movz_s: return "movz.s";
+    case Opcode::mips_movn_s: return "movn.s";
+    case Opcode::mips_movf_d: return "movf.d";
+    case Opcode::mips_movt_d: return "movt.d";
+    case Opcode::mips_movz_d: return "movz.d";
+    case Opcode::mips_movn_d: return "movn.d";
+    case Opcode::mips32_movz: return "movz";
+    case Opcode::mips32_movn: return "movn";
     case Opcode::mips64_movf_s: return "movf.s";
     case Opcode::mips64_movt_s: return "movt.s";
     case Opcode::mips64_movz_s: return "movz.s";
@@ -361,12 +426,24 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
             "stdx", "stdux", "lwbrx", "lhbrx", "stwbrx", "sthbrx", "mfcr", "mtcrf", "sc", "mfxer", "mtxer"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::ppc_addic)];
     }
+    if (op == Opcode::ppc_addze) return "addze";
+    if (op == Opcode::ppc_addze_dot) return "addze";
+    if (op == Opcode::ppc_addme) return "addme";
+    if (op == Opcode::ppc_addme_dot) return "addme";
+    if (op == Opcode::ppc_mulhw) return "mulhw";
+    if (op == Opcode::ppc_mulhwu) return "mulhwu";
     if (op >= Opcode::ppc_andc && op <= Opcode::ppc_extsw_dot) {
         static constexpr const char *names[]{"andc", "andc.", "nand", "nand.", "nor", "nor.",
             "orc", "orc.", "eqv", "eqv.", "cntlzw", "cntlzw.", "cntlzd", "cntlzd.",
             "extsb", "extsb.", "extsh", "extsh.", "extsw", "extsw."};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::ppc_andc)];
     }
+    if (op == Opcode::movmskps) return "movmskps";
+    if (op == Opcode::movmskpd) return "movmskpd";
+    if (op == Opcode::pmovmskb) return "pmovmskb";
+    if (op == Opcode::vmovmskps) return "vmovmskps";
+    if (op == Opcode::vmovmskpd) return "vmovmskpd";
+    if (op == Opcode::vpmovmskb) return "vpmovmskb";
     if (op >= Opcode::movdqa && op <= Opcode::divsd) {
         static constexpr const char *names[]{"movdqa", "movdqu", "paddd", "paddq", "psubd", "psubq", "pand", "por",
             "pxor", "movss", "movsd", "addss", "addsd", "subss", "subsd", "mulss", "mulsd", "divss", "divsd"};
@@ -378,7 +455,27 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::vaddps)];
     }
     switch (op) {
+    case Opcode::ppc_lwa: return "lwa";
+    case Opcode::ppc_lwax: return "lwax";
+    case Opcode::ppc_lwaux: return "lwaux";
+    case Opcode::ppc_popcntw: return "popcntw";
+    case Opcode::ppc_popcntd: return "popcntd";
+    case Opcode::ppc_popcntb: return "popcntb";
+    case Opcode::ppc_isel: return "isel";
+    case Opcode::ppc_addo: return "addo";
+    case Opcode::ppc_addo_dot: return "addo.";
+    case Opcode::ppc_subfo: return "subfo";
+    case Opcode::ppc_subfo_dot: return "subfo.";
     case Opcode::ppc_mcrf: return "mcrf";
+    case Opcode::ppc_mcrxr: return "mcrxr";
+    case Opcode::ppc_crand: return "crand";
+    case Opcode::ppc_crandc: return "crandc";
+    case Opcode::ppc_creqv: return "creqv";
+    case Opcode::ppc_crnand: return "crnand";
+    case Opcode::ppc_crnor: return "crnor";
+    case Opcode::ppc_cror: return "cror";
+    case Opcode::ppc_crorc: return "crorc";
+    case Opcode::ppc_crxor: return "crxor";
     case Opcode::ppc_ldbrx: return "ldbrx";
     case Opcode::ppc_stdbrx: return "stdbrx";
     case Opcode::ppc_rldicl: return "rldicl";
@@ -415,6 +512,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::ppc_fnmsubs: return "fnmsubs";
     case Opcode::ppc_fcmpu: return "fcmpu";
     case Opcode::ppc_fcmpo: return "fcmpo";
+    case Opcode::ppc_tw: return "tw";
+    case Opcode::ppc_td: return "td";
     case Opcode::ppc_fmr: return "fmr";
     case Opcode::ppc_fneg: return "fneg";
     case Opcode::ppc_fabs: return "fabs";
@@ -472,7 +571,9 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::vpor: return "vpor";
     case Opcode::vpxor: return "vpxor";
     case Opcode::vpandd: return "vpandd";
+    case Opcode::vpandnd: return "vpandnd";
     case Opcode::vpandq: return "vpandq";
+    case Opcode::vpandnq: return "vpandnq";
     case Opcode::vpord: return "vpord";
     case Opcode::vporq: return "vporq";
     case Opcode::vpxord: return "vpxord";
@@ -522,6 +623,10 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::vpabsd: return "vpabsd";
     case Opcode::vcmpps: return "vcmpps";
     case Opcode::vcmppd: return "vcmppd";
+    case Opcode::cmpps: return "cmpps";
+    case Opcode::cmppd: return "cmppd";
+    case Opcode::cmpss: return "cmpss";
+    case Opcode::cmpsd: return "cmpsd";
     case Opcode::vpunpcklbw: return "vpunpcklbw";
     case Opcode::vpunpcklwd: return "vpunpcklwd";
     case Opcode::vpunpckldq: return "vpunpckldq";
@@ -535,7 +640,31 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::vpackuswb: return "vpackuswb";
     case Opcode::vpackusdw: return "vpackusdw";
     case Opcode::vpshufb: return "vpshufb";
+    case Opcode::vshufps: return "vshufps";
+    case Opcode::vshufpd: return "vshufpd";
+    case Opcode::vpshufd: return "vpshufd";
     case Opcode::vpsadbw: return "vpsadbw";
+    case Opcode::vpermd: return "vpermd";
+    case Opcode::vpermb: return "vpermb";
+    case Opcode::vpternlogd: return "vpternlogd";
+    case Opcode::vpternlogq: return "vpternlogq";
+    case Opcode::vpmullq: return "vpmullq";
+    case Opcode::vpminsq: return "vpminsq";
+    case Opcode::vpminuq: return "vpminuq";
+    case Opcode::vpmaxsq: return "vpmaxsq";
+    case Opcode::vpmaxuq: return "vpmaxuq";
+    case Opcode::vpmovm2b: return "vpmovm2b";
+    case Opcode::vpmovm2w: return "vpmovm2w";
+    case Opcode::vpmovm2d: return "vpmovm2d";
+    case Opcode::vpmovm2q: return "vpmovm2q";
+    case Opcode::vpmovb2m: return "vpmovb2m";
+    case Opcode::vpmovw2m: return "vpmovw2m";
+    case Opcode::vpmovd2m: return "vpmovd2m";
+    case Opcode::vpmovq2m: return "vpmovq2m";
+    case Opcode::vpopcntb: return "vpopcntb";
+    case Opcode::vpopcntw: return "vpopcntw";
+    case Opcode::vpopcntd: return "vpopcntd";
+    case Opcode::vpopcntq: return "vpopcntq";
     case Opcode::vpcmpeqb: return "vpcmpeqb";
     case Opcode::vpcmpeqw: return "vpcmpeqw";
     case Opcode::vpcmpeqd: return "vpcmpeqd";
@@ -560,6 +689,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         static constexpr const char *names[]{"pcmpeqb", "pcmpeqw", "pcmpeqd", "pcmpgtb", "pcmpgtw", "pcmpgtd"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::pcmpeqb)];
     }
+    if (op == Opcode::pcmpgtq) return "pcmpgtq";
     switch (op) {
     case Opcode::paddb: return "paddb"; case Opcode::paddw: return "paddw";
     case Opcode::psubb: return "psubb"; case Opcode::psubw: return "psubw";
@@ -570,10 +700,11 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::pandn: return "pandn";
     case Opcode::psllw: return "psllw"; case Opcode::pslld: return "pslld"; case Opcode::psllq: return "psllq";
     case Opcode::psrlw: return "psrlw"; case Opcode::psrld: return "psrld"; case Opcode::psrlq: return "psrlq";
+    case Opcode::pslldq: return "pslldq"; case Opcode::psrldq: return "psrldq";
     case Opcode::psraw: return "psraw"; case Opcode::psrad: return "psrad";
     case Opcode::pmullw: return "pmullw"; case Opcode::pmulhw: return "pmulhw";
     case Opcode::pmulhuw: return "pmulhuw"; case Opcode::pmuludq: return "pmuludq";
-    case Opcode::pmaddwd: return "pmaddwd";
+    case Opcode::pmaddwd: return "pmaddwd"; case Opcode::psadbw: return "psadbw";
     case Opcode::pminub: return "pminub"; case Opcode::pmaxub: return "pmaxub";
     case Opcode::pminsw: return "pminsw"; case Opcode::pmaxsw: return "pmaxsw";
     case Opcode::pavgb: return "pavgb"; case Opcode::pavgw: return "pavgw";
@@ -582,6 +713,13 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::phsubd: return "phsubd"; case Opcode::phsubsw: return "phsubsw";
     case Opcode::pshufd: return "pshufd";
     case Opcode::pshufb: return "pshufb";
+    case Opcode::pmaddubsw: return "pmaddubsw"; case Opcode::pmulhrsw: return "pmulhrsw";
+    case Opcode::psignb: return "psignb"; case Opcode::psignw: return "psignw";
+    case Opcode::psignd: return "psignd";
+    case Opcode::pabsb: return "pabsb"; case Opcode::pabsw: return "pabsw";
+    case Opcode::pabsd: return "pabsd";
+    case Opcode::ptest: return "ptest";
+    case Opcode::vptest: return "vptest";
     default: break;
     }
     if (op >= Opcode::rv_lui && op <= Opcode::rv_remuw) {
@@ -607,7 +745,26 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         return csr_names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_csrrw)];
     }
     if (op == Opcode::rv_fcvtmod_w_d) return "fcvtmod.w.d";
+    if (op == Opcode::rv_andn) return "andn";
+    if (op == Opcode::rv_orn) return "orn";
+    if (op == Opcode::rv_xnor) return "xnor";
+    if (op == Opcode::rv_min) return "min";
+    if (op == Opcode::rv_minu) return "minu";
+    if (op == Opcode::rv_max) return "max";
+    if (op == Opcode::rv_maxu) return "maxu";
+    if (op == Opcode::rv_rol) return "rol";
+    if (op == Opcode::rv_ror) return "ror";
+    if (op == Opcode::rv_rori) return "rori";
+    if (op == Opcode::rv_sext_b) return "sext.b";
+    if (op == Opcode::rv_sext_h) return "sext.h";
+    if (op == Opcode::rv_zext_h) return "zext.h";
+    if (op == Opcode::rv_orc_b) return "orc.b";
+    if (op == Opcode::rv_rev8) return "rev8";
+    if (op == Opcode::rv_rolw) return "rolw";
+    if (op == Opcode::rv_rorw) return "rorw";
+    if (op == Opcode::rv_roriw) return "roriw";
     if (op == Opcode::rv_fence_i) return "fence.i";
+    if (op == Opcode::rv_fence_tso) return "fence.tso";
     if (op == Opcode::rv_fli_s) return "fli.s";
     if (op == Opcode::rv_fli_d) return "fli.d";
     if (op == Opcode::rv_fround_s) return "fround.s";
@@ -637,6 +794,20 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
             "vredminu.vs", "vredmin.vs", "vredmaxu.vs", "vredmax.vs"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vredsum)];
     }
+    if (op >= Opcode::rv_vcpop_m && op <= Opcode::rv_vid_v) {
+        static constexpr const char *names[]{"vcpop.m", "vfirst.m", "vmsbf.m", "vmsof.m",
+            "vmsif.m", "viota.m", "vid.v"};
+        return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vcpop_m)];
+    }
+    if (op >= Opcode::rv_vmand_mm && op <= Opcode::rv_vmxnor_mm) {
+        static constexpr const char *names[]{"vmand.mm", "vmnand.mm", "vmandn.mm", "vmxor.mm",
+            "vmor.mm", "vmnor.mm", "vmorn.mm", "vmxnor.mm"};
+        return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vmand_mm)];
+    }
+    if (op == Opcode::rv_vfredusum) return "vfredusum.vs";
+    if (op == Opcode::rv_vfredosum) return "vfredosum.vs";
+    if (op == Opcode::rv_vfredmin) return "vfredmin.vs";
+    if (op == Opcode::rv_vfredmax) return "vfredmax.vs";
     if (op >= Opcode::rv_vadd_vv && op <= Opcode::rv_vxor_vi) {
         static constexpr const char *names[]{"vadd.vv","vadd.vx","vadd.vi","vsub.vv","vsub.vx",
             "vand.vv","vand.vx","vand.vi","vor.vv","vor.vx","vor.vi","vxor.vv","vxor.vx","vxor.vi"};
@@ -704,6 +875,21 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
             "sh1add.uw", "sh2add.uw", "sh3add.uw", "slli.uw"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_sh1add)];
     }
+    if (op >= Opcode::rv_bclr && op <= Opcode::rv_bseti) {
+        static constexpr const char *names[]{"bclr", "bext", "binv", "bset",
+            "bclri", "bexti", "binvi", "bseti"};
+        return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_bclr)];
+    }
+    if (op >= Opcode::rv_clmul && op <= Opcode::rv_clmulr) {
+        static constexpr const char *names[]{"clmul", "clmulh", "clmulr"};
+        return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_clmul)];
+    }
+    if (op == Opcode::rv_czero_eqz) return "czero.eqz";
+    if (op == Opcode::rv_czero_nez) return "czero.nez";
+    if (op >= Opcode::rv_pack && op <= Opcode::rv_packw) {
+        static constexpr const char *names[]{"pack", "packh", "packw"};
+        return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_pack)];
+    }
     if (op >= Opcode::rv_vdivu_vv && op <= Opcode::rv_vrem_vx) {
         static constexpr const char *names[]{"vdivu.vv", "vdivu.vx", "vdiv.vv", "vdiv.vx",
                                              "vremu.vv", "vremu.vx", "vrem.vv", "vrem.vx"};
@@ -734,6 +920,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         return "idiv";
     if (op == Opcode::lahf)
         return "lahf";
+    if (op == Opcode::adcx) return "adcx";
+    if (op == Opcode::adox) return "adox";
     if (op == Opcode::bsf) return "bsf";
     if (op == Opcode::bsr) return "bsr";
     if (op == Opcode::bt) return "bt";
@@ -750,6 +938,11 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::bswap) return "bswap";
     if (op == Opcode::popcnt) return "popcnt";
     if (op == Opcode::bzhi) return "bzhi";
+    if (op == Opcode::andn) return "andn";
+    if (op == Opcode::bextr) return "bextr";
+    if (op == Opcode::blsi) return "blsi";
+    if (op == Opcode::blsmsk) return "blsmsk";
+    if (op == Opcode::blsr) return "blsr";
     if (op == Opcode::mulx) return "mulx";
     if (op == Opcode::pdep) return "pdep";
     if (op == Opcode::pext) return "pext";
@@ -760,6 +953,10 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::cmpxchg8b) return "cmpxchg8b";
     if (op == Opcode::cmpxchg16b) return "cmpxchg16b";
     if (op == Opcode::cbw) return "cbw";
+    if (op == Opcode::aam) return "aam";
+    if (op == Opcode::aad) return "aad";
+    if (op == Opcode::daa) return "daa";
+    if (op == Opcode::das) return "das";
     if (op == Opcode::cwde) return "cwde";
     if (op == Opcode::cdqe) return "cdqe";
     if (op == Opcode::cwd) return "cwd";
@@ -770,17 +967,24 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::x86_stos) return "stos";
     if (op == Opcode::x86_lods) return "lods";
     if (op == Opcode::x86_scas) return "scas";
+    if (op == Opcode::x86_ins) return "ins";
+    if (op == Opcode::x86_outs) return "outs";
     if (op == Opcode::pushf) return "pushf";
     if (op == Opcode::popf) return "popf";
     if (op == Opcode::pusha) return "pusha";
     if (op == Opcode::popa) return "popa";
     if (op == Opcode::enter) return "enter";
-    if ((op >= Opcode::a32_b && op <= Opcode::t32_mul) || op == Opcode::arm_tbb || op == Opcode::arm_tbh)
+    if ((op >= Opcode::a32_b && op <= Opcode::t32_mul) ||
+        (op >= Opcode::a32_sxtb && op <= Opcode::a32_uxtah) ||
+        (op >= Opcode::t32_sxtb16 && op <= Opcode::t32_uxtab16) ||
+        (op >= Opcode::a32_sxtb16 && op <= Opcode::a32_uxtab16) ||
+        op == Opcode::t32_addw || op == Opcode::t32_subw ||
+        op == Opcode::arm_tbb || op == Opcode::arm_tbh)
         return arm32_detail::mnemonic(op, condition);
     if ((op >= Opcode::a64_b && op <= Opcode::a64_strh) || op == Opcode::a64_sbfm || op == Opcode::a64_ubfm || op == Opcode::a64_bfm ||
         op == Opcode::a64_ccmp || op == Opcode::a64_ccmn)
         return a64_detail::mnemonic(op, condition);
-    static constexpr const char *names[]{"mov",  "movzx", "movsx", "movsxd",  "lea",   "push",    "pop", "leave",
+    static constexpr const char *names[]{"mov",  "movzx", "movsx", "movsxd", "arpl", "bound", "les", "lds", "lea",   "push",    "pop", "leave",
                                          "add",  "or",    "adc",   "sbb",     "and",   "sub",     "xor", "cmp",
                                          "test", "inc",   "dec",   "not",     "neg",   "imul",    "rol", "ror",
                                          "rcl",  "rcr",   "shl",   "shr",     "sar",   "call",    "jmp", "jcc",
@@ -811,11 +1015,42 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::m6502_isc) return "isc";
     if (op == Opcode::m6502_las) return "las";
     if (op == Opcode::m6502_anc) return "anc";
+    if (op == Opcode::m6502_alr) return "alr";
+    if (op == Opcode::m6502_lax) return "lax";
+    if (op == Opcode::m6502_sax) return "sax";
+    if (op == Opcode::m6502_kil) return "kil";
+    if (op == Opcode::palignr) return "palignr";
+    if (op == Opcode::vpalignr) return "vpalignr";
     const auto index = static_cast<std::size_t>(op);
     return index < std::size(names) ? names[index] : "?opcode";
 }
 std::string format_instruction(const Instruction &i) {
-    if (i.opcode == Opcode::wasm || i.opcode == Opcode::dex || i.opcode == Opcode::x86_opaque || i.opcode == Opcode::opaque)
+    if (i.opcode == Opcode::wasm) {
+        std::string out = i.mnemonic_override;
+        if (i.bytes[0] == std::byte{0xfd} && i.mnemonic_override == "v128.const") {
+            const auto encoded = i.encoded_bytes();
+            if (encoded.size() < 18) return out + " <missing immediate bytes>";
+            static constexpr char hex_digits[] = "0123456789abcdef";
+            out += " 0x";
+            for (std::size_t index = 2; index < 18; ++index) {
+                const auto byte = std::to_integer<std::uint8_t>(encoded[index]);
+                out.push_back(hex_digits[byte >> 4]);
+                out.push_back(hex_digits[byte & 0x0f]);
+            }
+            return out;
+        }
+        if (i.bytes[0] == std::byte{0xfd} &&
+            (out.find("extract_lane") != std::string::npos || out.find("replace_lane") != std::string::npos)) {
+            for (const auto &operand : i.operands) {
+                if (const auto *immediate = std::get_if<ImmediateOperand>(&operand)) {
+                    out += " " + std::to_string(immediate->value);
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+    if (i.opcode == Opcode::dex || i.opcode == Opcode::x86_opaque || i.opcode == Opcode::opaque)
         return i.mnemonic_override;
     if (i.context.architecture == Architecture::mos6502) {
         std::string out = opcode_name(i.opcode, i.condition);
@@ -898,9 +1133,12 @@ std::string format_instruction(const Instruction &i) {
             if (const auto *reg = std::get_if<RegisterOperand>(&operand)) out += register_name(*reg);
             else if (const auto *imm = std::get_if<ImmediateOperand>(&operand))
                 out += imm->is_signed ? signed_hex(x64_detail::sign_value(imm->value, imm->effective_width)) : hex(imm->value);
-            else if (const auto *mem = std::get_if<MemoryOperand>(&operand))
-                out += signed_hex(mem->displacement) + "(" + (mem->base ? register_name(*mem->base) : "0") + ")";
-            else if (const auto *rel = std::get_if<RelativeOperand>(&operand))
+            else if (const auto *mem = std::get_if<MemoryOperand>(&operand)) {
+                if ((i.opcode == Opcode::ppc_lwax || i.opcode == Opcode::ppc_lwaux) && mem->index)
+                    out += (mem->base ? register_name(*mem->base) : "0") + ", " + register_name(*mem->index);
+                else
+                    out += signed_hex(mem->displacement) + "(" + (mem->base ? register_name(*mem->base) : "0") + ")";
+            } else if (const auto *rel = std::get_if<RelativeOperand>(&operand))
                 out += i.direct_target ? hex(i.direct_target->offset) : signed_hex(rel->displacement);
         }
         return out;
@@ -920,7 +1158,14 @@ std::string format_instruction(const Instruction &i) {
             if (const auto *reg = std::get_if<RegisterOperand>(&operand))
                 out += register_name(*reg);
             else if (const auto *immediate = std::get_if<ImmediateOperand>(&operand)) {
-                if ((i.opcode == Opcode::rv_vsetvli || i.opcode == Opcode::rv_vsetivli) &&
+                const bool csr_operation = i.opcode >= Opcode::rv_csrrw && i.opcode <= Opcode::rv_csrrci;
+                const auto *csr_name = csr_operation && n == 1 && immediate->encoded_width == 12 &&
+                        !immediate->is_signed
+                    ? riscv_status_trap_csr_name(immediate->value)
+                    : nullptr;
+                if (csr_name) {
+                    out += csr_name;
+                } else if ((i.opcode == Opcode::rv_vsetvli || i.opcode == Opcode::rv_vsetivli) &&
                     n == 2 && immediate->effective_width >= 10) {
                     const auto value = immediate->value;
                     const auto vsew = static_cast<unsigned>((value >> 3) & 7);
@@ -957,7 +1202,8 @@ std::string format_instruction(const Instruction &i) {
         return arm32_detail::format(i);
     if (i.context.architecture == Architecture::arm64 && i.context.mode == ExecutionMode::a64)
         return a64_detail::format(i);
-    std::string mnemonic = i.opcode == Opcode::x87 ? i.mnemonic_override : opcode_name(i.opcode, i.condition);
+    std::string mnemonic = i.opcode == Opcode::x87 || i.opcode == Opcode::x86_flag_control
+        ? i.mnemonic_override : opcode_name(i.opcode, i.condition);
     if (i.opcode == Opcode::x86_loop && i.x86_loop_condition) {
         switch (*i.x86_loop_condition) {
         case X86LoopCondition::counter_nonzero: mnemonic = "loop"; break;
@@ -970,8 +1216,11 @@ std::string format_instruction(const Instruction &i) {
     }
     if (i.context.architecture == Architecture::powerpc &&
         (i.opcode == Opcode::ppc_addc || i.opcode == Opcode::ppc_adde ||
+         i.opcode == Opcode::ppc_addze || i.opcode == Opcode::ppc_addze_dot ||
+         i.opcode == Opcode::ppc_addme || i.opcode == Opcode::ppc_addme_dot ||
          i.opcode == Opcode::ppc_subfc || i.opcode == Opcode::ppc_subfe || i.opcode == Opcode::ppc_neg ||
          i.opcode == Opcode::ppc_mullw || i.opcode == Opcode::ppc_mulld ||
+         i.opcode == Opcode::ppc_mulhw || i.opcode == Opcode::ppc_mulhwu ||
          i.opcode == Opcode::ppc_divw || i.opcode == Opcode::ppc_divwu ||
          i.opcode == Opcode::ppc_divd || i.opcode == Opcode::ppc_divdu ||
          i.opcode == Opcode::ppc_slw || i.opcode == Opcode::ppc_srw ||
@@ -1000,8 +1249,21 @@ std::string format_instruction(const Instruction &i) {
                                             i.opcode == Opcode::rv_vloxei ? "vloxei" :
                                             i.opcode == Opcode::rv_vsuxei ? "vsuxei" : "vsoxei")
                                : load ? (strided ? "vlse" : "vle") : (strided ? "vsse" : "vse");
-            mnemonic = std::string(prefix) +
-                       std::to_string(width) + ".v";
+            const auto fields = std::max<std::uint8_t>(1, i.riscv_vector_segment_fields);
+            if (fields == 1) {
+                mnemonic = std::string(prefix) + std::to_string(width) + ".v";
+            } else if (indexed) {
+                const char *segmented_prefix = i.opcode == Opcode::rv_vluxei ? "vluxseg" :
+                    i.opcode == Opcode::rv_vloxei ? "vloxseg" :
+                    i.opcode == Opcode::rv_vsuxei ? "vsuxseg" : "vsoxseg";
+                mnemonic = std::string(segmented_prefix) + std::to_string(fields) + "ei" +
+                           std::to_string(width) + ".v";
+            } else {
+                const char *segmented_prefix = load ? (strided ? "vlsseg" : "vlseg")
+                                                    : (strided ? "vssseg" : "vsseg");
+                mnemonic = std::string(segmented_prefix) + std::to_string(fields) + "e" +
+                           std::to_string(width) + ".v";
+            }
         }
     }
     if (i.opcode == Opcode::pushf && i.stack_value_width == 16 && i.context.mode == ExecutionMode::x86_64)
@@ -1021,7 +1283,8 @@ std::string format_instruction(const Instruction &i) {
     else if (i.opcode == Opcode::popa && i.stack_value_width == 32)
         mnemonic = "popad";
     if (i.opcode == Opcode::x86_movs || i.opcode == Opcode::x86_cmps || i.opcode == Opcode::x86_stos ||
-        i.opcode == Opcode::x86_lods || i.opcode == Opcode::x86_scas) {
+        i.opcode == Opcode::x86_lods || i.opcode == Opcode::x86_scas ||
+        i.opcode == Opcode::x86_ins || i.opcode == Opcode::x86_outs) {
         std::uint16_t width = 0;
         for (const auto &operand : i.operands)
             if (const auto *memory = std::get_if<MemoryOperand>(&operand)) {
@@ -1036,7 +1299,8 @@ std::string format_instruction(const Instruction &i) {
     std::string out = (i.lock_prefix ? "lock " : "") + std::string(repeat) + mnemonic;
     const bool implicit_string = i.opcode == Opcode::x86_movs || i.opcode == Opcode::x86_cmps ||
                                  i.opcode == Opcode::x86_stos || i.opcode == Opcode::x86_lods ||
-                                 i.opcode == Opcode::x86_scas;
+                                 i.opcode == Opcode::x86_scas || i.opcode == Opcode::x86_ins ||
+                                 i.opcode == Opcode::x86_outs;
     const bool string_segment_override = implicit_string && std::any_of(
         i.operands.begin(), i.operands.end(), [](const Operand &operand) {
             const auto *memory = std::get_if<MemoryOperand>(&operand);

@@ -2,6 +2,8 @@
 #include "hexlab/loaders/loader.hpp"
 #include "hexlab/image/metadata.hpp"
 #include "hexlab/image/read_set.hpp"
+#include "hexlab/image/external_inputs.hpp"
+#include <optional>
 namespace hexlab {
 struct LoadedImage {
     std::shared_ptr<const Image> image;
@@ -13,6 +15,13 @@ struct LoadedImage {
     // byte dependency in the primary input. An empty set is valid for formats
     // whose mapping comes entirely from the explicit load recipe.
     bool metadata_reads_complete = false;
+    // Content identity for explicit auxiliary artifacts (currently local PDB
+    // and caller-selected DWP) that contribute loader metadata outside the
+    // primary input's ReadSet. It is folded into project analysis identity.
+    std::optional<Sha256Digest> external_input_fingerprint;
+    // False when a caller supplied an auxiliary resolver without a stable
+    // identity. Consumers must rebuild rather than reuse derived results.
+    bool external_inputs_certified = true;
     // PE runtime base when explicitly selected; otherwise absent for loaders
     // without a distinct runtime/preferred mapping choice.
     std::optional<std::uint64_t> load_base;
@@ -31,5 +40,8 @@ struct LoadedImage {
     // select either process view even when `image` is already selected.
     std::shared_ptr<const Image> pe_native_image;
     std::optional<PeRuntimeArchitecture> pe_runtime_target;
+    // Full-byte dependencies from explicitly declared callback input manifests.
+    // Resolver-family prefixes keep equal caller names in separate namespaces.
+    std::vector<ExternalInputDependency> external_input_dependencies;
 };
 } // namespace hexlab

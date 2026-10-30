@@ -4,6 +4,7 @@
 #include "strings_internal.hpp"
 #include <algorithm>
 #include <map>
+#include <span>
 #include <type_traits>
 namespace hexlab {
 namespace {
@@ -13,6 +14,58 @@ using function_detail::take;
 void canceled(std::stop_token stop) {
     if (stop.stop_requested())
         throw Failure{{ErrorCode::canceled, "Incremental analysis canceled"}};
+}
+template <class T>
+void copy_cancelable(std::vector<T> &destination, const std::vector<T> &source, std::stop_token stop) {
+    canceled(stop);
+    destination.reserve(source.size());
+    canceled(stop);
+    for (const auto &value : source) {
+        canceled(stop);
+        destination.push_back(value);
+    }
+}
+FunctionStackRecord copy_stack_record_cancelable(const FunctionStackRecord &source, std::stop_token stop) {
+    canceled(stop);
+    FunctionStackRecord copy;
+    copy.function = source.function;
+    copy.frame.maximum_stack_allocation_bytes = source.frame.maximum_stack_allocation_bytes;
+    copy.frame.complete = source.frame.complete;
+    copy.frame.slots.reserve(source.frame.slots.size());
+    canceled(stop);
+    for (const auto &slot : source.frame.slots) {
+        canceled(stop);
+        StackSlot cloned;
+        cloned.offset_from_entry_sp = slot.offset_from_entry_sp;
+        cloned.width = slot.width;
+        cloned.read = slot.read;
+        cloned.written = slot.written;
+        cloned.address_taken = slot.address_taken;
+        cloned.incoming_argument = slot.incoming_argument;
+        cloned.incoming_argument_abi = slot.incoming_argument_abi;
+        copy_cancelable(cloned.accesses, slot.accesses, stop);
+        copy_cancelable(cloned.access_details, slot.access_details, stop);
+        copy_cancelable(cloned.outgoing_call_arguments, slot.outgoing_call_arguments, stop);
+        copy.frame.slots.push_back(std::move(cloned));
+    }
+    canceled(stop);
+    return copy;
+}
+std::shared_ptr<FunctionSnapshot> clone_snapshot(const FunctionSnapshot &source, std::stop_token stop) {
+    auto copy = std::make_shared<FunctionSnapshot>();
+    copy_cancelable(copy->functions, source.functions, stop);
+    copy_cancelable(copy->blocks, source.blocks, stop);
+    copy_cancelable(copy->instructions, source.instructions, stop);
+    copy_cancelable(copy->calls, source.calls, stop);
+    copy_cancelable(copy->candidates, source.candidates, stop);
+    copy_cancelable(copy->conflicts, source.conflicts, stop);
+    copy_cancelable(copy->dependencies, source.dependencies, stop);
+    copy->key = source.key;
+    copy->complete = source.complete;
+    copy->omitted_functions = source.omitted_functions;
+    copy->omitted_blocks = source.omitted_blocks;
+    canceled(stop);
+    return copy;
 }
 template <class F> auto guarded(F f) -> decltype(f()) {
     try {
@@ -35,7 +88,8 @@ void validate_basis(const AnalysisBasis &old) {
 }
 std::vector<FunctionStackRecord> derive_stack_frames(
     const FunctionSnapshot &snapshot, const FunctionSnapshot *prior_snapshot,
-    std::span<const FunctionStackRecord> prior, std::stop_token stop) {
+    std::span<const FunctionStackRecord> prior, std::stop_token stop,
+    std::optional<CallingConvention> image_default_convention, bool abi_unchanged = true) {
     std::map<FunctionId, const FunctionStackRecord *> old;
     for (const auto &record : prior) {
         canceled(stop);
@@ -63,11 +117,12 @@ std::vector<FunctionStackRecord> derive_stack_frames(
     for (const auto &function : snapshot.functions) {
         canceled(stop);
         auto cached = old.find(function->id);
-        bool unchanged = prior_snapshot && cached != old.end();
+        bool unchanged = prior_snapshot && cached != old.end() && abi_unchanged;
         if (unchanged) {
             auto old_function = old_functions.find(function->id);
             unchanged = old_function != old_functions.end() && *old_function->second == *function;
             for (auto block_id : function->blocks) {
+                canceled(stop);
                 if (!unchanged) break;
                 auto previous = old_blocks.find(block_id);
                 auto current = current_blocks.find(block_id);
@@ -76,7 +131,7 @@ std::vector<FunctionStackRecord> derive_stack_frames(
             }
         }
         if (unchanged) {
-            frames.push_back(*cached->second);
+            frames.push_back(copy_stack_record_cancelable(*cached->second, stop));
         } else {
             // Stack transfer only follows blocks owned by this function. Passing
             // the whole recovered image here made a full analysis rescan every
@@ -89,7 +144,8 @@ std::vector<FunctionStackRecord> derive_stack_frames(
                 if (block != current_blocks.end())
                     function_view.blocks.push_back(block->second);
             }
-            frames.push_back({function->id, take(analyze_stack_frame(*function, function_view, stop))});
+            frames.push_back({function->id, take(analyze_stack_frame(*function, function_view, stop,
+                                                                    image_default_convention))});
         }
     }
     return frames;
@@ -136,23 +192,72 @@ bool effective_images_match(const Image &left, const Image &right, std::stop_tok
 // String recognition reads file bytes and uses only the segment-to-file
 // address mapping to attach virtual addresses. Processor contexts and code
 // policy do not affect its output.
-bool same_string_mapping(const Image &left, const Image &right) {
-    return left.storage()->size() == right.storage()->size() &&
-           left.layout().space == right.layout().space &&
-           left.layout().segments == right.layout().segments;
+bool same_string_mapping(const Image &left, const Image &right, std::stop_token stop) {
+    if (left.storage()->size() != right.storage()->size() ||
+        left.layout().space != right.layout().space)
+        return false;
+    const auto &left_segments = left.layout().segments;
+    const auto &right_segments = right.layout().segments;
+    if (left_segments.size() != right_segments.size())
+        return false;
+    for (std::size_t index = 0; index < left_segments.size(); ++index) {
+        canceled(stop);
+        if (left_segments[index] != right_segments[index])
+            return false;
+    }
+    return true;
 }
-bool same_instruction_mapping(const Image &left, const Image &right) {
+bool same_instruction_mapping(const Image &left, const Image &right, std::stop_token stop) {
     // Recovery rechecks current permission and context at every reused
     // instruction, then rebuilds all edges and ownership from those facts.
     // Keep address-to-file identity fixed so stored byte reads and IDs remain
     // meaningful across a policy or execution-context update.
-    return same_string_mapping(left, right);
+    return same_string_mapping(left, right, stop);
 }
 using LocationKey = std::tuple<unsigned, uint32_t, uint64_t>;
 LocationKey location_key(Location value) {
     if (auto address = std::get_if<Address>(&value))
         return {0, address->space.value, address->offset};
     return {1, 0, std::get<FileOffset>(value).value};
+}
+template <class T, class Equal>
+bool equal_decision_rows(std::span<const T> left, std::span<const T> right,
+                         std::stop_token stop, Equal equal) {
+    canceled(stop);
+    if (left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        canceled(stop);
+        if (!equal(left[index], right[index])) return false;
+    }
+    return true;
+}
+bool equal_function_decisions(std::span<const FunctionDecision> left,
+                              std::span<const FunctionDecision> right,
+                              std::stop_token stop) {
+    return equal_decision_rows(left, right, stop, [&](const auto &a, const auto &b) {
+        return a.id == b.id && a.entry == b.entry && a.suppressed == b.suppressed &&
+               equal_decision_rows(std::span<const DecisionRange>{a.chunks},
+                                   std::span<const DecisionRange>{b.chunks}, stop,
+                                   [](const auto &x, const auto &y) { return x == y; });
+    });
+}
+bool equal_root_decisions(const AnalysisDecisions &left, const AnalysisDecisions &right,
+                          std::stop_token stop) {
+    return equal_decision_rows(std::span<const RegionDecision>{left.regions},
+                               std::span<const RegionDecision>{right.regions}, stop,
+                               [](const auto &a, const auto &b) { return a == b; }) &&
+           equal_function_decisions(left.functions, right.functions, stop);
+}
+bool equal_reference_decisions(const AnalysisDecisions &left, const AnalysisDecisions &right,
+                               std::stop_token stop) {
+    return equal_decision_rows(std::span<const UserReference>{left.references},
+                               std::span<const UserReference>{right.references}, stop,
+                               [](const auto &a, const auto &b) { return a == b; });
+}
+bool equal_decisions(const AnalysisDecisions &left, const AnalysisDecisions &right,
+                     std::stop_token stop) {
+    return equal_root_decisions(left, right, stop) &&
+           equal_reference_decisions(left, right, stop);
 }
 } // namespace
 Result<std::shared_ptr<const DependencyIndex>> DependencyIndexCache::get_or_create(
@@ -203,8 +308,8 @@ Result<InvalidationPlan> plan_invalidation(const AnalysisBasis &old, std::span<c
             if (take(old.metadata_reads.intersects(range.begin, range.size)))
                 plan.metadata_invalid = true;
         }
-        plan.decisions_changed = decisions != old.decisions;
-        plan.reference_decisions_changed = decisions.references != old.decisions.references;
+        plan.decisions_changed = !equal_decisions(decisions, old.decisions, stop);
+        plan.reference_decisions_changed = !equal_reference_decisions(decisions, old.decisions, stop);
         std::set<std::uint64_t> changed_decision_ids;
         const auto collect_changed_ids = [&](const auto &before, const auto &after) {
             using Decision = typename std::decay_t<decltype(before)>::value_type;
@@ -237,8 +342,15 @@ Result<InvalidationPlan> plan_invalidation(const AnalysisBasis &old, std::span<c
             plan.full_reason = "Original input identity changed";
         else if (key.recipe_fingerprint != old.key.recipe_fingerprint)
             plan.full_reason = "Load recipe changed";
+        else if (key.external_input_fingerprint != old.key.external_input_fingerprint)
+            plan.full_reason = "External analysis-input identity changed";
         else if (key.engine_fingerprint != old.key.engine_fingerprint)
             plan.full_reason = "Analysis engine or options changed";
+        else if (!semantic_decoder_read_set_complete(old.options))
+            plan.full_reason = "Semantic decoder external reads are not completely declared; full rebuild required";
+        else if (semantic_decoder_image_reads_intersect(old.options, plan.byte_ranges.ranges(),
+                                                        old.image->storage()->size()))
+            plan.full_reason = "Changed bytes intersect a semantic decoder image-read dependency; full rebuild required";
         else if (plan.metadata_invalid)
             plan.full_reason = "Changed loader metadata requires a freshly parsed mapping";
         else if (!old.metadata_reads_complete && !plan.byte_ranges.ranges().empty())
@@ -269,26 +381,41 @@ Result<InvalidationPlan> plan_invalidation(const AnalysisBasis &old, std::span<c
                 ? take(old.dependency_index_cache->get_or_create(old.functions->dependencies,
                                                                  old.functions, stop))
                 : take(DependencyIndex::create(old.functions->dependencies, stop));
-            for (auto fact : take(index->affected(plan.byte_ranges, stop)))
+            for (auto fact : take(index->affected(plan.byte_ranges, stop))) {
+                canceled(stop);
                 facts.insert(fact);
+            }
             if (!changed_decision_ids.empty()) {
-                const std::vector<std::uint64_t> changed_ids(changed_decision_ids.begin(), changed_decision_ids.end());
-                for (auto fact : take(index->affected_decisions(changed_ids, stop)))
+                std::vector<std::uint64_t> changed_ids;
+                changed_ids.reserve(changed_decision_ids.size());
+                for (const auto id : changed_decision_ids) {
+                    canceled(stop);
+                    changed_ids.push_back(id);
+                }
+                for (auto fact : take(index->affected_decisions(changed_ids, stop))) {
+                    canceled(stop);
                     facts.insert(fact);
+                }
             }
             // Definition changes can alter rooted call seeds/shared ownership well beyond
             // an address interval. Rewalk ownership, retaining permitted byte facts.
-            if (decisions.regions != old.decisions.regions || decisions.functions != old.decisions.functions)
+            if (!equal_root_decisions(decisions, old.decisions, stop))
                 for (auto &dependency : old.functions->dependencies) {
                     canceled(stop);
                     if (dependency.fact.kind != FactKind::instruction)
                         facts.insert(dependency.fact);
                 }
         }
-        plan.facts.assign(facts.begin(), facts.end());
-        for (auto fact : facts)
+        plan.facts.reserve(facts.size());
+        for (auto fact : facts) {
+            canceled(stop);
+            plan.facts.push_back(fact);
+        }
+        for (auto fact : facts) {
+            canceled(stop);
             if (fact.kind == FactKind::function)
                 plan.functions.push_back({fact.id});
+        }
         std::map<LocationKey, Location> sources;
         for (auto &fact : old.functions->instructions) {
             canceled(stop);
@@ -297,10 +424,15 @@ Result<InvalidationPlan> plan_invalidation(const AnalysisBasis &old, std::span<c
                 sources.emplace(location_key(fact->instruction.address), fact->instruction.address);
         }
         if (plan.reference_decisions_changed)
-            for (auto &reference : old.decisions.references)
+            for (auto &reference : old.decisions.references) {
+                canceled(stop);
                 sources.emplace(location_key(reference.source), reference.source);
-        for (auto &[location, value] : sources)
+            }
+        plan.reference_sources.reserve(sources.size());
+        for (auto &[location, value] : sources) {
+            canceled(stop);
             plan.reference_sources.push_back(value);
+        }
         if (!plan.full_reason.empty()) {
             take(plan.string_ranges.include({0}, old.image->storage()->size()));
             plan.string_reason = "Rescan the complete input domain after source or mapping uncertainty";
@@ -329,12 +461,21 @@ Result<DerivedProposal> reanalyze(const AnalysisBasis &old, std::shared_ptr<cons
         require(image->storage()->size() == key.input.size &&
                     key.engine_fingerprint == function_engine_fingerprint(old.options),
                 "Reanalysis key does not match the enabled engine/options/input extent");
-        require(plan.decisions_changed == (decisions != old.decisions),
+        require(plan.decisions_changed == !equal_decisions(decisions, old.decisions, stop),
                 "Invalidation decisions do not match reanalysis");
         if (!analysis_detail::supports_automatic_flow(*image))
             return Error{ErrorCode::unsupported, "Derived instruction analysis requires a supported processor mode"};
+        canceled(stop);
         const bool same_layout = image->layout() == old.image->layout();
         const bool same_metadata = *metadata == *old.metadata;
+        const bool callback_reads_complete = semantic_decoder_read_set_complete(old.options);
+        // The invalidation plan may have been prepared before a host callback
+        // refreshed its manifest. Recheck its current primary-image reads at
+        // the reuse boundary so newly declared dependencies cannot leave stale
+        // callback-derived instructions in the retained snapshot.
+        const bool callback_read_conflict = !callback_reads_complete ||
+            semantic_decoder_image_reads_intersect(old.options, plan.byte_ranges.ranges(),
+                                                   old.image->storage()->size());
         // A loader's dependency ranges are the fast invalidation path, but the
         // freshly parsed result remains authoritative. A changed mapping or
         // metadata snapshot disables all derived-fact reuse even when the
@@ -343,13 +484,16 @@ Result<DerivedProposal> reanalyze(const AnalysisBasis &old, std::shared_ptr<cons
                                              !plan.metadata_invalid && plan.full_reason.empty();
         const bool loader_change_requires_full_facts = plan.metadata_invalid || untracked_loader_change ||
             (!old.metadata_reads_complete && !plan.byte_ranges.ranges().empty()) ||
-            (!old.loader_metadata_complete && !plan.byte_ranges.ranges().empty());
+            (!old.loader_metadata_complete && !plan.byte_ranges.ranges().empty()) ||
+            callback_read_conflict;
         DerivedProposal output;
         output.source_key = key;
         take(bind_derived_source(output,*image,stop));
         output.full_reason = !plan.full_reason.empty() ? plan.full_reason
             : untracked_loader_change
                 ? "Loader mapping or metadata changed without a declared invalidation range; full rebuild"
+                : callback_read_conflict
+                    ? "Semantic decoder read dependencies changed or could not be certified at reanalysis; full rebuild"
                 : "";
         output.string_reason = plan.string_reason;
 
@@ -361,18 +505,23 @@ Result<DerivedProposal> reanalyze(const AnalysisBasis &old, std::shared_ptr<cons
         // the conservative instruction-byte validation/recovery path below.
         const bool reference_decisions_only =
             plan.reference_decisions_changed && plan.decisions_changed &&
-            decisions.regions == old.decisions.regions && decisions.functions == old.decisions.functions &&
+            !callback_read_conflict &&
+            equal_root_decisions(decisions, old.decisions, stop) &&
             plan.byte_ranges.ranges().empty() && plan.byte_ranges_verified && plan.full_reason.empty() &&
             same_layout && same_metadata;
         if (reference_decisions_only) {
             canceled(stop);
-            auto functions = std::make_shared<FunctionSnapshot>(*old.functions);
+            auto functions = clone_snapshot(*old.functions, stop);
             functions->key = key;
             output.counters.reused_instructions = functions->instructions.size();
             output.counters.reused_blocks = functions->blocks.size();
             output.counters.reused_functions = functions->functions.size();
             output.functions = std::move(functions);
-            output.stack_frames = derive_stack_frames(*output.functions, old.functions.get(), old.stack_frames, stop);
+            // Reference decisions do not affect function ownership, block
+            // contents, or stack transfer. The branch predicates above prove
+            // those inputs are unchanged, so avoid rebuilding lookup maps just
+            // to rediscover that every prior frame is reusable.
+            output.stack_frames = old.stack_frames;
             output.references = take(derive_references(*image, *output.functions, *metadata, decisions, stop));
             output.strings = old.strings;
             output.complete = output.functions->complete && output.references->complete() && output.strings->complete;
@@ -381,7 +530,7 @@ Result<DerivedProposal> reanalyze(const AnalysisBasis &old, std::shared_ptr<cons
                 return Error{ErrorCode::conflict, "Semantic decoder set changed during incremental analysis"};
             return output;
         }
-        if (plan.byte_ranges.ranges().empty() && !plan.decisions_changed && same_layout && same_metadata &&
+        if (!callback_read_conflict && plan.byte_ranges.ranges().empty() && !plan.decisions_changed && same_layout && same_metadata &&
             plan.full_reason.empty()) {
             // A caller that advances a source revision while certifying an
             // empty dirty set has already compared the complete effective
@@ -397,7 +546,7 @@ Result<DerivedProposal> reanalyze(const AnalysisBasis &old, std::shared_ptr<cons
                     output.functions = old.functions;
                     output.references = old.references;
                 } else {
-                    auto functions = std::make_shared<FunctionSnapshot>(*old.functions);
+                    auto functions = clone_snapshot(*old.functions, stop);
                     functions->key = key;
                     output.functions = std::move(functions);
                     std::vector<Reference> references;
@@ -423,8 +572,24 @@ Result<DerivedProposal> reanalyze(const AnalysisBasis &old, std::shared_ptr<cons
         }
         function_detail::Recovery recovery(*image, *metadata, decisions, old.options, stop);
         recovery.output->key = key;
-        bool reusable = !loader_change_requires_full_facts && plan.full_reason.empty() &&
-                        same_instruction_mapping(*old.image, *image) && same_metadata;
+        // A certified byte diff can make a loader-metadata edit safe for
+        // instruction reuse even though roots and metadata-derived references
+        // must be rebuilt. Reuse is limited to the same input/recipe/engine and
+        // only when every effective byte difference is covered by the dirty
+        // ranges; the per-instruction dependency check below then excludes
+        // facts that consumed any changed byte. Recovery still walks all roots
+        // and rebuilds ownership/CFG from the fresh metadata.
+        const bool certified_metadata_edit = plan.byte_ranges_verified &&
+            !plan.byte_ranges.ranges().empty() &&
+            (plan.metadata_invalid || !old.metadata_reads_complete || !old.loader_metadata_complete) &&
+            key.input == old.key.input && key.recipe_fingerprint == old.key.recipe_fingerprint &&
+            key.external_input_fingerprint == old.key.external_input_fingerprint &&
+            key.engine_fingerprint == old.key.engine_fingerprint;
+        bool reusable = (!loader_change_requires_full_facts || certified_metadata_edit) &&
+                        (plan.full_reason.empty() || certified_metadata_edit) &&
+                        !callback_read_conflict &&
+                        same_instruction_mapping(*old.image, *image, stop) &&
+                        (same_metadata || certified_metadata_edit);
         if (reusable)
             for (auto &fact : old.functions->instructions) {
                 canceled(stop);
@@ -444,16 +609,20 @@ Result<DerivedProposal> reanalyze(const AnalysisBasis &old, std::shared_ptr<cons
                 }
             }
         auto recovered = recovery.run();
-        auto functions = std::make_shared<FunctionSnapshot>(*recovered);
+        auto functions = clone_snapshot(*recovered, stop);
         output.counters.decoded_instructions = recovery.decoded_instructions;
         output.counters.reused_instructions = recovery.reused_instructions;
         if (reusable) {
             std::map<BlockId, std::shared_ptr<const BasicBlock>> blocks;
             std::map<FunctionId, std::shared_ptr<const FunctionRecord>> records;
-            for (auto &block : old.functions->blocks)
+            for (auto &block : old.functions->blocks) {
+                canceled(stop);
                 blocks.emplace(block->id, block);
-            for (auto &function : old.functions->functions)
+            }
+            for (auto &function : old.functions->functions) {
+                canceled(stop);
                 records.emplace(function->id, function);
+            }
             for (auto &block : functions->blocks) {
                 canceled(stop);
                 auto found = blocks.find(block->id);
@@ -472,11 +641,14 @@ Result<DerivedProposal> reanalyze(const AnalysisBasis &old, std::shared_ptr<cons
             }
         }
         output.functions = std::move(functions);
-        output.stack_frames = derive_stack_frames(*output.functions, old.functions.get(), old.stack_frames, stop);
+        output.stack_frames = derive_stack_frames(*output.functions, old.functions.get(), old.stack_frames, stop,
+                                                   default_stack_calling_convention(*metadata),
+                                                   default_stack_calling_convention(*metadata) ==
+                                                       default_stack_calling_convention(*old.metadata));
         output.references = take(derive_references(*image, *output.functions, *metadata, decisions, stop));
         bool loader_strings_reused = false;
         if (loader_change_requires_full_facts && key.input == old.key.input &&
-            key.recipe_fingerprint == old.key.recipe_fingerprint && same_string_mapping(*old.image, *image)) {
+            key.recipe_fingerprint == old.key.recipe_fingerprint && same_string_mapping(*old.image, *image, stop)) {
             std::optional<ReadSet> verified_string_changes;
             if (plan.byte_ranges_verified) {
                 verified_string_changes = plan.byte_ranges;
@@ -499,11 +671,11 @@ Result<DerivedProposal> reanalyze(const AnalysisBasis &old, std::shared_ptr<cons
             }
         }
         if (!loader_strings_reused) {
-            if (plan.string_ranges.ranges().empty() && same_string_mapping(*old.image, *image) &&
+            if (plan.string_ranges.ranges().empty() && same_string_mapping(*old.image, *image, stop) &&
                 plan.full_reason.empty())
                 output.strings = old.strings;
             else if (plan.full_reason.empty() && plan.byte_ranges_verified &&
-                     same_string_mapping(*old.image, *image))
+                     same_string_mapping(*old.image, *image, stop))
                 output.strings = std::make_shared<const StringScan>(
                     take(refresh_strings(*image, old.options, *old.strings, plan.string_ranges, stop)));
             else
@@ -535,7 +707,10 @@ Result<DerivedProposal> analyze_derived(std::shared_ptr<const Image> image,
         take(bind_derived_source(result,*image,stop));
         result.full_reason = "Full derived analysis requested";
         result.functions = recovery.run();
-        result.stack_frames = derive_stack_frames(*result.functions, nullptr, {}, stop);
+        if (key.engine_fingerprint != function_engine_fingerprint(options))
+            return Error{ErrorCode::conflict, "Semantic decoder set changed during derived analysis"};
+        result.stack_frames = derive_stack_frames(*result.functions, nullptr, {}, stop,
+                                                  default_stack_calling_convention(*metadata));
         result.counters.decoded_instructions = recovery.decoded_instructions;
         result.references = take(derive_references(*image, *result.functions, *metadata, decisions, stop));
         result.strings = std::make_shared<const StringScan>(take(find_strings(*image, options, stop)));

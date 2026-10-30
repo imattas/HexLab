@@ -84,8 +84,12 @@ HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction> prepare_call_effects(
 HEXLAB_DECOMPILER_EXPORT AbiDescription x86_64_windows_abi();
 HEXLAB_DECOMPILER_EXPORT AbiDescription x86_64_system_v_abi();
 HEXLAB_DECOMPILER_EXPORT AbiDescription x86_32_cdecl_abi();
+HEXLAB_DECOMPILER_EXPORT AbiDescription x86_32_stdcall_abi();
+HEXLAB_DECOMPILER_EXPORT AbiDescription x86_32_fastcall_abi();
+HEXLAB_DECOMPILER_EXPORT AbiDescription x86_32_thiscall_abi();
 HEXLAB_DECOMPILER_EXPORT AbiDescription aarch64_abi();
 HEXLAB_DECOMPILER_EXPORT AbiDescription arm32_aapcs_abi();
+HEXLAB_DECOMPILER_EXPORT AbiDescription arm32_aapcs_vfp_abi();
 HEXLAB_DECOMPILER_EXPORT AbiDescription riscv32_ilp32_abi();
 HEXLAB_DECOMPILER_EXPORT AbiDescription riscv64_lp64_abi();
 HEXLAB_DECOMPILER_EXPORT AbiDescription mips32_o32_abi();

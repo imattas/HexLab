@@ -1,0 +1,25 @@
+{
+  "name": "brotli-decoder",
+  "version": "1.2.1",
+  "repository": "https://github.com/google/brotli",
+  "tag": "v1.2.1",
+  "commit": "db24a98aed38a16de78cc05ca15cdd8dc2a0d92d",
+  "license": "MIT",
+  "license_files": ["LICENSE"],
+  "purpose": "Decode Brotli-compressed EDK II UEFI GUID-defined sections.",
+  "built_sources": [
+    "c/common/constants.c",
+    "c/common/context.c",
+    "c/common/dictionary.c",
+    "c/common/platform.c",
+    "c/common/shared_dictionary.c",
+    "c/common/transform.c",
+    "c/dec/*.c"
+  ],
+  "public_headers": ["c/include/brotli/decode.h", "c/include/brotli/port.h", "c/include/brotli/types.h"],
+  "local_changes": [
+    "CMake builds a static decoder-only target; encoder and shared-dictionary source files are not compiled.",
+    "HexLab supplies a custom decoder allocator capped by the guided payload scratch declaration and a 32 MiB hard ceiling.",
+    "HexLab feeds and drains the decoder in 64 KiB steps with cancellation checks, exact output sizing, compressed-tail rejection, and global decode budgets."
+  ]
+}

@@ -32,8 +32,10 @@ struct AnalysisPool::Impl {
     explicit Impl(PoolLimits value) : limits(value) {
         if (!limits.max_sessions || limits.max_sessions > 4096)
             throw std::invalid_argument("Analysis pool capacity must be between 1 and 4096 sessions");
-        workers.reserve(2);
-        for (unsigned i = 0; i < 2; ++i)
+        if (!limits.max_workers || limits.max_workers > 16)
+            throw std::invalid_argument("Analysis pool worker count must be between 1 and 16");
+        workers.reserve(limits.max_workers);
+        for (std::size_t i = 0; i < limits.max_workers; ++i)
             workers.emplace_back([this](std::stop_token stop) { run(stop); });
     }
     static void finish(Work &work, Result<AnalysisPayload> result) {

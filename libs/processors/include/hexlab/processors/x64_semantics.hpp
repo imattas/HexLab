@@ -75,6 +75,167 @@ struct X86ShiftRotateResult {
     bool operator==(const X86ShiftRotateResult &) const = default;
 };
 
+enum class X86Bmi1 : std::uint8_t { andn, bextr, blsi, blsmsk, blsr };
+struct X86Bmi1Result {
+    std::uint64_t value = 0;
+    X86ShiftRotateFlags flags{};
+    bool operator==(const X86Bmi1Result &) const = default;
+};
+
+enum class X86Bmi2 : std::uint8_t { pdep, pext };
+struct X86Bmi2Result {
+    std::uint64_t value = 0;
+    bool operator==(const X86Bmi2Result &) const = default;
+};
+
+// PDEP scatters source bits into set mask positions; PEXT gathers those
+// positions into contiguous low bits. Inputs are architectural bit patterns.
+// A 32-bit result is returned zero-extended, including in long mode.
+constexpr std::optional<X86Bmi2Result> evaluate_x86_bmi2(
+    X86Bmi2 operation, std::uint64_t source, std::uint64_t bit_mask, unsigned width) noexcept {
+    if ((operation != X86Bmi2::pdep && operation != X86Bmi2::pext) ||
+        (width != 32 && width != 64)) return std::nullopt;
+    const std::uint64_t value_mask = width == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    source &= value_mask;
+    bit_mask &= value_mask;
+    X86Bmi2Result result{};
+    unsigned compact_bit = 0;
+    for (unsigned mask_bit = 0; mask_bit < width; ++mask_bit) {
+        const auto bit = UINT64_C(1) << mask_bit;
+        if (!(bit_mask & bit)) continue;
+        if (operation == X86Bmi2::pdep) {
+            if (source & (UINT64_C(1) << compact_bit)) result.value |= bit;
+        } else if (operation == X86Bmi2::pext) {
+            if (source & bit) result.value |= UINT64_C(1) << compact_bit;
+        }
+        ++compact_bit;
+    }
+    result.value &= value_mask;
+    return result;
+}
+
+struct X86BzhiResult {
+    std::uint64_t value = 0;
+    X86ShiftRotateFlags flags{};
+    bool operator==(const X86BzhiResult &) const = default;
+};
+
+// Evaluate BMI2 BZHI. The index is the low byte of the second source; an
+// index at least as large as the operand width copies the source and sets CF.
+constexpr std::optional<X86BzhiResult> evaluate_x86_bzhi(
+    std::uint64_t source, std::uint64_t index_value, unsigned width) noexcept {
+    if (width != 32 && width != 64) return std::nullopt;
+    const auto mask = width == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    source &= mask;
+    const unsigned index = static_cast<std::uint8_t>(index_value);
+    const bool oversized = index >= width;
+    const auto bit_mask = oversized ? mask : index == 0 ? 0 : (UINT64_C(1) << index) - 1;
+    X86BzhiResult result{};
+    result.value = source & bit_mask;
+    result.flags.carry = {oversized, true};
+    result.flags.overflow = {false, true};
+    result.flags.sign = {(result.value & (UINT64_C(1) << (width - 1))) != 0, true};
+    result.flags.zero = {result.value == 0, true};
+    result.flags.parity = {(std::popcount(static_cast<unsigned>(result.value & 0xff)) & 1) == 0, true};
+    result.flags.auxiliary = {};
+    return result;
+}
+
+// Evaluate one supplied hardware sample. This function never produces entropy.
+// An unavailable sample writes zero; successful samples truncate to operand size.
+struct X86RandomResult {
+    std::uint64_t value = 0;
+    std::uint64_t flags = 0;
+    bool operator==(const X86RandomResult &) const = default;
+};
+constexpr std::optional<X86RandomResult> evaluate_x86_random(
+    std::uint64_t sample, bool available, unsigned width, std::uint64_t incoming_flags) noexcept {
+    if (width != 16 && width != 32 && width != 64) return std::nullopt;
+    const auto mask = width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1;
+    // CF/PF/AF/ZF/SF/OF are the only modified FLAGS bits.
+    return X86RandomResult{available ? sample & mask : 0,
+                           (incoming_flags & ~UINT64_C(0x8d5)) | (available ? 1u : 0u)};
+}
+
+enum class X86Adx : std::uint8_t { carry, overflow };
+struct X86AdxResult {
+    std::uint64_t value = 0;
+    X86Flags flags{};
+    bool operator==(const X86AdxResult &) const = default;
+};
+
+// ADCX and ADOX form independent carry chains. All non-chain status flags are
+// preserved. The operand width is restricted to the architectural 32/64-bit
+// forms, and overflow is detected without relying on host signed arithmetic.
+constexpr std::optional<X86AdxResult> evaluate_x86_adx(
+    X86Adx operation, std::uint64_t destination, std::uint64_t source,
+    X86Flags incoming, unsigned width) noexcept {
+    if (width != 32 && width != 64) return std::nullopt;
+    const std::uint64_t mask = width == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    destination &= mask;
+    source &= mask;
+    const bool carry_in = operation == X86Adx::carry ? incoming.carry : incoming.overflow;
+    std::uint64_t partial = destination + source;
+    const bool carry1 = partial < destination;
+    const std::uint64_t result_value = partial + static_cast<std::uint64_t>(carry_in);
+    const bool carry2 = result_value < partial;
+    X86AdxResult result;
+    result.value = result_value & mask;
+    result.flags = incoming;
+    const bool output = width == 64 ? (carry1 || carry2)
+                                    : ((destination + source + static_cast<std::uint64_t>(carry_in)) > mask);
+    if (operation == X86Adx::carry) result.flags.carry = output;
+    else result.flags.overflow = output;
+    return result;
+}
+
+// Sources follow printed operand order, excluding the destination. Unary
+// lowest-set-bit operations ignore source2. AF/PF are always undefined;
+// BEXTR also leaves SF undefined. No host-width shifts or signed overflow.
+constexpr std::optional<X86Bmi1Result>
+evaluate_x86_bmi1(X86Bmi1 operation, std::uint64_t source1,
+                  std::uint64_t source2, unsigned width) noexcept {
+    if (width != 32 && width != 64) return std::nullopt;
+    const auto mask = width == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    source1 &= mask;
+    source2 &= mask;
+    X86Bmi1Result result;
+    bool carry = false;
+    switch (operation) {
+    case X86Bmi1::andn: result.value = (~source1 & source2) & mask; break;
+    case X86Bmi1::bextr: {
+        const unsigned start = static_cast<unsigned>(source2 & 0xff);
+        const unsigned length = static_cast<unsigned>((source2 >> 8) & 0xff);
+        if (start < width && length != 0) {
+            const unsigned available = width - start;
+            const unsigned count = length < available ? length : available;
+            const auto field_mask = count == 64 ? UINT64_MAX : (UINT64_C(1) << count) - 1;
+            result.value = (source1 >> start) & field_mask;
+        }
+        break;
+    }
+    case X86Bmi1::blsi:
+        result.value = (source1 & (UINT64_C(0) - source1)) & mask;
+        carry = source1 != 0;
+        break;
+    case X86Bmi1::blsmsk:
+        result.value = (source1 ^ (source1 - 1)) & mask;
+        carry = source1 == 0;
+        break;
+    case X86Bmi1::blsr:
+        result.value = (source1 & (source1 - 1)) & mask;
+        carry = source1 == 0;
+        break;
+    default: return std::nullopt;
+    }
+    result.flags.carry = {carry, true};
+    result.flags.overflow = {false, true};
+    result.flags.zero = {result.value == 0, true};
+    if (operation != X86Bmi1::bextr)
+        result.flags.sign = {(result.value & (UINT64_C(1) << (width - 1))) != 0, true};
+    return result;
+}
+
 namespace x86_semantics_detail {
 struct U128 { std::uint64_t low = 0, high = 0; };
 constexpr U128 multiply_u64(std::uint64_t a, std::uint64_t b) noexcept {

@@ -29,6 +29,16 @@ the low, signed high, or unsigned high half of each 16-by-16-bit product.
 `PMADDWD` sums adjacent signed word products into four wrapping dword results.
 `PAVGB` and `PAVGW` compute the unsigned rounded average `(a + b + 1) >> 1`
 in each byte or word lane.
+Immediate `PSLLDQ` and `PSRLDQ` shift the complete XMM byte sequence left or
+right by the encoded count, fill vacated bytes with zero, and zero the full
+result when the count is at least 16. Their legacy `66 0F 73 /7` and `/3`
+encodings retain a destructive XMM destination and are lifted as typed 128-bit
+intrinsics.
 The evaluator still rejects any opcode outside its closed list and requires
 the decoded 128-bit XMM/memory operand shape; it does not infer an operation
 from a mnemonic or fetch memory itself.
+
+`PSADBW` sums unsigned absolute differences of corresponding bytes separately
+in each eight-byte group, returning each sum in the low 16 bits of its qword
+and clearing the remaining bits in that qword. Its decoded XMM/m128 source and
+destructive XMM destination are retained by the typed lift.

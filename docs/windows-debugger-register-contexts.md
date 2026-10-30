@@ -45,4 +45,15 @@ the same underlying register through two aliases are rejected. `x18` and
 `w18` remain read-only because Windows reserves them as the thread environment
 pointer. The ARM64-specific branch remains conditional on an ARM64 build and
 still needs target-host validation. The backend does not claim a complete
-Windows XSAVE view: AVX-512/ZMM/opmask and WOW64 AVX remain unavailable.
+Windows XSAVE view; WOW64 AVX remains unavailable and the AVX-512 extension
+below is read-only.
+
+On native x64 Windows, a pending debug stop may additionally expose read-only
+`zmm0`-`zmm31` (64 bytes each) and `k0`-`k7` (8 bytes each) when AVX-512F is
+available and Windows reports all required AVX, opmask, ZMM_Hi256, and
+Hi16_ZMM XState components. Missing components are presented as architectural
+zero state; malformed or overlapping component extents reject the extended
+snapshot, after which the backend falls back to the existing AVX/YMM view when
+that remains available. The new ZMM/opmask values are inspection-only; writes
+remain unsupported. This does not expose AVX-512 state for WOW64 targets or
+32-bit debugger builds, and does not claim support for compacted XState layouts.

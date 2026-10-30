@@ -1,6 +1,7 @@
 #include "hexlab/debugger/debugger.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cctype>
@@ -10,9 +11,36 @@
 #include <utility>
 
 namespace hexlab::debugger {
+Result<LinuxSiginfoHeader> decode_linux_siginfo_header(
+    std::span<const std::byte> bytes, unsigned pointer_bits, ByteOrder byte_order) {
+    if (pointer_bits != 32 && pointer_bits != 64)
+        return Error{ErrorCode::invalid_argument, "Linux siginfo header decoding requires a 32-bit or 64-bit ABI"};
+    if (byte_order != ByteOrder::little && byte_order != ByteOrder::big)
+        return Error{ErrorCode::invalid_argument, "Linux siginfo header decoding requires a known byte order"};
+    const std::size_t union_offset = pointer_bits == 64 ? 16 : 12;
+    if (bytes.size() < union_offset)
+        return Error{ErrorCode::malformed, "Linux siginfo record is shorter than its ABI header"};
+    const auto read_signed = [&](std::size_t offset) {
+        std::uint32_t value = 0;
+        for (std::size_t index = 0; index < 4; ++index) {
+            const auto source = byte_order == ByteOrder::little ? offset + 3 - index : offset + index;
+            value = (value << 8) | std::to_integer<std::uint32_t>(bytes[source]);
+        }
+        return std::bit_cast<std::int32_t>(value);
+    };
+    LinuxSiginfoHeader result;
+    result.signal_number = read_signed(0);
+    result.error_number = read_signed(4);
+    result.code = read_signed(8);
+    result.union_bytes.assign(bytes.begin() + static_cast<std::ptrdiff_t>(union_offset), bytes.end());
+    return result;
+}
 namespace {
 Error invalid_state(const char* operation) {
     return {ErrorCode::invalid_argument, std::string(operation) + " is invalid in the current debugger state"};
+}
+bool valid_continue_status(ContinueStatus status) {
+    return status == ContinueStatus::handled || status == ContinueStatus::not_handled;
 }
 constexpr std::size_t max_breakpoint_event_ids = 4096;
 constexpr std::size_t max_debug_event_message_bytes = 4096;
@@ -53,6 +81,7 @@ private:
     MemoryRead memory_read_;
     std::string_view label_;
     std::size_t pos_ = 0, tokens_ = 0;
+    bool evaluation_enabled_ = true;
     void skip() { while (pos_ < source_.size() && std::isspace(static_cast<unsigned char>(source_[pos_]))) ++pos_; }
     Error syntax(const char* message) const { return {ErrorCode::invalid_argument, std::string(label_) + ": " + message}; }
     bool take(std::string_view token) { skip(); if (source_.substr(pos_, token.size()) == token) { pos_ += token.size(); return true; } return false; }
@@ -66,12 +95,26 @@ private:
     }
     Result<std::uint64_t> parse_or(unsigned depth) {
         auto lhs=parse_and(depth); if(!lhs)return lhs.error();
-        while(take("||")){ auto rhs=parse_and(depth); if(!rhs)return rhs.error(); lhs=std::uint64_t(lhs.value()!=0 || rhs.value()!=0); }
+        while(take("||")){
+            const bool outer = evaluation_enabled_;
+            evaluation_enabled_ = outer && lhs.value() == 0;
+            auto rhs=parse_and(depth);
+            evaluation_enabled_ = outer;
+            if(!rhs)return rhs.error();
+            lhs=std::uint64_t(outer && (lhs.value()!=0 || rhs.value()!=0));
+        }
         return lhs;
     }
     Result<std::uint64_t> parse_and(unsigned depth) {
         auto lhs=parse_compare(depth); if(!lhs)return lhs.error();
-        while(take("&&")){ auto rhs=parse_compare(depth); if(!rhs)return rhs.error(); lhs=std::uint64_t(lhs.value()!=0 && rhs.value()!=0); }
+        while(take("&&")){
+            const bool outer = evaluation_enabled_;
+            evaluation_enabled_ = outer && lhs.value() != 0;
+            auto rhs=parse_compare(depth);
+            evaluation_enabled_ = outer;
+            if(!rhs)return rhs.error();
+            lhs=std::uint64_t(outer && lhs.value()!=0 && rhs.value()!=0);
+        }
         return lhs;
     }
     Result<std::uint64_t> parse_compare(unsigned depth) {
@@ -108,43 +151,43 @@ private:
         for (;;) {
             if (take("<<")) {
                 auto rhs=parse_add(depth); if(!rhs)return rhs.error();
-                if (rhs.value() >= 64) return syntax("shift count must be less than 64");
-                lhs=lhs.value() << rhs.value();
+                if (evaluation_enabled_ && rhs.value() >= 64) return syntax("shift count must be less than 64");
+                lhs=evaluation_enabled_ ? lhs.value() << rhs.value() : 0;
             } else if (take(">>")) {
                 auto rhs=parse_add(depth); if(!rhs)return rhs.error();
-                if (rhs.value() >= 64) return syntax("shift count must be less than 64");
-                lhs=lhs.value() >> rhs.value();
+                if (evaluation_enabled_ && rhs.value() >= 64) return syntax("shift count must be less than 64");
+                lhs=evaluation_enabled_ ? lhs.value() >> rhs.value() : 0;
             } else return lhs;
         }
     }
     Result<std::uint64_t> parse_add(unsigned depth) {
         auto lhs=parse_multiply(depth); if(!lhs)return lhs.error();
         for (;;) {
-            if (take("+")) { auto rhs=parse_multiply(depth); if(!rhs)return rhs.error(); lhs=lhs.value()+rhs.value(); }
-            else if (take("-")) { auto rhs=parse_multiply(depth); if(!rhs)return rhs.error(); lhs=lhs.value()-rhs.value(); }
+            if (take("+")) { auto rhs=parse_multiply(depth); if(!rhs)return rhs.error(); lhs=evaluation_enabled_ ? lhs.value()+rhs.value() : 0; }
+            else if (take("-")) { auto rhs=parse_multiply(depth); if(!rhs)return rhs.error(); lhs=evaluation_enabled_ ? lhs.value()-rhs.value() : 0; }
             else return lhs;
         }
     }
     Result<std::uint64_t> parse_multiply(unsigned depth) {
         auto lhs=parse_unary(depth); if(!lhs)return lhs.error();
         for (;;) {
-            if (take("*")) { auto rhs=parse_unary(depth); if(!rhs)return rhs.error(); lhs=lhs.value()*rhs.value(); }
+            if (take("*")) { auto rhs=parse_unary(depth); if(!rhs)return rhs.error(); lhs=evaluation_enabled_ ? lhs.value()*rhs.value() : 0; }
             else if (take("/")) {
                 auto rhs=parse_unary(depth); if(!rhs)return rhs.error();
-                if (!rhs.value()) return syntax("division by zero");
-                lhs=lhs.value()/rhs.value();
+                if (evaluation_enabled_ && !rhs.value()) return syntax("division by zero");
+                lhs=evaluation_enabled_ ? lhs.value()/rhs.value() : 0;
             } else if (take("%")) {
                 auto rhs=parse_unary(depth); if(!rhs)return rhs.error();
-                if (!rhs.value()) return syntax("remainder by zero");
-                lhs=lhs.value()%rhs.value();
+                if (evaluation_enabled_ && !rhs.value()) return syntax("remainder by zero");
+                lhs=evaluation_enabled_ ? lhs.value()%rhs.value() : 0;
             } else return lhs;
         }
     }
     Result<std::uint64_t> parse_unary(unsigned depth) {
         if (depth > 16) return Error{ErrorCode::resource_limit, std::string(label_) + " nesting exceeds 16 levels"};
         if (++tokens_ > 64) return Error{ErrorCode::resource_limit, std::string(label_) + " exceeds 64 parsed operands"};
-        if(take("!")){auto v=parse_unary(depth+1);if(!v)return v.error();return std::uint64_t(v.value()==0);}
-        if(take("~")){auto v=parse_unary(depth+1);if(!v)return v.error();return ~v.value();}
+        if(take("!")){auto v=parse_unary(depth+1);if(!v)return v.error();return std::uint64_t(evaluation_enabled_ && v.value()==0);}
+        if(take("~")){auto v=parse_unary(depth+1);if(!v)return v.error();return evaluation_enabled_ ? ~v.value() : 0;}
         if(take("(")){auto v=parse_or(depth+1);if(!v)return v.error();if(!take(")"))return syntax("missing closing parenthesis");return v;}
         skip(); const auto start=pos_;
         if(pos_<source_.size() && std::isdigit(static_cast<unsigned char>(source_[pos_]))) {
@@ -166,11 +209,14 @@ private:
                 auto address = parse_or(depth + 1);
                 if (!address) return address.error();
                 if (!take(")")) return syntax("missing closing parenthesis after memory address");
+                if (!evaluation_enabled_) return std::uint64_t{0};
                 if (!memory_read_) return Error{ErrorCode::unsupported, std::string(label_) + ": target memory is unavailable"};
                 return memory_read_(address.value(), width);
             }
+            if (!evaluation_enabled_) return std::uint64_t{0};
             auto reg=std::find_if(registers_.begin(),registers_.end(),[&](const auto& r){if(r.name.size()!=name.size())return false;for(std::size_t i=0;i<name.size();++i)if(std::tolower(static_cast<unsigned char>(r.name[i]))!=std::tolower(static_cast<unsigned char>(name[i])))return false;return true;});
             if(reg==registers_.end())return Error{ErrorCode::invalid_argument,std::string(label_)+": unknown register '"+name+"'"};
+            if(!reg->available)return Error{ErrorCode::unsupported,std::string(label_)+": register '"+name+"' is unavailable"};
             if(reg->bytes.empty() || reg->bytes.size()>8)return Error{ErrorCode::unsupported,std::string(label_)+": register '"+name+"' is not a scalar of at most 64 bits"};
             if(!reg->byte_order)return Error{ErrorCode::unsupported,std::string(label_)+": byte order is unknown for register '"+name+"'"};
             std::uint64_t value=0; for(std::size_t i=0;i<reg->bytes.size();++i){const auto index=*reg->byte_order==ByteOrder::little?reg->bytes.size()-1-i:i;value=(value<<8)|std::to_integer<unsigned>(reg->bytes[index]);} return value;
@@ -259,7 +305,14 @@ struct DebugSession::Impl {
 DebugSession::DebugSession(std::unique_ptr<Backend> backend) : impl_(std::make_unique<Impl>(std::move(backend))) {}
 DebugSession::~DebugSession() { if (impl_ && impl_->backend && impl_->process) (void)detach(); }
 DebugSession::DebugSession(DebugSession&&) noexcept = default;
-DebugSession& DebugSession::operator=(DebugSession&&) noexcept = default;
+DebugSession& DebugSession::operator=(DebugSession&& other) noexcept {
+    if (this == &other) return *this;
+    // Replacing an active session must follow the same best-effort cleanup
+    // path as destruction before its backend ownership is released.
+    if (impl_ && impl_->backend && impl_->process) (void)detach();
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 SessionState DebugSession::state() const noexcept { return impl_->state; }
 const std::optional<ProcessInfo>& DebugSession::process() const noexcept { return impl_->process; }
 bool DebugSession::supports_scheduled_signal_disposition() const noexcept {
@@ -301,6 +354,8 @@ Result<ProcessInfo> DebugSession::launch(const Target& target) {
     const bool remote_active = impl_->backend->remote_launch_available();
     const bool connected_remote_launch = remote_active && (impl_->state == SessionState::running ||
         impl_->state == SessionState::stopped || impl_->state == SessionState::exited);
+    if (!connected_remote_launch && !target.remote_environment.empty())
+        return Error{ErrorCode::unsupported, "environment changes require an active extended-remote launch session"};
     if (!connected_remote_launch && impl_->state != SessionState::idle && impl_->state != SessionState::detached)
         return invalid_state("launch");
     if (connected_remote_launch && (impl_->pending_event || impl_->notification_ack_pending))
@@ -321,12 +376,19 @@ Result<ProcessInfo> DebugSession::attach(ProcessId id) {
     return result;
 }
 Result<ProcessInfo> DebugSession::connect_remote(std::string_view host, std::uint16_t port) {
+    return connect_remote(host, port, RemoteConnectOptions{});
+}
+Result<ProcessInfo> DebugSession::connect_remote(std::string_view host, std::uint16_t port,
+    const RemoteConnectOptions& options) {
     if ((impl_->state != SessionState::idle && impl_->state != SessionState::detached) || !impl_->backend || host.empty() || port == 0)
         return invalid_state("connect_remote");
-    auto result = impl_->backend->connect_remote(host, port);
+    auto result = impl_->backend->connect_remote(host, port, options);
     if (result) { impl_->resume_filter.reset(); impl_->step_resume = false; }
     if (result) { impl_->process = result.value(); impl_->state = SessionState::running; impl_->pending_event.reset(); impl_->pending_event_kind.reset(); impl_->notification_ack_pending = false; impl_->interrupt_requested = false; impl_->breakpoints.clear(); }
     return result;
+}
+std::optional<RemoteTargetMetadata> DebugSession::remote_target_metadata() const {
+    return impl_->backend ? impl_->backend->remote_target_metadata() : std::optional<RemoteTargetMetadata>{};
 }
 Result<ProcessInfo> DebugSession::attach_remote_process(ProcessId process) {
     if (!impl_->backend || process == 0 ||
@@ -366,6 +428,8 @@ Status DebugSession::terminate() {
         impl_->pending_event_kind.reset();
         impl_->notification_ack_pending = false;
         impl_->interrupt_requested = false;
+        impl_->resume_filter.reset();
+        impl_->step_resume = false;
         impl_->breakpoints.clear();
         impl_->state = SessionState::exited;
     }
@@ -385,6 +449,8 @@ Status DebugSession::detach() {
                 const auto next_id = next->id;
                 auto detached = impl_->backend->detach_remote_current_process(current);
                 if (detached) {
+                    impl_->resume_filter.reset();
+                    impl_->step_resume = false;
                     impl_->process.reset(); impl_->pending_event.reset(); impl_->pending_event_kind.reset(); impl_->notification_ack_pending = false; impl_->interrupt_requested = false;
                     impl_->breakpoints.clear(); impl_->state = SessionState::detached;
                     auto attached = attach_remote_process(next_id);
@@ -412,7 +478,13 @@ Status DebugSession::detach() {
     if (!result && impl_->last_diagnostic &&
         impl_->last_diagnostic->find("server rejected PID-specific detach") == 0)
         *impl_->last_diagnostic += "; whole-session detach failed: " + result.error().message;
-    if (result) { impl_->process.reset(); impl_->pending_event.reset(); impl_->pending_event_kind.reset(); impl_->notification_ack_pending = false; impl_->interrupt_requested = false; impl_->breakpoints.clear(); impl_->state = SessionState::detached; }
+    if (result) {
+        impl_->resume_filter.reset();
+        impl_->step_resume = false;
+        impl_->process.reset(); impl_->pending_event.reset(); impl_->pending_event_kind.reset();
+        impl_->notification_ack_pending = false; impl_->interrupt_requested = false;
+        impl_->breakpoints.clear(); impl_->state = SessionState::detached;
+    }
     return result;
 }
 Status DebugSession::request_interrupt() {
@@ -424,7 +496,20 @@ Status DebugSession::request_interrupt() {
     if (result) impl_->interrupt_requested = true;
     return result;
 }
+Status DebugSession::request_thread_interrupt(ThreadId thread) {
+    if (!impl_->backend || !impl_->process || impl_->state != SessionState::running || impl_->pending_event)
+        return invalid_state("request_thread_interrupt");
+    if (thread == 0)
+        return Error{ErrorCode::invalid_argument, "thread-qualified interrupt requires a nonzero session thread ID"};
+    return impl_->backend->request_thread_interrupt(thread);
+}
+bool DebugSession::supports_thread_interrupt() const noexcept {
+    return impl_->backend && impl_->process && impl_->state == SessionState::running &&
+        impl_->backend->supports_thread_interrupt();
+}
 Result<DebugEvent> DebugSession::wait_event(std::chrono::milliseconds timeout) {
+    if (timeout.count() < 0)
+        return Error{ErrorCode::invalid_argument, "debug event wait timeout cannot be negative"};
     const bool queued_notification = impl_->state == SessionState::stopped && impl_->notification_ack_pending;
     if (!impl_->backend || (impl_->state != SessionState::running && !queued_notification) || impl_->pending_event)
         return invalid_state("wait_event");
@@ -433,13 +518,20 @@ Result<DebugEvent> DebugSession::wait_event(std::chrono::milliseconds timeout) {
     for (;;) {
         auto result = impl_->backend->wait_event(remaining);
         if (!result) return result;
-        impl_->notification_ack_pending = false;
-        impl_->interrupt_requested = false;
         auto event = std::move(result.value());
+        if (event.exception_parameters.size() > max_debug_event_exception_parameters) {
+            event.exception_parameters.resize(max_debug_event_exception_parameters);
+            event.exception_parameters_truncated = true;
+        }
         if (event.message.size() > max_debug_event_message_bytes) {
             event.message.resize(max_debug_event_message_bytes - truncated_text.size());
             event.message += truncated_text;
         }
+        // Informational output does not consume a stop token or change the
+        // session's running/stopped state.
+        if (event.kind == EventKind::output && !impl_->backend->output_events_require_acknowledgement()) return event;
+        impl_->notification_ack_pending = false;
+        impl_->interrupt_requested = false;
         bool suppress = event.kind == EventKind::breakpoint && !event.breakpoint_ids.empty();
         bool matched_logpoint = false;
         std::string log_message;
@@ -485,6 +577,17 @@ Result<DebugEvent> DebugSession::wait_event(std::chrono::milliseconds timeout) {
                     auto value = parser.evaluate();
                     if (!value) { append_bounded(event.message, " [condition error: " + value.error().message + "]"); suppress = false; continue; }
                     passes = value.value() != 0;
+                }
+                if (passes && found->one_shot && found->enabled) {
+                    auto disabled = impl_->backend->set_breakpoint_enabled(found->id, false);
+                    if (!disabled) {
+                        append_bounded(event.message,
+                            " [one-shot breakpoint could not be disabled: " + disabled.error().message + "]");
+                        suppress = false;
+                        continue;
+                    }
+                    found->enabled = false;
+                    found->one_shot = false;
                 }
                 if (passes && found->logpoint) {
                     std::string message = found->log_message;
@@ -587,6 +690,8 @@ Result<DebugEvent> DebugSession::wait_event(std::chrono::milliseconds timeout) {
 Status DebugSession::continue_execution(std::uint64_t sequence, ContinueStatus status) {
     if (!impl_->backend || !impl_->pending_event || *impl_->pending_event != sequence || impl_->state == SessionState::detached)
         return invalid_state("continue");
+    if (!valid_continue_status(status))
+        return Error{ErrorCode::invalid_argument, "unknown debug event disposition"};
     auto result = impl_->backend->continue_event(sequence, status);
     if (result) {
         impl_->resume_filter.reset();
@@ -607,6 +712,8 @@ Status DebugSession::continue_thread_execution(std::uint64_t sequence, ThreadId 
     if (!impl_->backend || !impl_->pending_event || *impl_->pending_event != sequence ||
         impl_->state != SessionState::stopped || thread == 0)
         return invalid_state("thread-qualified continue");
+    if (!valid_continue_status(status))
+        return Error{ErrorCode::invalid_argument, "unknown debug event disposition"};
     std::vector<ThreadResumeAction> filter{{thread, ThreadResumeKind::continue_execution}};
     auto result = impl_->backend->continue_thread_event(sequence, thread, status);
     if (result) {
@@ -625,6 +732,8 @@ Status DebugSession::single_step_execution(std::uint64_t sequence, ContinueStatu
     if (!impl_->backend || !impl_->pending_event || *impl_->pending_event != sequence ||
         impl_->state != SessionState::stopped)
         return invalid_state("single_step");
+    if (!valid_continue_status(status))
+        return Error{ErrorCode::invalid_argument, "unknown debug event disposition"};
     auto result = impl_->backend->single_step_event(sequence, status);
     if (result) {
         impl_->resume_filter.reset();
@@ -648,6 +757,8 @@ Status DebugSession::resume_threads(std::uint64_t sequence, std::span<const Thre
     std::set<ThreadId> threads;
     bool resumes_any_thread = false;
     for (const auto& action : actions) {
+        if (action.signal_disposition && !valid_continue_status(*action.signal_disposition))
+            return Error{ErrorCode::invalid_argument, "thread resume schedule contains an unknown signal disposition"};
         if (action.thread == 0 || !threads.insert(action.thread).second)
             return Error{ErrorCode::invalid_argument, "thread resume schedule contains an invalid or duplicate thread"};
         if (action.kind != ThreadResumeKind::continue_execution &&
@@ -674,14 +785,50 @@ Status DebugSession::resume_threads(std::uint64_t sequence, std::span<const Thre
     }
     return result;
 }
+Result<std::vector<ThreadResumeOutcome>> DebugSession::resume_threads_with_outcomes(
+    std::uint64_t sequence, std::span<const ThreadResumeAction> actions) {
+    auto resumed = resume_threads(sequence, actions);
+    if (!resumed) return resumed.error();
+    std::vector<ThreadResumeOutcome> outcomes;
+    outcomes.reserve(actions.size());
+    for (const auto& action : actions) {
+        const auto outcome = action.kind == ThreadResumeKind::continue_execution
+            ? ThreadResumeOutcomeKind::continue_accepted
+            : action.kind == ThreadResumeKind::single_step
+                ? ThreadResumeOutcomeKind::single_step_accepted
+                : ThreadResumeOutcomeKind::stop_preserved;
+        outcomes.push_back({action.thread, outcome});
+    }
+    return outcomes;
+}
 Result<std::vector<std::byte>> DebugSession::read_memory(std::uint64_t address, std::size_t size) {
     if (!impl_->backend || !impl_->process || (impl_->state != SessionState::running && impl_->state != SessionState::stopped)) return invalid_state("read_memory");
     if (size > max_inspection_read || address > UINT64_MAX - size)
         return Error{ErrorCode::invalid_argument, "memory inspection range exceeds the 1 MiB limit or wraps the address space"};
     return impl_->backend->read_memory(address, size);
 }
+bool DebugSession::supports_memory_tag_read() const noexcept {
+    return impl_->backend && impl_->process && impl_->state == SessionState::stopped &&
+        impl_->backend->supports_memory_tag_read();
+}
+Result<std::vector<std::byte>> DebugSession::read_memory_tags(std::uint64_t address, std::size_t size,
+    std::int32_t type, std::size_t max_tag_bytes) {
+    if (!impl_->backend || !impl_->process || impl_->state != SessionState::stopped)
+        return invalid_state("memory-tag read");
+    if (!impl_->backend->supports_memory_tag_read())
+        return Error{ErrorCode::unsupported, "memory-tag inspection is not supported by this target"};
+    if (!size || size > max_inspection_read || address > UINT64_MAX - size ||
+        !max_tag_bytes || max_tag_bytes > 1024 * 1024)
+        return Error{ErrorCode::invalid_argument, "memory-tag range must be non-empty, non-overflowing, and within the 1 MiB limits"};
+    auto result = impl_->backend->read_memory_tags(address, size, type, max_tag_bytes);
+    if (result && result.value().size() > max_tag_bytes)
+        return Error{ErrorCode::resource_limit, "backend returned more memory-tag bytes than the requested limit"};
+    return result;
+}
 Status DebugSession::write_memory(std::uint64_t address, std::span<const std::byte> bytes) {
     if (!impl_->backend || !impl_->process || (impl_->state != SessionState::running && impl_->state != SessionState::stopped)) return invalid_state("write_memory");
+    if (bytes.size() > max_inspection_write || address > UINT64_MAX - bytes.size())
+        return Error{ErrorCode::invalid_argument, "memory write exceeds the 1 MiB limit or wraps the address space"};
     return impl_->backend->write_memory(address, bytes);
 }
 Result<MemorySearchReport> DebugSession::search_memory(const MemorySearchPattern& pattern,
@@ -732,6 +879,50 @@ Result<std::vector<std::byte>> DebugSession::signal_info() {
     auto result = impl_->backend->signal_info();
     if (result && result.value().size() > max_inspection_signal_info_bytes)
         return Error{ErrorCode::resource_limit, "signal-info object exceeds the 65536-byte inspection limit"};
+    return result;
+}
+Result<std::vector<std::byte>> DebugSession::read_remote_file(
+    std::string_view path, std::size_t maximum_size, std::stop_token cancellation) {
+    if (!impl_->backend || !impl_->process || impl_->state == SessionState::idle ||
+        impl_->state == SessionState::detached || impl_->state == SessionState::faulted)
+        return invalid_state("remote file read");
+    if (path.empty() || path.size() > 16 * 1024 || path.find('\0') != std::string_view::npos)
+        return Error{ErrorCode::invalid_argument, "remote file path must contain 1 to 16384 non-NUL bytes"};
+    if (maximum_size == 0 || maximum_size > max_inspection_remote_file_bytes)
+        return Error{ErrorCode::invalid_argument, "remote file read limit must be between 1 byte and 64 MiB"};
+    if (cancellation.stop_requested())
+        return Error{ErrorCode::canceled, "remote file read canceled before it started"};
+    auto result = impl_->backend->read_remote_file(path, maximum_size, cancellation);
+    if (result && result.value().size() > maximum_size)
+        return Error{ErrorCode::resource_limit, "backend returned more bytes than the remote file read limit"};
+    return result;
+}
+Result<RemoteFileInfo> DebugSession::stat_remote_file(
+    std::string_view path, bool follow_symlinks, std::stop_token cancellation) {
+    if (!impl_->backend || !impl_->process || impl_->state == SessionState::idle ||
+        impl_->state == SessionState::detached || impl_->state == SessionState::faulted)
+        return invalid_state("remote file metadata inspection");
+    if (path.empty() || path.size() > 16 * 1024 || path.find('\0') != std::string_view::npos)
+        return Error{ErrorCode::invalid_argument, "remote file path must contain 1 to 16384 non-NUL bytes"};
+    if (cancellation.stop_requested())
+        return Error{ErrorCode::canceled, "remote file metadata inspection canceled before it started"};
+    return impl_->backend->stat_remote_file(path, follow_symlinks, cancellation);
+}
+Result<std::vector<std::byte>> DebugSession::run_remote_monitor_command(
+    std::string_view command, std::stop_token cancellation) {
+    if (!impl_->backend || !impl_->process || impl_->state != SessionState::stopped)
+        return invalid_state("remote monitor command");
+    if (command.empty() || command.size() > 4096 || command.find('\0') != std::string_view::npos)
+        return Error{ErrorCode::invalid_argument, "remote monitor command must contain 1 to 4096 non-NUL bytes"};
+    for (const unsigned char byte : command) {
+        if (byte < 0x20 || byte == 0x7f)
+            return Error{ErrorCode::invalid_argument, "remote monitor command must contain printable bytes only"};
+    }
+    if (cancellation.stop_requested())
+        return Error{ErrorCode::canceled, "remote monitor command canceled before it started"};
+    auto result = impl_->backend->run_remote_monitor_command(command, cancellation);
+    if (result && result.value().size() > 1024 * 1024)
+        return Error{ErrorCode::resource_limit, "remote monitor output exceeds the 1 MiB limit"};
     return result;
 }
 Result<std::vector<RegisterValue>> DebugSession::read_registers(ThreadId thread) {
@@ -813,6 +1004,21 @@ Status DebugSession::set_breakpoint_enabled(BreakpointId id, bool enabled) {
     if (result) found->enabled = enabled;
     return result;
 }
+Status DebugSession::set_breakpoint_one_shot(BreakpointId id, bool enabled) {
+    if (!impl_->backend || !impl_->process ||
+        (impl_->state != SessionState::running && impl_->state != SessionState::stopped))
+        return invalid_state("set_breakpoint_one_shot");
+    const auto found = std::find_if(impl_->breakpoints.begin(), impl_->breakpoints.end(),
+        [id](const Breakpoint& breakpoint) { return breakpoint.id == id; });
+    if (found == impl_->breakpoints.end())
+        return Error{ErrorCode::invalid_argument, "breakpoint id is not owned by this debug session"};
+    if (enabled && found->kind != BreakpointKind::software && found->kind != BreakpointKind::hardware &&
+        found->kind != BreakpointKind::execute && found->kind != BreakpointKind::read &&
+        found->kind != BreakpointKind::write && found->kind != BreakpointKind::access)
+        return Error{ErrorCode::invalid_argument, "one-shot policy requires a recognized breakpoint kind"};
+    found->one_shot = enabled;
+    return std::monostate{};
+}
 Status DebugSession::set_breakpoint_ignore_count(BreakpointId id, std::uint64_t count) {
     if (!impl_->process || (impl_->state != SessionState::running && impl_->state != SessionState::stopped))
         return invalid_state("set_breakpoint_ignore_count");
@@ -858,6 +1064,30 @@ Status DebugSession::set_breakpoint_logpoint(BreakpointId id, bool enabled, std:
     if (found == impl_->breakpoints.end()) return Error{ErrorCode::invalid_argument, "unknown breakpoint ID"};
     found->logpoint = enabled;
     found->log_message = std::move(message);
+    return std::monostate{};
+}
+Status DebugSession::configure_breakpoint_rule(BreakpointId id, std::string condition,
+    bool logpoint, std::string log_message, std::uint64_t ignore_count, bool one_shot) {
+    if (!impl_->backend || !impl_->process ||
+        (impl_->state != SessionState::running && impl_->state != SessionState::stopped))
+        return invalid_state("configure_breakpoint_rule");
+    if (condition.size() > 256)
+        return Error{ErrorCode::resource_limit, "condition exceeds 256 characters"};
+    if (log_message.size() > 1024)
+        return Error{ErrorCode::resource_limit, "logpoint message exceeds 1024 bytes"};
+    const auto found = std::find_if(impl_->breakpoints.begin(), impl_->breakpoints.end(),
+        [id](const Breakpoint& breakpoint) { return breakpoint.id == id; });
+    if (found == impl_->breakpoints.end())
+        return Error{ErrorCode::invalid_argument, "breakpoint id is not owned by this debug session"};
+    if (one_shot && found->kind != BreakpointKind::software && found->kind != BreakpointKind::hardware &&
+        found->kind != BreakpointKind::execute && found->kind != BreakpointKind::read &&
+        found->kind != BreakpointKind::write && found->kind != BreakpointKind::access)
+        return Error{ErrorCode::invalid_argument, "one-shot policy requires a recognized breakpoint kind"};
+    found->condition = std::move(condition);
+    found->logpoint = logpoint;
+    found->log_message = std::move(log_message);
+    found->ignore_count = ignore_count;
+    found->one_shot = one_shot;
     return std::monostate{};
 }
 std::vector<Breakpoint> DebugSession::breakpoints() const { return impl_->breakpoints; }

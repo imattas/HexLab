@@ -3,12 +3,14 @@
 #include "hexlab/image/read_set.hpp"
 #include <map>
 #include <compare>
+#include <optional>
 #include <stop_token>
 namespace hexlab {
 struct InputIdentity {std::uint64_t size=0;Sha256Digest sha256=Sha256{}.digest();bool operator==(const InputIdentity&)const=default;};
 struct AnalysisKey {
     InputIdentity input;std::uint64_t byte_revision=0,decision_revision=0;
     Sha256Digest recipe_fingerprint{},engine_fingerprint{};
+    std::optional<Sha256Digest> external_input_fingerprint;
     bool operator==(const AnalysisKey&)const=default;
 };
 enum class FactKind {instruction,block,function,seed};
@@ -27,7 +29,6 @@ public:
         std::span<const std::uint64_t>, std::stop_token = {}) const;
 private:
     struct ReadInterval {std::uint64_t begin,end;FactKey fact;};
-    std::vector<FactDependency> facts_;
     std::map<FactKey,std::vector<FactKey>> dependents_;
     std::map<std::uint64_t,std::vector<FactKey>> decision_facts_;
     // Sorted read intervals plus a prefix maximum end lets invalidation skip

@@ -1,5 +1,6 @@
 #include "hexlab/analysis/switches.hpp"
 #include "hexlab/analysis/relocations.hpp"
+#include "dex_switch_internal.hpp"
 #include "instruction_flow.hpp"
 
 #include "hexlab/image/image.hpp"
@@ -9,8 +10,12 @@
 #include <bit>
 #include <cstddef>
 #include <deque>
+#include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <set>
+#include <tuple>
 
 namespace hexlab {
 namespace {
@@ -198,7 +203,8 @@ struct TableTarget {
 std::optional<TableTarget> table_target(const Image &image, Address table, std::size_t index,
                                         std::size_t width, bool relative_to_table = false,
                                         const RelocationResolver *relocations = nullptr, std::stop_token stop = {},
-                                        std::optional<Address> relative_base = {}) {
+                                        std::optional<Address> relative_base = {}, unsigned relative_xlen = 64,
+                                        bool unsigned_relative = false) {
     if (index > (UINT64_MAX / width))
         return {};
     const auto entry = add_offset(table, static_cast<std::uint64_t>(index * width), image);
@@ -211,6 +217,11 @@ std::optional<TableTarget> table_target(const Image &image, Address table, std::
         if (!fixed)
             return {};
         if (fixed.value().relocated()) {
+            // A resolved relocation address does not prove that the stored
+            // field is an unsigned displacement from this separately held
+            // register base. Never reinterpret such fields as raw RVA bytes.
+            if (unsigned_relative)
+                return {};
             if (!fixed.value().address)
                 return {};
             const auto source = fixed.value().dyld
@@ -243,12 +254,33 @@ std::optional<TableTarget> table_target(const Image &image, Address table, std::
             value = (value << 8) | std::to_integer<unsigned char>(byte);
     }
     if (relative_to_table) {
-        if (width != 4)
+        if ((width != 2 && width != 4) &&
+            !(width == 1 && (relative_xlen == 32 || (relative_xlen == 64 && relative_base))))
             return {};
         const auto base = relative_base.value_or(table);
         if (base.space != table.space)
             return {};
-        const auto displacement = static_cast<std::int32_t>(static_cast<std::uint32_t>(value));
+        if (unsigned_relative) {
+            if (width != 4 || relative_xlen != 64)
+                return {};
+            const auto target = add_offset(base, static_cast<std::uint32_t>(value), image);
+            return target ? std::optional<TableTarget>(TableTarget{*target}) : std::nullopt;
+        }
+        const auto displacement = width == 1
+            ? static_cast<std::int64_t>(static_cast<std::int8_t>(static_cast<std::uint8_t>(value)))
+            : width == 2
+                ? static_cast<std::int64_t>(static_cast<std::int16_t>(static_cast<std::uint16_t>(value)))
+                : static_cast<std::int64_t>(static_cast<std::int32_t>(static_cast<std::uint32_t>(value)));
+        if (relative_xlen == 32) {
+            if (width != 1 && width != 2 && width != 4)
+                return {};
+            if (base.offset > std::numeric_limits<std::uint32_t>::max())
+                return {};
+            const auto target = static_cast<std::uint32_t>(base.offset) + static_cast<std::uint32_t>(displacement);
+            return TableTarget{Address{base.space, target}};
+        }
+        if (relative_xlen != 64)
+            return {};
         if (displacement < 0) {
             const auto magnitude = static_cast<std::uint64_t>(-static_cast<std::int64_t>(displacement));
             if (magnitude > base.offset)
@@ -259,6 +291,120 @@ std::optional<TableTarget> table_target(const Image &image, Address table, std::
         return target ? std::optional<TableTarget>(TableTarget{*target}) : std::nullopt;
     }
     return TableTarget{Address{table.space, value}};
+}
+
+struct ElfRelocationTableScan {
+    bool applicable = false;
+    bool reject_unbounded = false;
+    bool complete = false;
+    std::vector<SwitchCase> cases;
+};
+
+bool decodes_at(const Image &image, DecodeContext context, Address target, std::stop_token stop);
+
+ElfRelocationTableScan scan_static_elf_absolute_table(const Image &image, Address table,
+                                                      std::uint32_t case_count, DecodeContext context,
+                                                      const RelocationResolver *relocations,
+                                                      const ImageMetadata *metadata, std::stop_token stop) {
+    ElfRelocationTableScan result;
+    if (case_count > max_entries || !relocations || !metadata || !metadata->elf || metadata->macho ||
+        relocations->format() != RelocationFormat::elf || !metadata->elf->header.is_64 ||
+        metadata->elf->header.order != ByteOrder::little)
+        return result;
+    const auto machine = metadata->elf->header.machine;
+    const bool x64 = machine == 62 && context.architecture == Architecture::x86_64 &&
+                     context.mode == ExecutionMode::x86_64;
+    const bool a64 = machine == 183 && context.architecture == Architecture::arm64 &&
+                     context.mode == ExecutionMode::a64;
+    if (!x64 && !a64)
+        return result;
+
+    if (!case_count) {
+        // A relocation-bearing table without a proven count has no safe extent.
+        // Detect it only to suppress the legacy prefix scan; do not publish any
+        // entries from this unbounded probe.
+        for (std::size_t index = 0; index < max_entries; ++index) {
+            if (stop.stop_requested())
+                return result;
+            const auto entry = add_offset(table, static_cast<std::uint64_t>(index) * 8, image);
+            if (!entry || !file_backed_range(image, *entry, 8, false))
+                break;
+            auto evidence = relocations->data_at(image, *entry, 8, stop);
+            if (evidence && evidence.value().relocated()) {
+                result.reject_unbounded = true;
+                break;
+            }
+        }
+        return result;
+    }
+
+    // Activate the relocation-only path only when this bounded slot range has
+    // at least one relocation. Ordinary encoded tables keep their normal path.
+    for (std::uint32_t index = 0; index < case_count; ++index) {
+        if (stop.stop_requested())
+            return result;
+        const auto entry = add_offset(table, static_cast<std::uint64_t>(index) * 8, image);
+        if (!entry)
+            break;
+        auto evidence = relocations->data_at(image, *entry, 8, stop);
+        if (evidence && evidence.value().relocated()) {
+            result.applicable = true;
+            break;
+        }
+    }
+    if (!result.applicable)
+        return result;
+
+    const auto extent = static_cast<std::uint64_t>(case_count) * 8;
+    if (!file_backed_range(image, table, static_cast<std::size_t>(extent), false)) {
+        result.complete = false;
+        return result;
+    }
+    result.complete = true;
+    result.cases.reserve(case_count);
+    for (std::uint32_t index = 0; index < case_count; ++index) {
+        if (stop.stop_requested()) {
+            result.complete = false;
+            break;
+        }
+        const auto entry = add_offset(table, static_cast<std::uint64_t>(index) * 8, image);
+        if (!entry || !file_backed_range(image, *entry, 8, false)) {
+            result.complete = false;
+            break;
+        }
+        auto fixed = relocations->data_at(image, *entry, 8, stop);
+        if (!fixed || !fixed.value().address || fixed.value().relocations.size() != 1 || fixed.value().dyld) {
+            result.complete = false;
+            break;
+        }
+        const auto row_index = fixed.value().relocations.front();
+        if (row_index >= metadata->elf->relocations.size()) {
+            result.complete = false;
+            break;
+        }
+        const auto &row = metadata->elf->relocations[static_cast<std::size_t>(row_index)];
+        const auto expected_type = x64 ? 1u : 257u; // R_X86_64_64 / R_AARCH64_ABS64
+        const auto target_section = entry->space.value;
+        bool exact_rela = metadata->elf->header.object_type == 1 && row.type == expected_type &&
+                          row.kind == ElfRelocationKind::absolute &&
+                          row.field_size == 8 && row.explicit_addend && row.addend && row.symbol_index_validated &&
+                          row.place == entry && row.target_section == target_section && row.source.section &&
+                          *row.source.section < metadata->elf->sections.size() && row.symbol_table &&
+                          row.symbol_table->section;
+        if (exact_rela) {
+            const auto &relocation_section = metadata->elf->sections[*row.source.section];
+            exact_rela = relocation_section.type == 4 && relocation_section.info == target_section &&
+                         relocation_section.link == *row.symbol_table->section;
+        }
+        if (!exact_rela || !decodes_at(image, context, *fixed.value().address, stop)) {
+            result.complete = false;
+            break;
+        }
+        result.cases.push_back({index, *fixed.value().address, SwitchCase::TargetSource::elf_relocation,
+                                fixed.value().relocations});
+    }
+    result.complete = result.complete && result.cases.size() == case_count;
+    return result;
 }
 
 std::optional<std::uint64_t> unsigned_table_entry(const Image &image, Address table, std::size_t index,
@@ -301,6 +447,29 @@ bool decodes_at(const Image &image, DecodeContext context, Address target, std::
     const auto decoded = decode_instruction(context, bytes.value(), target);
     return decoded.status == DecodeStatus::decoded && decoded.instruction.has_value() &&
            file_backed_range(image, target, decoded.instruction->length, true);
+}
+
+std::optional<Address> decoded_instruction_end(const Image &image, DecodeContext context, Address target,
+                                               std::stop_token stop) {
+    if (stop.stop_requested() || !executable_file_byte(image, target))
+        return {};
+    const auto target_context = image.context_at(target);
+    if (!target_context || target_context.value().architecture != context.architecture ||
+        target_context.value().mode != context.mode)
+        return {};
+    const auto count = static_cast<std::size_t>(image.code_window(target, 15));
+    if (!count)
+        return {};
+    const auto bytes = image.read(target, count);
+    if (!bytes)
+        return {};
+    const auto decoded = decode_instruction(context, bytes.value(), target);
+    if (decoded.status != DecodeStatus::decoded || !decoded.instruction ||
+        !decoded.instruction->length ||
+        !file_backed_range(image, target, decoded.instruction->length, true) ||
+        decoded.instruction->length > UINT64_MAX - target.offset)
+        return {};
+    return Address{target.space, target.offset + decoded.instruction->length};
 }
 
 const RegisterOperand *register_operand(const Instruction &instruction, std::size_t index) {
@@ -549,6 +718,187 @@ std::optional<SwitchGuardGraph> switch_guard_graph(
     return graph;
 }
 
+struct ReachingTableBase {
+    Address table;
+    Address definition;
+    std::vector<std::uint64_t> relocation_rows;
+};
+
+std::optional<ReachingTableBase> x86_path_complete_table_base(
+    const FunctionRecord &function, const FunctionSnapshot &snapshot,
+    const SwitchGuardGraph &graph, const Instruction &load, const RegisterOperand &base,
+    const RelocationResolver *relocations, Address dispatch, std::stop_token stop) {
+    constexpr std::size_t max_blocks = 128;
+    constexpr std::size_t max_snapshot_blocks = 1024;
+    constexpr std::size_t max_nodes = 4096;
+    constexpr std::size_t max_edges = 8192;
+    const auto width = load.context.mode == ExecutionMode::x86_64 ? 64u
+        : load.context.mode == ExecutionMode::x86_32 ? 32u : 0u;
+    if (!function.complete || !snapshot.complete || function.blocks.size() > max_blocks ||
+        snapshot.blocks.size() > max_snapshot_blocks ||
+        graph.nodes.size() > max_nodes || !width || base.width != width || base.bank != RegisterBank::gpr)
+        return {};
+    if (relocations) {
+        const auto load_resolution = relocations->operand(load, 1, stop);
+        if (!load_resolution || load_resolution.value().relocated())
+            return {};
+    }
+
+    // The graph contains only known targets. An unresolved indirect transfer
+    // elsewhere in the snapshot could enter this function without appearing
+    // as a predecessor, so decline the proof when any such transfer is known.
+    for (const auto &block : snapshot.blocks) {
+        if (stop.stop_requested() || !block)
+            return {};
+        for (const auto &fact : block->instructions) {
+            if (stop.stop_requested() || !fact)
+                return {};
+            const auto &instruction = fact->instruction;
+            if (instruction.address != dispatch &&
+                (instruction.flow == FlowKind::switch_dispatch ||
+                 ((instruction.flow == FlowKind::jump || instruction.flow == FlowKind::call) &&
+                  !instruction.direct_target)))
+                return {};
+        }
+        for (const auto &edge : block->successors)
+            if (edge.source != dispatch && !edge.target && edge.kind == BlockEdgeKind::unresolved)
+                return {};
+    }
+    if (snapshot.candidates.size() > 8192)
+        return {};
+    std::map<GuardAddress, bool> candidate_entries;
+    for (const auto &candidate : snapshot.candidates)
+        candidate_entries.emplace(guard_address(candidate.entry), true);
+
+    const auto load_node = graph.addresses.find(guard_address(load.address));
+    if (load_node == graph.addresses.end())
+        return {};
+    const auto load_index = load_node->second;
+    if (graph.nodes[load_index].alternate_entry || graph.nodes[load_index].ambiguous ||
+        graph.nodes[load_index].predecessors.empty())
+        return {};
+
+    std::vector<bool> seen(graph.nodes.size(), false);
+    std::vector<bool> definitions(graph.nodes.size(), false);
+    std::vector<std::size_t> dependencies(graph.nodes.size(), 0);
+    std::vector<std::vector<std::size_t>> dependents(graph.nodes.size());
+    std::vector<std::size_t> pending = graph.nodes[load_index].predecessors;
+    std::size_t edge_count = pending.size();
+    if (edge_count > max_edges)
+        return {};
+    std::size_t visited = 0;
+    std::optional<ReachingTableBase> result;
+    while (!pending.empty()) {
+        if (stop.stop_requested() || visited >= max_nodes)
+            return {};
+        const auto current = pending.back();
+        pending.pop_back();
+        if (seen[current])
+            continue;
+        seen[current] = true;
+        ++visited;
+        const auto &node = graph.nodes[current];
+        if (!node.fact || node.alternate_entry || node.ambiguous)
+            return {};
+        const auto &instruction = node.fact->instruction;
+        if (instruction.context != load.context)
+            return {};
+        if (candidate_entries.contains(guard_address(instruction.address)))
+            return {};
+
+        const bool lea_candidate = instruction.opcode == Opcode::lea &&
+            instruction.operands.size() == 2 && instruction.flow == FlowKind::fallthrough &&
+            same_register(register_operand(instruction, 0), &base);
+        if (lea_candidate) {
+            const auto *destination = register_operand(instruction, 0);
+            const auto *address = std::get_if<MemoryOperand>(&instruction.operands[1]);
+            if (!destination || destination->width != width || !address || address->segment ||
+                address->address_width != width || address->index)
+                return {};
+            const bool valid_base_form = width == 64
+                ? address->ip_relative && (!address->base || address->base->bank == RegisterBank::ip)
+                : !address->ip_relative && !address->base;
+            if (!valid_base_form)
+                return {};
+            const auto table = width == 64
+                ? relocated_operand_address(instruction, 1, address->resolved_address, relocations, stop)
+                : absolute_table_base(instruction, *address, 1, relocations, stop);
+            if (!table)
+                return {};
+            if (width == 32 && table->offset > UINT32_MAX)
+                return {};
+            ReachingTableBase candidate{*table, instruction.address, {}};
+            if (relocations) {
+                const auto resolution = relocations->operand(instruction, 1, stop);
+                if (!resolution || resolution.value().dyld)
+                    return {};
+                candidate.relocation_rows = resolution.value().relocations;
+            }
+            if (result && (result->table != candidate.table || result->definition != candidate.definition ||
+                           result->relocation_rows != candidate.relocation_rows))
+                return {};
+            result = std::move(candidate);
+            definitions[current] = true;
+            continue;
+        }
+
+        const auto *destination = register_operand(instruction, 0);
+        const bool recognized_register_write = destination && destination->bank == RegisterBank::gpr &&
+            !same_register(destination, &base) &&
+            (instruction.opcode == Opcode::mov || instruction.opcode == Opcode::movzx ||
+             instruction.opcode == Opcode::movsx || instruction.opcode == Opcode::movsxd ||
+             instruction.opcode == Opcode::lea || instruction.opcode == Opcode::add ||
+             instruction.opcode == Opcode::sub || instruction.opcode == Opcode::bit_and ||
+             instruction.opcode == Opcode::bit_or || instruction.opcode == Opcode::bit_xor ||
+             instruction.opcode == Opcode::shl || instruction.opcode == Opcode::shr ||
+             instruction.opcode == Opcode::sar ||
+             instruction.opcode == Opcode::inc || instruction.opcode == Opcode::dec);
+        const bool recognized_no_register_write = instruction.opcode == Opcode::nop ||
+            instruction.opcode == Opcode::cmp || instruction.opcode == Opcode::test;
+        const bool recognized_control =
+            (instruction.flow == FlowKind::jump && instruction.opcode == Opcode::jmp &&
+             instruction.direct_target) ||
+            (instruction.flow == FlowKind::conditional_branch && instruction.opcode == Opcode::jcc &&
+             instruction.direct_target);
+        const bool safe_instruction = recognized_control ||
+            (instruction.flow == FlowKind::fallthrough &&
+             (recognized_register_write || recognized_no_register_write));
+        if (writes_register(instruction, base) || instruction.opcode == Opcode::opaque ||
+            instruction.opcode == Opcode::x86_opaque || instruction.flow == FlowKind::call ||
+            instruction.flow == FlowKind::ret || instruction.flow == FlowKind::trap ||
+            !safe_instruction || node.predecessors.empty())
+            return {};
+        dependencies[current] = node.predecessors.size();
+        for (const auto predecessor : node.predecessors) {
+            if (++edge_count > max_edges)
+                return {};
+            dependents[predecessor].push_back(current);
+            pending.push_back(predecessor);
+        }
+    }
+    if (!result)
+        return {};
+
+    std::deque<std::size_t> ready;
+    for (std::size_t i = 0; i < graph.nodes.size(); ++i)
+        if (seen[i] && definitions[i])
+            ready.push_back(i);
+    std::size_t resolved = 0;
+    while (!ready.empty()) {
+        if (stop.stop_requested())
+            return {};
+        const auto current = ready.front();
+        ready.pop_front();
+        ++resolved;
+        for (const auto next : dependents[current])
+            if (--dependencies[next] == 0)
+                ready.push_back(next);
+    }
+    if (resolved != visited)
+        return {};
+    return result;
+}
+
 struct SwitchBound {
     std::uint32_t case_count = 0;
     Address default_target{{0}, 0};
@@ -631,25 +981,27 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                 compared_register = register_operand(compare, 0);
                 immediate = std::get_if<ImmediateOperand>(&compare.operands[1]);
                 exclusive_upper_bound = branch.condition == 8;
-            } else if (context.architecture == Architecture::riscv64 && context.mode == ExecutionMode::rv64 &&
+            } else if (((context.architecture == Architecture::riscv64 && context.mode == ExecutionMode::rv64) ||
+                        (context.architecture == Architecture::riscv32 && context.mode == ExecutionMode::rv32)) &&
                        compare.opcode == Opcode::rv_sltiu && compare.operands.size() == 3 &&
                        branch.opcode == Opcode::rv_beq && branch.operands.size() == 3) {
-                // SLTIU Xguard, Xselector, positive_bound; BEQ Xguard, X0,
+                // SLTIU guard, selector, positive_bound; BEQ guard, X0,
                 // default proves that the fallthrough selector is below the
-                // bound. A negative immediate is sign-extended before the
-                // unsigned comparison and is not a useful table bound here.
+                // bound for both XLENs. A negative immediate is sign-extended
+                // before the unsigned comparison and is not a useful table bound.
                 const auto *guard = register_operand(compare, 0);
                 compared_register = register_operand(compare, 1);
                 immediate = std::get_if<ImmediateOperand>(&compare.operands[2]);
                 const auto *left = register_operand(branch, 0);
                 const auto *right = register_operand(branch, 1);
+                const auto width = context.mode == ExecutionMode::rv32 ? 32u : 64u;
                 if (!guard || !compared_register || !immediate || guard->bank != RegisterBank::riscv_gpr ||
-                    guard->width != 64 || guard->index == 0 || *guard == *compared_register ||
+                    guard->width != width || guard->index == 0 || *guard == *compared_register ||
                     !((same_register(left, guard) && right && right->bank == RegisterBank::riscv_gpr &&
-                       right->width == 64 && right->index == 0) ||
+                       right->width == width && right->index == 0) ||
                       (same_register(right, guard) && left && left->bank == RegisterBank::riscv_gpr &&
-                       left->width == 64 && left->index == 0)) ||
-                    immediate->encoded_width != 12 || immediate->effective_width != 64 ||
+                       left->width == width && left->index == 0)) ||
+                    immediate->encoded_width != 12 || immediate->effective_width != width ||
                     !immediate->is_signed || immediate->value == 0 || immediate->value > 2047)
                     continue;
             } else if ((context.architecture == Architecture::mips32 && context.mode == ExecutionMode::mips32) ||
@@ -782,9 +1134,10 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                  (selector.bank != RegisterBank::arm32_gpr || selector.width != 32 || selector.high_byte ||
                   !compared_register || compared_register->bank != RegisterBank::arm32_gpr ||
                   compared_register->width != selector.width)) ||
-                (context.architecture == Architecture::riscv64 &&
-                 (selector.bank != RegisterBank::riscv_gpr || selector.width != 64 || selector.index == 0 ||
-                  !compared_register || compared_register->width != 64)) ||
+                ((context.architecture == Architecture::riscv64 || context.architecture == Architecture::riscv32) &&
+                 (selector.bank != RegisterBank::riscv_gpr ||
+                  selector.width != (context.mode == ExecutionMode::rv32 ? 32 : 64) || selector.index == 0 ||
+                  !compared_register || compared_register->width != selector.width)) ||
                 (context.architecture == Architecture::powerpc &&
                  (selector.bank != RegisterBank::ppc_gpr || selector.width != 32 || selector.index == 0 ||
                   !compared_register || compared_register->bank != RegisterBank::ppc_gpr ||
@@ -1051,8 +1404,11 @@ std::optional<SwitchSite> relative_offset_register_base_switch(
     // Recognize the common PIC variant where the signed offset is loaded and
     // dispatched contiguously, but LEA established the table base earlier in
     // this same block:
-    //   LEA Rbase, [RIP+table]; ...; MOVSXD Roff, [Rbase+Rindex*4];
+    //   LEA Rbase, [RIP+table]; ...; MOVSX[D] Roff, [Rbase+Rindex*1/2/4];
     //   ADD Roff, Rbase; JMP Roff.
+    // MOV Roff32, [Rbase+Rindex*4+disp] instead zero-extends a dword.
+    // Those entries are unsigned offsets from Rbase (often an image base),
+    // while Rbase+disp locates a distinct table.
     if (dispatch_index < 2 || !facts[dispatch_index] || !facts[dispatch_index - 1] ||
         !facts[dispatch_index - 2] || stop.stop_requested())
         return {};
@@ -1063,7 +1419,8 @@ std::optional<SwitchSite> relative_offset_register_base_switch(
         dispatch.context.architecture != Architecture::x86_64 || dispatch.context.mode != ExecutionMode::x86_64 ||
         add.context != dispatch.context || load.context != dispatch.context ||
         add.opcode != Opcode::add || add.flow != FlowKind::fallthrough ||
-        load.opcode != Opcode::movsxd || load.flow != FlowKind::fallthrough ||
+        (load.opcode != Opcode::movsxd && load.opcode != Opcode::mov && load.opcode != Opcode::movsx) ||
+        load.flow != FlowKind::fallthrough ||
         dispatch.operands.size() != 1 || add.operands.size() != 2 || load.operands.size() != 2)
         return {};
     const auto load_end = analysis_detail::continuation_address(load);
@@ -1076,13 +1433,21 @@ std::optional<SwitchSite> relative_offset_register_base_switch(
     const auto *add_dest = register_operand(add, 0);
     const auto *add_src = register_operand(add, 1);
     const auto *entries = std::get_if<MemoryOperand>(&load.operands[1]);
+    const bool unsigned_offsets = load.opcode == Opcode::mov;
+    const bool signed_byte_offsets = load.opcode == Opcode::movsx && entries && entries->data_width == 8;
+    const bool signed_word_offsets = load.opcode == Opcode::movsx && entries && entries->data_width == 16;
+    const auto entry_width = signed_byte_offsets ? std::size_t{1}
+        : signed_word_offsets ? std::size_t{2} : std::size_t{4};
     if (!target_reg || !loaded_reg || !add_dest || !add_src || !entries ||
         target_reg->bank != RegisterBank::gpr || target_reg->width != 64 || target_reg->high_byte ||
+        loaded_reg->bank != RegisterBank::gpr || loaded_reg->width != (unsigned_offsets ? 32 : 64) ||
+        loaded_reg->high_byte || add_dest->width != 64 || add_dest->high_byte ||
+        add_src->bank != RegisterBank::gpr || add_src->width != 64 || add_src->high_byte ||
         !same_register(target_reg, loaded_reg) || !same_register(loaded_reg, add_dest) ||
         !entries->base || !same_register(entries->base ? &*entries->base : nullptr, add_src) ||
-        !same_register(add_src, &*entries->base) || !entries->index || entries->scale != 4 ||
-        entries->data_width != 32 || entries->address_width != 64 || entries->segment ||
-        entries->displacement != 0 || same_register(add_src, loaded_reg) ||
+        !same_register(add_src, &*entries->base) || !entries->index || entries->scale != entry_width ||
+        entries->data_width != entry_width * 8 || entries->address_width != 64 || entries->segment || entries->ip_relative ||
+        (!unsigned_offsets && !signed_word_offsets && entries->displacement != 0) || same_register(add_src, loaded_reg) ||
         same_register(add_src, &*entries->index) || entries->index->bank != RegisterBank::gpr ||
         entries->index->width != 64 || entries->index->high_byte)
         return {};
@@ -1096,6 +1461,8 @@ std::optional<SwitchSite> relative_offset_register_base_switch(
     std::optional<Address> table;
     std::optional<Address> base_definition;
     std::optional<std::size_t> base_definition_index;
+    std::vector<std::uint64_t> base_relocation_rows;
+    bool cross_block_base = false;
     std::size_t examined = 0;
     for (std::size_t cursor = dispatch_index - 2; cursor > 0 && examined < max_relative_base_scan;) {
         ++examined;
@@ -1103,7 +1470,12 @@ std::optional<SwitchSite> relative_offset_register_base_switch(
         if (stop.stop_requested() || !facts[cursor])
             return {};
         const auto &candidate = facts[cursor]->instruction;
-        if (candidate.context != dispatch.context || candidate.flow != FlowKind::fallthrough)
+        if (candidate.context != dispatch.context || candidate.flow != FlowKind::fallthrough ||
+            candidate.opcode == Opcode::opaque || candidate.opcode == Opcode::x86_opaque)
+            return {};
+        const auto candidate_end = analysis_detail::continuation_address(candidate);
+        if (!candidate_end || !facts[cursor + 1] ||
+            candidate_end.value() != facts[cursor + 1]->instruction.address)
             return {};
         if (!writes_register(candidate, table_reg))
             continue;
@@ -1120,35 +1492,107 @@ std::optional<SwitchSite> relative_offset_register_base_switch(
             !address->ip_relative || address->address_width != 64 || !resolved_table ||
             (address->base && address->base->bank != RegisterBank::ip) || address->index)
             return {};
-        const auto candidate_end = analysis_detail::continuation_address(candidate);
-        if (!candidate_end || candidate_end.value().space != load.address.space ||
-            candidate_end.value().offset > load.address.offset)
-            return {};
+        // An indexed-load displacement carrying its own relocation is not a
+        // proven constant displacement from this base register, regardless
+        // of whether the table entries are signed or unsigned.
+        if (relocations) {
+            const auto load_resolution = relocations->operand(load, 1, stop);
+            if (!load_resolution || load_resolution.value().relocated())
+                return {};
+        }
+        if (relocations) {
+            const auto resolution = relocations->operand(candidate, 1, stop);
+            if (!resolution)
+                return {};
+            base_relocation_rows = resolution.value().relocations;
+            // Dyld ownership is not represented by base relocation rows.
+            // Keep unsigned base construction explicit and inspectable.
+            if (unsigned_offsets && resolution.value().dyld)
+                return {};
+        }
         table = resolved_table;
         base_definition = candidate.address;
         base_definition_index = cursor;
         break;
     }
-    if (!table || !base_definition || !base_definition_index)
+    if (!table || !base_definition || !base_definition_index) {
+        if (function.blocks.size() > 128 || snapshot.blocks.size() > 1024)
+            return {};
+        std::size_t snapshot_facts = 0;
+        std::size_t snapshot_edges = 0;
+        for (const auto &block : snapshot.blocks) {
+            if (stop.stop_requested() || !block || block->instructions.size() > 16384 - snapshot_facts ||
+                block->successors.size() > 32768 - snapshot_edges)
+                return {};
+            snapshot_facts += block->instructions.size();
+            snapshot_edges += block->successors.size();
+        }
+        std::size_t function_facts = 0;
+        for (const auto id : function.blocks) {
+            const auto block = guards.blocks.find(id.value);
+            if (block == guards.blocks.end() || !block->second ||
+                block->second->instructions.size() > 4096 - function_facts)
+                return {};
+            function_facts += block->second->instructions.size();
+        }
+        if (!guards.graph_attempted) {
+            guards.graph_attempted = true;
+            guards.graph = switch_guard_graph(function, snapshot, guards, stop);
+        }
+        if (!guards.graph || stop.stop_requested())
+            return {};
+        const auto reaching = x86_path_complete_table_base(function, snapshot, *guards.graph,
+                                                            load, table_reg, relocations,
+                                                            dispatch.address, stop);
+        if (!reaching)
+            return {};
+        table = reaching->table;
+        base_definition = reaching->definition;
+        base_relocation_rows = reaching->relocation_rows;
+        cross_block_base = true;
+    }
+    if (!table || !base_definition || (!base_definition_index && !cross_block_base))
         return {};
 
     SwitchSite site;
     site.dispatch = dispatch.address;
-    site.table = *table;
+    const auto entry_table = (unsigned_offsets || signed_word_offsets)
+        ? add_signed_offset(*table, entries->displacement, image) : table;
+    if (!entry_table)
+        return {};
+    site.table = *entry_table;
     site.selector = *entries->index;
-    site.scale = 4;
-    site.entry_encoding = SwitchEntryEncoding::signed_offset_from_table;
+    site.scale = static_cast<std::uint8_t>(entry_width);
+    site.entry_encoding = unsigned_offsets ? SwitchEntryEncoding::unsigned_dword_offset_from_target_base
+        : (signed_byte_offsets || signed_word_offsets) ? SwitchEntryEncoding::signed_offset_from_target_base
+                              : SwitchEntryEncoding::signed_offset_from_table;
+    if (unsigned_offsets || signed_byte_offsets || signed_word_offsets)
+        site.target_base = *table;
+    site.base_definition = base_definition;
+    site.selector_use = load.address;
+    if (!base_relocation_rows.empty()) {
+        site.table_base_source = SwitchSite::TableBaseSource::operand_relocation;
+        site.table_base_relocation_rows = std::move(base_relocation_rows);
+    }
     bool selector_unchanged = true;
-    for (std::size_t i = *base_definition_index + 1; i < dispatch_index - 2; ++i) {
-        if (stop.stop_requested() || !facts[i] ||
-            facts[i]->instruction.context != dispatch.context ||
-            facts[i]->instruction.flow != FlowKind::fallthrough ||
-            writes_register(facts[i]->instruction, site.selector)) {
-            selector_unchanged = false;
-            break;
+    if (!cross_block_base) {
+        for (std::size_t i = *base_definition_index + 1; i < dispatch_index - 2; ++i) {
+            if (stop.stop_requested() || !facts[i] ||
+                facts[i]->instruction.context != dispatch.context ||
+                facts[i]->instruction.flow != FlowKind::fallthrough ||
+                writes_register(facts[i]->instruction, site.selector)) {
+                selector_unchanged = false;
+                break;
+            }
         }
     }
-    if (selector_unchanged) {
+    if (selector_unchanged && cross_block_base) {
+        if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
+                                                  load.address, dispatch.address, dispatch.context, guards, stop)) {
+            site.case_count = bound->case_count;
+            site.default_target = bound->default_target;
+        }
+    } else if (selector_unchanged) {
         if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
                                                   *base_definition, dispatch.address, dispatch.context, guards, stop)) {
             site.case_count = bound->case_count;
@@ -1159,17 +1603,142 @@ std::optional<SwitchSite> relative_offset_register_base_switch(
     for (std::size_t index = 0; index < scan_limit; ++index) {
         if (stop.stop_requested())
             return {};
-        const auto target = table_target(image, site.table, index, 4, true, relocations, stop);
-        if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
+        const auto target = table_target(image, site.table, index, entry_width, true, relocations, stop,
+                                         site.target_base, 64, unsigned_offsets);
+        if (!target) {
             site.complete = false;
+            site.incomplete_reason = "table entry unreadable, address overflow, or unsupported relocation/fixup";
+            break;
+        }
+        if (!decodes_at(image, dispatch.context, target->address, stop)) {
+            site.complete = false;
+            site.incomplete_reason = "table target is not file-backed executable x86-64 code";
             break;
         }
         site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
                               target->relocation_rows, target->dyld_classic_rows, target->dyld_chained_rows});
     }
-    if (!site.case_count && site.cases.size() == max_entries)
+    if (!site.case_count && site.cases.size() == max_entries) {
         site.complete = false;
-    return site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1)
+        site.incomplete_reason = "table scan reached the 4096-entry limit";
+    }
+    return site.cases.size() >= 2 || (site.case_count && (site.cases.size() == 1 || !site.complete))
+        ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
+}
+
+std::optional<SwitchSite> x86_32_signed_word_register_base_switch(
+    const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
+    const std::vector<std::shared_ptr<const InstructionFact>> &facts,
+    std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
+    std::stop_token stop) {
+    // Exact compact relative-offset forms:
+    //   LEA Ebase, [table]; MOVSX Eoff, [Ebase+Eindex*1/2+disp];
+    //   LEA Ebase, [table]; MOV Eoff, [Ebase+Eindex*4+disp];
+    //   ADD Eoff, Ebase; JMP Eoff.
+    if (dispatch_index < 3 || stop.stop_requested() || !facts[dispatch_index] ||
+        !facts[dispatch_index - 1] || !facts[dispatch_index - 2] || !facts[dispatch_index - 3])
+        return {};
+    const auto &dispatch = facts[dispatch_index]->instruction;
+    const auto &add = facts[dispatch_index - 1]->instruction;
+    const auto &load = facts[dispatch_index - 2]->instruction;
+    const auto &lea = facts[dispatch_index - 3]->instruction;
+    if (dispatch.context.mode != ExecutionMode::x86_32 || add.context != dispatch.context ||
+        load.context != dispatch.context || lea.context != dispatch.context ||
+        dispatch.opcode != Opcode::jmp || dispatch.flow != FlowKind::jump ||
+        add.opcode != Opcode::add || add.flow != FlowKind::fallthrough ||
+        (load.opcode != Opcode::movsx && load.opcode != Opcode::mov) ||
+        load.flow != FlowKind::fallthrough ||
+        lea.opcode != Opcode::lea || lea.flow != FlowKind::fallthrough ||
+        dispatch.operands.size() != 1 || add.operands.size() != 2 || load.operands.size() != 2 ||
+        lea.operands.size() != 2)
+        return {};
+    const auto lea_end = analysis_detail::continuation_address(lea);
+    const auto load_end = analysis_detail::continuation_address(load);
+    const auto add_end = analysis_detail::continuation_address(add);
+    if (!lea_end || lea_end.value() != load.address || !load_end || load_end.value() != add.address ||
+        !add_end || add_end.value() != dispatch.address)
+        return {};
+
+    const auto *base = register_operand(lea, 0);
+    const auto *offset = register_operand(load, 0);
+    const auto *load_base = register_operand(add, 1);
+    const auto *add_dest = register_operand(add, 0);
+    const auto *target = register_operand(dispatch, 0);
+    const auto *table_address = std::get_if<MemoryOperand>(&lea.operands[1]);
+    const auto *entries = std::get_if<MemoryOperand>(&load.operands[1]);
+    const auto entry_bytes = entries ? static_cast<std::size_t>(entries->data_width / 8) : 0;
+    const bool exact_load_width = entries &&
+        ((load.opcode == Opcode::movsx && (entries->data_width == 8 || entries->data_width == 16)) ||
+         (load.opcode == Opcode::mov && entries->data_width == 32));
+    if (!base || !offset || !load_base || !add_dest || !target || !table_address || !entries ||
+        base->bank != RegisterBank::gpr || base->width != 32 || offset->bank != RegisterBank::gpr ||
+        offset->width != 32 || load_base->width != 32 || !same_register(load_base, base) ||
+        add_dest->width != 32 || !same_register(add_dest, offset) || target->width != 32 ||
+        !same_register(target, offset) || same_register(base, offset) ||
+        table_address->ip_relative || table_address->address_width != 32 || table_address->segment ||
+        table_address->base || table_address->index || entries->address_width != 32 || !exact_load_width ||
+        (entries->scale != 1 && entries->scale != 2 && entries->scale != 4) ||
+        entries->scale != entry_bytes ||
+        entries->ip_relative || entries->segment ||
+        !entries->base || !same_register(&*entries->base, base) || !entries->index ||
+        entries->index->bank != RegisterBank::gpr || entries->index->width != 32 ||
+        same_register(&*entries->index, base) || same_register(&*entries->index, offset))
+        return {};
+    const auto table_base = relocated_operand_address(lea, 1, table_address->resolved_address,
+                                                       relocations, stop);
+    if (!table_base || table_base->offset > UINT32_MAX)
+        return {};
+    if (relocations) {
+        const auto load_resolution = relocations->operand(load, 1, stop);
+        if (!load_resolution || load_resolution.value().relocated())
+            return {};
+    }
+    const auto table = add_signed_offset(*table_base, entries->displacement, image);
+    if (!table || table->offset > UINT32_MAX)
+        return {};
+
+    SwitchSite site;
+    site.dispatch = dispatch.address;
+    site.table = *table;
+    site.target_base = *table_base;
+    site.selector = *entries->index;
+    site.scale = static_cast<std::uint8_t>(entry_bytes);
+    site.entry_encoding = SwitchEntryEncoding::signed_offset_from_target_base;
+    site.base_definition = lea.address;
+    site.selector_use = load.address;
+    if (relocations) {
+        const auto base_resolution = relocations->operand(lea, 1, stop);
+        if (!base_resolution)
+            return {};
+        if (base_resolution.value().relocated()) {
+            site.table_base_source = SwitchSite::TableBaseSource::operand_relocation;
+            site.table_base_relocation_rows = base_resolution.value().relocations;
+        }
+    }
+    if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
+                                               lea.address, dispatch.address, dispatch.context, guards, stop)) {
+        site.case_count = bound->case_count;
+        site.default_target = bound->default_target;
+    }
+    const auto scan_limit = site.case_count ? *site.case_count : max_entries;
+    for (std::size_t index = 0; index < scan_limit; ++index) {
+        if (stop.stop_requested())
+            return {};
+        const auto entry = table_target(image, site.table, index, entry_bytes, true, relocations, stop,
+                                        site.target_base, 32);
+        if (!entry || !decodes_at(image, dispatch.context, entry->address, stop)) {
+            site.complete = false;
+            site.incomplete_reason = "x86-32 signed relative entry is unreadable, unresolved, or not executable code";
+            break;
+        }
+        site.cases.push_back({static_cast<std::uint32_t>(index), entry->address, entry->source,
+                              entry->relocation_rows, entry->dyld_classic_rows, entry->dyld_chained_rows});
+    }
+    if (!site.case_count && site.cases.size() == max_entries) {
+        site.complete = false;
+        site.incomplete_reason = "x86-32 signed relative table scan reached the 4096-entry limit";
+    }
+    return site.cases.size() >= 2 || (site.case_count && (site.cases.size() == 1 || !site.complete))
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
@@ -1182,7 +1751,10 @@ std::optional<SwitchSite> register_based_absolute_switch(
         return {};
     const auto &dispatch = facts[dispatch_index]->instruction;
     const auto &lea = facts[dispatch_index - 1]->instruction;
-    if (dispatch.context.mode != ExecutionMode::x86_64 || lea.context != dispatch.context ||
+    const auto mode_width = dispatch.context.mode == ExecutionMode::x86_64 ? 64u
+        : dispatch.context.mode == ExecutionMode::x86_32 ? 32u : 0u;
+    const auto entry_bytes = mode_width / 8;
+    if (!mode_width || lea.context != dispatch.context ||
         dispatch.opcode != Opcode::jmp || dispatch.flow != FlowKind::jump ||
         lea.opcode != Opcode::lea || lea.flow != FlowKind::fallthrough)
         return {};
@@ -1208,46 +1780,227 @@ std::optional<SwitchSite> register_based_absolute_switch(
             entries = memory;
         }
     }
-    if (!base || !table_address || !entries || base->bank != RegisterBank::gpr || base->width != 64 ||
-        base->high_byte || !table_address->ip_relative ||
+    const bool table_address_shape = mode_width == 64
+        ? table_address && table_address->ip_relative && table_address->address_width == 64 &&
+              (!table_address->base || table_address->base->bank == RegisterBank::ip)
+        : table_address && !table_address->ip_relative && table_address->address_width == 32 &&
+              !table_address->base;
+    if (!base || !table_address || !entries || base->bank != RegisterBank::gpr || base->width != mode_width ||
+        base->high_byte || !table_address_shape ||
         table_address->segment || table_address->index ||
-        (table_address->base && table_address->base->bank != RegisterBank::ip) ||
         entries->segment || !same_register(entries->base ? &*entries->base : nullptr, base) ||
-        !entries->index || entries->index->bank != RegisterBank::gpr || entries->index->width != 64 ||
+        !entries->index || entries->index->bank != RegisterBank::gpr || entries->index->width != mode_width ||
         entries->index->high_byte || same_register(&*entries->index, base) ||
-        entries->scale != 8 || entries->data_width != 64 || entries->address_width != 64 ||
+        entries->scale != entry_bytes || entries->data_width != mode_width || entries->address_width != mode_width ||
         entries->displacement != 0)
         return {};
     const auto resolved_table = relocated_operand_address(lea, 1, table_address->resolved_address,
                                                           relocations, stop);
-    if (!resolved_table)
+    if (!resolved_table || (mode_width == 32 && resolved_table->offset > UINT32_MAX))
         return {};
 
     SwitchSite site;
     site.dispatch = dispatch.address;
     site.table = *resolved_table;
     site.selector = *entries->index;
-    site.scale = 8;
+    site.scale = static_cast<std::uint8_t>(entry_bytes);
     if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector, lea.address,
                                                dispatch.address, dispatch.context, guards, stop)) {
         site.case_count = bound->case_count;
         site.default_target = bound->default_target;
     }
-    const auto scan_limit = site.case_count ? *site.case_count : max_entries;
-    for (std::size_t index = 0; index < scan_limit; ++index) {
-        if (stop.stop_requested()) return {};
-        const auto target = table_target(image, site.table, index, 8, false, relocations, stop);
-        if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
-            site.complete = false;
-            break;
+    const auto *metadata = relocations ? relocations->source_metadata() : nullptr;
+    const auto strict_scan = mode_width == 64
+        ? scan_static_elf_absolute_table(image, site.table, site.case_count.value_or(0),
+                                         dispatch.context, relocations, metadata, stop)
+        : ElfRelocationTableScan{};
+    if (strict_scan.reject_unbounded)
+        return {};
+    if (strict_scan.applicable) {
+        site.cases = strict_scan.cases;
+        site.complete = strict_scan.complete;
+        if (!site.complete)
+            site.incomplete_reason = "ELF absolute-pointer table has an incomplete or unsupported relocation prefix";
+    } else {
+        const auto scan_limit = site.case_count ? *site.case_count : max_entries;
+        for (std::size_t index = 0; index < scan_limit; ++index) {
+            if (stop.stop_requested()) return {};
+            const auto target = table_target(image, site.table, index, entry_bytes, false, relocations, stop);
+            if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
+                site.complete = false;
+                break;
+            }
+            site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
+                                  target->relocation_rows, target->dyld_classic_rows, target->dyld_chained_rows});
         }
-        site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
-                              target->relocation_rows, target->dyld_classic_rows, target->dyld_chained_rows});
+        if (!site.case_count && site.cases.size() == max_entries) site.complete = false;
     }
-    if (!site.case_count && site.cases.size() == max_entries) site.complete = false;
-    if (site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1))
+    if (site.cases.size() >= 2 || (site.case_count && (site.cases.size() == 1 || !site.complete)))
         return site;
     return {};
+}
+
+std::optional<SwitchSite> register_loaded_absolute_switch(
+    const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
+    const std::vector<std::shared_ptr<const InstructionFact>> &facts,
+    std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
+    std::stop_token stop) {
+    // Bounded x86-32 forms:
+    //   LEA Rbase, [absolute_table]; MOV Rtarget, [Rbase+Rindex*entry_bytes]; JMP Rtarget.
+    //   MOV Rtarget, [absolute_table+Rindex*entry_bytes]; JMP Rtarget.
+    if (dispatch_index == 0 || stop.stop_requested() || !facts[dispatch_index] ||
+        !facts[dispatch_index - 1])
+        return {};
+    const auto &dispatch = facts[dispatch_index]->instruction;
+    const auto &load = facts[dispatch_index - 1]->instruction;
+    const auto address_width = dispatch.context.mode == ExecutionMode::x86_32 ? 32u : 0u;
+    const auto entry_bytes = address_width / 8;
+    if (!address_width || load.context != dispatch.context ||
+        dispatch.opcode != Opcode::jmp || dispatch.flow != FlowKind::jump ||
+        load.opcode != Opcode::mov || load.flow != FlowKind::fallthrough ||
+        load.operands.size() != 2 || dispatch.operands.size() != 1)
+        return {};
+    const auto load_end = analysis_detail::continuation_address(load);
+    if (!load_end || load_end.value() != dispatch.address)
+        return {};
+
+    const auto *loaded = register_operand(load, 0);
+    const auto *target = register_operand(dispatch, 0);
+    const auto *entries = std::get_if<MemoryOperand>(&load.operands[1]);
+    if (!loaded || !target || !entries || loaded->bank != RegisterBank::gpr || loaded->width != address_width ||
+        target->bank != RegisterBank::gpr || target->width != address_width ||
+        !same_register(loaded, target) || entries->address_width != address_width ||
+        entries->data_width != address_width || entries->scale != entry_bytes ||
+        entries->ip_relative || entries->segment ||
+        !entries->index || entries->index->bank != RegisterBank::gpr || entries->index->width != address_width ||
+        same_register(&*entries->index, loaded))
+        return {};
+    std::optional<Address> table;
+    std::optional<Address> base_definition;
+    std::vector<std::uint64_t> base_relocation_rows;
+    bool cross_block_base = false;
+    if (entries->base) {
+        bool adjacent_definition = false;
+        if (dispatch_index >= 2 && facts[dispatch_index - 2]) {
+            const auto &lea = facts[dispatch_index - 2]->instruction;
+            const auto lea_end = analysis_detail::continuation_address(lea);
+            const auto *base = register_operand(lea, 0);
+            const auto *table_address = lea.operands.size() == 2
+                ? std::get_if<MemoryOperand>(&lea.operands[1]) : nullptr;
+            if (lea.context == dispatch.context && lea.opcode == Opcode::lea &&
+                lea.flow == FlowKind::fallthrough && lea_end && lea_end.value() == load.address &&
+                base && base->bank == RegisterBank::gpr && base->width == address_width &&
+                !same_register(base, loaded) && !same_register(base, &*entries->index) &&
+                table_address && !table_address->ip_relative &&
+                table_address->address_width == address_width && !table_address->segment &&
+                !table_address->base && !table_address->index && entries->displacement == 0 &&
+                same_register(&*entries->base, base)) {
+                table = absolute_table_base(lea, *table_address, 1, relocations, stop);
+                if (!table)
+                    return {};
+                base_definition = lea.address;
+                adjacent_definition = true;
+                if (relocations) {
+                    const auto load_resolution = relocations->operand(load, 1, stop);
+                    if (!load_resolution || load_resolution.value().relocated())
+                        return {};
+                }
+                if (relocations) {
+                    const auto resolution = relocations->operand(lea, 1, stop);
+                    if (!resolution || resolution.value().dyld)
+                        return {};
+                    base_relocation_rows = resolution.value().relocations;
+                }
+            }
+        }
+        if (!adjacent_definition) {
+            if (entries->displacement != 0 || function.blocks.size() > 128 || snapshot.blocks.size() > 1024)
+                return {};
+            std::size_t snapshot_facts = 0;
+            std::size_t snapshot_edges = 0;
+            for (const auto &block : snapshot.blocks) {
+                if (stop.stop_requested() || !block || block->instructions.size() > 16384 - snapshot_facts ||
+                    block->successors.size() > 32768 - snapshot_edges)
+                    return {};
+                snapshot_facts += block->instructions.size();
+                snapshot_edges += block->successors.size();
+            }
+            std::size_t function_facts = 0;
+            for (const auto id : function.blocks) {
+                const auto block = guards.blocks.find(id.value);
+                if (block == guards.blocks.end() || !block->second ||
+                    block->second->instructions.size() > 4096 - function_facts)
+                    return {};
+                function_facts += block->second->instructions.size();
+            }
+            if (!guards.graph_attempted) {
+                guards.graph_attempted = true;
+                guards.graph = switch_guard_graph(function, snapshot, guards, stop);
+            }
+            if (!guards.graph || stop.stop_requested())
+                return {};
+            const auto reaching = x86_path_complete_table_base(function, snapshot, *guards.graph,
+                                                                load, *entries->base, relocations,
+                                                                dispatch.address, stop);
+            if (!reaching)
+                return {};
+            table = reaching->table;
+            base_definition = reaching->definition;
+            base_relocation_rows = reaching->relocation_rows;
+            cross_block_base = true;
+        }
+    } else {
+        table = absolute_table_base(load, *entries, 1, relocations, stop);
+    }
+    if (!table || table->offset > UINT32_MAX)
+        return {};
+
+    SwitchSite site;
+    site.dispatch = dispatch.address;
+    site.table = *table;
+    site.selector = *entries->index;
+    site.scale = static_cast<std::uint8_t>(entry_bytes);
+    site.selector_use = load.address;
+    site.base_definition = base_definition;
+    if (relocations && !base_definition) {
+        const auto resolution = relocations->operand(load, 1, stop);
+        if (!resolution)
+            return {};
+        if (resolution.value().relocated()) {
+            site.table_base_source = SwitchSite::TableBaseSource::operand_relocation;
+            site.table_base_relocation_rows = resolution.value().relocations;
+        }
+    }
+    if (!base_relocation_rows.empty()) {
+        site.table_base_source = SwitchSite::TableBaseSource::operand_relocation;
+        site.table_base_relocation_rows = std::move(base_relocation_rows);
+    }
+    if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
+                                               cross_block_base ? load.address : base_definition.value_or(load.address),
+                                               dispatch.address,
+                                               dispatch.context, guards, stop)) {
+        site.case_count = bound->case_count;
+        site.default_target = bound->default_target;
+    }
+    const auto scan_limit = site.case_count ? *site.case_count : max_entries;
+    for (std::size_t index = 0; index < scan_limit; ++index) {
+        if (stop.stop_requested())
+            return {};
+        const auto entry = table_target(image, site.table, index, entry_bytes, false, relocations, stop);
+        if (!entry || !decodes_at(image, dispatch.context, entry->address, stop)) {
+            site.complete = false;
+            site.incomplete_reason = "x86-32 table entry is unreadable, unresolved, or not executable code";
+            break;
+        }
+        site.cases.push_back({static_cast<std::uint32_t>(index), entry->address, entry->source,
+                              entry->relocation_rows, entry->dyld_classic_rows, entry->dyld_chained_rows});
+    }
+    if (!site.case_count && site.cases.size() == max_entries) {
+        site.complete = false;
+        site.incomplete_reason = "x86-32 table scan reached the 4096-entry limit";
+    }
+    return site.cases.size() >= 2 || (site.case_count && (site.cases.size() == 1 || !site.complete))
+        ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
 std::optional<SwitchSite> a64_indexed_absolute_switch(
@@ -1342,24 +2095,35 @@ std::optional<SwitchSite> a64_indexed_absolute_switch(
         site.case_count = bound->case_count;
         site.default_target = bound->default_target;
     }
-    const auto scan_limit = site.case_count ? *site.case_count : max_entries;
-    for (std::size_t index = 0; index < scan_limit; ++index) {
-        if (stop.stop_requested())
-            return {};
-        const auto target = table_target(image, *table, index, 8, false, relocations, stop);
-        if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
-            site.complete = false;
-            break;
+    const auto strict_scan = scan_static_elf_absolute_table(image, *table, site.case_count.value_or(0),
+                                                             dispatch.context, relocations, metadata, stop);
+    if (strict_scan.reject_unbounded)
+        return {};
+    if (strict_scan.applicable) {
+        site.cases = strict_scan.cases;
+        site.complete = strict_scan.complete;
+        if (!site.complete)
+            site.incomplete_reason = "ELF absolute-pointer table has an incomplete or unsupported relocation prefix";
+    } else {
+        const auto scan_limit = site.case_count ? *site.case_count : max_entries;
+        for (std::size_t index = 0; index < scan_limit; ++index) {
+            if (stop.stop_requested())
+                return {};
+            const auto target = table_target(image, *table, index, 8, false, relocations, stop);
+            if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
+                site.complete = false;
+                break;
+            }
+            site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
+                                  target->relocation_rows, target->dyld_classic_rows, target->dyld_chained_rows});
         }
-        site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
-                              target->relocation_rows, target->dyld_classic_rows, target->dyld_chained_rows});
+        if (!site.case_count && site.cases.size() == max_entries)
+            site.complete = false;
     }
-    if (!site.case_count && site.cases.size() == max_entries)
-        site.complete = false;
     // A complete guard can prove a one-entry dispatch just as reliably as a
     // larger table. Keep unguarded one-entry prefixes ambiguous, since they
     // may simply be the first readable word of a larger table.
-    return site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1)
+    return site.cases.size() >= 2 || (site.case_count && (site.cases.size() == 1 || !site.complete))
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
@@ -1419,22 +2183,34 @@ std::optional<SwitchSite> a64_adr_indexed_absolute_switch(
         site.case_count = bound->case_count;
         site.default_target = bound->default_target;
     }
-    const auto scan_limit = site.case_count ? *site.case_count : max_entries;
-    for (std::size_t index = 0; index < scan_limit; ++index) {
-        if (stop.stop_requested())
-            return {};
-        const auto candidate = table_target(image, site.table, index, 8, false, relocations, stop);
-        if (!candidate || !decodes_at(image, dispatch.context, candidate->address, stop)) {
-            site.complete = false;
-            break;
+    const auto *metadata = relocations ? relocations->source_metadata() : nullptr;
+    const auto strict_scan = scan_static_elf_absolute_table(image, site.table, site.case_count.value_or(0),
+                                                             dispatch.context, relocations, metadata, stop);
+    if (strict_scan.reject_unbounded)
+        return {};
+    if (strict_scan.applicable) {
+        site.cases = strict_scan.cases;
+        site.complete = strict_scan.complete;
+        if (!site.complete)
+            site.incomplete_reason = "ELF absolute-pointer table has an incomplete or unsupported relocation prefix";
+    } else {
+        const auto scan_limit = site.case_count ? *site.case_count : max_entries;
+        for (std::size_t index = 0; index < scan_limit; ++index) {
+            if (stop.stop_requested())
+                return {};
+            const auto candidate = table_target(image, site.table, index, 8, false, relocations, stop);
+            if (!candidate || !decodes_at(image, dispatch.context, candidate->address, stop)) {
+                site.complete = false;
+                break;
+            }
+            site.cases.push_back({static_cast<std::uint32_t>(index), candidate->address, candidate->source,
+                                  candidate->relocation_rows, candidate->dyld_classic_rows,
+                                  candidate->dyld_chained_rows});
         }
-        site.cases.push_back({static_cast<std::uint32_t>(index), candidate->address, candidate->source,
-                              candidate->relocation_rows, candidate->dyld_classic_rows,
-                              candidate->dyld_chained_rows});
+        if (!site.case_count && site.cases.size() == max_entries)
+            site.complete = false;
     }
-    if (!site.case_count && site.cases.size() == max_entries)
-        site.complete = false;
-    return site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1)
+    return site.cases.size() >= 2 || (site.case_count && (site.cases.size() == 1 || !site.complete))
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
@@ -1447,11 +2223,16 @@ std::optional<SwitchSite> a64_signed_offset_switch(
     //   ADRP Xbase; ADD Xbase, Xbase, #lo12; LDR Woff, [Xbase, Wsel, UXTW #2];
     //   SXTW Xoff, Woff (encoded as SBFM Xoff, Xoff, #0, #31);
     //   ADD Xoff, Xbase, Xoff; BR Xoff.
+    //   ADRP Xbase; ADD Xbase, Xbase, #lo12; LDRH Woff, [Xbase, Wsel, UXTW #1];
+    //   SXTH Xoff, Woff (encoded as SBFM Xoff, Xoff, #0, #15);
+    //   ADD Xoff, Xbase, Xoff; BR Xoff.
     //   ADRP Xbase; ADD Xbase, Xbase, #lo12; LDRSW Xoff, [Xbase, Wsel, UXTW #2];
     //   ADD Xtarget, Xbase, Xoff; BR Xtarget.
     // Signedness comes only from the explicit SBFM alias or native LDRSW opcode.
     const bool native_signed_load = dispatch_index >= 2 && facts[dispatch_index - 2] &&
         facts[dispatch_index - 2]->instruction.opcode == Opcode::a64_ldrsw;
+    const bool signed_halfword_load = dispatch_index >= 3 && facts[dispatch_index - 3] &&
+        facts[dispatch_index - 3]->instruction.opcode == Opcode::a64_ldrh;
     const std::size_t setup_size = native_signed_load ? 4 : 5;
     if (dispatch_index < setup_size || stop.stop_requested())
         return {};
@@ -1472,7 +2253,8 @@ std::optional<SwitchSite> a64_signed_offset_switch(
         sign_extend.context != dispatch.context || target_add.context != dispatch.context ||
         page.opcode != Opcode::a64_adrp || page.flow != FlowKind::fallthrough ||
         base_add.opcode != Opcode::a64_add || base_add.flow != FlowKind::fallthrough ||
-        load.opcode != (native_signed_load ? Opcode::a64_ldrsw : Opcode::a64_ldr) ||
+        load.opcode != (native_signed_load ? Opcode::a64_ldrsw :
+                        signed_halfword_load ? Opcode::a64_ldrh : Opcode::a64_ldr) ||
         load.flow != FlowKind::fallthrough ||
         (!native_signed_load && (sign_extend.opcode != Opcode::a64_sbfm || sign_extend.flow != FlowKind::fallthrough)) ||
         target_add.opcode != Opcode::a64_add || target_add.flow != FlowKind::fallthrough)
@@ -1524,6 +2306,9 @@ std::optional<SwitchSite> a64_signed_offset_switch(
     const auto *extended_source = native_signed_load ? loaded_reg : register_operand(sign_extend, 1);
     const auto *immr = native_signed_load ? nullptr : std::get_if<ImmediateOperand>(&sign_extend.operands[2]);
     const auto *imms = native_signed_load ? nullptr : std::get_if<ImmediateOperand>(&sign_extend.operands[3]);
+    const std::uint8_t entry_width = signed_halfword_load ? 16 : 32;
+    const std::uint8_t entry_shift = signed_halfword_load ? 1 : 2;
+    const std::uint64_t sign_extend_last_bit = signed_halfword_load ? 15 : 31;
     const auto *target_dest = register_operand(target_add, 0);
     const auto *target_left = register_operand(target_add, 1);
     const auto *target_right = register_operand(target_add, 2);
@@ -1540,15 +2325,15 @@ std::optional<SwitchSite> a64_signed_offset_switch(
         !same_register(entries->base ? &*entries->base : nullptr, page_reg) || !entries->base ||
         entries->base->width != 64 || !entries->index ||
         entries->index->bank != RegisterBank::arm64_gpr || entries->index->width != 32 ||
-        entries->data_width != 32 || entries->address_width != 64 || entries->displacement != 0 ||
-        entries->segment || entries->index_extend != "uxtw" || entries->index_shift_amount != 2 ||
+        entries->data_width != entry_width || entries->address_width != 64 || entries->displacement != 0 ||
+        entries->segment || entries->index_extend != "uxtw" || entries->index_shift_amount != entry_shift ||
         same_register(page_reg, &*entries->index) || same_register(page_reg, loaded_reg) ||
         !extended_dest || extended_dest->bank != RegisterBank::arm64_gpr || extended_dest->width != 64 ||
         !same_register(extended_dest, loaded_reg) || !extended_source || extended_source->width != 64 ||
         !same_register(extended_source, loaded_reg) ||
         (!native_signed_load && (!immr || immr->encoded_width != 6 || immr->effective_width != 64 ||
          immr->is_signed || immr->value != 0 || !imms || imms->encoded_width != 6 ||
-         imms->effective_width != 64 || imms->is_signed || imms->value != 31)) ||
+         imms->effective_width != 64 || imms->is_signed || imms->value != sign_extend_last_bit)) ||
         !target_dest || target_dest->bank != RegisterBank::arm64_gpr || target_dest->width != 64 ||
         !same_register(target_dest, branch_reg) ||
         (!native_signed_load && !same_register(target_dest, extended_dest)) ||
@@ -1572,7 +2357,7 @@ std::optional<SwitchSite> a64_signed_offset_switch(
     site.dispatch = dispatch.address;
     site.table = *table;
     site.selector = *entries->index;
-    site.scale = 4;
+    site.scale = signed_halfword_load ? 2 : 4;
     site.entry_encoding = SwitchEntryEncoding::signed_offset_from_table;
     if (relocated_pair.address) {
         site.table_base_source = SwitchSite::TableBaseSource::elf_relocation_pair;
@@ -1587,7 +2372,8 @@ std::optional<SwitchSite> a64_signed_offset_switch(
     for (std::size_t index = 0; index < scan_limit; ++index) {
         if (stop.stop_requested())
             return {};
-        const auto target = table_target(image, *table, index, 4, true, relocations, stop);
+        const auto target = table_target(image, *table, index, signed_halfword_load ? 2 : 4,
+                                         true, relocations, stop);
         if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
             site.complete = false;
             break;
@@ -1599,7 +2385,7 @@ std::optional<SwitchSite> a64_signed_offset_switch(
         site.complete = false;
     // As for absolute-pointer tables, only a proved guard makes a single
     // signed-offset entry sufficient evidence for a switch site.
-    return site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1)
+    return (site.cases.size() >= 2 || site.case_count.has_value()) && !site.cases.empty()
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
@@ -1831,13 +2617,32 @@ std::optional<Address> riscv_table_base(const Image &image,
     if (!definition || !facts[*definition])
         return {};
     const auto &last = facts[*definition]->instruction;
-    if (last.context.architecture != Architecture::riscv64 || last.context.mode != ExecutionMode::rv64)
+    const auto xlen = last.context.mode == ExecutionMode::rv64 ? 64u
+        : last.context.mode == ExecutionMode::rv32 ? 32u : 0u;
+    const bool matching_architecture = xlen == 64
+        ? last.context.architecture == Architecture::riscv64
+        : xlen == 32 && last.context.architecture == Architecture::riscv32;
+    if (!matching_architecture)
         return {};
+    const auto add_xlen_signed = [&](Address address, std::int64_t delta) -> std::optional<Address> {
+        if (xlen == 32) {
+            if (address.offset > std::numeric_limits<std::uint32_t>::max())
+                return {};
+            const auto offset = static_cast<std::uint32_t>(address.offset) + static_cast<std::uint32_t>(delta);
+            return Address{address.space, offset};
+        }
+        return add_signed_offset(address, delta, image);
+    };
+    const auto lui_address = [&](std::int64_t value) {
+        const auto offset = xlen == 32 ? static_cast<std::uint64_t>(static_cast<std::uint32_t>(value))
+                                       : static_cast<std::uint64_t>(value);
+        return Address{last.address.space, offset};
+    };
     const auto *destination = register_operand(last, 0);
-    if (!destination || !same_register(destination, &base) || destination->width != 64)
+    if (!destination || !same_register(destination, &base) || destination->width != xlen || base.width != xlen)
         return {};
 
-    if (last.opcode == Opcode::rv_auipc && last.operands.size() == 2) {
+    if ((last.opcode == Opcode::rv_auipc || last.opcode == Opcode::rv_lui) && last.operands.size() == 2) {
         const auto high = riscv_switch_immediate(last, 1, 20);
         if (!high)
             return {};
@@ -1847,23 +2652,33 @@ std::optional<Address> riscv_table_base(const Image &image,
             if (!resolved || (resolved.value().relocated() && !resolved.value().address))
                 return {};
         }
-        return relocated ? relocated : add_signed_offset(last.address, *high, image);
+        if (relocated) {
+            if (xlen == 32 && relocated->offset > std::numeric_limits<std::uint32_t>::max())
+                return {};
+            return relocated;
+        }
+        if (last.opcode == Opcode::rv_auipc)
+            return add_xlen_signed(last.address, *high);
+        // The decoded U-immediate is already shifted into bits 31:12 and
+        // sign-extended to XLEN by LUI.
+        return lui_address(*high);
     }
     if (last.opcode != Opcode::rv_addi || last.operands.size() != 3 || *definition == 0)
         return {};
     const auto *source = register_operand(last, 1);
     const auto low = riscv_switch_immediate(last, 2, 12);
-    if (!source || !same_register(source, &base) || source->width != 64 || !low || !facts[*definition - 1])
+    if (!source || !same_register(source, &base) || source->width != xlen || !low || !facts[*definition - 1])
         return {};
     const auto &high_instruction = facts[*definition - 1]->instruction;
     const auto high_end = analysis_detail::continuation_address(high_instruction);
     const auto *high_destination = register_operand(high_instruction, 0);
-    const auto high = high_instruction.opcode == Opcode::rv_auipc && high_instruction.operands.size() == 2
+    const auto high = (high_instruction.opcode == Opcode::rv_auipc || high_instruction.opcode == Opcode::rv_lui) &&
+                              high_instruction.operands.size() == 2
                           ? riscv_switch_immediate(high_instruction, 1, 20)
                           : std::optional<std::int64_t>{};
     if (high_instruction.context != last.context || high_instruction.flow != FlowKind::fallthrough ||
         !high_end || high_end.value() != last.address || !high_destination ||
-        !same_register(high_destination, &base) || high_destination->width != 64 || !high)
+        !same_register(high_destination, &base) || high_destination->width != xlen || !high)
         return {};
     const auto relocated = relocated_operand_address(last, 2, {}, relocations, stop);
     if (relocations) {
@@ -1871,10 +2686,15 @@ std::optional<Address> riscv_table_base(const Image &image,
         if (!resolved || (resolved.value().relocated() && !resolved.value().address))
             return {};
     }
-    if (relocated)
+    if (relocated) {
+        if (xlen == 32 && relocated->offset > std::numeric_limits<std::uint32_t>::max())
+            return {};
         return relocated;
-    const auto page = add_signed_offset(high_instruction.address, *high, image);
-    return page ? add_signed_offset(*page, *low, image) : std::nullopt;
+    }
+    const auto high_address = high_instruction.opcode == Opcode::rv_auipc
+        ? add_xlen_signed(high_instruction.address, *high)
+        : std::optional<Address>(lui_address(*high));
+    return high_address ? add_xlen_signed(*high_address, *low) : std::nullopt;
 }
 
 std::optional<SwitchSite> riscv_indexed_absolute_switch(
@@ -1882,11 +2702,11 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
     std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
     std::stop_token stop) {
-    // RV64 absolute-pointer table form:
-    //   SLLI Xindex, Xselector, 3; ADD Xaddress, Xbase, Xindex;
-    //   LD Xtarget, 0(Xaddress); JALR X0, 0(Xtarget).
-    // The table base may have been materialized near the dispatch by a nearby
-    // AUIPC/ADDI pair. A short straight-line scan locates the scaled selector.
+    // RV32/RV64 absolute-pointer table forms use XLEN-sized entries:
+    //   SLLI Xindex, Xselector, log2(XLEN/8); ADD Xaddress, Xbase, Xindex;
+    //   LW/LD Xtarget, 0(Xaddress); JALR X0, 0(Xtarget).
+    // The table base may have been materialized near the dispatch by an
+    // AUIPC/ADDI or LUI/ADDI pair. A short straight-line scan locates selector scaling.
     if (dispatch_index < 3 || stop.stop_requested())
         return {};
     const auto &dispatch_fact = facts[dispatch_index];
@@ -1897,10 +2717,16 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
     const auto &dispatch = dispatch_fact->instruction;
     const auto &load = load_fact->instruction;
     const auto &address_add = address_add_fact->instruction;
-    if (dispatch.context.architecture != Architecture::riscv64 || dispatch.context.mode != ExecutionMode::rv64 ||
-        dispatch.opcode != Opcode::rv_jalr || dispatch.flow != FlowKind::jump ||
+    const auto xlen = dispatch.context.mode == ExecutionMode::rv64 ? 64u
+        : dispatch.context.mode == ExecutionMode::rv32 ? 32u : 0u;
+    const auto entry_bytes = xlen / 8;
+    const auto scale_shift = xlen == 64 ? 3u : 2u;
+    const bool matching_architecture = xlen == 64
+        ? dispatch.context.architecture == Architecture::riscv64
+        : xlen == 32 && dispatch.context.architecture == Architecture::riscv32;
+    if (!matching_architecture || dispatch.opcode != Opcode::rv_jalr || dispatch.flow != FlowKind::jump ||
         load.context != dispatch.context || address_add.context != dispatch.context ||
-        load.opcode != Opcode::rv_ld || load.flow != FlowKind::fallthrough ||
+        load.opcode != (xlen == 64 ? Opcode::rv_ld : Opcode::rv_lw) || load.flow != FlowKind::fallthrough ||
         address_add.opcode != Opcode::rv_add || address_add.flow != FlowKind::fallthrough ||
         dispatch.operands.size() != 2 || load.operands.size() != 2 || address_add.operands.size() != 3)
         return {};
@@ -1918,15 +2744,15 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
     const auto *branch_memory = std::get_if<MemoryOperand>(&dispatch.operands[1]);
     if (!add_destination || !add_left || !add_right || !loaded_reg ||
         !load_memory || !branch_destination || !branch_memory ||
-        add_destination->bank != RegisterBank::riscv_gpr || add_destination->width != 64 ||
+        add_destination->bank != RegisterBank::riscv_gpr || add_destination->width != xlen ||
         add_destination->index == 0 || loaded_reg->bank != RegisterBank::riscv_gpr ||
-        loaded_reg->width != 64 || loaded_reg->index == 0 || branch_destination->bank != RegisterBank::riscv_gpr ||
-        branch_destination->width != 64 || branch_destination->index != 0 ||
+        loaded_reg->width != xlen || loaded_reg->index == 0 || branch_destination->bank != RegisterBank::riscv_gpr ||
+        branch_destination->width != xlen || branch_destination->index != 0 ||
         !same_register(branch_memory->base ? &*branch_memory->base : nullptr, loaded_reg) ||
-        branch_memory->displacement != 0 || branch_memory->index || branch_memory->address_width != 64 ||
+        branch_memory->displacement != 0 || branch_memory->index || branch_memory->address_width != xlen ||
         !same_register(load_memory->base ? &*load_memory->base : nullptr, add_destination) ||
-        load_memory->displacement != 0 || load_memory->index || load_memory->address_width != 64 ||
-        load_memory->data_width != 64 ||
+        load_memory->displacement != 0 || load_memory->index || load_memory->address_width != xlen ||
+        load_memory->data_width != xlen ||
         same_register(add_destination, loaded_reg))
         return {};
 
@@ -1951,14 +2777,14 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
         const auto *scaled = register_operand(instruction, 0);
         const auto *source = register_operand(instruction, 1);
         const auto *amount = std::get_if<ImmediateOperand>(&instruction.operands[2]);
-        if (!scaled || scaled->bank != RegisterBank::riscv_gpr || scaled->width != 64 || scaled->index == 0 ||
-            !source || source->bank != RegisterBank::riscv_gpr || source->width != 64 || source->index == 0 ||
-            !amount || amount->encoded_width != 6 || amount->effective_width != 64 || amount->is_signed ||
-            amount->value != 3)
+        if (!scaled || scaled->bank != RegisterBank::riscv_gpr || scaled->width != xlen || scaled->index == 0 ||
+            !source || source->bank != RegisterBank::riscv_gpr || source->width != xlen || source->index == 0 ||
+            !amount || amount->encoded_width != (xlen == 64 ? 6 : 5) || amount->effective_width != xlen ||
+            amount->is_signed || amount->value != scale_shift)
             continue;
         const auto *candidate_base = same_register(add_left, scaled) ? add_right : add_left;
         if (!candidate_base || candidate_base->bank != RegisterBank::riscv_gpr ||
-            candidate_base->width != 64 || candidate_base->index == 0 ||
+            candidate_base->width != xlen || candidate_base->index == 0 ||
             same_register(candidate_base, scaled) || same_register(candidate_base, source) ||
             same_register(candidate_base, loaded_reg))
             continue;
@@ -1993,7 +2819,7 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
         same_register(index_reg, selector) || same_register(index_reg, loaded_reg) ||
         same_register(selector, add_destination) || same_register(selector, loaded_reg))
         return {};
-    if (!base || base->bank != RegisterBank::riscv_gpr || base->width != 64 || base->index == 0 ||
+    if (!base || base->bank != RegisterBank::riscv_gpr || base->width != xlen || base->index == 0 ||
         same_register(base, index_reg) || same_register(base, selector) || same_register(base, loaded_reg))
         return {};
     const auto table = riscv_table_base(image, facts, dispatch_index - 2, *base, relocations, stop);
@@ -2004,7 +2830,7 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
     site.dispatch = dispatch.address;
     site.table = *table;
     site.selector = *selector;
-    site.scale = 8;
+    site.scale = static_cast<std::uint8_t>(entry_bytes);
     const auto &scale = facts[*scale_index]->instruction;
     if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector, scale.address,
                                                dispatch.address, dispatch.context, guards, stop)) {
@@ -2015,7 +2841,7 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
     for (std::size_t index = 0; index < scan_limit; ++index) {
         if (stop.stop_requested())
             return {};
-        const auto target = table_target(image, site.table, index, 8, false, relocations, stop);
+        const auto target = table_target(image, site.table, index, entry_bytes, false, relocations, stop);
         if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
             site.complete = false;
             break;
@@ -2034,29 +2860,66 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
     std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
     std::stop_token stop) {
-    // MIPS64 N64 absolute table form, bounded to one straight-line block:
+    // MIPS64 N64 absolute and signed-relative table forms, bounded to one
+    // straight-line block:
     //   LUI/ORI tableBase; DSLL index, selector, 3; DADDU address, tableBase, index;
     //   LD target, 0(address); JR target.
+    // Relative tables use LW for a sign-extended dword followed by
+    // DADDU target, codeBase, target; JR target.
     // The same register facts also accept DADDIU adjustments around the base.
     if (dispatch_index < 4 || dispatch_index >= facts.size() || stop.stop_requested() ||
         !facts[dispatch_index])
         return {};
     const auto &dispatch = facts[dispatch_index]->instruction;
     if (dispatch.context.architecture != Architecture::mips64 ||
-        dispatch.context.mode != ExecutionMode::mips64 || dispatch.opcode != Opcode::mips_jr ||
+        dispatch.context.mode != ExecutionMode::mips64 ||
+        (dispatch.opcode != Opcode::mips_jr && dispatch.opcode != Opcode::mips64_jr_hb) ||
         dispatch.flow != FlowKind::jump || dispatch.operands.size() != 1)
         return {};
     const auto *target_register = register_operand(dispatch, 0);
     if (!target_register || target_register->bank != RegisterBank::mips_gpr || target_register->width != 64 ||
         target_register->index == 0 || !facts[dispatch_index - 1])
         return {};
-    const auto &terminal_load = facts[dispatch_index - 1]->instruction;
+    bool relative_table = false;
+    std::optional<RegisterOperand> relative_base_register;
+    std::size_t terminal_load_index = dispatch_index - 1;
+    if (dispatch_index >= 2 && facts[dispatch_index - 1]) {
+        const auto &add = facts[dispatch_index - 1]->instruction;
+        if (add.context == dispatch.context && add.opcode == Opcode::mips64_daddu &&
+            add.flow == FlowKind::fallthrough && add.operands.size() == 3 &&
+            same_register(register_operand(add, 0), target_register)) {
+            const auto *left = register_operand(add, 1);
+            const auto *right = register_operand(add, 2);
+            if (same_register(left, target_register) && right && !same_register(right, target_register))
+                relative_base_register = *right;
+            else if (same_register(right, target_register) && left && !same_register(left, target_register))
+                relative_base_register = *left;
+            if (relative_base_register) {
+                relative_table = true;
+                terminal_load_index = dispatch_index - 2;
+            }
+        }
+    }
+    if (terminal_load_index >= facts.size() || !facts[terminal_load_index])
+        return {};
+    const auto &terminal_load = facts[terminal_load_index]->instruction;
     const auto load_end = analysis_detail::continuation_address(terminal_load);
     const auto *loaded_register = terminal_load.operands.empty() ? nullptr : register_operand(terminal_load, 0);
-    if (!load_end || load_end.value() != dispatch.address || terminal_load.context != dispatch.context ||
-        terminal_load.opcode != Opcode::mips64_ld || terminal_load.flow != FlowKind::fallthrough ||
+    const auto expected_load_end = relative_table
+        ? std::optional<Address>{facts[dispatch_index - 1]->instruction.address}
+        : std::optional<Address>{dispatch.address};
+    if (!load_end || !expected_load_end || load_end.value() != expected_load_end.value() ||
+        terminal_load.context != dispatch.context ||
+        terminal_load.opcode != (relative_table ? Opcode::mips_lw : Opcode::mips64_ld) ||
+        terminal_load.flow != FlowKind::fallthrough ||
         !loaded_register || !same_register(loaded_register, target_register))
         return {};
+    if (relative_table) {
+        const auto add_end = analysis_detail::continuation_address(facts[dispatch_index - 1]->instruction);
+        if (!add_end || add_end.value() != dispatch.address || !relative_base_register ||
+            relative_base_register->bank != RegisterBank::mips_gpr || relative_base_register->width != 64)
+            return {};
+    }
 
     struct Value {
         std::optional<Address> constant;
@@ -2068,7 +2931,11 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     };
     std::map<std::uint32_t, Value> registers;
     const auto remember = [&](std::uint32_t index, Value value) { registers[index] = std::move(value); };
-    for (std::size_t index = 0; index < dispatch_index; ++index) {
+    // The final DADDU in a relative table transforms the loaded offset into a
+    // code address; keep it out of setup-value propagation so it cannot be
+    // mistaken for a table-base adjustment.
+    const auto setup_end = relative_table ? dispatch_index - 1 : dispatch_index;
+    for (std::size_t index = 0; index < setup_end; ++index) {
         if (stop.stop_requested() || !facts[index])
             return {};
         const auto &instruction = facts[index]->instruction;
@@ -2203,11 +3070,14 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
             if (value) remember(destination->index, std::move(*value));
             continue;
         }
-        if (instruction.opcode == Opcode::mips64_ld && instruction.operands.size() == 2 && destination) {
+        if ((instruction.opcode == Opcode::mips64_ld ||
+             (relative_table && instruction.opcode == Opcode::mips_lw)) &&
+            instruction.operands.size() == 2 && destination) {
             const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
             std::optional<Value> value;
+            const auto entry_width = instruction.opcode == Opcode::mips64_ld ? 64u : 32u;
             if (destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0 &&
-                memory && memory->data_width == 64 && memory->address_width == 64 && memory->base &&
+                memory && memory->data_width == entry_width && memory->address_width == 64 && memory->base &&
                 memory->base->bank == RegisterBank::mips_gpr && memory->base->width == 64 &&
                 memory->base->index != 0) {
                 const auto address = registers.find(memory->base->index);
@@ -2228,14 +3098,30 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
 
     const auto found = registers.find(target_register->index);
     if (found == registers.end() || !found->second.table_base || !found->second.selector ||
-        found->second.scale != 8 || !found->second.has_scale_instruction ||
-        !file_backed_range(image, *found->second.table_base, 8, false))
+        found->second.scale != (relative_table ? 4u : 8u) || !found->second.has_scale_instruction ||
+        !file_backed_range(image, *found->second.table_base, relative_table ? 4u : 8u, false))
         return {};
+    std::optional<Address> relative_base;
+    if (relative_table) {
+        if (!relative_base_register || relative_base_register->index == target_register->index)
+            return {};
+        if (relative_base_register->index == 0)
+            relative_base = Address{dispatch.address.space, 0};
+        else if (const auto base = registers.find(relative_base_register->index);
+                 base != registers.end() && base->second.constant)
+            relative_base = base->second.constant;
+        if (!relative_base || relative_base->space != found->second.table_base->space)
+            return {};
+    }
     SwitchSite site;
     site.dispatch = dispatch.address;
     site.table = *found->second.table_base;
     site.selector = *found->second.selector;
-    site.scale = 8;
+    site.scale = relative_table ? 4 : 8;
+    if (relative_table) {
+        site.entry_encoding = SwitchEntryEncoding::signed_offset_from_target_base;
+        site.target_base = relative_base;
+    }
     if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
                                                found->second.scale_instruction, dispatch.address,
                                                dispatch.context, guards, stop)) {
@@ -2245,9 +3131,26 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     const auto scan_limit = site.case_count ? *site.case_count : max_entries;
     for (std::size_t index = 0; index < scan_limit; ++index) {
         if (stop.stop_requested()) return {};
-        const auto target = table_target(image, site.table, index, 8, false, relocations, stop);
+        std::optional<TableTarget> target;
+        if (relative_table) {
+            const auto slot = add_offset(site.table, static_cast<std::uint64_t>(index) * 4, image);
+            if (slot && file_backed_range(image, *slot, 4, false)) {
+                bool raw_slot = true;
+                if (relocations) {
+                    const auto evidence = relocations->data_at(image, *slot, 4, stop);
+                    raw_slot = evidence && !evidence.value().relocated();
+                }
+                if (raw_slot)
+                    target = table_target(image, site.table, index, 4, true, nullptr, stop,
+                                          relative_base, 64, false);
+            }
+        } else {
+            target = table_target(image, site.table, index, 8, false, relocations, stop);
+        }
         if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
             site.complete = false;
+            if (relative_table)
+                site.incomplete_reason = "MIPS64 signed-relative entry could not be resolved to executable code";
             break;
         }
         site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
@@ -2258,13 +3161,156 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
+std::optional<std::uint32_t> mips32_path_complete_constant(
+    const FunctionRecord &function, const FunctionSnapshot &snapshot, const SwitchGuardGraph &graph,
+    Address before, RegisterOperand wanted, const RelocationResolver *relocations,
+    Address dispatch, bool control_flow_closed, std::stop_token stop) {
+    constexpr std::size_t max_blocks = 128;
+    constexpr std::size_t max_snapshot_blocks = 1024;
+    constexpr std::size_t max_nodes = 4096;
+    constexpr std::size_t max_edges = 8192;
+    constexpr std::size_t max_work = 32768;
+    if (!function.complete || !snapshot.complete || function.blocks.size() > max_blocks ||
+        snapshot.blocks.size() > max_snapshot_blocks || graph.nodes.size() > max_nodes ||
+        snapshot.candidates.size() > 8192 || wanted.bank != RegisterBank::mips_gpr ||
+        wanted.width != 32 || wanted.index == 0 || !control_flow_closed || stop.stop_requested())
+        return {};
+
+    const auto node = graph.addresses.find(guard_address(before));
+    if (node == graph.addresses.end() || !graph.nodes[node->second].fact ||
+        graph.nodes[node->second].fact->instruction.address != before)
+        return {};
+
+    using Key = std::tuple<std::size_t, std::uint8_t, bool>;
+    std::map<Key, std::optional<std::uint32_t>> memo;
+    std::set<Key> active;
+    std::size_t remaining_work = max_work;
+    std::function<std::optional<std::uint32_t>(std::size_t, std::uint8_t)> incoming;
+    std::function<std::optional<std::uint32_t>(std::size_t, std::uint8_t)> after;
+    const auto relocation_free = [&](const Instruction &instruction, std::uint32_t operand) {
+        if (!relocations) return true;
+        auto resolution = relocations->operand(instruction, operand, stop);
+        return resolution && !resolution.value().relocated();
+    };
+    incoming = [&](std::size_t current, std::uint8_t reg) -> std::optional<std::uint32_t> {
+        if (reg == 0) return 0;
+        const Key key{current, reg, false};
+        if (const auto found = memo.find(key); found != memo.end()) return found->second;
+        if (stop.stop_requested() || remaining_work == 0 || !active.insert(key).second) return {};
+        --remaining_work;
+        const auto &node_value = graph.nodes[current];
+        if (!node_value.fact || node_value.alternate_entry || node_value.ambiguous ||
+            node_value.predecessors.empty()) {
+            active.erase(key);
+            memo.emplace(key, std::nullopt);
+            return {};
+        }
+        std::optional<std::uint32_t> unanimous;
+        std::size_t visited_edges = 0;
+        for (const auto predecessor : node_value.predecessors) {
+            if (stop.stop_requested() || remaining_work == 0 || ++visited_edges > max_edges) {
+                active.erase(key);
+                return {};
+            }
+            --remaining_work;
+            const auto value = after(predecessor, reg);
+            if (!value || (unanimous && *unanimous != *value)) {
+                active.erase(key);
+                memo.emplace(key, std::nullopt);
+                return {};
+            }
+            unanimous = value;
+        }
+        active.erase(key);
+        memo.emplace(key, unanimous);
+        return unanimous;
+    };
+    after = [&](std::size_t current, std::uint8_t reg) -> std::optional<std::uint32_t> {
+        if (reg == 0) return 0;
+        const Key key{current, reg, true};
+        if (const auto found = memo.find(key); found != memo.end()) return found->second;
+        if (stop.stop_requested() || remaining_work == 0 || !active.insert(key).second) return {};
+        --remaining_work;
+        const auto &node_value = graph.nodes[current];
+        if (!node_value.fact || node_value.ambiguous) {
+            active.erase(key);
+            memo.emplace(key, std::nullopt);
+            return {};
+        }
+        const auto &instruction = node_value.fact->instruction;
+        if (instruction.context.architecture != Architecture::mips32 ||
+            instruction.context.mode != ExecutionMode::mips32 || instruction.delay_slots ||
+            instruction.flow == FlowKind::call || instruction.flow == FlowKind::ret ||
+            instruction.flow == FlowKind::trap || instruction.flow == FlowKind::switch_dispatch ||
+            instruction.opcode == Opcode::opaque || instruction.opcode == Opcode::x86_opaque ||
+            (instruction.flow != FlowKind::fallthrough && instruction.flow != FlowKind::conditional_branch &&
+             instruction.flow != FlowKind::jump)) {
+            active.erase(key);
+            memo.emplace(key, std::nullopt);
+            return {};
+        }
+        if (!writes_register(instruction, RegisterOperand{RegisterBank::mips_gpr, reg, 32, false})) {
+            const auto value = incoming(current, reg);
+            active.erase(key);
+            memo.emplace(key, value);
+            return value;
+        }
+
+        const auto *destination = instruction.operands.empty() ? nullptr : register_operand(instruction, 0);
+        const auto *source = instruction.operands.size() > 1 ? register_operand(instruction, 1) : nullptr;
+        const auto immediate = [&](std::size_t index, bool signed_value) -> std::optional<std::uint32_t> {
+            if (index >= instruction.operands.size() || !relocation_free(instruction,
+                    static_cast<std::uint32_t>(index))) return {};
+            const auto *value = std::get_if<ImmediateOperand>(&instruction.operands[index]);
+            if (!value || value->encoded_width != 16 || value->effective_width != 32 ||
+                value->is_signed != signed_value || (!signed_value && value->value > 0xffff)) return {};
+            return static_cast<std::uint32_t>(value->value);
+        };
+        std::optional<std::uint32_t> result;
+        if (!destination || destination->bank != RegisterBank::mips_gpr || destination->width != 32 ||
+            destination->index != reg || destination->index == 0 || instruction.flow != FlowKind::fallthrough) {
+            result.reset();
+        } else if (instruction.opcode == Opcode::mips_lui && instruction.operands.size() == 2) {
+            if (const auto value = immediate(1, false)) result = *value << 16;
+        } else if ((instruction.opcode == Opcode::mips_ori || instruction.opcode == Opcode::mips_addiu) &&
+                   instruction.operands.size() == 3 && source && source->bank == RegisterBank::mips_gpr &&
+                   source->width == 32) {
+            const auto literal = immediate(2, instruction.opcode == Opcode::mips_addiu);
+            const auto base = literal ? incoming(current, source->index) : std::nullopt;
+            if (base && literal) {
+                if (instruction.opcode == Opcode::mips_ori) result = *base | *literal;
+                else {
+                    const auto displacement = std::bit_cast<std::int32_t>(*literal);
+                    const auto sum = static_cast<std::int64_t>(*base) + displacement;
+                    if (sum >= 0 && sum <= UINT32_MAX) result = static_cast<std::uint32_t>(sum);
+                }
+            }
+        } else if (instruction.opcode == Opcode::mips_addu && instruction.operands.size() == 3) {
+            const auto *left = register_operand(instruction, 1);
+            const auto *right = register_operand(instruction, 2);
+            if (left && right && left->bank == RegisterBank::mips_gpr && right->bank == RegisterBank::mips_gpr &&
+                left->width == 32 && right->width == 32) {
+                const auto lhs = incoming(current, left->index);
+                const auto rhs = incoming(current, right->index);
+                if (lhs && rhs && *lhs <= UINT32_MAX - *rhs) result = *lhs + *rhs;
+            }
+        }
+        active.erase(key);
+        memo.emplace(key, result);
+        return result;
+    };
+    return incoming(node->second, wanted.index);
+}
+
 std::optional<SwitchSite> mips32_register_absolute_switch(
     const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
     std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
     std::stop_token stop) {
-    // MIPS32 O32 absolute table form, bounded to one straight-line block:
-    //   LUI/ORI tableBase; SLL index, selector, 3; ADDU address, tableBase, index;
+    // MIPS32 O32 absolute or signed-relative table forms, bounded to one
+    // straight-line block. Relative entries add a separately proven code base
+    // to the signed word loaded from the table.
+    //   LUI/ORI tableBase; SLL index, selector, 2; ADDU address, tableBase, index;
     //   LW target, 0(address); JR target.
     // The same register facts also accept ADDIU adjustments around the base.
     if (dispatch_index < 4 || dispatch_index >= facts.size() || stop.stop_requested() ||
@@ -2279,13 +3325,79 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
     if (!target_register || target_register->bank != RegisterBank::mips_gpr || target_register->width != 32 ||
         target_register->index == 0 || !facts[dispatch_index - 1])
         return {};
-    const auto &terminal_load = facts[dispatch_index - 1]->instruction;
+    bool relative_table = false;
+    bool relative_halfword_sign_extension = false;
+    std::optional<RegisterOperand> relative_base_register;
+    std::size_t terminal_load_index = dispatch_index - 1;
+    if (dispatch_index >= 2 && facts[dispatch_index - 1]) {
+        const auto &add = facts[dispatch_index - 1]->instruction;
+        if (add.context == dispatch.context && add.opcode == Opcode::mips_addu &&
+            add.flow == FlowKind::fallthrough && add.operands.size() == 3 &&
+            same_register(register_operand(add, 0), target_register)) {
+            const auto *left = register_operand(add, 1);
+            const auto *right = register_operand(add, 2);
+            if (same_register(left, target_register) && right && !same_register(right, target_register))
+                relative_base_register = *right;
+            else if (same_register(right, target_register) && left && !same_register(left, target_register))
+                relative_base_register = *left;
+            if (relative_base_register) {
+                relative_table = true;
+                terminal_load_index = dispatch_index - 2;
+                // Some O32 compilers load an unsigned halfword and explicitly
+                // sign-extend it before adding the code base:
+                //   LHU target, table[index]; SLL target,target,16;
+                //   SRA target,target,16; ADDU target,codeBase,target; JR target.
+                if (dispatch_index >= 4 && facts[dispatch_index - 2] && facts[dispatch_index - 3]) {
+                    const auto &arithmetic_shift = facts[dispatch_index - 2]->instruction;
+                    const auto &left_shift = facts[dispatch_index - 3]->instruction;
+                    const auto exact_shift = [&](const Instruction &instruction, Opcode opcode,
+                                                 const Instruction &next) {
+                        const auto *destination = instruction.operands.size() == 3
+                            ? register_operand(instruction, 0) : nullptr;
+                        const auto *source = instruction.operands.size() == 3
+                            ? register_operand(instruction, 1) : nullptr;
+                        const auto *amount = instruction.operands.size() == 3
+                            ? std::get_if<ImmediateOperand>(&instruction.operands[2]) : nullptr;
+                        const auto end = analysis_detail::continuation_address(instruction);
+                        return instruction.context == dispatch.context && instruction.opcode == opcode &&
+                            instruction.flow == FlowKind::fallthrough && instruction.delay_slots == 0 &&
+                            end && end.value() == next.address && same_register(destination, target_register) &&
+                            same_register(source, target_register) && amount && amount->encoded_width == 5 &&
+                            amount->effective_width == 32 && !amount->is_signed && amount->value == 16;
+                    };
+                    if (exact_shift(arithmetic_shift, Opcode::mips_sra,
+                                    facts[dispatch_index - 1]->instruction) &&
+                        exact_shift(left_shift, Opcode::mips_sll, arithmetic_shift)) {
+                        relative_halfword_sign_extension = true;
+                        terminal_load_index = dispatch_index - 4;
+                    }
+                }
+            }
+        }
+    }
+    if (terminal_load_index >= facts.size() || !facts[terminal_load_index]) return {};
+    const auto &terminal_load = facts[terminal_load_index]->instruction;
     const auto load_end = analysis_detail::continuation_address(terminal_load);
     const auto *loaded_register = terminal_load.operands.empty() ? nullptr : register_operand(terminal_load, 0);
-    if (!load_end || load_end.value() != dispatch.address || terminal_load.context != dispatch.context ||
-        terminal_load.opcode != Opcode::mips_lw || terminal_load.flow != FlowKind::fallthrough ||
+    const auto expected_load_end = relative_table
+        ? std::optional<Address>{facts[relative_halfword_sign_extension
+            ? dispatch_index - 3 : dispatch_index - 1]->instruction.address}
+        : std::optional<Address>{dispatch.address};
+    if (!load_end || !expected_load_end || load_end.value() != expected_load_end.value() ||
+        terminal_load.context != dispatch.context ||
+        (terminal_load.opcode != Opcode::mips_lw &&
+         !(relative_table && terminal_load.opcode == Opcode::mips_lh) &&
+         !(relative_halfword_sign_extension && terminal_load.opcode == Opcode::mips_lhu)) ||
+        terminal_load.flow != FlowKind::fallthrough ||
         !loaded_register || !same_register(loaded_register, target_register))
         return {};
+    if (relative_table) {
+        const auto add_end = analysis_detail::continuation_address(facts[dispatch_index - 1]->instruction);
+        if (!add_end || add_end.value() != dispatch.address || !relative_base_register ||
+            relative_base_register->bank != RegisterBank::mips_gpr || relative_base_register->width != 32 ||
+            relative_base_register->index == target_register->index)
+            return {};
+    }
 
     struct Value {
         std::optional<Address> constant;
@@ -2297,7 +3409,74 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
     };
     std::map<std::uint32_t, Value> registers;
     const auto remember = [&](std::uint32_t index, Value value) { registers[index] = std::move(value); };
-    for (std::size_t index = 0; index < dispatch_index; ++index) {
+    // Seed constants that reach the beginning of this basic block only when
+    // every CFG predecessor path agrees. Dynamic selector values remain
+    // unknown; the existing same-block transfer then proves the table scale
+    // and address calculation from the seeded bases.
+    if (!facts.empty() && facts.front()) {
+        bool bounded_graph_candidate = function.complete && snapshot.complete &&
+            function.blocks.size() <= 128 && snapshot.blocks.size() <= 1024;
+        std::size_t function_instruction_count = 0;
+        if (bounded_graph_candidate) {
+            for (const auto id : function.blocks) {
+                const auto block = guards.blocks.find(id.value);
+                if (block == guards.blocks.end() || !block->second ||
+                    block->second->instructions.size() > 4096 - function_instruction_count) {
+                    bounded_graph_candidate = false;
+                    break;
+                }
+                function_instruction_count += block->second->instructions.size();
+            }
+        }
+        if (!guards.graph_attempted && bounded_graph_candidate) {
+            guards.graph_attempted = true;
+            guards.graph = switch_guard_graph(function, snapshot, guards, stop);
+        }
+        if (guards.graph) {
+            bool control_flow_closed = snapshot.complete && snapshot.blocks.size() <= 1024;
+            for (const auto &block : snapshot.blocks) {
+                if (!control_flow_closed) break;
+                if (stop.stop_requested()) return {};
+                if (!guards.scan(stop) || !block) { control_flow_closed = false; break; }
+                for (const auto &fact : block->instructions) {
+                    if (stop.stop_requested()) return {};
+                    if (!guards.scan(stop) || !fact) { control_flow_closed = false; break; }
+                    const auto &instruction = fact->instruction;
+                    if (instruction.address != dispatch.address &&
+                        (instruction.flow == FlowKind::switch_dispatch ||
+                         ((instruction.flow == FlowKind::jump || instruction.flow == FlowKind::call) &&
+                          !instruction.direct_target)))
+                        control_flow_closed = false;
+                }
+                if (!control_flow_closed) break;
+                for (const auto &edge : block->successors) {
+                    if (stop.stop_requested()) return {};
+                    if (!guards.scan(stop)) { control_flow_closed = false; break; }
+                    if (edge.source != dispatch.address && !edge.target && edge.kind == BlockEdgeKind::unresolved)
+                        control_flow_closed = false;
+                }
+                if (!control_flow_closed) break;
+            }
+            std::set<std::uint8_t> entry_reads;
+            for (const auto &fact : facts) {
+                if (stop.stop_requested() || !fact) return {};
+                for (const auto &read : fact->instruction.register_reads)
+                    if (read.bank == RegisterBank::mips_gpr && read.width == 32 && read.index != 0)
+                        entry_reads.insert(read.index);
+            }
+            const auto block_entry = facts.front()->instruction.address;
+            for (const auto reg : entry_reads) {
+                if (stop.stop_requested()) return {};
+                const RegisterOperand operand{RegisterBank::mips_gpr, reg, 32, false};
+                if (const auto value = mips32_path_complete_constant(function, snapshot, *guards.graph,
+                        block_entry, operand, relocations, dispatch.address, control_flow_closed, stop))
+                    remember(reg, Value{Address{dispatch.address.space, *value}});
+            }
+        }
+    }
+    const auto setup_end = relative_table
+        ? dispatch_index - (relative_halfword_sign_extension ? 3 : 1) : dispatch_index;
+    for (std::size_t index = 0; index < setup_end; ++index) {
         if (stop.stop_requested() || !facts[index])
             return {};
         const auto &instruction = facts[index]->instruction;
@@ -2431,11 +3610,16 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
             if (value) remember(destination->index, std::move(*value));
             continue;
         }
-        if (instruction.opcode == Opcode::mips_lw && instruction.operands.size() == 2 && destination) {
+        if ((instruction.opcode == Opcode::mips_lw ||
+             (relative_table && (instruction.opcode == Opcode::mips_lh ||
+                                 (relative_halfword_sign_extension && instruction.opcode == Opcode::mips_lhu)))) &&
+            instruction.operands.size() == 2 && destination) {
             const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
             std::optional<Value> value;
+            const auto entry_width = instruction.opcode == Opcode::mips_lh || instruction.opcode == Opcode::mips_lhu
+                ? 16u : 32u;
             if (destination->bank == RegisterBank::mips_gpr && destination->width == 32 && destination->index != 0 &&
-                memory && memory->data_width == 32 && memory->address_width == 32 && memory->base &&
+                memory && memory->data_width == entry_width && memory->address_width == 32 && memory->base &&
                 memory->base->bank == RegisterBank::mips_gpr && memory->base->width == 32 &&
                 memory->base->index != 0) {
                 const auto address = registers.find(memory->base->index);
@@ -2455,15 +3639,35 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
     }
 
     const auto found = registers.find(target_register->index);
+    const auto entry_width = relative_table &&
+        (terminal_load.opcode == Opcode::mips_lh || relative_halfword_sign_extension) ? 2u : 4u;
     if (found == registers.end() || !found->second.table_base || !found->second.selector ||
-        same_register(&*found->second.selector, target_register) || found->second.scale != 4 ||
-        !found->second.has_scale_instruction || !file_backed_range(image, *found->second.table_base, 4, false))
+        same_register(&*found->second.selector, target_register) ||
+        found->second.scale != entry_width ||
+        !found->second.has_scale_instruction ||
+        !file_backed_range(image, *found->second.table_base, entry_width, false))
         return {};
     SwitchSite site;
     site.dispatch = dispatch.address;
     site.table = *found->second.table_base;
     site.selector = *found->second.selector;
-    site.scale = 4;
+    site.scale = static_cast<std::uint8_t>(found->second.scale);
+    if (relative_table) {
+        if (same_register(&*found->second.selector, &*relative_base_register)) return {};
+        std::optional<Address> relative_base;
+        if (relative_base_register->index == 0)
+            relative_base = Address{dispatch.address.space, 0};
+        else if (const auto base = registers.find(relative_base_register->index);
+                 base != registers.end() && base->second.constant)
+            relative_base = base->second.constant;
+        if (!relative_base || relative_base->space != dispatch.address.space ||
+            relative_base->offset > UINT32_MAX)
+            return {};
+        site.entry_encoding = entry_width == 2
+            ? SwitchEntryEncoding::signed_halfword_offset_from_target_base
+            : SwitchEntryEncoding::signed_offset_from_target_base;
+        site.target_base = relative_base;
+    }
     if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
                                                found->second.scale_instruction, dispatch.address,
                                                dispatch.context, guards, stop)) {
@@ -2473,9 +3677,24 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
     const auto scan_limit = site.case_count ? *site.case_count : max_entries;
     for (std::size_t index = 0; index < scan_limit; ++index) {
         if (stop.stop_requested()) return {};
-        const auto target = table_target(image, site.table, index, 4, false, relocations, stop);
+        std::optional<TableTarget> target;
+        if (relative_table) {
+            const auto slot = add_offset(site.table, static_cast<std::uint64_t>(index) * entry_width, image);
+            bool raw_slot = slot && file_backed_range(image, *slot, entry_width, false);
+            if (raw_slot && relocations) {
+                const auto evidence = relocations->data_at(image, *slot, entry_width, stop);
+                raw_slot = evidence && !evidence.value().relocated();
+            }
+            if (raw_slot)
+                target = table_target(image, site.table, index, entry_width, true, nullptr, stop,
+                                      site.target_base, 32, false);
+        } else {
+            target = table_target(image, site.table, index, 4, false, relocations, stop);
+        }
         if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
             site.complete = false;
+            if (relative_table)
+                site.incomplete_reason = "MIPS32 signed-relative entry could not be resolved to executable code";
             break;
         }
         site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
@@ -2491,9 +3710,10 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
     std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
     std::stop_token stop) {
-    // PPC32 indexed absolute-pointer form:
+    // PPC32 indexed table forms:
     //   ADDIS/ORI tableBase; MULLI index, selector, 4 (or SLWI by 2);
-    //   LWZX target, tableBase, index;
+    //   LWZX target, tableBase, index; [ADD target, tableBase, target];
+    //   or for relative halfwords, LHAX target, tableBase, index; ADD target, codeBase, target;
     //   MTCTR target; BCTR.
     // This deliberately handles linked images with literal instruction
     // immediates. Relocation-paired HA/LO table bases need a separate proof.
@@ -2518,13 +3738,35 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
         !dispatch_target || dispatch_target->bank != RegisterBank::ppc_gpr || dispatch_target->width != 32 ||
         dispatch_target->index == 0 || !facts[dispatch_index - 2])
         return {};
-    const auto &terminal_load = facts[dispatch_index - 2]->instruction;
+    const Instruction *relative_target_add = nullptr;
+    std::size_t load_index = dispatch_index - 2;
+    if (dispatch_index >= 4 && facts[dispatch_index - 2] &&
+        facts[dispatch_index - 2]->instruction.opcode == Opcode::ppc_add) {
+        relative_target_add = &facts[dispatch_index - 2]->instruction;
+        load_index = dispatch_index - 3;
+    }
+    if (!facts[load_index]) return {};
+    const auto &terminal_load = facts[load_index]->instruction;
     const auto load_end = analysis_detail::continuation_address(terminal_load);
     const auto *loaded_register = terminal_load.operands.empty() ? nullptr : register_operand(terminal_load, 0);
-    if (terminal_load.context != dispatch.context || terminal_load.opcode != Opcode::ppc_lwzx ||
-        terminal_load.flow != FlowKind::fallthrough || !load_end || load_end.value() != move_to_ctr.address ||
+    const bool halfword_relative = relative_target_add && terminal_load.opcode == Opcode::ppc_lhax;
+    if (terminal_load.context != dispatch.context ||
+        (terminal_load.opcode != Opcode::ppc_lwzx && !halfword_relative) ||
+        terminal_load.flow != FlowKind::fallthrough || !load_end ||
+        load_end.value() != (relative_target_add ? relative_target_add->address : move_to_ctr.address) ||
         !loaded_register || !same_register(loaded_register, dispatch_target) || terminal_load.operands.size() != 2)
         return {};
+    if (relative_target_add) {
+        const auto add_end = analysis_detail::continuation_address(*relative_target_add);
+        if (relative_target_add->context != dispatch.context || relative_target_add->flow != FlowKind::fallthrough ||
+            !add_end || add_end.value() != move_to_ctr.address || relative_target_add->operands.size() != 3 ||
+            !same_register(register_operand(*relative_target_add, 0), dispatch_target))
+            return {};
+        const auto *left = register_operand(*relative_target_add, 1);
+        const auto *right = register_operand(*relative_target_add, 2);
+        if (!same_register(left, dispatch_target) && !same_register(right, dispatch_target))
+            return {};
+    }
 
     struct Value {
         std::optional<Address> constant;
@@ -2550,7 +3792,8 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
         return Address{base.space, static_cast<std::uint32_t>(base.offset + static_cast<std::uint64_t>(delta))};
     };
 
-    for (std::size_t index = 0; index < dispatch_index - 1; ++index) {
+    const auto setup_end = relative_target_add ? dispatch_index - 2 : dispatch_index - 1;
+    for (std::size_t index = 0; index < setup_end; ++index) {
         if (stop.stop_requested() || !facts[index])
             return {};
         const auto &instruction = facts[index]->instruction;
@@ -2637,6 +3880,7 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
             }
             continue;
         }
+        const auto entry_scale = halfword_relative ? 2u : 4u;
         const bool multiply_scale = instruction.opcode == Opcode::ppc_mulli &&
                                     instruction.operands.size() == 3;
         const bool shift_scale = instruction.opcode == Opcode::ppc_rlwinm &&
@@ -2648,20 +3892,20 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
             if (multiply_scale) {
                 const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
                 exact_scale = immediate && immediate->effective_width == 32 && immediate->is_signed &&
-                    std::bit_cast<std::int64_t>(immediate->value) == 4 &&
+                    std::bit_cast<std::int64_t>(immediate->value) == entry_scale &&
                     decoded_immediate_is_unrelocated(instruction, 2);
             } else {
                 const auto *shift = std::get_if<ImmediateOperand>(&instruction.operands[2]);
                 const auto *mask_begin = std::get_if<ImmediateOperand>(&instruction.operands[3]);
                 const auto *mask_end = std::get_if<ImmediateOperand>(&instruction.operands[4]);
-                exact_scale = shift && mask_begin && mask_end && shift->value == 2 &&
-                    mask_begin->value == 0 && mask_end->value == 29;
+                exact_scale = shift && mask_begin && mask_end && shift->value == (halfword_relative ? 1u : 2u) &&
+                    mask_begin->value == 0 && mask_end->value == (halfword_relative ? 30u : 29u);
             }
             if (exact_scale && source && source->bank == RegisterBank::ppc_gpr &&
                 source->width == 32 && source->index) {
                 Value scaled;
                 scaled.selector = *source;
-                scaled.scale = 4;
+                scaled.scale = entry_scale;
                 scaled.scale_instruction = instruction.address;
                 scaled.has_scale_instruction = true;
                 value = std::move(scaled);
@@ -2671,11 +3915,13 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
                 registers[destination->index] = std::move(*value);
             continue;
         }
-        if (instruction.opcode == Opcode::ppc_lwzx && instruction.operands.size() == 2 &&
+        if ((instruction.opcode == Opcode::ppc_lwzx ||
+             (halfword_relative && instruction.opcode == Opcode::ppc_lhax)) && instruction.operands.size() == 2 &&
             valid_destination(destination)) {
             const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
             std::optional<Value> loaded;
-            if (memory && memory->data_width == 32 && memory->address_width == 32 && memory->base &&
+            if (memory && memory->data_width == (halfword_relative ? 16u : 32u) &&
+                memory->address_width == 32 && memory->base &&
                 memory->index && memory->scale == 1) {
                 const auto base = registers.find(memory->base->index);
                 const auto index_value = registers.find(memory->index->index);
@@ -2684,8 +3930,9 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
                     base != registers.end() && base->second.constant &&
                     base->second.constant->space == dispatch.address.space && index_value != registers.end() &&
                     index_value->second.selector && index_value->second.has_scale_instruction &&
-                    index_value->second.scale == 4) {
+                    index_value->second.scale == entry_scale) {
                     Value table_value;
+                    table_value.constant = *base->second.constant;
                     table_value.table_base = add32(*base->second.constant, memory->displacement);
                     table_value.selector = index_value->second.selector;
                     table_value.scale = index_value->second.scale;
@@ -2704,36 +3951,67 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
 
     const auto loaded = registers.find(dispatch_target->index);
     if (loaded == registers.end() || !loaded->second.table_base || !loaded->second.selector ||
-        !loaded->second.has_scale_instruction || loaded->second.scale != 4 ||
+        !loaded->second.has_scale_instruction || loaded->second.scale != (halfword_relative ? 2u : 4u) ||
         same_register(&*loaded->second.selector, dispatch_target) ||
-        !file_backed_range(image, *loaded->second.table_base, 4, false))
+        !file_backed_range(image, *loaded->second.table_base, halfword_relative ? 2u : 4u, false))
         return {};
+    if (relative_target_add) {
+        const auto *left = register_operand(*relative_target_add, 1);
+        const auto *right = register_operand(*relative_target_add, 2);
+        const auto *base_register = same_register(left, dispatch_target) ? right : left;
+        const auto base = base_register && base_register->bank == RegisterBank::ppc_gpr && base_register->index
+            ? registers.find(base_register->index) : registers.end();
+        if (base == registers.end() || !base->second.constant || !loaded->second.constant ||
+            *base->second.constant != *loaded->second.constant)
+            return {};
+    }
     SwitchSite site;
     site.dispatch = dispatch.address;
     site.table = *loaded->second.table_base;
     site.selector = *loaded->second.selector;
-    site.scale = 4;
+    site.scale = static_cast<std::uint8_t>(loaded->second.scale);
+    if (relative_target_add) {
+        site.entry_encoding = halfword_relative ? SwitchEntryEncoding::signed_halfword_offset_from_target_base
+                                                : SwitchEntryEncoding::signed_offset_from_target_base;
+        site.target_base = loaded->second.constant;
+    }
     const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
                                            loaded->second.scale_instruction, dispatch.address,
                                            dispatch.context, guards, stop);
-    if (!bound || bound->case_count == 0 || bound->case_count > max_entries)
+    if (bound && (bound->case_count == 0 || bound->case_count > max_entries))
         return {};
-    site.case_count = bound->case_count;
-    site.default_target = bound->default_target;
-    const auto scan_limit = static_cast<std::size_t>(bound->case_count);
+    if (bound) {
+        site.case_count = bound->case_count;
+        site.default_target = bound->default_target;
+    }
+    // Without an exact selector guard, retain only the contiguous prefix whose
+    // entries independently resolve to executable PPC32 instructions. The
+    // result stays partial because table extent and default remain unknown.
+    const auto scan_limit = bound ? static_cast<std::size_t>(bound->case_count) : max_entries;
     for (std::size_t index = 0; index < scan_limit; ++index) {
         if (stop.stop_requested())
             return {};
-        const auto target = table_target(image, site.table, index, 4, false, relocations, stop);
+        const auto entry_bytes = halfword_relative ? 2u : 4u;
+        const auto target = table_target(image, site.table, index, entry_bytes, relative_target_add != nullptr,
+                                         relocations, stop,
+                                         relative_target_add ? site.target_base : std::nullopt,
+                                         32);
         if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
             site.complete = false;
-            site.incomplete_reason = "table entry is unreadable, unresolved, or not executable PPC32 code";
+            site.incomplete_reason = bound
+                ? "table entry is unreadable, unresolved, or not executable PPC32 code"
+                : "unguarded table prefix ended at an unreadable, unresolved, or non-executable PPC32 entry";
             break;
         }
         site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
                               target->relocation_rows, target->dyld_classic_rows, target->dyld_chained_rows});
     }
-    return !site.cases.empty() ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
+    if (!bound && site.cases.size() == max_entries) {
+        site.complete = false;
+        site.incomplete_reason = "unguarded PPC32 table prefix reached the 4096-entry scan cap";
+    }
+    return site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1)
+        ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
 std::optional<SwitchSite> riscv_indexed_relative_switch(
@@ -2741,10 +4019,10 @@ std::optional<SwitchSite> riscv_indexed_relative_switch(
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
     std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
     std::stop_token stop) {
-    // AUIPC Xbase[, ADDI Xbase, Xbase, lo]; SLLI Xindex, Xselector, 2;
-    // ADD Xaddress, Xbase, Xindex; LW Xoffset, 0(Xaddress);
+    // AUIPC Xbase[, ADDI Xbase, Xbase, lo]; SLLI Xindex, Xselector, 1|2;
+    // ADD Xaddress, Xbase, Xindex; LH|LW Xoffset, 0(Xaddress);
     // ADD Xtarget, Xbase, Xoffset; JALR X0, 0(Xtarget).
-    // LW sign-extends the table's 32-bit entries before the target ADD.
+    // LH/LW sign-extend 16/32-bit byte displacements before the target ADD.
     if (dispatch_index < 5 || stop.stop_requested())
         return {};
     const auto &dispatch = facts[dispatch_index];
@@ -2761,10 +4039,17 @@ std::optional<SwitchSite> riscv_indexed_relative_switch(
     const auto &address_instruction = address_add->instruction;
     const auto &scale_instruction = scale->instruction;
     const auto &setup_instruction = last_setup->instruction;
-    if (branch_instruction.context.architecture != Architecture::riscv64 ||
-        branch_instruction.context.mode != ExecutionMode::rv64 ||
-        branch_instruction.opcode != Opcode::rv_jalr || branch_instruction.flow != FlowKind::jump ||
-        target_instruction.opcode != Opcode::rv_add || load_instruction.opcode != Opcode::rv_lw ||
+    const bool halfword_offsets = load_instruction.opcode == Opcode::rv_lh;
+    const std::uint64_t entry_bytes = halfword_offsets ? 2 : 4;
+    const std::uint64_t scale_shift = halfword_offsets ? 1 : 2;
+    const bool rv32 = branch_instruction.context.architecture == Architecture::riscv32 &&
+                      branch_instruction.context.mode == ExecutionMode::rv32;
+    const bool rv64 = branch_instruction.context.architecture == Architecture::riscv64 &&
+                      branch_instruction.context.mode == ExecutionMode::rv64;
+    const unsigned xlen = rv32 ? 32u : rv64 ? 64u : 0u;
+    if (xlen == 0 || branch_instruction.opcode != Opcode::rv_jalr || branch_instruction.flow != FlowKind::jump ||
+        target_instruction.opcode != Opcode::rv_add ||
+        (load_instruction.opcode != Opcode::rv_lw && !halfword_offsets) ||
         address_instruction.opcode != Opcode::rv_add || scale_instruction.opcode != Opcode::rv_slli ||
         (setup_instruction.opcode != Opcode::rv_auipc && setup_instruction.opcode != Opcode::rv_addi) ||
         branch_instruction.operands.size() != 2 || target_instruction.operands.size() != 3 ||
@@ -2804,29 +4089,29 @@ std::optional<SwitchSite> riscv_indexed_relative_switch(
     const auto *scaled_index = register_operand(scale_instruction, 0);
     const auto *selector = register_operand(scale_instruction, 1);
     const auto *amount = std::get_if<ImmediateOperand>(&scale_instruction.operands[2]);
-    const auto gpr64 = [](const RegisterOperand *reg) {
-        return reg && reg->bank == RegisterBank::riscv_gpr && reg->width == 64 && reg->index != 0;
+    const auto gpr = [xlen](const RegisterOperand *reg) {
+        return reg && reg->bank == RegisterBank::riscv_gpr && reg->width == xlen && reg->index != 0;
     };
     if (!branch_destination || branch_destination->bank != RegisterBank::riscv_gpr ||
-        branch_destination->width != 64 || branch_destination->index != 0 ||
+        branch_destination->width != xlen || branch_destination->index != 0 ||
         !branch_memory || !target_destination || !target_left || !target_right ||
-        !gpr64(target_destination) || !gpr64(loaded_offset) || !load_memory ||
-        !gpr64(address_destination) || !address_left || !address_right ||
-        !gpr64(scaled_index) || !gpr64(selector) ||
-        !amount || amount->encoded_width != 6 || amount->effective_width != 64 ||
-        amount->is_signed || amount->value != 2 ||
+        !gpr(target_destination) || !gpr(loaded_offset) || !load_memory ||
+        !gpr(address_destination) || !address_left || !address_right ||
+        !gpr(scaled_index) || !gpr(selector) ||
+        !amount || amount->encoded_width != (xlen == 32 ? 5 : 6) || amount->effective_width != xlen ||
+        amount->is_signed || amount->value != scale_shift ||
         !same_register(branch_memory->base ? &*branch_memory->base : nullptr, target_destination) ||
         branch_memory->segment || branch_memory->index || branch_memory->ip_relative ||
-        branch_memory->displacement != 0 || branch_memory->address_width != 64 ||
+        branch_memory->displacement != 0 || branch_memory->address_width != xlen ||
         !same_register(load_memory->base ? &*load_memory->base : nullptr, address_destination) ||
         load_memory->segment || load_memory->index || load_memory->ip_relative ||
-        load_memory->displacement != 0 || load_memory->address_width != 64 ||
-        load_memory->data_width != 32)
+        load_memory->displacement != 0 || load_memory->address_width != xlen ||
+        load_memory->data_width != entry_bytes * 8)
         return {};
 
     const auto *base = same_register(target_left, loaded_offset) ? target_right
         : same_register(target_right, loaded_offset) ? target_left : nullptr;
-    if (!gpr64(base) || same_register(base, selector) || same_register(base, scaled_index) ||
+    if (!gpr(base) || same_register(base, selector) || same_register(base, scaled_index) ||
         same_register(base, address_destination) || same_register(base, loaded_offset) ||
         !((same_register(address_left, base) && same_register(address_right, scaled_index)) ||
           (same_register(address_right, base) && same_register(address_left, scaled_index))))
@@ -2847,8 +4132,9 @@ std::optional<SwitchSite> riscv_indexed_relative_switch(
     site.dispatch = branch_instruction.address;
     site.table = *table;
     site.selector = *selector;
-    site.scale = 4;
-    site.entry_encoding = SwitchEntryEncoding::signed_offset_from_table;
+    site.scale = static_cast<std::uint8_t>(entry_bytes);
+    site.entry_encoding = halfword_offsets ? SwitchEntryEncoding::signed_halfword_offset_from_table
+                                          : SwitchEntryEncoding::signed_offset_from_table;
     if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
                                                facts[first]->instruction.address, site.dispatch,
                                                branch_instruction.context, guards, stop)) {
@@ -2859,8 +4145,10 @@ std::optional<SwitchSite> riscv_indexed_relative_switch(
     for (std::size_t index = 0; index < scan_limit; ++index) {
         if (stop.stop_requested())
             return {};
-        const auto target = table_target(image, site.table, index, 4, true, relocations, stop);
-        if (!target || !decodes_at(image, branch_instruction.context, target->address, stop)) {
+        const auto target = table_target(image, site.table, index, entry_bytes, true, relocations, stop, {}, xlen);
+        if (!target || target->address.space != branch_instruction.address.space ||
+            (xlen == 32 && target->address.offset > std::numeric_limits<std::uint32_t>::max()) ||
+            !decodes_at(image, branch_instruction.context, target->address, stop)) {
             site.complete = false;
             break;
         }
@@ -2894,13 +4182,21 @@ std::optional<SwitchSite> thumb_table_branch_switch(
     const std::size_t entry_width = dispatch.opcode == Opcode::arm_tbb ? 1 : 2;
     if (memory->data_width != entry_width * 8 || memory->scale != entry_width)
         return {};
+    // The table bytes begin after the 32-bit instruction. The architectural
+    // PC value used as the branch target base is word-aligned independently;
+    // for a dispatch at address 2 mod 4 it is two bytes before the table.
     const auto table = add_offset(dispatch.address, 4, image);
-    if (!table || !file_backed_range(image, *table, entry_width, false))
+    const auto pc_value = add_offset(dispatch.address, 4, image);
+    const auto target_base = pc_value
+        ? std::optional<Address>(Address{pc_value->space, pc_value->offset & ~UINT64_C(3)})
+        : std::optional<Address>{};
+    if (!table || !target_base || !file_backed_range(image, *table, entry_width, false))
         return {};
 
     SwitchSite site;
     site.dispatch = dispatch.address;
     site.table = *table;
+    site.target_base = *target_base;
     site.selector = *memory->index;
     site.scale = static_cast<std::uint8_t>(entry_width);
     site.entry_encoding = SwitchEntryEncoding::thumb_scaled_pc_relative;
@@ -2918,7 +4214,7 @@ std::optional<SwitchSite> thumb_table_branch_switch(
             site.complete = false;
             break;
         }
-        const auto target = add_offset(site.table, *displacement * 2, image);
+        const auto target = add_offset(*site.target_base, *displacement * 2, image);
         if (!target || !decodes_at(image, dispatch.context, *target, stop)) {
             site.complete = false;
             break;
@@ -3114,6 +4410,37 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
             if (!fact)
                 continue;
             const auto &instruction = fact->instruction;
+            if (instruction.context.architecture == Architecture::dex && instruction.opcode == Opcode::dex_switch &&
+                instruction.dex_switch) {
+                auto decoded = instruction;
+                auto populated = function_detail::populate_dex_switch_table(image, decoded, nullptr, stop);
+                if (!populated)
+                    return populated.error();
+                if (!populated.value() || !decoded.dex_switch || !decoded.dex_switch->validated)
+                    continue;
+                const auto selector = std::find_if(decoded.operands.begin(), decoded.operands.end(), [](const auto &operand) {
+                    const auto *reg = std::get_if<RegisterOperand>(&operand);
+                    return reg && reg->bank == RegisterBank::dex_vreg;
+                });
+                if (selector == decoded.operands.end())
+                    continue;
+                const auto *selector_reg = std::get_if<RegisterOperand>(&*selector);
+                SwitchSite site;
+                site.dispatch = instruction.address;
+                site.table = decoded.dex_switch->payload;
+                site.selector = *selector_reg;
+                site.selector_use = instruction.address;
+                site.entry_encoding = SwitchEntryEncoding::decoded_metadata;
+                site.table_base_source = SwitchSite::TableBaseSource::encoded_bytes;
+                site.case_count = static_cast<std::uint32_t>(decoded.dex_switch->cases.size());
+                const auto fallthrough = analysis_detail::continuation_address(instruction);
+                if (fallthrough)
+                    site.default_target = fallthrough.value();
+                for (const auto &item : decoded.dex_switch->cases)
+                    site.cases.push_back({static_cast<std::uint32_t>(item.value), item.target});
+                result.sites.push_back(std::move(site));
+                continue;
+            }
             if (instruction.context.architecture == Architecture::powerpc &&
                 instruction.context.mode == ExecutionMode::ppc32 && instruction.opcode == Opcode::ppc_bcctr &&
                 instruction.flow == FlowKind::jump) {
@@ -3142,8 +4469,11 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
                 }
                 continue;
             }
-            if (instruction.context.architecture == Architecture::riscv64 &&
-                instruction.context.mode == ExecutionMode::rv64 && instruction.opcode == Opcode::rv_jalr &&
+            const bool riscv32_jalr = instruction.context.architecture == Architecture::riscv32 &&
+                instruction.context.mode == ExecutionMode::rv32;
+            const bool riscv64_jalr = instruction.context.architecture == Architecture::riscv64 &&
+                instruction.context.mode == ExecutionMode::rv64;
+            if ((riscv32_jalr || riscv64_jalr) && instruction.opcode == Opcode::rv_jalr &&
                 instruction.flow == FlowKind::jump) {
                 auto riscv_switch = riscv_indexed_absolute_switch(image, function, snapshot,
                                                                    found->second->instructions, fact_index,
@@ -3259,6 +4589,24 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
                     result.sites.push_back(std::move(*register_based));
                     continue;
                 }
+                auto register_loaded = register_loaded_absolute_switch(
+                    image, function, snapshot, found->second->instructions, fact_index, guards, relocations, stop);
+                if (stop.stop_requested())
+                    return Error{ErrorCode::canceled, "Switch analysis canceled"};
+                if (register_loaded) {
+                    result.complete = result.complete && register_loaded->complete;
+                    result.sites.push_back(std::move(*register_loaded));
+                    continue;
+                }
+                auto x86_32_relative = x86_32_signed_word_register_base_switch(
+                    image, function, snapshot, found->second->instructions, fact_index, guards, relocations, stop);
+                if (stop.stop_requested())
+                    return Error{ErrorCode::canceled, "Switch analysis canceled"};
+                if (x86_32_relative) {
+                    result.complete = result.complete && x86_32_relative->complete;
+                    result.sites.push_back(std::move(*x86_32_relative));
+                    continue;
+                }
                 auto register_relative = relative_offset_register_base_switch(
                     image, function, snapshot, found->second->instructions, fact_index, guards, relocations, stop);
                 if (stop.stop_requested())
@@ -3283,11 +4631,30 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
                                        : instruction.context.mode == ExecutionMode::x86_32 ? 32u
                                        : instruction.context.mode == ExecutionMode::x86_64 ? 64u : 0u;
             const std::size_t pointer_bytes = pointer_width / 8;
+            const Instruction *x86_16_scale = nullptr;
+            if (instruction.context.mode == ExecutionMode::x86_16 && pointer_width == 16 &&
+                table_memory->data_width == 16 && table_memory->address_width == 16 &&
+                table_memory->scale == 1 && table_memory->index && !table_memory->base &&
+                !table_memory->segment && !table_memory->ip_relative && fact_index > 0 &&
+                found->second->instructions[fact_index - 1]) {
+                const auto &scale = found->second->instructions[fact_index - 1]->instruction;
+                const auto *destination = register_operand(scale, 0);
+                const auto *amount = scale.operands.size() == 2
+                    ? std::get_if<ImmediateOperand>(&scale.operands[1]) : nullptr;
+                const auto scale_end = analysis_detail::continuation_address(scale);
+                if (scale.context == instruction.context && scale.opcode == Opcode::shl &&
+                    scale.flow == FlowKind::fallthrough && scale.operands.size() == 2 &&
+                    scale_end && scale_end.value() == instruction.address && destination &&
+                    same_register(destination, &*table_memory->index) &&
+                    destination->bank == RegisterBank::gpr && destination->width == 16 &&
+                    !destination->high_byte && amount && amount->value == 1)
+                    x86_16_scale = &scale;
+            }
             const bool relative_offsets = instruction.context.mode == ExecutionMode::x86_64 &&
                                           table_memory->ip_relative && table_memory->scale == 4;
-            const std::size_t entry_bytes = relative_offsets ? 4 : pointer_bytes;
+            const std::size_t entry_bytes = x86_16_scale ? 2 : relative_offsets ? 4 : pointer_bytes;
             if (!entry_bytes || table_memory->data_width != pointer_width ||
-                table_memory->scale != entry_bytes)
+                (table_memory->scale != entry_bytes && !x86_16_scale))
                 continue;
 
             SwitchSite site;
@@ -3296,39 +4663,136 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
                 continue;
             site.table = *table_base;
             site.selector = *table_memory->index;
-            site.scale = table_memory->scale;
+            site.selector_use = x86_16_scale ? std::optional<Address>{x86_16_scale->address}
+                                             : std::optional<Address>{};
+            site.scale = static_cast<std::uint8_t>(entry_bytes);
             if (relative_offsets)
                 site.entry_encoding = SwitchEntryEncoding::signed_offset_from_table;
             if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
-                                                      instruction.address, instruction.address, instruction.context, guards, stop)) {
+                    x86_16_scale ? x86_16_scale->address : instruction.address,
+                    instruction.address, instruction.context, guards, stop)) {
                 site.case_count = bound->case_count;
                 site.default_target = bound->default_target;
             }
-            const auto scan_limit = site.case_count ? *site.case_count : max_entries;
-            for (std::size_t index = 0; index < scan_limit; ++index) {
-                if (stop.stop_requested())
-                    return Error{ErrorCode::canceled, "Switch analysis canceled"};
-                const auto target = table_target(image, site.table, index, entry_bytes, relative_offsets,
-                                                 relocations, stop);
-                if (!target || !decodes_at(image, instruction.context, target->address, stop)) {
-                    site.complete = false;
-                    break;
+            const auto strict_scan = !relative_offsets && entry_bytes == 8
+                ? scan_static_elf_absolute_table(image, site.table, site.case_count.value_or(0),
+                                                  instruction.context, relocations, metadata, stop)
+                : ElfRelocationTableScan{};
+            if (strict_scan.reject_unbounded)
+                continue;
+            if (strict_scan.applicable) {
+                site.cases = strict_scan.cases;
+                site.complete = strict_scan.complete;
+                if (!site.complete)
+                    site.incomplete_reason = "ELF absolute-pointer table has an incomplete or unsupported relocation prefix";
+            } else {
+                const auto scan_limit = site.case_count ? *site.case_count : max_entries;
+                for (std::size_t index = 0; index < scan_limit; ++index) {
+                    if (stop.stop_requested())
+                        return Error{ErrorCode::canceled, "Switch analysis canceled"};
+                    const auto target = table_target(image, site.table, index, entry_bytes, relative_offsets,
+                                                     relocations, stop);
+                    if (!target || !decodes_at(image, instruction.context, target->address, stop)) {
+                        site.complete = false;
+                        break;
+                    }
+                    if (index > std::numeric_limits<std::uint32_t>::max()) {
+                        site.complete = false;
+                        break;
+                    }
+                    site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
+                                          target->relocation_rows, target->dyld_classic_rows,
+                                          target->dyld_chained_rows});
                 }
-                if (index > std::numeric_limits<std::uint32_t>::max()) {
+                if (!site.case_count && site.cases.size() == max_entries)
                     site.complete = false;
-                    break;
-                }
-                site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
-                                      target->relocation_rows, target->dyld_classic_rows,
-                                      target->dyld_chained_rows});
             }
-            if (!site.case_count && site.cases.size() == max_entries)
-                site.complete = false;
-            if (site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1)) {
+            if (site.cases.size() >= 2 || (site.case_count && (site.cases.size() == 1 || !site.complete))) {
                 result.complete = result.complete && site.complete;
                 result.sites.push_back(std::move(site));
             }
         }
+    }
+    // Each target is checked for decodability when its table entry is read,
+    // but individually decodable starts can still overlap one another or the
+    // encoded table bytes. Keep only the verified table prefix before the
+    // first conflicting instruction extent.
+    constexpr std::size_t target_overlap_work_budget = 1'000'000;
+    std::size_t target_overlap_work = target_overlap_work_budget;
+    for (auto &site : result.sites) {
+        if (stop.stop_requested())
+            return Error{ErrorCode::canceled, "Switch target-overlap validation canceled"};
+        if (site.entry_encoding == SwitchEntryEncoding::decoded_metadata || !site.scale)
+            continue;
+        const auto context = image.context_at(site.dispatch);
+        if (!context) {
+            site.complete = false;
+            if (!site.incomplete_reason)
+                site.incomplete_reason = "switch dispatch context is unavailable for target-overlap validation";
+            result.complete = false;
+            continue;
+        }
+        const auto table_entries = site.case_count.value_or(static_cast<std::uint32_t>(site.cases.size()));
+        bool table_range_valid = table_entries <= max_entries &&
+            table_entries <= UINT64_MAX / site.scale;
+        const auto table_bytes = table_range_valid ? std::uint64_t{table_entries} * site.scale : 0;
+        table_range_valid = table_range_valid && table_bytes <= UINT64_MAX - site.table.offset;
+        const auto table_end = table_range_valid ? site.table.offset + table_bytes : 0;
+        if (!table_range_valid) {
+            site.complete = false;
+            if (!site.incomplete_reason)
+                site.incomplete_reason = "switch table extent overflows or exceeds its case bound";
+        }
+
+        std::map<GuardAddress, std::uint64_t> decoded_ranges;
+        std::size_t case_index = 0;
+        while (case_index < site.cases.size()) {
+            if (stop.stop_requested())
+                return Error{ErrorCode::canceled, "Switch target-overlap validation canceled"};
+            if (!target_overlap_work) {
+                site.complete = false;
+                if (!site.incomplete_reason)
+                    site.incomplete_reason = "switch target-overlap validation reached its work limit";
+                break;
+            }
+            --target_overlap_work;
+            const auto &item = site.cases[case_index];
+            const auto end = decoded_instruction_end(image, context.value(), item.target, stop);
+            if (!end || end->space != item.target.space) {
+                site.complete = false;
+                if (!site.incomplete_reason)
+                    site.incomplete_reason = "switch case target instruction extent is not file-backed executable code";
+                site.cases.resize(case_index);
+                break;
+            }
+            bool overlap = table_range_valid && item.target.space == site.table.space &&
+                item.target.offset < table_end && end->offset > site.table.offset;
+            const auto key = guard_address(item.target);
+            const auto next = decoded_ranges.lower_bound(key);
+            if (next != decoded_ranges.end() && next->first == key) {
+                // Multiple case values may intentionally share one block.
+                overlap = overlap || next->second != end->offset;
+            } else {
+                if (next != decoded_ranges.end() && next->first.first == key.first &&
+                    next->first.second < end->offset)
+                    overlap = true;
+                if (next != decoded_ranges.begin()) {
+                    const auto previous = std::prev(next);
+                    if (previous->first.first == key.first && previous->second > item.target.offset)
+                        overlap = true;
+                }
+            }
+            if (overlap) {
+                site.complete = false;
+                if (!site.incomplete_reason)
+                    site.incomplete_reason = "switch case instruction overlaps another target or its table bytes";
+                site.cases.resize(case_index);
+                break;
+            }
+            decoded_ranges.emplace(key, end->offset);
+            ++case_index;
+        }
+        result.complete = result.complete && site.complete;
     }
     return result;
 }

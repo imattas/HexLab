@@ -40,6 +40,14 @@ mapped-file, compressed, remote, or branch-heavy workload. The 4 KiB cache
 reduces per-read overhead; it does not remove the per-instruction segment and
 policy checks or reduce the analysis snapshot's memory use.
 
+Byte comparison honors its stop token while validating both images and building
+the region lookup and byte-count estimate, checking at least every 256 regions
+and every 256 ignored-range entries. A request received during this setup now
+returns the same `canceled` error as a request during byte comparison, before a
+partial report is published. This closes the setup-time cancellation gap for
+large region catalogs and relocation-ignore maps; these setup phases do not
+emit byte-progress callbacks, so progress still begins with byte visits.
+
 Incremental recovery can also retain instruction facts across execution-context
 or code-policy changes when the address-to-file mapping and loader metadata are
 unchanged. It rechecks each reused instruction's current context and permission,
@@ -53,6 +61,11 @@ annotation rather than processor mode or code policy.
 
 String extraction now has an optional cumulative work budget, `AnalysisOptions::string_scan_work_budget`. It counts byte inspections across encoding passes, so one byte revisited by ASCII, UTF-8, Windows-1252, UTF-16, and UTF-32 passes consumes work for each inspection. The default is `size_t` maximum and preserves exhaustive behavior. A smaller budget ends scanning with a partial result (`complete=false`) and a warning diagnostic; cancellation remains independently available through the stop token. The option participates in the function-engine fingerprint so cached derived results cannot cross different work budgets.
 
+UTF-8 recognition skips a UTF-8 signature (`EF BB BF`) at the beginning of a
+file-backed scan range. The signature is included in byte-inspection accounting,
+while each resulting string's file offset and address begin at its first text
+byte. UTF-16 and UTF-32 passes retain their independent byte interpretations.
+
 Function recovery also accepts an optional `AnalysisOptions::progress` callback.
 It receives `("instruction-discovery", completed_attempts, instruction_budget)`
 at start and after each 1024 new/reused instruction attempts, then
@@ -64,3 +77,27 @@ a project worker the callback runs on that worker thread, so callers should
 keep it short and marshal UI updates to the owner thread. The callback does not
 participate in cache fingerprints. This gives hosts bounded coarse progress
 and cancellation control without claiming a corpus-wide ETA.
+
+String scanning also uses the ASCII pass to record whether a range contains
+any high-bit bytes. If it does not, the scanner skips its 18 locale-specific
+single-byte fallback passes. Each fallback requires at least one high-bit byte
+to emit a non-ASCII candidate, so this preserves results while reducing an
+ASCII-only range of N bytes by exactly 18N byte inspections. UTF-8 and UTF-16/
+UTF-32 passes still run because they can identify distinct encodings and
+alignment patterns. The high-bit flag is range-local; mixed or binary ranges
+continue to receive the complete fallback scan. Cancellation checkpoints in
+the remaining passes are unchanged, and the skipped work also shortens the
+maximum time before the next check on ASCII-only ranges.
+
+This is a deterministic work-count improvement, not a corpus-wide timing
+claim. A representative cross-platform corpus run is still needed to measure
+wall-clock gains and verify cancellation latency for realistic mapped images.
+
+The string scanner's multi-byte unit reader now assembles units directly from
+its current 64 KiB byte window when the full unit is already cached and the
+remaining work budget covers it. This avoids repeating the per-byte window
+lookup and budget branch for UTF-16/UTF-32 units while preserving the same
+inspection count. If a unit crosses the cached window or the remaining budget
+is too small, it uses the existing byte-at-a-time path, retaining its exact
+partial-budget behavior. This is a bounded hot-path reduction in scanner
+overhead; it has not yet been measured against a representative corpus.

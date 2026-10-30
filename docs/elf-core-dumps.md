@@ -9,7 +9,12 @@ executable/shared-object symbol, DWARF, unwind, or relocation import passes.
 
 Generic `PT_NOTE` records remain available in `ElfMetadata::notes`. Linux
 `CORE`/`LINUX` `NT_PRPSINFO` notes additionally expose the process IDs,
-executable name, and bounded argument string through `ElfMetadata::core`.
+executable name, and bounded argument string through `ElfMetadata::core` for
+both ELF32 and ELF64. ELF32 uses its 128-byte layout (32-bit flags, uid/gid and
+IDs, command name at byte 32, and arguments at byte 48); ELF64 uses its
+136-byte layout with 64-bit flags alignment and strings at bytes 40/56. Short
+records remain generic notes with a core diagnostic; trailing extension bytes
+remain preserved in the original generic note.
 `NT_PRSTATUS` notes expose per-thread IDs and the current signal. Register values
 are decoded for little-endian ELF64 x86-64, AArch64, and RISC-V cores. x86-64
 retains the 27 Linux gregset entries, and AArch64 retains `x0`–`x30`, `sp`, `pc`, and
@@ -104,21 +109,29 @@ enforce the shared record and metadata budgets.
 Unsupported register architectures, byte orders and ABI variants remain generic
 notes with an explicit per-thread diagnostic. A truncated process or thread
 record is retained as malformed metadata and marks the loaded image incomplete;
-it does not discard other core mappings. Floating-point/SIMD regsets remain in
-the generic note list. CLI `inspect` recognizes little-endian x86-64
-`NT_FPREGSET` payloads of exactly 512 bytes and prints the x87 control/address
-fields, eight 128-bit x87 storage slots, and sixteen XMM registers with source
-offsets. It recognizes little-endian AArch64 payloads of exactly 528 bytes
-and prints `v0`-`v31`, `fpsr`, and `fpcr`, also with source offsets. Other
-lengths and byte orders are shown as unsupported rather than interpreted using
-a guessed layout. Rendering is capped at 64 FPREGSET notes. The loader does
-not associate these notes with a particular thread. OS-specific notes and
-architecture-specific signal frames are not decoded. Missing pages are not
-reconstructed and absent core data is not treated as a live process state.
+it does not discard other core mappings. For a Linux `NT_FPREGSET` note
+immediately following a successfully decoded `NT_PRSTATUS`, the loader attaches
+typed floating-point state to that thread. It accepts only little-endian
+x86-64 payloads of exactly 512 bytes (control/address fields, eight 128-bit
+x87 storage slots, and sixteen XMM registers) and AArch64 payloads of exactly
+528 bytes (`v0`-`v31`, `fpsr`, and `fpcr`). Linux ARM32 `LINUX`/`NT_ARM_VFP`
+notes immediately after a decoded thread retain `d0`-`d31` and `fpscr` from
+the exact 260-byte user VFP record. Each field retains its note,
+payload, and exact file offset. This ordering rule avoids guessing a thread
+owner when a note is detached or interleaved. Unmatched notes, unsupported
+machines or byte orders, and other payload sizes remain available in the
+generic note list and add an explicit core diagnostic; no layout is inferred
+from a partial prefix. CLI `inspect` prints decoded FP registers under their
+owning thread, capped at 64 FP states and the existing 256-thread output limit.
+The retained values count against the loader's shared metadata budget. Other OS-specific
+notes and architecture-specific signal frames are not decoded. Missing pages
+are not reconstructed and absent core data is not treated as a live process
+state.
 
 The Linux note layouts follow the kernel's [`elfcore.h`](https://github.com/torvalds/linux/blob/master/include/linux/elfcore.h)
 and AArch64 [`user_pt_regs`](https://github.com/torvalds/linux/blob/master/arch/arm64/include/uapi/asm/ptrace.h)
 definitions. The x86-64 general-register order follows Linux's ELF core ABI.
+The ARM32 VFP payload size follows [`ARM_VFPREGS_SIZE`](https://github.com/torvalds/linux/blob/master/arch/arm/include/uapi/asm/ptrace.h).
 
 The ELF32 layouts follow Linux's [i386 user register structure](https://github.com/torvalds/linux/blob/master/arch/x86/include/asm/user_32.h),
 [ARM register structure](https://github.com/torvalds/linux/blob/master/arch/arm/include/uapi/asm/ptrace.h),

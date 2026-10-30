@@ -16,6 +16,7 @@ struct SetProjectBreakpoint {
     bool logpoint=false;
     std::string log_message;
     std::uint64_t ignore_count=0;
+    bool one_shot=false;
 };
 struct DefineRegion {Address begin;std::uint64_t size;RegionKind kind;};
 struct DefineFunction {Address entry;};

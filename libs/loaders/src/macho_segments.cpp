@@ -81,6 +81,14 @@ void read_segments(const ByteStorage &storage, MachOMetadata &metadata, Budget &
             address_extent(section.address, section.size, header.is_64);
             require(section.alignment < (header.is_64 ? 64u : 32u),
                     "Mach-O section alignment overflows its address width");
+            if (section.alignment) {
+                const auto alignment_mask = (std::uint64_t{1} << section.alignment) - 1;
+                require((section.address & alignment_mask) == 0,
+                        "Mach-O section address violates its declared alignment");
+                if (!zero_fill(section.flags) && section.size)
+                    require((section.raw_file_offset & alignment_mask) == 0,
+                            "Mach-O section file offset violates its declared alignment");
+            }
             if (!zero_fill(section.flags))
                 section.file_offset = reader.file(section.raw_file_offset, section.size);
             budget.include(section.name.size() + section.segment_name.size());

@@ -5,6 +5,7 @@
 #include "hexlab/core/sha256.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -55,11 +56,21 @@ struct SignatureMatch {
     // the index in the ordered SignatureCatalogSet used for recognition.
     std::size_t catalog_index = 0;
 };
+// Optional file-coordinate window for targeted scans. Matches must fit fully
+// inside the selected range as well as their executable segment.
+struct SignatureScanRange {
+    FileOffset begin;
+    std::uint64_t size = 0;
+};
 struct SignatureLimits {
     std::size_t max_results = 4096;
     std::uint64_t max_candidates = 16777216;
     std::uint64_t max_comparisons = 67108864;
     std::uint64_t max_scanned_bytes = 67108864;
+    std::optional<SignatureScanRange> file_range;
+    // Optional floor on positive-pattern mask specificity. This is a bit
+    // count, not a confidence score; zero keeps all validated definitions.
+    std::uint32_t minimum_constrained_bits = 0;
 };
 struct SignatureScan {
     std::vector<SignatureMatch> matches;
@@ -97,6 +108,13 @@ HEXLAB_ANALYSIS_EXPORT Result<SignatureDefinition>
 create_function_signature(const Image &, const ByteStorage &, const FunctionRecord &, const FunctionSnapshot &,
                           std::string name, std::string provenance, const FunctionSignatureOptions & = {},
                           std::stop_token = {});
+// Builds a target-scoped reusable catalog from explicitly selected recovered
+// function IDs. Selection order is preserved; invalid or un-signable entries
+// fail the operation rather than yielding a partial catalog.
+HEXLAB_ANALYSIS_EXPORT Result<SignatureCatalog>
+create_function_signature_catalog(const Image &, const ByteStorage &, const FunctionSnapshot &,
+                                  std::span<const FunctionId>, std::string provenance,
+                                  const FunctionSignatureOptions & = {}, std::stop_token = {});
 // Canonical four-field text, accepted by parse_signature_definitions.
 HEXLAB_ANALYSIS_EXPORT Result<std::string> serialize_signature_definitions(std::span<const SignatureDefinition>);
 struct FunctionSignatureMatch {
@@ -145,16 +163,23 @@ struct FunctionFingerprintCatalog {
     ExecutionMode target_mode = ExecutionMode::unknown;
     std::vector<FunctionFingerprintDefinition> definitions;
 };
+// Ordered in-memory composition of fingerprint catalogs. Catalog order and
+// duplicates are preserved so cross-version candidates remain explicit.
+struct FunctionFingerprintCatalogSet {
+    std::vector<FunctionFingerprintCatalog> catalogs;
+};
 struct FunctionFingerprintLimits {
     std::size_t max_functions = 100000;
     std::uint64_t max_instructions = 4000000;
     std::uint64_t max_token_bytes = 256ull * 1024 * 1024;
     FunctionFingerprintOptions per_function;
+    std::uint64_t max_definition_checks = 16777216;
 };
 struct FunctionFingerprintCandidate {
     std::string name, provenance;
     std::uint32_t instruction_count = 0;
     Sha256Digest digest{};
+    std::size_t catalog_index = 0;
 };
 struct FunctionFingerprintMatch {
     FunctionId function{0};
@@ -164,7 +189,7 @@ struct FunctionFingerprintMatch {
 };
 struct FunctionFingerprintRecognition {
     std::vector<FunctionFingerprintMatch> functions;
-    std::uint64_t functions_scanned = 0, instructions_scanned = 0, token_bytes = 0;
+    std::uint64_t functions_scanned = 0, instructions_scanned = 0, token_bytes = 0, definition_checks = 0;
     bool complete = true;
     std::optional<AnalysisKey> source_key;
 };
@@ -172,11 +197,22 @@ HEXLAB_ANALYSIS_EXPORT Result<FunctionFingerprintDefinition>
 create_function_fingerprint(const Image &, const ByteStorage &, const FunctionRecord &,
                             const FunctionSnapshot &, std::string name, std::string provenance,
                             const FunctionFingerprintOptions & = {}, std::stop_token = {});
+// Builds a reusable catalog from explicitly selected recovered function IDs.
+// Generated names are stable address labels; invalid/stale selected functions
+// fail the operation rather than being silently omitted.
+HEXLAB_ANALYSIS_EXPORT Result<FunctionFingerprintCatalog>
+create_function_fingerprint_catalog(const Image &, const ByteStorage &, const FunctionSnapshot &,
+                                    std::span<const FunctionId>, std::string provenance,
+                                    const FunctionFingerprintOptions & = {}, std::stop_token = {});
 HEXLAB_ANALYSIS_EXPORT Result<std::string> serialize_function_fingerprint_catalog(const FunctionFingerprintCatalog &);
 HEXLAB_ANALYSIS_EXPORT Result<FunctionFingerprintCatalog> parse_function_fingerprint_catalog(std::string_view);
 HEXLAB_ANALYSIS_EXPORT Result<FunctionFingerprintRecognition>
 recognize_function_fingerprints(const Image &, const ByteStorage &, const FunctionSnapshot &,
                                 const FunctionFingerprintCatalog &, const FunctionFingerprintLimits & = {},
+                                std::stop_token = {});
+HEXLAB_ANALYSIS_EXPORT Result<FunctionFingerprintRecognition>
+recognize_function_fingerprints(const Image &, const ByteStorage &, const FunctionSnapshot &,
+                                const FunctionFingerprintCatalogSet &, const FunctionFingerprintLimits & = {},
                                 std::stop_token = {});
 
 enum class FunctionRecognitionKind : std::uint8_t {
@@ -191,6 +227,8 @@ struct FunctionRecognitionCandidateEvidence {
     // Added in evidence format 2 for FLAIR public/local names.
     std::uint8_t symbol_kind=0;
     std::uint32_t matching_patterns=0;
+    // Added in evidence format 3 for ordered catalog-set recognition.
+    std::uint32_t catalog_index=0;
     bool operator==(const FunctionRecognitionCandidateEvidence&)const=default;
 };
 struct FunctionRecognitionRecord {

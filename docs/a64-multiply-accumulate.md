@@ -22,6 +22,16 @@ Zero-register sources become typed zero constants, and writes to WZR/XZR are
 discarded. These expressions use fixed-width integer types in the existing
 typed SSA pipeline.
 
+`evaluate_a64_multiply_accumulate_instruction` evaluates decoded W/X `MADD`
+and `MSUB`. It follows decoder operand order (Rn, Rm, Ra), computes
+`Rn * Rm + Ra` or `Ra - Rn * Rm`, and wraps at the operation width. W results
+are returned zero-extended. WZR/XZR inputs contribute zero; writes to WZR/XZR
+remain discarded by the architectural register model.
+
+The helper validates the decoded GPR operands and effects but does not sample
+register state or commit results. These instructions do not update NZCV;
+timing and execution of surrounding instructions remain outside this helper.
+
 This slice does not support signed or unsigned high-half multiply, long
 multiply, division, conditional-select operations, or saturating arithmetic.
 Successful decoding of this family does not imply broader AArch64 ISA support.

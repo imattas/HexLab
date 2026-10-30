@@ -7,14 +7,15 @@
 
 namespace hexlab::desktop {
 ArchiveView::ArchiveView(wxWindow* parent, const ArArchive& archive)
-    : wxDialog(parent, wxID_ANY, "Browse ar archive", wxDefaultPosition, wxSize(760, 440), wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER) {
+    : wxDialog(parent, wxID_ANY, "Browse ar archive", wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER) {
     auto* box = new wxBoxSizer(wxVERTICAL);
     members_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxLC_REPORT | wxLC_SINGLE_SEL);
     members_->SetName("ar-member-list");
-    members_->AppendColumn("Index", wxLIST_FORMAT_RIGHT, 64);
-    members_->AppendColumn("Member", wxLIST_FORMAT_LEFT, 390);
-    members_->AppendColumn("Size", wxLIST_FORMAT_RIGHT, 110);
-    members_->AppendColumn("Kind", wxLIST_FORMAT_LEFT, 130);
+    members_->SetToolTip("Archive members. Use Up/Down to select and Enter or double-click to open a regular member.");
+    members_->AppendColumn("Index", wxLIST_FORMAT_RIGHT, FromDIP(64));
+    members_->AppendColumn("Member", wxLIST_FORMAT_LEFT, FromDIP(390));
+    members_->AppendColumn("Size", wxLIST_FORMAT_RIGHT, FromDIP(110));
+    members_->AppendColumn("Kind", wxLIST_FORMAT_LEFT, FromDIP(130));
     regular_.reserve(archive.members.size());
     for (std::size_t i = 0; i < archive.members.size(); ++i) {
         const auto& member = archive.members[i];
@@ -23,21 +24,26 @@ ArchiveView::ArchiveView(wxWindow* parent, const ArArchive& archive)
         members_->SetItem(row, 1, wxString::FromUTF8(member.name.c_str()));
         members_->SetItem(row, 2, wxString::Format("%llu", static_cast<unsigned long long>(member.size)));
         const char* kind = member.kind == ArMemberKind::regular ? "regular" :
-                           member.kind == ArMemberKind::symbol_index ? "symbol index" : "long-name table";
+                           member.kind == ArMemberKind::thin_external ? "external thin member" :
+                           member.kind == ArMemberKind::symbol_index ? "symbol index" :
+                           member.kind == ArMemberKind::member_table ? "member table" : "long-name table";
         members_->SetItem(row, 3, kind);
         members_->SetItemData(row, static_cast<long>(i));
         if (member.kind != ArMemberKind::regular)
             members_->SetItemTextColour(row, wxSystemSettings::GetColour(wxSYS_COLOUR_GRAYTEXT));
     }
-    box->Add(members_, 1, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
-    index_status_ = new wxStaticText(this, wxID_ANY, "Indexed symbols");
+    box->Add(members_, 1, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(8));
+    index_status_ = new wxStaticText(this, wxID_ANY, archive.thin
+        ? "GNU thin archive: external member contents are not resolved"
+        : "Indexed symbols");
     index_status_->SetName("ar-index-status");
-    box->Add(index_status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
-    symbols_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxSize(-1, 130), wxLC_REPORT | wxLC_SINGLE_SEL);
+    box->Add(index_status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(8));
+    symbols_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxSize(-1, FromDIP(130)), wxLC_REPORT | wxLC_SINGLE_SEL);
     symbols_->SetName("ar-symbol-list");
-    symbols_->AppendColumn("Symbol", wxLIST_FORMAT_LEFT, 300);
-    symbols_->AppendColumn("Member", wxLIST_FORMAT_LEFT, 300);
-    symbols_->AppendColumn("Member index", wxLIST_FORMAT_RIGHT, 100);
+    symbols_->SetToolTip("Indexed symbols. Use Up/Down to select; selecting a symbol also selects its member above.");
+    symbols_->AppendColumn("Symbol", wxLIST_FORMAT_LEFT, FromDIP(300));
+    symbols_->AppendColumn("Member", wxLIST_FORMAT_LEFT, FromDIP(300));
+    symbols_->AppendColumn("Member index", wxLIST_FORMAT_RIGHT, FromDIP(100));
     for (const auto& symbol : archive.symbols) {
         if (symbol.member_index >= archive.members.size()) continue;
         const long row = symbols_->InsertItem(symbols_->GetItemCount(), wxString::FromUTF8(symbol.name.c_str()));
@@ -54,15 +60,16 @@ ArchiveView::ArchiveView(wxWindow* parent, const ArArchive& archive)
         index_status_->SetLabel(wxString::Format("Indexed symbols (%llu)",
             static_cast<unsigned long long>(symbols_->GetItemCount())));
     }
-    box->Add(symbols_, 0, wxEXPAND | wxLEFT | wxRIGHT, 8);
+    box->Add(symbols_, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(8));
     auto* buttons = new wxStdDialogButtonSizer();
     auto* open = new wxButton(this, wxID_OK, "Open Member");
     open->SetName("ar-open-member");
     buttons->AddButton(open);
     buttons->AddButton(new wxButton(this, wxID_CANCEL));
     buttons->Realize();
-    box->Add(buttons, 0, wxEXPAND | wxALL, 8);
+    box->Add(buttons, 0, wxEXPAND | wxALL, FromDIP(8));
     SetSizer(box);
+    SetClientSize(FromDIP(wxSize(760, 440)));
     Bind(wxEVT_LIST_ITEM_ACTIVATED, [this](wxListEvent&) { if (selected_member()) EndModal(wxID_OK); }, members_->GetId());
     Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent& event) {
         const auto member = static_cast<long>(event.GetData());

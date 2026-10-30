@@ -52,11 +52,151 @@ inline void elf_description(std::ostream &out, const ImageMetadata &metadata, co
         << " OSABI=" << unsigned(header.os_abi) << " flags=" << elf_hex(header.flags) << '\n';
     if (elf.interpreter)
         out << "Interpreter: " << elf_text(elf.interpreter->path) << '\n';
+    constexpr std::size_t max_debug_companion_rows = 128;
+    out << "ELF GNU debuglink records: " << elf.gnu_debug_links.size() << '\n';
+    for (std::size_t index = 0; index < std::min(elf.gnu_debug_links.size(), max_debug_companion_rows); ++index) {
+        const auto &link = elf.gnu_debug_links[index];
+        out << "  section=" << link.section << " filename=\"" << elf_text(link.filename)
+            << "\" crc32=" << elf_hex(link.crc32) << " file=" << elf_hex(link.file_offset)
+            << " crc-file=" << elf_hex(link.crc_file_offset) << '\n';
+    }
+    if (elf.gnu_debug_links.size() > max_debug_companion_rows)
+        out << "  debuglink-output-capped=true omitted=" << elf.gnu_debug_links.size() - max_debug_companion_rows << '\n';
+    out << "ELF GNU debugaltlink records: " << elf.gnu_debug_altlinks.size() << '\n';
+    for (std::size_t index = 0; index < std::min(elf.gnu_debug_altlinks.size(), max_debug_companion_rows); ++index) {
+        const auto &link = elf.gnu_debug_altlinks[index];
+        out << "  section=" << link.section << " filename=\"" << elf_text(link.filename)
+            << "\" build-id-bytes=" << link.build_id.size() << " build-id=";
+        const auto shown = std::min<std::size_t>(link.build_id.size(), 32);
+        const auto previous_fill = out.fill();
+        for (std::size_t byte = 0; byte < shown; ++byte)
+            out << std::hex << std::setw(2) << std::setfill('0')
+                << std::to_integer<unsigned>(link.build_id[byte]);
+        out.fill(previous_fill);
+        out << " file=" << elf_hex(link.file_offset) << " build-id-file="
+            << elf_hex(link.build_id_file_offset) << '\n';
+    }
+    if (elf.gnu_debug_altlinks.size() > max_debug_companion_rows)
+        out << "  debugaltlink-output-capped=true omitted=" << elf.gnu_debug_altlinks.size() - max_debug_companion_rows << '\n';
     out << "ELF programs: " << elf.programs.size() << " sections=" << elf.sections.size() << '\n';
+    constexpr std::size_t max_program_rows = 256;
+    const auto shown_programs = std::min(elf.programs.size(), max_program_rows);
+    for (std::size_t index = 0; index < shown_programs; ++index) {
+        const auto &program = elf.programs[index];
+        const char *type = program.type == 0 ? "NULL" : program.type == 1 ? "LOAD" :
+                           program.type == 2 ? "DYNAMIC" : program.type == 3 ? "INTERP" :
+                           program.type == 4 ? "NOTE" : program.type == 5 ? "SHLIB" :
+                           program.type == 6 ? "PHDR" : program.type == 7 ? "TLS" :
+                           program.type == 0x6474e551 ? "GNU_STACK" :
+                           program.type == 0x6474e552 ? "GNU_RELRO" :
+                           program.type == 0x6474e553 ? "GNU_PROPERTY" : "unknown";
+        out << "  program #" << program.index << " type=" << type << '(' << program.type << ") flags="
+            << elf_hex(program.flags) << "["
+            << ((program.flags & 4) ? 'R' : '-') << ((program.flags & 2) ? 'W' : '-')
+            << ((program.flags & 1) ? 'X' : '-') << "] file=" << elf_hex(program.offset)
+            << '+' << elf_hex(program.file_size) << " address=" << elf_hex(program.address)
+            << '+' << elf_hex(program.memory_size) << " align=" << elf_hex(program.alignment);
+        if (program.type == 0x6474e551)
+            out << " executable-stack-request=" << ((program.flags & 1) ? "yes" : "no");
+        else if (program.type == 0x6474e552)
+            out << " relro-candidate=yes";
+        out << '\n';
+    }
+    if (shown_programs < elf.programs.size())
+        out << "  program headers omitted: " << (elf.programs.size() - shown_programs)
+            << " (limit " << max_program_rows << ")\n";
+    if (!elf.eh_frame_headers.empty()) {
+        std::size_t total_entries = 0;
+        for (const auto &header : elf.eh_frame_headers) total_entries += header.entries.size();
+        out << "ELF .eh_frame_hdr indexes: " << elf.eh_frame_headers.size()
+            << " entries=" << total_entries << '\n';
+        constexpr std::size_t max_rows = 128;
+        const auto shown_headers = std::min(elf.eh_frame_headers.size(), max_rows);
+        std::size_t rows = 0, shown_entries = 0;
+        for (std::size_t hi = 0; hi < shown_headers; ++hi) {
+            const auto &header = elf.eh_frame_headers[hi];
+            out << "  program=" << header.program << " file=" << elf_hex(header.file_offset)
+                << " bytes=" << header.file_size << " eh-frame=" << elf_hex(header.eh_frame_address)
+                << " encodings=" << elf_hex(header.eh_frame_pointer_encoding) << '/'
+                << elf_hex(header.fde_count_encoding) << '/' << elf_hex(header.table_encoding)
+                << " entries=" << header.entries.size() << '\n';
+            for (const auto &entry : header.entries) {
+                if (rows++ >= max_rows) continue;
+                ++shown_entries;
+                out << "    initial=" << elf_hex(entry.initial_location) << " fde=" << elf_hex(entry.fde_address)
+                    << " initial-file=" << elf_hex(entry.initial_location_file_offset)
+                    << " fde-file=" << elf_hex(entry.fde_file_offset) << '\n';
+            }
+        }
+        if (shown_headers < elf.eh_frame_headers.size())
+            out << "  .eh_frame_hdr headers omitted: " << (elf.eh_frame_headers.size() - shown_headers)
+                << " (limit " << max_rows << ")\n";
+        if (total_entries > shown_entries)
+            out << "  .eh_frame_hdr rows omitted: " << (total_entries - shown_entries) << " (limit " << max_rows << ")\n";
+    }
     for (const auto &section : elf.sections)
         out << "  section #" << section.index << " name=" << elf_text(section.name) << " type=" << section.type
             << " flags=" << elf_hex(section.flags) << " file=" << elf_hex(section.offset)
             << " size=" << elf_hex(section.size) << " link=" << section.link << '\n';
+    out << "ELF section groups: " << elf.section_groups.size() << '\n';
+    for (const auto &group : elf.section_groups) {
+        out << "  group-section=" << group.section << " flags=" << elf_hex(group.flags)
+            << " signature-table=" << group.signature_symbol_table
+            << " signature-symbol=" << group.signature_symbol
+            << " signature-name=\"" << elf_text(group.signature_name) << "\" members=";
+        for (std::size_t index = 0; index < group.members.size(); ++index) {
+            if (index) out << ',';
+            out << group.members[index];
+        }
+        out << '\n';
+    }
+    constexpr std::size_t max_gnu_abi_tag_rows = 256;
+    out << "ELF GNU ABI tags: " << elf.gnu_abi_tags.size() << '\n';
+    const auto shown_gnu_abi_tags = std::min(elf.gnu_abi_tags.size(), max_gnu_abi_tag_rows);
+    for (std::size_t index = 0; index < shown_gnu_abi_tags; ++index) {
+        const auto &tag = elf.gnu_abi_tags[index];
+        const char *os = tag.os == 0 ? "linux" : tag.os == 1 ? "gnu" :
+                         tag.os == 2 ? "solaris2" : tag.os == 3 ? "freebsd" : "unknown";
+        out << "  os=" << os << '(' << tag.os << ") version=" << tag.major << '.'
+            << tag.minor << '.' << tag.subminor << " note-file=" << elf_hex(tag.note_file_offset)
+            << " desc-file=" << elf_hex(tag.description_file_offset)
+            << " extension-size=" << tag.extension.size();
+        if (tag.program) out << " program=" << *tag.program;
+        if (tag.section) out << " section=" << *tag.section;
+        out << '\n';
+    }
+    if (shown_gnu_abi_tags < elf.gnu_abi_tags.size())
+        out << "  abi-tag-output-capped=true omitted=" << elf.gnu_abi_tags.size() - shown_gnu_abi_tags << '\n';
+    constexpr std::size_t max_gnu_hwcap_notes = 128;
+    constexpr std::size_t max_gnu_hwcap_entries = 64;
+    constexpr std::size_t max_gnu_hwcap_name_preview = 64;
+    out << "ELF GNU HWCAP notes: " << elf.gnu_hwcaps.size() << '\n';
+    const auto shown_hwcap_notes = std::min(elf.gnu_hwcaps.size(), max_gnu_hwcap_notes);
+    for (std::size_t index = 0; index < shown_hwcap_notes; ++index) {
+        const auto &hwcap = elf.gnu_hwcaps[index];
+        out << "  mask=" << elf_hex(hwcap.mask) << " entries=" << hwcap.entries.size()
+            << " note-file=" << elf_hex(hwcap.note_file_offset)
+            << " desc-file=" << elf_hex(hwcap.description_file_offset);
+        if (hwcap.program) out << " program=" << *hwcap.program;
+        if (hwcap.section) out << " section=" << *hwcap.section;
+        out << '\n';
+        const auto shown_entries = std::min(hwcap.entries.size(), max_gnu_hwcap_entries);
+        for (std::size_t entry = 0; entry < shown_entries; ++entry) {
+            const auto &value = hwcap.entries[entry];
+            const auto name_preview = std::string_view(value.name).substr(0, max_gnu_hwcap_name_preview);
+            out << "    bit=" << static_cast<unsigned>(value.bit)
+                << " enabled=" << (value.enabled ? "true" : "false")
+                << " name=\"" << elf_text(name_preview) << '\"'
+                << " entry-file=" << elf_hex(value.entry_file_offset)
+                << " name-file=" << elf_hex(value.name_file_offset);
+            if (name_preview.size() < value.name.size()) out << "...";
+            out << '\n';
+        }
+        if (shown_entries < hwcap.entries.size())
+            out << "    entries-output-capped=true omitted=" << hwcap.entries.size() - shown_entries << '\n';
+    }
+    if (shown_hwcap_notes < elf.gnu_hwcaps.size())
+        out << "  hwcap-output-capped=true omitted=" << elf.gnu_hwcaps.size() - shown_hwcap_notes << '\n';
     constexpr std::size_t max_gnu_property_rows = 512;
     constexpr std::size_t max_gnu_property_preview = 32;
     out << "ELF GNU properties: " << elf.gnu_properties.size() << '\n';
@@ -95,6 +235,16 @@ inline void elf_description(std::ostream &out, const ImageMetadata &metadata, co
                 if (value & 2) emit_feature("SHSTK", first);
                 if (value & ~3U) emit_feature("unknown-bits=" + elf_hex(value & ~3U), first);
                 if (first) out << "none";
+            } else if ((header.machine == 3 || header.machine == 62) &&
+                       (property.type == 0xc0008002 || property.type == 0xc0010002)) {
+                out << (property.type == 0xc0008002 ? " x86-isa-1-needed=" : " x86-isa-1-used=");
+                bool first = true;
+                if (value & 1) emit_feature("baseline", first);
+                if (value & 2) emit_feature("v2", first);
+                if (value & 4) emit_feature("v3", first);
+                if (value & 8) emit_feature("v4", first);
+                if (value & ~15U) emit_feature("unknown-bits=" + elf_hex(value & ~15U), first);
+                if (first) out << "none";
             } else if (header.machine == 183 && property.type == 0xc0000000) {
                 out << " aarch64-feature-1-and=";
                 bool first = true;
@@ -130,6 +280,12 @@ inline void elf_description(std::ostream &out, const ImageMetadata &metadata, co
                 out << " version=\"" << elf_text(*symbol.version_name) << '\"';
             if (symbol.version_file)
                 out << " version-file=\"" << elf_text(*symbol.version_file) << '\"';
+            if (symbol.version_flags)
+                out << " version-flags=" << elf_hex(*symbol.version_flags);
+            if (symbol.version_flags && (*symbol.version_flags & 0x0002))
+                out << " version-weak=true";
+            if (symbol.version_hash)
+                out << " version-hash=" << elf_hex(*symbol.version_hash);
             if (symbol.version_hidden)
                 out << " version-hidden=true";
         }
@@ -166,6 +322,8 @@ inline void elf_description(std::ostream &out, const ImageMetadata &metadata, co
     if (elf.core) {
         constexpr std::size_t max_core_threads = 256, max_core_registers = 4096;
         const auto thread_count = std::min(elf.core->threads.size(), max_core_threads);
+        std::size_t floating_point_states_printed = 0;
+        bool floating_point_output_capped = false;
         std::size_t registers_printed = 0;
         out << "ELF core threads: " << elf.core->threads.size() << '\n';
         for (std::size_t index = 0; index < thread_count; ++index) {
@@ -197,68 +355,37 @@ inline void elf_description(std::ostream &out, const ImageMetadata &metadata, co
             registers_printed += shown;
             if (shown < thread.registers.size())
                 out << "    register-output-capped=true omitted=" << thread.registers.size() - shown << '\n';
+            for (const auto &state : thread.floating_point) {
+                if (floating_point_states_printed >= 64) {
+                    if (!floating_point_output_capped)
+                        out << "  FPREGSET output capped at 64 thread states\n";
+                    floating_point_output_capped = true;
+                    break;
+                }
+                ++floating_point_states_printed;
+                out << "  FPREGSET: layout=" << elf_text(state.layout)
+                    << " note-file=" << elf_hex(state.note_file_offset)
+                    << " payload-file=" << elf_hex(state.payload_file_offset) << '\n';
+                for (const auto &reg : state.registers) {
+                    out << "    " << elf_text(reg.name) << '=';
+                    if (reg.bytes.size() <= sizeof(std::uint64_t)) {
+                        std::uint64_t value = 0;
+                        for (std::size_t i = 0; i < reg.bytes.size(); ++i)
+                            value |= std::to_integer<std::uint64_t>(reg.bytes[i]) << (i * 8);
+                        out << elf_hex(value);
+                    } else {
+                        out << "0x";
+                        for (const auto byte : reg.bytes)
+                            out << std::hex << std::setw(2) << std::setfill('0')
+                                << std::to_integer<unsigned>(byte);
+                        out << std::dec;
+                    }
+                    out << " file=" << elf_hex(reg.file_offset) << '\n';
+                }
+            }
         }
         if (thread_count < elf.core->threads.size())
             out << "  thread-output-capped=true omitted=" << elf.core->threads.size() - thread_count << '\n';
-        // Linux NT_FPREGSET payloads are retained in the original notes. Decode
-        // the two common 64-bit layouts here without making unsupported or
-        // extended register-set sizes look authoritative.
-        std::size_t fp_rows = 0;
-        for (const auto &note : elf.notes) {
-            if (note.type != 2 || (note.name != "CORE" && note.name != "LINUX")) continue;
-            if (fp_rows >= 64) { out << "  FPREGSET output capped at 64 notes\n"; break; }
-            ++fp_rows;
-            if (elf.header.machine != 62 && elf.header.machine != 183) continue;
-            const auto &bytes = note.description;
-            const auto layout = elf.header.machine == 62 ? "linux-x86_64-fpregs" : "linux-aarch64-fpsimd";
-            const auto expected = elf.header.machine == 62 ? 512u : 528u;
-            out << "ELF core FPREGSET: layout=" << layout << " note-file=" << elf_hex(note.file_offset)
-                << " payload-file=" << elf_hex(note.description_file_offset) << " bytes=" << bytes.size();
-            if (bytes.size() != expected) {
-                out << " status=unsupported-size\n";
-                continue;
-            }
-            if ((elf.header.machine == 62 || elf.header.machine == 183) && elf.header.order != ByteOrder::little) {
-                out << " status=unsupported-byte-order\n";
-                continue;
-            }
-            out << " status=decoded\n";
-            const auto value = [&](std::size_t at, std::size_t width) {
-                std::uint64_t result = 0;
-                for (std::size_t i = 0; i < width; ++i) {
-                    const auto shift = elf.header.order == ByteOrder::little ? i : width - i - 1;
-                    result |= std::to_integer<std::uint64_t>(bytes[at + i]) << (shift * 8);
-                }
-                return result;
-            };
-            if (elf.header.machine == 62 && elf.header.order == ByteOrder::little) {
-                out << "  cwd=" << elf_hex(value(0, 2)) << " swd=" << elf_hex(value(2, 2))
-                    << " ftw=" << elf_hex(value(4, 2)) << " fop=" << elf_hex(value(6, 2))
-                    << " rip=" << elf_hex(value(8, 8)) << " rdp=" << elf_hex(value(16, 8))
-                    << " mxcsr=" << elf_hex(value(24, 4)) << " mxcr-mask=" << elf_hex(value(28, 4)) << '\n';
-                const auto emit_vector = [&](std::string_view name, std::size_t at, std::size_t size) {
-                    out << "  " << name << "=0x";
-                    for (std::size_t i = 0; i < size; ++i)
-                        out << std::hex << std::setw(2) << std::setfill('0')
-                            << std::to_integer<unsigned>(bytes[at + i]);
-                    out << std::dec << " file=" << elf_hex(note.description_file_offset + at) << '\n';
-                };
-                for (std::size_t i = 0; i < 8; ++i) emit_vector("st" + std::to_string(i), 32 + i * 16, 16);
-                for (std::size_t i = 0; i < 16; ++i) emit_vector("xmm" + std::to_string(i), 160 + i * 16, 16);
-            } else if (elf.header.machine == 183 && elf.header.order == ByteOrder::little) {
-                const auto emit_vector = [&](std::size_t i) {
-                    const auto at = i * 16;
-                    out << "  v" << i << "=0x";
-                    for (std::size_t b = 0; b < 16; ++b)
-                        out << std::hex << std::setw(2) << std::setfill('0')
-                            << std::to_integer<unsigned>(bytes[at + b]);
-                    out << std::dec << " file=" << elf_hex(note.description_file_offset + at) << '\n';
-                };
-                for (std::size_t i = 0; i < 32; ++i) emit_vector(i);
-                out << "  fpsr=" << elf_hex(value(512, 4)) << " file=" << elf_hex(note.description_file_offset + 512)
-                    << " fpcr=" << elf_hex(value(516, 4)) << " file=" << elf_hex(note.description_file_offset + 516) << '\n';
-            }
-        }
         out << "ELF core signal info: " << elf.core->signal_info.size() << '\n';
         for (const auto &info : elf.core->signal_info) {
             out << "  signal=" << info.signal << " error=" << info.error << " code=" << info.code;
@@ -267,12 +394,34 @@ inline void elf_description(std::ostream &out, const ImageMetadata &metadata, co
             out << " note-file=" << elf_hex(info.note_file_offset)
                 << " payload-file=" << elf_hex(info.payload_file_offset) << '\n';
         }
+        out << "ELF AArch64 control notes: " << elf.core->arm64_control_notes.size() << '\n';
+        constexpr std::size_t arm64_note_limit = 128;
+        for (std::size_t i = 0; i < std::min(elf.core->arm64_control_notes.size(), arm64_note_limit); ++i) {
+            const auto &note = elf.core->arm64_control_notes[i];
+            const auto label = note.type == 0x406 ? "NT_ARM_PAC_MASK"
+                : note.type == 0x409 ? "NT_ARM_TAGGED_ADDR_CTRL" : "NT_ARM_PAC_ENABLED_KEYS";
+            out << "  " << label;
+            if (note.type == 0x406) {
+                out << " data-mask=0x" << std::hex << note.first_value;
+                if (note.second_value) out << " instruction-mask=0x" << *note.second_value;
+                else out << " instruction-mask=unavailable";
+            }
+            else if (note.type == 0x409) out << " control=0x" << std::hex << note.first_value;
+            else out << " enabled-keys=0x" << std::hex << note.first_value;
+            out << " note-file=" << note.note_file_offset
+                << " payload-file=" << note.payload_file_offset << std::dec << '\n';
+        }
+        if (elf.core->arm64_control_notes.size() > arm64_note_limit)
+            out << "  AArch64 control notes omitted="
+                << (elf.core->arm64_control_notes.size() - arm64_note_limit) << '\n';
     }
     out << "ELF relocations: " << elf.relocations.size() << ' ' << (elf.relocations_complete ? "complete" : "partial")
         << '\n';
     for (const auto &row : elf.relocations) {
         out << "  relocation record=file:" << elf_hex(row.record_file_offset) << " type=" << row.type
             << " symbol=" << row.symbol_index;
+        if (!elf.header.is_64 && elf.header.machine == 8 && row.type == 3)
+            out << " name=R_MIPS_REL32";
         if (row.symbol_table)
             out << " symbol-table=file:" << elf_hex(row.symbol_table->file_offset);
         if (row.symbol_table && row.symbol_table->section)

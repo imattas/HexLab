@@ -561,3 +561,14 @@ nodes at one physical address or complete ARM predication and ISA coverage.
 Focused function tests cover a conflicting Thumb ITSTATE join and an adjacent
 A32-to-Thumb region that remains a separate function boundary.
 
+## Thumb-2 variable rotate
+
+The wide `ROR{S}.W Rd, Rn, Rm` form now decodes for general-purpose registers
+r0-r12. The normalized instruction retains the rotated source and amount
+register separately, plus exact source/destination/optional APSR effects. Its
+existing MOV-with-shift formatter prints ROR syntax, and the decompiler's
+shared ARM scalar path represents the value as a register-controlled rotate.
+SP/PC operands remain outside this profile-free decoder slice. Immediate ROR,
+other Thumb-2 register-controlled shifts, and broader scalar coverage remain
+separate gaps.
+

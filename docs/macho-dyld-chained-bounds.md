@@ -42,6 +42,14 @@ IA, IB, DA, or DB and show its numeric encoding, diversity value, and
 address-diversity bit. These labels describe stored metadata only; they do not
 indicate that the pointer's PAC was checked or applied.
 
+Authenticated ARM64e bind pointers also retain their chained import association
+in dyld reference provenance: library ordinal, imported symbol, weak-import
+flag, combined addend, and import-row identity remain available even though the
+resolution reason stays `authenticated`. This association identifies the
+encoded binding only; it does not resolve the runtime target or validate/apply
+PAC. Persisted provenance accepts this binding only when its original pointer
+is both authenticated and a bind.
+
 ARM64e segmented format 14 stores an 8-byte field with a 4-byte chain stride.
 The parser retains the lower 32-bit target payload (4-bit segment index plus
 28-bit segment offset), the 12-bit next field, and authenticated diversity,
@@ -87,4 +95,31 @@ pointer formats, malformed extents, and targets that require unavailable
 runtime state leave the stream incomplete or fail parsing when the input is
 structurally malformed. No guessed target base is attempted.
 
+For `DYLD_CHAINED_PTR_ARM64E_SEGMENTED` (format 14), the retained 4-bit target
+segment index and 28-bit segment-relative offset produce an additional target
+VM address only when the index names a parsed segment, the offset is within its
+declared memory size, checked base addition succeeds, and the resulting address
+maps in the image. Encrypted fixup bytes are not interpreted. The packed target
+and authentication fields remain authoritative source data; this derivation does
+not strip or validate pointer authentication and does not make the containing
+fixup stream complete. Format 14's bit layout follows Apple's
+[`fixup-chains.h`](https://github.com/apple-oss-distributions/dyld/blob/main/include/mach-o/fixup-chains.h).
+
 Format reference: [Apple dyld chained fixup definitions](https://github.com/apple-oss-distributions/dyld/blob/main/include/mach-o/fixup-chains.h).
+
+The firmware `__TEXT,__chain_starts` section is also retained as an indexed
+table of raw 32-bit offsets. Apple's `fixup-chains.h` defines its header as a
+pointer format, a start count, and one offset per chain; the expected formats
+are 32_FIRMWARE (5) and ARM64E_KERNEL (7). Apple's `ld64` documentation
+describes the offsets as file offsets by default, or VM offsets from `__TEXT`
+when the section uses the VM-offset flag. The loader resolves the first pointer
+location only when the declared coordinate maps unambiguously inside the
+selected image and the pointer word is fully file-backed. Unknown formats,
+coordinate flags, and raw offsets are preserved as incomplete rows. These
+section records now drive bounded chain traversal and conservative target
+resolution for supported little-endian firmware images; see
+[firmware chain traversal](macho-firmware-chains.md). Unknown or incomplete
+start rows remain inventory-only.
+
+Sources: [Apple dyld `fixup-chains.h`](https://raw.githubusercontent.com/apple-oss-distributions/dyld/main/include/mach-o/fixup-chains.h)
+and [Apple ld64 manual](https://github.com/apple-oss-distributions/ld64/blob/main/doc/man/man1/ld.1).

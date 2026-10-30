@@ -42,6 +42,12 @@ uses the same 4,096-thread and 1 MiB bounds, stays stable across continuation
 chunks, and rejects duplicate/zero IDs or XML control characters. Thread
 enumeration remains available through `qfThreadInfo`/`qsThreadInfo` regardless
 of whether the XML form can be advertised.
+For targets started with `--launch`, the server also advertises
+`qXfer:exec-file:read` when the executable path is non-empty and no larger than
+64 KiB. The binary annex returns the normalized absolute UTF-8 launch path in
+bounded chunks, including normal RSP escaping for reserved packet bytes. Attach
+sessions omit the feature because the server does not have a reliable executable
+path from the attach request alone.
 The server supports `Z1` hardware execute breakpoints on Windows x86/x64 and
 Linux x86-64 targets, and advertises `hwbreak+` only for those combinations.
 It also routes `Z2`/`Z3`/`Z4` write/read/access watchpoints through the native

@@ -24,6 +24,8 @@ bool bit_operations(State &s, std::uint8_t opcode, bool extended) {
         s.operand(m.reg, OperandAccess::write);
         s.operand(m.rm, OperandAccess::read);
         // POPCNT clears CF/PF/AF/SF/OF and sets ZF when its source is zero.
+        // Other FLAGS bits are preserved, so retain the incoming whole value.
+        s.flags_read = true;
         s.flags_write = true;
         return true;
     }
@@ -35,10 +37,18 @@ bool bit_operations(State &s, std::uint8_t opcode, bool extended) {
         s.i.opcode = opcode == 0xa4 || opcode == 0xa5 ? Opcode::shld : Opcode::shrd;
         s.operand(m.rm, OperandAccess::read_write);
         s.operand(m.reg, OperandAccess::read);
-        if (immediate)
-            s.operand(s.immediate(8, 8, false), OperandAccess::read);
-        else
+        if (immediate) {
+            const auto count = s.immediate(8, 8, false);
+            const unsigned mask = width == 64 ? 0x3fU : 0x1fU;
+            // A zero effective immediate count preserves FLAGS; record the
+            // incoming dependency alongside the unconditional write fact.
+            s.flags_read = (count.value & mask) == 0;
+            s.operand(count, OperandAccess::read);
+        } else {
             s.operand(gpr(1, 8), OperandAccess::read);
+            // CL is runtime-valued and may be zero, which leaves FLAGS intact.
+            s.flags_read = true;
+        }
         s.flags_write = true;
         return true;
     }
@@ -84,6 +94,9 @@ bool bit_operations(State &s, std::uint8_t opcode, bool extended) {
     if (scan) {
         s.operand(m.reg, OperandAccess::write);
         s.operand(m.rm, OperandAccess::read);
+        // The scan/count instructions define only selected arithmetic flags;
+        // the remaining FLAGS bits are preserved from their incoming value.
+        s.flags_read = true;
     } else {
         s.operand(m.rm, read_modify_write ? OperandAccess::read_write : OperandAccess::read);
         if (immediate)
@@ -91,6 +104,10 @@ bool bit_operations(State &s, std::uint8_t opcode, bool extended) {
         else
             s.operand(m.reg, OperandAccess::read);
     }
+    // BT/BTS/BTR/BTC update CF and preserve non-arithmetic FLAGS bits. Scan
+    // forms also preserve the unaffected bits; their decoded branch above
+    // explicitly records the same incoming dependency.
+    s.flags_read = true;
     s.flags_write = true;
     return true;
 }

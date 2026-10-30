@@ -3,11 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <set>
+#include <string>
 #include <tuple>
 
 namespace hexlab::plugins::detail {
 namespace {
-using RegisterKey = std::tuple<RegisterBank, std::uint8_t, std::uint16_t, bool>;
+using RegisterKey = std::tuple<RegisterBank, std::uint16_t, std::uint16_t, bool>;
 RegisterKey key(RegisterOperand value) { return {value.bank,value.index,value.width,value.high_byte}; }
 bool zero(const HexLabSemanticRegisterV2 &value) {
     return !value.bank&&!value.index&&!value.width&&!value.reserved;
@@ -31,6 +32,13 @@ bool native_scalar_context(DecodeContext context){
 bool native_scalar_register(RegisterOperand reg, DecodeContext context) {
     if(reg.high_byte)return false;
     switch(reg.bank){
+    case RegisterBank::flags:
+        // Scalar plugins may model the complete architectural status word on
+        // x86. Partial flag lanes and non-x86 status banks need dedicated
+        // merge/condition semantics and stay outside this generic formula API.
+        return (context.architecture==Architecture::x86||context.architecture==Architecture::x86_64)&&
+               reg.index==0&&reg.width==(context.mode==ExecutionMode::x86_16?16:
+                   context.mode==ExecutionMode::x86_32?32:context.mode==ExecutionMode::x86_64?64:0);
     case RegisterBank::gpr:
         return reg.width==(context.mode==ExecutionMode::x86_64?64:context.mode==ExecutionMode::x86_32?32:16)&&
                reg.index<(context.mode==ExecutionMode::x86_64?16:8);
@@ -87,9 +95,16 @@ std::optional<decompiler::Intrinsic> convert_scalar_ir(const HexLabInstructionIR
         }else{
             if(node.value||!zero(node.reg)||node.left>=i||values[node.left]->type!=type)return {};
             costs[i]+=costs[node.left];depths[i]+=depths[node.left];
-            if(node.operation==HEXLAB_SCALAR_IR_NOT){
+            if(node.operation==HEXLAB_SCALAR_IR_NOT||node.operation==HEXLAB_SCALAR_IR_CLZ||
+               node.operation==HEXLAB_SCALAR_IR_CTZ||node.operation==HEXLAB_SCALAR_IR_POPCOUNT||
+               node.operation==HEXLAB_SCALAR_IR_BSWAP||node.operation==HEXLAB_SCALAR_IR_NEG){
                 if(node.right!=HEXLAB_SCALAR_IR_NO_NODE)return {};
-                values[i]=std::make_shared<Expression>(Expression{type,UnaryValue{"bitnot",values[node.left]}});
+                const std::string operation=node.operation==HEXLAB_SCALAR_IR_NOT?"bitnot":
+                    node.operation==HEXLAB_SCALAR_IR_CLZ?"clz":
+                    node.operation==HEXLAB_SCALAR_IR_CTZ?"ctz":
+                    node.operation==HEXLAB_SCALAR_IR_POPCOUNT?"popcount":
+                    node.operation==HEXLAB_SCALAR_IR_NEG?"-":"bswap"+std::to_string(node.width);
+                values[i]=std::make_shared<Expression>(Expression{type,UnaryValue{operation,values[node.left]}});
             }else{
                 if(node.right>=i||values[node.right]->type!=type)return {};
                 const bool is_shift=node.operation==HEXLAB_SCALAR_IR_SHL||

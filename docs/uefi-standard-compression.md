@@ -30,9 +30,26 @@ The PI specification defines only `EFI_NOT_COMPRESSED` (0) and
 Tiano LZHUF variant as compression type `2` in an `EFI_SECTION_COMPRESSION`
 section. It uses the same bounded decoder with Tiano's five-bit position
 alphabet and is an implementation compatibility extension, not a PI-defined
-compression type. Tiano/custom compression carried in GUID-defined sections,
-unknown compression types, compressed payload execution, PE/TE image loading,
-and extraction to disk remain unsupported.
+compression type.
+
+The EDK II Tiano custom-decompression GUID
+(`A31280AD-481E-41B6-95E8-127F4C984779`) is also recognized on
+`EFI_SECTION_GUID_DEFINED` sections with `PROCESSING_REQUIRED` set. Its payload
+uses the same 8-byte compressed/output size preamble and bounded type-2 Tiano
+decoder. Successfully decoded bytes are used only to inventory a nested
+section stream; child offsets are relative to the decompressed stream. A
+malformed stream, budget limit, or invalid nested section stream keeps the
+guided payload opaque with a diagnostic. EDK II also defines the LZMA custom
+decompression GUID (`EE4E5898-3914-4259-9D6E-DC7BD79403CF`) and the LZMA x86
+converter GUID (`D42AE6BD-1352-4BFB-909A-CA72A6EAE889`). Those
+processing-required payloads remain opaque: this build has no bounded LZMA
+decoder dependency, and their format is not treated as interchangeable with
+the Tiano LZHUF stream. For any GUID-defined section whose
+`PROCESSING_REQUIRED` attribute is clear, PI permits direct retrieval of the
+payload as nested sections; the parser inventories that stream without
+interpreting the GUID-specific encoding. Other unknown processing-required
+GUIDs, unknown compression types, compressed payload execution, PE/TE image
+loading, and extraction to disk remain unsupported.
 
 The decoder structure is adapted from TianoCore EDK II
 `BaseTools/Source/C/Common/Decompress.c` (Intel copyright, BSD-2-Clause-Patent).
@@ -43,3 +60,7 @@ Formats](https://uefi.org/sites/default/files/resources/UEFI_PI_Spec_Final_Draft
 The PI specification's compression-type values are also listed in
 [TianoCore's section definitions](https://github.com/tianocore/edk2/blob/master/MdePkg/Include/Pi/PiFirmwareFile.h); the Tiano type-2 compatibility decoder is based on the distinct
 [Tiano compression routine](https://github.com/tianocore/edk2/blob/master/BaseTools/Source/C/TianoCompress/TianoCompress.c).
+The custom-decompression GUID and handler behavior follow EDK II's
+[MdePkg declaration](https://github.com/tianocore/edk2/blob/master/MdePkg/MdePkg.dec)
+and [Tiano guided-section handler](https://github.com/tianocore/edk2/blob/master/MdePkg/Library/BaseUefiDecompressLib/BaseUefiTianoCustomDecompressLib.c).
+The LZMA and LZMAF86 GUIDs follow EDK II's [LZMA decompression GUID declarations](https://github.com/tianocore/edk2/blob/master/MdeModulePkg/Include/Guid/LzmaDecompress.h); both processing-required payloads are decoded under bounded output, dictionary, work, and active-memory limits, with the x86 branch filter applied for LZMAF86. EDK II's Brotli custom-decompression GUID is also supported; its wrapper, allocator cap, and limits are described in [Brotli guided sections](uefi-brotli-compression.md).

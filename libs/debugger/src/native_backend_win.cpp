@@ -1,4 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <tlhelp32.h>
 
@@ -10,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <charconv>
 #include <cstring>
 #include <limits>
@@ -26,6 +30,66 @@ namespace {
 Error win_error(const char* action) {
     return {ErrorCode::io, std::string(action) + " failed (Win32 error " + std::to_string(GetLastError()) + ")"};
 }
+BOOL wait_for_debug_event_compatible(LPDEBUG_EVENT event, DWORD timeout) {
+    using WaitForDebugEventExFunction = BOOL (WINAPI *)(LPDEBUG_EVENT, DWORD);
+    static const auto wait_ex = [] {
+        const auto kernel = GetModuleHandleW(L"kernel32.dll");
+        return kernel ? reinterpret_cast<WaitForDebugEventExFunction>(GetProcAddress(kernel, "WaitForDebugEventEx")) : nullptr;
+    }();
+    return wait_ex ? wait_ex(event, timeout) : WaitForDebugEvent(event, timeout);
+}
+std::string read_debug_output(HANDLE process, const OUTPUT_DEBUG_STRING_INFO& info) {
+    constexpr std::size_t max_message_bytes = 4096;
+    constexpr std::size_t truncation_marker_reserve = 32;
+    const auto reported = static_cast<std::size_t>(info.nDebugStringLength);
+    if (!reported) return "[debug string has a zero length field; content unavailable]";
+    const auto address = reinterpret_cast<std::uintptr_t>(info.lpDebugStringData);
+    const std::size_t raw_limit = info.fUnicode
+        ? max_message_bytes / 2 : (max_message_bytes - truncation_marker_reserve) / 4;
+    const auto requested = std::min(reported, raw_limit);
+    const auto read_size = info.fUnicode ? (requested & ~std::size_t{1}) : requested;
+    if (!address || !read_size || address > std::numeric_limits<std::uintptr_t>::max() - read_size)
+        return "[debug string address or length is invalid]";
+    std::vector<std::byte> bytes(read_size);
+    SIZE_T actual = 0;
+    if (!ReadProcessMemory(process, reinterpret_cast<const void*>(address), bytes.data(), bytes.size(), &actual))
+        return "[debug string read failed (Win32 error " + std::to_string(GetLastError()) + ")]";
+    if (actual != bytes.size()) return "[debug string read was shorter than the reported length]";
+
+    std::string output;
+    if (info.fUnicode) {
+        std::wstring wide(actual / sizeof(wchar_t), L'\0');
+        if (!wide.empty()) std::memcpy(wide.data(), bytes.data(), wide.size() * sizeof(wchar_t));
+        const auto terminator = wide.find(L'\0');
+        if (terminator != std::wstring::npos) wide.resize(terminator);
+        if (!wide.empty()) {
+            const auto utf8_size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(),
+                static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+            if (utf8_size <= 0) return "[debug string contains invalid UTF-16 data]";
+            output.resize(static_cast<std::size_t>(utf8_size));
+            if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(),
+                    static_cast<int>(wide.size()), output.data(), utf8_size, nullptr, nullptr) != utf8_size)
+                return "[debug string UTF-16 conversion failed]";
+        }
+    } else {
+        static constexpr char digits[] = "0123456789ABCDEF";
+        output.reserve(std::min<std::size_t>(bytes.size() * 4, max_message_bytes));
+        for (const auto byte_value : bytes) {
+            const auto byte = std::to_integer<unsigned char>(byte_value);
+            if (!byte) break;
+            if (byte == '\n' || byte == '\r' || byte == '\t' || (byte >= 0x20 && byte < 0x7f))
+                output.push_back(static_cast<char>(byte));
+            else {
+                output += "\\x";
+                output.push_back(digits[byte >> 4]);
+                output.push_back(digits[byte & 0x0f]);
+            }
+        }
+    }
+    if (reported > read_size) output += " [debug string truncated]";
+    if (output.empty()) output = "[empty debug string]";
+    return output;
+}
 std::string narrow(const wchar_t* value) {
     if (!value || !*value) return {};
     const auto count = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
@@ -35,16 +99,23 @@ std::string narrow(const wchar_t* value) {
     out.pop_back();
     return out;
 }
-std::wstring widen(const std::string& value) {
-    if (value.empty()) return {};
-    const auto count = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
-    if (count <= 0) return {};
+Result<std::wstring> widen(const std::string& value) {
+    if (value.empty()) return std::wstring{};
+    if (value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        return Error{ErrorCode::invalid_argument, "Windows launch string exceeds UTF-8 conversion limits"};
+    const auto count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                                            static_cast<int>(value.size()), nullptr, 0);
+    if (count <= 0)
+        return Error{ErrorCode::invalid_argument, "Windows launch strings must contain valid UTF-8"};
     std::wstring out(static_cast<std::size_t>(count), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), out.data(), count);
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                            static_cast<int>(value.size()), out.data(), count) != count)
+        return Error{ErrorCode::invalid_argument, "Windows launch strings must contain valid UTF-8"};
+    if (out.find(L'\0') != std::wstring::npos)
+        return Error{ErrorCode::invalid_argument, "Windows launch strings cannot contain NUL characters"};
     return out;
 }
-std::wstring quote(const std::string& argument) {
-    const auto input = widen(argument);
+std::wstring quote(const std::wstring& input) {
     std::wstring out(1, L'"');
     std::size_t slashes = 0;
     for (wchar_t ch : input) {
@@ -88,7 +159,15 @@ template<class T> bool assign_register(const RegisterValue& reg, const char* nam
 #if defined(_M_X64)
 constexpr DWORD64 avx_feature_mask = UINT64_C(1) << 2;
 constexpr DWORD64 sse_feature_mask = UINT64_C(1) << 1;
+constexpr DWORD64 avx512_opmask_feature = UINT64_C(1) << 5;
+constexpr DWORD64 avx512_zmm_hi256_feature = UINT64_C(1) << 6;
+constexpr DWORD64 avx512_hi16_zmm_feature = UINT64_C(1) << 7;
+constexpr DWORD64 avx512_feature_mask = avx_feature_mask | avx512_opmask_feature |
+    avx512_zmm_hi256_feature | avx512_hi16_zmm_feature;
 constexpr std::size_t ymm_upper_bytes = 16 * sizeof(M128A);
+constexpr std::size_t opmask_bytes = 8 * sizeof(std::uint64_t);
+constexpr std::size_t zmm_hi256_bytes = 16 * 32;
+constexpr std::size_t hi16_zmm_bytes = 16 * 64;
 
 Error xstate_error(const char* action) {
     const auto code = GetLastError();
@@ -130,11 +209,23 @@ bool avx_context_enabled(const XStateApi& api) {
     constexpr auto required_state = sse_feature_mask | avx_feature_mask;
     return (api.enabled() & required_state) == required_state;
 }
+bool avx512_context_enabled(const XStateApi& api) {
+    if (!avx_context_enabled(api) || (api.enabled() & avx512_feature_mask) != avx512_feature_mask) return false;
+    int cpu[4]{};
+    __cpuid(cpu, 0);
+    if (cpu[0] < 7) return false;
+    __cpuidex(cpu, 7, 0);
+    return (static_cast<unsigned>(cpu[1]) & (1u << 16)) != 0; // AVX512F
+}
 
 struct X64AvxContext {
     std::vector<std::byte> storage;
     PCONTEXT context = nullptr;
     std::byte* upper = nullptr;
+    std::byte* opmask = nullptr;
+    std::byte* zmm_hi256 = nullptr;
+    std::byte* hi16_zmm = nullptr;
+    DWORD64 valid_features = 0;
     X64AvxContext() = default;
     X64AvxContext(const X64AvxContext&) = delete;
     X64AvxContext& operator=(const X64AvxContext&) = delete;
@@ -147,10 +238,12 @@ struct X64AvxContext {
     }
 };
 
-Result<X64AvxContext> read_x64_avx_context(HANDLE thread) {
+Result<X64AvxContext> read_x64_avx_context(HANDLE thread, bool include_avx512 = false) {
     const auto& api = xstate_api();
-    if (!avx_context_enabled(api))
-        return Error{ErrorCode::unsupported, "Windows YMM state requires enabled CPU/OS AVX context support"};
+    if (include_avx512 ? !avx512_context_enabled(api) : !avx_context_enabled(api))
+        return Error{ErrorCode::unsupported, include_avx512
+            ? "Windows ZMM/opmask state requires enabled CPU/OS AVX-512 XState support"
+            : "Windows YMM state requires enabled CPU/OS AVX context support"};
     constexpr DWORD requested = CONTEXT_FULL | CONTEXT_FLOATING_POINT | CONTEXT_XSTATE;
     DWORD size = 0;
     if (api.initialize(nullptr, requested, nullptr, &size) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
@@ -169,16 +262,18 @@ Result<X64AvxContext> read_x64_avx_context(HANDLE thread) {
         return Error{ErrorCode::unsupported, "Windows did not initialize a complete x64 AVX context"};
     // Legacy XMM/x87/MXCSR arrive through CONTEXT_FLOATING_POINT. Request only
     // the AVX extension; no other extended feature is read or later submitted.
+    const auto requested_features = include_avx512 ? avx512_feature_mask : avx_feature_mask;
     DWORD64 selected = 0;
-    if (!api.set_mask(result.context, avx_feature_mask) ||
-        !api.get_mask(result.context, &selected) || selected != avx_feature_mask)
-        return Error{ErrorCode::unsupported, "Windows AVX context feature selection failed"};
+    if (!api.set_mask(result.context, requested_features) ||
+        !api.get_mask(result.context, &selected) || selected != requested_features)
+        return Error{ErrorCode::unsupported, "Windows extended vector context feature selection failed"};
     if (!GetThreadContext(thread, result.context)) return xstate_error("GetThreadContext for x64 AVX state");
     if ((result.context->ContextFlags & requested) != requested)
         return Error{ErrorCode::unsupported, "Windows returned an incomplete x64 AVX context"};
     DWORD64 valid = 0;
-    if (!api.get_mask(result.context, &valid) || (valid & ~avx_feature_mask))
-        return Error{ErrorCode::unsupported, "Windows AVX context validity mask is unavailable"};
+    if (!api.get_mask(result.context, &valid) || (valid & ~requested_features))
+        return Error{ErrorCode::unsupported, "Windows extended vector context validity mask is unavailable"};
+    result.valid_features = valid;
     DWORD feature_size = 0;
     result.upper = static_cast<std::byte*>(api.locate(result.context, XSTATE_AVX, &feature_size));
     if (feature_size != ymm_upper_bytes || !result.contains(result.upper, feature_size))
@@ -190,6 +285,31 @@ Result<X64AvxContext> read_x64_avx_context(HANDLE thread) {
     // An absent valid bit means architectural INIT state, not unavailable
     // storage. Its saved bytes are undefined; materialize the zero upper halves.
     if (!(valid & avx_feature_mask)) std::memset(result.upper, 0, feature_size);
+    if (include_avx512) {
+        struct Feature { DWORD id; std::size_t expected; std::byte** destination; DWORD64 bit; const char* label; };
+        const std::array features{
+            Feature{5, opmask_bytes, &result.opmask, avx512_opmask_feature, "opmask"},
+            Feature{6, zmm_hi256_bytes, &result.zmm_hi256, avx512_zmm_hi256_feature, "ZMM upper"},
+            Feature{7, hi16_zmm_bytes, &result.hi16_zmm, avx512_hi16_zmm_feature, "high ZMM"}};
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> extents;
+        const auto context_begin = reinterpret_cast<std::uintptr_t>(result.context);
+        extents.emplace_back(context_begin, context_begin + sizeof(CONTEXT));
+        const auto upper_begin = reinterpret_cast<std::uintptr_t>(result.upper);
+        extents.emplace_back(upper_begin, upper_begin + ymm_upper_bytes);
+        for (const auto& feature : features) {
+            DWORD size = 0;
+            *feature.destination = static_cast<std::byte*>(api.locate(result.context, feature.id, &size));
+            if (size != feature.expected || !result.contains(*feature.destination, size))
+                return Error{ErrorCode::unsupported, std::string("Windows AVX-512 ") + feature.label + " state has an invalid extent"};
+            const auto begin = reinterpret_cast<std::uintptr_t>(*feature.destination);
+            const auto end = begin + size;
+            for (const auto& prior : extents)
+                if (begin < prior.second && prior.first < end)
+                    return Error{ErrorCode::unsupported, "Windows AVX-512 XState components overlap"};
+            extents.emplace_back(begin, end);
+            if (!(valid & feature.bit)) std::memset(*feature.destination, 0, size);
+        }
+    }
     return std::move(result);
 }
 
@@ -226,6 +346,37 @@ void append_ymm_register(std::vector<RegisterValue>& out, std::uint32_t index, c
     std::memcpy(reg.bytes.data(), &state.context->FltSave.XmmRegisters[index], sizeof(M128A));
     std::memcpy(reg.bytes.data() + sizeof(M128A), state.upper + index * sizeof(M128A), sizeof(M128A));
     out.push_back(std::move(reg));
+}
+void append_avx512_registers(std::vector<RegisterValue>& out, const X64AvxContext& state) {
+    for (std::uint32_t index = 0; index < 32; ++index) {
+        RegisterValue reg;
+        reg.name = "zmm" + std::to_string(index);
+        reg.group = "vector";
+        reg.number = index;
+        reg.byte_order = ByteOrder::little;
+        reg.bytes.resize(64);
+        if (index < 16) {
+            std::memcpy(reg.bytes.data(), &state.context->FltSave.XmmRegisters[index], 16);
+            if (state.valid_features & avx_feature_mask)
+                std::memcpy(reg.bytes.data() + 16, state.upper + index * 16, 16);
+            if (state.valid_features & avx512_zmm_hi256_feature)
+                std::memcpy(reg.bytes.data() + 32, state.zmm_hi256 + index * 32, 32);
+        } else if (state.valid_features & avx512_hi16_zmm_feature) {
+            std::memcpy(reg.bytes.data(), state.hi16_zmm + (index - 16) * 64, 64);
+        }
+        out.push_back(std::move(reg));
+    }
+    for (std::uint32_t index = 0; index < 8; ++index) {
+        RegisterValue reg;
+        reg.name = "k" + std::to_string(index);
+        reg.group = "vector-mask";
+        reg.number = index;
+        reg.byte_order = ByteOrder::little;
+        reg.bytes.resize(sizeof(std::uint64_t));
+        if (state.valid_features & avx512_opmask_feature)
+            std::memcpy(reg.bytes.data(), state.opmask + index * sizeof(std::uint64_t), sizeof(std::uint64_t));
+        out.push_back(std::move(reg));
+    }
 }
 #endif
 
@@ -427,6 +578,111 @@ bool arm32_condition_passed(unsigned condition, DWORD cpsr) {
     }
 }
 
+Result<Arm32StepDestination> arm32_a32_ldm_pc_destination(HANDLE process,
+    std::uint32_t word, DWORD pc, DWORD cpsr, const std::array<DWORD, 16>& registers) {
+    // Ordinary A32 LDM (A1), with PC in the list. S=1 is the exception-return
+    // form and must never be interpreted as a plain interworking load.
+    const auto base_register = static_cast<unsigned>((word >> 16) & 15u);
+    const auto list = word & 0xffffu;
+    const bool writeback = (word & (1u << 21)) != 0;
+    if ((word & 0x0e108000u) != 0x08108000u || (word >> 28) == 15 ||
+        (word & (1u << 22)) || (cpsr & (1u << 9)) || base_register == 15 ||
+        (writeback && (list & (1u << base_register))))
+        return Error{ErrorCode::unsupported, "A32 LDM PC requires an ordinary little-endian load, non-PC base and unambiguous writeback"};
+    if (!arm32_condition_passed(word >> 28, cpsr))
+        return Arm32StepDestination{pc + 4u, false};
+    unsigned count = 0;
+    for (auto bits = list; bits; bits &= bits - 1) ++count;
+    const bool increment = (word & (1u << 23)) != 0;
+    const bool before = (word & (1u << 24)) != 0;
+    const auto base = static_cast<std::int64_t>(registers[base_register]);
+    const auto size = static_cast<std::int64_t>(count) * 4;
+    // Registers transfer in ascending order; PC is always the last word.
+    const auto begin = increment ? base + (before ? 4 : 0)
+                                 : base - size + (before ? 0 : 4);
+    const auto end = begin + size;
+    const auto updated_base = increment ? base + size : base - size;
+    if ((base & 3) || begin < 0 || end > (std::int64_t{1} << 32) ||
+        (writeback && (updated_base < 0 || updated_base > UINT32_MAX)))
+        return Error{ErrorCode::invalid_argument, "A32 LDM PC transfer range or writeback is unaligned or exceeds the address space"};
+    std::array<std::byte, 4> bytes{};
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(process, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(end - 4)),
+                           bytes.data(), bytes.size(), &read) || read != bytes.size())
+        return win_error("ReadProcessMemory for A32 LDM PC");
+    const auto loaded = std::to_integer<std::uint32_t>(bytes[0]) |
+        (std::to_integer<std::uint32_t>(bytes[1]) << 8) |
+        (std::to_integer<std::uint32_t>(bytes[2]) << 16) |
+        (std::to_integer<std::uint32_t>(bytes[3]) << 24);
+    const bool thumb = (loaded & 1u) != 0;
+    if (!thumb && (loaded & 3u))
+        return Error{ErrorCode::invalid_argument, "A32 LDM PC produced an unaligned ARM-state target"};
+    const auto target = loaded & (thumb ? ~std::uint32_t{1} : ~std::uint32_t{3});
+    const auto trap_end = static_cast<std::uint64_t>(target) + (thumb ? 2u : 4u);
+    // Installing the successor trap must not change this instruction or any
+    // value it will load, including a different register's transfer slot.
+    if ((target < static_cast<std::uint64_t>(end) && static_cast<std::uint64_t>(begin) < trap_end) ||
+        (target < static_cast<std::uint64_t>(pc) + 4u && pc < trap_end))
+        return Error{ErrorCode::unsupported, "A32 LDM PC successor trap overlaps its instruction or transfer range"};
+    return Arm32StepDestination{target, thumb};
+}
+
+Result<Arm32StepDestination> arm32_thumb2_ldm_pc_destination(HANDLE process,
+    std::uint16_t first, std::uint16_t second, DWORD pc, DWORD cpsr,
+    const std::array<DWORD, 16>& registers, std::uint8_t it_state) {
+    // Thumb-2 LDMIA/LDMDB T2, including the SP-based POP.W alias for IA.
+    const auto base_register = static_cast<unsigned>(first & 0x0fu);
+    const auto list = static_cast<std::uint32_t>(second);
+    const bool writeback = (first & 0x20u) != 0;
+    const bool increment_after = (first & 0xffd0u) == 0xe890u;
+    const bool decrement_before = (first & 0xffd0u) == 0xe910u;
+    if ((!increment_after && !decrement_before) || base_register == 15 ||
+        (list & 0x8000u) == 0 || (list & 0x6000u) != 0 || std::popcount(list) < 2 ||
+        (writeback && (list & (1u << base_register)) != 0))
+        return Error{ErrorCode::unsupported,
+            "Thumb-2 LDM PC requires a valid IA/DB form, non-PC base, and unambiguous register list"};
+    if (it_state != 0 && (it_state & 7u) != 0)
+        return Error{ErrorCode::unsupported, "Thumb-2 LDM PC is only stepped in the final IT slot"};
+    if (it_state != 0 && !arm32_condition_passed(it_state >> 4, cpsr))
+        return Arm32StepDestination{static_cast<DWORD>(pc + 4u), true};
+
+    const auto base = static_cast<std::uint64_t>(registers[base_register]);
+    const auto count = static_cast<std::uint64_t>(std::popcount(list));
+    const auto transfer_size = count * 4u;
+    if ((base & 3u) != 0 || (decrement_before && base < transfer_size))
+        return Error{ErrorCode::invalid_argument,
+            "Thumb-2 LDM PC transfer range is unaligned or exceeds the address space"};
+    const auto transfer_begin = increment_after ? base : base - transfer_size;
+    const auto transfer_end = increment_after ? base + transfer_size : base;
+    const auto pc_slot = increment_after ? base + static_cast<std::uint64_t>(std::popcount(list & 0x7fffu)) * 4u
+                                         : base - 4u;
+    const auto updated_base = increment_after ? base + transfer_size : base - transfer_size;
+    if (transfer_end > (std::uint64_t{1} << 32) ||
+        (writeback && updated_base > UINT32_MAX))
+        return Error{ErrorCode::invalid_argument,
+            "Thumb-2 LDM PC transfer range or writeback exceeds the address space"};
+
+    std::array<std::byte, 4> loaded_bytes{};
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(process, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(pc_slot)),
+                           loaded_bytes.data(), loaded_bytes.size(), &read) || read != loaded_bytes.size())
+        return win_error("ReadProcessMemory for Thumb-2 LDMIA PC");
+    const auto loaded = std::to_integer<std::uint32_t>(loaded_bytes[0]) |
+        (std::to_integer<std::uint32_t>(loaded_bytes[1]) << 8) |
+        (std::to_integer<std::uint32_t>(loaded_bytes[2]) << 16) |
+        (std::to_integer<std::uint32_t>(loaded_bytes[3]) << 24);
+    const bool thumb = (loaded & 1u) != 0;
+    if (!thumb && (loaded & 3u) != 0)
+        return Error{ErrorCode::invalid_argument, "Thumb-2 LDMIA PC produced an unaligned ARM-state target"};
+    const auto target = loaded & (thumb ? ~std::uint32_t{1} : ~std::uint32_t{3});
+    const auto trap_end = static_cast<std::uint64_t>(target) + (thumb ? 2u : 4u);
+    if ((target < transfer_end && transfer_begin < trap_end) ||
+        (target < static_cast<std::uint64_t>(pc) + 4u && pc < trap_end))
+        return Error{ErrorCode::unsupported,
+            "Thumb-2 LDM PC successor trap overlaps its instruction or transfer range"};
+    return Arm32StepDestination{target, thumb};
+}
+
 std::int64_t arm32_sign_extend(std::uint32_t value, unsigned bits) {
     const auto sign = std::uint32_t{1} << (bits - 1);
     return (value & sign) ? static_cast<std::int64_t>(value) - (std::int64_t{1} << bits)
@@ -460,6 +716,21 @@ std::optional<Arm32StepDestination> arm32_branch_destination(
         const DWORD fallthrough = pc + 2;
         const bool in_it = it_state != 0;
         if (in_it && (it_state & 7u) != 0) return {}; // PC-changing T32 instructions belong in the final IT slot.
+        // CBZ/CBNZ T1 compares a low register without consulting flags. Its
+        // forward-only target uses Align(PC, 4) plus the encoded unsigned
+        // offset, and the instruction is forbidden in every IT block.
+        if ((half & 0xf500u) == 0xb100u) {
+            if (in_it) return {};
+            const auto reg = static_cast<unsigned>(half & 7u);
+            const bool nonzero = registers[reg] != 0;
+            const bool branch_if_nonzero = (half & 0x0800u) != 0;
+            if (nonzero != branch_if_nonzero) return Arm32StepDestination{fallthrough, true};
+            const auto offset = ((half >> 3) & 31u) * 2u + ((half >> 9) & 1u) * 64u;
+            const auto base = (static_cast<std::uint64_t>(pc) + 4u) & ~std::uint64_t{3};
+            const auto target = base + offset;
+            if (target > UINT32_MAX || (target & 1u)) return {};
+            return Arm32StepDestination{static_cast<DWORD>(target), true};
+        }
         const bool it_executes = !in_it || arm32_condition_passed(it_state >> 4, cpsr);
         const auto destination = [&](std::int64_t displacement) -> std::optional<Arm32StepDestination> {
             const auto target = static_cast<std::int64_t>(pc) + 4 + displacement;
@@ -501,6 +772,36 @@ std::optional<Arm32StepDestination> arm32_branch_destination(
                 if (target < 0 || target > UINT32_MAX || (target & 1)) return {};
                 return Arm32StepDestination{static_cast<DWORD>(target), true};
             }
+            // Thumb BL (T1) and BLX immediate (T2). These PC-relative
+            // interworking forms are only valid outside an IT block or in its
+            // final slot, checked above. The original instruction is still
+            // executed after its successor trap is installed, so architectural
+            // link-register effects remain the processor's responsibility.
+            const bool thumb_bl = (second & 0xd000u) == 0xd000u;
+            const bool thumb_blx = (second & 0xd001u) == 0xc000u;
+            if (thumb_bl || thumb_blx) {
+                if (!it_executes) return Arm32StepDestination{static_cast<DWORD>(pc + 4u), true};
+                const auto s = static_cast<std::uint32_t>((half >> 10) & 1u);
+                const auto j1 = static_cast<std::uint32_t>((second >> 13) & 1u);
+                const auto j2 = static_cast<std::uint32_t>((second >> 11) & 1u);
+                const auto i1 = (~(j1 ^ s)) & 1u;
+                const auto i2 = (~(j2 ^ s)) & 1u;
+                std::int64_t target = 0;
+                if (thumb_bl) {
+                    const auto encoded = (s << 24) | (i1 << 23) | (i2 << 22) |
+                        (static_cast<std::uint32_t>(half & 0x03ffu) << 12) |
+                        (static_cast<std::uint32_t>(second & 0x07ffu) << 1);
+                    target = static_cast<std::int64_t>(pc) + 4 + arm32_sign_extend(encoded, 25);
+                } else {
+                    const auto encoded = (s << 24) | (i1 << 23) | (i2 << 22) |
+                        (static_cast<std::uint32_t>(half & 0x03ffu) << 12) |
+                        (static_cast<std::uint32_t>((second >> 1) & 0x03ffu) << 2);
+                    const auto base = (static_cast<std::int64_t>(pc) + 4) & ~std::int64_t{3};
+                    target = base + arm32_sign_extend(encoded, 25);
+                }
+                if (target < 0 || target > UINT32_MAX || (target & (thumb_bl ? 1 : 3))) return {};
+                return Arm32StepDestination{static_cast<DWORD>(target), thumb_bl};
+            }
         }
         if ((half & 0xf000u) == 0xd000u) { // B<cond> T1.
             const auto condition = static_cast<unsigned>((half >> 8) & 0xfu);
@@ -531,6 +832,15 @@ std::optional<Arm32StepDestination> arm32_branch_destination(
         (std::to_integer<std::uint32_t>(bytes[2]) << 16) |
         (std::to_integer<std::uint32_t>(bytes[3]) << 24);
     const auto condition = static_cast<unsigned>(word >> 28);
+    // A32 BLX immediate has cond=1111, a fixed 101 opcode field, H in bit 24,
+    // and a signed 26-bit displacement from the architectural PC (address+8).
+    // H contributes bit 1 and switches execution to Thumb state.
+    if ((word & 0xfe000000u) == 0xfa000000u) {
+        const auto encoded = ((word & 0x00ffffffu) << 2) | (((word >> 24) & 1u) << 1);
+        const auto target = static_cast<std::int64_t>(pc) + 8 + arm32_sign_extend(encoded, 26);
+        if (target < 0 || target > UINT32_MAX || (target & 1)) return {};
+        return Arm32StepDestination{static_cast<DWORD>(target), true};
+    }
     if (condition == 15) return {};
     const auto fallthrough = static_cast<DWORD>(pc + 4u);
     if ((word & 0x0e000000u) == 0x0a000000u) { // B/BL immediate.
@@ -554,6 +864,7 @@ std::optional<Arm32StepDestination> arm32_branch_destination(
 class Win32Backend final : public Backend {
 public:
     ~Win32Backend() override { close_handles(); }
+    bool output_events_require_acknowledgement() const noexcept override { return true; }
 
     Result<std::vector<ProcessInfo>> processes() override {
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -582,17 +893,34 @@ public:
     }
 
     Result<ProcessInfo> launch(const Target& target) override {
+        if (!target.remote_environment.empty())
+            return Error{ErrorCode::unsupported, "remote environment changes are not supported by native launch"};
         if (process_) return Error{ErrorCode::busy, "backend already owns a debug target"};
         if (target.executable.empty()) return Error{ErrorCode::invalid_argument, "executable path is empty"};
-        std::wstring command = quote(target.executable);
-        for (const auto& argument : target.arguments) { command.push_back(L' '); command += quote(argument); }
+        auto executable = widen(target.executable);
+        if (!executable) return executable.error();
+        std::wstring command = quote(executable.value());
+        for (const auto& argument : target.arguments) {
+            auto wide_argument = widen(argument);
+            if (!wide_argument) return wide_argument.error();
+            command.push_back(L' ');
+            command += quote(wide_argument.value());
+            if (command.size() >= 32767)
+                return Error{ErrorCode::invalid_argument, "Windows process command line exceeds the 32,767-character CreateProcessW limit"};
+        }
+        if (command.size() >= 32767)
+            return Error{ErrorCode::invalid_argument, "Windows process command line exceeds the 32,767-character CreateProcessW limit"};
         std::vector<wchar_t> command_buffer(command.begin(), command.end());
         command_buffer.push_back(L'\0');
-        const auto executable = widen(target.executable);
-        const auto directory = target.working_directory.empty() ? std::wstring{} : widen(target.working_directory);
+        std::wstring directory;
+        if (!target.working_directory.empty()) {
+            auto wide_directory = widen(target.working_directory);
+            if (!wide_directory) return wide_directory.error();
+            directory = std::move(wide_directory.value());
+        }
         STARTUPINFOW startup{}; startup.cb = sizeof(startup);
         PROCESS_INFORMATION info{};
-        if (!CreateProcessW(executable.c_str(), command_buffer.data(), nullptr, nullptr, FALSE,
+        if (!CreateProcessW(executable.value().c_str(), command_buffer.data(), nullptr, nullptr, FALSE,
                             DEBUG_ONLY_THIS_PROCESS | CREATE_UNICODE_ENVIRONMENT, nullptr,
                             directory.empty() ? nullptr : directory.c_str(), &startup, &info)) return win_error("CreateProcessW");
         process_ = info.hProcess; process_id_ = info.dwProcessId; launched_ = true; exited_ = false;
@@ -622,7 +950,7 @@ public:
     Status detach() override {
         auto step_resumed = resume_step_suspensions();
         if (!step_resumed) return step_resumed;
-        if (exited_) { exited_ = false; process_id_ = 0; return std::monostate{}; }
+        if (exited_) { exited_ = false; process_id_ = 0; scheduled_x86_step_.reset(); return std::monostate{}; }
         if (!process_) return Error{ErrorCode::invalid_argument, "no debug target is attached"};
         const bool process_exit_event = pending_ && pending_->dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT;
         if (process_exit_event) {
@@ -632,12 +960,13 @@ public:
             if (process_) CloseHandle(process_);
             close_terminate_handle();
             process_ = nullptr; process_id_ = 0; launched_ = false;
+            scheduled_x86_step_.reset();
             breakpoints_.clear(); stepping_breakpoint_.clear(); hardware_breakpoints_.clear(); arm64_step_thread_.reset(); arm64_step_original_cpsr_.reset(); arm64_hardware_step_.reset(); exited_ = true;
             return std::monostate{};
         }
         if (!pending_) {
             DEBUG_EVENT queued{};
-            if (WaitForDebugEvent(&queued, 0)) pending_ = queued;
+            if (wait_for_debug_event_compatible(&queued, 0)) pending_ = queued;
             else if (GetLastError() != ERROR_SEM_TIMEOUT) return win_error("WaitForDebugEvent before detach");
         }
         if (!pending_) {
@@ -645,13 +974,15 @@ public:
             // debug-event protocol a stable stop point for state cleanup.
             if (!DebugBreakProcess(process_)) return win_error("DebugBreakProcess for detach");
             DEBUG_EVENT event{};
-            if (!WaitForDebugEvent(&event, 5000)) {
+            if (!wait_for_debug_event_compatible(&event, 5000)) {
                 if (GetLastError() == ERROR_SEM_TIMEOUT)
                     return Error{ErrorCode::busy, "timed out waiting for the target to stop for detach"};
                 return win_error("WaitForDebugEvent for detach");
             }
             pending_ = event;
         }
+        auto restored_x86_step = restore_scheduled_x86_step();
+        if (!restored_x86_step) return restored_x86_step;
         if (arm32_step_) {
             auto restored = restore_arm32_step();
             if (!restored) return restored;
@@ -738,7 +1069,7 @@ public:
                 return Error{ErrorCode::busy, "timed out waiting for the terminated process exit event"};
             DEBUG_EVENT event{};
             const auto wait_ms = static_cast<DWORD>(std::clamp<std::int64_t>(remaining.count(), 1, MAXDWORD - 1));
-            if (!WaitForDebugEvent(&event, wait_ms)) {
+            if (!wait_for_debug_event_compatible(&event, wait_ms)) {
                 if (GetLastError() == ERROR_SEM_TIMEOUT)
                     return Error{ErrorCode::busy, "timed out waiting for the terminated process exit event"};
                 return win_error("WaitForDebugEvent during terminate");
@@ -757,6 +1088,7 @@ public:
             launched_ = false;
             exited_ = true;
             pending_.reset();
+            scheduled_x86_step_.reset();
             breakpoints_.clear();
             stepping_breakpoint_.clear();
             hardware_breakpoints_.clear();
@@ -774,11 +1106,14 @@ public:
         if (pending_) return Error{ErrorCode::busy, "previous debug event has not been continued"};
         const auto bounded = std::clamp<std::int64_t>(timeout.count(), 0, MAXDWORD - 1);
         DEBUG_EVENT event{};
-        if (!WaitForDebugEvent(&event, static_cast<DWORD>(bounded))) {
+        if (!wait_for_debug_event_compatible(&event, static_cast<DWORD>(bounded))) {
             if (GetLastError() == ERROR_SEM_TIMEOUT) return Error{ErrorCode::busy, "debug event wait timed out"};
             return win_error("WaitForDebugEvent");
         }
         pending_ = event;
+        const bool interrupted_x86_step = scheduled_x86_step_ &&
+            event.dwThreadId != scheduled_x86_step_->first;
+        auto restored_x86_step = restore_scheduled_x86_step();
         const bool completed_arm32_step = arm32_step_ && event.dwThreadId == arm32_step_->thread &&
             event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
             event.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT &&
@@ -841,9 +1176,21 @@ public:
             result.address = reinterpret_cast<std::uintptr_t>(event.u.Exception.ExceptionRecord.ExceptionAddress);
             result.code = event.u.Exception.ExceptionRecord.ExceptionCode;
             result.first_chance = event.u.Exception.dwFirstChance != FALSE;
+            {
+                const auto reported = static_cast<std::size_t>(event.u.Exception.ExceptionRecord.NumberParameters);
+                const auto count = std::min(reported, max_debug_event_exception_parameters);
+                result.exception_parameters.reserve(count);
+                for (std::size_t index = 0; index < count; ++index)
+                    result.exception_parameters.push_back(static_cast<std::uint64_t>(
+                        event.u.Exception.ExceptionRecord.ExceptionInformation[index]));
+                result.exception_parameters_truncated = reported > count;
+                if (result.exception_parameters_truncated)
+                    result.message = "exception (parameter count exceeded the Windows record limit; values truncated)";
+                else result.message = "exception";
+            }
             result.kind = result.code == EXCEPTION_BREAKPOINT ? EventKind::breakpoint :
                           result.code == EXCEPTION_SINGLE_STEP ? EventKind::single_step : EventKind::exception;
-            result.message = "exception"; break;
+            break;
         case CREATE_THREAD_DEBUG_EVENT:
             result.kind = EventKind::thread_created; result.message = "thread created";
             if (!hardware_breakpoints_.empty()) {
@@ -857,7 +1204,12 @@ public:
         case LOAD_DLL_DEBUG_EVENT: result.kind = EventKind::module_loaded; result.message = "module loaded"; break;
         case UNLOAD_DLL_DEBUG_EVENT: result.kind = EventKind::module_unloaded; result.message = "module unloaded"; break;
         case EXIT_PROCESS_DEBUG_EVENT: result.kind = EventKind::process_exited; result.code = event.u.ExitProcess.dwExitCode; result.message = "process exited"; break;
-        case OUTPUT_DEBUG_STRING_EVENT: result.kind = EventKind::output; result.message = "debug output"; break;
+        case OUTPUT_DEBUG_STRING_EVENT:
+            result.kind = EventKind::output;
+            result.address = reinterpret_cast<std::uintptr_t>(event.u.DebugString.lpDebugStringData);
+            result.code = event.u.DebugString.nDebugStringLength;
+            result.message = read_debug_output(process_, event.u.DebugString);
+            break;
         default: result.kind = EventKind::unknown; result.message = "debug event"; break;
         }
         if (completed_arm32_step) {
@@ -888,11 +1240,42 @@ public:
             if (!result.breakpoint_ids.empty()) {
                 result.kind = EventKind::breakpoint;
                 result.message = "ARM64 hardware execution breakpoint hit";
-            } else if (!completed_arm64_step && std::any_of(hardware_breakpoints_.begin(), hardware_breakpoints_.end(), [](const auto& bp) {
+            } else if (std::any_of(hardware_breakpoints_.begin(), hardware_breakpoints_.end(), [](const auto& bp) {
                            return bp.enabled && bp.kind != BreakpointKind::execute;
                        })) {
-                result.kind = EventKind::breakpoint;
-                result.message = "ARM64 hardware watchpoint exception; Windows did not expose a hit-slot mask";
+                const auto& exception = event.u.Exception.ExceptionRecord;
+                bool matched_watchpoint = false;
+                // Windows ARM64 reports the access kind and data address in
+                // ExceptionInformation[0..1] for a hardware watchpoint.
+                if (exception.NumberParameters >= 2 &&
+                    exception.NumberParameters <= EXCEPTION_MAXIMUM_PARAMETERS) {
+                    const auto access_kind = exception.ExceptionInformation[0]; // 0 = read, 1 = write.
+                    const auto accessed_address = static_cast<std::uint64_t>(exception.ExceptionInformation[1]);
+                    if (access_kind <= 1) {
+                        for (const auto& breakpoint : hardware_breakpoints_) {
+                            if (!breakpoint.enabled || breakpoint.kind == BreakpointKind::execute || breakpoint.size == 0 ||
+                                breakpoint.address > UINT64_MAX - breakpoint.size)
+                                continue;
+                            const bool kind_matches = breakpoint.kind == BreakpointKind::access ||
+                                (access_kind == 0 && breakpoint.kind == BreakpointKind::read) ||
+                                (access_kind == 1 && breakpoint.kind == BreakpointKind::write);
+                            const auto end = breakpoint.address + breakpoint.size;
+                            if (kind_matches && accessed_address >= breakpoint.address && accessed_address < end) {
+                                result.breakpoint_ids.push_back(breakpoint.id);
+                                matched_watchpoint = true;
+                            }
+                        }
+                    }
+                    if (matched_watchpoint) {
+                        result.address = accessed_address;
+                        result.kind = EventKind::breakpoint;
+                        result.message = "ARM64 hardware watchpoint hit";
+                    }
+                }
+                if (!matched_watchpoint && !completed_arm64_step) {
+                    result.kind = EventKind::breakpoint;
+                    result.message = "ARM64 hardware watchpoint exception; access metadata is unavailable or unmatched";
+                }
             }
         } else if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
             event.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP &&
@@ -919,6 +1302,10 @@ public:
             result.message += "; ARM64 single-step state restoration failed: " + arm64_step_restore_diagnostic;
         if (!arm64_hw_step_restore_diagnostic.empty())
             result.message += "; ARM64 hardware breakpoint restoration failed: " + arm64_hw_step_restore_diagnostic;
+        if (!restored_x86_step)
+            result.message += "; scheduled x86 single-step flags restoration failed: " + restored_x86_step.error().message;
+        else if (interrupted_x86_step && event.dwDebugEventCode != EXIT_PROCESS_DEBUG_EVENT)
+            result.message += "; scheduled event-owner step interrupted by a peer event";
         return result;
     }
 
@@ -926,8 +1313,11 @@ public:
         return continue_event_impl(sequence, status, true);
     }
 
-    Status continue_event_impl(std::uint64_t sequence, ContinueStatus status, bool release_peers) {
+    Status continue_event_impl(std::uint64_t sequence, ContinueStatus status, bool release_peers,
+                              bool resume_event_owner = true) {
         if (!pending_ || sequence != sequence_) return Error{ErrorCode::invalid_argument, "event sequence does not match pending event"};
+        auto restored_x86_step = restore_scheduled_x86_step();
+        if (!restored_x86_step) return restored_x86_step;
         if (arm32_completed_step_pending_ && status != ContinueStatus::handled)
             return Error{ErrorCode::invalid_argument, "the debugger-owned ARM32 step trap must be handled"};
         if (arm32_step_) {
@@ -938,7 +1328,7 @@ public:
             auto restored = restore_arm64_hardware_step();
             if (!restored) return restored;
         }
-        if (status == ContinueStatus::handled && target_architecture() == Architecture::arm64 &&
+        if (resume_event_owner && status == ContinueStatus::handled && target_architecture() == Architecture::arm64 &&
             pending_->dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
             pending_->u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP) {
             const auto address = reinterpret_cast<std::uintptr_t>(pending_->u.Exception.ExceptionRecord.ExceptionAddress);
@@ -1036,13 +1426,30 @@ public:
                          "DBG_EXCEPTION_NOT_HANDLED is valid only for a pending exception event"};
         if (runnable.empty())
             return Error{ErrorCode::invalid_argument, "Windows schedule cannot resume with stop-only actions"};
-        if (steps && (steps != 1 || runnable.size() != 1 || owner_action->kind != ThreadResumeKind::single_step))
-            return Error{ErrorCode::unsupported, "Windows schedules support one event-thread step or a continue-only thread subset"};
+        const auto arm64_execute_hit = [&] {
+            if (target_architecture() != Architecture::arm64 ||
+                pending_->dwDebugEventCode != EXCEPTION_DEBUG_EVENT ||
+                pending_->u.Exception.ExceptionRecord.ExceptionCode != EXCEPTION_SINGLE_STEP ||
+                disposition != ContinueStatus::handled) return false;
+            const auto address = reinterpret_cast<std::uintptr_t>(pending_->u.Exception.ExceptionRecord.ExceptionAddress);
+            return std::any_of(hardware_breakpoints_.begin(), hardware_breakpoints_.end(), [address](const auto &bp) {
+                return bp.enabled && bp.kind == BreakpointKind::execute && bp.address == address;
+            });
+        }();
+        const bool x86_step = target_architecture() == Architecture::x86 || target_architecture() == Architecture::x86_64;
+        if (steps && (steps != 1 || owner_action->kind != ThreadResumeKind::single_step ||
+                      (runnable.size() != 1 && !arm64_execute_hit && !x86_step)))
+            return Error{ErrorCode::unsupported, "Windows schedules support one event-thread step or a continue-only thread subset; x86/x64 steps and ARM64 execute-breakpoint step-over may also continue selected peers"};
         if (steps && disposition == ContinueStatus::not_handled)
             return Error{ErrorCode::unsupported,
                          "a Windows single-step cannot both pass an exception to the debuggee and execute an instruction"};
-        if (steps)
+        if (steps) {
+            if (runnable.size() > 1 && x86_step)
+                return single_step_x86(sequence, disposition, runnable);
+            if (runnable.size() > 1)
+                return single_step_arm64(sequence, disposition, runnable);
             return single_step_event(sequence, disposition);
+        }
         // ContinueDebugEvent always releases the event-owning thread. When its
         // requested action is stop, continue_selected_threads acquires our
         // suspend count for that owner (along with every omitted peer) before
@@ -1055,7 +1462,10 @@ public:
             return Error{ErrorCode::invalid_argument, "thread-filtered continue has no matching pending event or selected threads"};
         if (stepping_breakpoint_.active())
             return Error{ErrorCode::busy, "a displaced software-breakpoint step must complete before changing its thread schedule"};
-        if (selected.size() > 1 && status == ContinueStatus::handled && target_architecture() == Architecture::arm64 &&
+        const bool event_owner_selected = std::find(selected.begin(), selected.end(),
+            static_cast<ThreadId>(pending_->dwThreadId)) != selected.end();
+        if (event_owner_selected && selected.size() > 1 && status == ContinueStatus::handled &&
+            target_architecture() == Architecture::arm64 &&
             pending_->dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
             pending_->u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP) {
             const auto address = reinterpret_cast<std::uintptr_t>(pending_->u.Exception.ExceptionRecord.ExceptionAddress);
@@ -1071,7 +1481,7 @@ public:
         if (!recovered) return recovered;
         auto suspended = suspend_unselected_threads(selected);
         if (!suspended) return suspended;
-        auto result = continue_event_impl(sequence, status, false);
+        auto result = continue_event_impl(sequence, status, false, event_owner_selected);
         if (!result) {
             const auto error = result.error();
             auto rollback = resume_step_suspensions();
@@ -1087,13 +1497,43 @@ public:
         if (target_architecture() == Architecture::arm)
             return single_step_arm32(status);
         if (target_architecture() == Architecture::arm64) return single_step_arm64(sequence, status);
+        return single_step_x86(sequence, status);
+    }
+
+    Status single_step_x86(std::uint64_t sequence, ContinueStatus status,
+                           std::span<const ThreadId> selected = {}) {
+        if (!pending_ || sequence != sequence_)
+            return Error{ErrorCode::invalid_argument, "event sequence does not match pending event"};
+        const auto thread_id = static_cast<ThreadId>(pending_->dwThreadId);
+        const std::array<ThreadId, 1> owner_only{thread_id};
+        if (selected.empty()) selected = owner_only;
+        if (std::find(selected.begin(), selected.end(), thread_id) == selected.end())
+            return Error{ErrorCode::invalid_argument, "x86 step thread must remain in the selected resume set"};
+        if (stepping_breakpoint_.active())
+            return Error{ErrorCode::busy, "a displaced software-breakpoint step must complete before another step"};
+        auto restored_x86_step = restore_scheduled_x86_step();
+        if (!restored_x86_step) return restored_x86_step;
         auto resumed = resume_step_suspensions();
         if (!resumed) return resumed;
         if (pending_->dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT)
             return Error{ErrorCode::invalid_argument, "cannot single-step a process-exit event"};
 
-        const auto thread_id = static_cast<ThreadId>(pending_->dwThreadId);
         std::optional<std::uintptr_t> displaced_breakpoint;
+        std::optional<RegisterValue> original_ip;
+        const auto restore_displaced_breakpoint = [&]() -> Status {
+            if (!displaced_breakpoint) return std::monostate{};
+            // Reinstalling INT3 alone leaves a rewound IP pointing at that
+            // trap, so the same owned stop cannot be retried correctly.
+            auto ip_restored = original_ip
+                ? write_registers(thread_id, std::span<const RegisterValue>(&*original_ip, 1))
+                : Status{std::monostate{}};
+            auto trap_restored = patch_byte(*displaced_breakpoint, std::byte{0xcc});
+            if (!ip_restored || !trap_restored)
+                return Error{ErrorCode::io, "restoring displaced x86 breakpoint state failed" +
+                    std::string(!ip_restored ? "; instruction pointer: " + ip_restored.error().message : "") +
+                    std::string(!trap_restored ? "; trap bytes/protection: " + trap_restored.error().message : "")};
+            return std::monostate{};
+        };
         if (pending_->dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
             pending_->u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT) {
             const auto address = reinterpret_cast<std::uintptr_t>(pending_->u.Exception.ExceptionRecord.ExceptionAddress);
@@ -1107,26 +1547,27 @@ public:
                 std::uint64_t current_ip = 0;
                 std::memcpy(&current_ip, ip->bytes.data(), ip->bytes.size());
                 if (current_ip == address + 1) {
+                    original_ip = *ip;
                     auto removed = patch_bytes(address, found->second.original);
                     if (!removed) return removed;
+                    displaced_breakpoint = address;
                     const auto rewind_ip = static_cast<std::uint64_t>(address);
                     std::memcpy(ip->bytes.data(), &rewind_ip, ip->bytes.size());
                     auto rewind = write_registers(thread_id, std::span<const RegisterValue>(&*ip, 1));
                     if (!rewind) {
-                        auto trap_restored = patch_byte(address, std::byte{0xcc});
-                        if (!trap_restored)
-                            return Error{ErrorCode::io, rewind.error().message + "; restoring breakpoint trap also failed: " + trap_restored.error().message};
+                        auto restored = restore_displaced_breakpoint();
+                        if (!restored)
+                            return Error{ErrorCode::io, rewind.error().message + "; " + restored.error().message};
                         return rewind;
                     }
-                    displaced_breakpoint = address;
                 }
             }
         }
         auto flags = read_eflags(thread_id);
         if (!flags) {
             if (displaced_breakpoint) {
-                auto trap_restored = patch_byte(*displaced_breakpoint, std::byte{0xcc});
-                if (!trap_restored) return Error{ErrorCode::io, flags.error().message + "; restoring breakpoint trap also failed: " + trap_restored.error().message};
+                auto restored = restore_displaced_breakpoint();
+                if (!restored) return Error{ErrorCode::io, flags.error().message + "; " + restored.error().message};
             }
             return flags.error();
         }
@@ -1135,8 +1576,8 @@ public:
         auto set = write_eflags(thread_id, original_flags | trap_flag);
         if (!set) {
             if (displaced_breakpoint) {
-                auto trap_restored = patch_byte(*displaced_breakpoint, std::byte{0xcc});
-                if (!trap_restored) return Error{ErrorCode::io, set.error().message + "; restoring breakpoint trap also failed: " + trap_restored.error().message};
+                auto restored = restore_displaced_breakpoint();
+                if (!restored) return Error{ErrorCode::io, set.error().message + "; " + restored.error().message};
             }
             return set;
         }
@@ -1144,7 +1585,7 @@ public:
         if (displaced_breakpoint && !stepping_breakpoint_.begin(
                 *displaced_breakpoint, *displaced_breakpoint + 1, thread_id)) {
             auto flags_restored = write_eflags(thread_id, original_flags);
-            auto trap_restored = patch_byte(*displaced_breakpoint, std::byte{0xcc});
+            auto trap_restored = restore_displaced_breakpoint();
             if (!flags_restored || !trap_restored)
                 return Error{ErrorCode::io, "restoring state after a concurrent breakpoint step failed" +
                     std::string(!flags_restored ? "; thread flags: " + flags_restored.error().message : "") +
@@ -1152,12 +1593,20 @@ public:
             return Error{ErrorCode::busy, "another software breakpoint step is already pending"};
         }
 
-        auto suspended = suspend_peer_threads(thread_id);
+        // A process-wide software breakpoint is absent while its original
+        // instruction executes. Keep every peer suspended for that one
+        // instruction even if the schedule selected them to continue; the
+        // next debug event releases our extra suspend counts while Windows
+        // still holds the new event, so the caller can then choose a schedule.
+        const std::array<ThreadId, 1> breakpoint_step_owner{thread_id};
+        const auto suspension_selection = displaced_breakpoint
+            ? std::span<const ThreadId>(breakpoint_step_owner)
+            : selected;
+        auto suspended = suspend_unselected_threads(suspension_selection);
         if (!suspended) {
             if (displaced_breakpoint) stepping_breakpoint_.clear();
             auto restored = write_eflags(thread_id, original_flags);
-            Status trap_restored = std::monostate{};
-            if (displaced_breakpoint) trap_restored = patch_byte(*displaced_breakpoint, std::byte{0xcc});
+            auto trap_restored = restore_displaced_breakpoint();
             if (!restored || !trap_restored)
                 return Error{ErrorCode::io, suspended.error().message +
                     std::string(!restored ? "; restoring the thread flags also failed: " + restored.error().message : "") +
@@ -1170,19 +1619,18 @@ public:
             const auto continue_error = win_error("ContinueDebugEvent for single-step");
             if (displaced_breakpoint) stepping_breakpoint_.clear();
             auto restored = write_eflags(thread_id, original_flags);
-            Status trap_restored = std::monostate{};
-            if (displaced_breakpoint) trap_restored = patch_byte(*displaced_breakpoint, std::byte{0xcc});
+            auto trap_restored = restore_displaced_breakpoint();
             auto released = resume_step_suspensions();
-            if (!restored || !trap_restored)
+            if (!restored || !trap_restored || !released)
                 return Error{ErrorCode::io, continue_error.message +
                     std::string(!restored ? "; restoring the thread flags also failed: " + restored.error().message : "") +
-                    std::string(!trap_restored ? "; restoring breakpoint bytes/protection also failed: " + trap_restored.error().message : "")};
-            if (!released)
-                return Error{ErrorCode::io, continue_error.message + "; releasing peer-thread suspensions also failed: " + released.error().message};
+                    std::string(!trap_restored ? "; restoring breakpoint state also failed: " + trap_restored.error().message : "") +
+                    std::string(!released ? "; releasing peer-thread suspensions also failed: " + released.error().message : "")};
             return continue_error;
         }
         close_event_handles(*pending_);
         pending_.reset();
+        if (selected.size() > 1) scheduled_x86_step_ = std::pair{thread_id, original_flags};
         return std::monostate{};
     }
 
@@ -1361,6 +1809,8 @@ public:
         return result;
     }
     Result<std::vector<RegisterValue>> read_registers(ThreadId id) override {
+        if (!id || id > MAXDWORD)
+            return Error{ErrorCode::invalid_argument, "invalid Windows thread ID"};
         if (target_architecture() == Architecture::arm) {
 #if !defined(_M_ARM)
             return Error{ErrorCode::unsupported, "Windows ARM32 context access requires an ARM32 debugger build"};
@@ -1416,6 +1866,10 @@ public:
             if (!pending_) return Error{ErrorCode::busy, "Windows ARM64 contexts are readable only while a debug event has stopped the target"};
             HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, static_cast<DWORD>(id));
             if (!thread) return win_error("OpenThread for ARM64 context");
+            if (GetProcessIdOfThread(thread) != process_id_) {
+                CloseHandle(thread);
+                return Error{ErrorCode::invalid_argument, "ARM64 thread does not belong to the debug target"};
+            }
             CONTEXT c{};
             c.ContextFlags = CONTEXT_ARM64_FULL | CONTEXT_ARM64_X18;
             const bool ok = GetThreadContext(thread, &c) != FALSE;
@@ -1488,6 +1942,10 @@ public:
         }
         HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, static_cast<DWORD>(id));
         if (!thread) return win_error("OpenThread");
+        if (GetProcessIdOfThread(thread) != process_id_) {
+            CloseHandle(thread);
+            return Error{ErrorCode::invalid_argument, "thread does not belong to the debug target"};
+        }
         std::vector<RegisterValue> out;
 #if defined(_WIN64)
         if (target_architecture() == Architecture::x86) {
@@ -1508,13 +1966,22 @@ public:
             CONTEXT legacy{};
 #if defined(_M_X64)
             std::optional<X64AvxContext> avx;
+            bool avx512 = false;
             if (target_architecture() == Architecture::x86_64 && pending_) {
-                auto captured = read_x64_avx_context(thread);
-                if (captured) avx.emplace(std::move(captured.value()));
-                else if (captured.error().code != ErrorCode::unsupported) {
-                    const auto error = captured.error();
+                auto extended = read_x64_avx_context(thread, true);
+                if (extended) { avx.emplace(std::move(extended.value())); avx512 = true; }
+                else if (extended.error().code != ErrorCode::unsupported) {
+                    const auto error = extended.error();
                     CloseHandle(thread);
                     return error;
+                } else {
+                    auto captured = read_x64_avx_context(thread);
+                    if (captured) avx.emplace(std::move(captured.value()));
+                    else if (captured.error().code != ErrorCode::unsupported) {
+                        const auto error = captured.error();
+                        CloseHandle(thread);
+                        return error;
+                    }
                 }
             }
             CONTEXT& c = avx ? *avx->context : legacy;
@@ -1545,6 +2012,7 @@ public:
             if (!fp) return fp.error();
             if (avx)
                 for (std::uint32_t i = 0; i < 16; ++i) append_ymm_register(out, i, *avx);
+            if (avx512) append_avx512_registers(out, *avx);
 #elif defined(_M_IX86)
             append_register(out,"eax",c.Eax); append_register(out,"ebx",c.Ebx); append_register(out,"ecx",c.Ecx); append_register(out,"edx",c.Edx);
             append_register(out,"esi",c.Esi); append_register(out,"edi",c.Edi); append_register(out,"ebp",c.Ebp); append_register(out,"esp",c.Esp);
@@ -1562,6 +2030,8 @@ public:
     }
     Status write_registers(ThreadId id, std::span<const RegisterValue> registers) override {
         if (registers.empty()) return std::monostate{};
+        if (!id || id > MAXDWORD)
+            return Error{ErrorCode::invalid_argument, "invalid Windows thread ID"};
         const bool wants_ymm = std::any_of(registers.begin(), registers.end(),
             [](const RegisterValue& reg) { return reg.name.starts_with("ymm"); });
         const bool wants_native_x64_vector = target_architecture() == Architecture::x86_64 &&
@@ -1679,6 +2149,10 @@ public:
             HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
                                        FALSE, static_cast<DWORD>(id));
             if (!thread) return win_error("OpenThread for ARM64 context edit");
+            if (GetProcessIdOfThread(thread) != process_id_) {
+                CloseHandle(thread);
+                return Error{ErrorCode::invalid_argument, "ARM64 thread does not belong to the debug target"};
+            }
             CONTEXT c{};
             c.ContextFlags = CONTEXT_ARM64_FULL | CONTEXT_ARM64_X18;
             if (!GetThreadContext(thread, &c)) {
@@ -1799,6 +2273,10 @@ public:
         }
         HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, static_cast<DWORD>(id));
         if (!thread) return win_error("OpenThread");
+        if (GetProcessIdOfThread(thread) != process_id_) {
+            CloseHandle(thread);
+            return Error{ErrorCode::invalid_argument, "thread does not belong to the debug target"};
+        }
 #if defined(_WIN64)
         if (target_architecture() == Architecture::x86) {
             WOW64_CONTEXT c{};
@@ -2080,7 +2558,8 @@ public:
         if (found == breakpoints_.end()) return Error{ErrorCode::invalid_argument, "unknown breakpoint id"};
         if ((target_architecture() == Architecture::arm64 || target_architecture() == Architecture::arm) && !pending_)
             return Error{ErrorCode::busy, "ARM software breakpoints can only be changed while a debug event has stopped the target"};
-        auto restored = patch_bytes(found->first, found->second.original);
+        const auto& expected = found->second.enabled ? found->second.trap : found->second.original;
+        auto restored = replace_breakpoint_bytes(found->first, expected, found->second.original);
         if (!restored) return restored;
         breakpoints_.erase(found); return std::monostate{};
     }
@@ -2105,8 +2584,9 @@ public:
         if (found->second.enabled == enabled) return std::monostate{};
         if ((target_architecture() == Architecture::arm64 || target_architecture() == Architecture::arm) && !pending_)
             return Error{ErrorCode::busy, "ARM software breakpoints can only be changed while a debug event has stopped the target"};
-        const auto bytes = enabled ? found->second.trap : found->second.original;
-        auto patched = patch_bytes(found->first, bytes);
+        const auto& expected = enabled ? found->second.original : found->second.trap;
+        const auto& replacement = enabled ? found->second.trap : found->second.original;
+        auto patched = replace_breakpoint_bytes(found->first, expected, replacement);
         if (!patched) return patched;
         found->second.enabled = enabled;
         return std::monostate{};
@@ -2215,7 +2695,7 @@ private:
             return Error{ErrorCode::invalid_argument, "ARM32 step thread does not belong to the target"};
         }
         CONTEXT context{};
-        context.ContextFlags = CONTEXT_CONTROL;
+        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
         if (!GetThreadContext(thread, &context)) {
             const auto error = win_error("GetThreadContext for ARM32 step");
             CloseHandle(thread);
@@ -2280,8 +2760,156 @@ private:
         registers[10] = context.R10; registers[11] = context.R11;
         registers[12] = context.R12; registers[13] = context.Sp;
         registers[14] = context.Lr; registers[15] = context.Pc;
-        const auto branch = arm32_branch_destination(instruction, static_cast<DWORD>(pc), thumb,
-            context.Cpsr, registers, it_state);
+        std::optional<Arm32StepDestination> branch;
+        bool table_branch = false;
+        bool pc_relative_load = false;
+        if (thumb) {
+            const auto first = static_cast<std::uint16_t>(std::to_integer<unsigned>(instruction[0]) |
+                (std::to_integer<unsigned>(instruction[1]) << 8));
+            const auto second = static_cast<std::uint16_t>(std::to_integer<unsigned>(instruction[2]) |
+                (std::to_integer<unsigned>(instruction[3]) << 8));
+            if (((first & 0xffd0u) == 0xe890u || (first & 0xffd0u) == 0xe910u) &&
+                (second & 0x8000u)) { // LDMIA/LDMDB T2 including PC.
+                pc_relative_load = true;
+                auto destination = arm32_thumb2_ldm_pc_destination(process_, first, second,
+                    static_cast<DWORD>(pc), context.Cpsr, registers, it_state);
+                if (!destination) { CloseHandle(thread); return destination.error(); }
+                branch = destination.value();
+            } else if ((first & 0xfe00u) == 0xbc00u && (first & 0x0100u)) { // POP T1 including PC.
+                pc_relative_load = true;
+                const auto register_list = static_cast<unsigned>(first & 0x00ffu);
+                unsigned register_count = 0;
+                for (unsigned bits = register_list; bits; bits &= bits - 1) ++register_count;
+                const bool in_it = it_state != 0;
+                if (in_it && (it_state & 7u) != 0) {
+                    CloseHandle(thread);
+                    return Error{ErrorCode::unsupported, "Thumb POP to PC is only stepped in the final IT slot"};
+                }
+                if (in_it && !arm32_condition_passed(it_state >> 4, context.Cpsr)) {
+                    branch = Arm32StepDestination{static_cast<DWORD>(pc + 2u), true};
+                } else {
+                    const auto stack = static_cast<std::uint64_t>(context.Sp);
+                    const auto total_size = (register_count + 1u) * 4u;
+                    const auto target_slot = stack + register_count * 4u;
+                    if ((stack & 3u) || stack + total_size > (std::uint64_t{1} << 32) ||
+                        target_slot > UINT32_MAX - 3u) {
+                        CloseHandle(thread);
+                        return Error{ErrorCode::invalid_argument, "Thumb POP PC stack range is unaligned or exceeds the ARM32 address space"};
+                    }
+                    std::array<std::byte, 4> loaded_bytes{};
+                    if (!ReadProcessMemory(process_, reinterpret_cast<const void*>(target_slot), loaded_bytes.data(),
+                                           loaded_bytes.size(), &read) || read != loaded_bytes.size()) {
+                        const auto error = win_error("ReadProcessMemory for Thumb POP PC");
+                        CloseHandle(thread);
+                        return error;
+                    }
+                    const auto loaded = std::to_integer<std::uint32_t>(loaded_bytes[0]) |
+                        (std::to_integer<std::uint32_t>(loaded_bytes[1]) << 8) |
+                        (std::to_integer<std::uint32_t>(loaded_bytes[2]) << 16) |
+                        (std::to_integer<std::uint32_t>(loaded_bytes[3]) << 24);
+                    const bool target_thumb = (loaded & 1u) != 0;
+                    const auto target = loaded & (target_thumb ? ~std::uint32_t{1} : ~std::uint32_t{3});
+                    if (!target_thumb && (loaded & 3u) != 0) {
+                        CloseHandle(thread);
+                        return Error{ErrorCode::invalid_argument, "Thumb POP PC produced an unaligned ARM-state target"};
+                    }
+                    branch = Arm32StepDestination{target, target_thumb};
+                }
+            } else if ((first & 0xfff0u) == 0xe8d0u && (second & 0xffe0u) == 0xf000u) {
+                table_branch = true;
+                const auto base_register = static_cast<unsigned>(first & 0xfu);
+                const auto index_register = static_cast<unsigned>(second & 0xfu);
+                const bool halfword = (second & 0x10u) != 0;
+                if (base_register == 13 || index_register == 13 || index_register == 15 ||
+                    (it_state != 0 && (it_state & 7u) != 0)) {
+                    CloseHandle(thread);
+                    return Error{ErrorCode::unsupported, "ARM32 TBB/TBH uses a prohibited register or non-final IT slot"};
+                }
+                if (it_state != 0 && !arm32_condition_passed(it_state >> 4, context.Cpsr)) {
+                    branch = Arm32StepDestination{static_cast<DWORD>(pc + 4u), true};
+                } else {
+                    const auto table_base = base_register == 15 ? static_cast<std::uint64_t>(pc) + 4u
+                                                                 : registers[base_register];
+                    const auto table_offset = static_cast<std::uint64_t>(registers[index_register]) *
+                        (halfword ? 2u : 1u);
+                    const auto entry_address = table_base + table_offset;
+                    if (entry_address > UINT32_MAX) {
+                        CloseHandle(thread);
+                        return Error{ErrorCode::invalid_argument, "ARM32 TBB/TBH table entry exceeds the address space"};
+                    }
+                    std::array<std::byte, 2> entry{};
+                    const auto entry_size = halfword ? 2u : 1u;
+                    if (!ReadProcessMemory(process_, reinterpret_cast<const void*>(entry_address), entry.data(),
+                                           entry_size, &read) || read != entry_size) {
+                        const auto error = win_error("ReadProcessMemory for ARM32 TBB/TBH table entry");
+                        CloseHandle(thread);
+                        return error;
+                    }
+                    const auto displacement = std::to_integer<std::uint64_t>(entry[0]) |
+                        (halfword ? (std::to_integer<std::uint64_t>(entry[1]) << 8) : 0u);
+                    const auto target = static_cast<std::uint64_t>(pc) + 4u + displacement * 2u;
+                    if (target > UINT32_MAX || (target & 1u)) {
+                        CloseHandle(thread);
+                        return Error{ErrorCode::invalid_argument, "ARM32 TBB/TBH branch target exceeds the aligned address space"};
+                    }
+                    branch = Arm32StepDestination{static_cast<DWORD>(target), true};
+                }
+            }
+        } else {
+            const auto word = std::to_integer<std::uint32_t>(instruction[0]) |
+                (std::to_integer<std::uint32_t>(instruction[1]) << 8) |
+                (std::to_integer<std::uint32_t>(instruction[2]) << 16) |
+                (std::to_integer<std::uint32_t>(instruction[3]) << 24);
+            // A32 LDR (literal) with PC as both base and destination. U selects
+            // the signed literal displacement; the loaded bit zero selects
+            // ARM/Thumb state on the architectural PC write.
+            if ((word & 0x0e108000u) == 0x08108000u) {
+                pc_relative_load = true;
+                auto destination = arm32_a32_ldm_pc_destination(process_, word, static_cast<DWORD>(pc), context.Cpsr, registers);
+                if (!destination) { CloseHandle(thread); return destination.error(); }
+                branch = destination.value();
+            } else if ((word & 0x0f7ff000u) == 0x051ff000u) {
+                pc_relative_load = true;
+                const auto condition = static_cast<unsigned>(word >> 28);
+                if (condition == 15) {
+                    CloseHandle(thread);
+                    return Error{ErrorCode::unsupported, "unconditional A32 literal PC load is unsupported"};
+                }
+                if (!arm32_condition_passed(condition, context.Cpsr)) {
+                    branch = Arm32StepDestination{static_cast<DWORD>(pc + 4u), false};
+                } else {
+                    const auto base = static_cast<std::uint64_t>(pc) + 8u;
+                    const auto offset = static_cast<std::uint64_t>(word & 0xfffu);
+                    const auto literal = (word & (1u << 23)) ? base + offset
+                        : (offset <= base ? base - offset : UINT64_MAX);
+                    if (literal > UINT32_MAX - 3u) {
+                        CloseHandle(thread);
+                        return Error{ErrorCode::invalid_argument, "A32 literal PC-load address exceeds the address space"};
+                    }
+                    std::array<std::byte, 4> loaded_bytes{};
+                    if (!ReadProcessMemory(process_, reinterpret_cast<const void*>(literal), loaded_bytes.data(),
+                                           loaded_bytes.size(), &read) || read != loaded_bytes.size()) {
+                        const auto error = win_error("ReadProcessMemory for A32 literal PC load");
+                        CloseHandle(thread);
+                        return error;
+                    }
+                    const auto loaded = std::to_integer<std::uint32_t>(loaded_bytes[0]) |
+                        (std::to_integer<std::uint32_t>(loaded_bytes[1]) << 8) |
+                        (std::to_integer<std::uint32_t>(loaded_bytes[2]) << 16) |
+                        (std::to_integer<std::uint32_t>(loaded_bytes[3]) << 24);
+                    const bool target_thumb = (loaded & 1u) != 0;
+                    const auto target = loaded & (target_thumb ? ~std::uint32_t{1} : ~std::uint32_t{3});
+                    if (!target_thumb && (loaded & 3u) != 0) {
+                        CloseHandle(thread);
+                        return Error{ErrorCode::invalid_argument, "A32 literal PC load produced an unaligned ARM target"};
+                    }
+                    branch = Arm32StepDestination{target, target_thumb};
+                }
+            }
+        }
+        if (!table_branch && !pc_relative_load)
+            branch = arm32_branch_destination(instruction, static_cast<DWORD>(pc), thumb,
+                context.Cpsr, registers, it_state);
         std::optional<std::size_t> width;
         Arm32StepDestination next{};
         if (branch) {
@@ -2375,8 +3003,10 @@ private:
 #endif
     }
 
-    Status single_step_arm64(std::uint64_t sequence, ContinueStatus status) {
+    Status single_step_arm64(std::uint64_t sequence, ContinueStatus status,
+                             std::span<const ThreadId> selected = {}) {
         (void)sequence;
+        (void)selected;
 #if !defined(_M_ARM64)
         (void)status;
         return Error{ErrorCode::unsupported, "this debugger build cannot step Windows ARM64 contexts; rebuild for ARM64"};
@@ -2495,7 +3125,20 @@ private:
             return Error{ErrorCode::busy, "another software breakpoint step is already pending"};
         }
         if (hardware_step_state) arm64_hardware_step_ = *hardware_step_state;
-        auto suspended = suspend_peer_threads(thread_id);
+        const std::array<ThreadId, 1> owner_only{thread_id};
+        if (selected.empty()) selected = owner_only;
+        if (std::find(selected.begin(), selected.end(), thread_id) == selected.end()) {
+            if (displaced_breakpoint) stepping_breakpoint_.clear();
+            auto restored = restore_arm64_step_context(thread_id, original_pc, original_cpsr);
+            Status trap_restored = std::monostate{};
+            if (displaced_breakpoint) trap_restored = patch_bytes(*displaced_breakpoint, software_breakpoint_instruction());
+            Status hw_restored = std::monostate{};
+            if (hardware_step_state) hw_restored = restore_arm64_hardware_step_state(*hardware_step_state);
+            if (!restored || !trap_restored || !hw_restored)
+                return Error{ErrorCode::io, "ARM64 step thread is absent from its resume set and rollback failed"};
+            return Error{ErrorCode::invalid_argument, "ARM64 step thread must remain in the selected resume set"};
+        }
+        auto suspended = suspend_unselected_threads(selected);
         if (!suspended) {
             if (displaced_breakpoint) stepping_breakpoint_.clear();
             auto restored = restore_arm64_step_context(thread_id, original_pc, original_cpsr);
@@ -2618,6 +3261,25 @@ private:
         if (!arm64_hardware_step_) return std::monostate{};
         auto restored = restore_arm64_hardware_step_state(*arm64_hardware_step_);
         if (restored) arm64_hardware_step_.reset();
+        return restored;
+    }
+
+    Status restore_scheduled_x86_step() {
+        if (!scheduled_x86_step_) return std::monostate{};
+        if (!pending_) return Error{ErrorCode::busy, "scheduled x86 step needs a stopped debug event for flag restoration"};
+        const auto [thread, original_flags] = *scheduled_x86_step_;
+        if (pending_->dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT ||
+            (pending_->dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT && pending_->dwThreadId == thread)) {
+            scheduled_x86_step_.reset();
+            return std::monostate{};
+        }
+        auto flags = read_eflags(thread);
+        if (!flags) return flags.error();
+        constexpr DWORD trap_flag = 0x100;
+        // The stepped instruction may change flags. Restore only our TF bit,
+        // even when a peer stops first, so a later run cannot inherit the step.
+        auto restored = write_eflags(thread, (flags.value() & ~trap_flag) | (original_flags & trap_flag));
+        if (restored) scheduled_x86_step_.reset();
         return restored;
     }
 
@@ -3083,6 +3745,21 @@ private:
             message += "; restoring original page protection after rollback failed (Win32 error " + std::to_string(final_protection_error) + ")";
         return Error{ErrorCode::io, std::move(message)};
     }
+    Status replace_breakpoint_bytes(std::uintptr_t address,
+                                    std::span<const std::byte> expected,
+                                    std::span<const std::byte> replacement) {
+        if (expected.size() != replacement.size() || expected.empty())
+            return Error{ErrorCode::invalid_argument, "invalid software breakpoint patch extent"};
+        std::vector<std::byte> current(expected.size());
+        SIZE_T read = 0;
+        if (!ReadProcessMemory(process_, reinterpret_cast<const void*>(address), current.data(),
+                               current.size(), &read) || read != current.size())
+            return win_error("ReadProcessMemory verifying software breakpoint bytes");
+        if (!std::equal(current.begin(), current.end(), expected.begin()))
+            return Error{ErrorCode::conflict,
+                         "software breakpoint bytes changed outside this debugger; refusing to overwrite them"};
+        return patch_bytes(address, replacement);
+    }
     Status patch_byte(std::uintptr_t address, std::byte value) {
         return patch_bytes(address, std::span<const std::byte>(&value, 1));
     }
@@ -3098,6 +3775,7 @@ private:
         close_terminate_handle();
         process_ = nullptr; process_id_ = 0; launched_ = false; exited_ = false; pending_.reset(); breakpoints_.clear();
         architecture_ = Architecture::unknown;
+        scheduled_x86_step_.reset();
         stepping_breakpoint_.clear(); hardware_breakpoints_.clear(); arm32_step_.reset(); arm32_completed_step_pending_ = false; arm64_step_thread_.reset(); arm64_step_original_cpsr_.reset(); arm64_hardware_step_.reset();
     }
     void close_terminate_handle() {
@@ -3113,6 +3791,7 @@ private:
     std::uint64_t sequence_ = 0;
     BreakpointId breakpoint_id_ = 0;
     std::optional<DEBUG_EVENT> pending_;
+    std::optional<std::pair<ThreadId, DWORD>> scheduled_x86_step_;
     std::optional<DWORD> arm64_step_thread_;
     std::optional<Arm32StepState> arm32_step_;
     bool arm32_completed_step_pending_ = false;

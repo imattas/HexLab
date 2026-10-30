@@ -25,6 +25,11 @@ applies the result, and preserves undefined flags. This helper is not an
 instruction executor and does not model faults, locking, or concurrent atomic
 updates.
 
+`evaluate_x86_bswap_instruction` evaluates the register result of a decoded
+`BSWAP`. It accepts only the decoder's 32-bit or 64-bit GPR form; the 32-bit
+result is returned zero-extended, matching x86-64 register-write behavior.
+The helper does not modify flags.
+
 The decompiler currently preserves these decoded operations as named x86
 intrinsics with their architectural register outputs and memory read or
 read-modify-write effects. It does not yet lower the bit selection/update or

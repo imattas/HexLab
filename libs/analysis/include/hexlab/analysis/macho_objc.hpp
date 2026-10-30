@@ -38,6 +38,8 @@ struct MachOObjCIvar {
 
 struct MachOObjCProperty {
     Address entry{};
+    std::optional<Address> list_address;
+    std::uint32_t list_index = 0;
     std::optional<std::string> name, attributes;
     std::string name_status = "not-read", attributes_status = "not-read";
     std::optional<std::string> type_encoding;
@@ -48,8 +50,20 @@ struct MachOObjCProperty {
     // through attributes and reported by attribute_semantics_status.
     std::optional<std::string> custom_getter, custom_setter, backing_ivar;
     std::string attribute_semantics_status = "not-read";
+    std::optional<std::size_t> backing_ivar_index;
+    std::string backing_ivar_link_status = "not-declared";
+    std::optional<Address> getter_method, setter_method;
+    std::string getter_link_status = "not-resolved", setter_link_status = "not-resolved";
     bool readonly = false, copy = false, strong = false, weak = false;
     bool nonatomic = false, dynamic = false;
+};
+
+struct MachOObjCProtocolRequirementResult {
+    std::string selector;
+    bool class_method = false;
+    std::optional<std::size_t> declaring_protocol_index;
+    std::optional<Address> implementation;
+    std::string status = "unverified";
 };
 
 struct MachOObjCProtocolReference {
@@ -59,6 +73,10 @@ struct MachOObjCProtocolReference {
     std::optional<std::string> name;
     std::string name_status = "not-read";
     std::optional<std::size_t> definition_index;
+    // Direct class-adoption requirement checks. Results are populated only for
+    // class protocol lists; category and protocol adoption remain references.
+    std::vector<MachOObjCProtocolRequirementResult> requirements;
+    std::string conformance_status = "not-checked";
 };
 
 struct MachOObjCListOrigin {
@@ -70,6 +88,8 @@ struct MachOObjCListOrigin {
 
 struct MachOObjCList {
     std::optional<Address> address;
+    std::optional<Address> pointer_slot;
+    std::string pointer_status = "not-read";
     std::optional<std::uint32_t> count;
     std::optional<std::uint32_t> stride;
     std::uint32_t encoded_flags = 0;
@@ -91,6 +111,7 @@ struct MachOObjCClass {
     std::string metaclass_pointer_status = "not-read";
     std::optional<Address> metaclass_ro_address;
     std::string metaclass_ro_pointer_status = "not-read";
+    std::optional<std::uint32_t> metaclass_flags;
     std::optional<std::string> metaclass_name;
     std::string metaclass_name_status = "not-read";
     MachOObjCList class_methods;
@@ -102,6 +123,9 @@ struct MachOObjCClass {
     std::string name_status = "not-read";
     std::optional<std::string> superclass_name;
     std::optional<std::size_t> superclass_index;
+    // Graph link status is separate from pointer/fixup status. A cycle means
+    // the on-disk hierarchy is contradictory even if all pointers resolved.
+    std::string superclass_link_status = "unlinked";
     std::optional<std::uint32_t> flags;
     std::optional<std::uint32_t> instance_start;
     std::optional<std::uint32_t> instance_size;
@@ -121,7 +145,8 @@ struct MachOObjCCategory {
     std::optional<std::string> name, target_class_name;
     std::string name_status = "not-read";
     std::string target_class_link_status = "unlinked";
-    MachOObjCList instance_methods, class_methods, protocols, instance_properties;
+    MachOObjCList instance_methods, class_methods, protocols, instance_properties, class_properties;
+    std::string class_properties_status = "not-present-or-unrecognized-tail";
     bool complete = true;
 };
 
@@ -137,7 +162,9 @@ struct MachOObjCProtocol {
     MachOObjCList adopted_protocols;
     MachOObjCList required_instance_methods, required_class_methods;
     MachOObjCList optional_instance_methods, optional_class_methods;
-    MachOObjCList instance_properties;
+    MachOObjCList instance_properties, class_properties;
+    std::optional<std::uint32_t> runtime_size;
+    std::string class_properties_status = "not-present-or-invalid-size";
     bool complete = true;
 };
 
@@ -148,6 +175,8 @@ struct MachOObjCLimits {
     std::uint64_t max_metadata_bytes = 64ull * 1024 * 1024;
     std::size_t max_name_bytes = 4096;
     std::uint32_t max_list_entries = 1000000;
+    std::size_t max_protocol_inheritance_depth = 32;
+    std::size_t max_protocol_requirement_work = 200000;
 };
 
 struct MachOObjCScan {
@@ -166,11 +195,12 @@ struct MachOObjCScan {
 HEXLAB_ANALYSIS_EXPORT std::vector<std::string>
 macho_objc_class_ro_flag_names(std::uint32_t flags);
 
-// Parses 32-bit and 64-bit little-endian Objective-C class-list, class_ro_t,
-// protocol, and category ObjC2 metadata from mapped Mach-O images. Both widths
-// accept validated absolute and 32-bit field-relative method entries; ObjC1
-// __OBJC records remain unsupported. Pointer slots use
-// exact relocation/dyld resolution where available; only unassociated
+// Parses little-endian Objective-C class-list, class_ro_t, protocol, and
+// category ObjC2 metadata from mapped Mach-O images, including the arm64_32
+// ABI's four-byte metadata pointers in a validated 64-bit address space. The
+// 32-bit and 64-bit layouts accept validated absolute and 32-bit
+// field-relative method entries; ObjC1 __OBJC records remain unsupported.
+// Pointer slots use exact relocation/dyld resolution where available; only unassociated
 // initialized bytes are treated as raw pointers.
 HEXLAB_ANALYSIS_EXPORT Result<MachOObjCScan>
 scan_macho_objc_classes(const Image &, const ImageMetadata &, const MachOObjCLimits & = {}, std::stop_token = {});

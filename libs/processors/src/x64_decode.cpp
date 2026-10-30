@@ -4,6 +4,44 @@
 namespace hexlab::x64_detail {
 namespace {
 bool string_operation(State &s, std::uint8_t opcode) {
+    if (opcode >= 0x6c && opcode <= 0x6f) {
+        const bool input = opcode == 0x6c || opcode == 0x6d;
+        const bool byte = opcode == 0x6c || opcode == 0x6e;
+        const auto scalar_width = static_cast<std::uint16_t>(s.rules.long_mode()
+            ? (s.operand_override ? 16 : 32) : s.width());
+        const auto data_width = static_cast<std::uint16_t>(byte ? 8 : scalar_width);
+        const auto address_width = s.rules.address_width(s.address_override);
+        const RegisterOperand index{RegisterBank::gpr, static_cast<std::uint8_t>(input ? 7 : 6), address_width, false};
+        const RegisterOperand port{RegisterBank::gpr, 2, 16, false};
+        MemoryOperand memory;
+        memory.data_width = data_width;
+        memory.address_width = address_width;
+        memory.base = index;
+        memory.segment = input ? std::optional<RegisterOperand>{{RegisterBank::segment, 0, 16, false}} : s.segment;
+        if (!input && !memory.segment && s.rules.segmented_memory())
+            memory.segment = RegisterOperand{RegisterBank::segment, 3, 16, false};
+        s.i.opcode = input ? Opcode::x86_ins : Opcode::x86_outs;
+        s.i.x86_repeat = s.group1 == 0xf3 ? X86RepeatPrefix::rep
+                         : s.group1 == 0xf2 ? X86RepeatPrefix::repne : X86RepeatPrefix::none;
+        if (input) s.i.register_reads.push_back(port);
+        s.flags_read = true; // DF selects forward or backward index movement.
+        s.i.register_reads.push_back(index);
+        s.i.register_writes.push_back(index);
+        if (s.i.x86_repeat != X86RepeatPrefix::none) {
+            const RegisterOperand count{RegisterBank::gpr, 1, address_width, false};
+            s.i.register_reads.push_back(count);
+            s.i.register_writes.push_back(count);
+        }
+        if (input) {
+            s.operand(memory, OperandAccess::write);
+            s.i.memory_write = true;
+        } else {
+            s.operand(port, OperandAccess::read);
+            s.operand(memory, OperandAccess::read);
+            s.i.memory_read = true;
+        }
+        return true;
+    }
     if (opcode < 0xa4 || opcode > 0xaf || (opcode > 0xa7 && opcode < 0xaa))
         return false;
 
@@ -80,6 +118,67 @@ bool string_operation(State &s, std::uint8_t opcode) {
 } // namespace
 bool move(State &s, std::uint8_t opcode, bool extended) {
     const auto wide = s.width();
+    if (!extended && (opcode == 0x27 || opcode == 0x2f)) {
+        if (s.rules.long_mode())
+            invalid("DAA/DAS are not valid in long mode");
+        s.i.opcode = opcode == 0x27 ? Opcode::daa : Opcode::das;
+        const RegisterOperand al{RegisterBank::gpr, 0, 8, false};
+        s.i.register_reads.push_back(al);
+        s.i.register_writes.push_back(al);
+        s.flags_read = true;
+        s.flags_write = true;
+        return true;
+    }
+    if (!extended && (opcode == 0xd4 || opcode == 0xd5)) {
+        if (s.rules.long_mode())
+            invalid("AAM/AAD are not valid in long mode");
+        s.i.opcode = opcode == 0xd4 ? Opcode::aam : Opcode::aad;
+        const auto base = s.immediate(8, 8, false);
+        s.operand(base, OperandAccess::read);
+        const RegisterOperand al{RegisterBank::gpr, 0, 8, false};
+        const RegisterOperand ah{RegisterBank::gpr, 0, 8, true};
+        s.i.register_reads.push_back(al);
+        if (opcode == 0xd4)
+            s.i.register_writes.insert(s.i.register_writes.end(), {al, ah});
+        else {
+            s.i.register_reads.push_back(ah);
+            s.i.register_writes.push_back(al);
+            s.i.register_writes.push_back(ah);
+        }
+        s.flags_write = true;
+        return true;
+    }
+    if (!extended && opcode == 0x62) {
+        if (s.rules.long_mode())
+            invalid("BOUND is not valid in long mode; opcode 62 is the EVEX prefix");
+        const auto width = s.width();
+        auto m = modrm(s, width, width);
+        if (m.mod == 3 || !std::holds_alternative<MemoryOperand>(m.rm))
+            invalid("BOUND requires a memory bounds-pair operand");
+        auto &bounds = std::get<MemoryOperand>(m.rm);
+        // One typed memory operand spans the lower and upper bound values.
+        bounds.data_width = static_cast<std::uint16_t>(width * 2);
+        s.i.opcode = Opcode::bound;
+        s.i.flow = FlowKind::trap;
+        s.operand(m.reg, OperandAccess::read);
+        s.operand(bounds, OperandAccess::read);
+        return true;
+    }
+    if (!extended && (opcode == 0xc4 || opcode == 0xc5)) {
+        if (s.rules.long_mode())
+            invalid("LES/LDS are not valid in long mode; C4/C5 are VEX prefixes");
+        const auto width = s.width();
+        auto m = modrm(s, width, width);
+        if (m.mod == 3 || !std::holds_alternative<MemoryOperand>(m.rm))
+            invalid("LES/LDS require a memory far-pointer operand");
+        auto &pointer = std::get<MemoryOperand>(m.rm);
+        pointer.data_width = static_cast<std::uint16_t>(width + 16);
+        s.i.opcode = opcode == 0xc4 ? Opcode::les : Opcode::lds;
+        s.operand(m.reg, OperandAccess::write);
+        s.operand(pointer, OperandAccess::read);
+        s.i.register_writes.push_back({RegisterBank::segment, static_cast<std::uint8_t>(opcode == 0xc4 ? 0 : 3), 16, false});
+        return true;
+    }
     if (!extended && (opcode == 0x86 || opcode == 0x87)) {
         const auto width = static_cast<std::uint16_t>(opcode == 0x86 ? 8 : wide);
         auto m = modrm(s, width);
@@ -150,14 +249,23 @@ bool move(State &s, std::uint8_t opcode, bool extended) {
         s.operand(m.reg, OperandAccess::write);
         s.operand(m.rm, OperandAccess::address);
     } else if (opcode == 0x63) {
-        if (!s.rules.long_mode())
-            unsupported("Legacy ARPL form is not covered");
-        if (!(s.rex & 8))
-            unsupported("MOVSXD forms without REX.W are not yet covered");
-        s.i.opcode = Opcode::movsxd;
-        auto m = modrm(s, 32, 64);
-        s.operand(m.reg, OperandAccess::write);
-        s.operand(m.rm, OperandAccess::read);
+        if (!s.rules.long_mode()) {
+            // ARPL is fixed-width: operand-size override does not select a
+            // 32-bit form. ModRM r/m is the destination, unlike MOVSXD.
+            s.i.opcode = Opcode::arpl;
+            auto m = modrm(s, 16);
+            s.operand(m.rm, OperandAccess::read_write);
+            s.operand(m.reg, OperandAccess::read);
+            s.flags_write = true;
+        } else {
+            s.i.opcode = Opcode::movsxd;
+            // Long-mode opcode 63 has both the sign-extending r64 form
+            // (REX.W) and the valid same-width r32 form (without REX.W).
+            const auto destination_width = static_cast<std::uint16_t>((s.rex & 8) ? 64 : 32);
+            auto m = modrm(s, 32, destination_width);
+            s.operand(m.reg, OperandAccess::write);
+            s.operand(m.rm, OperandAccess::read);
+        }
     } else
         return false;
     return true;
@@ -245,17 +353,66 @@ DecodeResult decode_scalar(std::span<const std::byte> input, Address address, De
         bool extended = opcode == 0x0f;
         if (extended) {
             opcode = static_cast<std::uint8_t>(state.take(1));
+            if (opcode == 0x3a) {
+                const auto map_opcode = static_cast<std::uint8_t>(state.take(1));
+                if (!simd_0f3a(state, map_opcode))
+                    unsupported("Legacy 0F 3A opcode is outside the enabled immediate SIMD subset");
+                std::string reason;
+                finish(state, reason);
+                return {DecodeStatus::decoded, std::move(state.i), std::move(reason)};
+            }
             if (opcode == 0x38) {
                 const auto map_opcode = static_cast<std::uint8_t>(state.take(1));
-                if (!simd_0f38(state, map_opcode))
-                    unsupported("Legacy 0F 38 SIMD opcode is outside the enabled SSSE3 subset");
+                if (map_opcode == 0xf6 &&
+                    ((state.group1 == 0 && state.operand_override) ||
+                     (state.group1 == 0xf3 && !state.operand_override))) {
+                    const std::uint16_t width = state.rules.long_mode() && (state.rex & 8) ? 64 : 32;
+                    const auto decoded = modrm(state, width, width);
+                    state.i.opcode = state.group1 == 0xf3 ? Opcode::adox : Opcode::adcx;
+                    state.operand(decoded.reg, OperandAccess::read_write);
+                    state.operand(decoded.rm, OperandAccess::read);
+                    state.flags_read = true;
+                    state.flags_write = true;
+                } else if ((map_opcode == 0xf0 || map_opcode == 0xf1) && state.group1 == 0xf2) {
+                    const std::uint16_t destination_width = state.rules.long_mode() && (state.rex & 8) ? 64 : 32;
+                    const std::uint16_t source_width = map_opcode == 0xf0 ? 8 : state.width();
+                    const auto decoded = modrm(state, source_width, destination_width);
+                    state.i.opcode = Opcode::crc32;
+                    state.operand(decoded.reg, OperandAccess::read_write);
+                    state.operand(decoded.rm, OperandAccess::read);
+                    if (state.rules.long_mode() && destination_width == 32)
+                        state.i.register_writes.push_back(gpr(decoded.reg.index, 64));
+                } else if (map_opcode == 0xf0 || map_opcode == 0xf1) {
+                    if (state.group1 == 0xf3)
+                        invalid("REP is not valid for MOVBE");
+                    const auto width = state.width();
+                    const auto decoded = modrm(state, width, width);
+                    if (!std::holds_alternative<MemoryOperand>(decoded.rm))
+                        invalid("MOVBE requires a memory ModRM r/m operand");
+                    const bool load = map_opcode == 0xf0;
+                    state.i.opcode = Opcode::movbe;
+                    state.operand(load ? Operand{decoded.reg} : decoded.rm, OperandAccess::write);
+                    state.operand(load ? decoded.rm : Operand{decoded.reg}, OperandAccess::read);
+                    if (load) {
+                        const auto full_width = state.rules.pointer_width();
+                        if (width < full_width) {
+                            const auto full = gpr(decoded.reg.index, full_width);
+                            // A 16-bit write preserves the wider view; a
+                            // 32-bit long-mode write clears its high half.
+                            if (width == 16) state.i.register_reads.push_back(full);
+                            state.i.register_writes.push_back(full);
+                        }
+                    }
+                } else if (!simd_0f38(state, map_opcode))
+                    unsupported("Legacy 0F 38 opcode is outside the enabled scalar/SSSE3 subset");
                 std::string reason;
                 finish(state, reason);
                 return {DecodeStatus::decoded, std::move(state.i), std::move(reason)};
             }
         }
         const bool f3_bit_count = extended && (opcode == 0xbc || opcode == 0xbd || opcode == 0xb8);
-        const bool string_form = !extended && opcode >= 0xa4 && opcode <= 0xaf && !(opcode >= 0xa8 && opcode <= 0xa9);
+        const bool string_form = !extended && ((opcode >= 0x6c && opcode <= 0x6f) ||
+            (opcode >= 0xa4 && opcode <= 0xaf && !(opcode >= 0xa8 && opcode <= 0xa9)));
         const bool simd_form = simd(state, opcode, extended);
         if (!simd_form && ((state.group1 == 0xf2 && !string_form) ||
             (state.group1 == 0xf3 && !f3_bit_count && !string_form &&

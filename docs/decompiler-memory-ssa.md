@@ -8,15 +8,15 @@ the predecessor-specific states; reads in the block then refer to the merged
 version. This prevents dataflow consumers from treating a load as though it
 were independent of earlier stores or branch choice.
 
-Memory SSA is deliberately coarse: all modeled addresses share one memory
-variable. This captures ordering and control-flow dependence without claiming
-alias precision. In addition, `to_ssa` creates bounded address partitions for
-flat absolute loads and stores whose address and byte width are both known and
-which have no dynamic base or index. Overlapping access ranges in the same
-address space share one partition; disjoint ranges can keep independent
-versions. The partition identifies a byte range by address, not a named source
-object. Unclassified dynamic stores and write-capable intrinsics still
-invalidate every partition, so a possible pointer alias keeps its dependency.
+Memory SSA retains a coarse whole-memory variable for ordering and as a
+fallback. In addition, `to_ssa` creates bounded byte-range partitions for
+explicit absolute ranges and pointer-relative accesses whose address has a
+proven root and checked offset. Overlapping ranges in the same address space
+or under the same pointer root share one partition; disjoint ranges can keep
+independent versions. The partition identifies a byte range, not a named
+source object. Unclassified stores and write-capable intrinsics still
+invalidate every partition that may be affected, so a possible pointer alias
+keeps its dependency.
 Calls invalidate absolute-address and dynamic-address partitions, but preserve
 stack partitions for slots that stack recovery has proven nonescaping and
 nonoverlapping: those slots cannot be reached by an unknown callee. Escaped,
@@ -25,18 +25,21 @@ continues to depend on whole-memory SSA. If more than 4,096 distinct absolute
 ranges are present, global range partitioning is skipped while proven stack
 partitions remain available.
 
-The pass also keeps a bounded dynamic-address partition when an access uses a
-single base register whose SSA value has a tracked origin. Origins start as
-opaque version-0 register roots and propagate through register copies,
-constant `add`/`sub`, and phis whose incoming origins agree. Accesses rooted at
-the same origin are grouped by overlapping byte ranges, so stores at one
-constant offset preserve facts for nonoverlapping ranges under that same root.
-Different roots are always treated as potentially aliasing: a store through
-one root clobbers every other root's partition, along with absolute and stack
-partitions. Calls and unknown writes clobber all dynamic partitions. Indexed
-addresses, unsupported arithmetic, offset overflow, and resource-cap overflow
-receive no dynamic partition and keep the broad memory dependency. Conflicting
-phis receive an opaque root, which remains may-alias with every other root.
+The pointer-relative partitioner tracks a single base register's SSA origin.
+Origins propagate through same-width copies, checked constant `add`/`sub`
+offsets (including proven constant registers), and phis whose incoming origins
+and offsets agree. A flat architecture address proven as a numeric constant
+can also identify the same root and byte offset across registers. An indexed
+access is partitioned only when its index is an exact constant or a finite
+supported interval; interval accesses cover every possible byte. Unsupported
+extensions, unbounded indices, nonconstant pointer arithmetic, or offset
+overflow stay on whole-memory SSA. Accesses rooted at the same origin are
+grouped by overlapping byte ranges, so stores at one constant offset preserve
+facts for nonoverlapping ranges under that same root. Different roots are
+always treated as potentially aliasing: a store through one root clobbers
+every other root's partition, along with absolute and stack partitions. Calls
+and unknown writes clobber all dynamic partitions. Conflicting phis receive an
+opaque root, which remains may-alias with every other root.
 This is a local must-alias refinement; it does not discover heap
 allocation sites, prove distinct pointer roots disjoint, or model interprocedural
 points-to facts.

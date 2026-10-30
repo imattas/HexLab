@@ -1,5 +1,7 @@
 #include "history_internal.hpp"
+#include "hexlab/image/file_storage.hpp"
 #include <algorithm>
+#include <chrono>
 #include <type_traits>
 namespace hexlab::database {
 Result<StateDelta> invert_delta(const StateDelta& delta){
@@ -75,15 +77,19 @@ StateDelta decode_delta(std::span<const std::byte> bytes){
 }
 void append_history(Connection& connection,uint64_t step,uint64_t group,bool bytes,bool decisions,const StateDelta& delta){
     const auto forward=encode_delta(delta),inverse=encode_delta(take(invert_delta(delta)));
+    const auto now=std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    require(now>=0,"System clock predates Unix epoch while recording project history");
     auto remove=take(connection.prepare("DELETE FROM history WHERE step>=?1"));take(remove->bind_blob(1,encode_u64(step)));take(remove->step());
-    auto row=take(connection.prepare("INSERT INTO history VALUES(?1,?2,?3,?4)"));take(row->bind_blob(1,encode_u64(step)));take(row->bind_blob(2,encode_u64(group)));take(row->bind_integer(3,bytes));take(row->bind_integer(4,decisions));take(row->step());
+    auto row=take(connection.prepare("INSERT INTO history(step,group_id,byte_change,decision_change,created_unix_ms) VALUES(?1,?2,?3,?4,?5)"));take(row->bind_blob(1,encode_u64(step)));take(row->bind_blob(2,encode_u64(group)));take(row->bind_integer(3,bytes));take(row->bind_integer(4,decisions));take(row->bind_blob(5,encode_u64(static_cast<std::uint64_t>(now))));take(row->step());
     auto payload=take(connection.prepare("INSERT INTO history_payload VALUES(?1,?2,?3,?4)"));
     for(int side=0;side<2;++side){const auto& data=side?inverse:forward;size_t ordinal=0;for(size_t cursor=0;cursor<data.size();){const auto amount=std::min<size_t>(1024*1024,data.size()-cursor);take(payload->bind_blob(1,encode_u64(step)));take(payload->bind_integer(2,side));take(payload->bind_integer(3,ordinal++));take(payload->bind_blob(4,std::span(data).subspan(cursor,amount)));take(payload->step());take(payload->reset());cursor+=amount;}}
 }
 StateDelta read_history_bounded(Connection& connection,uint64_t step,bool inverse,size_t& remaining){
-    auto payload=take(connection.prepare("SELECT ordinal,length(data),data FROM history_payload WHERE step=?1 AND side=?2 ORDER BY ordinal"));take(payload->bind_blob(1,encode_u64(step)));take(payload->bind_integer(2,inverse?1:0));
+    auto payload=take(connection.prepare("SELECT ordinal,length(data),data,typeof(ordinal),typeof(data) FROM history_payload WHERE step=?1 AND side=?2 ORDER BY ordinal"));take(payload->bind_blob(1,encode_u64(step)));take(payload->bind_integer(2,inverse?1:0));
     std::vector<std::byte> data;size_t ordinal=0;
     while(take(payload->step())){
+        require(take(payload->text(3))=="integer" && take(payload->text(4))=="blob","History chunk metadata has an invalid storage type");
         require(take(payload->integer(0))==static_cast<int64_t>(ordinal++),"Missing history payload chunk");
         const auto size=take(payload->integer(1));
         require(size>0 && size<=1024*1024 && static_cast<uint64_t>(size)<=project_payload_limit-data.size(),"Invalid history chunk extent");
@@ -92,6 +98,18 @@ StateDelta read_history_bounded(Connection& connection,uint64_t step,bool invers
         remaining-=chunk.size();data.insert(data.end(),chunk.begin(),chunk.end());
     }
     require(!data.empty(),"Missing history delta");return decode_delta(data);
+}
+void validate_history_payload_rows(Connection& connection,uint64_t step){
+    // Read both sides below only where side is 0 or 1. First reject malformed
+    // rows at this step so an extra side or CHECK-bypassing write cannot be
+    // hidden from the audit's directional delta reads.
+    auto invalid=take(connection.prepare(
+        "SELECT 1 FROM history_payload WHERE step=?1 AND ("
+        "typeof(side)!='integer' OR side NOT IN(0,1) OR "
+        "typeof(ordinal)!='integer' OR ordinal<0 OR "
+        "typeof(data)!='blob' OR length(data) NOT BETWEEN 1 AND 1048576) LIMIT 1"));
+    take(invalid->bind_blob(1,encode_u64(step)));
+    require(!take(invalid->step()),"Invalid history payload row metadata");
 }
 StateDelta read_history(Connection& connection,uint64_t step,bool inverse){
     size_t remaining=project_payload_limit;return read_history_bounded(connection,step,inverse,remaining);
@@ -111,11 +129,15 @@ HistoryPage read_history_header(Connection& connection, bool validate_full_histo
     require(!take(header->step()),"Duplicate project header");
     require(page.source_revisions.bytes<=page.source_revisions.edit && page.source_revisions.decisions<=page.source_revisions.edit && page.history_cursor<=page.source_revisions.edit,"Inconsistent project revision header");
     if (validate_full_history) {
+        const auto timestamp_check = version>=18
+            ? "(created_unix_ms IS NOT NULL AND (typeof(created_unix_ms)!='blob' OR length(created_unix_ms)!=8))"
+            : "0";
         auto extent=take(connection.prepare(
             "SELECT count(*),min(step),max(step),coalesce(sum(CASE WHEN "
             "typeof(step)!='blob' OR length(step)!=8 OR typeof(group_id)!='blob' OR length(group_id)!=8 OR "
             "typeof(byte_change)!='integer' OR byte_change NOT IN(0,1) OR "
-            "typeof(decision_change)!='integer' OR decision_change NOT IN(0,1) "
+            "typeof(decision_change)!='integer' OR decision_change NOT IN(0,1) OR "
+            + std::string(timestamp_check) + " "
             "THEN 1 ELSE 0 END),0) FROM history"));
         require(take(extent->step()),"Cannot read history extent");
         const auto count=take(extent->integer(0));
@@ -141,6 +163,39 @@ std::vector<HistoryRow> history_rows(Connection& connection){
     while(take(query->step())){require(rows.size()<project_record_limit,"History entry count exceeds budget");const auto step=take(decode_u64(take(query->blob(0)))),group=take(decode_u64(take(query->blob(1))));require(step==rows.size()+1,"History sequence has a gap");rows.push_back({step,group});}
     return rows;
 }
+Result<HistorySourceIdentityCheck> check_current_external_input(
+    const ProjectState& state,const std::filesystem::path& project,std::stop_token stop) {
+    if(!state.provenance)return HistorySourceIdentityCheck::no_recorded_path;
+    const auto& provenance=*state.provenance;
+    std::filesystem::path source_path;
+    if(!provenance.relative_path.empty()) {
+        const auto relative=std::filesystem::path(std::u8string(
+            reinterpret_cast<const char8_t*>(provenance.relative_path.data()),provenance.relative_path.size()));
+        source_path=(project.parent_path()/relative).lexically_normal();
+    } else if(provenance.native_path.is_absolute()) {
+        source_path=provenance.native_path;
+    }
+    if(source_path.empty())return HistorySourceIdentityCheck::no_recorded_path;
+    if(stop.stop_requested())return Error{ErrorCode::canceled,"External source identity check canceled"};
+    const auto opened=FileStorage::open(source_path);
+    if(!opened)return HistorySourceIdentityCheck::unavailable;
+    const auto& source=*opened.value();
+    if(source.size()>history_source_identity_check_limit)return HistorySourceIdentityCheck::over_limit;
+    if(source.size()!=state.input.size)return HistorySourceIdentityCheck::size_mismatch;
+    Sha256 hash;
+    for(std::uint64_t position=0;position<source.size();) {
+        if(stop.stop_requested())return Error{ErrorCode::canceled,"External source identity check canceled"};
+        const auto amount=static_cast<std::size_t>(std::min<std::uint64_t>(1024u*1024u,source.size()-position));
+        const auto view=source.read_at({position},amount);
+        if(!view || view.value().bytes.size()!=amount)return HistorySourceIdentityCheck::unavailable;
+        const auto hashed=hash.update(view.value().bytes);
+        if(!hashed)return HistorySourceIdentityCheck::unavailable;
+        position+=amount;
+    }
+    if(stop.stop_requested())return Error{ErrorCode::canceled,"External source identity check canceled"};
+    return hash.digest()==state.input.sha256 ? HistorySourceIdentityCheck::matches
+                                              : HistorySourceIdentityCheck::digest_mismatch;
+}
 }
 Result<HistoryPage> ProjectStore::history_page(uint64_t expected,uint64_t after,size_t limit,std::stop_token stop) const{
     return detail::guarded([&]()->Result<HistoryPage>{
@@ -152,7 +207,10 @@ Result<HistoryPage> ProjectStore::history_page(uint64_t expected,uint64_t after,
         auto page=detail::read_history_header(*impl_->connection, false);
         if(page.source_revisions.edit!=expected)return Error{ErrorCode::conflict,"Project edit revision changed; refresh before retrying"};
         if(after>page.history_count)return Error{ErrorCode::invalid_argument,"History page cursor exceeds durable history"};
-        auto query=detail::take(impl_->connection->prepare("SELECT step,group_id,byte_change,decision_change FROM history WHERE step>?1 ORDER BY step LIMIT ?2"));
+        const auto history_schema=detail::schema_version(*impl_->connection);
+        auto query=detail::take(impl_->connection->prepare(history_schema>=18
+            ? "SELECT step,group_id,byte_change,decision_change,created_unix_ms,typeof(created_unix_ms) FROM history WHERE step>?1 ORDER BY step LIMIT ?2"
+            : "SELECT step,group_id,byte_change,decision_change,NULL,'null' FROM history WHERE step>?1 ORDER BY step LIMIT ?2"));
         detail::take(query->bind_blob(1,encode_u64(after)));detail::take(query->bind_integer(2,static_cast<int64_t>(limit)));
         page.next_after_step=after;page.entries.reserve(limit);
         while(detail::take(query->step())){
@@ -162,7 +220,12 @@ Result<HistoryPage> ProjectStore::history_page(uint64_t expected,uint64_t after,
             const auto byte_change=detail::take(query->integer(2));
             const auto decision_change=detail::take(query->integer(3));
             detail::require((byte_change==0 || byte_change==1) && (decision_change==0 || decision_change==1),"Invalid history metadata flags");
-            page.entries.push_back({step,group,byte_change!=0,decision_change!=0,step<=page.history_cursor});
+            std::optional<std::uint64_t> created_unix_ms;
+            if (!detail::take(query->is_null(4))) {
+                detail::require(detail::take(query->text(5))=="blob","History timestamp has an invalid storage type");
+                created_unix_ms=detail::take(decode_u64(detail::take(query->blob(4))));
+            }
+            page.entries.push_back({step,group,byte_change!=0,decision_change!=0,step<=page.history_cursor,created_unix_ms});
             page.next_after_step=step;
         }
         if(page.entries.size()<limit && page.next_after_step<page.history_count)
@@ -183,8 +246,17 @@ Result<HistoryAuditPage> ProjectStore::audit_history(uint64_t expected,uint64_t 
         auto header=detail::read_history_header(*impl_->connection,false);
         if(header.source_revisions.edit!=expected)return Error{ErrorCode::conflict,"Project edit revision changed; refresh before retrying"};
         if(after>header.history_count)return Error{ErrorCode::invalid_argument,"History audit cursor exceeds durable history"};
+        auto orphan=detail::take(impl_->connection->prepare(
+            "SELECT 1 FROM history_payload AS p LEFT JOIN history AS h ON h.step=p.step WHERE h.step IS NULL LIMIT 1"));
+        if(detail::take(orphan->step()))return Error{ErrorCode::integrity,"History payload contains an orphan step key"};
+        auto trailing=detail::take(impl_->connection->prepare("SELECT 1 FROM history WHERE step>?1 LIMIT 1"));
+        detail::take(trailing->bind_blob(1,encode_u64(header.history_count)));
+        if(detail::take(trailing->step()))return Error{ErrorCode::integrity,"History contains entries beyond the durable count"};
         HistoryAuditPage page{header.uuid,header.source_revisions,header.history_cursor,header.history_count,after,0,0,false};
-        auto query=detail::take(impl_->connection->prepare("SELECT step,group_id,byte_change,decision_change FROM history WHERE step>?1 ORDER BY step LIMIT ?2"));
+        const auto history_schema=detail::schema_version(*impl_->connection);
+        auto query=detail::take(impl_->connection->prepare(history_schema>=18
+            ? "SELECT step,group_id,byte_change,decision_change,created_unix_ms,typeof(created_unix_ms) FROM history WHERE step>?1 ORDER BY step LIMIT ?2"
+            : "SELECT step,group_id,byte_change,decision_change,NULL,'null' FROM history WHERE step>?1 ORDER BY step LIMIT ?2"));
         detail::take(query->bind_blob(1,encode_u64(after)));
         detail::take(query->bind_integer(2,static_cast<int64_t>(limits.max_steps)));
         // The bounded reader decrements this shared counter for every chunk
@@ -195,9 +267,14 @@ Result<HistoryAuditPage> ProjectStore::audit_history(uint64_t expected,uint64_t 
             const auto step=detail::take(decode_u64(detail::take(query->blob(0))));
             detail::require(step==page.next_after_step+1,"History sequence has a gap");
             (void)detail::take(decode_u64(detail::take(query->blob(1))));
+            detail::validate_history_payload_rows(*impl_->connection,step);
             const auto byte_change=detail::take(query->integer(2));
             const auto decision_change=detail::take(query->integer(3));
             detail::require((byte_change==0 || byte_change==1) && (decision_change==0 || decision_change==1),"Invalid history metadata flags");
+            if (!detail::take(query->is_null(4))) {
+                detail::require(detail::take(query->text(5))=="blob","History timestamp has an invalid storage type");
+                (void)detail::take(decode_u64(detail::take(query->blob(4))));
+            }
             const auto forward=detail::read_history_bounded(*impl_->connection,step,false,remaining);
             const auto inverse=detail::read_history_bounded(*impl_->connection,step,true,remaining);
             bool delta_changes_bytes=false,delta_changes_decisions=false;
@@ -224,6 +301,8 @@ Result<HistoryAuditPage> ProjectStore::audit_history(uint64_t expected,uint64_t 
         page.has_more=page.next_after_step<header.history_count;
         page.delta_bytes=limits.max_delta_bytes-remaining;
         if(stop.stop_requested())return Error{ErrorCode::canceled,"History audit canceled"};
+        if(after==0)page.source_identity_check=detail::take(
+            detail::check_current_external_input(*impl_->state,impl_->path,stop));
         return page;
     });
 }

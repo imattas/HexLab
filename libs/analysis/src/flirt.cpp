@@ -173,6 +173,7 @@ Result<FlirtCatalog> parse_flirt_pat(std::string_view text, Architecture archite
             std::string token;
             while (tokens >> token) {
                 check_stop(stop);
+                if (token.front() == '#' || token.front() == ';') break;
                 if (token.front() == ':' || token.front() == '^') {
                     const auto kind = token.front() == '^' ? FlirtSymbolKind::reference :
                         (!token.empty() && token.back() == '@' ? FlirtSymbolKind::local_name : FlirtSymbolKind::public_name);
@@ -195,7 +196,10 @@ Result<FlirtCatalog> parse_flirt_pat(std::string_view text, Architecture archite
                             crc_end + definition.tail.size() <= definition.module_length,
                         "FLIRT tail extends beyond the module length");
                 std::string extra;
-                require(!(tokens >> extra), "Unexpected token after FLIRT tail");
+                if (tokens >> extra)
+                    require(extra.front() == '#' || extra.front() == ';',
+                            "Unexpected token after FLIRT tail");
+                break;
             }
             require(!definition.symbols.empty(), "FLIRT pattern has no symbols");
             catalog.patterns.push_back(std::move(definition));
@@ -319,7 +323,6 @@ Result<FlirtCatalog> parse_flirt_sig(std::span<const std::byte> input, std::stri
         const auto liblen=byte(); const auto alternate_compiler_type_crc16=static_cast<std::uint16_t>(le(2));
         const auto valid_features=version>=10?0x3fu:0x1fu;
         require((features & ~valid_features)==0,"Unsupported FLIRT .sig feature flags",ErrorCode::unsupported);
-        require(version != 5 || !(features & 0x10),"Compressed FLIRT .sig version 5 bodies are unsupported",ErrorCode::unsupported);
         std::uint32_t function_count=0; std::uint16_t head_size=32;
         if(version>=6) function_count=le(4);
         if(version>=8) head_size=static_cast<std::uint16_t>(le(2));
@@ -332,7 +335,11 @@ Result<FlirtCatalog> parse_flirt_sig(std::span<const std::byte> input, std::stri
         if (features & 0x10) {
             require(at < input.size(), "Compressed FLIRT .sig body is empty");
             mz_stream stream{};
-            require(mz_inflateInit(&stream) == MZ_OK,
+            // The legacy v5/v6 encoding is raw DEFLATE. Rizin's FLIRT reader
+            // selects raw inflate for these versions and zlib-wrapped inflate
+            // from v7 onward.
+            const auto window_bits = version <= 6 ? -MZ_DEFAULT_WINDOW_BITS : MZ_DEFAULT_WINDOW_BITS;
+            require(mz_inflateInit2(&stream, window_bits) == MZ_OK,
                     "Could not initialize bounded FLIRT decompressor", ErrorCode::resource_limit);
             struct InflateGuard {
                 mz_stream *stream;
@@ -410,6 +417,8 @@ Result<FlirtCatalog> parse_flirt_sig(std::span<const std::byte> input, std::stri
                 else if(len<=32)mask=vint32();
                 else mask=(std::uint64_t(vint32())<<32)|vint32();
                 require(std::popcount(mask)<=len,"Invalid FLIRT wildcard mask");
+                if (len < 64)
+                    require((mask >> len) == 0, "FLIRT wildcard mask sets bits beyond its trie node");
                 std::vector<SignatureByte> node(len);
                 for(std::size_t i=len;i>0;--i){
                     if(mask&(std::uint64_t{1}<<(i-1)))node[i-1]={};
@@ -472,8 +481,13 @@ Result<FlirtRecognition> recognize_flirt_catalogs(const Image &image, const Byte
         require(snapshot.functions.size() <= limits.max_functions && snapshot.calls.size() <= 2000000,
                 "FLIRT function/call snapshot exceeds its supported bound", ErrorCode::resource_limit);
 
-        struct Anchor { std::uint8_t offset; std::byte value; };
-        std::map<std::pair<std::uint8_t, unsigned>, std::vector<std::size_t>> anchors;
+        // Index on the most selective constrained head byte. IDASGN trie
+        // nodes may constrain only a nibble (or other bit subset), so an
+        // exact-byte-only index incorrectly rejected otherwise valid leaves.
+        using AnchorKey = std::tuple<std::uint8_t, unsigned, unsigned>;
+        std::map<AnchorKey, std::vector<std::size_t>> anchors;
+        std::array<std::set<unsigned>, 64> anchor_masks;
+        std::vector<std::size_t> unanchored;
         std::size_t max_probe = 0;
         for (std::size_t index = 0; index < patterns.size(); ++index) {
             check_stop(stop);
@@ -499,11 +513,21 @@ Result<FlirtRecognition> recognize_flirt_catalogs(const Image &image, const Byte
                     require(false, "Invalid FLIRT symbol kind");
                 }
             }
-            const auto anchor = std::find_if(pattern.head.begin(), pattern.head.end(),
-                [](const auto &byte) { return byte.mask == std::byte{0xff}; });
-            require(anchor != pattern.head.end(), "FLIRT head has no exact anchor byte");
-            const auto offset = static_cast<std::uint8_t>(anchor - pattern.head.begin());
-            anchors[{offset, std::to_integer<unsigned>(anchor->value)}].push_back(index);
+            auto anchor = pattern.head.end();
+            int anchor_bits = 0;
+            for (auto it = pattern.head.begin(); it != pattern.head.end(); ++it) {
+                const auto bits = std::popcount(std::to_integer<unsigned>(it->mask));
+                if (bits > anchor_bits) { anchor = it; anchor_bits = bits; }
+            }
+            if (anchor == pattern.head.end()) {
+                unanchored.push_back(index);
+            } else {
+                const auto offset = static_cast<std::uint8_t>(anchor - pattern.head.begin());
+                const auto mask = std::to_integer<unsigned>(anchor->mask);
+                const auto value = std::to_integer<unsigned>(anchor->value) & mask;
+                anchors[{offset, mask, value}].push_back(index);
+                anchor_masks[offset].insert(mask);
+            }
             std::size_t probe = std::min<std::size_t>(pattern.head.size(), pattern.module_length) + pattern.crc_length + pattern.tail.size();
             for (const auto &[offset, byte] : pattern.sparse_tail) {
                 (void)byte;
@@ -566,16 +590,27 @@ Result<FlirtRecognition> recognize_flirt_catalogs(const Image &image, const Byte
             std::vector<std::size_t> candidates;
             for (std::uint8_t offset = 0; offset < 64; ++offset) {
                 if (offset >= code.size()) break;
-                const auto found = anchors.find({offset, std::to_integer<unsigned>(code[offset])});
-                if (found == anchors.end()) continue;
-                for (const auto pattern_index : found->second) {
-                    check_stop(stop);
-                    require(result.pattern_candidates < limits.max_pattern_candidates,
-                            "FLIRT candidate budget reached", ErrorCode::resource_limit);
-                    ++result.pattern_candidates;
-                    candidates.push_back(pattern_index);
+                const auto byte = std::to_integer<unsigned>(code[offset]);
+                for (const auto mask : anchor_masks[offset]) {
+                    const auto found = anchors.find({offset, mask, byte & mask});
+                    if (found == anchors.end()) continue;
+                    for (const auto pattern_index : found->second) {
+                        check_stop(stop);
+                        require(result.pattern_candidates < limits.max_pattern_candidates,
+                                "FLIRT candidate budget reached", ErrorCode::resource_limit);
+                        ++result.pattern_candidates;
+                        candidates.push_back(pattern_index);
+                    }
                 }
             }
+            for (const auto pattern_index : unanchored) {
+                check_stop(stop);
+                require(result.pattern_candidates < limits.max_pattern_candidates,
+                        "FLIRT candidate budget reached", ErrorCode::resource_limit);
+                ++result.pattern_candidates;
+                candidates.push_back(pattern_index);
+            }
+            std::sort(candidates.begin(), candidates.end());
 
             for (const auto pattern_index : candidates) {
                 check_stop(stop);
@@ -715,7 +750,7 @@ Result<FunctionRecognitionEvidence> make_function_recognition_evidence(const Fun
         require(snapshot.key && recognition.source_key && *snapshot.key == *recognition.source_key,
                 "FLAIR recognition is not bound to the current source identity", ErrorCode::conflict);
         FunctionRecognitionEvidence evidence;
-        evidence.format_version = 2;
+        evidence.format_version = 3;
         evidence.kind = FunctionRecognitionKind::flirt_patterns;
         evidence.source_key = *snapshot.key;
         evidence.catalog_digest = catalog_digest;
@@ -731,7 +766,8 @@ Result<FunctionRecognitionEvidence> make_function_recognition_evidence(const Fun
             for (const auto &candidate : match.candidates) {
                 check_stop(stop);
                 record.candidates.push_back({candidate.name, candidate.provenance, 0, 0, 0, {},
-                    static_cast<std::uint8_t>(candidate.kind), candidate.matching_patterns});
+                    static_cast<std::uint8_t>(candidate.kind), candidate.matching_patterns,
+                    static_cast<std::uint32_t>(candidate.catalog_index)});
             }
             evidence.functions.push_back(std::move(record));
         }

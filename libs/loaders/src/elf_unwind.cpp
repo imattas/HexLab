@@ -82,12 +82,13 @@ std::uint64_t add_signed(std::uint64_t base, std::int64_t delta) {
     return base - magnitude;
 }
 
-void validate_encoding(std::uint8_t encoding, bool allow_indirect, bool allow_omit = false) {
+void validate_encoding(std::uint8_t encoding, bool allow_indirect, bool allow_omit = false,
+                       bool allow_data_relative = false) {
     if (encoding == 0xff && allow_omit) return;
     require(encoding != 0xff, "DW_EH_PE_omit cannot encode an ELF .eh_frame address", ErrorCode::unsupported);
     require(allow_indirect || !(encoding & 0x80), "Indirect FDE range encodings are unsupported", ErrorCode::unsupported);
     const auto application = encoding & 0x70;
-    require(application == 0 || application == 0x10,
+    require(application == 0 || application == 0x10 || (allow_data_relative && application == 0x30),
             "Unsupported DW_EH_PE application in ELF .eh_frame", ErrorCode::unsupported);
     const auto format = encoding & 0x0f;
     require(format == 0 || format == 1 || format == 2 || format == 3 || format == 4 ||
@@ -96,8 +97,9 @@ void validate_encoding(std::uint8_t encoding, bool allow_indirect, bool allow_om
 }
 
 std::uint64_t encoded(Cursor &cursor, std::uint8_t encoding, std::uint64_t field_address,
-                      unsigned address_size, bool apply_relative, bool exception_pointer = false) {
-    validate_encoding(encoding, exception_pointer);
+                      unsigned address_size, bool apply_relative, bool exception_pointer = false,
+                      std::optional<std::uint64_t> data_relative_base = {}) {
+    validate_encoding(encoding, exception_pointer, false, data_relative_base.has_value());
     const auto application = encoding & 0x70;
     const auto format = encoding & 0x0f;
     std::uint64_t raw = 0;
@@ -128,6 +130,10 @@ std::uint64_t encoded(Cursor &cursor, std::uint8_t encoding, std::uint64_t field
                 "Relative DW_EH_PE value exceeds signed address range", ErrorCode::overflow);
         signed_value = static_cast<std::int64_t>(raw);
     }
+    if (application == 0x30) {
+        require(data_relative_base.has_value(), "Missing DW_EH_PE data-relative base", ErrorCode::unsupported);
+        return add_signed(*data_relative_base, signed_value);
+    }
     return add_signed(field_address, signed_value);
 }
 
@@ -156,6 +162,8 @@ void parse_section(const ByteStorage &storage, const Image &image, const ElfMeta
                                    (machine == 62 && metadata.header.is_64) ||
                                    (machine == 40 && !metadata.header.is_64) ||
                                    (machine == 183 && metadata.header.is_64) || machine == 243 ||
+                                   (machine == 20 && !metadata.header.is_64) ||
+                                   (machine == 21 && metadata.header.is_64) ||
                                    (machine == 8 && !metadata.header.is_64) ||
                                    (machine == 8 && metadata.header.is_64);
     require(supported_machine, "ELF machine has no supported .eh_frame root semantics", ErrorCode::unsupported);
@@ -312,6 +320,109 @@ void parse_section(const ByteStorage &storage, const Image &image, const ElfMeta
     output = std::move(parsed);
     cfi_output = std::move(parsed_cfi);
 }
+
+std::uint64_t file_offset_for_address(const ElfMetadata &metadata, std::uint64_t address) {
+    std::optional<std::uint64_t> result;
+    for (const auto &program : metadata.programs) {
+        if (program.type != 1 || address < program.address || address - program.address >= program.file_size) continue;
+        const auto candidate = add(program.offset, address - program.address);
+        require(!result || *result == candidate, "ELF unwind address has conflicting PT_LOAD file mappings",
+                ErrorCode::unsupported);
+        result = candidate;
+    }
+    require(result.has_value(), "ELF unwind address is not in initialized PT_LOAD data", ErrorCode::unsupported);
+    return *result;
+}
+
+std::vector<ElfEhFrameHeader> parse_eh_frame_headers(const ByteStorage &storage, const Image &image,
+                                                      const ElfMetadata &metadata, Budget &budget,
+                                                      std::stop_token stop) {
+    constexpr std::uint32_t pt_gnu_eh_frame = 0x6474e550;
+    constexpr std::uint64_t max_entries = 1'000'000;
+    std::vector<ElfEhFrameHeader> headers;
+    bool seen_header = false;
+    Reader reader(storage, metadata.header.order, stop);
+    for (const auto &program : metadata.programs) {
+        canceled(stop);
+        if (program.type != pt_gnu_eh_frame) continue;
+        require(!seen_header, "ELF contains duplicate PT_GNU_EH_FRAME programs");
+        seen_header = true;
+        require(program.file_size >= 4 && program.file_size <= metadata_limit,
+                "ELF PT_GNU_EH_FRAME extent is invalid", ErrorCode::resource_limit);
+        const auto header_file_offset = file_offset_for_address(metadata, program.address);
+        require(header_file_offset == program.offset,
+                "ELF PT_GNU_EH_FRAME address and file offset disagree");
+        budget.include(program.file_size);
+        budget.include(sizeof(ElfEhFrameHeader));
+        const auto data = reader.bytes(program.offset, static_cast<std::size_t>(program.file_size)).bytes;
+        Cursor cursor{reader, data, 0, data.size()};
+        ElfEhFrameHeader header;
+        header.program = program.index;
+        header.file_offset = program.offset;
+        header.file_size = program.file_size;
+        header.version = static_cast<std::uint8_t>(cursor.fixed(1));
+        header.eh_frame_pointer_encoding = static_cast<std::uint8_t>(cursor.fixed(1));
+        header.fde_count_encoding = static_cast<std::uint8_t>(cursor.fixed(1));
+        header.table_encoding = static_cast<std::uint8_t>(cursor.fixed(1));
+        require(header.version == 1, "Unsupported ELF .eh_frame_hdr version", ErrorCode::unsupported);
+        const auto address_size = metadata.header.is_64 ? 8u : 4u;
+        const auto pointer_start = cursor.at;
+        header.eh_frame_pointer_field_offset = add(program.offset, pointer_start);
+        header.eh_frame_address = encoded(cursor, header.eh_frame_pointer_encoding,
+            add(program.address, pointer_start), address_size, true, false, program.address);
+        const auto eh_frame_file_offset = file_offset_for_address(metadata, header.eh_frame_address);
+        bool has_eh_frame_section = false, matches_eh_frame_section = false;
+        for (const auto &section : metadata.sections) {
+            if (section.name != ".eh_frame") continue;
+            has_eh_frame_section = true;
+            if (header.eh_frame_address == section.address && eh_frame_file_offset == section.offset)
+                matches_eh_frame_section = true;
+        }
+        require(!has_eh_frame_section || matches_eh_frame_section,
+                "ELF .eh_frame_hdr pointer disagrees with the .eh_frame section");
+        const auto count_start = cursor.at;
+        header.fde_count_field_offset = add(program.offset, count_start);
+        require((header.fde_count_encoding & 0x70) == 0 && !(header.fde_count_encoding & 0x80) &&
+                    ((header.fde_count_encoding & 0x0f) == 0x00 || (header.fde_count_encoding & 0x0f) == 0x01 ||
+                     (header.fde_count_encoding & 0x0f) == 0x02 || (header.fde_count_encoding & 0x0f) == 0x03 ||
+                     (header.fde_count_encoding & 0x0f) == 0x04),
+                "ELF .eh_frame_hdr FDE count encoding is not unsigned absolute", ErrorCode::unsupported);
+        const auto count = encoded(cursor, header.fde_count_encoding, add(program.address, count_start),
+                                   address_size, false);
+        require(count <= max_entries && count <= (data.size() - cursor.at) / 2,
+                "ELF .eh_frame_hdr table count exceeds its bounded extent", ErrorCode::resource_limit);
+        header.table_file_offset = add(program.offset, cursor.at);
+        const auto retained = count * sizeof(ElfEhFrameHeaderEntry);
+        budget.include(retained);
+        header.entries.reserve(static_cast<std::size_t>(count));
+        std::optional<std::uint64_t> previous_location;
+        for (std::uint64_t i = 0; i < count; ++i) {
+            canceled(stop);
+            const auto initial_at = cursor.at;
+            const auto initial = encoded(cursor, header.table_encoding, add(program.address, initial_at),
+                                         address_size, true, false, program.address);
+            const auto fde_at = cursor.at;
+            const auto fde = encoded(cursor, header.table_encoding, add(program.address, fde_at),
+                                     address_size, true, false, program.address);
+            require(!previous_location || initial > *previous_location,
+                    "ELF .eh_frame_hdr initial locations are not strictly increasing");
+            previous_location = initial;
+            const Address initial_address{{0}, initial};
+            const auto *segment = image.segment_at(initial_address);
+            require(segment && segment->executable && initial >= segment->begin.offset &&
+                        initial - segment->begin.offset < segment->file_size,
+                    "ELF .eh_frame_hdr initial location is not initialized executable memory");
+            const auto initial_file = file_offset_for_address(metadata, initial);
+            const auto fde_file = file_offset_for_address(metadata, fde);
+            header.entries.push_back({initial, fde, initial_file, fde_file});
+        }
+        require(std::all_of(data.begin() + static_cast<std::ptrdiff_t>(cursor.at), data.end(),
+                            [](std::byte value) { return value == std::byte{0}; }),
+                "Nonzero trailing bytes follow the ELF .eh_frame_hdr table");
+        headers.push_back(std::move(header));
+    }
+    return headers;
+}
 } // namespace
 
 Result<bool> read_unwind_ranges(const ByteStorage &storage, const Image &image, ElfMetadata &metadata,
@@ -349,6 +460,8 @@ Result<bool> read_unwind_ranges(const ByteStorage &storage, const Image &image, 
                     std::make_move_iterator(functions.begin()), std::make_move_iterator(functions.end()));
             }
         }
+        metadata.eh_frame_headers = parse_eh_frame_headers(storage, image, metadata, budget, stop);
+        found = found || !metadata.eh_frame_headers.empty();
         std::sort(metadata.unwind_ranges.begin(), metadata.unwind_ranges.end(), [](const auto &a, const auto &b) {
             return std::tie(a.begin.space.value, a.begin.offset, a.file_offset) <
                    std::tie(b.begin.space.value, b.begin.offset, b.file_offset);

@@ -46,6 +46,40 @@ bool multiple(Instruction &i, std::uint32_t w) {
 bool memory(Instruction &i, std::uint32_t w) {
     if ((w & 0x0e000000) == 0x08000000)
         return multiple(i, w);
+    const auto exclusive_load = w & 0x0ff00fff;
+    const auto exclusive_store = w & 0x0ff00ff0;
+    const auto load_kind = exclusive_load == 0x01900f9fu ? 0 :
+        exclusive_load == 0x01d00f9fu ? 1 : exclusive_load == 0x01f00f9fu ? 2 : -1;
+    const auto store_kind = exclusive_store == 0x01800f90u ? 0 :
+        exclusive_store == 0x01c00f90u ? 1 : exclusive_store == 0x01e00f90u ? 2 : -1;
+    if (load_kind >= 0 || store_kind >= 0) {
+        const bool load = load_kind >= 0;
+        const auto kind = static_cast<unsigned>(load ? load_kind : store_kind);
+        const auto rn = (w >> 16) & 15, rt = (w >> (load ? 12 : 0)) & 15;
+        const auto status = (w >> 12) & 15;
+        if (rn == 15 || rt == 15 || (!load && (status == 15 || status == rn || status == rt)))
+            return false;
+        static constexpr unsigned widths[]{32, 8, 16};
+        static constexpr Opcode loads[]{Opcode::arm_ldrex, Opcode::arm_ldrexb, Opcode::arm_ldrexh};
+        static constexpr Opcode stores[]{Opcode::arm_strex, Opcode::arm_strexb, Opcode::arm_strexh};
+        ArmMemoryOperand address{gpr(rn)};
+        address.data_width = static_cast<std::uint16_t>(widths[kind]);
+        i.opcode = load ? loads[kind] : stores[kind];
+        if (load) {
+            i.operands = {gpr(rt), address};
+            i.access = {OperandAccess::write, OperandAccess::address};
+            i.register_writes.push_back(gpr(rt));
+        } else {
+            i.operands = {gpr(status), gpr(rt), address};
+            i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::address};
+            i.register_writes.push_back(gpr(status));
+            read(i, gpr(rt));
+        }
+        read(i, gpr(rn));
+        i.memory_read = load;
+        i.memory_write = !load;
+        return true;
+    }
     const bool ordinary = (w & 0x0c000000) == 0x04000000;
     const bool extra = (w & 0x0e000090) == 0x00000090 && (w & 0x60);
     if (!ordinary && !extra)

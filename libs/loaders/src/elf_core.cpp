@@ -1,17 +1,24 @@
 #include "elf_internal.hpp"
 
 #include <algorithm>
+#include <array>
 #include <iterator>
 #include <string_view>
+#include <tuple>
 
 namespace hexlab::elf_detail {
 namespace {
 constexpr std::uint16_t et_core = 4;
 constexpr std::uint32_t nt_prstatus = 1;
+constexpr std::uint32_t nt_fpregset = 2;
 constexpr std::uint32_t nt_prpsinfo = 3;
 constexpr std::uint32_t nt_auxv = 6;
 constexpr std::uint32_t nt_siginfo = 0x53494749;
 constexpr std::uint32_t nt_file = 0x46494c45;
+constexpr std::uint32_t nt_arm_pac_mask = 0x406;
+constexpr std::uint32_t nt_arm_tagged_addr_ctrl = 0x409;
+constexpr std::uint32_t nt_arm_pac_enabled_keys = 0x40a;
+constexpr std::uint32_t nt_arm_vfp = 0x400;
 constexpr std::uint64_t core_record_limit = 1'000'000;
 constexpr std::size_t elf64_prstatus_register_offset = 112;
 constexpr std::size_t elf32_prstatus_register_offset = 72;
@@ -47,7 +54,25 @@ void read_process_info(const ElfHeader &header, const ElfNote &note,
                        ElfCoreInfo &core, Budget &budget) {
     const auto bytes = std::span<const std::byte>(note.description);
     if (!header.is_64) {
-        diagnostic(core, budget, "ELF32 NT_PRPSINFO process fields are retained only as a generic note");
+        // Linux ELF32 elf_prpsinfo uses 32-bit flags, uid/gid and process IDs,
+        // followed by the fixed 16-byte command name and 80-byte argument
+        // prefix. Keep its class-specific offsets explicit instead of applying
+        // the ELF64 alignment/padding layout.
+        constexpr std::size_t process_info_size = 128;
+        if (bytes.size() < process_info_size) {
+            diagnostic(core, budget, "ELF32 NT_PRPSINFO note is shorter than its fixed Linux record");
+            return;
+        }
+        const auto id = [&](std::size_t at) {
+            return static_cast<std::uint32_t>(note_value(bytes, at, 4, header.order));
+        };
+        core.process_id = id(16);
+        core.parent_process_id = id(20);
+        core.process_group_id = id(24);
+        core.session_id = id(28);
+        core.executable = fixed_string(bytes.subspan(32, 16));
+        core.arguments = fixed_string(bytes.subspan(48, 80));
+        budget.include(sizeof(std::uint32_t) * 4 + core.executable->size() + core.arguments->size());
         return;
     }
     // Linux's ELF64 elf_prpsinfo layout: four state bytes, aligned unsigned
@@ -213,6 +238,102 @@ void read_thread_status(const ElfHeader &header, const ElfNote &note,
     core.threads.push_back(std::move(thread));
 }
 
+bool read_floating_point_state(const ElfHeader &header, const ElfNote &note,
+                              ElfCoreThread &thread, ElfCoreInfo &core, Budget &budget) {
+    const auto bytes = std::span<const std::byte>(note.description);
+    const bool x86_64 = header.machine == 62;
+    const bool aarch64 = header.machine == 183;
+    const auto expected = x86_64 ? std::size_t{512} : aarch64 ? std::size_t{528} : std::size_t{0};
+    if (!expected || header.order != ByteOrder::little || bytes.size() != expected) {
+        diagnostic(core, budget, "ELF NT_FPREGSET retained as a generic note: unsupported machine, byte order, or exact layout size");
+        return false;
+    }
+    if (note.description_file_offset > UINT64_MAX - bytes.size()) {
+        diagnostic(core, budget, "ELF NT_FPREGSET source offsets overflow");
+        return false;
+    }
+
+    ElfCoreFloatingPointState state;
+    state.layout = x86_64 ? "linux-x86_64-fpregs" : "linux-aarch64-fpsimd";
+    state.note_file_offset = note.file_offset;
+    state.payload_file_offset = note.description_file_offset;
+    const auto add_register = [&](std::string name, std::size_t offset, std::size_t size) {
+        if (offset > bytes.size() || size > bytes.size() - offset ||
+            note.description_file_offset > UINT64_MAX - offset) {
+            diagnostic(core, budget, "ELF NT_FPREGSET register source extent overflows");
+            return false;
+        }
+        budget.include(sizeof(ElfCoreFloatingPointRegister) + name.size() + size);
+        ElfCoreFloatingPointRegister reg;
+        reg.name = std::move(name);
+        reg.bytes.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                         bytes.begin() + static_cast<std::ptrdiff_t>(offset + size));
+        reg.file_offset = note.description_file_offset + offset;
+        state.registers.push_back(std::move(reg));
+        return true;
+    };
+    if (x86_64) {
+        for (const auto [name, offset, size] : std::array<std::tuple<const char *, std::size_t, std::size_t>, 8>{{
+                 {"cwd", 0, 2}, {"swd", 2, 2}, {"ftw", 4, 2}, {"fop", 6, 2},
+                 {"rip", 8, 8}, {"rdp", 16, 8}, {"mxcsr", 24, 4}, {"mxcr-mask", 28, 4}}})
+            if (!add_register(name, offset, size)) return false;
+        for (std::size_t i = 0; i < 8; ++i)
+            if (!add_register("st" + std::to_string(i), 32 + i * 16, 16)) return false;
+        for (std::size_t i = 0; i < 16; ++i)
+            if (!add_register("xmm" + std::to_string(i), 160 + i * 16, 16)) return false;
+    } else {
+        for (std::size_t i = 0; i < 32; ++i)
+            if (!add_register("v" + std::to_string(i), i * 16, 16)) return false;
+        if (!add_register("fpsr", 512, 4) || !add_register("fpcr", 516, 4)) return false;
+    }
+    budget.include(sizeof(ElfCoreFloatingPointState) + state.layout.size());
+    thread.floating_point.push_back(std::move(state));
+    return true;
+}
+
+bool read_arm_vfp_state(const ElfHeader &header, const ElfNote &note,
+                        ElfCoreThread &thread, ElfCoreInfo &core, Budget &budget) {
+    constexpr std::size_t register_bytes = 32 * 8;
+    constexpr std::size_t fpscr_offset = register_bytes;
+    constexpr std::size_t record_bytes = register_bytes + 4;
+    const auto bytes = std::span<const std::byte>(note.description);
+    if (note.name != "LINUX" || header.is_64 || header.machine != 40 || bytes.size() != record_bytes) {
+        diagnostic(core, budget,
+            "ELF NT_ARM_VFP retained as a generic note: unsupported machine, owner, or exact layout size");
+        return false;
+    }
+    if (note.description_file_offset > UINT64_MAX - bytes.size()) {
+        diagnostic(core, budget, "ELF NT_ARM_VFP source offsets overflow");
+        return false;
+    }
+
+    ElfCoreFloatingPointState state;
+    state.layout = "linux-arm32-vfp";
+    state.note_file_offset = note.file_offset;
+    state.payload_file_offset = note.description_file_offset;
+    const auto add_register = [&](std::string name, std::size_t offset, std::size_t size) {
+        if (offset > bytes.size() || size > bytes.size() - offset ||
+            note.description_file_offset > UINT64_MAX - offset) {
+            diagnostic(core, budget, "ELF NT_ARM_VFP register source extent overflows");
+            return false;
+        }
+        budget.include(sizeof(ElfCoreFloatingPointRegister) + name.size() + size);
+        ElfCoreFloatingPointRegister reg;
+        reg.name = std::move(name);
+        reg.bytes.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                         bytes.begin() + static_cast<std::ptrdiff_t>(offset + size));
+        reg.file_offset = note.description_file_offset + offset;
+        state.registers.push_back(std::move(reg));
+        return true;
+    };
+    for (std::size_t i = 0; i < 32; ++i)
+        if (!add_register("d" + std::to_string(i), i * 8, 8)) return false;
+    if (!add_register("fpscr", fpscr_offset, 4)) return false;
+    budget.include(sizeof(ElfCoreFloatingPointState) + state.layout.size());
+    thread.floating_point.push_back(std::move(state));
+    return true;
+}
+
 void read_auxiliary_values(const ElfHeader &header, const ElfNote &note,
                            ElfCoreInfo &core, Budget &budget, std::stop_token stop) {
     const auto bytes = std::span<const std::byte>(note.description);
@@ -294,6 +415,26 @@ void read_signal_info(const ElfHeader &header, const ElfNote &note,
     budget.include(sizeof(ElfCoreSignalInfo));
     core.signal_info.push_back(std::move(info));
 }
+
+void read_arm64_control_note(const ElfHeader &header, const ElfNote &note,
+                             ElfCoreInfo &core, Budget &budget) {
+    require(header.is_64 && header.machine == 183,
+            "AArch64 control note appears in a non-AArch64 ELF core");
+    const auto bytes = std::span<const std::byte>(note.description);
+    const bool pac_mask = note.type == nt_arm_pac_mask;
+    require(bytes.size() == (pac_mask ? 16u : 8u),
+            "AArch64 control note has an unsupported descriptor size");
+    if (note.description_file_offset > UINT64_MAX - bytes.size())
+        throw Failure{{ErrorCode::overflow, "AArch64 control note source offsets overflow"}};
+    ElfCoreArm64ControlNote row;
+    row.type = note.type;
+    row.first_value = note_value(bytes, 0, 8, header.order);
+    if (pac_mask) row.second_value = note_value(bytes, 8, 8, header.order);
+    row.note_file_offset = note.file_offset;
+    row.payload_file_offset = note.description_file_offset;
+    budget.include(sizeof(row));
+    core.arm64_control_notes.push_back(std::move(row));
+}
 } // namespace
 
 void read_core_notes(ElfMetadata &metadata, Budget &budget, std::stop_token stop) {
@@ -305,31 +446,61 @@ void read_core_notes(ElfMetadata &metadata, Budget &budget, std::stop_token stop
         if (program.type == 1 && program.memory_size)
             ++core.load_segment_count;
     }
+    std::optional<std::size_t> adjacent_thread;
     for (const auto &note : metadata.notes) {
         canceled(stop);
-        if (!note.program)
+        if (!note.program) {
+            adjacent_thread.reset();
             continue;
-        if (!linux_core_note(note))
+        }
+        if (!linux_core_note(note)) {
+            adjacent_thread.reset();
             continue;
-        if (note.type == nt_prpsinfo)
-            read_process_info(metadata.header, note, core, budget);
-        else if (note.type == nt_prstatus)
+        }
+        if (note.type == nt_prstatus) {
+            adjacent_thread.reset();
             read_thread_status(metadata.header, note, core, budget);
-        else if (note.type == nt_auxv || note.type == nt_file || note.type == nt_siginfo) {
+            if (!core.threads.empty() && core.threads.back().status == ElfCoreThreadStatus::decoded)
+                adjacent_thread = core.threads.size() - 1;
+        } else if (note.type == nt_fpregset || note.type == nt_arm_vfp) {
+            if (adjacent_thread && *adjacent_thread < core.threads.size()) {
+                if (note.type == nt_arm_vfp)
+                    read_arm_vfp_state(metadata.header, note, core.threads[*adjacent_thread], core, budget);
+                else
+                    read_floating_point_state(metadata.header, note, core.threads[*adjacent_thread], core, budget);
+            } else {
+                diagnostic(core, budget, note.type == nt_arm_vfp
+                    ? "ELF NT_ARM_VFP retained as a generic note: no immediately preceding valid NT_PRSTATUS thread"
+                    : "ELF NT_FPREGSET retained as a generic note: no immediately preceding valid NT_PRSTATUS thread");
+            }
+            adjacent_thread.reset();
+        } else if (note.type == nt_prpsinfo) {
+            adjacent_thread.reset();
+            read_process_info(metadata.header, note, core, budget);
+        } else if (note.type == nt_auxv || note.type == nt_file || note.type == nt_siginfo ||
+                   note.type == nt_arm_pac_mask || note.type == nt_arm_tagged_addr_ctrl ||
+                   note.type == nt_arm_pac_enabled_keys) {
+            adjacent_thread.reset();
             try {
                 if (note.type == nt_auxv)
                     read_auxiliary_values(metadata.header, note, core, budget, stop);
                 else if (note.type == nt_file)
                     read_file_mappings(metadata.header, note, core, budget, stop);
-                else
+                else if (note.type == nt_siginfo)
                     read_signal_info(metadata.header, note, core, budget);
+                else
+                    read_arm64_control_note(metadata.header, note, core, budget);
             } catch (const Failure &failure) {
                 if (failure.error.code == ErrorCode::canceled)
                     throw;
                 const auto label = note.type == nt_auxv ? "ELF NT_AUXV: "
-                                   : note.type == nt_file ? "ELF NT_FILE: " : "ELF NT_SIGINFO: ";
+                                   : note.type == nt_file ? "ELF NT_FILE: "
+                                   : note.type == nt_siginfo ? "ELF NT_SIGINFO: "
+                                   : "ELF AArch64 control note: ";
                 diagnostic(core, budget, std::string(label) + failure.error.message);
             }
+        } else {
+            adjacent_thread.reset();
         }
     }
     budget.include(sizeof(ElfCoreInfo));

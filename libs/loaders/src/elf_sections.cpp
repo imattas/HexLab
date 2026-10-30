@@ -1,5 +1,6 @@
 #include "elf_internal.hpp"
 #include <algorithm>
+#include <limits>
 namespace hexlab::elf_detail {
 void read_tables(const ByteStorage &storage, ElfMetadata &metadata, Budget &budget, std::stop_token stop) {
     const auto &h = metadata.header;
@@ -37,6 +38,9 @@ void read_tables(const ByteStorage &storage, ElfMetadata &metadata, Budget &budg
     constexpr std::uint32_t pt_note = 4;
     constexpr std::uint32_t pt_gnu_property = 0x6474e553;
     constexpr std::uint32_t sht_note = 7;
+    constexpr std::uint32_t nt_gnu_hwcap = 2;
+    constexpr std::uint32_t nt_gnu_abi_tag = 1;
+    constexpr std::uint32_t nt_gnu_build_id = 3;
     constexpr std::uint32_t nt_gnu_property_type_0 = 5;
     std::map<std::uint64_t, std::size_t> note_indices;
     for (std::size_t index = 0; index < metadata.notes.size(); ++index)
@@ -46,6 +50,15 @@ void read_tables(const ByteStorage &storage, ElfMetadata &metadata, Budget &budg
     for (std::size_t index = 0; index < metadata.gnu_properties.size(); ++index)
         property_indices.emplace(PropertyKey{metadata.gnu_properties[index].property_file_offset,
                                              metadata.gnu_properties[index].program}, index);
+    std::map<std::uint64_t, std::size_t> build_id_indices;
+    for (std::size_t index = 0; index < metadata.gnu_build_ids.size(); ++index)
+        build_id_indices.emplace(metadata.gnu_build_ids[index].note_file_offset, index);
+    std::map<std::uint64_t, std::size_t> abi_tag_indices;
+    for (std::size_t index = 0; index < metadata.gnu_abi_tags.size(); ++index)
+        abi_tag_indices.emplace(metadata.gnu_abi_tags[index].note_file_offset, index);
+    std::map<std::uint64_t, std::size_t> hwcap_indices;
+    for (std::size_t index = 0; index < metadata.gnu_hwcaps.size(); ++index)
+        hwcap_indices.emplace(metadata.gnu_hwcaps[index].note_file_offset, index);
     const auto parse_note_region = [&](std::uint64_t file_offset, std::uint64_t size,
                                        std::optional<std::uint32_t> program_index,
                                        std::optional<std::uint32_t> section_index) {
@@ -99,6 +112,109 @@ void read_tables(const ByteStorage &storage, ElfMetadata &metadata, Budget &budg
             }
             const auto &note = metadata.notes[note_index->second];
 
+            if (note.name == "GNU" && type == nt_gnu_build_id) {
+                require(!note.description.empty(), "GNU ELF build ID must not be empty");
+                const auto found = build_id_indices.find(cursor);
+                if (found == build_id_indices.end()) {
+                    budget.include(sizeof(ElfGnuBuildId) + note.description.size());
+                    ElfGnuBuildId build_id;
+                    build_id.program = note.program;
+                    build_id.section = note.section;
+                    build_id.note_file_offset = cursor;
+                    build_id.description_file_offset = note.description_file_offset;
+                    build_id.identifier = note.description;
+                    metadata.gnu_build_ids.push_back(std::move(build_id));
+                    build_id_indices.emplace(cursor, metadata.gnu_build_ids.size() - 1);
+                } else {
+                    auto &build_id = metadata.gnu_build_ids[found->second];
+                    if (!build_id.program)
+                        build_id.program = program_index;
+                    if (section_index)
+                        build_id.section = section_index;
+                }
+            }
+
+            if (note.name == "GNU" && type == nt_gnu_abi_tag) {
+                require(note.description.size() >= 16,
+                        "GNU ELF ABI tag must contain four 32-bit fields");
+                const auto found = abi_tag_indices.find(cursor);
+                if (found == abi_tag_indices.end()) {
+                    budget.include(sizeof(ElfGnuAbiTag) + note.description.size() - 16);
+                    const auto abi_bytes = std::span<const std::byte>(note.description);
+                    ElfGnuAbiTag tag;
+                    tag.program = note.program;
+                    tag.section = note.section;
+                    tag.note_file_offset = cursor;
+                    tag.description_file_offset = note.description_file_offset;
+                    tag.os = static_cast<std::uint32_t>(reader.value(abi_bytes, 0, 4));
+                    tag.major = static_cast<std::uint32_t>(reader.value(abi_bytes, 4, 4));
+                    tag.minor = static_cast<std::uint32_t>(reader.value(abi_bytes, 8, 4));
+                    tag.subminor = static_cast<std::uint32_t>(reader.value(abi_bytes, 12, 4));
+                    tag.extension.assign(note.description.begin() + 16, note.description.end());
+                    metadata.gnu_abi_tags.push_back(std::move(tag));
+                    abi_tag_indices.emplace(cursor, metadata.gnu_abi_tags.size() - 1);
+                } else {
+                    auto &tag = metadata.gnu_abi_tags[found->second];
+                    if (!tag.program) tag.program = program_index;
+                    if (section_index) tag.section = section_index;
+                }
+            }
+
+            if (note.name == "GNU" && type == nt_gnu_hwcap) {
+                const auto description = std::span<const std::byte>(note.description);
+                require(description.size() >= 8, "Truncated GNU ELF HWCAP descriptor");
+                const auto count = reader.value(description, 0, 4);
+                const auto mask = static_cast<std::uint32_t>(reader.value(description, 4, 4));
+                require(count <= 4096, "GNU ELF HWCAP entry count exceeds limit", ErrorCode::resource_limit);
+                auto found = hwcap_indices.find(cursor);
+                if (found == hwcap_indices.end()) {
+                    ElfGnuHwcap hwcap;
+                    hwcap.program = note.program;
+                    hwcap.section = note.section;
+                    hwcap.note_file_offset = cursor;
+                    hwcap.description_file_offset = note.description_file_offset;
+                    hwcap.mask = mask;
+                    hwcap.entries.reserve(static_cast<std::size_t>(count));
+                    std::uint64_t entry_at = 8;
+                    std::uint64_t aggregate_name_bytes = 0;
+                    for (std::uint64_t entry_index = 0; entry_index < count; ++entry_index) {
+                        canceled(stop);
+                        require(entry_at < description.size(), "GNU ELF HWCAP entries exceed descriptor");
+                        const auto record_at = entry_at;
+                        const auto bit = std::to_integer<std::uint8_t>(description[static_cast<std::size_t>(entry_at++)]);
+                        require(bit < 32, "GNU ELF HWCAP bit index exceeds mask width");
+                        const auto name_at = entry_at;
+                        const auto name_begin = description.begin() + static_cast<std::ptrdiff_t>(name_at);
+                        const auto name_end = std::find(name_begin, description.end(), std::byte{0});
+                        require(name_end != description.end(), "Unterminated GNU ELF HWCAP name");
+                        const auto name_size = static_cast<std::uint64_t>(name_end - name_begin);
+                        require(name_size && name_size <= 4096, "GNU ELF HWCAP name has invalid length");
+                        require(name_size <= 1024u * 1024u - aggregate_name_bytes,
+                                "GNU ELF HWCAP names exceed 1 MiB", ErrorCode::resource_limit);
+                        aggregate_name_bytes += name_size;
+                        budget.include(name_size);
+                        std::string name(reinterpret_cast<const char *>(description.data() +
+                                         static_cast<std::size_t>(name_at)),
+                                         static_cast<std::size_t>(name_size));
+                        hwcap.entries.push_back({bit, (mask & (std::uint32_t{1} << bit)) != 0,
+                                                 std::move(name),
+                                                 add(note.description_file_offset, record_at),
+                                                 add(note.description_file_offset, name_at)});
+                        entry_at = static_cast<std::uint64_t>(name_end - description.begin()) + 1;
+                    }
+                    require(entry_at == description.size(), "GNU ELF HWCAP descriptor has trailing bytes");
+                    budget.include(sizeof(ElfGnuHwcap) + count * sizeof(ElfGnuHwcapEntry));
+                    metadata.gnu_hwcaps.push_back(std::move(hwcap));
+                    hwcap_indices.emplace(cursor, metadata.gnu_hwcaps.size() - 1);
+                } else {
+                    auto &hwcap = metadata.gnu_hwcaps[found->second];
+                    require(hwcap.mask == mask && hwcap.entries.size() == count,
+                            "Conflicting GNU ELF HWCAP note views");
+                    if (!hwcap.program) hwcap.program = program_index;
+                    if (section_index) hwcap.section = section_index;
+                }
+            }
+
             // GNU program properties use target-class alignment inside the
             // note description. Keep every raw property, including unknown
             // types, while exposing exact property/data file provenance.
@@ -112,6 +228,17 @@ void read_tables(const ByteStorage &storage, ElfMetadata &metadata, Budget &budg
                     const auto property_type = static_cast<std::uint32_t>(
                         reader.value(description, static_cast<std::size_t>(property_at), 4));
                     const auto data_size = reader.value(description, static_cast<std::size_t>(property_at + 4), 4);
+                    constexpr std::uint32_t gnu_property_x86_feature_1_and = 0xc0000002;
+                    constexpr std::uint32_t gnu_property_x86_isa_1_needed = 0xc0008002;
+                    constexpr std::uint32_t gnu_property_x86_isa_1_used = 0xc0010002;
+                    constexpr std::uint32_t gnu_property_aarch64_feature_1_and = 0xc0000000;
+                    if (property_type == gnu_property_x86_feature_1_and ||
+                        ((h.machine == 3 || h.machine == 62) &&
+                         (property_type == gnu_property_x86_isa_1_needed ||
+                          property_type == gnu_property_x86_isa_1_used)) ||
+                        property_type == gnu_property_aarch64_feature_1_and)
+                        require(data_size == 4,
+                                "Known GNU x86/AArch64 property must contain exactly four bytes");
                     const auto data_at = add(property_at, 8);
                     require(data_size <= description.size() - data_at,
                             "GNU ELF property data exceeds note description");
@@ -182,6 +309,8 @@ void read_tables(const ByteStorage &storage, ElfMetadata &metadata, Budget &budg
                 reader.extent(s.offset, s.size);
             require(aligned(s.alignment), "ELF section alignment is not a power of two");
             if (s.flags & 2) {
+                require(s.alignment <= 1 || s.address % s.alignment == 0,
+                        "ELF allocated section address violates declared alignment");
                 const auto end = add(h.object_type == 1 ? 0 : s.address, s.size);
                 require(wide || end <= UINT64_C(0x100000000), "ELF32 section exceeds address domain");
             }
@@ -219,6 +348,61 @@ void read_tables(const ByteStorage &storage, ElfMetadata &metadata, Budget &budg
     } else {
         for (const auto &section : metadata.sections)
             require(section.name_index == 0, "ELF section has a name without a string table");
+    }
+
+    // GNU split-debug companion descriptors are small section payloads. Keep
+    // their identity/provenance only; selection and path opening belong to a
+    // caller-controlled resolver.
+    for (const auto &section : metadata.sections) {
+        canceled(stop);
+        if (section.name != ".gnu_debuglink" && section.name != ".gnu_debugaltlink")
+            continue;
+        require(section.type == 1, "GNU ELF debug companion section must be PROGBITS");
+        constexpr std::uint64_t max_descriptor_bytes = 8192;
+        require(section.size <= max_descriptor_bytes,
+                "GNU ELF debug companion descriptor exceeds limit", ErrorCode::resource_limit);
+        require(section.size <= std::numeric_limits<std::size_t>::max(),
+                "GNU ELF debug companion descriptor exceeds host address space", ErrorCode::resource_limit);
+        budget.include(section.size);
+        const auto descriptor = reader.bytes(section.offset, static_cast<std::size_t>(section.size));
+        const auto bytes = descriptor.bytes;
+        const auto terminator = std::find(bytes.begin(), bytes.end(), std::byte{0});
+        require(terminator != bytes.end(), "GNU ELF debug companion filename is unterminated");
+        const auto name_size = static_cast<std::size_t>(terminator - bytes.begin());
+        require(name_size != 0 && name_size <= 4096,
+                "GNU ELF debug companion filename has invalid length", ErrorCode::resource_limit);
+        const std::string filename(reinterpret_cast<const char *>(bytes.data()), name_size);
+        budget.include(name_size);
+        if (section.name == ".gnu_debuglink") {
+            const auto crc_at = (name_size + 1u + 3u) & ~std::size_t{3};
+            require(crc_at <= bytes.size() && bytes.size() - crc_at == 4,
+                    "GNU ELF debuglink has an invalid CRC extent");
+            for (std::size_t padding = name_size + 1; padding < crc_at; ++padding)
+                require(bytes[padding] == std::byte{0}, "GNU ELF debuglink padding is nonzero");
+            ElfGnuDebugLink link;
+            link.section = section.index;
+            link.file_offset = section.offset;
+            link.size = section.size;
+            link.crc_file_offset = add(section.offset, crc_at);
+            link.filename = filename;
+            link.crc32 = static_cast<std::uint32_t>(reader.value(bytes, crc_at, 4));
+            budget.include(sizeof(ElfGnuDebugLink));
+            metadata.gnu_debug_links.push_back(std::move(link));
+        } else {
+            const auto build_id_at = name_size + 1;
+            const auto build_id_size = bytes.size() - build_id_at;
+            require(build_id_size != 0 && build_id_size <= 4096,
+                    "GNU ELF debugaltlink build ID has invalid length", ErrorCode::resource_limit);
+            ElfGnuDebugAltLink link;
+            link.section = section.index;
+            link.file_offset = section.offset;
+            link.size = section.size;
+            link.build_id_file_offset = add(section.offset, build_id_at);
+            link.filename = filename;
+            link.build_id.assign(bytes.begin() + static_cast<std::ptrdiff_t>(build_id_at), bytes.end());
+            budget.include(sizeof(ElfGnuDebugAltLink) + build_id_size);
+            metadata.gnu_debug_altlinks.push_back(std::move(link));
+        }
     }
 }
 } // namespace hexlab::elf_detail

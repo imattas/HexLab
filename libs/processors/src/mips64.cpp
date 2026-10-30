@@ -54,6 +54,17 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
     };
     const RegisterOperand hi{RegisterBank::mips_hilo, 0, 64, false};
     const RegisterOperand lo{RegisterBank::mips_hilo, 1, 64, false};
+    if (op == 0x10) {
+        // ERET is the sole CP0 instruction currently modeled by this slice.
+        // Validate the entire fixed-field encoding so neighboring encodings
+        // cannot be mistaken for a return.
+        if (rs == 16 && rt == 0 && rd == 0 && shamt == 0 && funct == 0x18) {
+            i.opcode = Opcode::mips_eret;
+            i.flow = FlowKind::ret;
+            return {DecodeStatus::decoded, std::move(i), {}};
+        }
+        return {DecodeStatus::unsupported, {}, "MIPS64 COP0 operation is outside the ERET subset"};
+    }
     if (op == 0x11) {
         const RegisterOperand fcsr{RegisterBank::mips_fcsr, 0, 32, false};
         if (rs == 8) { // BC1F/BC1T, FCC0-FCC7, non-likely forms.
@@ -228,9 +239,27 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         if (load) i.register_writes = {fp}; else i.register_reads = {fp};
     } else if (op == 0) {
         switch (funct) {
-        case 0x08: case 0x09:
-            if (rt || shamt || (funct == 0x08 && rd)) return invalid("Reserved MIPS64 register jump encoding");
-            i.opcode = funct == 8 ? Opcode::mips_jr : Opcode::mips_jalr;
+        case 0x01: { // MOVCI: integer MOVF / MOVT, selected by an FCC bit.
+            if (shamt || (rt & 2)) return invalid("Reserved MIPS64 MOVCI encoding");
+            const auto cc = static_cast<std::uint8_t>((rt >> 2) & 7);
+            i.opcode = (rt & 1) ? Opcode::mips64_movt : Opcode::mips64_movf;
+            i.condition = cc;
+            i.operands = {reg(rd), reg(rs), ImmediateOperand{cc, 3, 32, false, {}}};
+            i.access = {OperandAccess::read_write, OperandAccess::read, OperandAccess::read};
+            // The false condition preserves all 64 destination bits. GPR0 is
+            // the constant zero; the encoded rt field is not a GPR source.
+            if (rd) i.register_reads.push_back(reg(rd));
+            if (rs) i.register_reads.push_back(reg(rs));
+            i.register_reads.push_back({RegisterBank::mips_fcsr, 0, 32, false});
+            if (rd) i.register_writes.push_back(reg(rd));
+            break;
+        }
+        case 0x08: case 0x09: {
+            if (rt || (shamt != 0 && shamt != 16) || (funct == 0x08 && rd)) return invalid("Reserved MIPS64 register jump encoding");
+            const bool hazard_barrier = shamt == 16;
+            i.opcode = funct == 8
+                ? (hazard_barrier ? Opcode::mips64_jr_hb : Opcode::mips_jr)
+                : (hazard_barrier ? Opcode::mips64_jalr_hb : Opcode::mips_jalr);
             i.operands = {reg(rs)};
             i.access = {OperandAccess::read};
             i.register_reads = {reg(rs)};
@@ -239,6 +268,7 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
             else i.flow = FlowKind::jump;
             i.delay_slots = 1;
             break;
+        }
         case 0x10: case 0x12: // MFHI/MFLO
             if (rs || rt || shamt) return invalid("Reserved MIPS64 HI/LO read encoding");
             i.opcode = funct == 0x10 ? Opcode::mips64_mfhi : Opcode::mips64_mflo;
@@ -299,10 +329,13 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         case 0x00: case 0x02: case 0x03: case 0x38: case 0x3a: case 0x3b:
         case 0x3c: case 0x3e: case 0x3f: {
             const bool rotate = (funct == 0x3a || funct == 0x3e) && rs == 1;
-            if (rs && !rotate) return invalid("Reserved MIPS64 fixed-shift encoding");
+            const bool word_rotate = funct == 0x02 && rs == 1;
+            if (rs && !rotate && !word_rotate) return invalid("Reserved MIPS64 fixed-shift encoding");
             unsigned amount = shamt;
             Opcode opcode;
-            if (rotate) {
+            if (word_rotate) {
+                opcode = Opcode::mips64_rotr;
+            } else if (rotate) {
                 opcode = funct == 0x3a ? Opcode::mips64_drotr : Opcode::mips64_drotr32;
                 if (funct == 0x3e) amount += 32;
             } else if (funct == 0x00) opcode = Opcode::mips64_sll;
@@ -335,8 +368,11 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
             if (rd) i.register_writes = {reg(rd)};
             break;
         case 0x04: case 0x06: case 0x07:
-            if (shamt) return invalid("Reserved MIPS64 variable-shift encoding");
-            i.opcode = funct == 4 ? Opcode::mips64_sllv : funct == 6 ? Opcode::mips64_srlv : Opcode::mips64_srav;
+            if (funct == 0x06 && shamt == 1) i.opcode = Opcode::mips64_rotrv;
+            else {
+                if (shamt) return invalid("Reserved MIPS64 variable-shift encoding");
+                i.opcode = funct == 4 ? Opcode::mips64_sllv : funct == 6 ? Opcode::mips64_srlv : Opcode::mips64_srav;
+            }
             i.operands = {reg(rd), reg(rt), reg(rs)};
             i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
             i.register_reads = {reg(rt), reg(rs)};
@@ -398,6 +434,58 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         if (rd) i.register_writes = {reg(rd)};
         }
     } else if (op == 0x1f) {
+        // SPECIAL3 byte/halfword shuffles and sign extension. These fields
+        // are distinct from the DEXT/DINS function family below.
+        if (rs == 0 && funct == 0x20) { // BSHFL
+            Opcode opcode;
+            switch (shamt) {
+            case 0x02: opcode = Opcode::mips64_wsbh; break;
+            case 0x10: opcode = Opcode::mips64_seb; break;
+            case 0x18: opcode = Opcode::mips64_seh; break;
+            default: return {DecodeStatus::unsupported, {}, "MIPS64 BSHFL suboperation is unsupported"};
+            }
+            i.opcode = opcode;
+            i.operands = {reg(rd), reg(rt)};
+            i.access = {OperandAccess::write, OperandAccess::read};
+            if (rt) i.register_reads = {reg(rt)};
+            if (rd) i.register_writes = {reg(rd)};
+            return {DecodeStatus::decoded, std::move(i), {}};
+        }
+        if (rs == 0 && funct == 0x24 && (shamt == 0x02 || shamt == 0x05)) { // DBSHFL
+            i.opcode = shamt == 0x02 ? Opcode::mips64_dsbh : Opcode::mips64_dshd;
+            i.operands = {reg(rd), reg(rt)};
+            i.access = {OperandAccess::write, OperandAccess::read};
+            if (rt) i.register_reads = {reg(rt)};
+            if (rd) i.register_writes = {reg(rd)};
+            return {DecodeStatus::decoded, std::move(i), {}};
+        }
+        // MIPS32 Release 2 EXT/INS remain word operations in a MIPS64
+        // execution context. EXT encodes size-1 in rd; INS encodes the
+        // inclusive most-significant bit there.
+        if (funct == 0x00 || funct == 0x04) {
+            const unsigned position = shamt;
+            const unsigned field = rd;
+            const bool insert = funct == 0x04;
+            unsigned size = 0;
+            if (!insert) {
+                size = field + 1;
+                if (position + size > 32) return invalid("Reserved MIPS64 EXT range");
+                i.opcode = Opcode::mips_ext;
+            } else {
+                if (field < position) return invalid("Reserved MIPS64 INS range");
+                size = field - position + 1;
+                i.opcode = Opcode::mips_ins;
+            }
+            i.operands = {reg(rt), reg(rs),
+                ImmediateOperand{position, 5, 32, false, EncodedField{3, 1}},
+                ImmediateOperand{size, 6, 32, false, EncodedField{2, 1}}};
+            i.access = {insert ? OperandAccess::read_write : OperandAccess::write,
+                        OperandAccess::read, OperandAccess::read, OperandAccess::read};
+            if (insert && rt) i.register_reads = {reg(rt)};
+            if (rs) i.register_reads.push_back(reg(rs));
+            if (rt) i.register_writes = {reg(rt)};
+            return {DecodeStatus::decoded, std::move(i), {}};
+        }
         // MIPS64 Release 2 SPECIAL3 doubleword extract/insert fields. The
         // three encodings divide the architectural field range into the
         // lower, crossing, and upper-word cases.
@@ -426,11 +514,12 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
             position = position_field; size = size_field - position_field + 1;
             insert = true; opcode = Opcode::mips64_dins; break;
         case 0x05: // DINSM; destination MSB is in the upper word.
-            position = position_field; size = size_field + 33;
+            position = position_field; size = size_field + 33 - position;
             if (position + size > 64) return invalid("Reserved MIPS64 DINSM range");
             insert = true; opcode = Opcode::mips64_dinsm; break;
         case 0x06: // DINSU; source and destination begin in the upper word.
-            position = position_field + 32; size = size_field + 1;
+            if (size_field < position_field) return invalid("Reserved MIPS64 DINSU range");
+            position = position_field + 32; size = size_field + 33 - position;
             if (position + size > 64) return invalid("Reserved MIPS64 DINSU range");
             insert = true; opcode = Opcode::mips64_dinsu; break;
         default:

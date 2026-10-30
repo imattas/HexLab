@@ -308,8 +308,13 @@ Result<SignatureScan> scan_executable_signatures(const Image &image, const ByteS
         }
         require(limits.max_results && limits.max_results <= 100000 && limits.max_candidates &&
                     limits.max_candidates <= 16777216 && limits.max_comparisons && limits.max_comparisons <= 67108864 &&
-                    limits.max_scanned_bytes && limits.max_scanned_bytes <= 268435456,
+                    limits.max_scanned_bytes && limits.max_scanned_bytes <= 268435456 &&
+                    limits.minimum_constrained_bits <= 2048,
                 "Signature scan limits exceed supported bounds", ErrorCode::resource_limit);
+        if (limits.file_range)
+            require(limits.file_range->size && limits.file_range->begin.value <= bytes.size() &&
+                        limits.file_range->size <= bytes.size() - limits.file_range->begin.value,
+                    "Signature scan file range exceeds source extent", ErrorCode::invalid_argument);
         SignatureScan scan;
         std::uint64_t scanned_bytes = 0;
         Reader reader{bytes};
@@ -325,10 +330,22 @@ Result<SignatureScan> scan_executable_signatures(const Image &image, const ByteS
             if (!segment.executable || segment.file_size == 0) continue;
             require(segment.file_begin.value <= bytes.size() && segment.file_size <= bytes.size() - segment.file_begin.value,
                     "Executable segment exceeds source extent", ErrorCode::integrity);
+            auto scan_file_begin = segment.file_begin.value;
+            auto scan_file_size = segment.file_size;
+            if (limits.file_range) {
+                const auto segment_end = segment.file_begin.value + segment.file_size;
+                const auto range_begin = limits.file_range->begin.value;
+                const auto range_end = range_begin + limits.file_range->size;
+                scan_file_begin = std::max(segment.file_begin.value, range_begin);
+                const auto scan_file_end = std::min(segment_end, range_end);
+                if (scan_file_begin >= scan_file_end) continue;
+                scan_file_size = scan_file_end - scan_file_begin;
+            }
             std::map<unsigned, std::vector<Anchor>> anchors;
             for (std::size_t d = 0; d < definitions.size(); ++d) {
+                if (specificity[d].first < limits.minimum_constrained_bits) continue;
                 const auto &pattern = definitions[d].pattern;
-                if (pattern.size() > segment.file_size) continue;
+                if (pattern.size() > scan_file_size) continue;
                 std::size_t best_start = 0, best_length = 0;
                 for (std::size_t i = 0; i < pattern.size();) {
                     if (pattern[i].mask != std::byte{0xff}) { ++i; continue; }
@@ -339,28 +356,29 @@ Result<SignatureScan> scan_executable_signatures(const Image &image, const ByteS
                 require(best_length != 0, "Signature pattern requires at least one exact byte");
                 anchors[std::to_integer<unsigned>(pattern[best_start].value)].push_back({d, best_start, best_length});
             }
+            if (anchors.empty()) continue;
 
             // First index signatures by the leading byte of their longest exact run. Only
             // positions passing that anchor enter full-pattern verification.
             std::vector<std::vector<std::uint64_t>> candidates(definitions.size());
-            for (std::uint64_t delta = 0; delta < segment.file_size; ++delta) {
+            for (std::uint64_t delta = 0; delta < scan_file_size; ++delta) {
                 canceled(stop);
                 require(scanned_bytes < limits.max_scanned_bytes, "Signature indexed-byte budget reached", ErrorCode::resource_limit);
                 ++scanned_bytes;
-                const auto found = anchors.find(std::to_integer<unsigned>(reader.at(segment.file_begin.value + delta)));
+                const auto found = anchors.find(std::to_integer<unsigned>(reader.at(scan_file_begin + delta)));
                 if (found == anchors.end()) continue;
                 for (const auto &anchor : found->second) {
-                    if (anchor.pattern_offset > delta || anchor.length > segment.file_size - delta) continue;
+                    if (anchor.pattern_offset > delta || anchor.length > scan_file_size - delta) continue;
                     const auto start = delta - anchor.pattern_offset;
                     const auto width = definitions[anchor.definition].pattern.size();
-                    if (width > segment.file_size - start) continue;
+                    if (width > scan_file_size - start) continue;
                     bool anchor_matches = true;
                     for (std::size_t n = 0; n < anchor.length; ++n) {
                         canceled(stop);
                         require(scan.comparisons < limits.max_comparisons,
                                 "Signature comparison budget reached", ErrorCode::resource_limit);
                         ++scan.comparisons;
-                        if (reader.at(segment.file_begin.value + delta + n) !=
+                        if (reader.at(scan_file_begin + delta + n) !=
                             definitions[anchor.definition].pattern[anchor.pattern_offset + n].value) {
                             anchor_matches = false;
                             break;
@@ -377,11 +395,11 @@ Result<SignatureScan> scan_executable_signatures(const Image &image, const ByteS
                 const auto &definition = definitions[d];
                 for (const auto delta : candidates[d]) {
                     canceled(stop);
-                    const auto file = segment.file_begin.value + delta;
+                    const auto file = scan_file_begin + delta;
                     if (!matches(reader, file, definition.pattern, scan.comparisons, limits, stop)) continue;
                     bool excluded = false;
                     for (const auto &negative : definition.exclusions) {
-                        if (negative.size() <= segment.file_size - delta &&
+                        if (negative.size() <= scan_file_size - delta &&
                             matches(reader, file, negative, scan.comparisons, limits, stop)) {
                             excluded = true;
                             break;
@@ -389,9 +407,10 @@ Result<SignatureScan> scan_executable_signatures(const Image &image, const ByteS
                     }
                     if (excluded) continue;
                     require(scan.matches.size() < limits.max_results, "Signature result limit reached", ErrorCode::resource_limit);
-                    require(delta <= UINT64_MAX - segment.begin.offset, "Executable address overflows", ErrorCode::integrity);
+                    const auto segment_delta = file - segment.file_begin.value;
+                    require(segment_delta <= UINT64_MAX - segment.begin.offset, "Executable address overflows", ErrorCode::integrity);
                     scan.matches.push_back({definition.name, definition.provenance, {file},
-                                            {segment.begin.space, segment.begin.offset + delta}, d,
+                                            {segment.begin.space, segment.begin.offset + segment_delta}, d,
                                             specificity[d].first, specificity[d].second});
                 }
             }
@@ -598,6 +617,43 @@ Result<SignatureDefinition> create_function_signature(const Image &image, const 
     });
 }
 
+Result<SignatureCatalog> create_function_signature_catalog(const Image &image, const ByteStorage &bytes,
+        const FunctionSnapshot &snapshot, std::span<const FunctionId> selected_functions,
+        std::string provenance, const FunctionSignatureOptions &options, std::stop_token stop) {
+    return guarded([&]() -> Result<SignatureCatalog> {
+        canceled(stop);
+        require(!selected_functions.empty() && selected_functions.size() <= 4096,
+                "Signature catalog selection must contain 1 through 4,096 functions", ErrorCode::resource_limit);
+        require(!provenance.empty() && provenance.size() <= 256 &&
+                    provenance.find_first_of("|\r\n") == std::string::npos,
+                "Invalid signature catalog provenance");
+        SignatureCatalog catalog{2, {}, image.layout().architecture, image.layout().mode};
+        std::set<std::uint64_t> selected_ids;
+        std::set<std::string> names;
+        for (const auto id : selected_functions) {
+            canceled(stop);
+            require(selected_ids.insert(id.value).second,
+                    "Signature catalog selection contains a duplicate function ID");
+            const auto function = std::find_if(snapshot.functions.begin(), snapshot.functions.end(),
+                [&](const auto &candidate) { return candidate && candidate->id == id; });
+            require(function != snapshot.functions.end(),
+                    "Signature catalog selection contains a stale or unknown function ID");
+            std::ostringstream name;
+            name << "sub_" << std::hex << std::uppercase << (*function)->entry.space.value
+                 << '_' << (*function)->entry.offset;
+            require(names.insert(name.str()).second,
+                    "Signature catalog selection has duplicate entry addresses");
+            auto definition = create_function_signature(image, bytes, **function, snapshot,
+                                                        name.str(), provenance, options, stop);
+            if (!definition) return definition.error();
+            catalog.definitions.push_back(std::move(definition.value()));
+        }
+        auto encoded = serialize_signature_catalog(catalog);
+        require(bool(encoded), encoded ? "" : encoded.error().message);
+        return catalog;
+    });
+}
+
 Result<FunctionSignatureRecognition> recognize_function_signatures(const Image &image, const ByteStorage &bytes,
         const FunctionSnapshot &snapshot, std::span<const SignatureDefinition> definitions,
         const SignatureLimits &limits, std::stop_token stop) {
@@ -699,7 +755,7 @@ class TokenWriter {
 };
 
 void token_register(TokenWriter &out, const RegisterOperand &reg) {
-    out.u8(static_cast<std::uint8_t>(reg.bank)); out.u8(reg.index); out.u16(reg.width); out.u8(reg.high_byte);
+    out.u8(static_cast<std::uint8_t>(reg.bank)); out.u16(reg.index); out.u16(reg.width); out.u8(reg.high_byte);
 }
 void token_address(TokenWriter &out, Address address) {
     out.u32(address.space.value); out.u64(address.offset);
@@ -924,6 +980,7 @@ Result<std::pair<std::vector<std::byte>, std::uint32_t>> fingerprint_tokens(
                     const auto &arm = *canonical.arm;
                     out.u8(static_cast<std::uint8_t>(arm.predicate)); out.u8(static_cast<std::uint8_t>(arm.exchange));
                     out.u8(arm.flags_written); out.u8(arm.flags_known); out.u8(arm.writes_pc); out.u8(arm.writeback);
+                    out.u8(arm.q_flag_may_set);
                     out.u8(static_cast<std::uint8_t>(arm.multiple_mode));
                     out.u8(arm.it_before.known); out.u8(arm.it_before.bits);
                     out.u8(arm.it_after.known); out.u8(arm.it_after.bits);
@@ -993,6 +1050,35 @@ Result<FunctionFingerprintDefinition> create_function_fingerprint(const Image &i
         const FunctionRecord &function, const FunctionSnapshot &snapshot, std::string name,
         std::string provenance, const FunctionFingerprintOptions &options, std::stop_token stop) {
     return fingerprint_definition(image, bytes, function, snapshot, std::move(name), std::move(provenance), options, stop);
+}
+
+Result<FunctionFingerprintCatalog> create_function_fingerprint_catalog(const Image &image, const ByteStorage &bytes,
+        const FunctionSnapshot &snapshot, std::span<const FunctionId> selected_functions,
+        std::string provenance, const FunctionFingerprintOptions &options, std::stop_token stop) {
+    return guarded([&]() -> Result<FunctionFingerprintCatalog> {
+        require(!selected_functions.empty() && selected_functions.size() <= 4096,
+                "Fingerprint catalog selection must contain 1 through 4,096 functions", ErrorCode::resource_limit);
+        require(!provenance.empty() && provenance.size() <= 256 && provenance.find_first_of("|\r\n") == std::string::npos,
+                "Invalid fingerprint catalog provenance");
+        FunctionFingerprintCatalog catalog{1, image.layout().architecture, image.layout().mode, {}};
+        std::set<std::uint64_t> selected_ids;
+        std::set<std::string> names;
+        for (const auto id : selected_functions) {
+            canceled(stop);
+            require(selected_ids.insert(id.value).second, "Fingerprint catalog selection contains a duplicate function ID");
+            const auto function = std::find_if(snapshot.functions.begin(), snapshot.functions.end(),
+                [&](const auto &candidate) { return candidate && candidate->id == id; });
+            require(function != snapshot.functions.end(), "Fingerprint catalog selection contains a stale or unknown function ID");
+            std::ostringstream name;
+            name << "sub_" << std::hex << std::uppercase << (*function)->entry.space.value
+                 << '_' << (*function)->entry.offset;
+            require(names.insert(name.str()).second, "Fingerprint catalog selection has duplicate entry addresses");
+            auto definition = fingerprint_definition(image, bytes, **function, snapshot, name.str(), provenance, options, stop);
+            if (!definition) return definition.error();
+            catalog.definitions.push_back(std::move(definition.value()));
+        }
+        return catalog;
+    });
 }
 
 Result<std::string> serialize_function_fingerprint_catalog(const FunctionFingerprintCatalog &catalog) {
@@ -1087,15 +1173,21 @@ Result<FunctionFingerprintCatalog> parse_function_fingerprint_catalog(std::strin
 Result<FunctionFingerprintRecognition> recognize_function_fingerprints(const Image &image, const ByteStorage &bytes,
         const FunctionSnapshot &snapshot, const FunctionFingerprintCatalog &catalog,
         const FunctionFingerprintLimits &limits, std::stop_token stop) {
+    return recognize_function_fingerprints(image, bytes, snapshot,
+        FunctionFingerprintCatalogSet{{catalog}}, limits, stop);
+}
+
+Result<FunctionFingerprintRecognition> recognize_function_fingerprints(const Image &image, const ByteStorage &bytes,
+        const FunctionSnapshot &snapshot, const FunctionFingerprintCatalogSet &catalog_set,
+        const FunctionFingerprintLimits &limits, std::stop_token stop) {
     return guarded([&]() -> Result<FunctionFingerprintRecognition> {
         canceled(stop);
-        require(catalog.format_version == 1 && catalog.target_architecture == image.layout().architecture &&
-                    catalog.target_mode == image.layout().mode,
-                "Fingerprint catalog target does not match image architecture and mode");
-        require(!catalog.definitions.empty() && catalog.definitions.size() <= 4096 &&
-                    limits.max_functions && limits.max_functions <= 100000 &&
+        require(!catalog_set.catalogs.empty() && catalog_set.catalogs.size() <= 256,
+                "Fingerprint catalog set is empty or exceeds 256 catalogs", ErrorCode::resource_limit);
+        require(limits.max_functions && limits.max_functions <= 100000 &&
                     limits.max_instructions && limits.max_instructions <= 4000000 &&
                     limits.max_token_bytes && limits.max_token_bytes <= 256ull * 1024 * 1024 &&
+                    limits.max_definition_checks && limits.max_definition_checks <= 268435456 &&
                     limits.per_function.max_instructions && limits.per_function.max_instructions <= 2048 &&
                     limits.per_function.max_blocks && limits.per_function.max_blocks <= 4096 &&
                     limits.per_function.max_token_bytes && limits.per_function.max_token_bytes <= 4 * 1024 * 1024,
@@ -1105,11 +1197,22 @@ Result<FunctionFingerprintRecognition> recognize_function_fingerprints(const Ima
         result.complete = snapshot.complete;
         std::map<AddressKey, std::vector<FunctionFingerprintCandidate>> matches;
         std::set<AddressKey> entries;
-        for (const auto &definition : catalog.definitions) {
-            require(definition.target_architecture == catalog.target_architecture &&
-                        definition.target_mode == catalog.target_mode && definition.instruction_count > 0 &&
-                        definition.instruction_count <= limits.per_function.max_instructions,
-                    "Fingerprint definition target/count is inconsistent with its catalog");
+        std::size_t definition_total = 0;
+        for (const auto &catalog : catalog_set.catalogs) {
+            canceled(stop);
+            require(catalog.format_version == 1 && catalog.target_architecture == image.layout().architecture &&
+                        catalog.target_mode == image.layout().mode && !catalog.definitions.empty() &&
+                        catalog.definitions.size() <= 4096,
+                    "Fingerprint catalog target does not match image or catalog is invalid");
+            require(catalog.definitions.size() <= 65536 - definition_total,
+                    "Fingerprint catalog set exceeds 65,536 definitions", ErrorCode::resource_limit);
+            definition_total += catalog.definitions.size();
+            for (const auto &definition : catalog.definitions) {
+                require(definition.target_architecture == catalog.target_architecture &&
+                            definition.target_mode == catalog.target_mode && definition.instruction_count > 0 &&
+                            definition.instruction_count <= limits.per_function.max_instructions,
+                        "Fingerprint definition target/count is inconsistent with its catalog");
+            }
         }
         for (const auto &function : snapshot.functions) {
             canceled(stop);
@@ -1127,11 +1230,16 @@ Result<FunctionFingerprintRecognition> recognize_function_fingerprints(const Ima
             Sha256 hash; auto updated = hash.update(tokens.value().first);
             require(bool(updated), updated ? "" : updated.error().message, ErrorCode::resource_limit);
             const auto digest = hash.digest();
-            for (const auto &definition : catalog.definitions) {
-                canceled(stop);
-                if (definition.instruction_count == tokens.value().second && definition.digest == digest)
-                    matches[address_key(function->entry)].push_back({definition.name, definition.provenance,
-                        definition.instruction_count, definition.digest});
+            for (std::size_t catalog_index = 0; catalog_index < catalog_set.catalogs.size(); ++catalog_index) {
+                for (const auto &definition : catalog_set.catalogs[catalog_index].definitions) {
+                    canceled(stop);
+                    require(result.definition_checks < limits.max_definition_checks,
+                            "Fingerprint definition comparison budget reached", ErrorCode::resource_limit);
+                    ++result.definition_checks;
+                    if (definition.instruction_count == tokens.value().second && definition.digest == digest)
+                        matches[address_key(function->entry)].push_back({definition.name, definition.provenance,
+                            definition.instruction_count, definition.digest, catalog_index});
+                }
             }
         }
         for (auto &[key, candidates] : matches) {
@@ -1159,6 +1267,7 @@ void evidence_key(std::vector<std::byte>& out,const AnalysisKey& key){
     evidence_u64(out,key.byte_revision);evidence_u64(out,key.decision_revision);
     out.insert(out.end(),key.recipe_fingerprint.begin(),key.recipe_fingerprint.end());
     out.insert(out.end(),key.engine_fingerprint.begin(),key.engine_fingerprint.end());
+    if(key.external_input_fingerprint){evidence_u8(out,1);out.insert(out.end(),key.external_input_fingerprint->begin(),key.external_input_fingerprint->end());}
 }
 struct EvidenceReader {
     std::span<const std::byte> bytes;std::size_t at=0;
@@ -1168,13 +1277,15 @@ struct EvidenceReader {
     std::uint64_t u64(){std::uint64_t v=0;for(unsigned i=0;i<8;++i)v|=std::uint64_t(u8())<<(i*8);return v;}
     std::string string(std::size_t maximum){const auto size=u16();require(size>0&&size<=maximum&&size<=bytes.size()-at,"Invalid recognition evidence string extent");std::string value;value.reserve(size);for(std::size_t i=0;i<size;++i)value.push_back(static_cast<char>(u8()));return value;}
     Sha256Digest digest(){require(bytes.size()-at>=32,"Truncated recognition evidence digest");Sha256Digest value{};std::copy_n(bytes.begin()+static_cast<std::ptrdiff_t>(at),32,value.begin());at+=32;return value;}
-    AnalysisKey key(){AnalysisKey value;value.input.size=u64();value.input.sha256=digest();value.byte_revision=u64();value.decision_revision=u64();value.recipe_fingerprint=digest();value.engine_fingerprint=digest();return value;}
+    AnalysisKey key(bool has_external=false){AnalysisKey value;value.input.size=u64();value.input.sha256=digest();value.byte_revision=u64();value.decision_revision=u64();value.recipe_fingerprint=digest();value.engine_fingerprint=digest();if(has_external&&u8()){value.external_input_fingerprint=digest();}return value;}
 };
 void validate_evidence(const FunctionRecognitionEvidence& evidence){
     const bool legacy_kind=evidence.kind==FunctionRecognitionKind::byte_signatures||evidence.kind==FunctionRecognitionKind::normalized_fingerprints;
-    const bool valid_legacy=evidence.format_version==1&&legacy_kind;
-    const bool valid_flirt=evidence.format_version==2&&evidence.kind==FunctionRecognitionKind::flirt_patterns;
+    const bool valid_legacy=(evidence.format_version==1||evidence.format_version==3||evidence.format_version==4)&&legacy_kind;
+    const bool valid_flirt=(evidence.format_version==2||evidence.format_version==3||evidence.format_version==4)&&evidence.kind==FunctionRecognitionKind::flirt_patterns;
     require(valid_legacy||valid_flirt,"Unsupported function recognition evidence version or kind",ErrorCode::unsupported);
+    require((evidence.format_version==4)==evidence.source_key.external_input_fingerprint.has_value(),
+            "Recognition evidence format does not match its external-input identity",ErrorCode::integrity);
     require(evidence.functions.size()<=100000,"Function recognition evidence function limit exceeded",ErrorCode::resource_limit);
     std::set<std::uint64_t> ids;std::set<AddressKey> entries;std::uint64_t candidates=0;
     for(const auto& function:evidence.functions){
@@ -1187,6 +1298,8 @@ void validate_evidence(const FunctionRecognitionEvidence& evidence){
                 require(candidate.instruction_count>0,"Fingerprint evidence has no instruction count");
             if(evidence.kind==FunctionRecognitionKind::flirt_patterns)
                 require(candidate.symbol_kind<=1&&candidate.matching_patterns>0,"Invalid FLAIR candidate metadata");
+            if(evidence.format_version>=3)
+                require(candidate.catalog_index<256,"Recognition evidence catalog index exceeds limit",ErrorCode::resource_limit);
         }
     }
 }
@@ -1197,11 +1310,11 @@ Result<FunctionRecognitionEvidence> make_function_recognition_evidence(const Fun
     return guarded([&]()->Result<FunctionRecognitionEvidence>{
         canceled(stop);require(snapshot.key&&recognition.source_key&&*snapshot.key==*recognition.source_key,
             "Signature recognition is not bound to the current source identity",ErrorCode::conflict);
-        FunctionRecognitionEvidence evidence;evidence.kind=FunctionRecognitionKind::byte_signatures;
+        FunctionRecognitionEvidence evidence;evidence.format_version=snapshot.key->external_input_fingerprint?4:3;evidence.kind=FunctionRecognitionKind::byte_signatures;
         evidence.source_key=*snapshot.key;evidence.catalog_digest=catalog_digest;evidence.complete=recognition.complete;
         evidence.functions.reserve(recognition.functions.size());
         for(const auto& function:recognition.functions){canceled(stop);FunctionRecognitionRecord record;record.function=function.function;record.entry=function.entry;record.ambiguous=function.ambiguous;
-            for(const auto& candidate:function.candidates)record.candidates.push_back({candidate.name,candidate.provenance,candidate.constrained_bits,candidate.pattern_bytes,0,{}});
+            for(const auto& candidate:function.candidates)record.candidates.push_back({candidate.name,candidate.provenance,candidate.constrained_bits,candidate.pattern_bytes,0,{},0,0,static_cast<std::uint32_t>(candidate.catalog_index)});
             evidence.functions.push_back(std::move(record));}
         validate_evidence(evidence);return evidence;
     });
@@ -1211,11 +1324,11 @@ Result<FunctionRecognitionEvidence> make_function_recognition_evidence(const Fun
     return guarded([&]()->Result<FunctionRecognitionEvidence>{
         canceled(stop);require(snapshot.key&&recognition.source_key&&*snapshot.key==*recognition.source_key,
             "Fingerprint recognition is not bound to the current source identity",ErrorCode::conflict);
-        FunctionRecognitionEvidence evidence;evidence.kind=FunctionRecognitionKind::normalized_fingerprints;
+        FunctionRecognitionEvidence evidence;evidence.format_version=snapshot.key->external_input_fingerprint?4:3;evidence.kind=FunctionRecognitionKind::normalized_fingerprints;
         evidence.source_key=*snapshot.key;evidence.catalog_digest=catalog_digest;evidence.complete=recognition.complete;
         evidence.functions.reserve(recognition.functions.size());
         for(const auto& function:recognition.functions){canceled(stop);FunctionRecognitionRecord record;record.function=function.function;record.entry=function.entry;record.ambiguous=function.ambiguous;
-            for(const auto& candidate:function.candidates)record.candidates.push_back({candidate.name,candidate.provenance,0,0,candidate.instruction_count,candidate.digest});
+            for(const auto& candidate:function.candidates)record.candidates.push_back({candidate.name,candidate.provenance,0,0,candidate.instruction_count,candidate.digest,0,0,static_cast<std::uint32_t>(candidate.catalog_index)});
             evidence.functions.push_back(std::move(record));}
         validate_evidence(evidence);return evidence;
     });
@@ -1242,7 +1355,8 @@ Result<std::vector<std::byte>> encode_function_recognition_evidence(const Functi
             for(const auto& candidate:function.candidates){evidence_u16(out,static_cast<std::uint16_t>(candidate.name.size()));for(auto ch:candidate.name)evidence_u8(out,static_cast<std::uint8_t>(ch));
                 evidence_u16(out,static_cast<std::uint16_t>(candidate.provenance.size()));for(auto ch:candidate.provenance)evidence_u8(out,static_cast<std::uint8_t>(ch));
                 evidence_u32(out,candidate.constrained_bits);evidence_u32(out,candidate.pattern_bytes);evidence_u32(out,candidate.instruction_count);out.insert(out.end(),candidate.digest.begin(),candidate.digest.end());
-                if(evidence.format_version>=2){evidence_u8(out,candidate.symbol_kind);evidence_u32(out,candidate.matching_patterns);}}
+                if(evidence.format_version>=2){evidence_u8(out,candidate.symbol_kind);evidence_u32(out,candidate.matching_patterns);}
+                if(evidence.format_version>=3)evidence_u32(out,candidate.catalog_index);}
             require(out.size()<=16*1024*1024,"Recognition evidence payload exceeds 16 MiB",ErrorCode::resource_limit);
         }
         return out;
@@ -1253,11 +1367,11 @@ Result<FunctionRecognitionEvidence> decode_function_recognition_evidence(std::sp
     return guarded([&]()->Result<FunctionRecognitionEvidence>{
         canceled(stop);require(bytes.size()>=164&&bytes.size()<=16*1024*1024,"Recognition evidence payload extent is invalid",ErrorCode::integrity);
         EvidenceReader reader{bytes};require(reader.u8()=='H'&&reader.u8()=='X'&&reader.u8()=='R'&&reader.u8()=='E',"Invalid recognition evidence magic",ErrorCode::integrity);
-        FunctionRecognitionEvidence evidence;evidence.format_version=reader.u16();require(evidence.format_version==1||evidence.format_version==2,"Unsupported recognition evidence format",ErrorCode::unsupported);evidence.kind=static_cast<FunctionRecognitionKind>(reader.u8());const auto complete=reader.u8();require(complete<=1,"Invalid recognition evidence completion flag",ErrorCode::integrity);evidence.complete=complete!=0;
-        evidence.source_key=reader.key();evidence.catalog_digest=reader.digest();const auto count=reader.u32();require(count<=100000,"Recognition evidence function count exceeds limit",ErrorCode::resource_limit);evidence.functions.reserve(count);
+        FunctionRecognitionEvidence evidence;evidence.format_version=reader.u16();require(evidence.format_version==1||evidence.format_version==2||evidence.format_version==3||evidence.format_version==4,"Unsupported recognition evidence format",ErrorCode::unsupported);evidence.kind=static_cast<FunctionRecognitionKind>(reader.u8());const auto complete=reader.u8();require(complete<=1,"Invalid recognition evidence completion flag",ErrorCode::integrity);evidence.complete=complete!=0;
+        evidence.source_key=reader.key(evidence.format_version>=4);evidence.catalog_digest=reader.digest();const auto count=reader.u32();require(count<=100000,"Function recognition evidence function count exceeds limit",ErrorCode::resource_limit);evidence.functions.reserve(count);
         for(std::uint32_t i=0;i<count;++i){canceled(stop);FunctionRecognitionRecord function;function.function={reader.u64()};function.entry={{reader.u32()},reader.u64()};const auto ambiguous=reader.u8();require(ambiguous<=1,"Invalid recognition evidence ambiguity flag",ErrorCode::integrity);function.ambiguous=ambiguous!=0;
             const auto candidates=reader.u16();require(candidates>0&&candidates<=4096,"Recognition evidence candidate count exceeds limit",ErrorCode::resource_limit);function.candidates.reserve(candidates);
-            for(std::uint16_t n=0;n<candidates;++n){FunctionRecognitionCandidateEvidence candidate;candidate.name=reader.string(256);candidate.provenance=reader.string(256);candidate.constrained_bits=reader.u32();candidate.pattern_bytes=reader.u32();candidate.instruction_count=reader.u32();candidate.digest=reader.digest();if(evidence.format_version>=2){candidate.symbol_kind=reader.u8();candidate.matching_patterns=reader.u32();}function.candidates.push_back(std::move(candidate));}
+            for(std::uint16_t n=0;n<candidates;++n){FunctionRecognitionCandidateEvidence candidate;candidate.name=reader.string(256);candidate.provenance=reader.string(256);candidate.constrained_bits=reader.u32();candidate.pattern_bytes=reader.u32();candidate.instruction_count=reader.u32();candidate.digest=reader.digest();if(evidence.format_version>=2){candidate.symbol_kind=reader.u8();candidate.matching_patterns=reader.u32();}if(evidence.format_version>=3)candidate.catalog_index=reader.u32();function.candidates.push_back(std::move(candidate));}
             evidence.functions.push_back(std::move(function));}
         require(reader.at==bytes.size(),"Trailing bytes in recognition evidence",ErrorCode::integrity);validate_evidence(evidence);
         require(evidence.source_key==expected&&evidence.kind==expected_kind,"Recognition evidence source or kind mismatch",ErrorCode::conflict);return evidence;

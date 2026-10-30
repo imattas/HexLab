@@ -11,10 +11,103 @@
 #include <wx/filedlg.h>
 #include <wx/msgdlg.h>
 #include <wx/settings.h>
+#include <wx/config.h>
 #include <algorithm>
 #include <array>
 namespace hexlab::desktop {
 namespace {
+constexpr std::size_t recent_find_limit = 16, recent_find_value_limit = 4096;
+struct RecentFind {
+    wxString value;
+    long kind = 0, encoding = 1, width = 3, results = 256, positions = 1048576;
+    bool signed_value = false, case_sensitive = true;
+    bool operator==(const RecentFind&) const = default;
+};
+bool valid_recent_find(const RecentFind& setup) {
+    if (setup.kind < 0 || setup.kind > 2 || setup.encoding < 0 || setup.encoding > 7 ||
+        setup.width < 0 || setup.width > 3 || setup.results < 1 || setup.results > 4096 ||
+        setup.positions < 1 || setup.positions > 16777216 || setup.value.length() > recent_find_value_limit)
+        return false;
+    const auto value = setup.value.utf8_string();
+    if (value.size() > recent_find_value_limit || value.find('\0') != std::string::npos) return false;
+    constexpr TextEncoding encodings[] = {TextEncoding::ascii, TextEncoding::utf8, TextEncoding::utf16le,
+                                          TextEncoding::utf16be, TextEncoding::utf32le, TextEncoding::utf32be,
+                                          TextEncoding::windows1252, TextEncoding::iso8859_1};
+    constexpr std::uint16_t widths[] = {8, 16, 32, 64};
+    SearchQuery query = BytePattern{value};
+    if (setup.kind == 1) query = TextQuery{value, encodings[setup.encoding], setup.case_sensitive};
+    else if (setup.kind == 2) query = ImmediateQuery{value, widths[setup.width], setup.signed_value
+        ? ImmediateInterpretation::signed_value : ImmediateInterpretation::unsigned_value};
+    return static_cast<bool>(search_query_fingerprint(query));
+}
+std::vector<RecentFind> load_recent_finds() {
+    std::vector<RecentFind> result;
+    auto* config = wxConfigBase::Get(false);
+    long version = 0, count = 0;
+    if (!config || !config->Read("/Search/Recent/Version", &version) || version != 1 ||
+        !config->Read("/Search/Recent/Count", &count) || count < 0 || count > static_cast<long>(recent_find_limit)) return result;
+    for (long index = 0; index < count; ++index) {
+        const auto prefix = wxString::Format("/Search/Recent/%ld/", index);
+        RecentFind setup;
+        if (config->Read(prefix + "Value", &setup.value) && config->Read(prefix + "Kind", &setup.kind) &&
+            config->Read(prefix + "Encoding", &setup.encoding) && config->Read(prefix + "Width", &setup.width) &&
+            config->Read(prefix + "Signed", &setup.signed_value) && config->Read(prefix + "Results", &setup.results) &&
+            config->Read(prefix + "Positions", &setup.positions)) {
+            // Older recent records predate this setting; keep their historical
+            // case-sensitive behavior when the key is absent.
+            (void)config->Read(prefix + "CaseSensitive", &setup.case_sensitive);
+            if (valid_recent_find(setup) && std::find(result.begin(), result.end(), setup) == result.end())
+                result.push_back(std::move(setup));
+        }
+    }
+    return result;
+}
+void remember_find(RecentFind setup, std::vector<RecentFind> recent) {
+    if (!valid_recent_find(setup)) return; // Larger searches still run; only persistence is capped.
+    auto* config = wxConfigBase::Get(false);
+    if (!config) return;
+    std::erase(recent, setup);
+    recent.insert(recent.begin(), std::move(setup));
+    if (recent.size() > recent_find_limit) recent.resize(recent_find_limit);
+    (void)config->DeleteGroup("/Search/Recent");
+    for (std::size_t index = 0; index < recent.size(); ++index) {
+        const auto prefix = wxString::Format("/Search/Recent/%zu/", index);
+        const auto& item = recent[index];
+        (void)config->Write(prefix + "Value", item.value);
+        (void)config->Write(prefix + "Kind", item.kind);
+        (void)config->Write(prefix + "Encoding", item.encoding);
+        (void)config->Write(prefix + "Width", item.width);
+        (void)config->Write(prefix + "Signed", item.signed_value);
+        (void)config->Write(prefix + "CaseSensitive", item.case_sensitive);
+        (void)config->Write(prefix + "Results", item.results);
+        (void)config->Write(prefix + "Positions", item.positions);
+    }
+    (void)config->Write("/Search/Recent/Version", 1L);
+    (void)config->Write("/Search/Recent/Count", static_cast<long>(recent.size()));
+    (void)config->Flush();
+}
+wxString recent_find_label(const RecentFind& item) {
+    auto label = item.value.Left(80);
+    label.Replace("\r", " "); label.Replace("\n", " "); label.Replace("\t", " ");
+    return (item.kind == 0 ? "Bytes: " : item.kind == 1 ? "Text: " : "Immediate: ") + label;
+}
+bool save_recent_finds(const std::vector<RecentFind>& recent) {
+    auto* config = wxConfigBase::Get(false);
+    if (!config) return false;
+    if (!config->DeleteGroup("/Search/Recent")) return false;
+    for (std::size_t index = 0; index < recent.size(); ++index) {
+        const auto prefix = wxString::Format("/Search/Recent/%zu/", index);
+        const auto& item = recent[index];
+        if (!config->Write(prefix + "Value", item.value) || !config->Write(prefix + "Kind", item.kind) ||
+            !config->Write(prefix + "Encoding", item.encoding) || !config->Write(prefix + "Width", item.width) ||
+            !config->Write(prefix + "Signed", item.signed_value) ||
+            !config->Write(prefix + "CaseSensitive", item.case_sensitive) ||
+            !config->Write(prefix + "Results", item.results) || !config->Write(prefix + "Positions", item.positions))
+            return false;
+    }
+    return config->Write("/Search/Recent/Version", 1L) &&
+        config->Write("/Search/Recent/Count", static_cast<long>(recent.size())) && config->Flush();
+}
 wxString number(std::uint64_t value) {
     return wxString::Format("%llu", static_cast<unsigned long long>(value));
 }
@@ -32,6 +125,24 @@ std::optional<FindRequest> find_dialog(wxWindow *parent) {
                     wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
     const int pad = dialog.FromDIP(10);
     auto *box = new wxBoxSizer(wxVERTICAL);
+    auto recent = load_recent_finds();
+    auto* recent_bar = new wxBoxSizer(wxHORIZONTAL);
+    recent_bar->Add(new wxStaticText(&dialog, wxID_ANY, "Recent searches"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, pad);
+    auto* recent_choice = new wxChoice(&dialog, wxID_ANY);
+    recent_choice->SetName("search-recent");
+    recent_choice->SetToolTip("Restore a validated setup without starting a search. The last 16 setups up to 4 KiB are stored locally.");
+    for (const auto& item : recent) recent_choice->Append(recent_find_label(item));
+    recent_choice->Enable(!recent.empty());
+    recent_bar->Add(recent_choice, 1, wxRIGHT, pad);
+    auto* forget_recent = new wxButton(&dialog, wxID_ANY, "Forget selected");
+    forget_recent->SetName("search-forget-recent");
+    forget_recent->Enable(false);
+    recent_bar->Add(forget_recent, 0, wxRIGHT, pad);
+    auto* clear_recent = new wxButton(&dialog, wxID_ANY, "Clear recent");
+    clear_recent->SetName("search-clear-recent");
+    clear_recent->Enable(!recent.empty());
+    recent_bar->Add(clear_recent);
+    box->Add(recent_bar, 0, wxEXPAND | wxALL, pad);
     auto choice = [&](const wxString &label, const wxString &name, std::initializer_list<wxString> entries,
                       int selected) {
         box->Add(new wxStaticText(&dialog, wxID_ANY, label), 0, wxLEFT | wxRIGHT | wxTOP, pad);
@@ -51,7 +162,12 @@ std::optional<FindRequest> find_dialog(wxWindow *parent) {
     value->SetHint("Byte patterns support nibble wildcards, e.g. 48 8B ?? A? ?F");
     value->SetToolTip("Search value. For byte patterns, ? matches one nibble and ?? matches one byte.");
     box->Add(value, 1, wxEXPAND | wxALL, pad);
-    auto *encoding = choice("Text encoding", "search-encoding", {"ASCII", "UTF-8", "UTF-16LE", "UTF-16BE", "UTF-32LE", "UTF-32BE"}, 1);
+    auto *encoding = choice("Text encoding", "search-encoding", {"ASCII", "UTF-8", "UTF-16LE", "UTF-16BE", "UTF-32LE", "UTF-32BE", "Windows-1252", "ISO-8859-1"}, 1);
+    auto *case_sensitive = new wxCheckBox(&dialog, wxID_ANY, "Case-sensitive text search");
+    case_sensitive->SetName("search-case-sensitive");
+    case_sensitive->SetValue(true);
+    case_sensitive->SetToolTip("Match text letter case. Uncheck for ASCII-only case folding.");
+    box->Add(case_sensitive, 0, wxLEFT | wxRIGHT | wxBOTTOM, pad);
     auto *width = choice("Immediate effective width", "search-width", {"8", "16", "32", "64"}, 3);
     auto *sign = new wxCheckBox(&dialog, wxID_ANY, "Interpret immediate input as signed");
     sign->SetName("search-signed");
@@ -61,7 +177,7 @@ std::optional<FindRequest> find_dialog(wxWindow *parent) {
     box->Add(all_documents, 0, wxLEFT | wxRIGHT | wxBOTTOM, pad);
     auto *from_selection = new wxCheckBox(&dialog, wxID_ANY, "Start at the current selection and search forward");
     from_selection->SetName("search-from-selection");
-    from_selection->SetToolTip("Begin at the current file offset or mapped instruction and search toward the end of this document.");
+    from_selection->SetToolTip("Begin at the current file offset or mapped instruction and search forward, optionally stopping at the exclusive end offset.");
     box->Add(from_selection, 0, wxLEFT | wxRIGHT | wxBOTTOM, pad);
     auto number = [&](const wxString &label, const wxString &name, const wxString &initial) {
         box->Add(new wxStaticText(&dialog, wxID_ANY, label), 0, wxLEFT | wxRIGHT, pad);
@@ -73,6 +189,7 @@ std::optional<FindRequest> find_dialog(wxWindow *parent) {
     };
     auto *limit = number("Matches per page (1..4096)", "search-limit", "256");
     auto *budget = number("Positions examined per page (1..16777216)", "search-budget", "1048576");
+    auto *end_offset = number("Exclusive end file offset (optional; hexadecimal or decimal)", "search-end-offset", "");
     auto *error = new wxStaticText(&dialog, wxID_ANY, "");
     error->SetName("search-error");
     error->SetToolTip("Search validation message. Correct the value before starting the search.");
@@ -82,6 +199,7 @@ std::optional<FindRequest> find_dialog(wxWindow *parent) {
     std::optional<FindRequest> result;
     auto update = [&] {
         encoding->Enable(kind->GetSelection() == 1);
+        case_sensitive->Enable(kind->GetSelection() == 1);
         width->Enable(kind->GetSelection() == 2);
         sign->Enable(kind->GetSelection() == 2);
         if (from_selection->IsChecked()) all_documents->SetValue(false);
@@ -89,6 +207,51 @@ std::optional<FindRequest> find_dialog(wxWindow *parent) {
     };
     kind->Bind(wxEVT_CHOICE, [&](wxCommandEvent &) { update(); });
     from_selection->Bind(wxEVT_CHECKBOX, [&](wxCommandEvent &) { update(); });
+    const auto restore_recent = [&](std::size_t index) {
+        if (index >= recent.size()) return;
+        const auto& item = recent[index];
+        kind->SetSelection(static_cast<int>(item.kind)); encoding->SetSelection(static_cast<int>(item.encoding));
+        width->SetSelection(static_cast<int>(item.width)); sign->SetValue(item.signed_value);
+        case_sensitive->SetValue(item.case_sensitive);
+        value->ChangeValue(item.value);
+        limit->ChangeValue(wxString::Format("%ld", item.results));
+        budget->ChangeValue(wxString::Format("%ld", item.positions));
+        error->SetLabel({}); update();
+    };
+    recent_choice->Bind(wxEVT_CHOICE, [&](wxCommandEvent &) {
+        const auto selection = recent_choice->GetSelection();
+        forget_recent->Enable(selection >= 0 && static_cast<std::size_t>(selection) < recent.size());
+        if (selection >= 0) restore_recent(static_cast<std::size_t>(selection));
+    });
+    forget_recent->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) {
+        const auto selection = recent_choice->GetSelection();
+        if (selection < 0 || static_cast<std::size_t>(selection) >= recent.size()) return;
+        auto updated = recent;
+        updated.erase(updated.begin() + selection);
+        if (!save_recent_finds(updated)) {
+            error->SetLabel("Could not update stored recent searches."); dialog.Layout(); return;
+        }
+        recent = std::move(updated);
+        recent_choice->Clear();
+        for (const auto& item : recent) recent_choice->Append(recent_find_label(item));
+        recent_choice->SetSelection(wxNOT_FOUND);
+        recent_choice->Enable(!recent.empty());
+        forget_recent->Disable();
+        clear_recent->Enable(!recent.empty());
+        error->SetLabel("Selected recent search removed. The current query is still editable.");
+        dialog.Layout();
+    });
+    clear_recent->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) {
+        auto* config = wxConfigBase::Get(false);
+        if (!config || !config->DeleteGroup("/Search/Recent") || !config->Flush()) {
+            error->SetLabel("Could not clear stored recent searches."); dialog.Layout(); return;
+        }
+        recent.clear(); recent_choice->Clear(); recent_choice->Disable(); clear_recent->Disable();
+        forget_recent->Disable();
+        error->SetLabel("Stored recent searches cleared. The current query is still editable.");
+        dialog.Layout();
+    });
+    if (!recent.empty()) { recent_choice->SetSelection(0); restore_recent(0); }
     update();
     dialog.Bind(
         wxEVT_BUTTON,
@@ -97,9 +260,10 @@ std::optional<FindRequest> find_dialog(wxWindow *parent) {
             SearchQuery query = BytePattern{input};
             if (kind->GetSelection() == 1) {
                 constexpr TextEncoding encodings[] = {TextEncoding::ascii, TextEncoding::utf8, TextEncoding::utf16le,
-                                                      TextEncoding::utf16be, TextEncoding::utf32le, TextEncoding::utf32be};
+                                                      TextEncoding::utf16be, TextEncoding::utf32le, TextEncoding::utf32be,
+                                                      TextEncoding::windows1252, TextEncoding::iso8859_1};
                 const auto selection = std::clamp(encoding->GetSelection(), 0, int(std::size(encodings)) - 1);
-                query = TextQuery{input, encodings[selection]};
+                query = TextQuery{input, encodings[selection], case_sensitive->IsChecked()};
             } else if (kind->GetSelection() == 2) {
                 constexpr uint16_t widths[] = {8, 16, 32, 64};
                 query = ImmediateQuery{input, widths[width->GetSelection()],
@@ -123,6 +287,18 @@ std::optional<FindRequest> find_dialog(wxWindow *parent) {
             SearchLimits limits;
             limits.max_results = std::size_t(count.value());
             limits.max_candidates = positions.value();
+            if (!end_offset->GetValue().empty()) {
+                auto parsed_end = parse_address(end_offset->GetValue().ToStdWstring());
+                if (!parsed_end) {
+                    error->SetLabel("Enter a valid exclusive end file offset, or leave it blank.");
+                    dialog.Layout();
+                    return;
+                }
+                limits.end_offset = parsed_end.value();
+            }
+            remember_find({value->GetValue(), kind->GetSelection(), encoding->GetSelection(), width->GetSelection(),
+                static_cast<long>(count.value()), static_cast<long>(positions.value()), sign->IsChecked(),
+                kind->GetSelection() != 1 || case_sensitive->IsChecked()}, recent);
             result = FindRequest{std::move(query), limits, all_documents->IsChecked(), from_selection->IsChecked()};
             dialog.EndModal(wxID_OK);
         },

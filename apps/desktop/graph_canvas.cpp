@@ -75,6 +75,8 @@ const char *edge_name(GraphEdgeKind kind) {
 } // namespace
 GraphCanvas::GraphCanvas(wxWindow *parent) : wxPanel(parent) {
     SetName("graph-canvas");
+    SetHelpText("Graph keyboard controls: Tab and Shift+Tab move between nodes; Up and Down move between instructions; Ctrl+Up and Ctrl+Down cycle edges; Enter activates the focused item; Home fits the graph; plus and minus zoom; arrow keys pan; Ctrl+Left and Ctrl+Right move between graphs; F6 returns focus to graph items.");
+    SetToolTip(GetHelpText());
     SetBackgroundStyle(wxBG_STYLE_PAINT);
     Bind(wxEVT_PAINT, &GraphCanvas::paint, this);
     Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &event) {

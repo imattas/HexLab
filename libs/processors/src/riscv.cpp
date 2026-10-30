@@ -127,13 +127,70 @@ bool decode_vector_reduction(std::uint32_t w, RiscvInstruction &i) {
     const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
     const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
     const unsigned funct3 = (w >> 12) & 7, vd = (w >> 7) & 31;
-    // Integer reductions are OPMVV-only and require vm=1. vs1 is the
-    // vector-register seed (its element zero), while vd is a vector result.
-    if (funct3 != 2 || vm != 1 || funct6 > 7) return false;
+    // Integer reductions are OPMVV-only. vs1 is the vector-register seed
+    // (its element zero), while vd is a vector result.
+    if (funct3 != 2 || funct6 > 7) return false;
     static constexpr RiscvOpcode ops[]{RiscvOpcode::vredsum, RiscvOpcode::vredand,
         RiscvOpcode::vredor, RiscvOpcode::vredxor, RiscvOpcode::vredminu,
         RiscvOpcode::vredmin, RiscvOpcode::vredmaxu, RiscvOpcode::vredmax};
     i.opcode = ops[funct6];
+    operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
+    read_vector_destination(i, vd);
+    operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
+    operand(i, RiscvRegister{static_cast<std::uint8_t>(vs1), false, true}, RiscvOperandAccess::read);
+    if (!vm) i.register_reads.push_back(RiscvRegister{0, false, true});
+    i.vector_masked = !vm;
+    return true;
+}
+
+bool decode_vector_mask_unary(std::uint32_t w, RiscvInstruction &i) {
+    const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
+    const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
+    const unsigned funct3 = (w >> 12) & 7, vd = (w >> 7) & 31;
+
+    // vcpop/vfirst use the vector-mask VXUNARY0 encoding and write a GPR.
+    if (funct6 == 0x10 && funct3 == 6 && (vs1 == 16 || vs1 == 17)) {
+        i.opcode = vs1 == 16 ? RiscvOpcode::vcpop_m : RiscvOpcode::vfirst_m;
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vd)}, RiscvOperandAccess::write);
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
+        if (!vm) i.register_reads.push_back(RiscvRegister{0, false, true});
+        i.vector_masked = !vm;
+        return true;
+    }
+
+    // VMUNARY0: prefix masks, population indices, and element indices.
+    if (funct6 != 0x14 || funct3 != 2) return false;
+    switch (vs1) {
+    case 1: i.opcode = RiscvOpcode::vmsbf_m; break;
+    case 2: i.opcode = RiscvOpcode::vmsof_m; break;
+    case 3: i.opcode = RiscvOpcode::vmsif_m; break;
+    case 16: i.opcode = RiscvOpcode::viota_m; break;
+    case 17:
+        if (vs2 != 0) return false; // vid.v reserves vs2.
+        i.opcode = RiscvOpcode::vid_v;
+        break;
+    default: return false;
+    }
+    operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
+    read_vector_destination(i, vd);
+    if (i.opcode != RiscvOpcode::vid_v)
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
+    if (!vm) i.register_reads.push_back(RiscvRegister{0, false, true});
+    i.vector_masked = !vm;
+    return true;
+}
+
+bool decode_vector_mask_logic(std::uint32_t w, RiscvInstruction &i) {
+    const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
+    const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
+    const unsigned funct3 = (w >> 12) & 7, vd = (w >> 7) & 31;
+    // Mask logical operations are OPMVV, always unmasked, and reserve vm=0.
+    if (funct3 != 2 || vm != 1 || funct6 < 0x18 || funct6 > 0x1f) return false;
+    // funct6 encodings are not in mnemonic order.
+    static constexpr RiscvOpcode ops[]{RiscvOpcode::vmandn_mm, RiscvOpcode::vmand_mm,
+        RiscvOpcode::vmor_mm, RiscvOpcode::vmxor_mm, RiscvOpcode::vmorn_mm,
+        RiscvOpcode::vmnand_mm, RiscvOpcode::vmnor_mm, RiscvOpcode::vmxnor_mm};
+    i.opcode = ops[funct6 - 0x18];
     operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
     read_vector_destination(i, vd);
     operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
@@ -229,6 +286,25 @@ bool decode_vector_floating(std::uint32_t w, RiscvInstruction &i) {
     const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
     const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
     const unsigned funct3 = (w >> 12) & 7, vd = (w >> 7) & 31;
+    if (funct3 == 1 && (funct6 == 1 || funct6 == 3 || funct6 == 5 || funct6 == 7)) {
+        switch (funct6) {
+        case 1: i.opcode = RiscvOpcode::vfredusum; break;
+        case 3: i.opcode = RiscvOpcode::vfredosum; break;
+        case 5: i.opcode = RiscvOpcode::vfredmin; break;
+        case 7: i.opcode = RiscvOpcode::vfredmax; break;
+        default: return false;
+        }
+        i.reads_frm = funct6 == 1 || funct6 == 3;
+        i.reads_fflags = true;
+        i.writes_fflags = true;
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
+        read_vector_destination(i, vd);
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vs1), false, true}, RiscvOperandAccess::read);
+        if (!vm) i.register_reads.push_back(RiscvRegister{0, false, true});
+        i.vector_masked = !vm;
+        return true;
+    }
     // VFUNARY1 uses OPFVV and encodes its sub-op in vs1.
     if (funct3 == 1 && funct6 == 0x13 &&
         (vs1 == 0 || vs1 == 4 || vs1 == 5 || vs1 == 16)) {
@@ -469,15 +545,17 @@ bool decode_vector_memory(std::uint32_t w, RiscvInstruction &i, bool store) {
     const unsigned width = width_code == 0 ? 8 : width_code == 5 ? 16 :
                            width_code == 6 ? 32 : width_code == 7 ? 64 : 0;
     const unsigned mop = (w >> 26) & 3;
-    // Single-field integer unit-stride, strided, and indexed accesses only.
-    // Keep segmented, fault-only-first, whole-register, and mask forms opaque.
-    if (!width || (w >> 29) != 0 || ((w >> 28) & 1) != 0 ||
+    const unsigned segment_fields = ((w >> 29) & 7) + 1;
+    // Integer unit-stride, strided, and indexed accesses, including segmented
+    // forms. Fault-only-first, whole-register, and mask transfers stay opaque.
+    if (!width || ((w >> 28) & 1) != 0 ||
         (mop == 0 && ((w >> 20) & 0x1f) != 0))
         return false;
     const unsigned vd_vs3 = (w >> 7) & 31, base = (w >> 15) & 31;
     const unsigned stride = (w >> 20) & 31;
     const bool unmasked = ((w >> 25) & 1) != 0;
     i.vector_masked = !unmasked;
+    i.vector_segment_fields = static_cast<std::uint8_t>(segment_fields);
     if (mop == 0)
         i.opcode = store ? RiscvOpcode::vse : RiscvOpcode::vle;
     else if (mop == 1)
@@ -560,6 +638,20 @@ bool decode_op(std::uint32_t w, RiscvInstruction &i, bool word_form, unsigned xl
     const unsigned f7 = w >> 25;
     const bool m_extension = f7 == 1;
     const bool word = word_form;
+    // Zicond defines only the two funct3 values below for funct7=0000111.
+    // Preserve the condition-register read even for rd=x0 through set_rr.
+    if (!word && f7 == 0x07 && (f3 == 5 || f3 == 7)) {
+        set_rr(i, f3 == 5 ? RiscvOpcode::czero_eqz : RiscvOpcode::czero_nez,
+               rd, rs1, rs2);
+        return true;
+    }
+    if (!word && ((f7 == 0x24 && (f3 == 1 || f3 == 5)) ||
+                  (f7 == 0x14 && f3 == 1) || (f7 == 0x34 && f3 == 1))) {
+        const auto op = f7 == 0x24 ? (f3 == 1 ? RiscvOpcode::bclr : RiscvOpcode::bext)
+                       : f7 == 0x14 ? RiscvOpcode::bset : RiscvOpcode::binv;
+        set_rr(i, op, rd, rs1, rs2);
+        return true;
+    }
     if (!word && f7 == 0x10 && (f3 == 2 || f3 == 4 || f3 == 6)) {
         const auto op = f3 == 2 ? RiscvOpcode::sh1add : f3 == 4 ? RiscvOpcode::sh2add : RiscvOpcode::sh3add;
         set_rr(i, op, rd, rs1, rs2);
@@ -583,6 +675,47 @@ bool decode_op(std::uint32_t w, RiscvInstruction &i, bool word_form, unsigned xl
             return false;
         const auto base = word ? 3u : 0u;
         i.opcode = static_cast<RiscvOpcode>(static_cast<unsigned>(RiscvOpcode::clz) + base + f3 - 1);
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(rd)}, RiscvOperandAccess::write);
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(rs1)}, RiscvOperandAccess::read);
+        return true;
+    }
+    if (!word && f7 == 0x20 && (f3 == 4 || f3 == 6 || f3 == 7)) {
+        set_rr(i, f3 == 4 ? RiscvOpcode::xnor : f3 == 6 ? RiscvOpcode::orn : RiscvOpcode::andn,
+               rd, rs1, rs2);
+        return true;
+    }
+    if (!word && f7 == 0x05 && (f3 == 1 || f3 == 2 || f3 == 3)) {
+        const auto op = f3 == 1 ? RiscvOpcode::clmul : f3 == 2 ? RiscvOpcode::clmulr : RiscvOpcode::clmulh;
+        set_rr(i, op, rd, rs1, rs2);
+        return true;
+    }
+    if (!word && f7 == 0x05 && f3 >= 4) {
+        static constexpr std::array<RiscvOpcode, 4> ops{
+            RiscvOpcode::min, RiscvOpcode::minu, RiscvOpcode::max, RiscvOpcode::maxu};
+        set_rr(i, ops[f3 - 4], rd, rs1, rs2);
+        return true;
+    }
+    // Zbkb PACK selects the low half from each source; PACKH selects low bytes.
+    // PACKW is the RV64 OP-32 form and sign-extends the packed 32-bit result.
+    if (!word && f7 == 0x04 && f3 == 4) {
+        set_rr(i, RiscvOpcode::pack, rd, rs1, rs2);
+        return true;
+    }
+    if (!word && f7 == 0x04 && f3 == 7) {
+        set_rr(i, RiscvOpcode::packh, rd, rs1, rs2);
+        return true;
+    }
+    if (word && xlen == 64 && f7 == 0x04 && f3 == 4) {
+        set_rr(i, RiscvOpcode::packw, rd, rs1, rs2);
+        return true;
+    }
+    if (f7 == 0x30 && (f3 == 1 || f3 == 5) && (!word || xlen == 64)) {
+        set_rr(i, word ? (f3 == 1 ? RiscvOpcode::rolw : RiscvOpcode::rorw)
+                       : (f3 == 1 ? RiscvOpcode::rol : RiscvOpcode::ror), rd, rs1, rs2);
+        return true;
+    }
+    if (!word && f7 == 0x04 && f3 == 4 && rs2 == 0) {
+        i.opcode = RiscvOpcode::zext_h;
         operand(i, RiscvRegister{static_cast<std::uint8_t>(rd)}, RiscvOperandAccess::write);
         operand(i, RiscvRegister{static_cast<std::uint8_t>(rs1)}, RiscvOperandAccess::read);
         return true;
@@ -641,8 +774,49 @@ bool decode_op_imm(std::uint32_t w, RiscvInstruction &i, bool word_form, unsigne
     const unsigned low = (w >> 20) & (word_form || xlen == 32 ? 31 : 63);
     const unsigned upper = w >> (word_form || xlen == 32 ? 25 : 26);
     const auto imm = sign_extend(w >> 20, 12);
+    const auto set_unary = [&](RiscvOpcode op) {
+        i.opcode = op;
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(rd)}, RiscvOperandAccess::write);
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(rs1)}, RiscvOperandAccess::read);
+    };
     if (word_form && xlen != 64)
         return false;
+    if (!word_form && (f3 == 1 || f3 == 5)) {
+        const unsigned funct6 = w >> 26;
+        const bool valid = (funct6 == 0x12 && (f3 == 1 || f3 == 5)) ||
+                           (funct6 == 0x0a && f3 == 1) ||
+                           (funct6 == 0x1a && f3 == 1);
+        if (valid) {
+            const auto op = funct6 == 0x12 ? (f3 == 1 ? RiscvOpcode::bclri : RiscvOpcode::bexti)
+                           : funct6 == 0x0a ? RiscvOpcode::bseti : RiscvOpcode::binvi;
+            set_ri(i, op, rd, rs1, low, xlen == 32 ? 5 : 6, false);
+            return true;
+        }
+    }
+    if (word_form && (w >> 25) == 0x30 && f3 == 5) {
+        set_ri(i, RiscvOpcode::roriw, rd, rs1, low, 5, false);
+        return true;
+    }
+    if (!word_form && f3 == 1 && (w >> 20) == 0x604) {
+        set_unary(RiscvOpcode::sext_b);
+        return true;
+    }
+    if (!word_form && f3 == 1 && (w >> 20) == 0x605) {
+        set_unary(RiscvOpcode::sext_h);
+        return true;
+    }
+    if (!word_form && f3 == 5 && (w >> 20) == 0x287) {
+        set_unary(RiscvOpcode::orc_b);
+        return true;
+    }
+    if (!word_form && f3 == 5 && (w >> 20) == (xlen == 32 ? 0x698u : 0x6b8u)) {
+        set_unary(RiscvOpcode::rev8);
+        return true;
+    }
+    if (!word_form && f3 == 5 && upper == (xlen == 32 ? 0x30u : 0x18u)) {
+        set_ri(i, RiscvOpcode::rori, rd, rs1, low, xlen == 32 ? 5 : 6, false);
+        return true;
+    }
     if (word_form && xlen == 64 && f3 == 1 && (w & 0xfc00707fu) == 0x0800101bu) {
         const unsigned shift = (w >> 20) & 63;
         set_ri(i, RiscvOpcode::slli_uw, rd, rs1, shift, 6, false);
@@ -883,6 +1057,14 @@ bool decode_system(std::uint32_t w, RiscvInstruction &i, std::string &reason) {
         case 7: i.opcode = RiscvOpcode::csrrci; csr_read = true; csr_write = source != 0; break;
         default: return false;
         }
+        // CSR address bits 11:10 encode read/write access. A value of 0b11
+        // denotes a read-only CSR, so any instruction that actually requests
+        // a write is reserved regardless of whether this implementation
+        // provides that CSR. CSRRS/CSRRC with a zero source remain legal reads.
+        if (csr_write && ((csr >> 10) & 3u) == 3u) {
+            reason = "Zicsr write targets an encoding-defined read-only CSR";
+            return false;
+        }
         i.csr_read = csr_read;
         i.csr_write = csr_write;
         operand(i, RiscvRegister{static_cast<std::uint8_t>(rd)}, RiscvOperandAccess::write);
@@ -1017,6 +1199,16 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
         if (f3 != 0 || rd != 0 || rs1 != 0)
             return false;
         if ((w >> 28) != 0) {
+            // The optional FENCE.TSO encoding has an exact nonzero fm value
+            // and RW predecessor/successor masks. Other non-base fm encodings
+            // remain outside the decoder's enabled subset.
+            const unsigned fm = (w >> 28) & 0xf;
+            const unsigned predecessor = (w >> 24) & 0xf;
+            const unsigned successor = (w >> 20) & 0xf;
+            if (fm == 8 && predecessor == 3 && successor == 3) {
+                i.opcode = RiscvOpcode::fence_tso;
+                return true;
+            }
             unsupported = "non-base FENCE ordering encoding is unsupported";
             return false;
         }
@@ -1048,7 +1240,7 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
             unsupported = "reserved or unimplemented vector-configuration encoding";
             return false;
         }
-        if (decode_vector_reduction(w, i) || decode_vector_integer(w, i) || decode_vector_compare(w, i) || decode_vector_floating(w, i) || decode_vector_widening_add_sub(w, i) || decode_vector_widening_multiply(w, i) || decode_vector_multiply_add(w, i) ||
+        if (decode_vector_mask_unary(w, i) || decode_vector_reduction(w, i) || decode_vector_mask_logic(w, i) || decode_vector_integer(w, i) || decode_vector_compare(w, i) || decode_vector_floating(w, i) || decode_vector_widening_add_sub(w, i) || decode_vector_widening_multiply(w, i) || decode_vector_multiply_add(w, i) ||
             decode_vector_shift_minmax(w, i) ||
             decode_vector_multiply(w, i) || decode_vector_divide(w, i) || decode_vector_permutation(w, i)) {
             read_vector_configuration(i);
@@ -1064,10 +1256,12 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
                                      funct6 == 0x0c || funct6 == 0x0e || funct6 == 0x0f ||
                                      (funct6 >= 0x18 && funct6 <= 0x1f) || (funct6 >= 0x20 && funct6 <= 0x23);
             const bool floating_implemented = funct6 == 0 || funct6 == 2 || funct6 == 4 || funct6 == 6 ||
+                funct6 == 1 || funct6 == 3 || funct6 == 5 || funct6 == 7 ||
                 funct6 == 8 || funct6 == 9 || funct6 == 10 || funct6 == 0x18 || funct6 == 0x19 ||
                 funct6 == 0x1b || funct6 == 0x1c || funct6 == 0x1d || funct6 == 0x1f ||
                 funct6 == 0x20 || funct6 == 0x24 || funct6 == 0x13;
-            if ((implemented && (funct3 == 0 || funct3 == 3 || funct3 == 4)) || floating_implemented)
+            if ((implemented && (funct3 == 0 || funct3 == 3 || funct3 == 4 ||
+                                 (funct3 == 2 && funct6 >= 0x18 && funct6 <= 0x1f))) || floating_implemented)
                 return false; // Reserved operand class of an explicitly implemented integer/FP operation.
             unsupported = "RVV operand class or operation is outside the enabled vector subset";
             return false;

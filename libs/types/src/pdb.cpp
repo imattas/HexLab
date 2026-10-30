@@ -193,6 +193,16 @@ Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &database, std::stop_tok
             case 0x1503: { // LF_ARRAY
                 rec.kind=CodeViewTypeKind::array; rec.referenced_type=r32(); rec.underlying_type=r32(); rec.size=numeric(at,limit); rec.name=read_name(at,limit); break;
             }
+            case 0x1516: { // LF_STRIDED_ARRAY: LF_ARRAY fields plus element byte stride.
+                rec.kind = CodeViewTypeKind::strided_array;
+                rec.referenced_type = r32();
+                rec.underlying_type = r32();
+                rec.size = numeric(at, limit);
+                rec.array_stride = numeric(at, limit, true);
+                rec.name = read_name(at, limit);
+                require(rec.array_stride != 0, "CodeView LF_STRIDED_ARRAY has zero stride");
+                break;
+            }
             case 0x151b: { // LF_VECTOR: scalar lane type, count, byte extent, and name.
                 rec.kind = CodeViewTypeKind::vector;
                 rec.referenced_type = r32();
@@ -271,6 +281,7 @@ Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &database, std::stop_tok
                     }
                     auto member= r16();
                     CodeViewField f; f.leaf=member;
+                    f.record_offset = static_cast<std::uint32_t>(at - 2);
                     if (member==0x150d) { f.attributes=r16(); f.type=r32(); f.offset=numeric(at,limit); f.name=read_name(at,limit); }
                     else if (member==0x1400 || member==0x151a) { // LF_BCLASS / LF_BINTERFACE
                         // Both describe a fixed-offset base. Keep the original leaf
@@ -305,6 +316,9 @@ Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &database, std::stop_tok
                     }
                     else if (member==0x1409) { // LF_VFUNCTAB: type of the implicit vfptr.
                         f.type=r32();
+                    }
+                    else if (member==0x140c) { // LF_VFUNCOFF: vfptr at a nonzero class byte offset.
+                        f.type=r32(); f.value=r32();
                     }
                     else if (member==0x1510) { // LF_NESTTYPE: nested type declaration.
                         (void)r16(); f.type=r32(); f.name=read_name(at,limit);
@@ -811,6 +825,7 @@ Result<PdbTypeGraph> resolve_pdb_type_graph(const PdbTypeStream &stream, std::st
             case CodeViewTypeKind::pointer:
                 add_reference(record.index, record.referenced_type, PdbTypeReferenceKind::pointee); break;
             case CodeViewTypeKind::array:
+            case CodeViewTypeKind::strided_array:
                 add_reference(record.index, record.referenced_type, PdbTypeReferenceKind::array_element);
                 add_reference(record.index, record.underlying_type, PdbTypeReferenceKind::array_index); break;
             case CodeViewTypeKind::vector:
@@ -880,6 +895,8 @@ Result<PdbTypeGraph> resolve_pdb_type_graph(const PdbTypeStream &stream, std::st
                     else if (field.leaf == 0x1511)
                         add_reference(record.index, field.type, PdbTypeReferenceKind::method_type);
                     else if (field.leaf == 0x1409)
+                        add_reference(record.index, field.type, PdbTypeReferenceKind::vftable_pointer_type);
+                    else if (field.leaf == 0x140c)
                         add_reference(record.index, field.type, PdbTypeReferenceKind::vftable_pointer_type);
                 for (const auto continuation : record.field_list_continuations)
                     add_reference(record.index, continuation, PdbTypeReferenceKind::field_list_continuation);
@@ -1199,7 +1216,8 @@ Result<PdbSymbolTable> parse_pdb_symbols(const PdbDatabase &database, std::stop_
                     database.streams[symbol_record_stream].has_value(),
                     "PDB DBI refers to an absent symbol-record stream");
             const auto records = std::span<const std::byte>(*database.streams[symbol_record_stream]);
-            constexpr std::uint16_t S_PUB32 = 0x110e;
+            constexpr std::uint16_t S_PUB32 = 0x110e, S_GPROC32_GLOBAL_RECORD = 0x1110,
+                                    S_GPROC32_ID_GLOBAL_RECORD = 0x1147;
             constexpr std::uint16_t S_PROCREF = 0x1125, S_DATAREF = 0x1126, S_LPROCREF = 0x1127;
             std::size_t at = 0;
             while (at < records.size()) {
@@ -1228,12 +1246,14 @@ Result<PdbSymbolTable> parse_pdb_symbols(const PdbDatabase &database, std::stop_
                     symbol.section_offset = r32(records, payload); payload += 4;
                     symbol.section = r16(records, payload); payload += 2;
                     supported = true;
-                } else if (record_kind == S_GPROC32) {
+                } else if (record_kind == S_GPROC32_GLOBAL_RECORD ||
+                           record_kind == S_GPROC32_ID_GLOBAL_RECORD) {
                     require(end - payload >= 35, "Truncated CodeView global procedure symbol");
                     payload += 12; // Parent, end, next.
                     symbol.size = r32(records, payload); payload += 4;
                     payload += 8; // Debug start/end offsets.
                     symbol.type_index = r32(records, payload); payload += 4;
+                    symbol.type_index_is_id = record_kind == S_GPROC32_ID_GLOBAL_RECORD;
                     symbol.section_offset = r32(records, payload); payload += 4;
                     symbol.section = r16(records, payload); payload += 2;
                     payload += 1; // Procedure flags.

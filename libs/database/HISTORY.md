@@ -1,5 +1,12 @@
 # Read-only project history
 
+For a bounded semantic proof that both applied and redo commands agree with the
+current durable user state and embedded original patch bytes, use
+`ProjectStore::verify_history_replay`. It rewinds to an empty root and replays the
+entire retained log without adopting any state. See
+[whole-history semantic verification](../../docs/project-history-semantic-verification.md)
+for budgets, report fields and remaining limits.
+
 Exact historical states can also be published as independent editable projects
 with `ProjectStore::save_history_as`. The source remains unchanged, the copied
 project retains its complete undo/redo history, and the requested step can be
@@ -39,7 +46,9 @@ durable command metadata in ascending step order. Start with `after_step = 0`,
 then pass the returned `next_after_step` while `has_more` is true. Steps are
 exclusive page cursors; a cursor equal to `history_count` returns an empty page.
 The page includes the project UUID, source revisions, durable cursor/count, and
-each step's group ID, byte-change flag, decision-change flag, and applied status.
+each step's group ID, byte-change flag, decision-change flag, applied status,
+and optional creation time in Unix milliseconds. Creation times are recorded
+for newly committed commands; legacy rows remain undated after migration.
 Redo steps remain visible with `applied = false`. Group zero means an ungrouped
 command; adjacent nonzero equal IDs retain their existing undo/redo grouping.
 
@@ -52,9 +61,8 @@ step continuity from the exclusive cursor. Sequential paging detects a gap
 when it reaches that gap. A caller that starts after an earlier corrupt gap
 does not audit the skipped prefix; use exact-step preview or reopen validation
 when a full history audit is needed. History remains capped at 100,000 rows.
-Metadata listing does not validate payload integrity. Command names,
-timestamps, authors, and changed entity lists are not stored and are not
-fabricated.
+Metadata listing does not validate payload integrity. Command names, authors,
+and changed entity lists are not stored and are not fabricated.
 
 `ProjectStore::preview_history_at(expected_edit, target_step, limits, stop)`
 projects immutable `UserState` at exactly the requested durable step. Step zero
@@ -119,8 +127,12 @@ A concurrent writer may commit after the snapshot begins; the returned source
 revision still identifies the coherent snapshot that was read. Neither operation
 updates the in-memory store snapshot, revisions, history cursor, rows, caches, or
 schema. Transaction cleanup also runs after cancellation and failures. Stop
-tokens are observed by SQL reads and between replay steps; a single bounded
-codec/application operation can finish before cancellation is observed.
+tokens are observed by SQL reads, between grouped undo/redo steps, and between
+individual entity or patch changes within a replayed delta. This keeps large
+groups and multi-change commands interruptible without publishing a partial
+state: cancellation rolls back the surrounding transaction. A single bounded
+delta decode or individual entity validation operation can finish before
+cancellation is observed.
 
 The CLI history audit can optionally request `--verify-replay`. After every
 history page has been audited from step zero through the end, it asks the

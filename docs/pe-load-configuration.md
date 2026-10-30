@@ -8,7 +8,18 @@ declared structure. These pointer values are normalized from preferred-base
 VAs. The loader also retains the Guard XFG check, dispatch, and table-dispatch
 helper RVAs, the CastGuard failure-mode pointer, and the Guard memcpy pointer.
 Each is decoded only when its full pointer-width field lies within the
-declared structure and is zero or maps to initialized image data.
+declared structure and is zero or maps to initialized image data. The size,
+version, GuardFlags, cookie pointer, Guard CF table pointer, and table count
+retain their file source offsets. The table count and flags are retained even
+when the table is empty; nonempty table records are read only after validating
+the complete RVA extent and the one-million-entry budget.
+
+When the declared size covers the complete 12-byte
+`IMAGE_LOAD_CONFIG_CODE_INTEGRITY` record, HexLab preserves its raw flags,
+catalog identifier, catalog offset, reserved value, and source span for PE32
+and PE32+. The CLI inspection report displays these fields and their source
+file offset. The record is descriptive metadata only: HexLab does not resolve
+the catalog offset, validate a catalog, or make a signature or trust decision.
 
 The supported Guard CF subset reads table entries as a 32-bit function RVA
 plus the metadata byte count encoded in the high nibble of `GuardFlags`. The
@@ -47,6 +58,8 @@ This is metadata inspection: HexLab does not enforce CFG, XFG, or
 EH-continuation policy, nor simulate all Windows loader decisions. Dynamic
 value relocations are parsed and supported ARM64X transformations are exposed
 as a separate image view; see [PE dynamic value relocations](pe-dynamic-value-relocations.md).
+Load-configuration code-integrity catalog fields are raw metadata and do not
+validate Authenticode signatures or establish publisher trust.
 Guard RF tables and fields without an explicit representation remain opaque. Field offsets follow the Windows
 `IMAGE_LOAD_CONFIG_DIRECTORY32/64` definitions in [Microsoft's PE load
 configuration reference](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-image_load_config_directory64).

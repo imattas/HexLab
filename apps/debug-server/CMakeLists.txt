@@ -7,4 +7,10 @@ elseif(APPLE)
 elseif(UNIX)
   set_target_properties(hexlab_debug_server PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
 endif()
-install(TARGETS hexlab_debug_server RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+if(WIN32)
+  install(TARGETS hexlab_debug_server
+    RUNTIME_DEPENDENCY_SET hexlab_windows_runtime_dependencies
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+else()
+  install(TARGETS hexlab_debug_server RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+endif()

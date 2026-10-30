@@ -25,16 +25,42 @@ std::string hex_thread_token(std::uint64_t value) {
     const auto [end, error] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, 16);
     return error == std::errc{} ? std::string(buffer.data(), end) : std::string{};
 }
+Result<std::pair<std::vector<std::byte>, bool>> decode_register_slice(std::string_view encoded) {
+    if (encoded.empty() || encoded.size() % 2 != 0)
+        return Error{ErrorCode::malformed, "remote register reply has an invalid encoded width"};
+    const auto unavailable = [](char c) { return c == 'x' || c == 'X'; };
+    const bool all_unavailable = std::all_of(encoded.begin(), encoded.end(), unavailable);
+    std::vector<std::byte> bytes(encoded.size() / 2, std::byte{0});
+    if (all_unavailable) return std::pair{std::move(bytes), false};
+    for (std::size_t i = 0; i < encoded.size(); i += 2) {
+        const auto digit = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        const int high = digit(encoded[i]), low = digit(encoded[i + 1]);
+        if (high < 0 || low < 0)
+            return Error{ErrorCode::malformed, "remote register reply mixes unavailable markers with value bytes"};
+        bytes[i / 2] = static_cast<std::byte>((high << 4) | low);
+    }
+    return std::pair{std::move(bytes), true};
+}
 
-struct TargetRegister { std::string name, group; std::size_t number = 0, bits = 0; };
+struct TargetRegister { std::string name, group; std::size_t number = 0, bits = 0; std::string type; };
 struct TargetDescription {
     Architecture architecture = Architecture::unknown;
+    std::string architecture_name;
     std::size_t pointer_bits = 0;
     bool big_endian = false;
     bool endian_declared = false;
     std::vector<TargetRegister> registers;
 };
-struct RemoteThreadDescription { std::string id, name; ThreadState state = ThreadState::unknown; };
+struct RemoteThreadDescription {
+    std::string id, name;
+    ThreadState state = ThreadState::unknown;
+    std::optional<std::uint32_t> core;
+};
 struct RemoteProcessDescription { std::uint64_t id = 0; std::string command; };
 struct RemoteOsDataDescription {
     std::string type;
@@ -95,8 +121,17 @@ std::uint64_t target_integer(std::span<const std::byte> bytes, bool big_endian) 
     return value;
 }
 std::optional<bool> target_architecture_endian(std::string_view name) {
-    if (name == "aarch64_be" || name == "aarch64: big endian") return true;
-    if (name == "aarch64: little endian") return false;
+    std::string normalized(name);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (normalized == "aarch64_be" || normalized == "aarch64: big endian") return true;
+    if (normalized == "aarch64" || normalized == "aarch64: little endian") return false;
+    // BFD uses the `eb` suffix for big-endian ARM targets (for example,
+    // `armeb` and `armv7eb`). Do not infer an order from unsuffixed `arm*`
+    // names: those occur with both byte orders.
+    if (normalized == "armeb" || normalized.starts_with("armeb:") ||
+        (normalized.starts_with("arm") && normalized.ends_with("eb"))) return true;
     return std::nullopt;
 }
 bool xml_name_char(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == ':' || c == '.'; }
@@ -451,6 +486,13 @@ Result<std::vector<RemoteThreadDescription>> parse_threads_xml(std::string_view 
             if (threads.size() >= 65536) return Error{ErrorCode::resource_limit, "RSP thread count exceeds limit"};
             RemoteThreadDescription value{id->second, "thread " + id->second, ThreadState::unknown};
             if (const auto name = attrs.find("name"); name != attrs.end() && !name->second.empty()) value.name = name->second;
+            if (const auto core = attrs.find("core"); core != attrs.end()) {
+                std::uint32_t number = 0;
+                const auto [end, error] = std::from_chars(core->second.data(), core->second.data() + core->second.size(), number, 10);
+                if (error != std::errc{} || end != core->second.data() + core->second.size())
+                    return Error{ErrorCode::malformed, "invalid RSP thread core number"};
+                value.core = number;
+            }
             if (const auto state = attrs.find("state"); state != attrs.end()) {
                 if (state->second == "running") value.state = ThreadState::running;
                 else if (state->second == "stopped") value.state = ThreadState::stopped;
@@ -626,7 +668,11 @@ Status parse_target_xml_document(std::string_view xml, TargetXmlContext& context
                 return Error{ErrorCode::malformed, "duplicate target XML register number"};
             if (regnum != next_regnum) return Error{ErrorCode::unsupported, "target XML register numbering contains gaps or reordering"};
             const auto group = attrs.find("group");
-            out.registers.push_back({name->second, group == attrs.end() ? current_feature : group->second, regnum, bit_count});
+            const auto type = attrs.find("type");
+            if (type != attrs.end() && (type->second.empty() || type->second.size() > 128))
+                return Error{ErrorCode::resource_limit, "target XML register type must contain 1 to 128 bytes"};
+            out.registers.push_back({name->second, group == attrs.end() ? current_feature : group->second, regnum, bit_count,
+                type == attrs.end() ? std::string{} : type->second});
             next_regnum = regnum + 1;
         } else if (tag == "architecture") {
             const auto close = xml.find("</architecture>", pos);
@@ -634,6 +680,11 @@ Status parse_target_xml_document(std::string_view xml, TargetXmlContext& context
             auto name = xml.substr(pos, close - pos);
             while (!name.empty() && std::isspace(static_cast<unsigned char>(name.front()))) name.remove_prefix(1);
             while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back()))) name.remove_suffix(1);
+            if (name.empty() || name.size() > 128)
+                return Error{ErrorCode::resource_limit, "target XML architecture must contain 1 to 128 bytes"};
+            if (!out.architecture_name.empty() && out.architecture_name != name)
+                return Error{ErrorCode::malformed, "target XML contains conflicting architecture names"};
+            out.architecture_name = name;
             const auto architecture = target_architecture(name);
             if (architecture != Architecture::unknown) {
                 if (out.architecture != Architecture::unknown && out.architecture != architecture)
@@ -672,6 +723,27 @@ Result<TargetDescription> parse_target_xml(std::string_view xml, rsp::Client& cl
     if (!parsed) return parsed.error();
     auto& out = context.target;
     if (out.registers.empty()) return Error{ErrorCode::unsupported, "target XML contains no usable registers"};
+    // These BFD architecture names select a compressed MIPS dialect, but do
+    // not identify the target's register width. A unique PC declaration does.
+    std::string normalized_architecture = out.architecture_name;
+    std::transform(normalized_architecture.begin(), normalized_architecture.end(), normalized_architecture.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (normalized_architecture == "mips:16" || normalized_architecture == "mips:micromips") {
+        const TargetRegister* pc = nullptr;
+        for (const auto& reg : out.registers) {
+            if (reg.name != "pc") continue;
+            if (pc) return Error{ErrorCode::malformed, "compact MIPS target XML has ambiguous PC registers"};
+            pc = &reg;
+        }
+        if (!pc) for (const auto& reg : out.registers) {
+            if (reg.type != "code_ptr") continue;
+            if (pc) return Error{ErrorCode::malformed, "compact MIPS target XML has ambiguous code-pointer registers"};
+            pc = &reg;
+        }
+        if (!pc || (pc->bits != 32 && pc->bits != 64))
+            return Error{ErrorCode::unsupported, "compact MIPS target XML needs one 32-bit or 64-bit PC register"};
+        out.architecture = pc->bits == 32 ? Architecture::mips32 : Architecture::mips64;
+    }
     if (out.architecture == Architecture::powerpc) {
         const auto pc = std::find_if(out.registers.begin(), out.registers.end(), [](const auto& reg) {
             return reg.name == "pc";
@@ -761,7 +833,7 @@ Result<std::vector<MemoryRegion>> parse_memory_map_xml(std::string_view xml) {
     bool root_seen = false, root_closed = false;
     std::size_t position = 0;
     std::string property_name, property_text;
-    bool permissions_seen = false, native_type_seen = false;
+    bool permissions_seen = false, native_type_seen = false, blocksize_seen = false;
     auto finish_property = [&]() -> Status {
         auto decoded = decode_xml_text(property_text);
         if (!decoded) return decoded.error();
@@ -786,6 +858,20 @@ Result<std::vector<MemoryRegion>> parse_memory_map_xml(std::string_view xml) {
                 return Error{ErrorCode::resource_limit, "memory-map native type exceeds 32 KiB"};
             regions.back().type = std::move(decoded.value());
             native_type_seen = true;
+        } else if (property_name == "blocksize") {
+            if (blocksize_seen) return Error{ErrorCode::malformed, "duplicate memory-map flash blocksize property"};
+            std::string_view value = decoded.value();
+            const auto first = value.find_first_not_of(" \t\r\n");
+            if (first == std::string_view::npos)
+                return Error{ErrorCode::malformed, "empty memory-map flash blocksize property"};
+            value = value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+            std::uint64_t block_size = 0;
+            if (!parse_hex_value(value, block_size) || block_size == 0 || regions.back().type != "flash" ||
+                block_size > regions.back().length || regions.back().length % block_size != 0 ||
+                regions.back().start % block_size != 0)
+                return Error{ErrorCode::malformed, "invalid or inconsistent memory-map flash blocksize property"};
+            regions.back().flash_block_size = block_size;
+            blocksize_seen = true;
         }
         property_name.clear(); property_text.clear();
         return std::monostate{};
@@ -894,7 +980,7 @@ Result<std::vector<MemoryRegion>> parse_memory_map_xml(std::string_view xml) {
                 return Error{ErrorCode::malformed, "invalid memory-map region type or extent"};
             MemoryRegion region{start, length, true, type->second == "ram", false, type->second};
             regions.push_back(std::move(region));
-            permissions_seen = false; native_type_seen = false;
+            permissions_seen = false; native_type_seen = false; blocksize_seen = false;
         } else if (name == "property") {
             if (stack.size() != 2 || stack.back() != "memory" || !attrs.contains("name"))
                 return Error{ErrorCode::malformed, "invalid memory-map property"};
@@ -937,8 +1023,6 @@ public:
     Result<ProcessInfo> launch(const Target&) override { return unsupported("RSP targets must be connected by host and port"); }
     Result<ProcessInfo> launch_remote(const Target& target) override {
         if (!client_) return Error{ErrorCode::invalid_argument, "connect to a remote target before launching an inferior"};
-        if (!target.working_directory.empty())
-            return unsupported("RSP remote launch does not yet set an inferior working directory");
         if (target.executable.empty())
             return Error{ErrorCode::invalid_argument, "remote launch requires an executable path"};
         if (selected_inferior_live_ || pending_stop_ || pending_event_)
@@ -964,6 +1048,14 @@ public:
                     ? unsupported("remote does not support extended-remote mode required by vRun")
                     : Error{ErrorCode::io, "remote rejected extended-remote mode: " + extended.value()};
             extended_mode_supported_ = true;
+        }
+        // Always reset supported settings, including empty values, so a failed
+        // prior vRun cannot leak configuration. The client rolls back both
+        // settings to target defaults when any later packet fails.
+        if (!target.remote_environment.empty() || client_->supports_environment_reset() ||
+            client_->supports_working_directory()) {
+            auto configured = client_->configure_launch_settings(target.remote_environment, target.working_directory);
+            if (!configured) return configured.error();
         }
         auto stopped = client_->run_program(target.executable, target.arguments);
         if (!stopped) return stopped.error();
@@ -999,6 +1091,9 @@ public:
             for (auto it = expected_step_threads_.begin(); it != expected_step_threads_.end();) {
                 if (belongs(*it)) it = expected_step_threads_.erase(it); else ++it;
             }
+            for (auto it = requested_stop_threads_.begin(); it != requested_stop_threads_.end();) {
+                if (belongs(*it)) it = requested_stop_threads_.erase(it); else ++it;
+            }
             inferiors_.erase(process_id);
         };
         if (multiprocess_supported_) {
@@ -1010,6 +1105,7 @@ public:
             thread_run_states_.clear();
             inferiors_.clear();
             expected_step_threads_.clear();
+            requested_stop_threads_.clear();
             next_thread_token_ = 1;
         }
         remote_process_id_ = process;
@@ -1033,7 +1129,13 @@ public:
     }
     Result<ProcessInfo> attach(ProcessId) override { return unsupported("RSP attach is performed during host connection"); }
     Result<ProcessInfo> connect_remote(std::string_view host, std::uint16_t port) override {
+        return connect_remote(host, port, RemoteConnectOptions{});
+    }
+    Result<ProcessInfo> connect_remote(std::string_view host, std::uint16_t port,
+        const RemoteConnectOptions& options) override {
         if (client_) return Error{ErrorCode::conflict, "remote debugger is already connected"};
+        if (options.max_packet_size < 128 || options.max_packet_size > 1024 * 1024)
+            return Error{ErrorCode::invalid_argument, "remote packet limit must be between 128 bytes and 1 MiB"};
         terminated_ = false;
         current_process_detach_rejected_ = false;
         selected_inferior_live_ = false;
@@ -1044,8 +1146,8 @@ public:
             if (!transport) return transport.error();
             transport_ = std::move(transport.value());
         }
-        client_ = std::make_unique<rsp::Client>(*transport_, 3s, 1024 * 1024);
-        auto features = client_->negotiate();
+        client_ = std::make_unique<rsp::Client>(*transport_, 3s, options.max_packet_size);
+        auto features = client_->negotiate({}, options.request_no_ack);
         if (!features) { client_.reset(); transport_.reset(); return features.error(); }
         multiprocess_supported_ = false;
         if (const auto multiprocess = features.value().features.find("multiprocess");
@@ -1061,14 +1163,14 @@ public:
             extended_mode_supported_ = extended.value() == "OK";
         }
         non_stop_mode_ = false;
-        if (features.value().non_stop_supported) {
+        if (options.enable_non_stop && features.value().non_stop_supported) {
             auto enabled = client_->set_non_stop_mode(true);
             if (enabled) non_stop_mode_ = true;
             else if (enabled.error().code != ErrorCode::unsupported) {
                 client_.reset(); transport_.reset(); return enabled.error();
             }
         }
-        if (features.value().thread_events_supported) {
+        if (options.enable_thread_events && features.value().thread_events_supported) {
             auto enabled = client_->set_thread_events(true);
             if (!enabled && enabled.error().code != ErrorCode::unsupported) {
                 client_.reset(); transport_.reset(); return enabled.error();
@@ -1111,10 +1213,13 @@ public:
             }
         }
         target_.reset();
+        target_xml_.clear();
         remote_thread_tokens_.clear();
         thread_token_ids_.clear();
         thread_run_states_.clear();
         inferiors_.clear();
+        expected_step_threads_.clear();
+        requested_stop_threads_.clear();
         next_thread_token_ = 1;
         target_xml_advertised_ = false;
         libraries_advertised_ = false;
@@ -1130,6 +1235,7 @@ public:
             auto target_xml = client_->read_feature_annex();
             if (!target_xml) { client_.reset(); transport_.reset(); return target_xml.error(); }
             if (target_xml.value()) {
+                target_xml_ = *target_xml.value();
                 auto parsed = parse_target_xml(*target_xml.value(), *client_);
                 if (!parsed) { client_.reset(); transport_.reset(); return parsed.error(); }
                 target_ = std::move(parsed.value());
@@ -1192,6 +1298,19 @@ public:
         const auto id = remote_process_id_.value_or(pending_stop_ && pending_stop_->thread ? pending_stop_->thread : 1);
         return ProcessInfo{id, host_ + ":" + std::to_string(port), target_ ? target_->architecture : Architecture::unknown};
     }
+    std::optional<RemoteTargetMetadata> remote_target_metadata() const override {
+        if (!client_) return {};
+        RemoteTargetMetadata metadata;
+        metadata.packet_size = client_->peer_packet_limit();
+        metadata.target_xml = target_xml_;
+        if (target_) {
+            metadata.architecture_name = target_->architecture_name;
+            metadata.pointer_bits = target_->pointer_bits;
+            metadata.big_endian = target_->big_endian;
+            metadata.endian_declared = target_->endian_declared;
+        }
+        return metadata;
+    }
     Result<ProcessInfo> attach_remote_process(ProcessId process) override {
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
         if (!multiprocess_supported_)
@@ -1231,6 +1350,7 @@ public:
         pending_event_signal_ = 0;
         pending_event_thread_.clear();
         expected_step_threads_.clear();
+        requested_stop_threads_.clear();
         legacy_expected_step_ = false;
         // Restore only this inferior's cached thread states; other inferiors
         // remain resident in the map and are never rewritten by its stops.
@@ -1359,7 +1479,7 @@ public:
                     inferior.known_attached = false;
                 }
                 pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
-                expected_step_threads_.clear(); legacy_expected_step_ = false;
+                expected_step_threads_.clear(); requested_stop_threads_.clear(); legacy_expected_step_ = false;
                 breakpoints_.clear();
                 selected_inferior_live_ = false;
                 // vKill;pid affects only that inferior. Keep the negotiated
@@ -1369,7 +1489,7 @@ public:
             for (auto& [thread, state] : thread_run_states_) state = ThreadState::exited;
             selected_inferior_live_ = false;
             client_.reset(); transport_.reset(); pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
-            expected_step_threads_.clear(); legacy_expected_step_ = false; terminated_ = true; remote_process_id_.reset();
+            expected_step_threads_.clear(); requested_stop_threads_.clear(); legacy_expected_step_ = false; terminated_ = true; remote_process_id_.reset();
             breakpoints_.clear(); target_.reset(); target_xml_advertised_ = false; libraries_advertised_ = false;
             memory_map_advertised_ = false; threads_xml_advertised_ = false; auxv_advertised_ = false; siginfo_advertised_ = false;
             exec_file_advertised_ = false; multiprocess_supported_ = false;
@@ -1403,7 +1523,7 @@ public:
         }
         client_.reset(); transport_.reset(); pending_stop_.reset(); pending_event_.reset(); pending_event_thread_.clear(); pending_event_signal_ = 0;
         selected_inferior_live_ = false;
-        expected_step_threads_.clear(); legacy_expected_step_ = false;
+        expected_step_threads_.clear(); requested_stop_threads_.clear(); legacy_expected_step_ = false;
         remote_thread_tokens_.clear(); thread_token_ids_.clear(); thread_run_states_.clear(); next_thread_token_ = 1;
         inferiors_.clear();
         breakpoints_.clear(); target_.reset(); target_xml_advertised_ = false; libraries_advertised_ = false;
@@ -1419,8 +1539,34 @@ public:
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
         return client_->interrupt();
     }
+    Status request_thread_interrupt(ThreadId thread) override {
+        if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
+        if (!non_stop_mode_ || !supports_vcont_thread_stop_)
+            return unsupported("remote does not support thread-qualified stops in non-stop mode");
+        if (pending_event_)
+            return Error{ErrorCode::busy, "acknowledge the current remote stop before requesting another thread stop"};
+        const auto wire = thread_id(thread);
+        if (wire.empty() || !valid_thread_wire_id(wire) ||
+            (multiprocess_supported_ && (!remote_process_id_ || thread_process_id(wire) != remote_process_id_)))
+            return Error{ErrorCode::invalid_argument, "thread interrupt requires an exact thread in the selected process"};
+        const auto state = thread_run_states_.find(wire);
+        if (state == thread_run_states_.end() || state->second != ThreadState::running)
+            return Error{ErrorCode::invalid_argument, "thread interrupt requires a known running thread"};
+        if (requested_stop_threads_.contains(wire))
+            return Error{ErrorCode::busy, "a stop request for this remote thread is already pending"};
+        if (requested_stop_threads_.size() >= max_inspection_threads)
+            return Error{ErrorCode::resource_limit, "remote thread stop requests exceed the 4096-thread limit"};
+        const std::array<std::string, 1> actions{"t:" + wire};
+        auto result = client_->send_vcont_actions(actions);
+        if (result) requested_stop_threads_.insert(wire);
+        return result;
+    }
+    bool supports_thread_interrupt() const noexcept override {
+        return client_ && non_stop_mode_ && supports_vcont_thread_stop_;
+    }
     Result<DebugEvent> wait_event(std::chrono::milliseconds timeout) override {
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
+        if (auto output = take_console_output_event()) return std::move(*output);
         Result<rsp::StopReply> stopped = pending_stop_ ? Result<rsp::StopReply>(std::move(*pending_stop_)) :
             client_->wait_stop_reply(timeout);
         pending_stop_.reset();
@@ -1429,6 +1575,10 @@ public:
             if (stopped.error().code == ErrorCode::io && stopped.error().message.find("timed out") != std::string::npos)
                 return Error{ErrorCode::busy, "remote target has not stopped yet"};
             return stopped.error();
+        }
+        if (auto output = take_console_output_event()) {
+            pending_stop_ = std::move(stopped.value());
+            return std::move(*output);
         }
         DebugEvent event;
         event.sequence = ++sequence_;
@@ -1480,9 +1630,12 @@ public:
             const auto lifecycle_reason = fields.find("reason");
             const bool watchpoint = fields.contains("watch") || fields.contains("rwatch") || fields.contains("awatch");
             const bool breakpoint = fields.contains("swbreak") || fields.contains("hwbreak") || watchpoint;
+            const bool requested_thread_stop = !pending_event_thread_.empty() &&
+                requested_stop_threads_.erase(pending_event_thread_) != 0;
             event.kind = lifecycle_reason != fields.end() && lifecycle_reason->second == "thread-created" ? EventKind::thread_created :
                          lifecycle_reason != fields.end() && lifecycle_reason->second == "thread-exited" ? EventKind::thread_exited :
                          breakpoint ? EventKind::breakpoint :
+                         requested_thread_stop && stopped.value().signal == 0 ? EventKind::interrupted :
                          stopped.value().signal == 5 && expected_step ? EventKind::single_step : EventKind::exception;
             event.code = stopped.value().signal;
             if (watchpoint) {
@@ -1493,6 +1646,7 @@ public:
             else if (fields.contains("hwbreak")) event.message = "remote hardware breakpoint";
             else if (lifecycle_reason != fields.end() && lifecycle_reason->second == "thread-created") event.message = "remote thread created";
             else if (lifecycle_reason != fields.end() && lifecycle_reason->second == "thread-exited") event.message = "remote thread exited";
+            else if (event.kind == EventKind::interrupted) event.message = "remote thread stop requested";
             else if (expected_step && event.kind == EventKind::single_step) event.message = "remote single-step completed";
             else event.message = "remote stop signal " + std::to_string(stopped.value().signal);
             for (const auto name : {"watch", "rwatch", "awatch", "pc"}) {
@@ -1739,6 +1893,14 @@ public:
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
         return client_->read_memory(address, size);
     }
+    bool supports_memory_tag_read() const noexcept override {
+        return client_ && client_->memory_tagging_supported();
+    }
+    Result<std::vector<std::byte>> read_memory_tags(std::uint64_t address, std::size_t size,
+        std::int32_t type, std::size_t max_tag_bytes) override {
+        if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
+        return client_->read_memory_tags(address, size, type, max_tag_bytes);
+    }
     Status write_memory(std::uint64_t address, std::span<const std::byte> bytes) override {
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
         return client_->write_memory(address, bytes);
@@ -1757,7 +1919,7 @@ public:
                     if (!thread_belongs_to_session(thread.id)) continue;
                     const auto state = thread_run_states_.try_emplace(thread.id, thread.state).first;
                     if (thread.state != ThreadState::unknown) state->second = thread.state;
-                    result.push_back({thread_token(thread.id), thread.name, state->second});
+                    result.push_back({thread_token(thread.id), thread.name, state->second, thread.core});
                 }
                 if (result.empty()) return unsupported("remote thread list contains no threads in the session process");
                 return result;
@@ -1901,6 +2063,26 @@ public:
         if (!raw.value()) return unsupported("remote advertised qXfer:siginfo:read but returned no signal information");
         return std::move(*raw.value());
     }
+    Result<std::vector<std::byte>> read_remote_file(std::string_view path, std::size_t maximum_size,
+        std::stop_token stop) override {
+        if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
+        return client_->read_remote_file(path, maximum_size, stop);
+    }
+    Result<RemoteFileInfo> stat_remote_file(std::string_view path, bool follow_symlinks,
+        std::stop_token stop) override {
+        if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
+        auto stat = client_->stat_remote_file_path(path, follow_symlinks, stop);
+        if (!stat) return stat.error();
+        const auto &source = stat.value();
+        return RemoteFileInfo{source.device, source.inode, source.mode, source.link_count,
+            source.user_id, source.group_id, source.device_type, source.size, source.block_size,
+            source.blocks, source.access_time, source.modification_time, source.change_time};
+    }
+    Result<std::vector<std::byte>> run_remote_monitor_command(std::string_view command,
+        std::stop_token stop) override {
+        if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
+        return client_->run_monitor_command(command, stop);
+    }
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread) override {
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
         const auto wire_id = thread_id(thread);
@@ -1910,21 +2092,50 @@ public:
         auto selected = client_->select_thread(wire_id); if (!selected) return selected.error();
         if (!target_ && target_xml_advertised_)
             return Error{ErrorCode::unsupported, "remote advertised target XML but did not provide usable register metadata"};
-        auto bytes = client_->read_registers(); if (!bytes) return bytes.error();
+        auto bytes = client_->read_registers_raw(); if (!bytes) return bytes.error();
         if (!target_) {
-            return std::vector<RegisterValue>{{"g (target register packet)", std::move(bytes.value())}};
+            auto packet = std::move(bytes.value());
+            if (packet.empty() || packet.size() % 2 != 0)
+                return Error{ErrorCode::malformed, "remote register packet has invalid width without target XML"};
+            auto value = decode_register_slice(packet);
+            if (!value) return value.error();
+            if (!value.value().second && !std::all_of(packet.begin(), packet.end(), [](char c) { return c == 'x' || c == 'X'; }))
+                return Error{ErrorCode::malformed, "remote register packet has ambiguous unavailable markers without target XML"};
+            return std::vector<RegisterValue>{{"g (target register packet)", std::move(value.value().first), {}, 0, {}, {}, {}, value.value().second}};
         }
+        auto register_packet = std::move(bytes.value());
         std::size_t expected = 0;
         for (const auto& reg : target_->registers) expected += (reg.bits + 7) / 8;
-        if (bytes.value().size() != expected)
+        if (register_packet.empty()) {
+            // Some stubs implement only the single-register `p` packet. Fall
+            // back only for an explicit empty/unsupported `g` response; a
+            // malformed non-empty bulk response must not be hidden.
+            constexpr std::size_t max_single_register_fallback = 256;
+            if (target_->registers.size() > max_single_register_fallback)
+                return Error{ErrorCode::resource_limit,
+                    "remote rejected the bulk register packet and its target description exceeds the single-register fallback limit"};
+            register_packet.reserve(expected * 2);
+            for (const auto& reg : target_->registers) {
+                auto value = client_->read_register_raw(reg.number);
+                if (!value) return value.error();
+                const auto width = (reg.bits + 7) / 8;
+                if (value.value().size() != width * 2)
+                    return Error{ErrorCode::unsupported,
+                        "single-register reply length does not match target XML metadata"};
+                register_packet += value.value();
+            }
+        }
+        if (register_packet.size() != expected * 2)
             return Error{ErrorCode::unsupported, "remote register packet length does not match target XML metadata"};
         std::vector<RegisterValue> result; result.reserve(target_->registers.size());
         std::size_t offset = 0;
         for (const auto& reg : target_->registers) {
             const auto size = (reg.bits + 7) / 8;
-            result.push_back({reg.name, std::vector<std::byte>(bytes.value().begin() + static_cast<std::ptrdiff_t>(offset),
-                bytes.value().begin() + static_cast<std::ptrdiff_t>(offset + size)), reg.group, reg.number,
-                target_->big_endian ? ByteOrder::big : ByteOrder::little});
+            auto decoded = decode_register_slice(std::string_view(register_packet).substr(offset * 2, size * 2));
+            if (!decoded) return decoded.error();
+            result.push_back({reg.name, std::move(decoded.value().first), reg.group, reg.number,
+                target_->big_endian ? ByteOrder::big : ByteOrder::little,
+                target_->architecture_name, reg.type, decoded.value().second});
             offset += size;
         }
         return result;
@@ -1938,6 +2149,7 @@ public:
         std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> originals;
         originals.reserve(registers.size());
         for (const auto& value : registers) {
+            if (!value.available) return Error{ErrorCode::invalid_argument, "cannot write a register marked unavailable"};
             const auto found = std::find_if(target_->registers.begin(), target_->registers.end(), [&](const auto& reg) {
                 return reg.name == value.name && reg.number == value.number;
             });
@@ -1952,9 +2164,60 @@ public:
         if (!thread_belongs_to_session(wire_id))
             return Error{ErrorCode::invalid_argument, "remote thread token belongs to another process"};
         auto selected = client_->select_thread(wire_id); if (!selected) return selected;
+        auto write_through_bulk_packet = [&]() -> Status {
+            auto raw = client_->read_registers_raw(); if (!raw) return raw.error();
+            if (raw.value().empty())
+                return unsupported("remote rejects both single-register reads and the bulk g packet required for safe fallback");
+            std::size_t expected_bytes = 0;
+            for (const auto& reg : target_->registers) {
+                const auto width = (reg.bits + 7u) / 8u;
+                if (width == 0 || width > std::numeric_limits<std::size_t>::max() - expected_bytes)
+                    return Error{ErrorCode::resource_limit, "remote target register layout exceeds the host size limit"};
+                expected_bytes += width;
+            }
+            if (expected_bytes > std::numeric_limits<std::size_t>::max() / 2 ||
+                raw.value().size() != expected_bytes * 2)
+                return unsupported("bulk g packet width does not match target XML metadata for safe register fallback");
+            const std::string original_packet = raw.value();
+            std::string updated = original_packet;
+            std::size_t offset_bytes = 0;
+            for (const auto& reg : target_->registers) {
+                const auto width = (reg.bits + 7u) / 8u;
+                auto decoded = decode_register_slice(std::string_view(updated).substr(offset_bytes * 2, width * 2));
+                if (!decoded) return decoded.error();
+                if (!decoded.value().second)
+                    return unsupported("bulk g packet contains unavailable registers, so a full-register write cannot preserve them safely");
+                offset_bytes += width;
+            }
+            auto nibble = [](unsigned value) { return "0123456789abcdef"[value & 0xfu]; };
+            for (const auto& value : registers) {
+                const auto metadata = std::find_if(target_->registers.begin(), target_->registers.end(), [&](const auto& reg) {
+                    return reg.name == value.name && reg.number == value.number;
+                });
+                if (metadata == target_->registers.end())
+                    return Error{ErrorCode::invalid_argument, "unknown remote register name or number"};
+                std::size_t byte_offset = 0;
+                for (auto it = target_->registers.begin(); it != metadata; ++it)
+                    byte_offset += (it->bits + 7u) / 8u;
+                for (std::size_t i = 0; i < value.bytes.size(); ++i) {
+                    const auto byte = std::to_integer<unsigned>(value.bytes[i]);
+                    updated[(byte_offset + i) * 2] = nibble(byte >> 4u);
+                    updated[(byte_offset + i) * 2 + 1] = nibble(byte);
+                }
+            }
+            auto written = client_->write_registers_raw(updated);
+            if (!written && written.error().code != ErrorCode::unsupported) {
+                auto failure = written.error();
+                auto rollback = client_->write_registers_raw(original_packet);
+                if (!rollback) failure.message += "; bulk register rollback failed: " + rollback.error().message;
+                return failure;
+            }
+            return written;
+        };
         for (const auto& value : registers) {
             const auto original = client_->read_register(value.number);
             if (!original) return original.error();
+            if (original.value().empty()) return write_through_bulk_packet();
             const auto metadata = std::find_if(target_->registers.begin(), target_->registers.end(), [&](const auto& reg) { return reg.number == value.number; });
             if (metadata == target_->registers.end() || original.value().size() != (metadata->bits + 7) / 8)
                 return unsupported("remote does not expose readable p-registers for safe write rollback");
@@ -2081,6 +2344,28 @@ private:
             (kind == BreakpointKind::hardware || kind == BreakpointKind::execute) ? 4 : size;
     }
     static Error unsupported(std::string message) { return {ErrorCode::unsupported, std::move(message)}; }
+    std::optional<DebugEvent> take_console_output_event() {
+        if (!client_) return {};
+        // Four characters per byte is the worst-case escaped rendering; keep
+        // the final event inside DebugSession's 4 KiB message budget.
+        const auto bytes = client_->take_console_output(1024);
+        if (bytes.empty()) return {};
+        static constexpr char digits[] = "0123456789ABCDEF";
+        DebugEvent event;
+        event.kind = EventKind::output;
+        event.message.reserve(bytes.size());
+        for (const auto value : bytes) {
+            const auto byte = std::to_integer<unsigned char>(value);
+            if (byte == '\n' || byte == '\r' || byte == '\t' || (byte >= 0x20 && byte < 0x7f)) {
+                event.message.push_back(static_cast<char>(byte));
+            } else {
+                event.message += "\\x";
+                event.message.push_back(digits[byte >> 4]);
+                event.message.push_back(digits[byte & 0x0f]);
+            }
+        }
+        return event;
+    }
     ThreadId thread_token(std::string_view wire_id) {
         const auto found = remote_thread_tokens_.find(wire_id);
         if (found != remote_thread_tokens_.end()) return found->second;
@@ -2100,8 +2385,10 @@ private:
     std::string pending_event_thread_;
     unsigned pending_event_signal_ = 0;
     std::set<std::string, std::less<>> expected_step_threads_;
+    std::set<std::string, std::less<>> requested_stop_threads_;
     bool legacy_expected_step_ = false;
     std::optional<TargetDescription> target_;
+    std::string target_xml_;
     bool target_xml_advertised_ = false;
     bool libraries_advertised_ = false;
     bool memory_map_advertised_ = false;
@@ -2161,11 +2448,18 @@ public:
         return remote_ ? remote_->detach_remote_current_process(id) : unsupported("no remote debugger session is active");
     }
     Result<ProcessInfo> connect_remote(std::string_view host, std::uint16_t port) override {
+        return connect_remote(host, port, RemoteConnectOptions{});
+    }
+    Result<ProcessInfo> connect_remote(std::string_view host, std::uint16_t port,
+        const RemoteConnectOptions& options) override {
         if (remote_) return Error{ErrorCode::conflict, "remote debugger is already connected"};
         auto remote = make_remote_backend();
-        auto result = remote->connect_remote(host, port);
+        auto result = remote->connect_remote(host, port, options);
         if (result) remote_ = std::move(remote);
         return result;
+    }
+    std::optional<RemoteTargetMetadata> remote_target_metadata() const override {
+        return remote_ ? remote_->remote_target_metadata() : std::optional<RemoteTargetMetadata>{};
     }
     Status detach() override {
         if (remote_) {
@@ -2177,12 +2471,30 @@ public:
     }
     Status terminate() override { return active().terminate(); }
     Status request_interrupt() override { return active().request_interrupt(); }
+    Status request_thread_interrupt(ThreadId thread) override { return active().request_thread_interrupt(thread); }
+    bool supports_thread_interrupt() const noexcept override {
+        return (remote_ ? remote_ : native_)->supports_thread_interrupt();
+    }
     Result<DebugEvent> wait_event(std::chrono::milliseconds timeout) override { return active().wait_event(timeout); }
+    bool output_events_require_acknowledgement() const noexcept override {
+        return (remote_ ? remote_ : native_)->output_events_require_acknowledgement();
+    }
+    bool acknowledgement_keeps_target_stopped(EventKind kind) const noexcept override {
+        return (remote_ ? remote_ : native_)->acknowledgement_keeps_target_stopped(kind);
+    }
+    bool supports_scheduled_signal_disposition() const noexcept override {
+        return (remote_ ? remote_ : native_)->supports_scheduled_signal_disposition();
+    }
     Status continue_event(std::uint64_t sequence, ContinueStatus status) override { return active().continue_event(sequence, status); }
     Status continue_thread_event(std::uint64_t sequence, ThreadId thread, ContinueStatus status) override { return active().continue_thread_event(sequence, thread, status); }
     Status resume_threads_event(std::uint64_t sequence, std::span<const ThreadResumeAction> actions) override { return active().resume_threads_event(sequence, actions); }
     Status single_step_event(std::uint64_t sequence, ContinueStatus status) override { return active().single_step_event(sequence, status); }
     Result<std::vector<std::byte>> read_memory(std::uint64_t address, std::size_t size) override { return active().read_memory(address, size); }
+    bool supports_memory_tag_read() const noexcept override { return active_const().supports_memory_tag_read(); }
+    Result<std::vector<std::byte>> read_memory_tags(std::uint64_t address, std::size_t size,
+        std::int32_t type, std::size_t max_tag_bytes) override {
+        return active().read_memory_tags(address, size, type, max_tag_bytes);
+    }
     Status write_memory(std::uint64_t address, std::span<const std::byte> bytes) override { return active().write_memory(address, bytes); }
     Result<std::vector<ThreadInfo>> threads() override { return active().threads(); }
     Result<std::vector<ThreadRunState>> thread_run_states() override { return active().thread_run_states(); }
@@ -2190,6 +2502,12 @@ public:
     Result<std::vector<MemoryRegion>> memory_regions() override { return active().memory_regions(); }
     Result<std::vector<AuxiliaryVectorEntry>> auxiliary_vector() override { return active().auxiliary_vector(); }
     Result<std::vector<std::byte>> signal_info() override { return active().signal_info(); }
+    Result<std::vector<std::byte>> read_remote_file(std::string_view path, std::size_t maximum_size,
+        std::stop_token stop) override { return active().read_remote_file(path, maximum_size, stop); }
+    Result<RemoteFileInfo> stat_remote_file(std::string_view path, bool follow_symlinks,
+        std::stop_token stop) override { return active().stat_remote_file(path, follow_symlinks, stop); }
+    Result<std::vector<std::byte>> run_remote_monitor_command(std::string_view command,
+        std::stop_token stop) override { return active().run_remote_monitor_command(command, stop); }
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread) override { return active().read_registers(thread); }
     Status write_registers(ThreadId thread, std::span<const RegisterValue> registers) override { return active().write_registers(thread, registers); }
     Result<Breakpoint> add_breakpoint(std::uint64_t address, BreakpointKind kind) override { return active().add_breakpoint(address, kind); }
@@ -2199,6 +2517,7 @@ public:
 private:
     static Error unsupported(std::string message) { return {ErrorCode::unsupported, std::move(message)}; }
     Backend& active() { return remote_ ? *remote_ : *native_; }
+    const Backend& active_const() const { return remote_ ? *remote_ : *native_; }
     std::unique_ptr<Backend> native_;
     std::unique_ptr<Backend> remote_;
 };

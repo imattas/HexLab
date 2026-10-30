@@ -3,9 +3,11 @@
 #include "hexlab/workspace/project_analysis.hpp"
 #include "hexlab/workspace/export.hpp"
 #include "hexlab/analysis/signatures.hpp"
+#include <string>
+#include <vector>
 namespace hexlab {
 struct ProjectOperationId {std::uint64_t value=0;bool operator==(const ProjectOperationId&)const=default;};
-enum class ProjectOperationKind {open_project,import_binary,command,undo,redo,save,save_as,backup,export_binary,analyze,persist_recognition,read_recognition,close,refresh_external,refresh_if_external,history_page,history_preview,persist_breakpoint_hits,persist_type_import_diagnostics,history_audit};
+enum class ProjectOperationKind {open_project,import_binary,command,undo,redo,save,save_as,backup,export_binary,analyze,persist_recognition,read_recognition,close,refresh_external,refresh_if_external,history_page,history_preview,persist_breakpoint_hits,persist_type_import_diagnostics,persist_decompiler_diagnostics,persist_reviewed_issues,history_audit,read_preference,write_preference};
 struct ProjectReply {
     ProjectOperationKind kind;std::shared_ptr<const ProjectSnapshot> snapshot;
     std::optional<database::SavedProject> saved;std::optional<ExportReceipt> exported;
@@ -13,6 +15,7 @@ struct ProjectReply {
     std::optional<database::HistoryPage> history_page;
     std::optional<database::HistoryPreview> history_preview;
     std::optional<database::HistoryAuditPage> history_audit;
+    std::optional<std::string> preference_value;
     bool adopted=true,closed=false;std::optional<Error> adoption_error;
 };
 struct ProjectSubmission {SessionKey session;ProjectOperationId id;std::shared_future<Result<ProjectReply>> result;};
@@ -32,6 +35,11 @@ public:
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> import_binary(OpenRequest);
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> execute(ProjectCommand,std::uint64_t group=0);
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> execute_batch(std::vector<ProjectCommand>,std::uint64_t group=0);
+    // Review-planned edits bind to both source identity and the exact edit
+    // revision. Both are rechecked on the writer thread before validation.
+    HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> execute_batch_at_revision(
+        std::vector<ProjectCommand>,std::uint64_t expected_edit,AnalysisKey source_key,
+        std::shared_ptr<const ProjectSnapshot> reviewed_snapshot,std::uint64_t group=0);
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> undo();
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> redo();
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> ready(bool force=false);
@@ -41,6 +49,10 @@ public:
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> read_function_recognition(FunctionRecognitionKind);
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> persist_breakpoint_hit_counts(std::vector<database::BreakpointHitCount>);
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> replace_type_import_diagnostics(std::vector<database::TypeImportDiagnostic>);
+    HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> upsert_decompiler_diagnostics(AnalysisKey,Address,std::vector<database::TypeImportDiagnostic>);
+    HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> replace_reviewed_analysis_issue_keys(std::vector<std::string>);
+    HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> read_preference(std::string key);
+    HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> write_preference(std::string key,std::string value);
     // Read-only, revision-pinned durable history queries. The history preview
     // is never adopted into the live project session.
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> history_page(std::uint64_t expected_edit,

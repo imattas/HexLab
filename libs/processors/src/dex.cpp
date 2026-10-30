@@ -80,7 +80,8 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
                                                                                    word(static_cast<unsigned>(5 + i * 2))));
                         text += std::to_string(key) + ":" + std::to_string(static_cast<std::int64_t>(target_units) * 2);
                     }
-                    if (shown < count) text += (shown ? ", ..." : "...");
+                    if (shown < count) text += (shown ? ", ... (" : "... (") +
+                        std::to_string(count - shown) + " cases omitted)";
                     text += "}";
                 } else {
                     words = 2 + static_cast<unsigned>(count * 4);
@@ -103,7 +104,8 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
                         const auto target_units = std::bit_cast<std::int32_t>(le32(word(target_index), word(target_index + 1)));
                         text += std::to_string(key) + ":" + std::to_string(static_cast<std::int64_t>(target_units) * 2);
                     }
-                    if (shown < count) text += (shown ? ", ..." : "...");
+                    if (shown < count) text += (shown ? ", ... (" : "... (") +
+                        std::to_string(count - shown) + " cases omitted)";
                     text += "}";
                 }
             } else if (hi == 3) {
@@ -237,8 +239,6 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         const auto start = static_cast<unsigned>(word(2));
         if (count && start > UINT16_MAX - (count - 1))
             return fail(DecodeStatus::invalid, "DEX filled-new-array register range overflows 16-bit register indexes");
-        if (count && start + count - 1 > UINT8_MAX)
-            return fail(DecodeStatus::unsupported, "DEX register indexes above 255 exceed the typed operand model");
         text = "filled-new-array/range {";
         if (count) text += vr(start) + " .. " + vr(start + count - 1);
         dex_type_index = word(1);
@@ -333,6 +333,19 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
             text = std::string(names[op - 0xd8]) + " " + vr(hi) + ", " +
                    vr(operands & 255) + ", " + std::to_string(literal);
         }
+    } else if (op == 0xec) {
+        // Optimized Dalvik's debugger-only breakpoint is a single code unit
+        // with no register operands. Keep it explicit as a trap boundary.
+        text = "breakpoint";
+        flow = FlowKind::trap;
+    } else if (op == 0xed) {
+        // Legacy optimized DEX format 20bc: AA is a verification-error kind,
+        // while BBBB indexes the table appropriate to that kind. Keep both
+        // fields raw because their meaning depends on the verifier/runtime.
+        words = 2;
+        if (!ensure(words)) return fail(DecodeStatus::truncated, "truncated optimized DEX verification error");
+        text = "throw-verification-error kind=" + std::to_string(hi) + ", ref@" + std::to_string(word(1));
+        flow = FlowKind::trap;
     } else if (op >= 0xe3 && op <= 0xeb) {
         static constexpr std::array<std::string_view, 9> names{
             "iget-volatile", "iput-volatile", "sget-volatile", "sput-volatile",
@@ -388,7 +401,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         } else {
             const auto packed = word(2);
             const std::array<unsigned, 5> regs{unsigned(packed & 15), unsigned((packed >> 4) & 15),
-                unsigned((packed >> 8) & 15), unsigned((packed >> 12) & 15), unsigned((hi >> 4) & 15)};
+                unsigned((packed >> 8) & 15), unsigned((packed >> 12) & 15), unsigned(hi & 15)};
             text = std::string(op == 0xee ? "execute-inline {" : "invoke-virtual-quick {");
             for (unsigned n = 0; n < count; ++n) { if (n) text += ", "; text += vr(regs[n]); }
         }
@@ -445,7 +458,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         } else {
             const auto packed = word(2);
             const std::array<unsigned, 5> regs{unsigned(packed & 15), unsigned((packed >> 4) & 15),
-                unsigned((packed >> 8) & 15), unsigned((packed >> 12) & 15), unsigned((hi >> 4) & 15)};
+                unsigned((packed >> 8) & 15), unsigned((packed >> 12) & 15), unsigned(hi & 15)};
             for (unsigned n = 0; n < count; ++n) { if (n) text += ", "; text += vr(regs[n]); }
         }
         const auto reference_index = word(1);
@@ -504,16 +517,16 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
     // through the high half alias ordinary single-slot operations.
     bool unrepresentable_register = false;
     const auto reg = [&](unsigned index, OperandAccess access, unsigned width = 32) {
-        if (index > UINT8_MAX || (width == 64 && index == UINT8_MAX)) {
+        if (index > UINT16_MAX || (width == 64 && index == UINT16_MAX)) {
             unrepresentable_register = true;
             return;
         }
         instruction.operands.emplace_back(RegisterOperand{RegisterBank::dex_vreg,
-            static_cast<std::uint8_t>(index), static_cast<std::uint16_t>(width), false});
+            static_cast<std::uint16_t>(index), static_cast<std::uint16_t>(width), false});
         instruction.access.push_back(access);
         for (unsigned slot = 0; slot < width / 32; ++slot) {
             const RegisterOperand effect{RegisterBank::dex_vreg,
-                static_cast<std::uint8_t>(index + slot), 32, false};
+                static_cast<std::uint16_t>(index + slot), 32, false};
             const auto add = [&](auto &effects) {
                 if (std::find(effects.begin(), effects.end(), effect) == effects.end()) effects.push_back(effect);
             };
@@ -528,7 +541,10 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
     };
     constexpr auto read = OperandAccess::read, write = OperandAccess::write, rw = OperandAccess::read_write;
     const unsigned a = hi & 15, b = hi >> 4;
-    if (op >= 0x01 && op <= 0x09) {
+    if (op == 0xed) {
+        imm(hi, 8, 8);
+        imm(word(1), 16, 16);
+    } else if (op >= 0x01 && op <= 0x09) {
         const unsigned form = (op - 1) % 3, width = op >= 0x04 && op <= 0x06 ? 64 : 32;
         reg(form == 0 ? a : form == 1 ? hi : word(1), write, width);
         reg(form == 0 ? b : form == 1 ? word(1) : word(2), read, width);
@@ -571,7 +587,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
             const auto list = word(2);
             const std::array<unsigned, 5> regs{unsigned(list & 15), unsigned((list >> 4) & 15),
                 unsigned((list >> 8) & 15), unsigned((list >> 12) & 15),
-                invoke_ext ? unsigned((hi >> 4) & 15) : a};
+                invoke_ext ? unsigned(hi & 15) : a};
             for (unsigned i = 0; i < count; ++i) reg(regs[i], read);
         }
         // Invoke lists encode argument words, including both words of wide
@@ -596,7 +612,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         } else {
             const auto packed = word(2);
             const std::array<unsigned, 5> regs{unsigned(packed & 15), unsigned((packed >> 4) & 15),
-                unsigned((packed >> 8) & 15), unsigned((packed >> 12) & 15), unsigned((hi >> 4) & 15)};
+                unsigned((packed >> 8) & 15), unsigned((packed >> 12) & 15), unsigned(hi & 15)};
             for (unsigned i = 0; i < count; ++i) reg(regs[i], read);
         }
         imm(word(1), 16, 16);
@@ -650,7 +666,7 @@ DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
         imm(static_cast<std::uint64_t>(value), op <= 0xd7 ? 16 : 8, 32, true);
     }
     if (unrepresentable_register)
-        return fail(DecodeStatus::unsupported, "DEX register indexes above 255 exceed the typed operand model (including wide pairs)");
+        return fail(DecodeStatus::unsupported, "DEX register indexes exceed the 16-bit typed operand model (including wide pairs)");
     if (instruction.dex_switch) {
         instruction.operands.emplace_back(RelativeOperand{static_cast<std::int64_t>(instruction.dex_switch->payload.offset) -
             static_cast<std::int64_t>(at.offset), 32, 32, {}});

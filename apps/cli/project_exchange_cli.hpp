@@ -5,5 +5,7 @@ namespace hexlab::cli::project_detail {
 Result<std::vector<std::byte>> read_exchange_file(const std::filesystem::path &);
 Result<bool> write_exchange_file(const ProjectSnapshot &, const std::filesystem::path &, bool replace);
 Result<bool> write_type_library_file(const ProjectSnapshot &, const std::filesystem::path &, bool replace);
+Result<bool> write_type_library_header(const ProjectSnapshot &, const std::filesystem::path &, bool replace);
 Result<types::LibraryBundle> read_type_library_file(const std::filesystem::path &);
+Result<bool> type_assignment_source_bytes_match(const ProjectSnapshot &, const types::LibraryAssignment &);
 }

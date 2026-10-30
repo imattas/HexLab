@@ -46,6 +46,16 @@ bool stack_flow(State &s, std::uint8_t opcode, bool extended) {
             s.i.condition = opcode & 15;
             s.i.x86_condition = static_cast<X86Condition>(s.i.condition);
             s.flags_read = true;
+        } else if (opcode == 0xa2) {
+            s.i.opcode = Opcode::cpuid;
+            s.i.register_reads.push_back(gpr(0, 32)); // EAX leaf selector.
+            s.i.register_reads.push_back(gpr(1, 32)); // ECX subleaf selector.
+            for (const auto index : {0u, 3u, 1u, 2u}) {
+                const auto result = gpr(index, 32);
+                // A 32-bit GPR write clears its upper half in long mode.
+                if (s.rules.long_mode()) s.i.register_writes.push_back(gpr(index, 64));
+                s.i.register_writes.push_back(result);
+            }
         } else if (opcode == 0x1f) {
             auto m = modrm(s, s.width());
             if (m.group != 0)
@@ -64,7 +74,20 @@ bool stack_flow(State &s, std::uint8_t opcode, bool extended) {
             return false;
         return true;
     }
-    if (opcode == 0x60 || opcode == 0x61) {
+    if (opcode == 0xf5 || opcode == 0xf8 || opcode == 0xf9 || opcode == 0xfc || opcode == 0xfd) {
+        // These instructions replace one bit of the FLAGS value. Keep the
+        // unaffected bits as an explicit input to the whole-register model.
+        s.i.opcode = Opcode::x86_flag_control;
+        switch (opcode) {
+        case 0xf5: s.i.mnemonic_override = "cmc"; break;
+        case 0xf8: s.i.mnemonic_override = "clc"; break;
+        case 0xf9: s.i.mnemonic_override = "stc"; break;
+        case 0xfc: s.i.mnemonic_override = "cld"; break;
+        case 0xfd: s.i.mnemonic_override = "std"; break;
+        }
+        s.flags_read = true;
+        s.flags_write = true;
+    } else if (opcode == 0x60 || opcode == 0x61) {
         if (s.rules.long_mode())
             invalid("PUSHA/POPA are invalid in 64-bit mode");
         const auto width = s.stack_width();
@@ -96,6 +119,7 @@ bool stack_flow(State &s, std::uint8_t opcode, bool extended) {
         s.i.opcode = Opcode::x87;
         s.i.mnemonic_override = "sahf";
         s.i.register_reads.push_back({RegisterBank::gpr, 0, 8, true});
+        s.i.register_reads.push_back({RegisterBank::flags, 0, s.rules.pointer_width(), false});
         s.i.register_writes.push_back({RegisterBank::flags, 0, s.rules.pointer_width(), false});
     } else if (opcode == 0x9f) {
         // LAHF copies SF/ZF/AF/PF/CF to AH and leaves FLAGS unchanged.
@@ -214,8 +238,17 @@ bool stack_flow(State &s, std::uint8_t opcode, bool extended) {
         s.i.x86_loop_counter_width = width;
         const RegisterOperand counter{RegisterBank::gpr, 1, width, false};
         s.i.register_reads.push_back(counter);
-        if (opcode != 0xe3)
+        if (opcode != 0xe3) {
             s.i.register_writes.push_back(counter);
+            const auto full_width = s.rules.pointer_width();
+            if (width < full_width) {
+                const RegisterOperand full_counter{RegisterBank::gpr, 1, full_width, false};
+                // A 16-bit counter update preserves the wider register's high
+                // bits; a 32-bit long-mode update clears the high half.
+                if (width == 16) s.i.register_reads.push_back(full_counter);
+                s.i.register_writes.push_back(full_counter);
+            }
+        }
         if (opcode == 0xe0 || opcode == 0xe1)
             s.flags_read = true;
         std::optional<EncodedField> field;

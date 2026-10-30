@@ -45,6 +45,45 @@ host high-contrast theme remains in control. Search controls are created in a
 top-to-bottom tab order (page status/actions, filter/clear, result actions,
 results, preview); dialog labels precede their associated inputs.
 
+## Pseudocode text sizing
+
+While the pseudocode editor has focus, `Ctrl+-` decreases its text size,
+`Ctrl+Shift++` (or `Ctrl+=` on layouts where plus shares the equals key)
+increases it, and `Ctrl+0` restores the default size. These shortcuts call the
+same bounded sizing action as the labeled size buttons, so keyboard users can
+adjust readability without leaving the editor. The buttons remain available
+with descriptive accessible names and help text.
+
+## Type and symbol filtering
+
+In the Types, Assignments, and Importable Symbols pages, `Ctrl+F` focuses the
+page's filter field and selects its current text. The fields expose help text
+that states their search scope and shortcut, so keyboard users can move between
+the three page-specific filters without tabbing through the full action bar.
+The Strings page uses the same `Ctrl+F` behavior for its decoded-text/location
+filter; encoding, mapping, termination, length and sort controls remain separate
+facets.
+
+## Graph canvas keyboard help
+
+The graph canvas exposes its keyboard controls as both wx help text and a
+tooltip, making the existing keyboard navigation discoverable to keyboard and
+accessibility users: Tab/Shift+Tab moves between nodes, Up/Down moves between
+instructions, Ctrl+Up/Down cycles edges, Enter activates the focused item,
+Home fits the graph, plus/minus zooms, arrow keys pan, Ctrl+Left/Right changes
+graphs, and F6 returns focus to graph items.
+
+## Archive, comparison, and signature results
+
+Archive browsing, binary comparison, and FLAIR signature-match dialogs now
+scale their initial client size, fixed list heights, column widths, and margins
+through `FromDIP`. Their result lists expose stable control names and help text
+that describes arrow-key selection and Enter/double-click actions. The FLAIR
+dialog's summary, results list, navigation button, and close button also have
+stable names for automation and accessibility bridges. The dialog still uses
+native list controls, so spoken row/column announcements and DPI changes while
+the window moves between monitors remain host-platform validation work.
+
 This remains a focused keyboard and scaling improvement, not a completed
 accessibility audit. Screen-reader announcements, keyboard focus order after
 restoring arbitrary user perspectives, high-contrast themes, and multi-monitor

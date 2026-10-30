@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <functional>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
@@ -35,6 +36,9 @@ struct HEXLAB_PLUGINS_EXPORT PluginInfo {
     // IDs of loaded plugins that satisfy required capabilities at activation.
     // Host-provided capabilities do not appear in this list.
     std::vector<std::string> resolved_dependencies;
+    // Exact UTF-8 path requested for this loaded module. This is diagnostic
+    // provenance only; it does not establish publisher identity or trust.
+    std::string module_path;
 };
 enum class PluginRequirementResolution : std::uint8_t {
     host,
@@ -57,6 +61,9 @@ struct HEXLAB_PLUGINS_EXPORT PluginCandidate {
         std::string id;
         std::string name;
         std::string version;
+        // Optional lowercase SHA-256 pin for the adjacent module file. This is
+        // advisory integrity metadata, not a publisher signature.
+        std::string sha256;
         std::vector<PluginInfo::VersionedCapability> capabilities;
         std::vector<PluginInfo::VersionedCapability> required_capabilities;
     };
@@ -64,6 +71,10 @@ struct HEXLAB_PLUGINS_EXPORT PluginCandidate {
     // A malformed sidecar does not hide a native module candidate. Hosts can
     // display this diagnostic before the user explicitly chooses to load it.
     std::string manifest_error;
+    // Populated only when a valid manifest declares sha256. Hashing is
+    // data-only; mismatch/read-limit failures are reported here.
+    std::string module_sha256;
+    std::string integrity_error;
     // Advisory snapshot of host, loaded and supplied candidate providers. This
     // does not verify native modules or transitive dependency feasibility.
     // Refresh after lifecycle changes; activation always replans and validates.
@@ -91,6 +102,18 @@ struct HEXLAB_PLUGINS_EXPORT PluginExtensionFailure {
 };
 struct HEXLAB_PLUGINS_EXPORT AnalysisProviderInfo {
     std::string plugin_id, provider_id, display_name;
+};
+struct PluginUnloadPlan {
+    std::weak_ptr<const void> manager_identity;
+    std::uint64_t generation = 0;
+    std::string root_plugin_id;
+    bool all = false;
+    std::vector<std::string> plugin_ids; // exact consumer-first removal order
+    std::vector<std::string> retained_provider_ids;
+};
+struct PluginUnloadResult {
+    std::vector<std::string> removed;
+    std::optional<Error> failure; // partial cleanup must still invalidate clients
 };
 struct HEXLAB_PLUGINS_EXPORT LoaderProbeResult {
     std::string plugin_id, extension_id, format_id;
@@ -150,6 +173,9 @@ public:
 class HEXLAB_PLUGINS_EXPORT PluginManager {
 public:
     explicit PluginManager(std::shared_ptr<ModuleProvider> provider);
+    /* Persistent plugin.state store. The file is host-owned and scoped to the
+       current user profile; an empty path disables persistence. */
+    PluginManager(std::shared_ptr<ModuleProvider> provider, std::filesystem::path state_store_path);
     ~PluginManager();
     PluginManager(const PluginManager&) = delete;
     PluginManager& operator=(const PluginManager&) = delete;
@@ -157,6 +183,10 @@ public:
     PluginManager& operator=(PluginManager&&) noexcept;
 
     Result<PluginInfo> load(const std::string& path);
+    /* Loads a scanned candidate against its sidecar snapshot. A declared
+       SHA-256 pin is checked immediately before and after native module open,
+       and identity/capability declarations are checked before start. */
+    Result<PluginInfo> load_candidate(const PluginCandidate& candidate);
     /* Enumerates only direct native-module candidates (macOS .bundle directories
        are supported). Symlinks and unrelated nested directories are skipped;
        scanning is bounded and does not load or execute any candidate. */
@@ -183,6 +213,12 @@ public:
     /* Consumer-first unload of a plugin and all transitive loaded dependents.
        Providers that are merely dependencies of the selected plugin stay loaded. */
     Result<std::vector<std::string>> unload_with_dependents(const std::string& plugin_id);
+    // Data-only cleanup review: at most 256 loaded modules, 4096 resolved
+    // dependency edges and 64 KiB of loaded IDs. all ignores root_plugin_id.
+    Result<PluginUnloadPlan> plan_unload(const std::string& root_plugin_id, bool all = false) const;
+    // Rejects another manager or changed generations/plans before removal. Reports partial removals
+    // explicitly if a later removal fails; providers outside the plan remain.
+    Result<PluginUnloadResult> unload_reviewed(const PluginUnloadPlan&);
     // Stop all plugins in reverse activation order, including their dependents.
     Status unload_all();
     std::vector<PluginInfo> plugins() const;
@@ -225,11 +261,16 @@ private:
     struct Impl;
     Result<PluginInfo> load_locked(const std::string&, const PluginCandidate::Manifest* = nullptr);
     Status unload_locked(const std::string&);
+    Result<PluginUnloadPlan> plan_unload_locked(const std::string&, bool) const;
     Result<std::vector<PluginCandidate>> plan_activation_locked(
         std::span<const PluginCandidate>, const std::string&) const;
     explicit PluginManager(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
     std::shared_ptr<Impl> impl_;
 };
+
+/* Returns the per-user default plugin.state file location, or an empty path
+   when no user data directory can be determined. */
+HEXLAB_PLUGINS_EXPORT std::filesystem::path default_plugin_state_path();
 
 HEXLAB_PLUGINS_EXPORT std::shared_ptr<ModuleProvider> make_native_module_provider();
 // Reads a bounded, data-only `.hexlab-plugin` manifest. This never opens the

@@ -103,7 +103,9 @@ void read_symbols(const ByteStorage &storage, const Image &image, ElfMetadata &m
                   std::stop_token stop) {
     const auto is_symbols = [](const ElfSection &section) { return section.type == 2 || section.type == 11; };
     if (std::none_of(metadata.sections.begin(), metadata.sections.end(),
-                     [&](const auto &section) { return is_symbols(section) || section.type == 18; }))
+                     [&](const auto &section) {
+                         return is_symbols(section) || section.type == 18 || section.type == 17;
+                     }))
         return;
     const bool wide = metadata.header.is_64;
     const auto minimum = wide ? 24u : 16u;
@@ -138,15 +140,23 @@ void read_symbols(const ByteStorage &storage, const Image &image, ElfMetadata &m
         if (const auto found = strings.find(index); found != strings.end())
             return found->second;
         const auto &table = metadata.sections[index];
-        require(!(table.flags & 0x800), "Compressed ELF symbol strings are unsupported", ErrorCode::unsupported);
-        budget.include(table.size);
         budget.include(sizeof(ByteView) + sizeof(std::uint32_t) + 3 * sizeof(void *));
         ByteView view;
-        if (table.size) {
+        if (table.flags & 0x800) {
+            auto expanded = std::make_shared<const std::vector<std::uint8_t>>(
+                read_debug_section_bytes(storage, metadata, table, budget, stop));
+            require(!expanded->empty(), "ELF symbol string table requires boundary terminators");
+            view.owner = expanded;
+            view.bytes = {reinterpret_cast<const std::byte *>(expanded->data()), expanded->size()};
+        } else if (table.size) {
+            require(table.size <= metadata_limit && table.size <= std::numeric_limits<std::size_t>::max(),
+                    "ELF symbol string table exceeds metadata budget", ErrorCode::resource_limit);
+            budget.include(table.size);
             view = reader.bytes(table.offset, static_cast<std::size_t>(table.size));
+        }
+        if (!view.bytes.empty())
             require(view.bytes.front() == std::byte{0} && view.bytes.back() == std::byte{0},
                     "ELF symbol string table requires boundary terminators");
-        }
         return strings.emplace(index, std::move(view)).first->second;
     };
     for (const auto &table : metadata.sections) {
@@ -183,5 +193,53 @@ void read_symbols(const ByteStorage &storage, const Image &image, ElfMetadata &m
             metadata.symbols.push_back(std::move(symbol));
         }
     }
+    // SHT_GROUP is meaningful only for ET_REL. Preserve the signature and
+    // exact member list so callers can inspect COMDAT/grouped sections without
+    // pretending that the loader has selected or discarded duplicate groups.
+    budget.include(metadata.sections.size() * sizeof(std::uint8_t));
+    std::vector<std::uint8_t> grouped(metadata.sections.size());
+    for (const auto &section : metadata.sections) {
+        canceled(stop);
+        if (section.type != 17) // SHT_GROUP
+            continue;
+        require(metadata.header.object_type == 1, "SHT_GROUP requires relocatable ELF");
+        require(section.size >= 8 && section.size % 4 == 0 && section.entry_size == 4,
+                "Invalid ELF section-group record extent/stride");
+        require(section.link < metadata.sections.size() && is_symbols(metadata.sections[section.link]),
+                "ELF section-group link must name a symbol table");
+        const auto table = std::find_if(metadata.symbol_tables.begin(), metadata.symbol_tables.end(),
+            [&](const ElfSymbolTable &candidate) { return candidate.source.section == section.link; });
+        require(table != metadata.symbol_tables.end() && table->symbol_begin && table->count,
+                "ELF section-group signature table is unavailable");
+        require(section.info < *table->count, "ELF section-group signature index is outside symbol table");
+        const auto signature_at = static_cast<std::size_t>(*table->symbol_begin + section.info);
+        require(signature_at < metadata.symbols.size(), "ELF section-group signature symbol is unavailable");
+        const auto flags_view = reader.bytes(section.offset, 4);
+        const auto flags = static_cast<std::uint32_t>(reader.value(flags_view.bytes, 0, 4));
+        budget.include(sizeof(ElfSectionGroup) + (section.size / 4 - 1) * sizeof(std::uint32_t));
+        ElfSectionGroup group;
+        group.section = section.index;
+        group.flags = flags;
+        group.signature_symbol = section.info;
+        group.signature_symbol_table = section.link;
+        group.signature_name = metadata.symbols[signature_at].name;
+        group.members.reserve(static_cast<std::size_t>(section.size / 4 - 1));
+        for (std::uint64_t at = 4; at < section.size; at += 4) {
+            canceled(stop);
+            const auto member_view = reader.bytes(section.offset + at, 4);
+            const auto member = static_cast<std::uint32_t>(reader.value(member_view.bytes, 0, 4));
+            require(member != 0 && member < metadata.sections.size() && member != section.index,
+                    "ELF section-group member index is invalid");
+            require(metadata.sections[member].flags & 0x200,
+                    "ELF section-group member lacks SHF_GROUP");
+            require(!grouped[member], "ELF section belongs to multiple groups");
+            grouped[member] = 1;
+            group.members.push_back(member);
+        }
+        metadata.section_groups.push_back(std::move(group));
+    }
+    for (const auto &section : metadata.sections)
+        if (section.flags & 0x200)
+            require(grouped[section.index], "SHF_GROUP section has no SHT_GROUP membership");
 }
 } // namespace hexlab::elf_detail

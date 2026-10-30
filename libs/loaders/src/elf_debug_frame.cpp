@@ -45,6 +45,7 @@ struct FrameRecord {
 struct FrameCie {
     std::uint64_t file_offset = 0, code_alignment = 0, return_register = 0;
     std::int64_t data_alignment = 0;
+    bool has_z_augmentation = false;
     std::vector<std::byte> instructions;
 };
 constexpr std::size_t max_frame_records = 65536;
@@ -113,9 +114,17 @@ void parse_debug_frame_section(const ByteStorage &storage, const Image &image, c
         FrameCursor cursor{reader, bytes, record.body, record.end};
         const auto version = cursor.fixed(1);
         require(version == 1 || version == 3 || version == 4, "Unsupported .debug_frame CIE version", ErrorCode::unsupported);
-        // Nonempty augmentation changes the header/FDE contract. Do not parse
-        // unknown augmentation as an ordinary CIE or expose its guessed range.
-        require(cursor.fixed(1) == 0, "Augmented .debug_frame CIE is unsupported", ErrorCode::unsupported);
+        std::string augmentation;
+        while (true) {
+            const auto character = cursor.fixed(1);
+            if (!character) break;
+            require(augmentation.size() < 16, ".debug_frame CIE augmentation string is too long",
+                ErrorCode::resource_limit);
+            augmentation.push_back(static_cast<char>(character));
+        }
+        const bool has_z_augmentation = augmentation == "zR";
+        require(augmentation.empty() || has_z_augmentation,
+            "Unsupported .debug_frame CIE augmentation", ErrorCode::unsupported);
         if (version == 4) {
             require(cursor.fixed(1) == address_size && cursor.fixed(1) == 0,
                 "Unsupported .debug_frame address/segment size", ErrorCode::unsupported);
@@ -124,6 +133,12 @@ void parse_debug_frame_section(const ByteStorage &storage, const Image &image, c
         cie.file_offset = add(section.offset, record.begin);
         cie.code_alignment = cursor.uleb(); cie.data_alignment = cursor.sleb();
         cie.return_register = version == 1 ? cursor.fixed(1) : cursor.uleb();
+        cie.has_z_augmentation = has_z_augmentation;
+        if (has_z_augmentation) {
+            const auto augmentation_size = cursor.uleb();
+            require(augmentation_size == 1 && cursor.fixed(1) == 0,
+                "Only native absolute-pointer .debug_frame zR encoding is supported", ErrorCode::unsupported);
+        }
         require(cie.code_alignment != 0, "ELF .debug_frame CIE has zero code alignment");
         const auto size = cursor.end - cursor.at;
         require(size <= max_cfi_bytes, ".debug_frame CIE instructions exceed 1 MiB", ErrorCode::resource_limit);
@@ -145,6 +160,11 @@ void parse_debug_frame_section(const ByteStorage &storage, const Image &image, c
         const auto raw_begin = cursor.fixed(address_size);
         const auto begin = machine == 40 ? raw_begin & ~UINT64_C(1) : raw_begin;
         const auto size = cursor.fixed(address_size);
+        if (cie.has_z_augmentation) {
+            const auto augmentation_size = cursor.uleb();
+            require(augmentation_size == 0,
+                "Unexpected .debug_frame FDE augmentation data", ErrorCode::unsupported);
+        }
         const std::uint64_t limit = address_size == 4 ? UINT32_MAX : UINT64_MAX;
         require(size != 0 && begin <= limit && size - 1 <= limit - begin,
             "ELF .debug_frame range is empty or exceeds target address width", ErrorCode::overflow);

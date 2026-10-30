@@ -5,9 +5,11 @@
 #include "expression_type_context.hpp"
 #include "hexlab/processors/riscv_semantics.hpp"
 #include "hexlab/processors/x86_avx_semantics.hpp"
+#include "hexlab/processors/x64_instruction_semantics.hpp"
 #include "mips64_lifting.hpp"
 #include "ppc_lifting.hpp"
 #include "riscv_fp_lifting.hpp"
+#include "hexlab/processors/m6502_semantics.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -135,6 +137,10 @@ const types::TypePtr *expression_register_type(RegisterOperand reg,
 
 namespace hexlab::decompiler {
 namespace {
+bool x86_writes_flags(const Instruction &instruction) {
+    return std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+}
 ValueType integer_type(std::uint16_t bits) { return {TypeKind::integer, bits, false}; }
 ValueType floating_type(std::uint16_t bits) { return {TypeKind::floating, bits, false}; }
 ValueType vector_type(std::uint16_t bits, TypeKind element_kind = TypeKind::unknown,
@@ -153,7 +159,7 @@ std::string riscv_fp_name(Opcode op) {
     return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_flw)];
 }
 
-struct RiscvVectorEffect { const char* name; bool mask_result; bool floating = false; };
+struct RiscvVectorEffect { const char* name; bool mask_result; bool floating = false; bool mask_inputs = false; };
 std::optional<RiscvVectorEffect> riscv_vector_effect(Opcode opcode) {
     // Explicit opcode cases keep routing independent of serialized enum ranges.
     switch (opcode) {
@@ -179,6 +185,18 @@ std::optional<RiscvVectorEffect> riscv_vector_effect(Opcode opcode) {
     case Opcode::rv_vredmin: return RiscvVectorEffect{"vredmin.vs", false};
     case Opcode::rv_vredmaxu: return RiscvVectorEffect{"vredmaxu.vs", false};
     case Opcode::rv_vredmax: return RiscvVectorEffect{"vredmax.vs", false};
+    case Opcode::rv_vmand_mm: return RiscvVectorEffect{"vmand.mm", true, false, true};
+    case Opcode::rv_vmnand_mm: return RiscvVectorEffect{"vmnand.mm", true, false, true};
+    case Opcode::rv_vmandn_mm: return RiscvVectorEffect{"vmandn.mm", true, false, true};
+    case Opcode::rv_vmxor_mm: return RiscvVectorEffect{"vmxor.mm", true, false, true};
+    case Opcode::rv_vmor_mm: return RiscvVectorEffect{"vmor.mm", true, false, true};
+    case Opcode::rv_vmnor_mm: return RiscvVectorEffect{"vmnor.mm", true, false, true};
+    case Opcode::rv_vmorn_mm: return RiscvVectorEffect{"vmorn.mm", true, false, true};
+    case Opcode::rv_vmxnor_mm: return RiscvVectorEffect{"vmxnor.mm", true, false, true};
+    case Opcode::rv_vfredusum: return RiscvVectorEffect{"vfredusum.vs", false, true};
+    case Opcode::rv_vfredosum: return RiscvVectorEffect{"vfredosum.vs", false, true};
+    case Opcode::rv_vfredmin: return RiscvVectorEffect{"vfredmin.vs", false, true};
+    case Opcode::rv_vfredmax: return RiscvVectorEffect{"vfredmax.vs", false, true};
     RVV_TRIPLE(vsll, false);
     RVV_TRIPLE(vsrl, false);
     RVV_TRIPLE(vsra, false);
@@ -300,7 +318,8 @@ bool mips_branch_likely(Opcode opcode) {
 ExpressionPtr reg_expr(RegisterOperand reg) {
     if (reg.bank == RegisterBank::riscv_vpr)
         return std::make_shared<Expression>(Expression{vector_type(0), RegisterValue{reg}});
-    const auto type = (reg.bank == RegisterBank::riscv_fpr || reg.bank == RegisterBank::mips_fpr)
+    const auto type = (reg.bank == RegisterBank::riscv_fpr || reg.bank == RegisterBank::mips_fpr ||
+                       reg.bank == RegisterBank::arm32_vfp)
                           ? floating_type(reg.width) : integer_type(reg.width);
     return std::make_shared<Expression>(Expression{type, RegisterValue{reg}});
 }
@@ -392,6 +411,8 @@ std::string register_name(RegisterOperand reg) {
         return "stack_" + std::to_string(reg.index);
     if (reg.bank == RegisterBank::jvm_stack)
         return "jvm_stack_" + std::to_string(reg.index);
+    if (reg.bank == RegisterBank::jvm_local)
+        return "jvm_local_" + std::to_string(reg.index);
     if (reg.bank == RegisterBank::wasm_stack)
         return "wasm_stack_" + std::to_string(reg.index);
     if (reg.bank == RegisterBank::wasm_local)
@@ -406,6 +427,8 @@ std::string register_name(RegisterOperand reg) {
         return std::string(reg.width == 32 ? "w" : "x") + std::to_string(reg.index);
     if (reg.bank == RegisterBank::arm64_simd)
         return "v" + std::to_string(reg.index);
+    if (reg.bank == RegisterBank::arm32_vfp)
+        return std::string(reg.width == 64 ? "d" : "s") + std::to_string(reg.index);
     if (reg.bank == RegisterBank::arm64_sp)
         return reg.width == 32 ? "wsp" : "sp";
     if (reg.bank == RegisterBank::arm64_zero)
@@ -579,6 +602,8 @@ std::string operation_name(Opcode opcode) {
     case Opcode::m6502_las: return "LAS";
     case Opcode::m6502_anc: return "ANC";
     case Opcode::m6502_axs: return "AXS";
+    case Opcode::m6502_lax: return "LAX";
+    case Opcode::m6502_sax: return "SAX";
     case Opcode::m6502_cpx: return "CPX"; case Opcode::m6502_cpy: return "CPY";
     case Opcode::m6502_bit: return "BIT"; case Opcode::m6502_inc: return "INC";
     case Opcode::m6502_dec: return "DEC"; case Opcode::m6502_inx: return "INX";
@@ -601,8 +626,10 @@ std::string operation_name(Opcode opcode) {
     case Opcode::m6502_sed: return "SED"; case Opcode::m6502_asl: return "ASL";
     case Opcode::m6502_lsr: return "LSR"; case Opcode::m6502_rol: return "ROL";
     case Opcode::m6502_ror: return "ROR";
-    case Opcode::add: case Opcode::a64_add: case Opcode::a32_add: return "add";
-    case Opcode::sub: case Opcode::a64_sub: case Opcode::a32_sub: return "sub";
+    case Opcode::add: case Opcode::a64_add: case Opcode::a32_add: case Opcode::t32_addw: return "add";
+    case Opcode::a64_adc: return "adc"; case Opcode::a64_adcs: return "adcs";
+    case Opcode::a64_sbc: return "sbc"; case Opcode::a64_sbcs: return "sbcs";
+    case Opcode::sub: case Opcode::a64_sub: case Opcode::a32_sub: case Opcode::t32_subw: return "sub";
     case Opcode::a64_bfm: return "a64_bfm";
     case Opcode::a64_extr: return "extr";
     case Opcode::a32_rsb: return "rsb";
@@ -649,7 +676,14 @@ std::string operation_name(Opcode opcode) {
     case Opcode::lzcnt: return "lzcnt";
     case Opcode::cmpxchg8b: return "cmpxchg8b";
     case Opcode::cmpxchg16b: return "cmpxchg16b";
+    case Opcode::cpuid: return "cpuid";
+    case Opcode::xchg: return "xchg";
     case Opcode::bzhi: return "bzhi";
+    case Opcode::andn: return "andn";
+    case Opcode::bextr: return "bextr";
+    case Opcode::blsi: return "blsi";
+    case Opcode::blsmsk: return "blsmsk";
+    case Opcode::blsr: return "blsr";
     case Opcode::mulx: return "mulx";
     case Opcode::pdep: return "pdep";
     case Opcode::pext: return "pext";
@@ -673,6 +707,8 @@ std::string operation_name(Opcode opcode) {
     case Opcode::x86_stos: return "stos";
     case Opcode::x86_lods: return "lods";
     case Opcode::x86_scas: return "scas";
+    case Opcode::x86_ins: return "ins";
+    case Opcode::x86_outs: return "outs";
     case Opcode::paddd: return "paddd";
     case Opcode::paddq: return "paddq";
     case Opcode::psubd: return "psubd";
@@ -701,11 +737,17 @@ std::string operation_name(Opcode opcode) {
     case Opcode::psrlq: return "psrlq";
     case Opcode::psraw: return "psraw";
     case Opcode::psrad: return "psrad";
+    case Opcode::pslldq: return "pslldq";
+    case Opcode::psrldq: return "psrldq";
     case Opcode::pmullw: return "pmullw";
     case Opcode::pmulhw: return "pmulhw";
     case Opcode::pmulhuw: return "pmulhuw";
     case Opcode::pmuludq: return "pmuludq";
     case Opcode::pmaddwd: return "pmaddwd";
+    case Opcode::pabsb: return "pabsb";
+    case Opcode::pabsw: return "pabsw";
+    case Opcode::pabsd: return "pabsd";
+    case Opcode::psadbw: return "psadbw";
     case Opcode::pminub: return "pminub";
     case Opcode::pmaxub: return "pmaxub";
     case Opcode::pminsw: return "pminsw";
@@ -720,6 +762,11 @@ std::string operation_name(Opcode opcode) {
     case Opcode::pcmpgtb: return "pcmpgtb";
     case Opcode::pcmpgtw: return "pcmpgtw";
     case Opcode::pcmpgtd: return "pcmpgtd";
+    case Opcode::pcmpgtq: return "pcmpgtq";
+    case Opcode::cmpps: return "cmpps";
+    case Opcode::cmppd: return "cmppd";
+    case Opcode::cmpss: return "cmpss";
+    case Opcode::cmpsd: return "cmpsd";
     case Opcode::vaddps: return "vaddps";
     case Opcode::vaddpd: return "vaddpd";
     case Opcode::vsubps: return "vsubps";
@@ -764,7 +811,9 @@ std::string operation_name(Opcode opcode) {
     case Opcode::vpor: return "vpor";
     case Opcode::vpxor: return "vpxor";
     case Opcode::vpandd: return "vpandd";
+    case Opcode::vpandnd: return "vpandnd";
     case Opcode::vpandq: return "vpandq";
+    case Opcode::vpandnq: return "vpandnq";
     case Opcode::vpord: return "vpord";
     case Opcode::vporq: return "vporq";
     case Opcode::vpxord: return "vpxord";
@@ -777,6 +826,7 @@ std::string operation_name(Opcode opcode) {
     case Opcode::vpsubusw: return "vpsubusw";
     case Opcode::vpsubd: return "vpsubd";
     case Opcode::vpsubq: return "vpsubq";
+    case Opcode::vpcmpgtq: return "vpcmpgtq";
     case Opcode::vpmullw: return "vpmullw";
     case Opcode::vpmulhw: return "vpmulhw";
     case Opcode::vpmulhuw: return "vpmulhuw";
@@ -825,7 +875,37 @@ std::string operation_name(Opcode opcode) {
     case Opcode::vpackuswb: return "vpackuswb";
     case Opcode::vpackusdw: return "vpackusdw";
     case Opcode::vpshufb: return "vpshufb";
+    case Opcode::movmskps: return "movmskps";
+    case Opcode::movmskpd: return "movmskpd";
+    case Opcode::pmovmskb: return "pmovmskb";
+    case Opcode::vmovmskps: return "vmovmskps";
+    case Opcode::vmovmskpd: return "vmovmskpd";
+    case Opcode::vpmovmskb: return "vpmovmskb";
+    case Opcode::vshufps: return "vshufps";
+    case Opcode::vshufpd: return "vshufpd";
+    case Opcode::vpshufd: return "vpshufd";
     case Opcode::vpsadbw: return "vpsadbw";
+    case Opcode::vpermd: return "vpermd";
+    case Opcode::vpermb: return "vpermb";
+    case Opcode::vpternlogd: return "vpternlogd";
+    case Opcode::vpternlogq: return "vpternlogq";
+    case Opcode::vpmullq: return "vpmullq";
+    case Opcode::vpminsq: return "vpminsq";
+    case Opcode::vpminuq: return "vpminuq";
+    case Opcode::vpmaxsq: return "vpmaxsq";
+    case Opcode::vpmaxuq: return "vpmaxuq";
+    case Opcode::vpmovm2b: return "vpmovm2b";
+    case Opcode::vpmovm2w: return "vpmovm2w";
+    case Opcode::vpmovm2d: return "vpmovm2d";
+    case Opcode::vpmovm2q: return "vpmovm2q";
+    case Opcode::vpmovb2m: return "vpmovb2m";
+    case Opcode::vpmovw2m: return "vpmovw2m";
+    case Opcode::vpmovd2m: return "vpmovd2m";
+    case Opcode::vpmovq2m: return "vpmovq2m";
+    case Opcode::vpopcntb: return "vpopcntb";
+    case Opcode::vpopcntw: return "vpopcntw";
+    case Opcode::vpopcntd: return "vpopcntd";
+    case Opcode::vpopcntq: return "vpopcntq";
     case Opcode::vpcmpb: return "vpcmpb";
     case Opcode::vpcmpw: return "vpcmpw";
     case Opcode::vpcmpd: return "vpcmpd";
@@ -856,8 +936,10 @@ bool is_binary(Opcode opcode) {
     case Opcode::sub: case Opcode::bit_xor: case Opcode::cmp: case Opcode::test: case Opcode::imul:
     case Opcode::rol: case Opcode::ror: case Opcode::rcl: case Opcode::rcr: case Opcode::shl: case Opcode::shr:
     case Opcode::sar: case Opcode::a64_add: case Opcode::a64_adds: case Opcode::a64_sub: case Opcode::a64_subs:
+    case Opcode::a64_adc: case Opcode::a64_adcs: case Opcode::a64_sbc: case Opcode::a64_sbcs:
     case Opcode::a32_and: case Opcode::a32_eor: case Opcode::a32_sub: case Opcode::a32_rsb:
     case Opcode::a32_add: case Opcode::a32_adc: case Opcode::a32_sbc: case Opcode::a32_rsc:
+    case Opcode::t32_addw: case Opcode::t32_subw:
     case Opcode::a32_tst: case Opcode::a32_teq: case Opcode::a32_cmp: case Opcode::a32_cmn:
     case Opcode::a32_orr: case Opcode::a32_bic: return true;
     default: return false;
@@ -868,12 +950,27 @@ ExpressionPtr boolean_binary(std::string operation, ExpressionPtr left, Expressi
 ExpressionPtr boolean_unary(std::string operation, ExpressionPtr value);
 ExpressionPtr boolean_constant(bool value);
 
-ExpressionPtr a64_nzcv_arithmetic(ExpressionPtr left, ExpressionPtr right, bool subtract) {
+ExpressionPtr a64_nzcv_arithmetic(ExpressionPtr left, ExpressionPtr right, bool subtract,
+                                  ExpressionPtr carry_in = {}) {
     if (!left || !right || (left->type.bits != 32 && left->type.bits != 64) ||
         left->type.bits != right->type.bits) return {};
     const auto width = left->type.bits;
-    auto result = std::make_shared<Expression>(Expression{integer_type(width),
+    auto arithmetic = std::make_shared<Expression>(Expression{integer_type(width),
         BinaryValue{subtract ? "sub" : "add", left, right}});
+    auto result = arithmetic;
+    if (carry_in) {
+        auto widened_carry = std::make_shared<Expression>(Expression{integer_type(width),
+            UnaryValue{"zext", carry_in}});
+        if (subtract) {
+            auto borrow = std::make_shared<Expression>(Expression{integer_type(width),
+                BinaryValue{"sub", left, right}});
+            auto minus_one = std::make_shared<Expression>(Expression{integer_type(width),
+                BinaryValue{"sub", borrow, constant_expr(1, width)}});
+            result = std::make_shared<Expression>(Expression{integer_type(width),
+                BinaryValue{"add", minus_one, widened_carry}});
+        } else result = std::make_shared<Expression>(Expression{integer_type(width),
+            BinaryValue{"add", arithmetic, widened_carry}});
+    }
     const auto lhs_sign = boolean_unary("signbit", left);
     const auto rhs_sign = boolean_unary("signbit", right);
     const auto result_sign = boolean_unary("signbit", result);
@@ -881,8 +978,21 @@ ExpressionPtr a64_nzcv_arithmetic(ExpressionPtr left, ExpressionPtr right, bool 
     const auto sign_changed = boolean_binary("bool_xor", lhs_sign, result_sign);
     const auto overflow = boolean_binary("bool_and",
         subtract ? different_inputs : boolean_unary("not", different_inputs), sign_changed);
-    const auto carry = subtract ? boolean_binary("uge", left, right)
-                                : boolean_binary("ult", result, left);
+    ExpressionPtr carry;
+    if (!carry_in) carry = subtract ? boolean_binary("uge", left, right)
+                                    : boolean_binary("ult", result, left);
+    else if (subtract) {
+        const auto carry_set = boolean_binary("ne", carry_in, constant_expr(0, 1));
+        carry = boolean_binary("bool_or",
+            boolean_binary("bool_and", carry_set, boolean_binary("uge", left, right)),
+            boolean_binary("bool_and", boolean_unary("not", carry_set), boolean_binary("ugt", left, right)));
+    } else {
+        const auto carry_set = boolean_binary("ne", carry_in, constant_expr(0, 1));
+        const auto carry_from_base = boolean_binary("ult", arithmetic, left);
+        const auto carry_from_in = boolean_binary("bool_and", carry_set,
+            boolean_binary("eq", arithmetic, constant_expr(width == 64 ? UINT64_MAX : UINT32_MAX, width)));
+        carry = boolean_binary("bool_or", carry_from_base, carry_from_in);
+    }
     const auto zero = boolean_binary("eq", result, constant_expr(0, width));
     const auto placed = [](ExpressionPtr flag, unsigned shift) -> ExpressionPtr {
         auto value = std::make_shared<Expression>(Expression{integer_type(4),
@@ -1040,6 +1150,124 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
 
     const bool x86_context = instruction.context.architecture == Architecture::x86 ||
                              instruction.context.architecture == Architecture::x86_64;
+    if (x86_context && instruction.opcode == Opcode::cpuid) {
+        const auto malformed = [&]() -> Statement {
+            Intrinsic effect{"x86_cpuid_malformed", {}, IntrinsicMemoryEffect::unknown};
+            effect.register_writes = instruction.register_writes;
+            return effect;
+        };
+        if (!instruction.operands.empty() || instruction.flow != FlowKind::fallthrough ||
+            instruction.memory_read || instruction.memory_write ||
+            std::any_of(instruction.register_reads.begin(), instruction.register_reads.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; }) ||
+            x86_writes_flags(instruction))
+            return malformed();
+        const RegisterOperand eax{RegisterBank::gpr, 0, 32, false};
+        const RegisterOperand ecx{RegisterBank::gpr, 1, 32, false};
+        if ((instruction.context.mode != ExecutionMode::x86_16 &&
+             instruction.context.mode != ExecutionMode::x86_32 &&
+             instruction.context.mode != ExecutionMode::x86_64) ||
+            instruction.register_reads != std::vector<RegisterOperand>{eax, ecx})
+            return malformed();
+        std::vector<RegisterOperand> expected_writes;
+        for (const auto index : {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{1}, std::uint8_t{2}}) {
+            const RegisterOperand low{RegisterBank::gpr, index, 32, false};
+            if (instruction.context.mode == ExecutionMode::x86_64)
+                expected_writes.push_back({RegisterBank::gpr, index, 64, false});
+            expected_writes.push_back(low);
+        }
+        if (instruction.register_writes != expected_writes) return malformed();
+        Intrinsic effect{"x86_cpuid", {reg_expr(eax), reg_expr(ecx)}, IntrinsicMemoryEffect::none};
+        effect.register_writes = instruction.register_writes;
+        for (const auto written : effect.register_writes) {
+            const char *name = written.index == 0 ? "eax" : written.index == 3 ? "ebx" :
+                               written.index == 1 ? "ecx" : "edx";
+            auto value = unknown_expr(std::string("cpuid_") + name, 32);
+            if (written.width == 64)
+                value = std::make_shared<Expression>(Expression{integer_type(64), UnaryValue{"zext", std::move(value)}});
+            effect.register_output_values.push_back(std::move(value));
+        }
+        return effect;
+    }
+    if (x86_context && instruction.opcode == Opcode::bound && operands.size() == 2) {
+        const auto *index = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *bounds = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        const auto expected_mode_width = instruction.context.mode == ExecutionMode::x86_16 ? 16
+            : instruction.context.mode == ExecutionMode::x86_32 ? 32 : 0;
+        if (!index || !bounds || expected_mode_width == 0 || index->bank != RegisterBank::gpr ||
+            index->width != expected_mode_width || bounds->data_width != expected_mode_width * 2 ||
+            instruction.access != std::vector<OperandAccess>{OperandAccess::read, OperandAccess::read} ||
+            !instruction.memory_read || instruction.memory_write || !instruction.register_writes.empty() ||
+            x86_writes_flags(instruction) || instruction.flow != FlowKind::trap)
+            return Intrinsic{"x86_bound_malformed", operands, IntrinsicMemoryEffect::unknown};
+        return Intrinsic{"x86_bound", operands, IntrinsicMemoryEffect::read};
+    }
+    if (x86_context && (instruction.opcode == Opcode::les || instruction.opcode == Opcode::lds) &&
+        operands.size() == 2) {
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *pointer = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        const auto expected_width = instruction.context.mode == ExecutionMode::x86_16 ? 16
+            : instruction.context.mode == ExecutionMode::x86_32 ? 32 : 0;
+        const RegisterOperand segment{RegisterBank::segment,
+            static_cast<std::uint8_t>(instruction.opcode == Opcode::les ? 0 : 3), 16, false};
+        const bool has_dest = destination && std::find(instruction.register_writes.begin(),
+            instruction.register_writes.end(), *destination) != instruction.register_writes.end();
+        const bool has_segment = std::find(instruction.register_writes.begin(),
+            instruction.register_writes.end(), segment) != instruction.register_writes.end();
+        if (!destination || !pointer || expected_width == 0 || destination->bank != RegisterBank::gpr ||
+            destination->width != expected_width || pointer->data_width != expected_width + 16 ||
+            instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read} ||
+            !instruction.memory_read || instruction.memory_write || !has_dest || !has_segment ||
+            instruction.register_writes.size() != 2 || x86_writes_flags(instruction) ||
+            instruction.flow != FlowKind::fallthrough)
+            return Intrinsic{"x86_far_load_malformed", operands, IntrinsicMemoryEffect::unknown};
+        Intrinsic effect{instruction.opcode == Opcode::les ? "x86_les" : "x86_lds", operands,
+                         IntrinsicMemoryEffect::read};
+        effect.register_writes = instruction.register_writes;
+        return effect;
+    }
+    if (x86_context && (instruction.opcode == Opcode::aam || instruction.opcode == Opcode::aad)) {
+        const bool legacy = instruction.context.mode == ExecutionMode::x86_16 ||
+                            instruction.context.mode == ExecutionMode::x86_32;
+        const auto *base = instruction.operands.size() == 1
+            ? std::get_if<ImmediateOperand>(&instruction.operands.front()) : nullptr;
+        const bool aam = instruction.opcode == Opcode::aam;
+        const std::vector<RegisterOperand> expected_reads = aam
+            ? std::vector<RegisterOperand>{{RegisterBank::gpr, 0, 8, false}}
+            : std::vector<RegisterOperand>{{RegisterBank::gpr, 0, 8, false},
+                                           {RegisterBank::gpr, 0, 8, true}};
+        const std::vector<RegisterOperand> expected_writes = aam
+            ? std::vector<RegisterOperand>{{RegisterBank::gpr, 0, 8, false},
+                                           {RegisterBank::gpr, 0, 8, true}}
+            : std::vector<RegisterOperand>{{RegisterBank::gpr, 0, 8, false},
+                                           {RegisterBank::gpr, 0, 8, true}};
+        if (!legacy || !base || base->encoded_width != 8 || instruction.lock_prefix ||
+            instruction.register_reads != expected_reads || instruction.register_writes != expected_writes ||
+            !x86_writes_flags(instruction) || instruction.memory_read || instruction.memory_write ||
+            instruction.flow != FlowKind::fallthrough)
+            return Intrinsic{"x86_radix_adjust_malformed", operands, IntrinsicMemoryEffect::unknown};
+        Intrinsic effect{aam ? "x86_aam" : "x86_aad", operands, IntrinsicMemoryEffect::none};
+        effect.register_writes = instruction.register_writes;
+        return effect;
+    }
+    if (x86_context && instruction.opcode == Opcode::arpl && operands.size() == 2) {
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
+        const auto *source = std::get_if<RegisterOperand>(&instruction.operands[1]);
+        if (instruction.context.mode != ExecutionMode::x86_16 &&
+            instruction.context.mode != ExecutionMode::x86_32)
+            return Intrinsic{"x86_arpl_malformed", operands, IntrinsicMemoryEffect::unknown};
+        if ((!destination && !memory) || !source || source->bank != RegisterBank::gpr ||
+            source->width != 16 || (destination && destination->width != 16) ||
+            (memory && memory->data_width != 16) || instruction.lock_prefix ||
+            instruction.access != std::vector<OperandAccess>{OperandAccess::read_write, OperandAccess::read} ||
+            !x86_writes_flags(instruction) || instruction.flow != FlowKind::fallthrough)
+            return Intrinsic{"x86_arpl_malformed", operands, IntrinsicMemoryEffect::unknown};
+        Intrinsic effect{"x86_arpl", operands, memory ? IntrinsicMemoryEffect::unknown
+                                                       : IntrinsicMemoryEffect::none};
+        effect.register_writes = instruction.register_writes;
+        return effect;
+    }
     if (x86_context && instruction.opcode == Opcode::lahf) {
         const auto flags = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
             [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
@@ -1054,6 +1282,160 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             effect.register_output_values = {std::move(value)};
             return effect;
         }
+    }
+    if (x86_context && (instruction.opcode == Opcode::rdrand || instruction.opcode == Opcode::rdseed)) {
+        const std::string name = instruction.opcode == Opcode::rdrand ? "rdrand" : "rdseed";
+        const auto malformed = [&]() -> Statement {
+            Intrinsic effect{"x86_" + name + "_malformed", {}, IntrinsicMemoryEffect::unknown};
+            effect.register_writes = instruction.register_writes;
+            return effect;
+        };
+        if (!evaluate_x86_random_instruction(instruction, 0, false, 0)) return malformed();
+        const auto destination = std::get<RegisterOperand>(instruction.operands[0]);
+        const auto flags = instruction.register_reads.back();
+        const auto full_width = flags.width;
+        const RegisterOperand full{RegisterBank::gpr, destination.index, full_width, false};
+        const auto sample_name = "x86_" + name + "_" + std::to_string(instruction.address.space.value) + "_" +
+            std::to_string(instruction.address.offset);
+        // These unknowns are outputs of this single hardware operation, never
+        // calls to a host random generator or pure repeatable expressions.
+        auto available = unknown_expr(sample_name + "_available", 1);
+        auto alternatives = std::make_shared<Expression>(Expression{integer_type(destination.width),
+            BinaryValue{"pair", unknown_expr(sample_name + "_sample", destination.width),
+                constant_expr(0, destination.width)}});
+        auto value = std::make_shared<Expression>(Expression{integer_type(destination.width),
+            BinaryValue{"select_if", available, std::move(alternatives)}});
+        auto carry = std::make_shared<Expression>(Expression{integer_type(full_width), UnaryValue{"zext", available}});
+        auto preserved_flags = std::make_shared<Expression>(Expression{integer_type(full_width),
+            BinaryValue{"and", reg_expr(flags), constant_expr(~UINT64_C(0x8d5), full_width)}});
+        auto new_flags = std::make_shared<Expression>(Expression{integer_type(full_width),
+            BinaryValue{"or", std::move(preserved_flags), std::move(carry)}});
+        ExpressionPtr full_value = value;
+        const bool wide_alias = destination.width < full_width;
+        if (wide_alias) {
+            full_value = std::make_shared<Expression>(Expression{integer_type(full_width), UnaryValue{"zext", value}});
+            if (destination.width == 16) {
+                auto high = std::make_shared<Expression>(Expression{integer_type(full_width),
+                    BinaryValue{"and", reg_expr(full), constant_expr(~UINT64_C(0xffff), full_width)}});
+                full_value = std::make_shared<Expression>(Expression{integer_type(full_width),
+                    BinaryValue{"or", std::move(high), full_value}});
+            }
+        }
+        Intrinsic effect{"x86_" + name + "_i" + std::to_string(destination.width),
+            {reg_expr(flags)}, IntrinsicMemoryEffect::none};
+        if (wide_alias && destination.width == 16) effect.operands.push_back(reg_expr(full));
+        effect.result_type = integer_type(destination.width);
+        effect.register_writes = instruction.register_writes;
+        for (const auto written : effect.register_writes) {
+            if (written == flags) effect.register_output_values.push_back(new_flags);
+            else if (written == destination) effect.register_output_values.push_back(value);
+            else if (wide_alias && written == full) effect.register_output_values.push_back(full_value);
+            else return malformed();
+        }
+        return effect;
+    }
+    if (x86_context && instruction.opcode == Opcode::crc32) {
+        const bool long_mode = instruction.context.mode == ExecutionMode::x86_64;
+        const bool legacy_mode = instruction.context.mode == ExecutionMode::x86_16 ||
+            instruction.context.mode == ExecutionMode::x86_32;
+        const auto *destination = instruction.operands.size() == 2
+            ? std::get_if<RegisterOperand>(&instruction.operands[0]) : nullptr;
+        const auto *source = instruction.operands.size() == 2
+            ? std::get_if<RegisterOperand>(&instruction.operands[1]) : nullptr;
+        const auto *memory = instruction.operands.size() == 2
+            ? std::get_if<MemoryOperand>(&instruction.operands[1]) : nullptr;
+        const auto malformed = [&]() -> Statement {
+            Intrinsic effect{"x86_crc32_malformed", operands, IntrinsicMemoryEffect::unknown};
+            effect.register_writes = instruction.register_writes;
+            return effect;
+        };
+        if ((!long_mode && !legacy_mode) || !destination || destination->bank != RegisterBank::gpr ||
+            destination->index >= (long_mode ? 16 : 8) || destination->high_byte ||
+            (destination->width != 32 && !(long_mode && destination->width == 64)) ||
+            (!source && !memory) || instruction.lock_prefix || instruction.memory_write ||
+            instruction.memory_read != (memory != nullptr) || instruction.flow != FlowKind::fallthrough ||
+            instruction.access != std::vector<OperandAccess>{OperandAccess::read_write, OperandAccess::read})
+            return malformed();
+        const auto source_width = source ? source->width : memory->data_width;
+        if ((destination->width == 64 ? (source_width != 8 && source_width != 64)
+                                     : (source_width != 8 && source_width != 16 && source_width != 32)) ||
+            (source && (source->bank != RegisterBank::gpr || source->index >= (long_mode ? 16 : 8) ||
+                (source->high_byte && (source_width != 8 || source->index >= 4)))) ||
+            (memory && (long_mode ? (memory->address_width != 32 && memory->address_width != 64)
+                                 : (memory->address_width != 16 && memory->address_width != 32))))
+            return malformed();
+        const RegisterOperand wide{RegisterBank::gpr, destination->index, 64, false};
+        const bool wide_alias = long_mode && destination->width == 32;
+        const auto expected_writes = wide_alias ? std::vector<RegisterOperand>{wide, *destination}
+                                               : std::vector<RegisterOperand>{*destination};
+        if (instruction.register_writes != expected_writes) return malformed();
+        ExpressionPtr seed = operands[0];
+        if (destination->width == 64)
+            seed = std::make_shared<Expression>(Expression{integer_type(32), UnaryValue{"trunc32", seed}});
+        auto crc = std::make_shared<Expression>(Expression{integer_type(32),
+            BinaryValue{"x86_crc32c", std::move(seed), operands[1]}});
+        ExpressionPtr full = std::make_shared<Expression>(Expression{integer_type(64), UnaryValue{"zext", crc}});
+        Intrinsic effect{"x86_crc32c_s" + std::to_string(source_width), {operands[0], operands[1]},
+            memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+        effect.register_writes = instruction.register_writes;
+        effect.register_output_values = wide_alias ? std::vector<ExpressionPtr>{full, crc}
+            : std::vector<ExpressionPtr>{destination->width == 64 ? full : ExpressionPtr{crc}};
+        effect.result_type = integer_type(destination->width);
+        return effect;
+    }
+    if (x86_context && instruction.opcode == Opcode::movbe) {
+        const bool long_mode = instruction.context.mode == ExecutionMode::x86_64;
+        const bool legacy16 = instruction.context.mode == ExecutionMode::x86_16;
+        const bool legacy32 = instruction.context.mode == ExecutionMode::x86_32;
+        const auto *destination = instruction.operands.size() == 2
+            ? std::get_if<RegisterOperand>(&instruction.operands[0]) : nullptr;
+        const auto *source = instruction.operands.size() == 2
+            ? std::get_if<RegisterOperand>(&instruction.operands[1]) : nullptr;
+        const bool load = destination != nullptr;
+        const auto *data = load ? destination : source;
+        const auto *memory = instruction.operands.size() == 2
+            ? std::get_if<MemoryOperand>(&instruction.operands[load ? 1 : 0]) : nullptr;
+        const auto malformed = [&]() -> Statement {
+            Intrinsic effect{"x86_movbe_malformed", operands, IntrinsicMemoryEffect::unknown};
+            effect.register_writes = instruction.register_writes;
+            return effect;
+        };
+        if ((!long_mode && !legacy16 && !legacy32) || !data || data->bank != RegisterBank::gpr ||
+            data->index >= (long_mode ? 16 : 8) || data->high_byte ||
+            (data->width != 16 && data->width != 32 && !(long_mode && data->width == 64)) ||
+            !memory || memory->data_width != data->width || instruction.lock_prefix ||
+            (long_mode ? (memory->address_width != 32 && memory->address_width != 64)
+                       : (memory->address_width != 16 && memory->address_width != 32)) ||
+            instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read} ||
+            instruction.memory_read != load || instruction.memory_write == load ||
+            instruction.flow != FlowKind::fallthrough)
+            return malformed();
+        auto value = std::make_shared<Expression>(Expression{integer_type(data->width),
+            UnaryValue{"bswap" + std::to_string(data->width), operands[1]}});
+        if (!load) {
+            if (!instruction.register_writes.empty()) return malformed();
+            return Store{operands[0], std::move(value)};
+        }
+        const auto full_width = static_cast<std::uint16_t>(long_mode ? 64 : legacy16 ? 16 : 32);
+        if (data->width >= full_width) {
+            if (instruction.register_writes != std::vector<RegisterOperand>{*data}) return malformed();
+            return Assign{*data, std::move(value)};
+        }
+        const RegisterOperand full{RegisterBank::gpr, data->index, full_width, false};
+        if (instruction.register_writes != std::vector<RegisterOperand>{full, *data}) return malformed();
+        ExpressionPtr full_value = std::make_shared<Expression>(Expression{integer_type(full_width), UnaryValue{"zext", value}});
+        if (data->width == 16) {
+            if (std::find(instruction.register_reads.begin(), instruction.register_reads.end(), full) == instruction.register_reads.end())
+                return malformed();
+            auto high = std::make_shared<Expression>(Expression{integer_type(full_width),
+                BinaryValue{"and", reg_expr(full), constant_expr(full_width == 64 ? UINT64_C(0xffffffffffff0000) : UINT64_C(0xffff0000), full_width)}});
+            full_value = std::make_shared<Expression>(Expression{integer_type(full_width), BinaryValue{"or", high, full_value}});
+        }
+        Intrinsic effect{"x86_movbe_load", {operands[1]}, IntrinsicMemoryEffect::read};
+        effect.register_writes = instruction.register_writes;
+        effect.register_output_values = {std::move(full_value), std::move(value)};
+        effect.result_type = integer_type(data->width);
+        return effect;
     }
     if (x86_context && instruction.opcode == Opcode::bswap && operands.size() == 1) {
         const auto destination = as_register(instruction.operands.front());
@@ -1103,6 +1485,142 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 return Intrinsic{"x86_popcnt_unmodeled_output", {source}, IntrinsicMemoryEffect::unknown};
             return effect;
         }
+    }
+    const bool x86_bit_scan = instruction.opcode == Opcode::bsf || instruction.opcode == Opcode::bsr ||
+                              instruction.opcode == Opcode::tzcnt || instruction.opcode == Opcode::lzcnt;
+    if (x86_context && x86_bit_scan && instruction.operands.size() == 2) {
+        const auto destination = as_register(instruction.operands[0]);
+        const auto *source_register = std::get_if<RegisterOperand>(&instruction.operands[1]);
+        const auto *source_memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        const auto width = destination ? destination->width : 0;
+        const auto flags_read = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        const auto flags_write = std::find_if(instruction.register_writes.begin(), instruction.register_writes.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        const bool source_shape = (source_register && source_register->bank == RegisterBank::gpr &&
+                                   source_register->width == width) ||
+                                  (source_memory && source_memory->data_width == width);
+        if (destination && destination->bank == RegisterBank::gpr &&
+            (width == 16 || width == 32 || width == 64) && source_shape &&
+            operands[1]->type.bits == width && flags_read != instruction.register_reads.end() &&
+            flags_write != instruction.register_writes.end() &&
+            (flags_write->width == 16 || flags_write->width == 32 || flags_write->width == 64)) {
+            auto source = retag_expr(operands[1], integer_type(width));
+            auto result = std::make_shared<Expression>(Expression{integer_type(width),
+                UnaryValue{"x86_" + operation_name(instruction.opcode) + "_i" + std::to_string(width), source}});
+            const auto is_zero = boolean_binary("eq", source, constant_expr(0, width));
+            const auto is_negative_count = instruction.opcode == Opcode::tzcnt || instruction.opcode == Opcode::lzcnt;
+            const std::uint64_t cf_mask = UINT64_C(1) << 0;
+            const std::uint64_t zf_mask = UINT64_C(1) << 6;
+            const std::uint64_t undefined_mask = (UINT64_C(1) << 2) | (UINT64_C(1) << 4) |
+                (UINT64_C(1) << 7) | (UINT64_C(1) << 11) |
+                (is_negative_count ? 0 : cf_mask);
+            const std::uint64_t defined_mask = zf_mask | (is_negative_count ? cf_mask : 0);
+            const auto flags_width = flags_write->width;
+            auto updated_flags = std::make_shared<Expression>(Expression{integer_type(flags_width),
+                BinaryValue{"and", reg_expr(*flags_read),
+                    constant_expr(~(undefined_mask | defined_mask), flags_width)}});
+            const auto append_flag = [&](ExpressionPtr value, unsigned bit) {
+                auto extended = std::make_shared<Expression>(Expression{integer_type(flags_width),
+                    UnaryValue{"zext", std::move(value)}});
+                auto shifted = std::make_shared<Expression>(Expression{integer_type(flags_width),
+                    BinaryValue{"shl", std::move(extended), constant_expr(bit, flags_width)}});
+                updated_flags = std::make_shared<Expression>(Expression{integer_type(flags_width),
+                    BinaryValue{"or", std::move(updated_flags), std::move(shifted)}});
+            };
+            if (undefined_mask) {
+                auto arbitrary = std::make_shared<Expression>(Expression{integer_type(flags_width),
+                    BinaryValue{"and", unknown_expr("x86_" + operation_name(instruction.opcode) +
+                        "_undefined_flags", flags_width), constant_expr(undefined_mask, flags_width)}});
+                updated_flags = std::make_shared<Expression>(Expression{integer_type(flags_width),
+                    BinaryValue{"or", std::move(updated_flags), std::move(arbitrary)}});
+            }
+            if (is_negative_count) append_flag(boolean_binary("eq", result, constant_expr(0, width)), 6);
+            else append_flag(is_zero, 6);
+            if (is_negative_count) append_flag(is_zero, 0);
+
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_i" + std::to_string(width),
+                {source}, source_memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = integer_type(width);
+            for (const auto written : effect.register_writes) {
+                if (written == *destination) effect.register_output_values.push_back(result);
+                else if (written == *flags_write) effect.register_output_values.push_back(updated_flags);
+                else return Intrinsic{"x86_" + operation_name(instruction.opcode) + "_unmodeled_output",
+                    {source}, IntrinsicMemoryEffect::unknown};
+            }
+            if (effect.register_output_values.size() == effect.register_writes.size()) return effect;
+        }
+    }
+    if (instruction.context.architecture == Architecture::x86_64 &&
+        instruction.context.mode == ExecutionMode::x86_64 &&
+        (instruction.opcode == Opcode::mul || instruction.opcode == Opcode::imul) &&
+        instruction.operands.size() == 1) {
+        const bool signed_multiply = instruction.opcode == Opcode::imul;
+        const auto *source_register = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *source_memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
+        const auto width = source_register ? source_register->width : source_memory ? source_memory->data_width : 0;
+        const auto malformed = [&]() -> Statement {
+            Intrinsic effect{"x86_mul_implicit_malformed", operands, IntrinsicMemoryEffect::unknown};
+            effect.register_writes = instruction.register_writes;
+            return effect;
+        };
+        if ((width != 8 && width != 16 && width != 32 && width != 64) ||
+            (source_register && (source_register->bank != RegisterBank::gpr || source_register->width != width ||
+                source_register->index >= 16 || (source_register->high_byte && (width != 8 || source_register->index >= 4)))) ||
+            (source_memory && (source_memory->data_width != width ||
+                (source_memory->address_width != 32 && source_memory->address_width != 64))) ||
+            (!source_register && !source_memory) ||
+            (source_register && std::find(instruction.register_reads.begin(), instruction.register_reads.end(),
+                *source_register) == instruction.register_reads.end()) ||
+            instruction.lock_prefix || instruction.access != std::vector<OperandAccess>{OperandAccess::read} ||
+            instruction.memory_read != (source_memory != nullptr) || instruction.memory_write ||
+            instruction.flow != FlowKind::fallthrough)
+            return malformed();
+
+        const RegisterOperand accumulator{RegisterBank::gpr, 0,
+            static_cast<std::uint16_t>(width == 8 ? 8 : width), false};
+        const RegisterOperand low_output{RegisterBank::gpr, 0,
+            static_cast<std::uint16_t>(width == 8 ? 16 : width), false};
+        const RegisterOperand high_output{RegisterBank::gpr, 2, static_cast<std::uint16_t>(width), false};
+        const auto flags = std::find_if(instruction.register_writes.begin(), instruction.register_writes.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        std::vector<RegisterOperand> expected_writes{low_output};
+        if (width != 8) expected_writes.push_back(high_output);
+        if (flags != instruction.register_writes.end()) expected_writes.push_back(*flags);
+        if (std::find(instruction.register_reads.begin(), instruction.register_reads.end(), accumulator) ==
+                instruction.register_reads.end() ||
+            flags == instruction.register_writes.end() || flags->width != 64 ||
+            instruction.register_writes != expected_writes)
+            return malformed();
+
+        const auto product_width = static_cast<std::uint16_t>(width * 2);
+        auto product = std::make_shared<Expression>(Expression{integer_type(product_width),
+            BinaryValue{std::string("x86_mul_full_") + (signed_multiply ? "signed_i" : "unsigned_i") +
+                            std::to_string(width),
+                        reg_expr(accumulator), retag_expr(operands[0], integer_type(width))}});
+        Intrinsic effect{std::string("x86_mul_implicit_") + (signed_multiply ? "signed_i" : "unsigned_i") +
+                             std::to_string(width),
+                         {reg_expr(accumulator), retag_expr(operands[0], integer_type(width))},
+                         source_memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+        effect.register_writes = instruction.register_writes;
+        for (const auto written : effect.register_writes) {
+            if (written.bank == RegisterBank::flags) {
+                effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                    integer_type(written.width), UnaryValue{std::string("x86_mul_flags_cf_of_") +
+                        (signed_multiply ? "signed_i" : "unsigned_i") + std::to_string(width), product}}));
+            } else if (width == 8 && written == low_output) {
+                effect.register_output_values.push_back(product);
+            } else if (written == low_output) {
+                effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                    integer_type(width), UnaryValue{"x86_mul_low_i" + std::to_string(width), product}}));
+            } else if (width != 8 && written == high_output) {
+                effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                    integer_type(width), UnaryValue{"x86_mul_high_i" + std::to_string(width), product}}));
+            } else return malformed();
+        }
+        if (effect.register_output_values.size() != effect.register_writes.size()) return malformed();
+        return effect;
     }
     if (x86_context && (instruction.opcode == Opcode::push || instruction.opcode == Opcode::pop ||
                         instruction.opcode == Opcode::pushf || instruction.opcode == Opcode::popf ||
@@ -1177,7 +1695,8 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
     }
     const bool x86_string = instruction.opcode == Opcode::x86_movs || instruction.opcode == Opcode::x86_cmps ||
                             instruction.opcode == Opcode::x86_stos || instruction.opcode == Opcode::x86_lods ||
-                            instruction.opcode == Opcode::x86_scas;
+                            instruction.opcode == Opcode::x86_scas || instruction.opcode == Opcode::x86_ins ||
+                            instruction.opcode == Opcode::x86_outs;
     if (x86_context && x86_string) {
         const MemoryOperand *memory = nullptr;
         for (const auto &operand : instruction.operands) {
@@ -1193,7 +1712,9 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             const auto operation = instruction.opcode == Opcode::x86_movs ? "movs" :
                                    instruction.opcode == Opcode::x86_cmps ? "cmps" :
                                    instruction.opcode == Opcode::x86_stos ? "stos" :
-                                   instruction.opcode == Opcode::x86_lods ? "lods" : "scas";
+                                   instruction.opcode == Opcode::x86_lods ? "lods" :
+                                   instruction.opcode == Opcode::x86_scas ? "scas" :
+                                   instruction.opcode == Opcode::x86_ins ? "ins" : "outs";
             const bool compare = instruction.opcode == Opcode::x86_cmps || instruction.opcode == Opcode::x86_scas;
             const auto repeat = instruction.x86_repeat == X86RepeatPrefix::none ? "once" :
                                 compare ? (instruction.x86_repeat == X86RepeatPrefix::rep ? "repe" : "repne") :
@@ -1212,6 +1733,9 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                     inputs.push_back(reg_expr(reg));
                 else if (!explicit_register && reg.bank == RegisterBank::gpr && reg.index == 1 &&
                          instruction.x86_repeat != X86RepeatPrefix::none)
+                    inputs.push_back(reg_expr(reg));
+                else if (!explicit_register && reg.bank == RegisterBank::gpr && reg.index == 2 &&
+                         (instruction.opcode == Opcode::x86_ins || instruction.opcode == Opcode::x86_outs))
                     inputs.push_back(reg_expr(reg));
             }
             Intrinsic effect{"x86_string_" + std::string(operation) + "_i" +
@@ -1297,6 +1821,26 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
     }
 
     if ((instruction.context.architecture == Architecture::x86 ||
+         instruction.context.architecture == Architecture::x86_64) &&
+        instruction.opcode == Opcode::x86_flag_control) {
+        const auto &name = instruction.mnemonic_override;
+        const auto flags = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        const auto written_flags = std::find_if(instruction.register_writes.begin(),
+            instruction.register_writes.end(), [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        if (written_flags == instruction.register_writes.end())
+            return Intrinsic{name, {unknown_expr("FLAGS", 64)}, IntrinsicMemoryEffect::none};
+        auto input_flags = flags == instruction.register_reads.end()
+            ? unknown_expr("FLAGS", written_flags->width) : reg_expr(*flags);
+        Intrinsic effect{name, {input_flags}, IntrinsicMemoryEffect::none};
+        effect.register_writes = instruction.register_writes;
+        auto result = std::make_shared<Expression>(Expression{integer_type(written_flags->width),
+            UnaryValue{"x86_" + name, input_flags}});
+        effect.register_output_values.push_back(std::move(result));
+        return effect;
+    }
+
+    if ((instruction.context.architecture == Architecture::x86 ||
          instruction.context.architecture == Architecture::x86_64) && instruction.opcode == Opcode::x87) {
         const auto &name = instruction.mnemonic_override;
         const bool integer_memory = name.starts_with("fi");
@@ -1358,6 +1902,84 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                     typed_operands.push_back(retag_expr(reg_expr(reg), floating_type(80)));
             }
         }
+        // FLD ST(i) is a stack push plus an exact 80-bit payload copy. Keep
+        // that value edge explicit so the later TOP remapper can place the
+        // destination in the newly exposed physical slot while reading the
+        // source relative to the old TOP. FSW/FTW outputs remain unknown.
+        if (name == "fld" && instruction.x87_stack_delta == 1 &&
+            instruction.operands.size() == 1 && typed_operands.size() >= 1 &&
+            std::holds_alternative<RegisterOperand>(instruction.operands.front()) &&
+            std::get<RegisterOperand>(instruction.operands.front()).bank == RegisterBank::x87 &&
+            std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::x87 && reg.index == 0; })) {
+            Intrinsic effect{"x87_fld", std::move(typed_operands), IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.x87_stack_delta = instruction.x87_stack_delta;
+            effect.result_type = floating_type(80);
+            effect.register_output_values.reserve(effect.register_writes.size());
+            for (const auto reg : effect.register_writes) {
+                if (reg.bank == RegisterBank::x87 && reg.index == 0)
+                    effect.register_output_values.push_back(retag_expr(operands.front(), floating_type(80)));
+                else
+                    effect.register_output_values.push_back(unknown_expr("x87-status-after-fld-st", reg.width));
+            }
+            return effect;
+        }
+        // FST ST(i) is an exact stack-register copy. Preserve the value edge
+        // directly in IR; status/tag state is unchanged by the non-popping form.
+        if (name == "fst" && instruction.operands.size() == 1 &&
+            std::holds_alternative<RegisterOperand>(instruction.operands.front())) {
+            const auto destination = std::get<RegisterOperand>(instruction.operands.front());
+            const auto source = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::x87 && reg.index == 0; });
+            const bool tag_output = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::x87_tag; });
+            const bool status_output = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::x87_status; });
+            if (destination.bank == RegisterBank::x87 && source != instruction.register_reads.end() &&
+                std::find(instruction.register_writes.begin(), instruction.register_writes.end(), destination) !=
+                    instruction.register_writes.end() &&
+                instruction.register_writes.size() == 1u + (tag_output ? 1u : 0u) +
+                                                        (status_output ? 1u : 0u)) {
+                if (!tag_output && !status_output)
+                    return Assign{destination, retag_expr(reg_expr(*source), floating_type(80))};
+                Intrinsic effect{"x87_fst_sti", typed_operands, IntrinsicMemoryEffect::none};
+                effect.register_writes = instruction.register_writes;
+                for (const auto reg : effect.register_writes)
+                    effect.register_output_values.push_back(reg.bank == RegisterBank::x87
+                        ? retag_expr(reg_expr(*source), floating_type(80))
+                        : unknown_expr("x87-environment-after-fst", reg.width));
+                return effect;
+            }
+        }
+        // FXCH is a parallel two-register payload swap. Keep both outputs
+        // explicit so the existing TOP remapper applies the same physical
+        // mapping to input values and output locations.
+        if (name == "fxch" && instruction.operands.size() == 1 &&
+            std::holds_alternative<RegisterOperand>(instruction.operands.front())) {
+            const auto destination = std::get<RegisterOperand>(instruction.operands.front());
+            const RegisterOperand st0{RegisterBank::x87, 0, 80, false};
+            const auto stack_write_count = std::count_if(instruction.register_writes.begin(),
+                instruction.register_writes.end(), [](RegisterOperand reg) { return reg.bank == RegisterBank::x87; });
+            const bool tag_output = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::x87_tag; });
+            const bool status_output = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::x87_status; });
+            if (destination.bank == RegisterBank::x87 && destination.width == 80 &&
+                stack_write_count == (destination.index == 0 ? 1 : 2) &&
+                instruction.register_writes.size() == stack_write_count + (tag_output ? 1 : 0) +
+                                                       (status_output ? 1 : 0)) {
+                Intrinsic effect{"x87_fxch", {retag_expr(reg_expr(st0), floating_type(80)),
+                                                retag_expr(reg_expr(destination), floating_type(80))},
+                                 IntrinsicMemoryEffect::none};
+                effect.register_writes = instruction.register_writes;
+                for (const auto reg : effect.register_writes)
+                    effect.register_output_values.push_back(reg.bank == RegisterBank::x87
+                        ? retag_expr(reg.index == 0 ? reg_expr(destination) : reg_expr(st0), floating_type(80))
+                        : unknown_expr("x87-environment-after-fxch", reg.width));
+                return effect;
+            }
+        }
         // Keep the rounded-result expression and the status-word side effect
         // in one intrinsic. This lets SSA retain both architectural outputs.
         const bool real_binary = name == "fadd" || name == "fmul" || name == "fsub" ||
@@ -1413,14 +2035,45 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             effect.result_type = floating_type(80);
             return effect;
         }
+        if (name == "frndint" && numeric_operands.size() == 1 &&
+            std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::x87 && reg.index == 0; }) &&
+            std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::x87_status; })) {
+            auto value = std::make_shared<Expression>(Expression{floating_type(80),
+                UnaryValue{"x87_frndint", retag_expr(numeric_operands.front(), floating_type(80))}});
+            Intrinsic effect{"x87_frndint", std::move(typed_operands), IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.register_output_values.reserve(effect.register_writes.size());
+            for (const auto reg : effect.register_writes)
+                effect.register_output_values.push_back(reg.bank == RegisterBank::x87 && reg.index == 0
+                    ? value : unknown_expr("x87-status-after-frndint", reg.width));
+            effect.result_type = floating_type(80);
+            return effect;
+        }
         if (name == "sahf") {
             const auto ah = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
                 [](RegisterOperand reg) { return reg.bank == RegisterBank::gpr && reg.index == 0 &&
                                                  reg.width == 8 && reg.high_byte; });
-            Intrinsic effect{"sahf", ah == instruction.register_reads.end()
-                ? std::vector<ExpressionPtr>{unknown_expr("AH", 8)}
-                : std::vector<ExpressionPtr>{reg_expr(*ah)}, IntrinsicMemoryEffect::none};
+            const auto flags = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+            const auto flags_width = instruction.context.mode == ExecutionMode::x86_16 ? 16u
+                : instruction.context.mode == ExecutionMode::x86_64 ? 64u : 32u;
+            const auto ah_value = ah == instruction.register_reads.end()
+                ? unknown_expr("AH", 8) : reg_expr(*ah);
+            const auto flags_value = flags == instruction.register_reads.end()
+                ? unknown_expr("FLAGS", flags_width)
+                : reg_expr(*flags);
+            Intrinsic effect{"sahf", {ah_value, flags_value}, IntrinsicMemoryEffect::none};
             effect.register_writes = instruction.register_writes;
+            const auto written_flags = std::find_if(effect.register_writes.begin(), effect.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+            if (written_flags != effect.register_writes.end()) {
+                auto updated_flags = std::make_shared<Expression>(Expression{
+                    integer_type(written_flags->width),
+                    BinaryValue{"x86_sahf", flags_value, ah_value}});
+                effect.register_output_values.push_back(std::move(updated_flags));
+            }
             return effect;
         }
         Intrinsic effect{"x87_" + name, std::move(typed_operands),
@@ -1496,6 +2149,20 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         const RegisterOperand status{RegisterBank::mos6502, 3, 8, false};
         const RegisterOperand stack_pointer{RegisterBank::mos6502, 4, 8, false};
         const auto status_value = reg_expr(status);
+        const auto attach_memory_output = [&](Intrinsic &effect, std::uint32_t location_operand,
+                                              std::uint32_t value_operand) {
+            if (effect.memory_effect != IntrinsicMemoryEffect::read_write ||
+                !instruction.memory_read || !instruction.memory_write || instruction.operands.size() != 1 ||
+                instruction.access != std::vector<OperandAccess>{OperandAccess::read_write} ||
+                !is_memory(instruction.operands.front()) || location_operand >= effect.operands.size() ||
+                value_operand >= effect.operands.size() || location_operand == value_operand ||
+                !effect.operands[location_operand] || !effect.operands[value_operand] ||
+                effect.operands[location_operand]->type != integer_type(8) ||
+                effect.operands[value_operand]->type != integer_type(8) ||
+                !std::holds_alternative<MemoryValue>(effect.operands[location_operand]->value))
+                return;
+            effect.memory_output = IntrinsicMemoryOutput{location_operand, value_operand};
+        };
         const auto opaque = [&](std::string name, std::vector<ExpressionPtr> inputs,
                                  std::vector<RegisterOperand> outputs,
                                  IntrinsicMemoryEffect memory = IntrinsicMemoryEffect::none) -> Statement {
@@ -1597,6 +2264,25 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         }
         const auto op = instruction.opcode;
         if (!operands.empty()) {
+            if (op == Opcode::m6502_lax && is_memory(instruction.operands.front())) {
+                const auto value = operands.front();
+                const auto zero = boolean_binary("eq", value, constant_expr(0, 8));
+                const auto negative = boolean_unary("signbit", value);
+                const auto bool_byte = [](ExpressionPtr predicate) -> ExpressionPtr {
+                    return std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", std::move(predicate)}});
+                };
+                const auto bit = [&](ExpressionPtr predicate, unsigned index) -> ExpressionPtr {
+                    return binary("shl", bool_byte(std::move(predicate)), constant_expr(index, 8));
+                };
+                const auto flags = binary("or", binary("and", status_value, constant_expr(0x7d, 8)),
+                    binary("or", bit(zero, 1), bit(negative, 7)));
+                Intrinsic effect{"m6502_lax_load_a_and_x", {value}, IntrinsicMemoryEffect::read};
+                effect.register_writes = {accumulator, index_x, status};
+                effect.register_output_values = {value, value, flags};
+                return effect;
+            }
+            if (op == Opcode::m6502_sax && is_memory(instruction.operands.front()))
+                return Store{operands.front(), binary("and", reg_expr(accumulator), reg_expr(index_x))};
             if (op == Opcode::m6502_axs && std::holds_alternative<ImmediateOperand>(instruction.operands.front())) {
                 const auto source = binary("and", reg_expr(accumulator), reg_expr(index_x));
                 const auto difference = binary("sub", source, operands.front());
@@ -1645,6 +2331,48 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             if (op == Opcode::m6502_ldy) destination.index = 2;
             if (loads_accumulator || op == Opcode::m6502_ldx || op == Opcode::m6502_ldy) {
                 const auto value = operands.front();
+                const auto encoded = std::to_integer<unsigned>(instruction.bytes[0]);
+                const unsigned immediate_encoding = loads_accumulator ? 0xa9 : op == Opcode::m6502_ldx ? 0xa2 : 0xa0;
+                const unsigned zero_page_encoding = loads_accumulator ? 0xa5 : op == Opcode::m6502_ldx ? 0xa6 : 0xa4;
+                const unsigned absolute_encoding = loads_accumulator ? 0xad : op == Opcode::m6502_ldx ? 0xae : 0xac;
+                const bool immediate = encoded == immediate_encoding;
+                const bool zero_page = encoded == zero_page_encoding;
+                const bool absolute = encoded == absolute_encoding;
+                const auto *literal = std::get_if<ImmediateOperand>(&instruction.operands.front());
+                const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+                const auto encoded_operand = static_cast<std::uint16_t>(std::to_integer<unsigned>(instruction.bytes[1]) |
+                    (absolute ? std::to_integer<unsigned>(instruction.bytes[2]) << 8 : 0));
+                const bool source_valid = immediate
+                    ? literal && literal->value == encoded_operand && literal->encoded_width == 8 &&
+                        literal->effective_width == 8 && !literal->is_signed
+                    : memory && memory->data_width == 8 && memory->address_width == 16 &&
+                        !memory->base && !memory->index && !memory->segment && !memory->ip_relative &&
+                        !memory->writeback && !memory->post_index && memory->index_extend.empty() &&
+                        !memory->index_shift_amount && memory->displacement == encoded_operand &&
+                        (!memory->resolved_address || *memory->resolved_address == Address{instruction.address.space, encoded_operand});
+                if ((immediate || zero_page || absolute) && source_valid && instruction.operands.size() == 1 &&
+                    instruction.length == (absolute ? 3 : 2) && !instruction.memory_write &&
+                    instruction.memory_read == !immediate &&
+                    instruction.flow == FlowKind::fallthrough &&
+                    instruction.access == std::vector<OperandAccess>{OperandAccess::read} &&
+                    instruction.register_reads == std::vector<RegisterOperand>{status} &&
+                    instruction.register_writes == std::vector<RegisterOperand>{destination, status}) {
+                    ExpressionPtr new_status;
+                    if (immediate) {
+                        // N/Z do not depend on prior P, so the pure evaluator
+                        // can supply their exact constant while other bits stay symbolic.
+                        const auto evaluated = evaluate_m6502_load(op, static_cast<std::uint8_t>(literal->value), 0);
+                        new_status = binary("or", binary("and", status_value, constant_expr(0x7d, 8)),
+                            constant_expr(evaluated->status, 8));
+                    } else new_status = nz_flags(value, status_value);
+                    Intrinsic effect{"m6502_load", {value, status_value},
+                        immediate ? IntrinsicMemoryEffect::none : IntrinsicMemoryEffect::read};
+                    effect.register_writes = {destination, status};
+                    effect.register_output_values = {value, std::move(new_status)};
+                    return effect;
+                }
+                // Indexed/indirect address wrapping cannot be represented by
+                // an ordinary MemoryValue, so keep those outputs opaque.
                 return opaque("m6502_load", {value}, {destination, status},
                     instruction.memory_read ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none);
             }
@@ -1810,10 +2538,11 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                     subtract ? "m6502_sbc" : "m6502_adc",
                     (rra || isc) ? std::vector<ExpressionPtr>{old_byte, rhs, reg_expr(accumulator), status_value} :
                           std::vector<ExpressionPtr>{},
-                    (rra || isc) ? IntrinsicMemoryEffect::unknown :
+                    (rra || isc) ? IntrinsicMemoryEffect::read_write :
                         instruction.memory_read ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
                 effect.register_writes = {accumulator, status};
                 effect.register_output_values = {selected_result, selected_status};
+                if (rra || isc) attach_memory_output(effect, 0, 1);
                 return effect;
             }
             if (op == Opcode::m6502_cmp || op == Opcode::m6502_cpx || op == Opcode::m6502_cpy ||
@@ -1879,9 +2608,10 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                                    op == Opcode::m6502_rla ? "m6502_rla_rotate_then_and" :
                                                              "m6502_sre_shift_then_eor";
                 Intrinsic effect{name, {old_byte, shifted, reg_expr(accumulator), status_value},
-                    IntrinsicMemoryEffect::unknown};
+                    IntrinsicMemoryEffect::read_write};
                 effect.register_writes = {accumulator, status};
                 effect.register_output_values = {accumulator_result, flags};
+                attach_memory_output(effect, 0, 1);
                 return effect;
             }
             if (op == Opcode::m6502_dcp && is_memory(instruction.operands.front())) {
@@ -1891,9 +2621,10 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 const auto flags = nz_flags(difference, status_value, carry);
                 Intrinsic effect{"m6502_dcp_decrement_then_compare",
                     {operands.front(), decremented, reg_expr(accumulator), status_value},
-                    IntrinsicMemoryEffect::unknown};
+                    IntrinsicMemoryEffect::read_write};
                 effect.register_writes = {status};
                 effect.register_output_values = {flags};
+                attach_memory_output(effect, 0, 1);
                 return effect;
             }
         }
@@ -1938,13 +2669,14 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                              op == Opcode::m6502_rol ? "m6502_rol" : "m6502_ror",
                              memory_target ? std::vector<ExpressionPtr>{input, result, status_value}
                                            : std::vector<ExpressionPtr>{input, status_value},
-                             memory_target ? IntrinsicMemoryEffect::unknown : IntrinsicMemoryEffect::none};
+                             memory_target ? IntrinsicMemoryEffect::read_write : IntrinsicMemoryEffect::none};
             effect.register_writes = accumulator_target ? std::vector<RegisterOperand>{accumulator, status}
                                                         : std::vector<RegisterOperand>{status};
             const auto new_status = nz_flags(result, status_value, carry_out);
             effect.register_output_values = accumulator_target
                 ? std::vector<ExpressionPtr>{result, new_status}
                 : std::vector<ExpressionPtr>{new_status};
+            if (memory_target) attach_memory_output(effect, 0, 1);
             return effect;
         }
         if ((op == Opcode::m6502_inc || op == Opcode::m6502_dec) && !operands.empty()) {
@@ -1954,9 +2686,10 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             const auto result = byte_wrap(binary(op == Opcode::m6502_inc ? "add" : "sub",
                                                 operands.front(), constant_expr(1, 8)));
             Intrinsic effect{op == Opcode::m6502_inc ? "m6502_inc" : "m6502_dec",
-                             {operands.front(), result}, IntrinsicMemoryEffect::unknown};
+                             {operands.front(), result}, IntrinsicMemoryEffect::read_write};
             effect.register_writes = {status};
             effect.register_output_values = {nz_flags(result, status_value)};
+            attach_memory_output(effect, 0, 1);
             return effect;
         }
         switch (op) {
@@ -2136,10 +2869,39 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             return destination.bank == RegisterBank::arm64_zero ? ignored_write() : Assign{destination, std::move(value)};
         }
         const bool a64_vector_integer = instruction.opcode == Opcode::a64_vadd || instruction.opcode == Opcode::a64_vsub ||
-            instruction.opcode == Opcode::a64_vand || instruction.opcode == Opcode::a64_vorr || instruction.opcode == Opcode::a64_veor;
+            instruction.opcode == Opcode::a64_vand || instruction.opcode == Opcode::a64_vorr || instruction.opcode == Opcode::a64_veor ||
+            instruction.opcode == Opcode::a64_vsmax || instruction.opcode == Opcode::a64_vsmin ||
+            instruction.opcode == Opcode::a64_vumax || instruction.opcode == Opcode::a64_vumin;
         const bool a64_vector_fp = instruction.opcode == Opcode::a64_fadd || instruction.opcode == Opcode::a64_fsub ||
             instruction.opcode == Opcode::a64_fmul || instruction.opcode == Opcode::a64_fdiv ||
             instruction.opcode == Opcode::a64_fmax || instruction.opcode == Opcode::a64_fmin;
+        if (a64_vector_fp && instruction.operands.size() == 3 &&
+            (instruction.vector_bits == 32 || instruction.vector_bits == 64) &&
+            instruction.vector_element_bits == instruction.vector_bits) {
+            const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+            const auto *left = std::get_if<RegisterOperand>(&instruction.operands[1]);
+            const auto *right = std::get_if<RegisterOperand>(&instruction.operands[2]);
+            if (!destination || !left || !right || destination->bank != RegisterBank::arm64_simd ||
+                left->bank != RegisterBank::arm64_simd || right->bank != RegisterBank::arm64_simd ||
+                destination->width != instruction.vector_bits || left->width != instruction.vector_bits ||
+                right->width != instruction.vector_bits || destination->index >= 32 ||
+                left->index >= 32 || right->index >= 32)
+                goto a64_unhandled;
+            const auto scalar_type = floating_type(instruction.vector_bits);
+            const char *operation = instruction.opcode == Opcode::a64_fadd ? "fadd" :
+                instruction.opcode == Opcode::a64_fsub ? "fsub" :
+                instruction.opcode == Opcode::a64_fmul ? "fmul" :
+                instruction.opcode == Opcode::a64_fdiv ? "fdiv" :
+                instruction.opcode == Opcode::a64_fmax ? "fmax" : "fmin";
+            Intrinsic effect;
+            effect.name = std::string("a64_scalar_fp_") + operation + "_f" +
+                std::to_string(instruction.vector_bits);
+            effect.operands = {retag_expr(operand_expr(instruction.operands[1]), scalar_type),
+                               retag_expr(operand_expr(instruction.operands[2]), scalar_type)};
+            effect.register_writes.push_back(RegisterOperand{RegisterBank::arm64_simd, destination->index, 128, false});
+            effect.result_type = ValueType{TypeKind::floating, instruction.vector_bits, false};
+            return effect;
+        }
         if ((a64_vector_integer || a64_vector_fp) && instruction.operands.size() == 3 &&
             (instruction.vector_bits == 64 || instruction.vector_bits == 128) && instruction.vector_element_bits) {
             const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
@@ -2168,7 +2930,11 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 instruction.opcode == Opcode::a64_vadd ? "add" :
                 instruction.opcode == Opcode::a64_vsub ? "sub" :
                 instruction.opcode == Opcode::a64_vand ? "and" :
-                instruction.opcode == Opcode::a64_vorr ? "orr" : "eor";
+                instruction.opcode == Opcode::a64_vorr ? "orr" :
+                instruction.opcode == Opcode::a64_veor ? "eor" :
+                instruction.opcode == Opcode::a64_vsmax ? "smax" :
+                instruction.opcode == Opcode::a64_vsmin ? "smin" :
+                instruction.opcode == Opcode::a64_vumax ? "umax" : "umin";
             auto effect_name = std::string(a64_vector_fp ? "a64_simd_fp_" : "a64_simd_") + operation + "_" +
                 std::to_string(instruction.vector_bits / lane_bits) + "x" + std::to_string(lane_bits);
             if (instruction.vector_bits == 64) effect_name += "_zero_upper";
@@ -2274,6 +3040,58 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             }
             return Assign{*dst, std::move(value)};
         }
+        if ((instruction.opcode == Opcode::a64_rbit || instruction.opcode == Opcode::a64_rev16 ||
+             instruction.opcode == Opcode::a64_rev32 || instruction.opcode == Opcode::a64_rev) &&
+            instruction.operands.size() == 2) {
+            const auto *dst = std::get_if<RegisterOperand>(&instruction.operands[0]);
+            if (!dst || (dst->width != 32 && dst->width != 64)) goto a64_unhandled;
+            if (dst->bank == RegisterBank::arm64_zero) return ignored_write();
+            const unsigned width = dst->width;
+            ExpressionPtr value = operand_expr(instruction.operands[1]);
+            if (instruction.opcode == Opcode::a64_rbit) {
+                const std::uint64_t full_mask = width == 64 ? UINT64_MAX : UINT32_MAX;
+                for (unsigned shift = 1; shift < width; shift <<= 1) {
+                    std::uint64_t low_mask = 0;
+                    for (unsigned bit = 0; bit < width; ++bit)
+                        if ((bit % (shift * 2)) < shift) low_mask |= UINT64_C(1) << bit;
+                    const auto high_mask = full_mask ^ low_mask;
+                    auto low = std::make_shared<Expression>(Expression{integer_type(width),
+                        BinaryValue{"and", value, constant_expr(low_mask, width)}});
+                    low = std::make_shared<Expression>(Expression{integer_type(width),
+                        BinaryValue{"shl", std::move(low), constant_expr(shift, width)}});
+                    auto high = std::make_shared<Expression>(Expression{integer_type(width),
+                        BinaryValue{"and", value, constant_expr(high_mask, width)}});
+                    high = std::make_shared<Expression>(Expression{integer_type(width),
+                        BinaryValue{"shr", std::move(high), constant_expr(shift, width)}});
+                    value = std::make_shared<Expression>(Expression{integer_type(width),
+                        BinaryValue{"or", std::move(low), std::move(high)}});
+                }
+            } else {
+                const unsigned group_bytes = instruction.opcode == Opcode::a64_rev16 ? 2 :
+                    instruction.opcode == Opcode::a64_rev32 ? 4 : width / 8;
+                ExpressionPtr reversed;
+                for (unsigned base = 0; base < width / 8; base += group_bytes) {
+                    for (unsigned byte = 0; byte < group_bytes; ++byte) {
+                        const unsigned source_shift = (base + byte) * 8;
+                        const unsigned destination_shift = (base + group_bytes - 1 - byte) * 8;
+                        auto part = std::make_shared<Expression>(Expression{integer_type(width),
+                            BinaryValue{"and", value, constant_expr(UINT64_C(0xff) << source_shift, width)}});
+                        if (source_shift)
+                            part = std::make_shared<Expression>(Expression{integer_type(width),
+                                BinaryValue{"shr", std::move(part), constant_expr(source_shift, width)}});
+                        if (destination_shift)
+                            part = std::make_shared<Expression>(Expression{integer_type(width),
+                                BinaryValue{"shl", std::move(part), constant_expr(destination_shift, width)}});
+                        reversed = reversed
+                            ? std::make_shared<Expression>(Expression{integer_type(width),
+                                BinaryValue{"or", std::move(reversed), std::move(part)}})
+                            : std::move(part);
+                    }
+                }
+                value = std::move(reversed);
+            }
+            return Assign{*dst, std::move(value)};
+        }
         if (destination_operand && instruction.operands.size() >= 3 &&
             (instruction.opcode == Opcode::a64_ubfm || instruction.opcode == Opcode::a64_sbfm)) {
             if (instruction.operands.size() != 4) goto a64_unhandled;
@@ -2373,7 +3191,9 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         }
         if (destination_operand && instruction.operands.size() >= 3 &&
             (instruction.opcode == Opcode::a64_add || instruction.opcode == Opcode::a64_adds ||
-             instruction.opcode == Opcode::a64_sub || instruction.opcode == Opcode::a64_subs)) {
+             instruction.opcode == Opcode::a64_sub || instruction.opcode == Opcode::a64_subs ||
+             instruction.opcode == Opcode::a64_adc || instruction.opcode == Opcode::a64_adcs ||
+             instruction.opcode == Opcode::a64_sbc || instruction.opcode == Opcode::a64_sbcs)) {
             const auto destination = *destination_operand;
             const auto left = operand_expr(instruction.operands[1]);
             auto right = operand_expr(instruction.operands[2]);
@@ -2396,13 +3216,36 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                             UnaryValue{"ror_" + std::to_string(shift->value), right}});
                 }
             }
-            const bool subtract = instruction.opcode == Opcode::a64_sub || instruction.opcode == Opcode::a64_subs;
+            const bool subtract = instruction.opcode == Opcode::a64_sub || instruction.opcode == Opcode::a64_subs ||
+                                  instruction.opcode == Opcode::a64_sbc || instruction.opcode == Opcode::a64_sbcs;
+            const bool with_carry = instruction.opcode == Opcode::a64_adc || instruction.opcode == Opcode::a64_adcs ||
+                                    instruction.opcode == Opcode::a64_sbc || instruction.opcode == Opcode::a64_sbcs;
+            const bool set_flags = instruction.opcode == Opcode::a64_subs || instruction.opcode == Opcode::a64_adds ||
+                                   instruction.opcode == Opcode::a64_adcs || instruction.opcode == Opcode::a64_sbcs;
+            ExpressionPtr carry_in;
+            if (with_carry) {
+                const RegisterOperand flags_reg{RegisterBank::arm_flags, 0, 4, false};
+                auto flags_value = reg_expr(flags_reg);
+                auto carry_bit = std::make_shared<Expression>(Expression{integer_type(4),
+                    BinaryValue{"and", flags_value, constant_expr(2, 4)}});
+                carry_in = boolean_binary("ne", carry_bit, constant_expr(0, 4));
+            }
             auto value = std::make_shared<Expression>(Expression{integer_type(destination.width),
                 BinaryValue{subtract ? "sub" : "add", left, right}});
-            if (instruction.opcode == Opcode::a64_subs || instruction.opcode == Opcode::a64_adds) {
+            if (carry_in) {
+                if (subtract) value = std::make_shared<Expression>(Expression{integer_type(destination.width),
+                    BinaryValue{"add", std::make_shared<Expression>(Expression{integer_type(destination.width),
+                        BinaryValue{"sub", value, constant_expr(1, destination.width)}}),
+                        std::make_shared<Expression>(Expression{integer_type(destination.width), UnaryValue{"zext", carry_in}})}});
+                else value = std::make_shared<Expression>(Expression{integer_type(destination.width),
+                    BinaryValue{"add", value, std::make_shared<Expression>(Expression{integer_type(destination.width),
+                        UnaryValue{"zext", carry_in}})}});
+            }
+            if (set_flags) {
                 const RegisterOperand flags{RegisterBank::arm_flags, 0, 4, false};
-                Intrinsic effect{destination.bank == RegisterBank::arm64_zero
-                    ? (subtract ? "cmp" : "cmn") : (subtract ? "a64_subs" : "a64_adds"),
+                Intrinsic effect{destination.bank == RegisterBank::arm64_zero && !with_carry
+                    ? (subtract ? "cmp" : "cmn") : (subtract ? (with_carry ? "a64_sbcs" : "a64_subs")
+                                                                  : (with_carry ? "a64_adcs" : "a64_adds")),
                     {left, right}, IntrinsicMemoryEffect::none};
                 if (destination.bank == RegisterBank::arm64_gpr) {
                     effect.register_writes.push_back(destination);
@@ -2416,7 +3259,7 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                     }
                 }
                 effect.register_writes.push_back(flags);
-                effect.register_output_values.push_back(a64_nzcv_arithmetic(left, right, subtract));
+                effect.register_output_values.push_back(a64_nzcv_arithmetic(left, right, subtract, carry_in));
                 return effect;
             }
             if (destination.bank == RegisterBank::arm64_zero) {
@@ -2432,6 +3275,40 @@ a64_unhandled:
     if (mips) {
         const RegisterOperand hi{RegisterBank::mips_hilo, 0, 32, false};
         const RegisterOperand lo{RegisterBank::mips_hilo, 1, 32, false};
+        if (instruction.opcode == Opcode::mips32_movz || instruction.opcode == Opcode::mips32_movn) {
+            const auto *destination = instruction.operands.size() == 3
+                ? std::get_if<RegisterOperand>(&instruction.operands[0]) : nullptr;
+            const auto *source = instruction.operands.size() == 3
+                ? std::get_if<RegisterOperand>(&instruction.operands[1]) : nullptr;
+            const auto *condition = instruction.operands.size() == 3
+                ? std::get_if<RegisterOperand>(&instruction.operands[2]) : nullptr;
+            const auto valid_gpr = [](const RegisterOperand *value) {
+                return value && value->bank == RegisterBank::mips_gpr && value->index < 32 &&
+                    value->width == 32 && !value->high_byte;
+            };
+            bool valid = valid_gpr(destination) && valid_gpr(source) && valid_gpr(condition) &&
+                operands.size() == 3 && operands[0]->type == integer_type(32) &&
+                operands[1]->type == integer_type(32) && operands[2]->type == integer_type(32) &&
+                instruction.access == std::vector<OperandAccess>{OperandAccess::read_write,
+                    OperandAccess::read, OperandAccess::read} &&
+                instruction.register_reads == std::vector<RegisterOperand>{*destination, *source, *condition} &&
+                instruction.register_writes == (destination && destination->index
+                    ? std::vector<RegisterOperand>{*destination} : std::vector<RegisterOperand>{}) &&
+                !instruction.memory_read && !instruction.memory_write && instruction.flow == FlowKind::fallthrough &&
+                !instruction.delay_slots;
+            if (!valid) {
+                Intrinsic effect{"mips32_conditional_move_unmodeled_effects", operands,
+                    instruction.memory_read || instruction.memory_write
+                        ? IntrinsicMemoryEffect::unknown : IntrinsicMemoryEffect::none};
+                for (const auto read : instruction.register_reads) effect.operands.push_back(reg_expr(read));
+                effect.register_writes = instruction.register_writes;
+                return effect;
+            }
+            if (destination->index == 0) return Intrinsic{"nop", {}, IntrinsicMemoryEffect::none};
+            auto predicate = boolean_binary(instruction.opcode == Opcode::mips32_movz ? "eq" : "ne",
+                operands[2], constant_expr(0, 32));
+            return Assign{*destination, arm32_select(std::move(predicate), operands[1], operands[0])};
+        }
         const auto typed_input = [](ExpressionPtr value, bool is_signed) -> ExpressionPtr {
             if (!value) return value;
             auto type = value->type;
@@ -2513,6 +3390,108 @@ a64_unhandled:
                 effect.register_writes = instruction.register_writes;
                 return effect;
             }
+            if (op >= Opcode::mips_movf_s && op <= Opcode::mips_movn_d) {
+                const bool double_precision = op >= Opcode::mips_movf_d;
+                const bool fcc_move = op == Opcode::mips_movf_s || op == Opcode::mips_movt_s ||
+                    op == Opcode::mips_movf_d || op == Opcode::mips_movt_d;
+                const bool move_when_true = op == Opcode::mips_movt_s || op == Opcode::mips_movt_d ||
+                    op == Opcode::mips_movn_s || op == Opcode::mips_movn_d;
+                const std::uint16_t width = double_precision ? 64 : 32;
+                const auto *destination = instruction.operands.size() == 3
+                    ? std::get_if<RegisterOperand>(&instruction.operands[0]) : nullptr;
+                const auto *source = instruction.operands.size() == 3
+                    ? std::get_if<RegisterOperand>(&instruction.operands[1]) : nullptr;
+                const auto *condition_register = instruction.operands.size() == 3
+                    ? std::get_if<RegisterOperand>(&instruction.operands[2]) : nullptr;
+                const auto valid_fpr = [width](const RegisterOperand *value) {
+                    return value && value->bank == RegisterBank::mips_fpr && value->index < 32 &&
+                        value->width == width && !value->high_byte;
+                };
+                bool valid = valid_fpr(destination) && valid_fpr(source) && condition_register &&
+                    condition_register->width == 32 && !condition_register->high_byte &&
+                    (fcc_move ? (condition_register->bank == RegisterBank::mips_fcsr &&
+                                 condition_register->index >= 1 && condition_register->index <= 8 &&
+                                 instruction.condition == condition_register->index - 1)
+                              : (condition_register->bank == RegisterBank::mips_gpr &&
+                                 condition_register->index < 32 && instruction.condition == 0));
+                if (valid) {
+                    std::vector<RegisterOperand> expected_reads{*destination, *source};
+                    if (fcc_move || condition_register->index != 0) expected_reads.push_back(*condition_register);
+                    valid = operands.size() == 3 && operands[0]->type == floating_type(width) &&
+                        operands[1]->type == floating_type(width) && !instruction.memory_read &&
+                        !instruction.memory_write && instruction.flow == FlowKind::fallthrough &&
+                        !instruction.delay_slots && instruction.access == std::vector<OperandAccess>{
+                            OperandAccess::read_write, OperandAccess::read, OperandAccess::read} &&
+                        instruction.register_reads == expected_reads &&
+                        instruction.register_writes == std::vector<RegisterOperand>{*destination};
+                }
+                if (!valid) {
+                    Intrinsic effect{"mips.fp_conditional_move_unmodeled_effects", operands,
+                        instruction.memory_read || instruction.memory_write
+                            ? IntrinsicMemoryEffect::unknown : IntrinsicMemoryEffect::none};
+                    for (const auto read : instruction.register_reads) effect.operands.push_back(reg_expr(read));
+                    effect.register_writes = instruction.register_writes;
+                    return effect;
+                }
+                // FCC aliases carry their low Boolean bit; GPR conditions test
+                // all 32 bits. Selection occurs on integer bitcasts so no FP
+                // arithmetic, NaN canonicalization, or exception is introduced.
+                auto condition_bits = fcc_move
+                    ? std::make_shared<Expression>(Expression{integer_type(32),
+                        BinaryValue{"and", operands[2], constant_expr(1, 32)}}) : operands[2];
+                auto predicate = boolean_binary(move_when_true ? "ne" : "eq",
+                    std::move(condition_bits), constant_expr(0, 32));
+                const auto bitcast = [width](ExpressionPtr value) {
+                    return std::make_shared<Expression>(Expression{integer_type(width),
+                        UnaryValue{"bitcast_i" + std::to_string(width), std::move(value)}});
+                };
+                auto selected = arm32_select(std::move(predicate), bitcast(operands[1]), bitcast(operands[0]));
+                return Assign{*destination, std::make_shared<Expression>(Expression{floating_type(width),
+                    UnaryValue{"bitcast_f" + std::to_string(width), std::move(selected)}})};
+            }
+            const bool fp_abs = op == Opcode::mips_abs_s || op == Opcode::mips_abs_d;
+            const bool fp_move = op == Opcode::mips_mov_s || op == Opcode::mips_mov_d;
+            const bool fp_negate = op == Opcode::mips_neg_s || op == Opcode::mips_neg_d;
+            if (fp_abs || fp_move || fp_negate) {
+                const bool double_precision = op == Opcode::mips_abs_d || op == Opcode::mips_mov_d ||
+                    op == Opcode::mips_neg_d;
+                const std::uint16_t width = double_precision ? 64 : 32;
+                const auto *destination = instruction.operands.size() == 2
+                    ? std::get_if<RegisterOperand>(&instruction.operands[0]) : nullptr;
+                const auto *source = instruction.operands.size() == 2
+                    ? std::get_if<RegisterOperand>(&instruction.operands[1]) : nullptr;
+                const auto valid_fpr = [=](const RegisterOperand *value) {
+                    return value && value->bank == RegisterBank::mips_fpr && value->width == width &&
+                        value->index < 32 && !value->high_byte;
+                };
+                if (!valid_fpr(destination) || !valid_fpr(source) ||
+                    operands.size() != 2 || operands[0]->type != floating_type(width) ||
+                    operands[1]->type != floating_type(width) || instruction.memory_read || instruction.memory_write ||
+                    instruction.flow != FlowKind::fallthrough || instruction.delay_slots ||
+                    instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read} ||
+                    instruction.register_reads != std::vector<RegisterOperand>{*source} ||
+                    instruction.register_writes != std::vector<RegisterOperand>{*destination}) {
+                    Intrinsic effect{"mips.fp_sign_unmodeled_effects", operands, instruction.memory_read || instruction.memory_write
+                        ? IntrinsicMemoryEffect::unknown : IntrinsicMemoryEffect::none};
+                    // Preserve unexpected implicit state dependencies, including
+                    // any decoder-provided FCSR/FCC effects, without guessing.
+                    for (const auto read : instruction.register_reads) effect.operands.push_back(reg_expr(read));
+                    effect.register_writes = instruction.register_writes;
+                    return effect;
+                }
+                if (fp_move) return Assign{*destination, operands[1]};
+                // Bitcasts preserve every fraction/exponent bit, including NaN
+                // payloads and signaling encodings. No host FP operation occurs.
+                auto bits = std::make_shared<Expression>(Expression{integer_type(width),
+                    UnaryValue{"bitcast_i" + std::to_string(width), operands[1]}});
+                const auto sign = UINT64_C(1) << (width - 1);
+                const auto mask = fp_abs ? (double_precision ? UINT64_MAX : UINT64_C(0xffffffff)) ^ sign : sign;
+                auto transformed = std::make_shared<Expression>(Expression{integer_type(width),
+                    BinaryValue{fp_abs ? "and" : "xor", std::move(bits), constant_expr(mask, width)}});
+                auto value = std::make_shared<Expression>(Expression{floating_type(width),
+                    UnaryValue{"bitcast_f" + std::to_string(width), std::move(transformed)}});
+                return Assign{*destination, std::move(value)};
+            }
             std::string intrinsic_name;
             if (op >= Opcode::mips_add_s && op <= Opcode::mips_c_le_s) {
                 static constexpr const char *names[]{"mips.add.s", "mips.sub.s", "mips.mul.s", "mips.div.s",
@@ -2585,6 +3564,74 @@ a64_unhandled:
                         effect.result_type = floating_type(64);
                 }
                 effect.register_writes = instruction.register_writes;
+                const bool scalar_arithmetic =
+                    (op >= Opcode::mips_add_s && op <= Opcode::mips_sqrt_s) ||
+                    (op >= Opcode::mips_add_d && op <= Opcode::mips_sqrt_d);
+                const bool scalar_conversion = op >= Opcode::mips_cvt_s_d && op <= Opcode::mips_floor_w_d;
+                if (scalar_arithmetic || scalar_conversion) {
+                    const auto *destination = instruction.operands.empty()
+                        ? nullptr : std::get_if<RegisterOperand>(&instruction.operands[0]);
+                    const RegisterOperand fcsr{RegisterBank::mips_fcsr, 0, 32, false};
+                    const auto expected_destination_type = effect.result_type.value_or(integer_type(32));
+                    const auto expected_source_width = scalar_arithmetic
+                        ? static_cast<std::uint16_t>(op >= Opcode::mips_add_d ? 64 : 32)
+                        : static_cast<std::uint16_t>(op == Opcode::mips_cvt_s_d ||
+                            op == Opcode::mips_cvt_w_d || op >= Opcode::mips_round_w_d ? 64 : 32);
+                    const auto valid_destination = destination && destination->bank == RegisterBank::mips_fpr &&
+                        destination->index < 32 && !destination->high_byte &&
+                        destination->width == expected_destination_type.bits &&
+                        operands.size() == instruction.operands.size();
+                    std::vector<RegisterOperand> expected_reads;
+                    for (std::size_t index = 1; index < instruction.operands.size(); ++index) {
+                        const auto *source = std::get_if<RegisterOperand>(&instruction.operands[index]);
+                        if (!source || source->bank != RegisterBank::mips_fpr || source->index >= 32 ||
+                            source->high_byte || source->width != expected_source_width) {
+                            expected_reads.clear();
+                            break;
+                        }
+                        expected_reads.push_back(*source);
+                    }
+                    expected_reads.push_back(fcsr);
+                    const auto expected_writes = destination
+                        ? std::vector<RegisterOperand>{*destination, fcsr} : std::vector<RegisterOperand>{};
+                    const auto expected_access = instruction.operands.size() == 2
+                        ? std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read}
+                        : std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read, OperandAccess::read};
+                    if (!valid_destination || expected_reads.size() != instruction.operands.size() ||
+                        instruction.register_reads != expected_reads ||
+                        instruction.register_writes != expected_writes ||
+                        instruction.access != expected_access || instruction.memory_read ||
+                        instruction.memory_write || instruction.flow != FlowKind::fallthrough ||
+                        instruction.delay_slots) {
+                        Intrinsic malformed{"mips_malformed_fp_arithmetic_or_conversion", operands,
+                                            IntrinsicMemoryEffect::unknown};
+                        malformed.register_writes = instruction.register_writes;
+                        return malformed;
+                    }
+                    // Keep the rounding/status input in the dataflow graph.
+                    // The destination and FCSR results stay explicit but
+                    // opaque until their IEEE exception and mode semantics
+                    // are modeled by the decompiler.
+                    effect.operands.push_back(reg_expr(fcsr));
+                    if (op == Opcode::mips_cvt_d_w) {
+                        // Every signed 32-bit integer is exactly representable
+                        // in binary64. The result therefore does not depend
+                        // on FCSR.RM and cannot raise inexact; preserve the
+                        // existing FCSR value rather than inventing a status
+                        // update. Keep the intrinsic wrapper for operation
+                        // provenance and its incoming FCSR dependency.
+                        const auto signed_word = retag_expr(operands[1], integer_type(32));
+                        effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                            expected_destination_type, UnaryValue{"mips.s32_to_f64_exact", signed_word}}));
+                        effect.register_output_values.push_back(reg_expr(fcsr));
+                        return effect;
+                    }
+                    effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                        expected_destination_type,
+                        UnknownValue{intrinsic_name + "_result"}}));
+                    effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                        integer_type(32), UnknownValue{intrinsic_name + "_fcsr_after"}}));
+                }
                 return effect;
             }
             if (op == Opcode::mips_bc1t || op == Opcode::mips_bc1f ||
@@ -2601,6 +3648,26 @@ a64_unhandled:
         };
         if (auto lifted = fpu()) return std::move(*lifted);
         switch (instruction.opcode) {
+        case Opcode::mips_mul: {
+            if (operands.size() < 3 || instruction.operands.empty()) break;
+            const auto destination = as_register(instruction.operands[0]);
+            if (!destination || destination->bank != RegisterBank::mips_gpr) break;
+            auto lhs = typed_input(operands[1], true);
+            auto rhs = typed_input(operands[2], true);
+            auto product = std::make_shared<Expression>(Expression{
+                integer_type(32), BinaryValue{"mul", lhs, rhs}});
+            Intrinsic effect{"mips.mul.word.s32", {std::move(lhs), std::move(rhs)}, IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            for (const auto &output : effect.register_writes) {
+                if (output == *destination)
+                    effect.register_output_values.push_back(product);
+                else if (output.bank == RegisterBank::mips_hilo)
+                    effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                        integer_type(32), UnknownValue{"MIPS32 MUL leaves HI/LO unpredictable"}}));
+                else return {};
+            }
+            return effect;
+        }
         case Opcode::mips_mult: case Opcode::mips_multu: case Opcode::mips_div: case Opcode::mips_divu: {
             if (operands.size() < 2) break;
             const bool signed_operation = instruction.opcode == Opcode::mips_mult || instruction.opcode == Opcode::mips_div;
@@ -2625,7 +3692,7 @@ a64_unhandled:
             break;
         default: break;
         }
-        if (instruction.opcode == Opcode::mips_jr && instruction.flow == FlowKind::ret)
+        if ((instruction.opcode == Opcode::mips_jr || instruction.opcode == Opcode::mips64_jr_hb) && instruction.flow == FlowKind::ret)
             return Return{operands.empty() ? ExpressionPtr{} : operands.front()};
         if (instruction.flow == FlowKind::conditional_branch && !operands.empty()) {
             ExpressionPtr predicate;
@@ -2656,6 +3723,18 @@ a64_unhandled:
         if (!instruction.operands.empty()) {
             const auto destination = as_register(instruction.operands[0]);
             const auto op = instruction.opcode;
+            if (instruction.context.architecture == Architecture::mips32 &&
+                destination && destination->bank == RegisterBank::mips_gpr &&
+                (op == Opcode::mips_clz || op == Opcode::mips_clo) && operands.size() >= 2) {
+                if (destination->index == 0) return Intrinsic{"nop", {}, IntrinsicMemoryEffect::none};
+                auto input = operands[1];
+                if (op == Opcode::mips_clo)
+                    input = std::make_shared<Expression>(Expression{
+                        integer_type(32), UnaryValue{"bitnot", std::move(input)}});
+                auto count = std::make_shared<Expression>(Expression{
+                    integer_type(32), UnaryValue{"clz", std::move(input)}});
+                return Assign{*destination, std::move(count)};
+            }
             if (destination && destination->bank == RegisterBank::mips_gpr &&
                 (op == Opcode::mips_ext || op == Opcode::mips_ins) && operands.size() >= 4) {
                 if (destination->index == 0) return Intrinsic{"nop", {}, IntrinsicMemoryEffect::none};
@@ -2774,6 +3853,7 @@ a64_unhandled:
     if (riscv && !instruction.operands.empty()) {
         const auto dst = as_register(instruction.operands[0]);
         const auto op = instruction.opcode;
+        if (auto status_csr = lift_riscv_fstatus_csr(instruction, operands)) return *status_csr;
         if (op == Opcode::rv_fli_s || op == Opcode::rv_fli_d) {
             const auto *selector = instruction.operands.size() == 2
                 ? std::get_if<ImmediateOperand>(&instruction.operands[1]) : nullptr;
@@ -2845,7 +3925,8 @@ a64_unhandled:
             const auto vector_result = vector_type(0, operation->floating ? TypeKind::floating : TypeKind::unknown);
             const auto mask_result = vector_type(0, TypeKind::boolean, 1);
             std::vector<ExpressionPtr> inputs;
-            for (std::size_t n = 1; n < operands.size(); ++n) inputs.push_back(operands[n]);
+            for (std::size_t n = 1; n < operands.size(); ++n)
+                inputs.push_back(operation->mask_inputs ? retag_expr(operands[n], mask_result) : operands[n]);
             // Keep predicate and old-destination roles distinct even when v0
             // is also an explicit source or the destination register.
             if (instruction.riscv_vector_masked) {
@@ -3009,6 +4090,56 @@ a64_unhandled:
         const auto assign_value = [&](ExpressionPtr value) -> Statement {
             return dst ? Statement{Assign{*dst, std::move(value)}} : Statement{Intrinsic{"riscv", operands}};
         };
+        if (dst && operands.size() >= 3 &&
+            (op == Opcode::rv_czero_eqz || op == Opcode::rv_czero_nez)) {
+            // Zicond selects the first source when the condition is nonzero
+            // (NEZ) or zero (EQZ), and otherwise produces an XLEN zero.
+            auto condition = std::make_shared<Expression>(Expression{{TypeKind::boolean, 1, false},
+                BinaryValue{op == Opcode::rv_czero_eqz ? "eq" : "ne", operands[2],
+                    constant_expr(0, operands[2]->type.bits ? operands[2]->type.bits : dst->width)}});
+            auto alternatives = std::make_shared<Expression>(Expression{integer_type(dst->width),
+                BinaryValue{"pair", operands[1], constant_expr(0, dst->width)}});
+            auto value = std::make_shared<Expression>(Expression{integer_type(dst->width),
+                BinaryValue{"select_if", std::move(condition), std::move(alternatives)}});
+            return assign_value(std::move(value));
+        }
+        if (dst && operands.size() == 3 &&
+            (op == Opcode::rv_clmul || op == Opcode::rv_clmulh || op == Opcode::rv_clmulr) &&
+            (dst->width == 32 || dst->width == 64) &&
+            operands[1]->type == integer_type(dst->width) && operands[2]->type == integer_type(dst->width)) {
+            const char *operation = op == Opcode::rv_clmul ? "rvm_clmul" :
+                                    op == Opcode::rv_clmulh ? "rvm_clmulh" : "rvm_clmulr";
+            return assign_value(std::make_shared<Expression>(Expression{integer_type(dst->width),
+                BinaryValue{operation, operands[1], operands[2]}}));
+        }
+        if (dst && operands.size() >= 3 &&
+            (op == Opcode::rv_bclr || op == Opcode::rv_bext || op == Opcode::rv_binv || op == Opcode::rv_bset ||
+             op == Opcode::rv_bclri || op == Opcode::rv_bexti || op == Opcode::rv_binvi || op == Opcode::rv_bseti)) {
+            // Zbs indexes bits modulo XLEN for register and immediate forms.
+            // Keep the mask explicit so the common IR matches the ISA even
+            // when the source register contains an out-of-range index.
+            const auto width = dst->width;
+            auto index = std::make_shared<Expression>(Expression{integer_type(width),
+                BinaryValue{"and", retag_expr(operands[2], integer_type(width)), constant_expr(width - 1, width)}});
+            const auto selected_bit = std::make_shared<Expression>(Expression{integer_type(width),
+                BinaryValue{"shl", constant_expr(1, width), index}});
+            ExpressionPtr value;
+            if (op == Opcode::rv_bclr || op == Opcode::rv_bclri) {
+                auto inverse = std::make_shared<Expression>(Expression{integer_type(width), UnaryValue{"not", selected_bit}});
+                value = std::make_shared<Expression>(Expression{integer_type(width),
+                    BinaryValue{"and", operands[1], std::move(inverse)}});
+            } else if (op == Opcode::rv_bext || op == Opcode::rv_bexti) {
+                auto shifted = std::make_shared<Expression>(Expression{integer_type(width),
+                    BinaryValue{"shr", operands[1], std::move(index)}});
+                value = std::make_shared<Expression>(Expression{integer_type(width),
+                    BinaryValue{"and", std::move(shifted), constant_expr(1, width)}});
+            } else {
+                value = std::make_shared<Expression>(Expression{integer_type(width),
+                    BinaryValue{op == Opcode::rv_binv || op == Opcode::rv_binvi ? "xor" : "or",
+                                operands[1], std::move(selected_bit)}});
+            }
+            return assign_value(std::move(value));
+        }
         if (dst && operands.size() == 3 &&
             (op == Opcode::rv_sh1add || op == Opcode::rv_sh2add || op == Opcode::rv_sh3add ||
              op == Opcode::rv_add_uw || op == Opcode::rv_sh1add_uw || op == Opcode::rv_sh2add_uw ||
@@ -3265,6 +4396,175 @@ a64_unhandled:
         return Intrinsic{"thumb_itstate", operands, IntrinsicMemoryEffect::none};
 
     const bool arm32 = arm32_context;
+    const bool packed_extend_signed = instruction.opcode == Opcode::a32_sxtb16 ||
+        instruction.opcode == Opcode::a32_sxtab16 || instruction.opcode == Opcode::t32_sxtb16 ||
+        instruction.opcode == Opcode::t32_sxtab16;
+    const bool packed_extend_unsigned = instruction.opcode == Opcode::a32_uxtb16 ||
+        instruction.opcode == Opcode::a32_uxtab16 || instruction.opcode == Opcode::t32_uxtb16 ||
+        instruction.opcode == Opcode::t32_uxtab16;
+    if (arm32 && (packed_extend_signed || packed_extend_unsigned)) {
+        const bool add = instruction.opcode == Opcode::a32_sxtab16 || instruction.opcode == Opcode::a32_uxtab16 ||
+            instruction.opcode == Opcode::t32_sxtab16 || instruction.opcode == Opcode::t32_uxtab16;
+        const auto valid_gpr = [](const Operand &operand) {
+            const auto *reg = std::get_if<RegisterOperand>(&operand);
+            return reg && reg->bank == RegisterBank::arm32_gpr && reg->width == 32 &&
+                reg->index < 15 && !reg->high_byte;
+        };
+        const auto *rotated_operand = instruction.operands.size() == (add ? 3u : 2u)
+            ? std::get_if<ArmShiftedRegisterOperand>(&instruction.operands.back()) : nullptr;
+        if (!instruction.arm || !instruction.arm->flags_known || instruction.arm->flags_written ||
+            operands.size() != instruction.operands.size() ||
+            !valid_gpr(instruction.operands[0]) || (add && !valid_gpr(instruction.operands[1])) ||
+            !rotated_operand || rotated_operand->source.bank != RegisterBank::arm32_gpr ||
+            rotated_operand->source.width != 32 || rotated_operand->source.index >= 15 ||
+            rotated_operand->source.high_byte || rotated_operand->amount_register ||
+            rotated_operand->shift != ArmShift::ror || rotated_operand->amount > 24 ||
+            rotated_operand->amount % 8)
+            return Intrinsic{"arm_packed_extend_malformed", operands, IntrinsicMemoryEffect::none};
+        const auto destination = *as_register(instruction.operands[0]);
+        const auto &source = rotated_operand->source;
+        auto expected_reads = add
+            ? std::vector<RegisterOperand>{*as_register(instruction.operands[1]), source}
+            : std::vector<RegisterOperand>{source};
+        if (instruction.arm->predicate == ArmPredicate::condition)
+            expected_reads.insert(expected_reads.begin(), RegisterOperand{RegisterBank::arm_flags, 0, 4, false});
+        const auto expected_access = add
+            ? std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read, OperandAccess::read}
+            : std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read};
+        if (instruction.register_writes != std::vector<RegisterOperand>{destination} ||
+            instruction.register_reads != expected_reads || instruction.access != expected_access)
+            return Intrinsic{"arm_packed_extend_malformed", operands, IntrinsicMemoryEffect::none};
+        const auto masked = [](ExpressionPtr value, std::uint64_t mask) {
+            return std::make_shared<Expression>(Expression{integer_type(32),
+                BinaryValue{"and", std::move(value), constant_expr(mask, 32)}});
+        };
+        const auto byte0 = masked(operands.back(), 0xff);
+        const auto upper_word = std::make_shared<Expression>(Expression{integer_type(32),
+            BinaryValue{"shr", operands.back(), constant_expr(16, 32)}});
+        const auto byte1 = masked(std::move(upper_word), 0xff);
+        const auto extend_lane = [&](ExpressionPtr value) {
+            if (packed_extend_signed) {
+                value = std::make_shared<Expression>(Expression{integer_type(32),
+                    BinaryValue{"shl", std::move(value), constant_expr(24, 32)}});
+                value = std::make_shared<Expression>(Expression{integer_type(32),
+                    BinaryValue{"sar", std::move(value), constant_expr(24, 32)}});
+            }
+            return masked(std::move(value), 0xffff);
+        };
+        auto low_lane = extend_lane(byte0);
+        auto high_lane = extend_lane(byte1);
+        if (add) {
+            const auto accumulator = operands[1];
+            const auto low_base = masked(accumulator, 0xffff);
+            const auto upper_accumulator = std::make_shared<Expression>(Expression{integer_type(32),
+                BinaryValue{"shr", accumulator, constant_expr(16, 32)}});
+            const auto high_base = masked(std::move(upper_accumulator), 0xffff);
+            low_lane = masked(std::make_shared<Expression>(Expression{integer_type(32),
+                BinaryValue{"add", low_base, std::move(low_lane)}}), 0xffff);
+            high_lane = masked(std::make_shared<Expression>(Expression{integer_type(32),
+                BinaryValue{"add", high_base, std::move(high_lane)}}), 0xffff);
+        }
+        auto high_word = std::make_shared<Expression>(Expression{integer_type(32),
+            BinaryValue{"shl", std::move(high_lane), constant_expr(16, 32)}});
+        ExpressionPtr value = std::make_shared<Expression>(Expression{integer_type(32),
+            BinaryValue{"or", std::move(low_lane), std::move(high_word)}});
+        if (instruction.arm->predicate == ArmPredicate::condition) {
+            const auto predicate = arm32_condition_expr(instruction.condition,
+                reg_expr({RegisterBank::arm_flags, 0, 4, false}));
+            value = arm32_select(predicate, std::move(value), reg_expr(destination));
+        }
+        return Assign{destination, std::move(value)};
+    }
+    const bool arm_extend_signed = instruction.opcode == Opcode::a32_sxtb ||
+        instruction.opcode == Opcode::a32_sxth || instruction.opcode == Opcode::a32_sxtab ||
+        instruction.opcode == Opcode::a32_sxtah;
+    const bool arm_extend_unsigned = instruction.opcode == Opcode::a32_uxtb ||
+        instruction.opcode == Opcode::a32_uxth || instruction.opcode == Opcode::a32_uxtab ||
+        instruction.opcode == Opcode::a32_uxtah;
+    if (arm32 && (arm_extend_signed || arm_extend_unsigned)) {
+        const bool add = instruction.opcode == Opcode::a32_sxtab || instruction.opcode == Opcode::a32_sxtah ||
+            instruction.opcode == Opcode::a32_uxtab || instruction.opcode == Opcode::a32_uxtah;
+        const bool halfword = instruction.opcode == Opcode::a32_sxth || instruction.opcode == Opcode::a32_sxtah ||
+            instruction.opcode == Opcode::a32_uxth || instruction.opcode == Opcode::a32_uxtah;
+        const auto valid_gpr = [](const Operand &operand) {
+            const auto *reg = std::get_if<RegisterOperand>(&operand);
+            return reg && reg->bank == RegisterBank::arm32_gpr && reg->width == 32 &&
+                reg->index < 15 && !reg->high_byte;
+        };
+        if (instruction.operands.size() != (add ? 3u : 2u) ||
+            !valid_gpr(instruction.operands[0]) || (add && !valid_gpr(instruction.operands[1])) ||
+            !instruction.arm || instruction.arm->flags_written)
+            return Intrinsic{"arm_extend_malformed", operands, IntrinsicMemoryEffect::none};
+        const auto &source = instruction.operands.back();
+        const auto *shifted = std::get_if<ArmShiftedRegisterOperand>(&source);
+        if ((!shifted && !valid_gpr(source)) ||
+            (shifted && (shifted->source.bank != RegisterBank::arm32_gpr || shifted->source.width != 32 ||
+                shifted->source.index >= 15 || shifted->source.high_byte || shifted->amount_register ||
+                shifted->shift != ArmShift::ror || shifted->amount > 24 || shifted->amount % 8)))
+            return Intrinsic{"arm_extend_malformed", operands, IntrinsicMemoryEffect::none};
+        const auto destination = *as_register(instruction.operands[0]);
+        const unsigned narrow_bits = halfword ? 16 : 8;
+        ExpressionPtr value = operands.back();
+        if (arm_extend_signed) {
+            // The shift pair sign-extends the rotated low byte/halfword within
+            // a 32-bit value, including the wraparound bits in ROR #24.
+            value = std::make_shared<Expression>(Expression{integer_type(32),
+                BinaryValue{"shl", value, constant_expr(32 - narrow_bits, 32)}});
+            value = std::make_shared<Expression>(Expression{integer_type(32),
+                BinaryValue{"sar", value, constant_expr(32 - narrow_bits, 32)}});
+        } else {
+            value = std::make_shared<Expression>(Expression{integer_type(32),
+                BinaryValue{"and", value, constant_expr(halfword ? 0xffff : 0xff, 32)}});
+        }
+        if (add)
+            value = std::make_shared<Expression>(Expression{integer_type(32),
+                BinaryValue{"add", operands[1], value}});
+        if (instruction.arm->predicate == ArmPredicate::condition) {
+            auto predicate = arm32_condition_expr(instruction.condition, reg_expr({RegisterBank::arm_flags, 0, 4, false}));
+            value = arm32_select(predicate, std::move(value), reg_expr(destination));
+        }
+        return Assign{destination, std::move(value)};
+    }
+    if (thumb_context && (instruction.opcode == Opcode::t32_movw || instruction.opcode == Opcode::t32_movt)) {
+        const auto destination = instruction.operands.size() == 2
+            ? as_register(instruction.operands[0]) : std::optional<RegisterOperand>{};
+        const auto *immediate = instruction.operands.size() == 2
+            ? std::get_if<ImmediateOperand>(&instruction.operands[1]) : nullptr;
+        const bool movt = instruction.opcode == Opcode::t32_movt;
+        const RegisterOperand flags{RegisterBank::arm_flags, 0, 4, false};
+        const bool conditional = instruction.arm && instruction.arm->predicate == ArmPredicate::condition;
+        const bool valid_destination = destination && destination->bank == RegisterBank::arm32_gpr &&
+            destination->width == 32 && destination->index < 13 && !destination->high_byte;
+        const bool valid_immediate = immediate && immediate->encoded_width == 16 &&
+            immediate->effective_width == 32 && !immediate->is_signed && immediate->value <= 0xffff;
+        const auto expected_access = std::vector<OperandAccess>{
+            movt ? OperandAccess::read_write : OperandAccess::write, OperandAccess::read};
+        const bool reads_destination = std::find(instruction.register_reads.begin(),
+            instruction.register_reads.end(), destination.value_or(RegisterOperand{})) != instruction.register_reads.end();
+        if (!valid_destination || !valid_immediate || !instruction.arm || instruction.arm->flags_written ||
+            instruction.register_writes != std::vector<RegisterOperand>{*destination} ||
+            instruction.access != expected_access || (movt && !reads_destination) ||
+            (conditional && (instruction.condition >= 14 ||
+                std::find(instruction.register_reads.begin(), instruction.register_reads.end(), flags) ==
+                    instruction.register_reads.end())))
+            return Intrinsic{"thumb_movw_movt_malformed", operands, IntrinsicMemoryEffect::none};
+
+        ExpressionPtr value;
+        if (!movt) {
+            value = constant_expr(immediate->value, 32);
+        } else {
+            const auto prior_low = std::make_shared<Expression>(Expression{integer_type(32),
+                BinaryValue{"and", reg_expr(*destination), constant_expr(0xffff, 32)}});
+            const auto inserted_high = constant_expr(immediate->value << 16, 32);
+            value = std::make_shared<Expression>(Expression{integer_type(32),
+                BinaryValue{"or", prior_low, inserted_high}});
+        }
+        if (conditional) {
+            const auto predicate = arm32_condition_expr(instruction.condition, reg_expr(flags));
+            value = arm32_select(predicate, std::move(value), reg_expr(*destination));
+        }
+        return Assign{*destination, std::move(value)};
+    }
     if (arm32 && instruction.opcode == Opcode::t32_adr && instruction.operands.size() == 2) {
         const auto destination = as_register(instruction.operands[0]);
         const auto *address = std::get_if<ArmMemoryOperand>(&instruction.operands[1]);
@@ -3385,7 +4685,8 @@ a64_unhandled:
         const bool compare = opcode == Opcode::a32_tst || opcode == Opcode::a32_teq ||
                              opcode == Opcode::a32_cmp || opcode == Opcode::a32_cmn;
         const bool unary = opcode == Opcode::a32_mov || opcode == Opcode::a32_mvn;
-        const bool data_operation = opcode >= Opcode::a32_and && opcode <= Opcode::a32_mvn;
+        const bool data_operation = (opcode >= Opcode::a32_and && opcode <= Opcode::a32_mvn) ||
+                                    opcode == Opcode::t32_addw || opcode == Opcode::t32_subw;
         if (data_operation && ((compare && operands.size() >= 2) || (!compare && operands.size() >= 2))) {
             const auto destination = compare ? std::optional<RegisterOperand>{} : as_register(instruction.operands[0]);
             const auto left = compare ? operands[0] : operands.size() >= 3 ? operands[1] : operands[0];
@@ -3394,9 +4695,9 @@ a64_unhandled:
             switch (opcode) {
             case Opcode::a32_and: case Opcode::a32_tst: operation = "and"; break;
             case Opcode::a32_eor: case Opcode::a32_teq: operation = "xor"; break;
-            case Opcode::a32_sub: case Opcode::a32_cmp: operation = "sub"; break;
+            case Opcode::a32_sub: case Opcode::a32_cmp: case Opcode::t32_subw: operation = "sub"; break;
             case Opcode::a32_rsb: operation = "rsb"; break;
-            case Opcode::a32_add: case Opcode::a32_cmn: operation = "add"; break;
+            case Opcode::a32_add: case Opcode::a32_cmn: case Opcode::t32_addw: operation = "add"; break;
             case Opcode::a32_adc: operation = "adc"; break;
             case Opcode::a32_sbc: operation = "sbc"; break;
             case Opcode::a32_rsc: operation = "rsc"; break;
@@ -3595,7 +4896,8 @@ a64_unhandled:
 
     const bool x86 = instruction.context.architecture == Architecture::x86 ||
                      instruction.context.architecture == Architecture::x86_64;
-    if (x86 && (instruction.opcode == Opcode::xadd || instruction.opcode == Opcode::cmpxchg) &&
+    if (x86 && (instruction.opcode == Opcode::xchg || instruction.opcode == Opcode::xadd ||
+                instruction.opcode == Opcode::cmpxchg) &&
         instruction.operands.size() == 2) {
         const auto *destination_memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
         const auto destination = as_register(instruction.operands[0]);
@@ -3709,8 +5011,10 @@ a64_unhandled:
             const auto input_type = vector_type(width, TypeKind::floating, lane_bits,
                 static_cast<std::uint8_t>(width / lane_bits));
             const auto result_type = vector_type(static_cast<std::uint16_t>(zero_upper ? 256 : width),
-                TypeKind::floating, lane_bits,
+                TypeKind::integer, lane_bits,
                 static_cast<std::uint8_t>((zero_upper ? 256 : width) / lane_bits));
+            const auto low_result_type = vector_type(static_cast<std::uint16_t>(width), TypeKind::integer,
+                lane_bits, static_cast<std::uint8_t>(width / lane_bits));
             std::vector<ExpressionPtr> inputs{
                 retag_expr(operands[1], input_type), retag_expr(operands[2], input_type),
                 retag_expr(operands[3], integer_type(8)),
@@ -3722,6 +5026,35 @@ a64_unhandled:
                 memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
             effect.register_writes = instruction.register_writes;
             effect.result_type = result_type;
+            const bool writes_destination = std::find(effect.register_writes.begin(), effect.register_writes.end(),
+                *destination) != effect.register_writes.end();
+            const bool writes_mxcsr = std::any_of(effect.register_writes.begin(), effect.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::mxcsr; });
+            if (writes_destination && writes_mxcsr) {
+                auto compare_inputs = std::make_shared<Expression>(Expression{
+                    vector_type(128, TypeKind::integer, 8, 16),
+                    BinaryValue{"x86_avx_compare_ie_de_inputs_predicate" + std::to_string(predicate->value),
+                        retag_expr(operands[1], input_type), retag_expr(operands[2], input_type)}});
+                for (const auto written : effect.register_writes) {
+                    if (written == *destination) {
+                        effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                            low_result_type, UnaryValue{"x86_avx_compare_result", compare_inputs}}));
+                    } else if (zero_upper && written.bank == RegisterBank::ymm &&
+                               written.index == destination->index) {
+                        effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                            vector_type(256, TypeKind::integer, lane_bits,
+                                static_cast<std::uint8_t>(256 / lane_bits)),
+                            UnaryValue{"x86_avx_compare_result_zero_upper", compare_inputs}}));
+                    } else if (written.bank == RegisterBank::mxcsr) {
+                        effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                            integer_type(32), BinaryValue{"x86_mxcsr_after_avx_compare_sticky_ie_de",
+                                reg_expr(written), compare_inputs}}));
+                    } else {
+                        effect.register_output_values.clear();
+                        break;
+                    }
+                }
+            }
             return effect;
         }
     }
@@ -3763,6 +5096,30 @@ a64_unhandled:
                 std::move(inputs), memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
             effect.register_writes = instruction.register_writes;
             effect.result_type = integer_type(64);
+            auto compare_inputs = std::make_shared<Expression>(Expression{
+                vector_type(width, TypeKind::integer, 8, static_cast<std::uint8_t>(width / 8)),
+                BinaryValue{"x86_evex_compare_ie_de_inputs_predicate" + std::to_string(predicate->value),
+                    retag_expr(operands[1], vector_value_type),
+                    instruction.x86_evex_broadcast
+                        ? retag_expr(operands[2], floating_type(lane_bits))
+                        : retag_expr(operands[2], vector_value_type)}});
+            if (instruction.x86_opmask)
+                compare_inputs = std::make_shared<Expression>(Expression{compare_inputs->type, BinaryValue{
+                    "x86_evex_compare_ie_de_active_lanes", std::move(compare_inputs),
+                    reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false})}});
+            for (const auto written : effect.register_writes) {
+                if (written == *destination) {
+                    effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                        integer_type(64), UnaryValue{"x86_evex_float_compare_to_mask_result", compare_inputs}}));
+                } else if (written.bank == RegisterBank::mxcsr) {
+                    effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                        integer_type(32), BinaryValue{"x86_mxcsr_after_evex_compare_sticky_ie_de",
+                            reg_expr(written), compare_inputs}}));
+                } else {
+                    effect.register_output_values.clear();
+                    break;
+                }
+            }
             return effect;
         }
     }
@@ -3820,6 +5177,174 @@ a64_unhandled:
             return effect;
         }
     }
+    if (x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
+        (instruction.opcode == Opcode::vpopcntb || instruction.opcode == Opcode::vpopcntw ||
+         instruction.opcode == Opcode::vpopcntd || instruction.opcode == Opcode::vpopcntq) &&
+        instruction.operands.size() == 2 && !instruction.x86_evex_broadcast && !instruction.x86_evex_sae) {
+        const auto width = static_cast<unsigned>(instruction.vector_bits);
+        const auto lane_bits = static_cast<std::uint16_t>(instruction.opcode == Opcode::vpopcntb ? 8 :
+            instruction.opcode == Opcode::vpopcntw ? 16 : instruction.opcode == Opcode::vpopcntd ? 32 : 64);
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        if ((width == 128 || width == 256 || width == 512) && destination &&
+            x86_avx_detail::is_evex_vector(instruction.operands[0], width) &&
+            (x86_avx_detail::is_evex_vector(instruction.operands[1], width) ||
+             (memory && memory->data_width == width)) &&
+            (!instruction.vector_element_bits || instruction.vector_element_bits == lane_bits) &&
+            (!instruction.x86_opmask_zeroing || instruction.x86_opmask) &&
+            (!instruction.x86_opmask || (*instruction.x86_opmask > 0 && *instruction.x86_opmask < 8))) {
+            const auto input_type = vector_type(static_cast<std::uint16_t>(width), TypeKind::integer,
+                lane_bits, static_cast<std::uint8_t>(width / lane_bits));
+            const auto output_width = static_cast<std::uint16_t>(width < 512 ? 512 : width);
+            const auto result_type = vector_type(output_width, TypeKind::integer, lane_bits,
+                static_cast<std::uint8_t>(output_width / lane_bits));
+            std::vector<ExpressionPtr> inputs;
+            if (instruction.x86_opmask && !instruction.x86_opmask_zeroing)
+                inputs.push_back(retag_expr(operands[0], input_type));
+            inputs.push_back(retag_expr(operands[1], input_type));
+            if (instruction.x86_opmask)
+                inputs.push_back(reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false}));
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_i" +
+                std::to_string(lane_bits) + "x" + std::to_string(width / lane_bits) +
+                (instruction.x86_opmask ? (instruction.x86_opmask_zeroing ? "_mask_zero" : "_mask_merge") : "") +
+                (width < 512 ? "_zero_upper" : ""), std::move(inputs),
+                memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = result_type;
+            return effect;
+        }
+    }
+
+    if (const auto shift_shape = x86_avx_detail::immediate_shift_shape(instruction.opcode);
+        x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
+        shift_shape && shift_shape->second_bits == 8 && shift_shape->result_bits != 128 &&
+        instruction.operands.size() == 3 && !instruction.x86_evex_broadcast && !instruction.x86_evex_sae) {
+        const auto width = static_cast<unsigned>(instruction.vector_bits);
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        const auto *count = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        if (width == 128 || width == 256 || width == 512) {
+            const bool valid_source = x86_avx_detail::is_evex_vector(instruction.operands[1], width) ||
+                (memory && memory->data_width == width);
+            if (destination && x86_avx_detail::is_evex_vector(instruction.operands[0], width) && valid_source &&
+                count && count->encoded_width == 8 && count->effective_width == 8 && !count->is_signed &&
+                (!instruction.vector_element_bits || instruction.vector_element_bits == shift_shape->result_bits) &&
+                (!instruction.x86_opmask_zeroing || instruction.x86_opmask) &&
+                (!instruction.x86_opmask || (*instruction.x86_opmask > 0 && *instruction.x86_opmask < 8))) {
+                const auto lane_bits = static_cast<std::uint16_t>(shift_shape->result_bits);
+                const auto input_type = vector_type(static_cast<std::uint16_t>(width), TypeKind::integer,
+                    lane_bits, static_cast<std::uint8_t>(width / lane_bits));
+                const auto result_width = static_cast<std::uint16_t>(width < 512 ? 512 : width);
+                const auto result_type = vector_type(result_width, TypeKind::integer, lane_bits,
+                    static_cast<std::uint8_t>(result_width / lane_bits));
+                std::vector<ExpressionPtr> inputs;
+                if (instruction.x86_opmask && !instruction.x86_opmask_zeroing)
+                    inputs.push_back(retag_expr(operands[0], input_type));
+                inputs.push_back(retag_expr(operands[1], input_type));
+                inputs.push_back(retag_expr(operands[2], integer_type(8)));
+                if (instruction.x86_opmask)
+                    inputs.push_back(reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false}));
+                Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_i" +
+                    std::to_string(lane_bits) + "x" + std::to_string(width / lane_bits) + "_imm" +
+                    std::to_string(count->value) + (instruction.x86_opmask ?
+                        (instruction.x86_opmask_zeroing ? "_mask_zero" : "_mask_merge") : "") +
+                    (width < 512 ? "_zero_upper" : ""), std::move(inputs),
+                    memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = instruction.register_writes;
+                effect.result_type = result_type;
+                return effect;
+            }
+        }
+    }
+
+    if (x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
+        instruction.operands.size() == 2 &&
+        (instruction.opcode == Opcode::vpmovm2b || instruction.opcode == Opcode::vpmovm2w ||
+         instruction.opcode == Opcode::vpmovm2d || instruction.opcode == Opcode::vpmovm2q ||
+         instruction.opcode == Opcode::vpmovb2m || instruction.opcode == Opcode::vpmovw2m ||
+         instruction.opcode == Opcode::vpmovd2m || instruction.opcode == Opcode::vpmovq2m)) {
+        const auto width = static_cast<unsigned>(instruction.vector_bits);
+        const auto lane_bits = static_cast<std::uint16_t>(
+            instruction.opcode == Opcode::vpmovm2b || instruction.opcode == Opcode::vpmovb2m ? 8 :
+            instruction.opcode == Opcode::vpmovm2w || instruction.opcode == Opcode::vpmovw2m ? 16 :
+            instruction.opcode == Opcode::vpmovm2d || instruction.opcode == Opcode::vpmovd2m ? 32 : 64);
+        const bool mask_to_vector = instruction.opcode == Opcode::vpmovm2b ||
+            instruction.opcode == Opcode::vpmovm2w || instruction.opcode == Opcode::vpmovm2d ||
+            instruction.opcode == Opcode::vpmovm2q;
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const bool valid_width = width == 128 || width == 256 || width == 512;
+        const bool shape_valid = !instruction.vector_element_bits || instruction.vector_element_bits == lane_bits;
+        if (valid_width && shape_valid && destination && !instruction.x86_opmask &&
+            !instruction.x86_opmask_zeroing && !instruction.x86_evex_broadcast) {
+            if (mask_to_vector && x86_avx_detail::is_evex_vector(instruction.operands[0], width) &&
+                destination->bank != RegisterBank::opmask) {
+                const auto *source = std::get_if<RegisterOperand>(&instruction.operands[1]);
+                if (source && source->bank == RegisterBank::opmask && source->index < 8 &&
+                    source->width == 64 && !source->high_byte) {
+                    const auto result_width = static_cast<std::uint16_t>(width < 512 ? 512 : width);
+                    const auto type = vector_type(result_width, TypeKind::integer, lane_bits,
+                        static_cast<std::uint8_t>(result_width / lane_bits));
+                    Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_k_to_i" +
+                        std::to_string(lane_bits) + "x" + std::to_string(width / lane_bits) +
+                        (width < 512 ? "_zero_upper" : ""),
+                        {reg_expr(*source)}, IntrinsicMemoryEffect::none};
+                    effect.register_writes = instruction.register_writes;
+                    effect.result_type = type;
+                    return effect;
+                }
+            } else if (!mask_to_vector && destination->bank == RegisterBank::opmask &&
+                destination->index < 8 && destination->width == 64 && !destination->high_byte &&
+                x86_avx_detail::is_evex_vector(instruction.operands[1], width)) {
+                const auto type = vector_type(static_cast<std::uint16_t>(width), TypeKind::integer, lane_bits,
+                    static_cast<std::uint8_t>(width / lane_bits));
+                Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_i" +
+                    std::to_string(lane_bits) + "x" + std::to_string(width / lane_bits) + "_sign_bits_to_k",
+                    {retag_expr(operands[1], type)}, IntrinsicMemoryEffect::none};
+                effect.register_writes = instruction.register_writes;
+                effect.result_type = integer_type(64);
+                return effect;
+            }
+        }
+    }
+
+    if (x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
+        (instruction.opcode == Opcode::vpternlogd || instruction.opcode == Opcode::vpternlogq) &&
+        (instruction.vector_bits == 128 || instruction.vector_bits == 256 || instruction.vector_bits == 512) &&
+        instruction.operands.size() == 4 && !instruction.x86_evex_broadcast && !instruction.x86_evex_sae) {
+        const auto width = static_cast<unsigned>(instruction.vector_bits);
+        const auto lane_bits = static_cast<std::uint16_t>(instruction.opcode == Opcode::vpternlogq ? 64 : 32);
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
+        const auto *truth_table = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+        if (destination && x86_avx_detail::is_evex_vector(instruction.operands[0], width) &&
+            x86_avx_detail::is_evex_vector(instruction.operands[1], width) &&
+            (x86_avx_detail::is_evex_vector(instruction.operands[2], width) ||
+             (memory && memory->data_width == width)) && truth_table &&
+            truth_table->encoded_width == 8 && truth_table->effective_width == 8 && !truth_table->is_signed &&
+            (!instruction.vector_element_bits || instruction.vector_element_bits == lane_bits) &&
+            (!instruction.x86_opmask_zeroing || instruction.x86_opmask) &&
+            (!instruction.x86_opmask || (*instruction.x86_opmask > 0 && *instruction.x86_opmask < 8))) {
+            const auto input_type = vector_type(static_cast<std::uint16_t>(width), TypeKind::integer,
+                lane_bits, static_cast<std::uint8_t>(width / lane_bits));
+            const auto result_type = vector_type(static_cast<std::uint16_t>(width < 512 ? 512 : width),
+                TypeKind::integer, lane_bits,
+                static_cast<std::uint8_t>((width < 512 ? 512 : width) / lane_bits));
+            std::vector<ExpressionPtr> inputs{
+                retag_expr(operands[0], input_type), retag_expr(operands[1], input_type),
+                retag_expr(operands[2], input_type), retag_expr(operands[3], integer_type(8))};
+            if (instruction.x86_opmask)
+                inputs.push_back(reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false}));
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_i" + std::to_string(lane_bits) +
+                "x" + std::to_string(width / lane_bits) + "_truth_table" + std::to_string(truth_table->value) +
+                (instruction.x86_opmask ? (instruction.x86_opmask_zeroing ? "_mask_zero" : "_mask_merge") : "") +
+                (width < 512 ? "_zero_upper" : ""), std::move(inputs),
+                memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = result_type;
+            return effect;
+        }
+    }
+
     if (const auto shape = x86_avx_detail::evex_integer_shape(instruction.opcode);
         x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
         (instruction.vector_bits == 128 || instruction.vector_bits == 256 || instruction.vector_bits == 512) &&
@@ -3867,6 +5392,70 @@ a64_unhandled:
             effect.register_writes = instruction.register_writes;
             effect.result_type = result_type;
             return effect;
+        }
+    }
+    if (x86 && instruction.opcode == Opcode::vpcmpgtq && instruction.vector_element_bits &&
+        instruction.vector_element_bits != 64) {
+        Intrinsic effect{"x86_vpcmpgtq_malformed_lane_width", operands, IntrinsicMemoryEffect::unknown};
+        effect.register_writes = instruction.register_writes;
+        return effect;
+    }
+    const bool move_mask = instruction.opcode == Opcode::movmskps || instruction.opcode == Opcode::movmskpd ||
+        instruction.opcode == Opcode::pmovmskb || instruction.opcode == Opcode::vmovmskps ||
+        instruction.opcode == Opcode::vmovmskpd || instruction.opcode == Opcode::vpmovmskb;
+    if (x86 && move_mask &&
+        instruction.operands.size() == 2 && !instruction.x86_evex && !instruction.x86_opmask &&
+        !instruction.x86_opmask_zeroing && !instruction.x86_evex_broadcast && !instruction.x86_evex_sae &&
+        instruction.flow == FlowKind::fallthrough &&
+        !instruction.lock_prefix && instruction.access ==
+            std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read}) {
+        const auto destination = as_register(instruction.operands[0]);
+        const auto *source = std::get_if<RegisterOperand>(&instruction.operands[1]);
+        const auto vector_bits = instruction.vector_bits;
+        const bool is_byte_mask = instruction.opcode == Opcode::pmovmskb || instruction.opcode == Opcode::vpmovmskb;
+        const bool is_double = instruction.opcode == Opcode::movmskpd || instruction.opcode == Opcode::vmovmskpd;
+        const bool vex = instruction.opcode == Opcode::vmovmskps || instruction.opcode == Opcode::vmovmskpd ||
+                         instruction.opcode == Opcode::vpmovmskb;
+        const std::uint16_t lane_bits = is_byte_mask ? 8 : is_double ? 64 : 32;
+        const auto lanes = static_cast<std::uint8_t>(vector_bits / lane_bits);
+        const auto lane_kind = is_byte_mask ? TypeKind::integer : TypeKind::floating;
+        const auto expected_bank = vector_bits == 128 ? RegisterBank::xmm : RegisterBank::ymm;
+        const auto mode = instruction.context.mode;
+        const auto max_gprs = mode == ExecutionMode::x86_64 ? 16 : 8;
+        const bool source_reads = source && std::find(instruction.register_reads.begin(),
+            instruction.register_reads.end(), *source) != instruction.register_reads.end();
+        const bool destination_writes = destination && std::find(instruction.register_writes.begin(),
+            instruction.register_writes.end(), *destination) != instruction.register_writes.end();
+        if (destination && source && destination->bank == RegisterBank::gpr && destination->width == 32 &&
+            source->bank == expected_bank && source->width == vector_bits &&
+            (vector_bits == 128 || (vex && vector_bits == 256)) &&
+            (mode == ExecutionMode::x86_64 || mode == ExecutionMode::x86_16 || mode == ExecutionMode::x86_32) &&
+            ((instruction.context.architecture == Architecture::x86_64) == (mode == ExecutionMode::x86_64)) &&
+            destination->index < max_gprs && source->index < max_gprs &&
+            instruction.vector_element_bits == lane_bits && operands[1]->type.bits == vector_bits &&
+            (!vex || (instruction.context.architecture == Architecture::x86_64 &&
+                      instruction.context.mode == ExecutionMode::x86_64)) &&
+            source_reads && destination_writes &&
+            instruction.register_reads == std::vector<RegisterOperand>{*source} &&
+            instruction.register_writes == std::vector<RegisterOperand>{*destination} &&
+            !instruction.memory_read && !instruction.memory_write &&
+            !x86_writes_flags(instruction)) {
+            const auto source_type = vector_type(vector_bits, lane_kind, lane_bits, lanes);
+            auto vector_source = retag_expr(operands[1], source_type);
+            const auto lane_name = std::string(is_byte_mask ? "i" : "f") + std::to_string(lane_bits) + "x" +
+                std::to_string(lanes);
+            auto output = std::make_shared<Expression>(Expression{integer_type(32),
+                UnaryValue{"movemask_zero_extend_" + lane_name + "_to_i32", vector_source}});
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_" + lane_name + "_to_i32",
+                {vector_source}, IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = integer_type(32);
+            for (const auto written : effect.register_writes) {
+                if (written == *destination) effect.register_output_values.push_back(output);
+                else return Intrinsic{"x86_" + operation_name(instruction.opcode) +
+                    "_unmodeled_output", {vector_source}, IntrinsicMemoryEffect::unknown};
+            }
+            if (effect.register_output_values.size() == effect.register_writes.size()) return effect;
         }
     }
     if (const auto shape = x86_avx_detail::integer_dataflow_shape(instruction.opcode);
@@ -3986,6 +5575,8 @@ a64_unhandled:
     }
 
     const bool avx_move = instruction.opcode == Opcode::vmovups;
+    const bool avx_shuffle = instruction.opcode == Opcode::vshufps || instruction.opcode == Opcode::vshufpd;
+    const bool avx_immediate_shuffle = instruction.opcode == Opcode::vpshufd;
     const bool avx_float_arithmetic = instruction.opcode == Opcode::vaddps || instruction.opcode == Opcode::vaddpd ||
         instruction.opcode == Opcode::vsubps || instruction.opcode == Opcode::vsubpd ||
         instruction.opcode == Opcode::vmulps || instruction.opcode == Opcode::vmulpd ||
@@ -4004,6 +5595,8 @@ a64_unhandled:
         instruction.opcode == Opcode::vpmaxub || instruction.opcode == Opcode::vpmaxsw;
     const bool avx_integer_multiply = instruction.opcode == Opcode::vpmullw || instruction.opcode == Opcode::vpmulhw ||
         instruction.opcode == Opcode::vpmulhuw;
+    const bool avx_integer_sign = instruction.opcode == Opcode::vpsignb || instruction.opcode == Opcode::vpsignw ||
+        instruction.opcode == Opcode::vpsignd;
     const bool avx_integer_compare = x86_avx_detail::is_equal_compare(instruction.opcode) ||
                                      x86_avx_detail::is_greater_compare(instruction.opcode);
     const bool avx_integer_shift = instruction.opcode == Opcode::vpsllvw || instruction.opcode == Opcode::vpsllvd ||
@@ -4012,28 +5605,33 @@ a64_unhandled:
         instruction.opcode == Opcode::vpsravw || instruction.opcode == Opcode::vpsravd || instruction.opcode == Opcode::vpsravq;
     const bool avx_integer_lanes = (!instruction.x86_evex || avx_integer_shift) &&
         (avx_integer_arithmetic || avx_integer_subtraction || avx_integer_multiply ||
-         avx_integer_minmax || avx_integer_compare || avx_integer_shift);
+         avx_integer_minmax || avx_integer_compare || avx_integer_shift || avx_integer_sign ||
+         instruction.opcode == Opcode::vpermd);
     const auto avx_integer_lane_bits = instruction.opcode == Opcode::vpcmpeqb || instruction.opcode == Opcode::vpcmpgtb ||
         instruction.opcode == Opcode::vpaddb || instruction.opcode == Opcode::vpsubb ||
         instruction.opcode == Opcode::vpaddsb || instruction.opcode == Opcode::vpaddusb ||
-        instruction.opcode == Opcode::vpsubsb || instruction.opcode == Opcode::vpsubusb || instruction.opcode == Opcode::vpminub || instruction.opcode == Opcode::vpmaxub ? 8u
+        instruction.opcode == Opcode::vpsubsb || instruction.opcode == Opcode::vpsubusb || instruction.opcode == Opcode::vpsignb ||
+        instruction.opcode == Opcode::vpminub || instruction.opcode == Opcode::vpmaxub ? 8u
         : instruction.opcode == Opcode::vpcmpeqw || instruction.opcode == Opcode::vpcmpgtw ||
           instruction.opcode == Opcode::vpaddw || instruction.opcode == Opcode::vpsubw ||
           instruction.opcode == Opcode::vpaddsw || instruction.opcode == Opcode::vpaddusw ||
           instruction.opcode == Opcode::vpsubsw || instruction.opcode == Opcode::vpsubusw ||
-          instruction.opcode == Opcode::vpminsw || instruction.opcode == Opcode::vpmaxsw ? 16u
+          instruction.opcode == Opcode::vpsignw || instruction.opcode == Opcode::vpminsw || instruction.opcode == Opcode::vpmaxsw ? 16u
         : instruction.opcode == Opcode::vpcmpeqd || instruction.opcode == Opcode::vpcmpgtd ||
-          instruction.opcode == Opcode::vpaddd || instruction.opcode == Opcode::vpsubd ? 32u
-        : instruction.opcode == Opcode::vpaddq || instruction.opcode == Opcode::vpsubq ? 64u
+          instruction.opcode == Opcode::vpaddd || instruction.opcode == Opcode::vpsubd || instruction.opcode == Opcode::vpsignd ? 32u
+        : instruction.opcode == Opcode::vpcmpgtq ||
+          instruction.opcode == Opcode::vpaddq || instruction.opcode == Opcode::vpsubq ? 64u
         : instruction.opcode == Opcode::vpsllvw || instruction.opcode == Opcode::vpsrlvw || instruction.opcode == Opcode::vpsravw ? 16u
         : instruction.opcode == Opcode::vpsllvq || instruction.opcode == Opcode::vpsrlvq || instruction.opcode == Opcode::vpsravq ? 64u
+        : instruction.opcode == Opcode::vpermd ? 32u
         : avx_integer_multiply ? 16u : 0u;
     const bool avx_integer_bitwise = instruction.opcode == Opcode::vpand || instruction.opcode == Opcode::vpor ||
         instruction.opcode == Opcode::vpxor || instruction.opcode == Opcode::vpandd ||
         instruction.opcode == Opcode::vpandq || instruction.opcode == Opcode::vpord ||
         instruction.opcode == Opcode::vporq || instruction.opcode == Opcode::vpxord ||
         instruction.opcode == Opcode::vpxorq;
-    if (x86 && (avx_move || avx_float_arithmetic || avx_bitwise || avx_integer_lanes || avx_integer_bitwise)) {
+    if (x86 && (avx_move || avx_shuffle || avx_immediate_shuffle || avx_float_arithmetic ||
+                avx_bitwise || avx_integer_lanes || avx_integer_bitwise)) {
         const auto destination = instruction.operands.empty() ? std::optional<RegisterOperand>{} : as_register(instruction.operands[0]);
         const auto move_source = avx_move && instruction.operands.size() == 2 ? as_register(instruction.operands[1]) : std::optional<RegisterOperand>{};
         const auto vector_width = static_cast<std::uint16_t>(destination ? destination->width : move_source ? move_source->width : 0);
@@ -4100,13 +5698,69 @@ a64_unhandled:
                 if (!store) effect.result_type = result_type;
                 return effect;
             }
+        } else if (supported_width && avx_immediate_shuffle && instruction.operands.size() == 3) {
+            const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+            const bool source_valid = valid_vector_operand(instruction.operands[1], true);
+            if (source_valid && selector && selector->encoded_width == 8 &&
+                selector->effective_width == 8 && !selector->is_signed && instruction.vector_bits == vector_width &&
+                instruction.vector_element_bits == 32 &&
+                (!instruction.x86_evex || !instruction.x86_opmask_zeroing || instruction.x86_opmask)) {
+                const auto input_type = vector_type(vector_width, TypeKind::integer, 32,
+                    static_cast<std::uint8_t>(vector_width / 32));
+                const auto result_type = vector_type(result_width, TypeKind::integer, 32,
+                    static_cast<std::uint8_t>(result_width / 32));
+                std::vector<ExpressionPtr> shuffle_inputs;
+                if (instruction.x86_opmask && !instruction.x86_opmask_zeroing)
+                    shuffle_inputs.push_back(retag_expr(operands[0], input_type));
+                shuffle_inputs.push_back(retag_expr(operands[1], input_type));
+                shuffle_inputs.push_back(constant_expr(selector->value, 8));
+                if (instruction.x86_opmask)
+                    shuffle_inputs.push_back(reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false}));
+                Intrinsic effect{"x86_vpshufd_i32x" + std::to_string(vector_width / 32) + "_imm8_lane128" +
+                    (instruction.x86_evex ? "_evex" + std::to_string(vector_width) : "") +
+                    (zero_upper ? "_zero_upper" : "") +
+                    (instruction.x86_opmask ? (instruction.x86_opmask_zeroing ? "_mask_zero" : "_mask_merge") : ""),
+                    std::move(shuffle_inputs),
+                    std::holds_alternative<MemoryOperand>(instruction.operands[1])
+                        ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = instruction.register_writes;
+                effect.result_type = result_type;
+                return effect;
+            }
+        } else if (supported_width && avx_shuffle && instruction.operands.size() == 4) {
+            const auto first = as_register(instruction.operands[1]);
+            const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+            const bool source2_valid = valid_vector_operand(instruction.operands[2], true);
+            if (!instruction.x86_evex && first && first->bank == vector_bank && first->width == vector_width &&
+                source2_valid && selector && selector->encoded_width == 8 && selector->effective_width == 8 &&
+                !selector->is_signed && instruction.vector_bits == vector_width &&
+                instruction.vector_element_bits == (instruction.opcode == Opcode::vshufps ? 32 : 64)) {
+                const auto lane_bits = static_cast<std::uint16_t>(instruction.vector_element_bits);
+                const auto input_type = vector_type(vector_width, TypeKind::floating, lane_bits,
+                    static_cast<std::uint8_t>(vector_width / lane_bits));
+                const auto result_type = vector_type(result_width, TypeKind::floating, lane_bits,
+                    static_cast<std::uint8_t>(result_width / lane_bits));
+                std::vector<ExpressionPtr> inputs{
+                    retag_expr(operands[1], input_type), retag_expr(operands[2], input_type),
+                    constant_expr(selector->value, 8)};
+                Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_f" +
+                    std::to_string(lane_bits) + "x" + std::to_string(vector_width / lane_bits) +
+                    (zero_upper ? "_zero_upper" : ""), std::move(inputs),
+                    std::holds_alternative<MemoryOperand>(instruction.operands[2])
+                        ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = instruction.register_writes;
+                effect.result_type = result_type;
+                return effect;
+            }
         } else if (supported_width && (avx_float_arithmetic || avx_bitwise || avx_integer_lanes || avx_integer_bitwise) &&
                    instruction.operands.size() == 3) {
             const auto first = as_register(instruction.operands[1]);
             const bool source2_valid = valid_vector_operand(instruction.operands[2], true);
             if (first && first->bank == vector_bank && first->width == vector_width && source2_valid) {
-                const auto input_type = vector_type_for(avx_float_arithmetic, vector_width);
-                const auto result_type = vector_type_for(avx_float_arithmetic, result_width);
+                auto input_type = vector_type_for(avx_float_arithmetic, vector_width);
+                if (avx_integer_sign) input_type.is_signed = true;
+                auto result_type = vector_type_for(avx_float_arithmetic, result_width);
+                if (avx_integer_sign) result_type.is_signed = true;
                 auto second = retag_expr(operands[1], input_type);
                 auto third = instruction.x86_evex_broadcast
                     ? retag_expr(operands[2], floating_type(instruction.vector_element_bits))
@@ -4142,6 +5796,53 @@ a64_unhandled:
                     std::holds_alternative<MemoryOperand>(instruction.operands[2]) ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
                 effect.register_writes = instruction.register_writes;
                 effect.result_type = result_type;
+                if (avx_float_arithmetic) {
+                    const auto status_type = integer_type(32);
+                    const auto old_mxcsr = reg_expr({RegisterBank::mxcsr, 0, 32, false});
+                    const bool merge = instruction.x86_evex && instruction.x86_opmask &&
+                                       !instruction.x86_opmask_zeroing;
+                    const auto fp_type = vector_type_for(true, vector_width);
+                    const auto active = std::make_shared<Expression>(Expression{fp_type,
+                        BinaryValue{"x86_" + operation_name(instruction.opcode) +
+                            "_rounded_fp_lanes_using_mxcsr_rounding", retag_expr(operands[1], fp_type),
+                            instruction.x86_evex_broadcast
+                                ? retag_expr(operands[2], floating_type(instruction.vector_element_bits))
+                                : retag_expr(operands[2], fp_type)}});
+                    ExpressionPtr destination_value = active;
+                    if (instruction.x86_opmask) {
+                        const auto mask = reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false});
+                        destination_value = std::make_shared<Expression>(Expression{fp_type,
+                            BinaryValue{merge ? "x86_evex_merge_active_fp_lanes_only" :
+                                               "x86_evex_zero_inactive_fp_lanes_using_mask",
+                                merge ? retag_expr(operands[0], fp_type) : mask, active}});
+                    }
+                    ExpressionPtr exception_inputs = active;
+                    if (instruction.x86_evex && instruction.x86_opmask) {
+                        exception_inputs = std::make_shared<Expression>(Expression{status_type,
+                            BinaryValue{"x86_evex_filter_fp_exception_flags_to_opmask_active_lanes",
+                                active, reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false})}});
+                    }
+                    const auto exceptions = std::make_shared<Expression>(Expression{status_type,
+                        BinaryValue{"x86_" + operation_name(instruction.opcode) +
+                            "_fp_exception_flags_ie_de_ze_oe_ue_pe_with_mxcsr_masks", exception_inputs, old_mxcsr}});
+                    const auto next_mxcsr = std::make_shared<Expression>(Expression{status_type,
+                        BinaryValue{"x86_mxcsr_after_avx_fp_arithmetic_sticky_status_ie_de_ze_oe_ue_pe",
+                            old_mxcsr, exceptions}});
+                    effect.register_output_values.reserve(effect.register_writes.size());
+                    for (const auto written : effect.register_writes) {
+                        if (destination && written == *destination) effect.register_output_values.push_back(destination_value);
+                        else if (written.bank == RegisterBank::mxcsr) effect.register_output_values.push_back(next_mxcsr);
+                        else if ((instruction.x86_evex && written.bank == RegisterBank::zmm) ||
+                                 (!instruction.x86_evex && written.bank == RegisterBank::ymm))
+                            effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                                vector_type_for(true, written.width), UnaryValue{
+                                    instruction.x86_evex ? "x86_evex_zero_upper_zmm_after_fp_arithmetic"
+                                                        : "x86_vex_zero_upper_ymm_after_fp_arithmetic", destination_value}}));
+                        else { effect.register_output_values.clear(); break; }
+                    }
+                    if (effect.register_output_values.size() != effect.register_writes.size())
+                        effect.register_output_values.clear();
+                }
                 return effect;
             }
         }
@@ -4185,20 +5886,86 @@ a64_unhandled:
         }
     }
 
+    if (x86 && (instruction.opcode == Opcode::cmpps || instruction.opcode == Opcode::cmppd ||
+                instruction.opcode == Opcode::cmpss || instruction.opcode == Opcode::cmpsd) &&
+        instruction.operands.size() == 3) {
+        const bool scalar = instruction.opcode == Opcode::cmpss || instruction.opcode == Opcode::cmpsd;
+        const auto lane_bits = static_cast<std::uint16_t>(instruction.opcode == Opcode::cmppd ||
+                                                           instruction.opcode == Opcode::cmpsd ? 64 : 32);
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *source_register = std::get_if<RegisterOperand>(&instruction.operands[1]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        const auto memory_width = scalar ? lane_bits : std::uint16_t{128};
+        if (destination && destination->bank == RegisterBank::xmm && destination->width == 128 &&
+            !destination->high_byte &&
+            ((source_register && source_register->bank == RegisterBank::xmm && source_register->width == 128 &&
+              !source_register->high_byte) || (memory && memory->data_width == memory_width)) &&
+            predicate && predicate->encoded_width == 8 && predicate->effective_width == 8 &&
+            !predicate->is_signed && predicate->value < 8 &&
+            (!instruction.vector_element_bits || instruction.vector_element_bits == lane_bits)) {
+            const auto input_type = vector_type(128, TypeKind::floating, lane_bits,
+                static_cast<std::uint8_t>(128 / lane_bits));
+            const auto result_type = vector_type(128, TypeKind::integer, lane_bits,
+                static_cast<std::uint8_t>(128 / lane_bits));
+            std::vector<ExpressionPtr> inputs{
+                retag_expr(operands[0], input_type),
+                scalar && memory ? retag_expr(operands[1], floating_type(lane_bits))
+                                 : retag_expr(operands[1], input_type),
+                retag_expr(operands[2], integer_type(8)),
+                reg_expr({RegisterBank::mxcsr, 0, 32, false})};
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_f" +
+                std::to_string(lane_bits) + (scalar ? "_scalar" : "x" +
+                    std::to_string(128 / lane_bits)) + "_predicate" +
+                std::to_string(predicate->value) + "_mxcsr_control_status", std::move(inputs),
+                memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = result_type;
+            const bool has_mxcsr_write = std::any_of(effect.register_writes.begin(), effect.register_writes.end(),
+                [](RegisterOperand reg) { return reg.bank == RegisterBank::mxcsr; });
+            if (has_mxcsr_write && std::find(effect.register_writes.begin(), effect.register_writes.end(),
+                    *destination) != effect.register_writes.end()) {
+                const auto compare_inputs = std::make_shared<Expression>(Expression{
+                    vector_type(128, TypeKind::integer, 8, 16),
+                    BinaryValue{"x86_sse_compare_ie_de_inputs_predicate" + std::to_string(predicate->value),
+                        retag_expr(operands[0], input_type),
+                        scalar && memory ? retag_expr(operands[1], floating_type(lane_bits))
+                                         : retag_expr(operands[1], input_type)}});
+                for (const auto written : effect.register_writes) {
+                    if (written == *destination)
+                        effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                            result_type, UnaryValue{"x86_sse_compare_result", compare_inputs}}));
+                    else if (written.bank == RegisterBank::mxcsr)
+                        effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                            integer_type(32), BinaryValue{"x86_mxcsr_after_sse_compare_sticky_ie_de",
+                                reg_expr(written), compare_inputs}}));
+                    else {
+                        effect.register_output_values.clear();
+                        break;
+                    }
+                }
+            }
+            return effect;
+        }
+    }
+
     const auto packed_lane_bits = [](Opcode opcode) -> std::uint16_t {
         switch (opcode) {
         case Opcode::paddb: case Opcode::psubb: case Opcode::paddsb: case Opcode::paddusb:
         case Opcode::psubsb: case Opcode::psubusb: case Opcode::pcmpeqb: case Opcode::pcmpgtb:
-        case Opcode::pminub: case Opcode::pmaxub: case Opcode::pavgb: case Opcode::pshufb: return 8;
+        case Opcode::pminub: case Opcode::pmaxub: case Opcode::pavgb: case Opcode::pshufb:
+        case Opcode::pabsb: return 8;
         case Opcode::paddw: case Opcode::psubw: case Opcode::paddsw: case Opcode::paddusw:
         case Opcode::psubsw: case Opcode::psubusw: case Opcode::pcmpeqw: case Opcode::pcmpgtw:
         case Opcode::psllw: case Opcode::psrlw: case Opcode::psraw: case Opcode::pmullw:
         case Opcode::pmulhw: case Opcode::pmulhuw: case Opcode::pminsw: case Opcode::pmaxsw: case Opcode::pavgw:
-        case Opcode::phaddw: case Opcode::phaddsw: case Opcode::phsubw: case Opcode::phsubsw: return 16;
+        case Opcode::phaddw: case Opcode::phaddsw: case Opcode::phsubw: case Opcode::phsubsw:
+        case Opcode::pabsw: return 16;
         case Opcode::paddd: case Opcode::psubd: case Opcode::pcmpeqd: case Opcode::pcmpgtd:
         case Opcode::pslld: case Opcode::psrld: case Opcode::psrad: case Opcode::pmaddwd:
-        case Opcode::phaddd: case Opcode::phsubd: return 32;
-        case Opcode::paddq: case Opcode::psubq: case Opcode::psllq: case Opcode::psrlq:
+        case Opcode::phaddd: case Opcode::phsubd: case Opcode::pabsd: return 32;
+        case Opcode::paddq: case Opcode::psubq: case Opcode::psllq: case Opcode::psrlq: case Opcode::psadbw:
+        case Opcode::pcmpgtq:
         case Opcode::pmuludq: return 64;
         default: return 0;
         }
@@ -4213,11 +5980,13 @@ a64_unhandled:
         case Opcode::psllw: case Opcode::pslld: case Opcode::psllq: case Opcode::psrlw: case Opcode::psrld:
         case Opcode::psrlq: case Opcode::psraw: case Opcode::psrad:
         case Opcode::pcmpeqb: case Opcode::pcmpeqw: case Opcode::pcmpeqd:
-        case Opcode::pcmpgtb: case Opcode::pcmpgtw: case Opcode::pcmpgtd:
+        case Opcode::pcmpgtb: case Opcode::pcmpgtw: case Opcode::pcmpgtd: case Opcode::pcmpgtq:
         case Opcode::pmullw: case Opcode::pmulhw: case Opcode::pmulhuw: case Opcode::pmuludq:
         case Opcode::pmaddwd: case Opcode::pminub: case Opcode::pmaxub: case Opcode::pminsw:
-        case Opcode::pmaxsw: case Opcode::pavgb: case Opcode::pavgw: case Opcode::phaddw: case Opcode::phaddd: case Opcode::phaddsw:
-        case Opcode::phsubw: case Opcode::phsubd: case Opcode::phsubsw: case Opcode::pshufb: return true;
+        case Opcode::pmaxsw: case Opcode::pavgb: case Opcode::pavgw: case Opcode::psadbw: case Opcode::phaddw: case Opcode::phaddd: case Opcode::phaddsw:
+        case Opcode::phsubw: case Opcode::phsubd: case Opcode::phsubsw: case Opcode::pshufb:
+        case Opcode::pabsb: case Opcode::pabsw: case Opcode::pabsd:
+        case Opcode::pslldq: case Opcode::psrldq: return true;
         default: return false;
         }
     };
@@ -4257,7 +6026,8 @@ a64_unhandled:
             (source && source->bank == RegisterBank::xmm && source->width == 128);
         const bool immediate_packed_shift = instruction.opcode == Opcode::psllw || instruction.opcode == Opcode::pslld ||
             instruction.opcode == Opcode::psllq || instruction.opcode == Opcode::psrlw || instruction.opcode == Opcode::psrld ||
-            instruction.opcode == Opcode::psrlq || instruction.opcode == Opcode::psraw || instruction.opcode == Opcode::psrad;
+            instruction.opcode == Opcode::psrlq || instruction.opcode == Opcode::psraw || instruction.opcode == Opcode::psrad ||
+            instruction.opcode == Opcode::pslldq || instruction.opcode == Opcode::psrldq;
         const auto *packed_shift_count = std::get_if<ImmediateOperand>(&instruction.operands[1]);
         const bool immediate_shift_ok = immediate_packed_shift && packed_shift_count &&
             packed_shift_count->encoded_width == 8 && packed_shift_count->effective_width == 8 && !packed_shift_count->is_signed;
@@ -4269,6 +6039,7 @@ a64_unhandled:
                 instruction.opcode == Opcode::phaddsw || instruction.opcode == Opcode::phsubsw;
             const bool signed_result = signed_saturating || instruction.opcode == Opcode::pcmpgtb ||
                 instruction.opcode == Opcode::pcmpgtw || instruction.opcode == Opcode::pcmpgtd ||
+                instruction.opcode == Opcode::pcmpgtq ||
                 instruction.opcode == Opcode::pmulhw || instruction.opcode == Opcode::pmaddwd ||
                 instruction.opcode == Opcode::pminsw || instruction.opcode == Opcode::pmaxsw ||
                 instruction.opcode == Opcode::phaddw || instruction.opcode == Opcode::phaddd ||
@@ -4292,6 +6063,7 @@ a64_unhandled:
             std::vector<ExpressionPtr> typed_operands;
             const bool signed_lanes = signed_saturating || instruction.opcode == Opcode::pcmpgtb ||
                 instruction.opcode == Opcode::pcmpgtw || instruction.opcode == Opcode::pcmpgtd ||
+                instruction.opcode == Opcode::pcmpgtq ||
                 instruction.opcode == Opcode::pmulhw || instruction.opcode == Opcode::pmaddwd ||
                 instruction.opcode == Opcode::pminsw || instruction.opcode == Opcode::pmaxsw ||
                 instruction.opcode == Opcode::phaddw || instruction.opcode == Opcode::phaddd ||
@@ -4304,6 +6076,28 @@ a64_unhandled:
                 operand_type = vector_type(128, TypeKind::integer, 16, 8, true);
             else if (instruction.opcode == Opcode::pmuludq)
                 operand_type = vector_type(128, TypeKind::integer, 32, 4, false);
+            const bool signed_absolute = instruction.opcode == Opcode::pabsb ||
+                instruction.opcode == Opcode::pabsw || instruction.opcode == Opcode::pabsd;
+            if (signed_absolute && destination && !destination_memory && source_ok &&
+                !x86_writes_flags(instruction)) {
+                const auto input_type = vector_type(128, TypeKind::integer, result_type.element_bits,
+                    result_type.lanes, true);
+                auto input = retag_expr(operands[1], input_type);
+                auto output = std::make_shared<Expression>(Expression{input_type,
+                    UnaryValue{"abs_signed_i" + std::to_string(result_type.element_bits) + "x" +
+                        std::to_string(result_type.lanes) + "_mod", input}});
+                Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_i" +
+                    std::to_string(result_type.element_bits) + "x" + std::to_string(result_type.lanes),
+                    {input}, source_memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = instruction.register_writes;
+                effect.result_type = input_type;
+                for (const auto written : effect.register_writes) {
+                    if (written == *destination) effect.register_output_values.push_back(output);
+                    else return Intrinsic{"x86_" + operation_name(instruction.opcode) +
+                        "_unmodeled_output", {input}, IntrinsicMemoryEffect::unknown};
+                }
+                if (effect.register_output_values.size() == effect.register_writes.size()) return effect;
+            }
             if (x86_scalar_arithmetic && destination) {
                 typed_operands.push_back(retag_expr(reg_expr(*destination), result_type));
                 const auto scalar_type = floating_type(scalar_bits);
@@ -4338,13 +6132,44 @@ a64_unhandled:
             effect.register_writes = instruction.register_writes;
             if (destination && !x86_scalar_move) effect.result_type = result_type;
             else if (destination && x86_scalar_move) effect.result_type = result_type;
+            if (x86_scalar_arithmetic && destination) {
+                const auto scalar_type = floating_type(scalar_bits);
+                const auto old_destination = retag_expr(reg_expr(*destination), result_type);
+                const auto source_value = effect.operands.size() >= 2 ? effect.operands[1] : ExpressionPtr{};
+                if (source_value) {
+                    const auto rounded = std::make_shared<Expression>(Expression{scalar_type,
+                        BinaryValue{"x86_" + operation_name(instruction.opcode) +
+                            "_rounded_scalar_fp_using_mxcsr_rounding", source_value,
+                            reg_expr({RegisterBank::mxcsr, 0, 32, false})}});
+                    const auto output = std::make_shared<Expression>(Expression{result_type,
+                        BinaryValue{"x86_" + operation_name(instruction.opcode) +
+                            "_scalar_result_preserve_upper_xmm_lanes", old_destination, rounded}});
+                    const auto old_mxcsr = reg_expr({RegisterBank::mxcsr, 0, 32, false});
+                    const auto exceptions = std::make_shared<Expression>(Expression{integer_type(32),
+                        BinaryValue{"x86_" + operation_name(instruction.opcode) +
+                            "_scalar_fp_exception_flags_ie_de_ze_oe_ue_pe_with_mxcsr_masks", rounded, old_mxcsr}});
+                    const auto next_mxcsr = std::make_shared<Expression>(Expression{integer_type(32),
+                        BinaryValue{"x86_mxcsr_after_sse_scalar_arithmetic_sticky_status_ie_de_ze_oe_ue_pe",
+                            old_mxcsr, exceptions}});
+                    for (const auto written : effect.register_writes) {
+                        if (written == *destination) effect.register_output_values.push_back(output);
+                        else if (written.bank == RegisterBank::mxcsr) effect.register_output_values.push_back(next_mxcsr);
+                        else { effect.register_output_values.clear(); break; }
+                    }
+                    if (effect.register_output_values.size() != effect.register_writes.size())
+                        effect.register_output_values.clear();
+                }
+            }
             return effect;
         }
     }
     const bool x86_shift_rotate = instruction.opcode == Opcode::rol || instruction.opcode == Opcode::ror ||
         instruction.opcode == Opcode::rcl || instruction.opcode == Opcode::rcr ||
         instruction.opcode == Opcode::shl || instruction.opcode == Opcode::shr || instruction.opcode == Opcode::sar;
-    const bool x86_bmi2 = instruction.opcode == Opcode::bzhi || instruction.opcode == Opcode::mulx ||
+    const bool x86_bmi1 = instruction.opcode == Opcode::andn || instruction.opcode == Opcode::bextr ||
+        instruction.opcode == Opcode::blsi || instruction.opcode == Opcode::blsmsk ||
+        instruction.opcode == Opcode::blsr;
+    const bool x86_bmi = x86_bmi1 || instruction.opcode == Opcode::bzhi || instruction.opcode == Opcode::mulx ||
         instruction.opcode == Opcode::pdep || instruction.opcode == Opcode::pext ||
         instruction.opcode == Opcode::rorx || instruction.opcode == Opcode::sarx ||
         instruction.opcode == Opcode::shlx || instruction.opcode == Opcode::shrx;
@@ -4360,10 +6185,14 @@ a64_unhandled:
         effect.register_writes = instruction.register_writes;
         return effect;
     }
-    if (x86 && x86_bmi2 && !operands.empty()) {
+    if (x86 && x86_bmi && !operands.empty()) {
         // Preserve the architecture-specific bit operation and its precise register effects
         // as an intrinsic until the C-like expression model grows these operations.
         auto intrinsic_operands = operands;
+        // BMI1 destinations are pure outputs. Keeping the printed destination
+        // among intrinsic inputs would invent an incoming SSA dependency.
+        if (x86_bmi1)
+            intrinsic_operands.erase(intrinsic_operands.begin());
         if (instruction.opcode == Opcode::mulx) {
             const auto implicit_rdx = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
                 [](RegisterOperand reg) { return reg.bank == RegisterBank::gpr && reg.index == 2; });
@@ -4413,6 +6242,85 @@ a64_unhandled:
             }
         }
     }
+    const bool x86_register_bit_test = instruction.opcode == Opcode::bt || instruction.opcode == Opcode::bts ||
+        instruction.opcode == Opcode::btr || instruction.opcode == Opcode::btc;
+    if (x86 && x86_register_bit_test && instruction.operands.size() == 2 &&
+        instruction.access.size() == 2 && !is_memory(instruction.operands[0]) &&
+        !is_memory(instruction.operands[1]) && !instruction.memory_read && !instruction.memory_write &&
+        !instruction.lock_prefix && instruction.flow == FlowKind::fallthrough) {
+        const auto destination = as_register(instruction.operands[0]);
+        const auto *index_register = std::get_if<RegisterOperand>(&instruction.operands[1]);
+        const auto *index_immediate = std::get_if<ImmediateOperand>(&instruction.operands[1]);
+        const bool modifies = instruction.opcode != Opcode::bt;
+        const auto flags_read = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        const auto flags_write = std::find_if(instruction.register_writes.begin(), instruction.register_writes.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        if (destination && destination->bank == RegisterBank::gpr &&
+            (destination->width == 16 || destination->width == 32 || destination->width == 64) &&
+            instruction.access[0] == (modifies ? OperandAccess::read_write : OperandAccess::read) &&
+            instruction.access[1] == OperandAccess::read &&
+            ((index_register && index_register->bank == RegisterBank::gpr &&
+              index_register->width == destination->width) ||
+             (index_immediate && index_immediate->effective_width == 8 &&
+              index_immediate->encoded_width == 8 && !index_immediate->is_signed)) &&
+            flags_read != instruction.register_reads.end() && flags_write != instruction.register_writes.end() &&
+            (flags_write->width == 16 || flags_write->width == 32 || flags_write->width == 64)) {
+            const auto width = destination->width;
+            const auto index_mask = static_cast<std::uint64_t>(width - 1);
+            ExpressionPtr bit_index = index_immediate
+                ? constant_expr(index_immediate->value & index_mask, width)
+                : std::make_shared<Expression>(Expression{integer_type(width), BinaryValue{"and",
+                    retag_expr(operands[1], integer_type(width)), constant_expr(index_mask, width)}});
+            const auto value = retag_expr(operands[0], integer_type(width));
+            auto tested = boolean_binary("bit_extract", value, bit_index);
+            const auto bit_value = std::make_shared<Expression>(Expression{integer_type(width),
+                UnaryValue{"zext", tested}});
+            const auto bit_mask = std::make_shared<Expression>(Expression{integer_type(width),
+                BinaryValue{"shl", constant_expr(1, width), bit_index}});
+            ExpressionPtr updated_value = value;
+            if (instruction.opcode == Opcode::bts)
+                updated_value = std::make_shared<Expression>(Expression{integer_type(width),
+                    BinaryValue{"or", value, bit_mask}});
+            else if (instruction.opcode == Opcode::btr)
+                updated_value = std::make_shared<Expression>(Expression{integer_type(width),
+                    BinaryValue{"and", value, std::make_shared<Expression>(Expression{integer_type(width),
+                        UnaryValue{"not", bit_mask}})}});
+            else if (instruction.opcode == Opcode::btc)
+                updated_value = std::make_shared<Expression>(Expression{integer_type(width),
+                    BinaryValue{"xor", value, bit_mask}});
+
+            constexpr std::uint64_t arithmetic_flags = (UINT64_C(1) << 0) | (UINT64_C(1) << 2) |
+                (UINT64_C(1) << 4) | (UINT64_C(1) << 6) | (UINT64_C(1) << 7) | (UINT64_C(1) << 11);
+            constexpr std::uint64_t carry_flag = UINT64_C(1) << 0;
+            const auto flags_width = flags_write->width;
+            auto updated_flags = std::make_shared<Expression>(Expression{integer_type(flags_width),
+                BinaryValue{"and", reg_expr(*flags_read),
+                    constant_expr(~arithmetic_flags, flags_width)}});
+            auto undefined = std::make_shared<Expression>(Expression{integer_type(flags_width),
+                BinaryValue{"and", unknown_expr("x86_" + operation_name(instruction.opcode) +
+                    "_undefined_flags", flags_width), constant_expr(arithmetic_flags & ~carry_flag, flags_width)}});
+            updated_flags = std::make_shared<Expression>(Expression{integer_type(flags_width),
+                BinaryValue{"or", updated_flags, undefined}});
+            auto carry = std::make_shared<Expression>(Expression{integer_type(flags_width),
+                UnaryValue{"zext", tested}});
+            updated_flags = std::make_shared<Expression>(Expression{integer_type(flags_width),
+                BinaryValue{"or", updated_flags, carry}});
+
+            std::vector<ExpressionPtr> inputs{value, bit_index};
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_i" + std::to_string(width),
+                std::move(inputs), IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            if (modifies) effect.result_type = integer_type(width);
+            for (const auto written : effect.register_writes) {
+                if (modifies && written == *destination) effect.register_output_values.push_back(updated_value);
+                else if (written == *flags_write) effect.register_output_values.push_back(updated_flags);
+                else return Intrinsic{"x86_" + operation_name(instruction.opcode) +
+                    "_unmodeled_output", {value, bit_index}, IntrinsicMemoryEffect::unknown};
+            }
+            if (effect.register_output_values.size() == effect.register_writes.size()) return effect;
+        }
+    }
     const bool x86_bit_operation = instruction.opcode == Opcode::bt || instruction.opcode == Opcode::bts ||
         instruction.opcode == Opcode::btr || instruction.opcode == Opcode::btc ||
         instruction.opcode == Opcode::bsf || instruction.opcode == Opcode::bsr ||
@@ -4436,8 +6344,59 @@ a64_unhandled:
                          destination_memory ? IntrinsicMemoryEffect::unknown : IntrinsicMemoryEffect::none};
         effect.register_writes = instruction.register_writes;
         if (!destination_memory) {
-            if (const auto destination = as_register(instruction.operands[0]))
+            if (const auto destination = as_register(instruction.operands[0])) {
                 effect.result_type = integer_type(destination->width);
+                const auto *count = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+                const auto *source_register = std::get_if<RegisterOperand>(&instruction.operands[1]);
+                const auto width = destination->width;
+                if (destination->bank == RegisterBank::gpr && count &&
+                    (width == 16 || width == 32 || width == 64) &&
+                    count->effective_width == 8 && source_register &&
+                    source_register->bank == RegisterBank::gpr && source_register->width == width) {
+                    const unsigned count_mask = width == 64 ? 0x3fU : 0x1fU;
+                    const unsigned amount = static_cast<unsigned>(count->value) & count_mask;
+                    if (amount <= width) {
+                        auto value = amount == 0 ? retag_expr(operands[0], integer_type(width))
+                                                 : amount == width
+                            ? retag_expr(operands[1], integer_type(width))
+                            : [&] {
+                                const auto fixed_shift = [width](std::string operation,
+                                                                ExpressionPtr source,
+                                                                unsigned shift) {
+                                    return std::make_shared<Expression>(Expression{
+                                        integer_type(width), BinaryValue{std::move(operation), std::move(source),
+                                            constant_expr(shift, width)}});
+                                };
+                                auto destination_part = fixed_shift(
+                                    instruction.opcode == Opcode::shld ? "shl" : "shr",
+                                    retag_expr(operands[0], integer_type(width)), amount);
+                                auto source_part = fixed_shift(
+                                    instruction.opcode == Opcode::shld ? "shr" : "shl",
+                                    retag_expr(operands[1], integer_type(width)), width - amount);
+                                return std::make_shared<Expression>(Expression{
+                                    integer_type(width), BinaryValue{"or", std::move(destination_part),
+                                        std::move(source_part)}});
+                            }();
+                        effect.register_output_values.reserve(effect.register_writes.size());
+                        for (const auto written : effect.register_writes) {
+                            if (written == *destination) {
+                                effect.register_output_values.push_back(value);
+                            } else if (written.bank == RegisterBank::flags && amount == 0) {
+                                const auto incoming_flags = std::find_if(instruction.register_reads.begin(),
+                                    instruction.register_reads.end(), [](RegisterOperand reg) {
+                                        return reg.bank == RegisterBank::flags;
+                                    });
+                                effect.register_output_values.push_back(incoming_flags == instruction.register_reads.end()
+                                    ? unknown_expr("x86_flags_after_zero_count_double_shift", written.width)
+                                    : reg_expr(*incoming_flags));
+                            } else {
+                                effect.register_output_values.push_back(
+                                    unknown_expr("x86_flags_after_double_shift", written.width));
+                            }
+                        }
+                    }
+                }
+            }
         }
         return effect;
     }
@@ -4652,7 +6611,7 @@ std::string address_text(const MemoryValue &memory) {
     return out.str();
 }
 std::optional<std::string> typed_member_access(const MemoryValue &memory) {
-    if (!memory.base || memory.index || memory.absolute || memory.displacement < 0 ||
+    if (!memory.base || memory.absolute || memory.displacement < 0 ||
         !memory.type.bits || memory.type.bits % 8) return {};
     const auto *base_type = detail::expression_register_type(*memory.base, memory.base_version);
     if (!base_type || !*base_type) return {};
@@ -4669,8 +6628,13 @@ std::optional<std::string> typed_member_access(const MemoryValue &memory) {
 
     const auto access_bytes = static_cast<std::uint64_t>(memory.type.bits / 8);
     const auto address_offset = static_cast<std::uint64_t>(memory.displacement);
+    if (memory.index) {
+        if (!memory.index_add || !memory.index_shift.empty() || memory.index_shift_amount ||
+            !memory.index_extend.empty() || !memory.scale) return {};
+    }
     std::optional<std::string> result;
     for (const auto &member : object->members()) {
+        if (memory.index) break;
         if (!member.has_fixed_offset() || !member.type || member.name.empty() || address_offset < member.offset)
             continue;
         const auto relative = address_offset - member.offset;
@@ -4718,7 +6682,8 @@ std::optional<std::string> typed_member_access(const MemoryValue &memory) {
         return true;
     };
     const auto descend = [&](const types::TypePtr &input, std::uint64_t offset,
-                             const std::string &path, unsigned depth, auto &&self) -> void {
+                             const std::string &path, unsigned depth, bool dynamic_index_used,
+                             auto &&self) -> void {
         if (++work > 4096 || depth > 8) return;
         const auto type = unqualify(input);
         if (!type || !type->size() || offset > *type->size() ||
@@ -4730,6 +6695,18 @@ std::optional<std::string> typed_member_access(const MemoryValue &memory) {
                 type->count() * *element->size() != *type->size()) return;
             const auto index = offset / *element->size();
             const auto within = offset % *element->size();
+            if (memory.index && !dynamic_index_used) {
+                if (offset >= *element->size() || memory.scale != *element->size()) return;
+                const auto element_path = path + "[" +
+                    register_name(*memory.index, memory.index_version) + "]";
+                if (within == 0 && access_bytes == *element->size()) {
+                    nested_results.push_back(element_path);
+                    return;
+                }
+                if (element->kind() == types::Kind::structure || element->kind() == types::Kind::array)
+                    self(element, within, element_path, depth + 1, true, self);
+                return;
+            }
             if (index >= type->count()) return;
             const auto element_path = path + "[" + std::to_string(index) + "]";
             if (within == 0 && access_bytes == *element->size()) {
@@ -4737,7 +6714,7 @@ std::optional<std::string> typed_member_access(const MemoryValue &memory) {
                 return;
             }
             if (element->kind() == types::Kind::structure || element->kind() == types::Kind::array)
-                self(element, within, element_path, depth + 1, self);
+                self(element, within, element_path, depth + 1, dynamic_index_used, self);
             return;
         }
         if (type->kind() != types::Kind::structure || !valid_struct_layout(type)) return;
@@ -4755,10 +6732,10 @@ std::optional<std::string> typed_member_access(const MemoryValue &memory) {
                 continue;
             }
             if (field_type->kind() == types::Kind::structure || field_type->kind() == types::Kind::array)
-                self(field_type, relative, field_path, depth + 1, self);
+                self(field_type, relative, field_path, depth + 1, dynamic_index_used, self);
         }
     };
-    descend(object, address_offset, register_name(*memory.base, memory.base_version), 0, descend);
+    descend(object, address_offset, register_name(*memory.base, memory.base_version), 0, false, descend);
     if (nested_results.size() != 1) return {};
     return nested_results.front();
 }
@@ -4786,6 +6763,9 @@ std::string expression_text(const Expression &expression) {
             return "*[(" + address_text(value) + ")]";
         } else if constexpr (std::is_same_v<T, UnaryValue>) {
             const auto operand = expression_text(*value.operand);
+            constexpr std::string_view wasm_ref_func_prefix = "wasm_ref_func_";
+            if (value.operation.rfind(wasm_ref_func_prefix, 0) == 0)
+                return "wasm_function_ref(" + value.operation.substr(wasm_ref_func_prefix.size()) + ")";
             if (value.operation == "x87_fchs") return "x87_fchs_exact(" + operand + ")";
             if (value.operation == "x87_fabs") return "x87_fabs_exact(" + operand + ")";
             if (value.operation == "carry_flag") return "carry_flag(" + operand + ")";
@@ -4800,6 +6780,15 @@ std::string expression_text(const Expression &expression) {
             if (value.operation == "bitnot") return "~(" + operand + ")";
             return value.operation + "(" + operand + ")";
         } else if constexpr (std::is_same_v<T, BinaryValue>) {
+            if (value.operation.rfind("x86_mul_full_", 0) == 0)
+                return value.operation + "(" + expression_text(*value.left) + ", " +
+                       expression_text(*value.right) + ")";
+            if (value.operation == "jvm_lcmp" || value.operation == "jvm_fcmpl_nan_minus_one" ||
+                value.operation == "jvm_fcmpg_nan_plus_one" || value.operation == "jvm_dcmpl_nan_minus_one" ||
+                value.operation == "jvm_dcmpg_nan_plus_one" ||
+                value.operation == "x87_pending_unmasked_exception")
+                return value.operation + "(" + expression_text(*value.left) + ", " +
+                       expression_text(*value.right) + ")";
             if (value.operation == "a64_udiv" || value.operation == "a64_sdiv" ||
                 value.operation.rfind("wasm_", 0) == 0 || value.operation.rfind("ppc_fcmp_", 0) == 0 ||
                 value.operation.starts_with("fcvt."))
@@ -5310,6 +7299,14 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             state->registers.clear();
             return state;
         }
+        if ((instruction.opcode == Opcode::rdrand || instruction.opcode == Opcode::rdseed) &&
+            evaluate_x86_random_instruction(instruction, 0, false, 0)) {
+            PendingX86Compare pending;
+            pending.raw_x86_flags = true;
+            pending.operation = instruction.opcode == Opcode::rdrand ? "rdrand" : "rdseed";
+            pending.producer_instruction_id = instruction_id;
+            return std::optional<PendingX86Compare>{std::move(pending)};
+        }
         if (is_x86_flag_producer(instruction) || is_x86_unary_flag_producer(instruction)) {
             PendingX86Compare pending;
             pending.test = instruction.opcode == Opcode::test;
@@ -5703,6 +7700,15 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             }
             const bool x87_instruction = (decoded.context.architecture == Architecture::x86 ||
                 decoded.context.architecture == Architecture::x86_64) && decoded.opcode == Opcode::x87;
+            if (x87_instruction && decoded.x87_waiting) {
+                const RegisterOperand fsw{RegisterBank::x87_status, 0, 16, false};
+                const RegisterOperand fcw{RegisterBank::x87_control, 0, 16, false};
+                const auto condition = std::make_shared<Expression>(Expression{
+                    ValueType{TypeKind::boolean, 1, false},
+                    BinaryValue{"x87_pending_unmasked_exception", reg_expr(fsw), reg_expr(fcw)}});
+                block.trap_edges.push_back({decoded.address, TrapEdgeKind::may_trap,
+                    "pending unmasked x87 exception before " + decoded.mnemonic_override, condition});
+            }
             if (auto *intrinsic = std::get_if<Intrinsic>(&statement); intrinsic && x87_instruction)
                 intrinsic->x87_stack_state = x87_stack_state;
             const auto x87_post_state = transfer_x87_stack_state(x87_stack_state, decoded);
@@ -5736,28 +7742,114 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
                     if (!condition && decoded.condition < 14)
                         condition = a64_nzcv_predicate(decoded.condition,
                             reg_expr({RegisterBank::arm_flags, 0, 4, false}));
-                    auto false_value = operand_expr(decoded.operands[2]);
-                    if (decoded.opcode == Opcode::a64_csinc)
-                        false_value = std::make_shared<Expression>(Expression{integer_type(destination->width),
-                            BinaryValue{"add", false_value, constant_expr(1, destination->width)}});
-                    else if (decoded.opcode == Opcode::a64_csinv)
-                        false_value = std::make_shared<Expression>(Expression{integer_type(destination->width),
-                            UnaryValue{"bitnot", false_value}});
-                    else if (decoded.opcode == Opcode::a64_csneg)
-                        false_value = std::make_shared<Expression>(Expression{integer_type(destination->width),
-                            BinaryValue{"sub", constant_expr(0, destination->width), false_value}});
-                    if (condition) {
-                        auto selected = std::make_shared<Expression>(Expression{integer_type(destination->width),
-                            BinaryValue{"select_if", condition,
-                                std::make_shared<Expression>(Expression{integer_type(destination->width),
-                                    BinaryValue{"pair", operand_expr(decoded.operands[1]), false_value}})}});
+                    const bool zero_source_alias = when_true->bank == RegisterBank::arm64_zero &&
+                        when_true->index == 31 && when_false->bank == RegisterBank::arm64_zero &&
+                        when_false->index == 31;
+                    if (condition && zero_source_alias &&
+                        (decoded.opcode == Opcode::a64_csinc || decoded.opcode == Opcode::a64_csinv)) {
+                        // CSET/CSETM are aliases for CSINC/CSINV with both
+                        // sources set to XZR/WZR. Keep their Boolean intent
+                        // explicit instead of leaving a select over constants.
+                        auto predicate = boolean_unary("not", condition);
+                        const auto operation = decoded.opcode == Opcode::a64_csinc ? "zext" : "sext";
+                        auto value = std::make_shared<Expression>(Expression{
+                            integer_type(destination->width), UnaryValue{operation, std::move(predicate)}});
                         statement = destination->bank == RegisterBank::arm64_zero
                             ? Statement{Intrinsic{"nop", {}, IntrinsicMemoryEffect::none}}
-                            : Statement{Assign{*destination, std::move(selected)}};
+                            : Statement{Assign{*destination, std::move(value)}};
+                    } else {
+                        auto false_value = operand_expr(decoded.operands[2]);
+                        if (decoded.opcode == Opcode::a64_csinc)
+                            false_value = std::make_shared<Expression>(Expression{integer_type(destination->width),
+                                BinaryValue{"add", false_value, constant_expr(1, destination->width)}});
+                        else if (decoded.opcode == Opcode::a64_csinv)
+                            false_value = std::make_shared<Expression>(Expression{integer_type(destination->width),
+                                UnaryValue{"bitnot", false_value}});
+                        else if (decoded.opcode == Opcode::a64_csneg)
+                            false_value = std::make_shared<Expression>(Expression{integer_type(destination->width),
+                                BinaryValue{"sub", constant_expr(0, destination->width), false_value}});
+                        if (condition) {
+                            auto selected = std::make_shared<Expression>(Expression{integer_type(destination->width),
+                                BinaryValue{"select_if", condition,
+                                    std::make_shared<Expression>(Expression{integer_type(destination->width),
+                                        BinaryValue{"pair", operand_expr(decoded.operands[1]), false_value}})}});
+                            statement = destination->bank == RegisterBank::arm64_zero
+                                ? Statement{Intrinsic{"nop", {}, IntrinsicMemoryEffect::none}}
+                                : Statement{Assign{*destination, std::move(selected)}};
+                        }
                     }
                 }
             }
             if (auto *branch = std::get_if<Branch>(&statement)) {
+                if (is_x86_context(decoded) && decoded.opcode == Opcode::x86_loop && decoded.x86_loop_condition &&
+                    decoded.flow == FlowKind::conditional_branch && decoded.direct_target &&
+                    decoded.operands.size() == 1 && decoded.access == std::vector<OperandAccess>{OperandAccess::address} &&
+                    (decoded.x86_loop_counter_width == 16 || decoded.x86_loop_counter_width == 32 ||
+                     (decoded.x86_loop_counter_width == 64 && decoded.context.mode == ExecutionMode::x86_64)) &&
+                    !decoded.memory_read && !decoded.memory_write) {
+                    const auto width = decoded.x86_loop_counter_width;
+                    const RegisterOperand counter{RegisterBank::gpr, 1, width, false};
+                    const auto has_register = [](const auto &registers, RegisterOperand reg) {
+                        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+                    };
+                    const bool decrements = *decoded.x86_loop_condition != X86LoopCondition::counter_zero;
+                    const bool tests_zero_flag = *decoded.x86_loop_condition == X86LoopCondition::counter_nonzero_and_zero ||
+                        *decoded.x86_loop_condition == X86LoopCondition::counter_nonzero_and_not_zero;
+                    const auto full_width = decoded.context.mode == ExecutionMode::x86_64 ? 64u :
+                        decoded.context.mode == ExecutionMode::x86_32 ? 32u : 16u;
+                    const bool has_wide_alias = decrements && width < full_width;
+                    const RegisterOperand full_counter{RegisterBank::gpr, 1,
+                        static_cast<std::uint16_t>(full_width), false};
+                    const auto flags = std::find_if(decoded.register_reads.begin(), decoded.register_reads.end(),
+                        [](RegisterOperand reg) { return reg.bank == RegisterBank::flags && reg.index == 0; });
+                    std::vector<RegisterOperand> expected_writes;
+                    if (decrements) {
+                        expected_writes.push_back(counter);
+                        if (has_wide_alias) expected_writes.push_back(full_counter);
+                    }
+                    const bool reads_wide_alias = has_wide_alias && width == 16;
+                    const bool valid = std::holds_alternative<RelativeOperand>(decoded.operands.front()) &&
+                        has_register(decoded.register_reads, counter) && decoded.register_writes == expected_writes &&
+                        (!reads_wide_alias || has_register(decoded.register_reads, full_counter)) &&
+                        decoded.register_reads.size() == (tests_zero_flag ? 2u : 1u) + (reads_wide_alias ? 1u : 0u) &&
+                        (tests_zero_flag ? flags != decoded.register_reads.end() && flags->width >= 12
+                                         : flags == decoded.register_reads.end());
+                    if (valid) {
+                        const auto old_counter = reg_expr(counter);
+                        ExpressionPtr count_after = old_counter;
+                        if (decrements) {
+                            count_after = std::make_shared<Expression>(Expression{integer_type(width),
+                                BinaryValue{"sub", old_counter, constant_expr(1, width)}});
+                            ppc_before.push_back(Assign{counter, count_after});
+                            if (has_wide_alias) {
+                                ExpressionPtr full_value;
+                                if (width == 32) {
+                                    full_value = std::make_shared<Expression>(Expression{integer_type(64),
+                                        UnaryValue{"zext32", count_after}});
+                                } else {
+                                    const auto mask = UINT64_MAX << width;
+                                    auto preserved = std::make_shared<Expression>(Expression{integer_type(full_width),
+                                        BinaryValue{"and", reg_expr(full_counter), constant_expr(mask, full_width)}});
+                                    auto low = std::make_shared<Expression>(Expression{integer_type(full_width),
+                                        UnaryValue{"zext", count_after}});
+                                    full_value = std::make_shared<Expression>(Expression{integer_type(full_width),
+                                        BinaryValue{"or", std::move(preserved), std::move(low)}});
+                                }
+                                ppc_before.push_back(Assign{full_counter, std::move(full_value)});
+                            }
+                        }
+                        auto predicate = boolean_binary(*decoded.x86_loop_condition == X86LoopCondition::counter_zero
+                                ? "eq" : "ne", count_after, constant_expr(0, width));
+                        if (tests_zero_flag) {
+                            auto zero_flag = x86_flags_predicate(X86Condition::equal, reg_expr(*flags));
+                            if (*decoded.x86_loop_condition == X86LoopCondition::counter_nonzero_and_not_zero)
+                                zero_flag = boolean_unary("not", std::move(zero_flag));
+                            predicate = boolean_binary("bool_and", std::move(predicate), std::move(zero_flag));
+                        }
+                        branch->predicate = std::move(predicate);
+                        branch->condition = "predicate";
+                    }
+                }
                 if (decoded.x86_condition && pending_x86_compare) {
                     if (pending_x86_compare->x87_sahf) {
                         const auto flags = std::find_if(decoded.register_reads.begin(), decoded.register_reads.end(),
@@ -6130,6 +8222,14 @@ std::string format_pseudocode(const LiftedFunction &function) {
                             out << register_name(statement.register_writes[i], version);
                         }
                         out << " */";
+                    }
+                    if (statement.memory_output) {
+                        const auto location = statement.memory_output->location_operand;
+                        const auto value = statement.memory_output->value_operand;
+                        if (location < statement.operands.size() && value < statement.operands.size() &&
+                            statement.operands[location] && statement.operands[value])
+                            out << " /* memory output: " << expression_text(*statement.operands[location])
+                                << " = " << expression_text(*statement.operands[value]) << " */";
                     }
                     out << ';';
                 }
@@ -7248,7 +9348,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
     };
     // A post-tested loop with an explicit preheader has an initial header-phi
     // edge as well as a recurrent edge. Prove the complete CFG before emitting
-    // either copy sequence; one disjoint body diamond or side return is allowed.
+    // either copy sequence. Sequential disjoint diamonds and guarded return
+    // trees share a single validated body spine and retain their actual edges.
     auto try_ssa_post_tested_loop = [&]() -> std::optional<StructuredPseudocode> {
         if (function.blocks.size() < 3 || function.blocks.size() > 1024) return {};
         std::map<std::uint64_t, std::set<std::uint64_t>> predecessors;
@@ -7287,18 +9388,30 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             const LiftedBlock *branch = nullptr, *join = nullptr;
             const Branch *condition = nullptr;
             std::vector<const LiftedBlock *> yes, no;
-            BlockId yes_tail{}, no_tail{};
+            std::vector<BlockId> yes_tails, no_tails;
+        };
+        struct ReturnNode {
+            const LiftedBlock *block = nullptr;
+            BlockId predecessor{};
+            const Branch *condition = nullptr;
+            std::optional<std::size_t> next, yes, no;
         };
         struct SideReturn {
             const LiftedBlock *branch = nullptr, *continuation = nullptr;
             const Branch *condition = nullptr;
             bool on_true = false;
-            std::vector<const LiftedBlock *> path;
+            std::vector<ReturnNode> tree;
         };
-        std::optional<BodyDiamond> diamond;
-        std::optional<SideReturn> side_return;
+        std::map<std::uint64_t, BodyDiamond> diamonds;
+        std::map<std::uint64_t, SideReturn> side_returns;
+        std::set<std::uint64_t> diamond_joins;
         std::vector<const LiftedBlock *> path;
         std::set<std::uint64_t> covered;
+        std::set<std::uint64_t> body_claimed;
+        // A terminal return may be reached by more than one guarded side arm,
+        // or by both a side arm and the ordinary loop exit. Count the shared
+        // CFG block once for coverage, and record every edge used by its SSA phis.
+        std::map<std::uint64_t, std::set<std::uint64_t>> terminal_return_sources;
         auto *current = entry;
         const Branch *condition = nullptr;
         while (current && covered.insert(current->id.value).second) {
@@ -7313,38 +9426,76 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 const bool yes_back = in_path(*condition->true_target);
                 const bool no_back = in_path(*condition->false_target);
                 if (yes_back != no_back) break;
-                if (yes_back || diamond || side_return) return {};
+                if (yes_back) return {};
 
-                const auto trace_return = [&](Address target)
-                    -> std::optional<std::vector<const LiftedBlock *>> {
-                    std::vector<const LiftedBlock *> result;
+                const auto trace_return = [&](Address target) -> std::optional<std::vector<ReturnNode>> {
+                    struct Pending {
+                        const LiftedBlock *block;
+                        BlockId predecessor;
+                        std::optional<std::size_t> parent;
+                        unsigned child; // 0: root, 1: linear, 2: true, 3: false
+                    };
+                    std::vector<ReturnNode> result;
                     std::set<std::uint64_t> seen;
-                    auto *cursor = find_block(target);
-                    auto predecessor = current->id;
-                    while (cursor && result.size() < 64 && seen.insert(cursor->id.value).second &&
-                           !covered.contains(cursor->id.value) &&
-                           predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor.value}) {
-                        result.push_back(cursor);
-                        if (has_only_terminal_return(*cursor)) return result;
-                        if (contains_return(*cursor) || terminal_conditional(*cursor)) return {};
-                        predecessor = cursor->id;
-                        cursor = linear_successor(*cursor);
+                    std::vector<Pending> pending{{find_block(target), current->id, std::nullopt, 0}};
+                    while (!pending.empty()) {
+                        const auto item = pending.back();
+                        pending.pop_back();
+                        const auto *cursor = item.block;
+                        if (!cursor || result.size() >= 64) return {};
+                        const bool terminal_return = has_only_terminal_return(*cursor);
+                        if (terminal_return) {
+                            if (!predecessors[cursor->id.value].contains(item.predecessor.value) ||
+                                (covered.contains(cursor->id.value) &&
+                                 !terminal_return_sources.contains(cursor->id.value))) return {};
+                        } else if (!seen.insert(cursor->id.value).second ||
+                                   covered.contains(cursor->id.value) ||
+                                   predecessors[cursor->id.value] !=
+                                       std::set<std::uint64_t>{item.predecessor.value}) return {};
+                        const auto index = result.size();
+                        result.push_back(ReturnNode{cursor, item.predecessor});
+                        if (item.parent) {
+                            auto &parent = result[*item.parent];
+                            if (item.child == 1) parent.next = index;
+                            else if (item.child == 2) parent.yes = index;
+                            else parent.no = index;
+                        }
+                        if (terminal_return) continue;
+                        if (contains_return(*cursor)) return {};
+                        if (const auto *branch = terminal_conditional(*cursor)) {
+                            if (branch->indirect_target) return {};
+                            result[index].condition = branch;
+                            pending.push_back({find_block(*branch->false_target), cursor->id, index, 3});
+                            pending.push_back({find_block(*branch->true_target), cursor->id, index, 2});
+                        } else {
+                            const auto *next = linear_successor(*cursor);
+                            if (!next) return {};
+                            pending.push_back({next, cursor->id, index, 1});
+                        }
                     }
-                    return {};
+                    return result;
                 };
                 const auto yes_return = trace_return(*condition->true_target);
                 const auto no_return = trace_return(*condition->false_target);
                 if (yes_return && no_return) return {};
                 if (yes_return || no_return) {
                     const bool on_true = yes_return.has_value();
-                    const auto &return_path = on_true ? *yes_return : *no_return;
+                    const auto &return_tree = on_true ? *yes_return : *no_return;
                     const auto *continuation = find_block(on_true ? *condition->false_target
                                                                  : *condition->true_target);
                     if (!continuation || covered.contains(continuation->id.value) ||
                         predecessors[continuation->id.value] !=
                             std::set<std::uint64_t>{current->id.value}) return {};
-                    for (const auto *block : return_path) covered.insert(block->id.value);
-                    side_return = SideReturn{current, continuation, condition, on_true, return_path};
+                    for (const auto &node : return_tree) {
+                        if (has_only_terminal_return(*node.block)) {
+                            if (!terminal_return_sources[node.block->id.value]
+                                     .insert(node.predecessor.value).second)
+                                return {};
+                        }
+                        covered.insert(node.block->id.value);
+                    }
+                    side_returns.emplace(current->id.value,
+                        SideReturn{current, continuation, condition, on_true, return_tree});
                     current = continuation;
                     condition = nullptr;
                     continue;
@@ -7353,41 +9504,104 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 struct Arm {
                     const LiftedBlock *join = nullptr;
                     std::vector<const LiftedBlock *> blocks;
-                    BlockId tail{};
+            std::vector<BlockId> tails;
                 };
-                const auto trace_arm = [&](Address target) -> std::optional<Arm> {
-                    Arm arm;
-                    auto *cursor = find_block(target);
-                    auto predecessor = current->id;
-                    std::set<std::uint64_t> seen;
-                    while (cursor && arm.blocks.size() < 64 &&
-                           predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor.value}) {
-                        if (covered.contains(cursor->id.value) || !seen.insert(cursor->id.value).second ||
-                            terminal_conditional(*cursor) || contains_return(*cursor)) return {};
-                        const auto *next = linear_successor(*cursor);
-                        if (!next) return {};
-                        arm.blocks.push_back(cursor);
-                        predecessor = cursor->id;
-                        cursor = next;
-                    }
-                    if (!cursor || covered.contains(cursor->id.value) || seen.contains(cursor->id.value)) return {};
+        std::function<std::optional<Arm>(const LiftedBlock *, Address, unsigned &, unsigned)> trace_arm;
+        trace_arm = [&](const LiftedBlock *branch, Address target, unsigned &budget,
+                        unsigned depth) -> std::optional<Arm> {
+            if (!branch || depth > 32) return {};
+            Arm arm;
+            auto *cursor = find_block(target);
+            auto predecessor = branch->id;
+            std::set<std::uint64_t> seen;
+            const auto claim = [&](std::uint64_t id) {
+                if (covered.contains(id) || !seen.insert(id).second || !body_claimed.insert(id).second)
+                    return false;
+                return true;
+            };
+            while (cursor) {
+                if (covered.contains(cursor->id.value) || seen.contains(cursor->id.value)) return {};
+                // A join belongs to the parent region. Return it with all of
+                // this arm's actual predecessor leaves so phi copies remain
+                // tied to the original CFG edges.
+                if (predecessors[cursor->id.value] != std::set<std::uint64_t>{predecessor.value}) {
+                    if (body_claimed.contains(cursor->id.value)) return {};
                     arm.join = cursor;
-                    arm.tail = predecessor;
+                    arm.tails = {predecessor};
+                    for (const auto *block : arm.blocks)
+                        if (!claim(block->id.value)) return {};
                     return arm;
-                };
-                const auto yes = trace_arm(*condition->true_target);
-                const auto no = trace_arm(*condition->false_target);
-                if (!yes || !no || yes->join != no->join || yes->tail == no->tail ||
-                    predecessors[yes->join->id.value] !=
-                        std::set<std::uint64_t>{yes->tail.value, no->tail.value}) return {};
+                }
+                if (const auto *nested = terminal_conditional(*cursor)) {
+                    if (nested->indirect_target || contains_return(*cursor) || budget >= 64 ||
+                        !claim(cursor->id.value)) return {};
+                    ++budget;
+                    arm.blocks.push_back(cursor);
+                    auto yes = trace_arm(cursor, *nested->true_target, budget, depth + 1);
+                    auto no = trace_arm(cursor, *nested->false_target, budget, depth + 1);
+                    if (!yes || !no || yes->join != no->join || yes->join == cursor) return {};
+                    std::set<std::uint64_t> leaf_ids;
+                    for (const auto tail : yes->tails)
+                        if (!leaf_ids.insert(tail.value).second) return {};
+                    for (const auto tail : no->tails)
+                        if (!leaf_ids.insert(tail.value).second) return {};
+                    std::set<std::uint64_t> arm_ids;
+                    for (const auto *block : yes->blocks)
+                        if (!arm_ids.insert(block->id.value).second || seen.contains(block->id.value)) return {};
+                    for (const auto *block : no->blocks)
+                        if (!arm_ids.insert(block->id.value).second || seen.contains(block->id.value)) return {};
+                    std::vector<std::uint64_t> all_tails;
+                    all_tails.reserve(leaf_ids.size());
+                    for (const auto tail : yes->tails) all_tails.push_back(tail.value);
+                    for (const auto tail : no->tails) all_tails.push_back(tail.value);
+                    std::set<std::uint64_t> expected_predecessors;
+                    for (const auto id : all_tails) expected_predecessors.insert(id);
+                    if (predecessors[yes->join->id.value] != expected_predecessors ||
+                        body_claimed.contains(yes->join->id.value)) return {};
+                    for (const auto *block : yes->blocks) body_claimed.insert(block->id.value);
+                    for (const auto *block : no->blocks) body_claimed.insert(block->id.value);
+                    const auto [it, inserted] = diamonds.emplace(cursor->id.value,
+                        BodyDiamond{cursor, yes->join, nested, yes->blocks, no->blocks,
+                                    yes->tails, no->tails});
+                    if (!inserted || it->second.branch != cursor) return {};
+                    diamond_joins.insert(yes->join->id.value);
+                    for (const auto *block : arm.blocks)
+                        if (!body_claimed.insert(block->id.value).second && block != cursor) return {};
+                    arm.join = yes->join;
+                    arm.tails.clear();
+                    for (const auto id : all_tails) arm.tails.push_back(BlockId{id});
+                    return arm;
+                }
+                if (contains_return(*cursor) || budget >= 64 || !claim(cursor->id.value)) return {};
+                const auto *next = linear_successor(*cursor);
+                if (!next) return {};
+                arm.blocks.push_back(cursor);
+                ++budget;
+                predecessor = cursor->id;
+                cursor = const_cast<LiftedBlock *>(next);
+            }
+            return {};
+        };
+                unsigned yes_budget = 0, no_budget = 0;
+                const auto yes = trace_arm(current, *condition->true_target, yes_budget, 0);
+                const auto no = trace_arm(current, *condition->false_target, no_budget, 0);
+                if (!yes || !no || yes->join != no->join) return {};
+                std::set<std::uint64_t> join_predecessors;
+                for (const auto tail : yes->tails)
+                    if (!join_predecessors.insert(tail.value).second) return {};
+                for (const auto tail : no->tails)
+                    if (!join_predecessors.insert(tail.value).second) return {};
+                if (predecessors[yes->join->id.value] != join_predecessors) return {};
                 std::set<std::uint64_t> arms;
                 for (const auto *block : yes->blocks)
                     if (!arms.insert(block->id.value).second) return {};
                 for (const auto *block : no->blocks)
                     if (!arms.insert(block->id.value).second) return {};
-                for (const auto id : arms) covered.insert(id);
-                diamond = BodyDiamond{current, yes->join, condition, yes->blocks, no->blocks,
-                                      yes->tail, no->tail};
+                for (const auto id : body_claimed) covered.insert(id);
+                diamonds.emplace(current->id.value,
+                    BodyDiamond{current, yes->join, condition, yes->blocks, no->blocks,
+                                yes->tails, no->tails});
+                diamond_joins.insert(yes->join->id.value);
                 current = yes->join;
                 condition = nullptr;
                 continue;
@@ -7408,36 +9622,56 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         if (header_position == path.begin()) return {}; // Require a real initial incoming edge.
         const auto *header = *header_position;
         const auto header_offset = static_cast<std::size_t>(header_position - path.begin());
-        if (diamond) {
-            const auto branch_position = std::find(path.begin(), path.end(), diamond->branch);
-            if (branch_position < header_position || branch_position == path.end() ||
-                branch_position + 1 == path.end() || *(branch_position + 1) != diamond->join) return {};
+        for (const auto &item : diamonds) {
+            const auto &diamond = item.second;
+            const auto branch_position = std::find(path.begin(), path.end(), diamond.branch);
+            if (branch_position != path.end()) {
+                if (branch_position < header_position || branch_position + 1 == path.end() ||
+                    *(branch_position + 1) != diamond.join) return {};
+            } else {
+                const auto join_position = std::find(path.begin(), path.end(), diamond.join);
+                if (!body_claimed.contains(diamond.branch->id.value) || join_position == path.end() ||
+                    join_position < header_position) return {};
+            }
         }
-        if (side_return) {
-            const auto branch_position = std::find(path.begin(), path.end(), side_return->branch);
+        for (const auto &item : side_returns) {
+            const auto &side_return = item.second;
+            const auto branch_position = std::find(path.begin(), path.end(), side_return.branch);
             if (branch_position < header_position || branch_position == path.end() ||
                 branch_position + 1 == path.end() ||
-                *(branch_position + 1) != side_return->continuation) return {};
+                *(branch_position + 1) != side_return.continuation) return {};
         }
         const auto *preheader = path[header_offset - 1];
         if (predecessors[header->id.value] != std::set<std::uint64_t>{preheader->id.value, latch->id.value}) return {};
         for (std::size_t i = 1; i < path.size(); ++i) {
-            if (i != header_offset && (!diamond || path[i] != diamond->join) &&
+            if (i != header_offset && !diamond_joins.contains(path[i]->id.value) &&
                 predecessors[path[i]->id.value] != std::set<std::uint64_t>{path[i - 1]->id.value}) return {};
         }
 
         std::vector<const LiftedBlock *> exit_path;
         current = find_block(loops_on_true ? *condition->false_target : *condition->true_target);
         auto expected_predecessor = latch->id.value;
-        while (current && exit_path.size() < 64 && covered.insert(current->id.value).second) {
-            if (predecessors[current->id.value] != std::set<std::uint64_t>{expected_predecessor}) return {};
+        while (current && exit_path.size() < 64) {
+            const bool terminal_return = has_only_terminal_return(*current);
+            if (terminal_return) {
+                if (!predecessors[current->id.value].contains(expected_predecessor) ||
+                    (covered.contains(current->id.value) &&
+                     !terminal_return_sources.contains(current->id.value)) ||
+                    !terminal_return_sources[current->id.value].insert(expected_predecessor).second)
+                    return {};
+            } else if (covered.contains(current->id.value) ||
+                       predecessors[current->id.value] !=
+                           std::set<std::uint64_t>{expected_predecessor}) return {};
+            covered.insert(current->id.value);
             exit_path.push_back(current);
-            if (has_only_terminal_return(*current)) break;
+            if (terminal_return) break;
             expected_predecessor = current->id.value;
             current = linear_successor(*current);
         }
         if (exit_path.empty() || !has_only_terminal_return(*exit_path.back()) ||
             covered.size() != function.blocks.size()) return {};
+        for (const auto &[id, sources] : terminal_return_sources)
+            if (sources != predecessors[id]) return {};
 
         std::size_t phi_input_count = 0;
         for (const auto &block : function.blocks) {
@@ -7477,41 +9711,79 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         }
         out << "    bool __hexlab_do_repeat;\n    do {\n";
         for (std::size_t i = header_offset; i < path.size(); ++i) {
-            if (side_return && path[i] == side_return->branch) {
+            if (const auto found = side_returns.find(path[i]->id.value); found != side_returns.end()) {
+                const auto *side_return = &found->second;
                 emit_block(*side_return->branch, 8, true);
                 const auto predicate = branch_condition_text(*side_return->condition);
                 out << "        if (" << (side_return->on_true ? predicate : "!(" + predicate + ")")
                     << ") {\n";
-                auto predecessor = side_return->branch->id;
-                for (const auto *block : side_return->path) {
-                    edge_copies(*block, predecessor, 12);
-                    emit_block(*block, 12, true);
-                    predecessor = block->id;
+                struct ReturnFrame {
+                    std::size_t node;
+                    BlockId predecessor;
+                    unsigned indent;
+                    unsigned phase;
+                };
+                std::vector<ReturnFrame> frames{{0, side_return->branch->id, 12, 0}};
+                while (!frames.empty()) {
+                    auto &frame = frames.back();
+                    const auto &node = side_return->tree[frame.node];
+                    const auto spaces = std::string(frame.indent, ' ');
+                    if (frame.phase == 0) {
+                        edge_copies(*node.block, frame.predecessor, frame.indent);
+                        emit_block(*node.block, frame.indent, node.condition || node.next.has_value());
+                        if (node.condition) {
+                            out << spaces << "if (" << branch_condition_text(*node.condition) << ") {\n";
+                            frame.phase = 1;
+                            frames.push_back({*node.yes, node.block->id, frame.indent + 4, 0});
+                        } else if (node.next) {
+                            frame.phase = 3;
+                            frames.push_back({*node.next, node.block->id, frame.indent, 0});
+                        } else frames.pop_back();
+                    } else if (frame.phase == 1) {
+                        out << spaces << "} else {\n";
+                        frame.phase = 2;
+                        frames.push_back({*node.no, node.block->id, frame.indent + 4, 0});
+                    } else {
+                        if (frame.phase == 2) out << spaces << "}\n";
+                        frames.pop_back();
+                    }
                 }
                 out << "        }\n";
                 edge_copies(*side_return->continuation, side_return->branch->id, 8);
                 continue;
             }
-            if (diamond && path[i] == diamond->branch) {
-                emit_block(*diamond->branch, 8, true);
-                out << "        if (" << branch_condition_text(*diamond->condition) << ") {\n";
-                const auto emit_arm = [&](const std::vector<const LiftedBlock *> &arm) {
-                    auto predecessor = diamond->branch->id;
-                    for (const auto *block : arm) {
-                        edge_copies(*block, predecessor, 12);
-                        emit_block(*block, 12, true);
-                        predecessor = block->id;
-                    }
-                    edge_copies(*diamond->join, predecessor, 12);
+            if (const auto found = diamonds.find(path[i]->id.value); found != diamonds.end()) {
+                const auto *diamond = &found->second;
+                const auto emit_region = [&](const BodyDiamond &root, auto &&emit_region_ref,
+                                             unsigned indent) -> void {
+                    const auto spaces = std::string(indent, ' ');
+                    emit_block(*root.branch, indent, true);
+                    out << spaces << "if (" << branch_condition_text(*root.condition) << ") {\n";
+                    const auto emit_arm = [&](const std::vector<const LiftedBlock *> &arm) {
+                        auto predecessor = root.branch->id;
+                        bool nested_tail = false;
+                        for (const auto *block : arm) {
+                            edge_copies(*block, predecessor, indent + 4);
+                            const auto nested = diamonds.find(block->id.value);
+                            if (nested != diamonds.end() && nested->second.branch == block) {
+                                emit_region_ref(nested->second, emit_region_ref, indent + 4);
+                                nested_tail = true;
+                            } else
+                                emit_block(*block, indent + 4, true);
+                            predecessor = block->id;
+                        }
+                        if (!nested_tail) edge_copies(*root.join, predecessor, indent + 4);
+                    };
+                    emit_arm(root.yes);
+                    out << spaces << "} else {\n";
+                    emit_arm(root.no);
+                    out << spaces << "}\n";
                 };
-                emit_arm(diamond->yes);
-                out << "        } else {\n";
-                emit_arm(diamond->no);
-                out << "        }\n";
+                emit_region(*diamond, emit_region, 8);
                 continue;
             }
             emit_block(*path[i], 8, true);
-            if (i + 1 < path.size() && (!diamond || path[i + 1] != diamond->join))
+            if (i + 1 < path.size() && !diamond_joins.contains(path[i + 1]->id.value))
                 edge_copies(*path[i + 1], path[i]->id, 8);
         }
         // Evaluate the branch before recurrent copies: the predicate may read
@@ -7558,6 +9830,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             const LiftedBlock *branch = nullptr;
             std::vector<const LiftedBlock *> path;
             bool return_on_true = true;
+            std::vector<std::pair<std::string, std::string>> phi_copies;
         };
         std::vector<LoopConditionalReturn> loop_returns;
         struct LoopConditionalBody {
@@ -7587,6 +9860,9 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<LoopConditionalBody> conditional_joins;
             std::vector<std::pair<const LiftedBlock *, bool>> conditional_breaks;
             std::map<std::uint64_t, std::vector<const LiftedBlock *>> conditional_break_paths;
+            // A guarded terminal return may leave a nested loop body while
+            // the other edge continues along its ordinary body spine.
+            std::vector<LoopConditionalReturn> conditional_returns;
             std::vector<std::pair<const LiftedBlock *, bool>> conditional_continues;
             std::map<std::uint64_t, std::vector<const LiftedBlock *>> conditional_continue_paths;
         };
@@ -7604,7 +9880,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         // stacks while allowing substantially deeper bodies than the former
         // eight-level cutoff. The enclosing diamond CFG is also bounded to
         // 1,024 blocks, and recursive children must claim distinct blocks.
-        constexpr unsigned max_loop_child_depth = 32;
+        constexpr unsigned max_loop_child_depth = 64;
+        constexpr std::size_t max_nested_child_cleanup_blocks = 1024;
         std::map<std::uint64_t, NestedLoopBody> nested_loop_bodies;
         std::map<std::uint64_t, LoopConditionalBody> conditional_loop_bodies;
         std::set<std::uint64_t> conditional_phi_joins;
@@ -8290,7 +10567,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     loop_breaks.push_back({body, true_exits, break_path});
                     next_address = true_exits ? *body_condition->false_target : *body_condition->true_target;
                 } else {
-                    const auto trace_return_path = [&](Address target) {
+                    const auto trace_return_path = [&](Address target,
+                                                       std::vector<std::pair<std::string, std::string>> &phi_copies) {
                         std::vector<const LiftedBlock *> path;
                         std::set<std::uint64_t> seen;
                         auto *candidate = find_block(target);
@@ -8301,11 +10579,25 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                    return std::find(prior.path.begin(), prior.path.end(), candidate) != prior.path.end();
                                }) &&
                                seen.insert(candidate->id.value).second && path.size() < function.blocks.size() &&
-                               candidate->phis.empty() && has_only_simple_statements(*candidate) &&
+                               (candidate->phis.empty() || has_only_terminal_return(*candidate)) &&
+                               has_only_simple_statements(*candidate) &&
                                valid_diamond_memory_phi(*candidate) &&
                                diamond_predecessors[candidate->id.value] == std::set<std::uint64_t>{predecessor}) {
                             path.push_back(candidate);
-                            if (has_only_terminal_return(*candidate)) return path;
+                            if (has_only_terminal_return(*candidate)) {
+                                std::vector<RegisterOperand> destinations;
+                                for (const auto &phi : candidate->phis) {
+                                    if (std::find(destinations.begin(), destinations.end(), phi.destination) != destinations.end() ||
+                                        phi.inputs.size() != 1 || phi.inputs.front().predecessor.value != predecessor) {
+                                        path.clear();
+                                        return path;
+                                    }
+                                    destinations.push_back(phi.destination);
+                                    phi_copies.emplace_back(register_name(phi.destination, phi.version),
+                                        register_name(phi.destination, phi.inputs.front().version));
+                                }
+                                return path;
+                            }
                             if (contains_return(*candidate) || candidate->successors.size() != 1 ||
                                 !candidate->successors.front().target ||
                                 (candidate->successors.front().kind != BlockEdgeKind::jump &&
@@ -8318,11 +10610,15 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         path.clear();
                         return path;
                     };
-                    const auto true_return = trace_return_path(*body_condition->true_target);
-                    const auto false_return = trace_return_path(*body_condition->false_target);
+                    std::vector<std::pair<std::string, std::string>> true_return_phi_copies;
+                    std::vector<std::pair<std::string, std::string>> false_return_phi_copies;
+                    const auto true_return = trace_return_path(*body_condition->true_target, true_return_phi_copies);
+                    const auto false_return = trace_return_path(*body_condition->false_target, false_return_phi_copies);
                     if (body->phis.empty() && true_return.empty() != false_return.empty()) {
                         const bool return_on_true = !true_return.empty();
-                        loop_returns.push_back({body, return_on_true ? true_return : false_return, return_on_true});
+                        loop_returns.push_back({body, return_on_true ? true_return : false_return, return_on_true,
+                            return_on_true ? std::move(true_return_phi_copies) :
+                                             std::move(false_return_phi_copies)});
                         next_address = return_on_true ? *body_condition->false_target : *body_condition->true_target;
                         loop_body.push_back(body);
                         if (next_address == header->begin) break;
@@ -8398,7 +10694,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                         while (cursor && cursor != body && cursor != candidate.exit &&
                                                cursor != header && cursor != entry && cursor != exit_block &&
                                                !loop_body_ids.contains(cursor->id.value) &&
-                                               !inner_ids.contains(cursor->id.value) && path.size() < 256 &&
+                                               !inner_ids.contains(cursor->id.value) &&
+                                               path.size() < max_nested_child_cleanup_blocks &&
                                                seen.insert(cursor->id.value).second) {
                                             if (!cursor->phis.empty() || cursor->switch_dispatch ||
                                                 contains_return(*cursor) || !has_only_simple_statements(*cursor) ||
@@ -8463,8 +10760,14 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                         while (cursor && cursor != candidate.exit && cursor != body &&
                                                cursor != header && cursor != entry && cursor != exit_block &&
                                                !loop_body_ids.contains(cursor->id.value) &&
-                                               !inner_ids.contains(cursor->id.value) &&
-                                               path.size() < 256 && seen.insert(cursor->id.value).second) {
+                                               (!inner_ids.contains(cursor->id.value) ||
+                                                std::any_of(candidate.conditional_break_paths.begin(),
+                                                    candidate.conditional_break_paths.end(), [&](const auto &prior) {
+                                                        return std::find(prior.second.begin(), prior.second.end(), cursor) !=
+                                                            prior.second.end();
+                                                    })) &&
+                                               path.size() < max_nested_child_cleanup_blocks &&
+                                               seen.insert(cursor->id.value).second) {
                                             if (!cursor->phis.empty() || cursor->switch_dispatch ||
                                                 contains_return(*cursor) || !has_only_simple_statements(*cursor) ||
                                                 cursor->memory_phi || !cursor->memory_partition_phis.empty() ||
@@ -8472,9 +10775,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                                 !cursor->successors.front().target ||
                                                 (cursor->successors.front().kind != BlockEdgeKind::jump &&
                                                  cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
-                                                !has_unconditional_edge(*cursor, *cursor->successors.front().target) ||
-                                                diamond_predecessors[cursor->id.value] !=
-                                                    std::set<std::uint64_t>{predecessor})
+                                                !has_unconditional_edge(*cursor, *cursor->successors.front().target))
                                                 return std::nullopt;
                                             path.push_back(cursor);
                                             predecessor = cursor->id.value;
@@ -8491,6 +10792,25 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                     const bool false_break = false_break_path.has_value();
                                     if (true_break != false_break && inner_current->phis.empty()) {
                                         const auto &break_path = true_break ? *true_break_path : *false_break_path;
+                                        const auto valid_break_path = [&](const std::vector<const LiftedBlock *> &path) {
+                                            if (path.empty())
+                                                return diamond_predecessors[candidate.exit->id.value].contains(
+                                                    inner_current->id.value);
+                                            std::set<std::uint64_t> shared_head_predecessors{inner_current->id.value};
+                                            for (const auto &[prior_branch, prior_path] : candidate.conditional_break_paths)
+                                                if (prior_path == path) shared_head_predecessors.insert(prior_branch);
+                                            for (std::size_t path_index = 0; path_index < path.size(); ++path_index) {
+                                                const auto expected = path_index == 0 ? shared_head_predecessors :
+                                                    std::set<std::uint64_t>{path[path_index - 1]->id.value};
+                                                if (diamond_predecessors[path[path_index]->id.value] != expected) return false;
+                                            }
+                                            return diamond_predecessors[candidate.exit->id.value].contains(
+                                                path.back()->id.value);
+                                        };
+                                        if (!valid_break_path(break_path)) {
+                                            candidate_valid = false;
+                                            break;
+                                        }
                                         const Address continue_target = true_break ?
                                             *inner_condition->false_target : *inner_condition->true_target;
                                         const auto *continuation = find_block(continue_target);
@@ -8507,6 +10827,67 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                             candidate.conditional_breaks.emplace_back(inner_current, true_break);
                                             candidate.conditional_break_paths.emplace(inner_current->id.value, break_path);
                                             for (const auto *path_block : break_path)
+                                                inner_ids.insert(path_block->id.value);
+                                            inner_current = continuation;
+                                            continue;
+                                        }
+                                    }
+                                    // A return-only side exit is safe to emit
+                                    // inside the child loop when its complete
+                                    // path is single-entry and the sibling edge
+                                    // remains on the child body's linear spine.
+                                    // Keep return blocks separately owned so
+                                    // they are emitted only under this guard.
+                                    const auto trace_child_return_path = [&](const std::optional<Address> &target)
+                                        -> std::optional<std::vector<const LiftedBlock *>> {
+                                        if (!target) return std::nullopt;
+                                        std::vector<const LiftedBlock *> path;
+                                        auto *cursor = find_block(*target);
+                                        auto predecessor = inner_current->id.value;
+                                        std::set<std::uint64_t> seen;
+                                        while (cursor && cursor != body && cursor != candidate.exit &&
+                                               cursor != header && cursor != entry && cursor != exit_block &&
+                                               !loop_body_ids.contains(cursor->id.value) &&
+                                               !inner_ids.contains(cursor->id.value) &&
+                                               path.size() < 64 && seen.insert(cursor->id.value).second) {
+                                            if (!cursor->phis.empty() || cursor->switch_dispatch ||
+                                                !has_only_simple_statements(*cursor) ||
+                                                !valid_diamond_memory_phi(*cursor) ||
+                                                diamond_predecessors[cursor->id.value] !=
+                                                    std::set<std::uint64_t>{predecessor})
+                                                return std::nullopt;
+                                            path.push_back(cursor);
+                                            if (has_only_terminal_return(*cursor)) return path;
+                                            if (contains_return(*cursor) || cursor->successors.size() != 1 ||
+                                                !cursor->successors.front().target ||
+                                                (cursor->successors.front().kind != BlockEdgeKind::jump &&
+                                                 cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                                                !has_unconditional_edge(*cursor, *cursor->successors.front().target))
+                                                return std::nullopt;
+                                            predecessor = cursor->id.value;
+                                            cursor = find_block(*cursor->successors.front().target);
+                                        }
+                                        return std::nullopt;
+                                    };
+                                    const auto true_return_path = trace_child_return_path(inner_condition->true_target);
+                                    const auto false_return_path = trace_child_return_path(inner_condition->false_target);
+                                    if (true_return_path.has_value() != false_return_path.has_value() &&
+                                        inner_current->phis.empty()) {
+                                        const bool return_on_true = true_return_path.has_value();
+                                        const auto &return_path = return_on_true ? *true_return_path : *false_return_path;
+                                        const Address continue_target = return_on_true ?
+                                            *inner_condition->false_target : *inner_condition->true_target;
+                                        const auto *continuation = find_block(continue_target);
+                                        if (continuation && continuation != body && continuation != candidate.exit &&
+                                            continuation != entry && continuation != header &&
+                                            !loop_body_ids.contains(continuation->id.value) &&
+                                            !inner_ids.contains(continuation->id.value) &&
+                                            !contains_return(*inner_current)) {
+                                            candidate.body.push_back(inner_current);
+                                            inner_ids.insert(inner_current->id.value);
+                                            candidate.conditional_returns.push_back(
+                                                {inner_current, return_path, return_on_true});
+                                            for (const auto *path_block : return_path)
                                                 inner_ids.insert(path_block->id.value);
                                             inner_current = continuation;
                                             continue;
@@ -8585,6 +10966,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                 });
                             if (candidate_valid && (!candidate.conditional_joins.empty() ||
                                 !candidate.conditional_breaks.empty() ||
+                                !candidate.conditional_returns.empty() ||
                                 !candidate.conditional_continues.empty())) {
                                 // Arm ownership alone is insufficient if an outside
                                 // edge can enter another block of the child body.
@@ -8700,6 +11082,9 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             (void)branch_id;
                             for (const auto *path_block : path) loop_body_ids.insert(path_block->id.value);
                         }
+                        for (const auto &side_return : nested.conditional_returns)
+                            for (const auto *path_block : side_return.path)
+                                loop_body_ids.insert(path_block->id.value);
                         const auto nested_exit_address = nested.exit->begin;
                         nested_loop_bodies.emplace(body->id.value, std::move(nested));
                         next_address = nested_exit_address;
@@ -8870,7 +11255,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             for (const auto *back_edge : back_edges)
                 if (!expected_header_predecessors.insert(back_edge->id.value).second)
                     valid_loop_phis = false;
-            if (back_edges.size() > 8 ||
+            if (back_edges.size() > 64 ||
                 diamond_predecessors[header->id.value] != expected_header_predecessors)
                 valid_loop_phis = false;
             for (const auto &phi : header->phis) {
@@ -9007,6 +11392,22 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                        std::find(candidate.no.begin(), candidate.no.end(), inner_block) != candidate.no.end();
                             });
                         if (conditional_arm) continue;
+                        const auto conditional_return = std::find_if(region.conditional_returns.begin(),
+                            region.conditional_returns.end(), [&](const auto &candidate) {
+                                return candidate.branch == inner_block;
+                            });
+                        if (conditional_return != region.conditional_returns.end()) {
+                            const auto *branch = terminal_conditional(*inner_block);
+                            if (!branch) return fallback("nested loop return block has no valid branch");
+                            emit_block(*inner_block, 12, true);
+                            const auto condition = branch_condition_text(*branch);
+                            out << "            if (" << (conditional_return->return_on_true ? condition :
+                                "!(" + condition + ")") << ") {\n";
+                            for (const auto *return_block : conditional_return->path)
+                                emit_block(*return_block, 16, return_block != conditional_return->path.back());
+                            out << "            }\n";
+                            continue;
+                        }
                         const auto conditional_break = std::find_if(region.conditional_breaks.begin(),
                             region.conditional_breaks.end(), [&](const auto &candidate) {
                                 return candidate.first == inner_block;
@@ -9074,8 +11475,10 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     const auto condition = branch_condition_text(*body_condition);
                     out << "        if (" << (conditional_return->return_on_true ? condition :
                         "!(" + condition + ")") << ") {\n";
-                    for (const auto *return_block : conditional_return->path)
-                        emit_block(*return_block, 12, return_block != conditional_return->path.back());
+                    for (std::size_t i = 0; i + 1 < conditional_return->path.size(); ++i)
+                        emit_block(*conditional_return->path[i], 12, true);
+                    emit_parallel_copies(out, conditional_return->phi_copies, 12);
+                    emit_block(*conditional_return->path.back(), 12);
                     out << "        }\n";
                     continue;
                 }
@@ -9536,15 +11939,49 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
               edge_targets(latch->successors[1], *condition->false_target)) ||
              (edge_targets(latch->successors[1], *condition->true_target) &&
               edge_targets(latch->successors[0], *condition->false_target)))) {
-            // The natural do-while edge may be either branch arm; identify the
-            // non-loop edge as the sole exit and preserve the condition sense.
-            const bool loops_on_true = condition->true_target == std::optional<Address>{entry->begin};
-            const bool loops_on_false = condition->false_target == std::optional<Address>{entry->begin};
+            // A bounded phi-free cleanup chain may sit between the latch's
+            // repeat edge and the body header. Preserve it inside the loop and
+            // use an explicit continue so the original predicate still gates
+            // every iteration.
+            const auto trace_backedge = [&](Address start)
+                -> std::optional<std::vector<const LiftedBlock *>> {
+                std::vector<const LiftedBlock *> path;
+                auto *cursor = find_block(start);
+                auto predecessor = latch->id.value;
+                std::set<std::uint64_t> seen;
+                while (cursor && cursor != entry && cursor != latch && path.size() < 64 &&
+                       seen.insert(cursor->id.value).second && cursor->phis.empty() && !cursor->memory_phi &&
+                       cursor->memory_partition_phis.empty() && !cursor->switch_dispatch &&
+                       !contains_return(*cursor) && has_only_simple_statements(*cursor) &&
+                       predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor} &&
+                       cursor->successors.size() == 1 && cursor->successors.front().target &&
+                       (cursor->successors.front().kind == BlockEdgeKind::jump ||
+                        cursor->successors.front().kind == BlockEdgeKind::fallthrough) &&
+                       has_unconditional_edge(*cursor, *cursor->successors.front().target)) {
+                    path.push_back(cursor);
+                    predecessor = cursor->id.value;
+                    cursor = find_block(*cursor->successors.front().target);
+                }
+                if (cursor != entry || predecessors[entry->id.value] != std::set<std::uint64_t>{predecessor})
+                    return {};
+                return path;
+            };
+            const auto true_backedge = trace_backedge(*condition->true_target);
+            const auto false_backedge = trace_backedge(*condition->false_target);
+            const bool loops_on_true = true_backedge.has_value() && !false_backedge.has_value();
+            const bool loops_on_false = false_backedge.has_value() && !true_backedge.has_value();
+            std::vector<const LiftedBlock *> backedge_cleanup;
+            if (loops_on_true) backedge_cleanup = *true_backedge;
+            else if (loops_on_false) backedge_cleanup = *false_backedge;
             const Address exit_address = loops_on_true ? *condition->false_target :
                                          loops_on_false ? *condition->true_target : Address{};
             const auto *exit_block = find_block(exit_address);
             std::vector<const LiftedBlock *> exit_path;
             std::set<std::uint64_t> exit_path_ids;
+            const LiftedBlock *cleanup_branch = nullptr;
+            std::vector<const LiftedBlock *> cleanup_true_path;
+            std::vector<const LiftedBlock *> cleanup_false_path;
+            const Branch *cleanup_condition = nullptr;
             auto *exit_cursor = exit_block;
             auto expected_exit_predecessor = latch ? latch->id.value : 0;
             bool exit_path_valid = true;
@@ -9553,10 +11990,64 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                    exit_cursor != entry && exit_cursor != latch &&
                    !do_body_ids.contains(exit_cursor->id.value) &&
                    exit_cursor->phis.empty() && !exit_cursor->memory_phi &&
+                   exit_cursor->memory_partition_phis.empty() &&
                    has_only_simple_statements(*exit_cursor) &&
                    predecessors[exit_cursor->id.value] == std::set<std::uint64_t>{expected_exit_predecessor}) {
                 exit_path.push_back(exit_cursor);
                 if (has_only_terminal_return(*exit_cursor)) break;
+                if (const auto *candidate = terminal_conditional(*exit_cursor);
+                    candidate && candidate->true_target && candidate->false_target &&
+                    *candidate->true_target != *candidate->false_target) {
+                    const auto trace_cleanup_return = [&](Address start) {
+                        std::vector<const LiftedBlock *> path;
+                        std::set<std::uint64_t> seen;
+                        auto *cursor = find_block(start);
+                        auto predecessor = exit_cursor->id.value;
+                        while (cursor && cursor != entry && cursor != latch &&
+                               !do_body_ids.contains(cursor->id.value) &&
+                               !exit_path_ids.contains(cursor->id.value) &&
+                               path.size() < 64 && seen.insert(cursor->id.value).second &&
+                               cursor->phis.empty() && !cursor->memory_phi &&
+                               cursor->memory_partition_phis.empty() &&
+                               has_only_simple_statements(*cursor) &&
+                               predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor}) {
+                            path.push_back(cursor);
+                            if (has_only_terminal_return(*cursor)) return path;
+                            if (contains_return(*cursor) || cursor->successors.size() != 1 ||
+                                !cursor->successors.front().target ||
+                                (cursor->successors.front().kind != BlockEdgeKind::jump &&
+                                 cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                                !has_unconditional_edge(*cursor, *cursor->successors.front().target))
+                                return std::vector<const LiftedBlock *>{};
+                            predecessor = cursor->id.value;
+                            cursor = find_block(*cursor->successors.front().target);
+                        }
+                        return std::vector<const LiftedBlock *>{};
+                    };
+                    auto true_path = trace_cleanup_return(*candidate->true_target);
+                    auto false_path = trace_cleanup_return(*candidate->false_target);
+                    std::set<std::uint64_t> arm_ids;
+                    const auto disjoint_path = [&](const auto &path) {
+                        for (const auto *block : path)
+                            if (!arm_ids.insert(block->id.value).second) return false;
+                        return true;
+                    };
+                    const bool exact_edges = exit_cursor->successors.size() == 2 &&
+                        std::count_if(exit_cursor->successors.begin(), exit_cursor->successors.end(), [&](const auto &edge) {
+                            return edge_targets(edge, *candidate->true_target);
+                        }) == 1 &&
+                        std::count_if(exit_cursor->successors.begin(), exit_cursor->successors.end(), [&](const auto &edge) {
+                            return edge_targets(edge, *candidate->false_target);
+                        }) == 1;
+                    if (!true_path.empty() && !false_path.empty() && exact_edges &&
+                        disjoint_path(true_path) && disjoint_path(false_path)) {
+                        cleanup_branch = exit_cursor;
+                        cleanup_condition = candidate;
+                        cleanup_true_path = std::move(true_path);
+                        cleanup_false_path = std::move(false_path);
+                        break;
+                    }
+                }
                 if (contains_return(*exit_cursor) || exit_cursor->successors.size() != 1 ||
                     !exit_cursor->successors.front().target ||
                     (exit_cursor->successors.front().kind != BlockEdgeKind::jump &&
@@ -9568,21 +12059,34 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 expected_exit_predecessor = exit_cursor->id.value;
                 exit_cursor = find_block(*exit_cursor->successors.front().target);
             }
-            if (exit_path.empty() || !has_only_terminal_return(*exit_path.back()) ||
+            if (exit_path.empty() ||
+                (!has_only_terminal_return(*exit_path.back()) &&
+                 (!cleanup_branch || exit_path.back() != cleanup_branch)) ||
                 (exit_cursor && exit_path_ids.contains(exit_cursor->id.value) && exit_cursor != exit_path.back()))
                 exit_path_valid = false;
             if ((loops_on_true || loops_on_false) && exit_block && exit_path_valid && exit_block != entry &&
                 exit_block != latch && has_only_simple_statements(*latch) &&
-                predecessors[entry->id.value] == std::set<std::uint64_t>{latch->id.value} &&
+                (backedge_cleanup.empty()
+                    ? predecessors[entry->id.value] == std::set<std::uint64_t>{latch->id.value}
+                    : predecessors[entry->id.value] == std::set<std::uint64_t>{backedge_cleanup.back()->id.value}) &&
                 predecessors[exit_block->id.value] == std::set<std::uint64_t>{latch->id.value} &&
                 std::all_of(function.blocks.begin(), function.blocks.end(), [&](const LiftedBlock &candidate) {
                     return &candidate == latch || exit_path_ids.contains(candidate.id.value) ||
+                           std::any_of(backedge_cleanup.begin(), backedge_cleanup.end(), [&](const auto *block) {
+                               return block == &candidate;
+                           }) ||
+                           std::any_of(cleanup_true_path.begin(), cleanup_true_path.end(), [&](const auto *block) {
+                               return block == &candidate;
+                           }) ||
+                           std::any_of(cleanup_false_path.begin(), cleanup_false_path.end(), [&](const auto *block) {
+                               return block == &candidate;
+                           }) ||
                            do_body_ids.contains(candidate.id.value);
                 })) {
                 std::map<std::uint64_t, const DoLoopDiamond *> by_branch;
                 for (const auto &region : diamonds) by_branch.emplace(region.branch->id.value, &region);
                 out << "function " << address_label(function.entry) << "() {\n";
-                out << "    do {\n";
+                out << (backedge_cleanup.empty() ? "    do {\n" : "    while (true) {\n");
                 current = entry;
                 std::set<std::uint64_t> emitted;
                 while (current && current != latch && emitted.insert(current->id.value).second) {
@@ -9638,10 +12142,25 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 }
                 if (current != latch) return fallback("post-tested loop body is not a single conditional region chain");
                 emit_block(*latch, 8, true);
-                out << "    } while (" << (loops_on_true ? condition->condition : "!(" + condition->condition + ")")
-                    << ");\n";
+                const auto repeat_condition = loops_on_true ? condition->condition : "!(" + condition->condition + ")";
+                if (backedge_cleanup.empty()) {
+                    out << "    } while (" << repeat_condition << ");\n";
+                } else {
+                    out << "        if (" << repeat_condition << ") {\n";
+                    for (const auto *block : backedge_cleanup) emit_block(*block, 12, true);
+                    out << "            continue;\n        } else {\n            break;\n        }\n    }\n";
+                }
                 for (const auto *block : exit_path)
-                    emit_block(*block, 4, block != exit_path.back());
+                    emit_block(*block, 4, block == cleanup_branch || block != exit_path.back());
+                if (cleanup_branch && cleanup_condition && !cleanup_true_path.empty() && !cleanup_false_path.empty()) {
+                    out << "    if (" << branch_condition_text(*cleanup_condition) << ") {\n";
+                    for (const auto *block : cleanup_true_path)
+                        emit_block(*block, 8, block != cleanup_true_path.back());
+                    out << "    } else {\n";
+                    for (const auto *block : cleanup_false_path)
+                        emit_block(*block, 8, block != cleanup_false_path.back());
+                    out << "    }\n";
+                }
                 out << "}\n";
                 return {out.str(), false, {}};
             }
@@ -9656,13 +12175,14 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         return fallback("conditional targets do not identify distinct in-function blocks");
 
     // A decision tree whose leaves all return has no join to recover with the
-    // post-dominator structurer below. It is still safely expressible as nested
-    // if/else when every non-entry node has exactly one predecessor and the
-    // tree covers the whole function.
+    // post-dominator structurer below. It is expressible as nested if/else when
+    // the tree covers the function and any shared nodes are proven terminal
+    // returns or bounded conditional blocks that lead directly to returns.
     auto try_return_tree = [&]() -> std::optional<StructuredPseudocode> {
         const auto count = function.blocks.size();
         constexpr std::size_t max_return_tree_blocks = 4096;
-        constexpr std::size_t max_return_tree_depth = 1024;
+        constexpr std::size_t max_return_tree_depth = max_return_tree_blocks;
+        constexpr unsigned max_return_tree_indent = 256;
         if (count < 3 || count > max_return_tree_blocks) return {};
         using AddressKey = std::pair<std::uint64_t, std::uint64_t>;
         std::map<AddressKey, std::size_t> by_address;
@@ -9670,7 +12190,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         for (std::size_t i = 0; i < count; ++i) {
             const auto &block = function.blocks[i];
             if (!by_address.emplace(AddressKey{block.begin.space.value, block.begin.offset}, i).second ||
-                !by_id.emplace(block.id.value, i).second || block.switch_dispatch || !block.phis.empty()) return {};
+                !by_id.emplace(block.id.value, i).second || block.switch_dispatch) return {};
         }
         const auto index_of = [&](Address address) -> std::optional<std::size_t> {
             const auto found = by_address.find({address.space.value, address.offset});
@@ -9679,6 +12199,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         const auto root = index_of(function.entry);
         if (!root) return {};
         std::vector<std::vector<std::size_t>> children(count);
+        std::vector<std::vector<std::size_t>> predecessors(count);
         std::vector<std::size_t> predecessor_count(count, 0);
         for (std::size_t i = 0; i < count; ++i) {
             const auto &block = function.blocks[i];
@@ -9696,6 +12217,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 if (!next || (edge.block && (!by_id.contains(edge.block->value) || by_id.at(edge.block->value) != *next)))
                     return {};
                 children[i].push_back(*next);
+                predecessors[*next].push_back(i);
                 ++predecessor_count[*next];
             }
             if (children[i].empty()) {
@@ -9724,24 +12246,135 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             }
         }
         if (predecessor_count[*root] != 0) return {};
-        for (std::size_t i = 0; i < count; ++i)
-            if (i != *root && predecessor_count[i] != 1) return {};
+        // Memory SSA values are analysis-only in the C-like output, but their
+        // incoming edges still have to describe this exact decision tree.
+        // Accepting complete memory phis avoids falling back solely because a
+        // return arm carries a token merge that has no source-level assignment.
+        std::size_t memory_phi_inputs = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto &block = function.blocks[i];
+            if (block.memory_partition_phis.size() > 4096) return {};
+            std::set<std::uint64_t> expected;
+            for (const auto predecessor : predecessors[i])
+                expected.insert(function.blocks[predecessor].id.value);
+            const auto valid_memory_phi = [&](const auto &phi) {
+                if (phi.inputs.size() != expected.size() ||
+                    phi.inputs.size() > 65536 - memory_phi_inputs) return false;
+                memory_phi_inputs += phi.inputs.size();
+                std::set<std::uint64_t> seen;
+                for (const auto &input : phi.inputs)
+                    if (!expected.contains(input.predecessor.value) ||
+                        !seen.insert(input.predecessor.value).second) return false;
+                return seen == expected;
+            };
+            if (block.memory_phi && !valid_memory_phi(*block.memory_phi)) return {};
+            std::set<std::string> partitions;
+            for (const auto &phi : block.memory_partition_phis)
+                if (phi.partition.empty() || !partitions.insert(phi.partition).second ||
+                    !valid_memory_phi(phi)) return {};
+        }
+        const auto shared_terminal_return = [&](std::size_t i) {
+            const auto &block = function.blocks[i];
+            if (!children[i].empty() || !has_only_terminal_return(block) ||
+                predecessor_count[i] <= 1 || predecessor_count[i] > 64) return false;
+            std::set<std::uint64_t> expected;
+            for (const auto predecessor : predecessors[i])
+                expected.insert(function.blocks[predecessor].id.value);
+            std::vector<RegisterOperand> destinations;
+            for (const auto &phi : block.phis) {
+                if (phi.inputs.size() != expected.size() ||
+                    std::find(destinations.begin(), destinations.end(), phi.destination) != destinations.end())
+                    return false;
+                destinations.push_back(phi.destination);
+                std::set<std::uint64_t> seen;
+                for (const auto &input : phi.inputs) {
+                    if (!expected.contains(input.predecessor.value) ||
+                        !seen.insert(input.predecessor.value).second) return false;
+                }
+                if (seen != expected) return false;
+            }
+            return true;
+        };
+        const auto shared_return_branch = [&](std::size_t i) {
+            const auto &block = function.blocks[i];
+            const auto *condition = terminal_conditional(block);
+            if (children[i].size() != 2 || !condition || predecessor_count[i] <= 1 ||
+                predecessor_count[i] > 64) return false;
+            const auto yes = index_of(*condition->true_target);
+            const auto no = index_of(*condition->false_target);
+            if (!yes || !no || *yes == *no || !children[*yes].empty() || !children[*no].empty() ||
+                !has_only_terminal_return(function.blocks[*yes]) ||
+                !has_only_terminal_return(function.blocks[*no])) return false;
+            std::set<std::uint64_t> expected;
+            for (const auto predecessor : predecessors[i])
+                expected.insert(function.blocks[predecessor].id.value);
+            if (expected.size() != predecessor_count[i]) return false;
+            std::size_t input_count = 0;
+            std::vector<RegisterOperand> destinations;
+            for (const auto &phi : block.phis) {
+                if (phi.inputs.size() != expected.size() ||
+                    phi.inputs.size() > 65536 - input_count ||
+                    std::find(destinations.begin(), destinations.end(), phi.destination) != destinations.end())
+                    return false;
+                input_count += phi.inputs.size();
+                destinations.push_back(phi.destination);
+                std::set<std::uint64_t> seen;
+                for (const auto &input : phi.inputs) {
+                    if (!expected.contains(input.predecessor.value) ||
+                        !seen.insert(input.predecessor.value).second) return false;
+                }
+                if (seen != expected) return false;
+            }
+            return true;
+        };
+        for (std::size_t i = 0; i < count; ++i) {
+            if (!function.blocks[i].phis.empty() && !shared_terminal_return(i) && !shared_return_branch(i))
+                return {};
+            if (i != *root && predecessor_count[i] != 1 &&
+                !shared_terminal_return(i) && !shared_return_branch(i)) return {};
+        }
 
         std::vector<bool> visited(count, false);
         std::vector<std::pair<std::size_t, std::size_t>> pending{{*root, 1}};
         while (!pending.empty()) {
             const auto [node, depth] = pending.back();
             pending.pop_back();
-            if (visited[node] || depth > max_return_tree_depth) return {};
+            if (depth > max_return_tree_depth) return {};
+            // Shared terminal returns and a validated terminal-decision block
+            // are duplicated into each guarded arm during emission; other
+            // repeated nodes still imply an unsupported shared region.
+            if (visited[node]) {
+                if (shared_terminal_return(node) || shared_return_branch(node)) continue;
+                return {};
+            }
             visited[node] = true;
             for (const auto next : children[node]) pending.emplace_back(next, depth + 1);
         }
         if (std::any_of(visited.begin(), visited.end(), [](bool value) { return !value; })) return {};
 
         out << "function " << address_label(function.entry) << "() {\n";
-        struct ReturnTreeFrame { std::size_t node = 0; unsigned indent = 0; std::uint8_t phase = 0; };
-        std::vector<ReturnTreeFrame> emit_stack{{*root, 4, 0}};
-        emit_stack.reserve(std::min(count, max_return_tree_depth));
+        struct ReturnTreeFrame {
+            std::size_t node = 0;
+            unsigned indent = 0;
+            std::uint8_t phase = 0;
+            std::optional<std::size_t> incoming;
+        };
+        const auto emit_return_phi_copies = [&](std::size_t node, std::size_t incoming, unsigned indent) {
+            const auto predecessor_id = function.blocks[incoming].id;
+            std::vector<std::pair<std::string, std::string>> copies;
+            for (const auto &phi : function.blocks[node].phis) {
+                const auto input = std::find_if(phi.inputs.begin(), phi.inputs.end(), [&](const auto &candidate) {
+                    return candidate.predecessor == predecessor_id;
+                });
+                if (input == phi.inputs.end()) return false;
+                copies.emplace_back(register_name(phi.destination, phi.version),
+                                    register_name(phi.destination, input->version));
+            }
+            emit_parallel_copies(out, copies, indent);
+            return true;
+        };
+        std::vector<ReturnTreeFrame> emit_stack{{*root, 4, 0, {}}};
+        emit_stack.reserve(count);
         while (!emit_stack.empty()) {
             auto &frame = emit_stack.back();
             const auto node = frame.node;
@@ -9749,8 +12382,10 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             const auto &block = function.blocks[node];
             if (children[node].size() < 2) {
                 if (frame.phase++ == 0) {
+                    if (!block.phis.empty() &&
+                        (!frame.incoming || !emit_return_phi_copies(node, *frame.incoming, indent))) return {};
                     emit_block(block, indent, !children[node].empty());
-                    if (!children[node].empty()) emit_stack.push_back({children[node][0], indent, 0});
+                    if (!children[node].empty()) emit_stack.push_back({children[node][0], indent, 0, node});
                 } else {
                     emit_stack.pop_back();
                 }
@@ -9763,14 +12398,16 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             if (!true_index || !false_index) return {};
             const auto spaces = std::string(indent, ' ');
             if (frame.phase == 0) {
+                if (!block.phis.empty() &&
+                    (!frame.incoming || !emit_return_phi_copies(node, *frame.incoming, indent))) return {};
                 emit_block(block, indent, true);
                 out << spaces << "if (" << branch_condition_text(*condition) << ") {\n";
                 frame.phase = 1;
-                emit_stack.push_back({*true_index, indent + 4, 0});
+                emit_stack.push_back({*true_index, std::min(indent + 4, max_return_tree_indent), 0, node});
             } else if (frame.phase == 1) {
                 out << spaces << "} else {\n";
                 frame.phase = 2;
-                emit_stack.push_back({*false_index, indent + 4, 0});
+                emit_stack.push_back({*false_index, std::min(indent + 4, max_return_tree_indent), 0, node});
             } else {
                 out << spaces << "}\n";
                 emit_stack.pop_back();
@@ -9821,7 +12458,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 if (join_on_true == join_on_false) continue;
                 const auto *early_return = find_block(join_on_true ? *inner->false_target : *inner->true_target);
                 if (!early_return || early_return == join || early_return == nested || early_return == entry ||
-                    !has_only_terminal_return(*early_return) || !early_return->phis.empty()) continue;
+                    !has_only_terminal_return(*early_return) || early_return->memory_phi ||
+                    !early_return->memory_partition_phis.empty()) continue;
 
                 std::set<std::uint64_t> covered{entry->id.value, nested->id.value,
                                                 join->id.value, early_return->id.value};
@@ -9829,6 +12467,30 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 for (const auto *block : sibling_path)
                     if (!covered.insert(block->id.value).second || !block->phis.empty()) valid = false;
                 if (!valid || covered.size() != function.blocks.size()) continue;
+
+                std::size_t early_return_edge_count = 0;
+                bool early_return_has_unexpected_predecessor = false;
+                for (const auto &candidate : function.blocks) {
+                    for (const auto &edge : candidate.successors) {
+                        if (edge.target != std::optional<Address>{early_return->begin}) continue;
+                        ++early_return_edge_count;
+                        if (candidate.id != nested->id ||
+                            (edge.block && *edge.block != early_return->id))
+                            early_return_has_unexpected_predecessor = true;
+                    }
+                }
+                if (early_return_edge_count != 1 || early_return_has_unexpected_predecessor) continue;
+                std::vector<RegisterOperand> early_return_phi_destinations;
+                for (const auto &phi : early_return->phis) {
+                    if (std::find(early_return_phi_destinations.begin(), early_return_phi_destinations.end(),
+                                  phi.destination) != early_return_phi_destinations.end() ||
+                        phi.inputs.size() != 1 || phi.inputs.front().predecessor != nested->id) {
+                        valid = false;
+                        break;
+                    }
+                    early_return_phi_destinations.push_back(phi.destination);
+                }
+                if (!valid) continue;
 
                 const BlockId sibling_predecessor = sibling_path.empty() ? entry->id : sibling_path.back()->id;
                 const std::array<BlockId, 2> join_predecessors{nested->id, sibling_predecessor};
@@ -9854,6 +12516,17 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     }
                     emit_parallel_copies(out, copies, indent);
                 };
+                auto emit_early_return = [&](unsigned indent) {
+                    std::vector<std::pair<std::string, std::string>> copies;
+                    copies.reserve(early_return->phis.size());
+                    for (const auto &phi : early_return->phis) {
+                        const auto &input = phi.inputs.front();
+                        copies.emplace_back(register_name(phi.destination, phi.version),
+                                            register_name(phi.destination, input.version));
+                    }
+                    emit_parallel_copies(out, copies, indent);
+                    emit_block(*early_return, indent);
+                };
                 auto emit_sibling = [&](unsigned indent) {
                     for (const auto *block : sibling_path) emit_block(*block, indent);
                     emit_join_copies(sibling_predecessor, indent);
@@ -9863,10 +12536,10 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     emit_block(*nested, indent, true);
                     out << spaces << "if (" << branch_condition_text(*inner) << ") {\n";
                     if (join_on_true) emit_join_copies(nested->id, indent + 4);
-                    else emit_block(*early_return, indent + 4);
+                    else emit_early_return(indent + 4);
                     out << spaces << "} else {\n";
                     if (join_on_false) emit_join_copies(nested->id, indent + 4);
-                    else emit_block(*early_return, indent + 4);
+                    else emit_early_return(indent + 4);
                     out << spaces << "}\n";
                 };
 
@@ -9997,6 +12670,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 const auto &branch_statement = std::get<Branch>(block.instructions.back().statement);
                 if (branch_statement.condition == "true") {
                     if (successors[i].size() != 1 || !branch_statement.true_target || branch_statement.false_target ||
+                        branch_statement.indirect_target ||
+                        !has_unconditional_edge(block, *branch_statement.true_target) ||
                         function.blocks[successors[i].front()].begin != *branch_statement.true_target) return {};
                 } else if (!terminal_conditional(block)) return {};
             } else if (successors[i].size() > 1) {
@@ -10022,6 +12697,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             };
             if (block.phis.size() > 4096 ||
                 !std::all_of(block.phis.begin(), block.phis.end(), validate_phi_inputs)) return {};
+            std::vector<RegisterOperand> phi_destinations;
+            for (const auto &phi : block.phis) {
+                if (std::find(phi_destinations.begin(), phi_destinations.end(), phi.destination) !=
+                    phi_destinations.end()) return {};
+                phi_destinations.push_back(phi.destination);
+            }
             if (block.memory_phi && !validate_phi_inputs(*block.memory_phi)) return {};
             if (block.memory_partition_phis.size() > 4096) return {};
             std::set<std::string> memory_partitions;
@@ -10080,17 +12761,35 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             return true;
         };
 
+        // A shared block need not be a post-dominator of the enclosing branch:
+        // one arm can enter a cleanup/return region that another arm reaches
+        // only under a second predicate. Such overlapping joins cannot be
+        // represented by moving that block after either conditional. Duplicate
+        // it in the mutually exclusive paths instead. The graph was proven
+        // acyclic above, so each dynamic execution still visits that original
+        // block at most once. Keep the incoming *CFG* predecessor on each copy;
+        // synthetic region predecessors would select the wrong SSA phi input.
+        constexpr std::size_t max_acyclic_occurrences = 4096;
+        constexpr std::size_t max_copies_per_block = 64;
+        constexpr unsigned max_acyclic_region_depth = 64;
+        std::vector<std::size_t> occurrences(count, 0);
+        std::size_t occurrence_count = 0;
         std::set<std::size_t> emitted;
-        std::function<bool(std::size_t, std::optional<std::size_t>, unsigned, std::optional<BlockId>)> emit_region;
+        std::function<bool(std::size_t, std::optional<std::size_t>, unsigned,
+                           std::optional<BlockId>, unsigned)> emit_region;
         emit_region = [&](std::size_t start, std::optional<std::size_t> stop, unsigned indent,
-                          std::optional<BlockId> incoming_predecessor) -> bool {
+                          std::optional<BlockId> incoming_predecessor, unsigned depth) -> bool {
+            if (depth > max_acyclic_region_depth) return false;
             std::size_t current = start;
             std::set<std::size_t> local_path;
             while (true) {
                 if (current == virtual_exit) return !stop || *stop == virtual_exit;
                 if (stop && current == *stop)
                     return incoming_predecessor && emit_edge_phi_copies(current, *incoming_predecessor, indent);
-                if (!local_path.insert(current).second || !emitted.insert(current).second) return false;
+                if (!local_path.insert(current).second ||
+                    ++occurrences[current] > max_copies_per_block ||
+                    ++occurrence_count > max_acyclic_occurrences) return false;
+                emitted.insert(current);
                 if (incoming_predecessor && !emit_edge_phi_copies(current, *incoming_predecessor, indent)) return false;
                 const auto &block = function.blocks[current];
                 if (block.switch_dispatch) {
@@ -10107,7 +12806,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         if (group.is_default) out << labels << "default:\n";
                         out << labels << "{\n";
                         const auto target = index_for(group.target);
-                        if (!target || !emit_region(*target, join, indent + 8, block.id)) return false;
+                        if (!target || !emit_region(*target, join, indent + 8, block.id, depth + 1)) return false;
                         out << std::string(indent + 8, ' ') << "break;\n" << labels << "}\n";
                     }
                     out << spaces << "}\n";
@@ -10126,9 +12825,9 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     if (!join || *join == current || (stop && !postdominators[*join].contains(*stop))) return false;
                     const std::string spaces(indent, ' ');
                     out << spaces << "if (" << branch_condition_text(*conditional) << ") {\n";
-                    if (!emit_region(*true_target, join, indent + 4, block.id)) return false;
+                    if (!emit_region(*true_target, join, indent + 4, block.id, depth + 1)) return false;
                     out << spaces << "} else {\n";
-                    if (!emit_region(*false_target, join, indent + 4, block.id)) return false;
+                    if (!emit_region(*false_target, join, indent + 4, block.id, depth + 1)) return false;
                     out << spaces << "}\n";
                     if (stop && *join == *stop) return true;
                     current = *join;
@@ -10149,7 +12848,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         };
 
         out << "function " << address_label(function.entry) << "() {\n";
-        if (!emit_region(*entry_index, {}, 4, {}) || emitted.size() != count) {
+        if (!emit_region(*entry_index, {}, 4, {}, 0) || emitted.size() != count) {
             out.str(std::string{});
             out.clear();
             return {};

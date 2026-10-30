@@ -98,6 +98,26 @@ struct MachOCommandString {
     std::string name;
     bool operator==(const MachOCommandString &) const = default;
 };
+// One bounded, NUL-terminated option string from LC_LINKER_OPTION.
+struct MachOLinkerOption {
+    std::uint32_t command_index = 0, option_index = 0;
+    std::uint64_t record_file_offset = 0, string_file_offset = 0;
+    std::string option;
+    bool operator==(const MachOLinkerOption &) const = default;
+};
+struct MachODyldEnvironment {
+    std::uint32_t command_index = 0, name_offset = 0;
+    std::uint64_t record_file_offset = 0;
+    std::string value;
+    bool operator==(const MachODyldEnvironment &) const = default;
+};
+struct MachOUuid {
+    std::uint32_t command_index = 0;
+    std::uint64_t record_file_offset = 0;
+    std::uint64_t value_file_offset = 0;
+    std::array<std::uint8_t, 16> bytes{};
+    bool operator==(const MachOUuid &) const = default;
+};
 struct MachOBuildToolVersion {
     std::uint32_t tool = 0, version = 0;
     bool operator==(const MachOBuildToolVersion &) const = default;
@@ -114,6 +134,14 @@ struct MachOSourceVersion {
     std::uint64_t record_file_offset = 0, packed = 0;
     std::uint32_t major = 0, minor = 0, patch = 0, build = 0, prerelease = 0;
     bool operator==(const MachOSourceVersion &) const = default;
+};
+// LC_NOTE records a bounded opaque data span owned by the fixed 16-byte name.
+struct MachONote {
+    std::uint32_t command_index = 0;
+    std::uint64_t record_file_offset = 0, data_size = 0;
+    std::string data_owner;
+    FileOffset data_offset{};
+    bool operator==(const MachONote &) const = default;
 };
 // A bounded LC_FILESET_ENTRY declaration. Child commands are range-checked,
 // but child images are not mapped or recursively imported into this image.
@@ -154,6 +182,9 @@ struct MachOCompactUnwindFunction {
     std::uint32_t section = 0, page = 0, index = 0, encoding = 0;
     std::uint64_t record_file_offset = 0, function_offset = 0;
     std::optional<Address> address;
+    // End of this indexed interval is the next compact-unwind entry, or the
+    // next top-level index row for the final entry on a page.
+    std::uint64_t size = 0;
     bool operator==(const MachOCompactUnwindFunction &) const = default;
 };
 struct MachOEhFrameCallSite {
@@ -252,6 +283,17 @@ struct MachODynamicSymbolTable {
     std::array<MachODataTable, 6> tables;
     std::vector<std::uint32_t> indirect_symbols;
     bool operator==(const MachODynamicSymbolTable &) const = default;
+};
+enum class MachOIndirectBindingKind : std::uint8_t { symbol, local, absolute, reserved_flags };
+struct MachOIndirectSymbolBinding {
+    std::uint32_t dynamic_symbol_table_command = 0, section_ordinal = 0;
+    std::uint8_t section_type = 0;
+    std::optional<std::uint32_t> symbol_table_command, symbol_index;
+    std::uint64_t slot_index = 0, section_offset = 0;
+    std::uint32_t indirect_table_index = 0, raw_symbol_index = 0;
+    MachOIndirectBindingKind kind = MachOIndirectBindingKind::symbol;
+    std::optional<FileOffset> slot_file_offset;
+    bool operator==(const MachOIndirectSymbolBinding &) const = default;
 };
 enum class MachORelocationSource { section, external, local };
 enum class MachORelocationKind {
@@ -362,20 +404,69 @@ struct MachOChainedStarts {
     bool complete = true;
     bool operator==(const MachOChainedStarts &) const = default;
 };
+enum class MachOChainedTargetBaseKind : std::uint8_t {
+    shared_cache,
+    cache_level
+};
 struct MachOChainedPointer {
     std::uint32_t header = 0, starts = 0, page_index = 0, chain_start_index = 0, node_index = 0;
     std::uint64_t segment_offset = 0, raw = 0;
     std::uint16_t next = 0, diversity = 0;
     std::uint8_t field_size = 0, stride = 0, high8 = 0, key = 0;
+    // Kernel-cache pointer formats select one of four cache-level bases.
+    std::optional<std::uint8_t> cache_level;
+    // The encoded target is an offset into a base not carried by a standalone
+    // Mach-O image; expose which external mapping is needed to resolve it.
+    std::optional<MachOChainedTargetBaseKind> target_base_kind;
     bool bind = false, authenticated = false, address_diversity = false, target_is_offset = false;
     bool non_pointer = false, complete = true;
+    // False when the pointer bytes are encrypted or overlap another chain
+    // field, so later context-based target resolution must not interpret them.
+    bool source_interpretation_valid = true;
     // Target payload is unassembled; high8 and authentication are separate.
     std::optional<std::uint64_t> target, import_row;
     std::optional<std::uint32_t> import_index, scalar_value;
     std::int64_t addend = 0;
     std::optional<Address> place;
     std::optional<FileOffset> file_place;
+    // Address-resolvable in-image rebases retain their mapped destination.
+    // Format 14's segment index/offset and unauthenticated preferred-base
+    // offsets can be mapped; PAC is retained as metadata and never applied.
+    std::optional<Address> target_address;
     bool operator==(const MachOChainedPointer &) const = default;
+};
+// One source-backed offset from the firmware __TEXT,__chain_starts table.
+// The row identifies a chain's first pointer location, not its rebased target.
+struct MachOChainStartOffset {
+    std::uint32_t section_ordinal = 0, index = 0, pointer_format = 0, coordinate_flags = 0;
+    std::uint64_t raw_offset = 0, record_file_offset = 0;
+    std::optional<Address> pointer_address;
+    std::optional<FileOffset> pointer_file_offset;
+    bool complete = true;
+    // First node index and total count in firmware_chained_pointers. Nodes
+    // from different chains can interleave; select them by chain_start_row.
+    // chain_complete describes traversal only; authenticated/bind nodes still
+    // have no resolved target.
+    std::uint32_t first_pointer_row = 0, pointer_count = 0;
+    bool chain_complete = false;
+    bool operator==(const MachOChainStartOffset &) const = default;
+};
+// A node walked from __TEXT,__chain_starts, independent of LC_DYLD_CHAINED_FIXUPS
+// header/import namespaces. Every published node retains its original word.
+struct MachOFirmwareChainedPointer {
+    std::uint32_t chain_start_row = 0, node_index = 0;
+    std::uint64_t raw = 0;
+    std::uint16_t next = 0, diversity = 0;
+    std::uint8_t field_size = 0, stride = 4, high8 = 0, key = 0;
+    bool bind = false, authenticated = false, address_diversity = false, target_is_offset = false;
+    bool complete = true;
+    std::optional<std::uint64_t> target;
+    std::optional<std::uint32_t> import_index;
+    std::int64_t addend = 0;
+    Address place{};
+    FileOffset file_place{};
+    std::optional<Address> target_address;
+    bool operator==(const MachOFirmwareChainedPointer &) const = default;
 };
 struct MachOLinkeditDeclaration {
     std::uint32_t command_index = 0, command = 0, raw_offset = 0, size = 0;
@@ -393,9 +484,13 @@ struct MachOCodeSignatureBlob {
     bool code_directory = false;
     bool operator==(const MachOCodeSignatureBlob &) const = default;
 };
+enum class MachODataInCodeKind : std::uint16_t {
+    data = 1, jump_table8 = 2, jump_table16 = 3, jump_table32 = 4, absolute_jump_table32 = 5
+};
 struct MachODataInCode {
     std::uint32_t table = 0, index = 0, raw_offset = 0;
     std::uint16_t length = 0, kind = 0;
+    std::optional<MachODataInCodeKind> decoded_kind;
     std::uint64_t record_file_offset = 0;
     // Object records use object VM coordinates. Backing remains absent when
     // those declarations cannot identify one unique initialized section.
@@ -419,8 +514,12 @@ struct MachOMetadata {
     bool symbols_complete = true;
     std::vector<MachOLibrary> libraries;
     std::vector<MachOCommandString> paths;
+    std::vector<MachOLinkerOption> linker_options;
+    std::vector<MachODyldEnvironment> dyld_environments;
+    std::vector<MachOUuid> uuids;
     std::vector<MachOBuildVersion> build_versions;
     std::vector<MachOSourceVersion> source_versions;
+    std::vector<MachONote> notes;
     std::vector<MachOFileSetEntry> fileset_entries;
     std::vector<MachOEntry> entries;
     std::vector<MachOInitializer> initializers;
@@ -428,6 +527,8 @@ struct MachOMetadata {
     std::vector<MachOCompactUnwindFunction> compact_unwind_functions;
     std::vector<MachOEhFrameFunction> eh_frame_functions;
     std::vector<MachODynamicSymbolTable> dynamic_symbol_tables;
+    std::vector<MachOIndirectSymbolBinding> indirect_symbol_bindings;
+    bool indirect_symbol_bindings_complete = true;
     bool commands_complete = true, entries_conflict = false;
     std::vector<MachORelocationTable> relocation_tables;
     std::vector<MachORelocation> relocations;
@@ -440,6 +541,8 @@ struct MachOMetadata {
     std::vector<MachOChainedImport> chained_imports;
     std::vector<MachOChainedStarts> chained_starts;
     std::vector<MachOChainedPointer> chained_pointers;
+    std::vector<MachOChainStartOffset> chain_start_offsets;
+    std::vector<MachOFirmwareChainedPointer> firmware_chained_pointers;
     bool dyld_complete = true;
     // Signature bytes are declared, never authenticated by this parser.
     std::vector<MachOLinkeditDeclaration> data_in_code_tables, code_signatures;

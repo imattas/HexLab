@@ -67,8 +67,10 @@ inline Result<bool> populate_dex_switch_table(const Image &image, Instruction &i
     const auto expected_ident = instruction.dex_switch->packed ? 0x0100u : 0x0200u;
     if (ident != expected_ident)
         return fail(ErrorCode::malformed, "DEX switch opcode references the wrong payload kind");
-    if (count > 64)
-        return fail(ErrorCode::resource_limit, "DEX switch exceeds the 64-case analysis limit");
+    // Bound CFG expansion and derived-cache records while allowing larger
+    // tables than the former 64-case display limit.
+    if (count > 1024)
+        return fail(ErrorCode::resource_limit, "DEX switch exceeds the 1024-case analysis limit");
     const std::size_t header_size = instruction.dex_switch->packed ? 8 : 4;
     const std::size_t item_size = instruction.dex_switch->packed ? 4 : 8;
     if (count > (std::numeric_limits<std::size_t>::max() - header_size) / item_size)

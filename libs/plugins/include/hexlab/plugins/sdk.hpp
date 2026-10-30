@@ -11,14 +11,59 @@ namespace hexlab::plugins::sdk {
 inline constexpr std::uint32_t abi_major = HEXLAB_PLUGIN_ABI_MAJOR;
 inline constexpr std::uint32_t abi_minor = HEXLAB_PLUGIN_ABI_MINOR;
 
+namespace detail {
+template <typename Record>
+inline bool initialize_page_records(Record* records, std::uint32_t capacity,
+                                    std::uint32_t maximum = HEXLAB_PROJECT_MAX_PAGE) noexcept {
+    if (capacity > maximum || (capacity && !records)) return false;
+    for (std::uint32_t i = 0; i < capacity; ++i)
+        records[i].struct_size = static_cast<std::uint32_t>(sizeof(Record));
+    return true;
+}
+} // namespace detail
+
+/* Revision-checked opaque state scoped to this plugin ID. The host retains
+   it across this module's unload/reload while the PluginManager is alive. */
+class PluginStateClient {
+public:
+    PluginStateClient() = default;
+    explicit PluginStateClient(const HexLabHostApi* host) noexcept {
+        if (HEXLAB_PLUGIN_HAS_FIELD(host, HexLabHostApi, plugin_state_api) && host->plugin_state_api &&
+            HEXLAB_PLUGIN_HAS_FIELD(host->plugin_state_api, HexLabPluginStateApi, erase) &&
+            host->plugin_state_api->api_version == HEXLAB_PLUGIN_STATE_API_VERSION &&
+            host->plugin_state_api->get && host->plugin_state_api->set && host->plugin_state_api->erase)
+            api_ = host->plugin_state_api;
+    }
+    bool available() const noexcept { return api_ != nullptr; }
+    int32_t get(const char* key, uint8_t* output, uint32_t capacity,
+                uint32_t& required, uint64_t& revision) const noexcept {
+        required = 0; revision = 0;
+        if (!api_ || (capacity && !output)) return HEXLAB_PLUGIN_STATE_INVALID;
+        return api_->get(api_->host_context, key, capacity, output, &required, &revision);
+    }
+    int32_t set(const char* key, uint64_t expected_revision, const uint8_t* value,
+                uint32_t size, uint64_t& new_revision) const noexcept {
+        new_revision = 0;
+        if (!api_) return HEXLAB_PLUGIN_STATE_FAILED;
+        return api_->set(api_->host_context, key, expected_revision, value, size, &new_revision);
+    }
+    int32_t erase(const char* key, uint64_t expected_revision,
+                  uint64_t& new_revision) const noexcept {
+        new_revision = 0;
+        if (!api_) return HEXLAB_PLUGIN_STATE_FAILED;
+        return api_->erase(api_->host_context, key, expected_revision, &new_revision);
+    }
+private:
+    const HexLabPluginStateApi* api_ = nullptr;
+};
+
 /* RAII client for the optional host-owned project service table. */
 class ProjectClient {
 public:
     ProjectClient() = default;
     explicit ProjectClient(const HexLabHostApi* host) noexcept {
-        constexpr auto required = offsetof(HexLabHostApi, project_api) + sizeof(host->project_api);
-        if (host && host->struct_size >= required && host->project_api &&
-            host->project_api->struct_size >= offsetof(HexLabProjectApi, functions) + sizeof(host->project_api->functions) &&
+        if (HEXLAB_PLUGIN_HAS_FIELD(host, HexLabHostApi, project_api) && host->project_api &&
+            HEXLAB_PLUGIN_HAS_FIELD(host->project_api, HexLabProjectApi, functions) &&
             host->project_api->api_version == HEXLAB_PROJECT_API_VERSION &&
             host->project_api->create && host->project_api->open && host->project_api->close &&
             host->project_api->analyze && host->project_api->summary && host->project_api->functions)
@@ -48,6 +93,14 @@ public:
         return status;
     }
     int32_t analyze() noexcept { return api_ && project_ && api_->analyze ? api_->analyze(api_->host_context, project_) : -1; }
+    int32_t undo(std::uint64_t expected_edit_revision) noexcept {
+        if (!supports_history() || !project_) return HEXLAB_PROJECT_HISTORY_INVALID;
+        return api_->undo(api_->host_context, project_, expected_edit_revision);
+    }
+    int32_t redo(std::uint64_t expected_edit_revision) noexcept {
+        if (!supports_history() || !project_) return HEXLAB_PROJECT_HISTORY_INVALID;
+        return api_->redo(api_->host_context, project_, expected_edit_revision);
+    }
     int32_t summary(HexLabProjectSummary& result) noexcept {
         result = {}; result.struct_size = sizeof(result);
         return api_ && project_ && api_->summary ? api_->summary(api_->host_context, project_, &result) : -1;
@@ -55,30 +108,81 @@ public:
     int32_t functions(uint64_t start, uint32_t capacity, HexLabFunction* output, uint32_t& written) noexcept {
         written = 0;
         if (!api_ || !project_ || !api_->functions) return -1;
+        if (!detail::initialize_page_records(output, capacity)) return -1;
         return api_->functions(api_->host_context, project_, start, capacity, output, &written);
+    }
+    int32_t function_owners(uint32_t address_space, uint64_t address,
+                            uint64_t start, uint32_t capacity,
+                            HexLabFunctionOwner* output, uint32_t& written) noexcept {
+        written = 0;
+        if (!supports_function_owners() || !project_) return -1;
+        if (!detail::initialize_page_records(output, capacity)) return -1;
+        return api_->function_owners(api_->host_context, project_, address_space, address,
+                                     start, capacity, output, &written);
+    }
+    int32_t instructions_text(uint64_t start, uint32_t capacity,
+                              HexLabInstructionText* output, uint32_t& written) noexcept {
+        written = 0;
+        if (!supports_instruction_text() || !project_ ||
+            !detail::initialize_page_records(output, capacity)) return -1;
+        return api_->instructions_text(api_->host_context, project_, start, capacity,
+                                       output, &written);
+    }
+    int32_t block_instructions_text(uint64_t block_id, uint64_t start, uint32_t capacity,
+                                    HexLabInstructionText* output,
+                                    uint32_t& written) noexcept {
+        written = 0;
+        if (!supports_instruction_text() || !project_ ||
+            !detail::initialize_page_records(output, capacity)) return -1;
+        return api_->block_instructions_text(api_->host_context, project_, block_id,
+                                             start, capacity, output, &written);
     }
     int32_t instructions(uint64_t start, uint32_t capacity, HexLabInstruction* output, uint32_t& written) noexcept {
         written = 0;
         if (!supports_instructions() || !project_) return -1;
+        if (!detail::initialize_page_records(output, capacity)) return -1;
         return api_->instructions(api_->host_context, project_, start, capacity, output, &written);
     }
     int32_t references(uint32_t source_space, uint64_t source, uint64_t start, uint32_t capacity,
                        HexLabReference* output, uint32_t& written) noexcept {
         written = 0;
         if (!supports_references() || !project_) return -1;
+        if (!detail::initialize_page_records(output, capacity)) return -1;
         return api_->references(api_->host_context, project_, source_space, source, start,
                                 capacity, output, &written);
+    }
+    int32_t outgoing_references_range(uint32_t begin_space, uint64_t begin, uint64_t size,
+                                      uint64_t start, uint32_t capacity,
+                                      HexLabReference* output, uint32_t& written) noexcept {
+        written = 0;
+        if (!supports_outgoing_references_range() || !project_ || size == 0 ||
+            !detail::initialize_page_records(output, capacity)) return -1;
+        return api_->outgoing_references_range(api_->host_context, project_, begin_space,
+            begin, size, start, capacity, output, &written);
     }
     int32_t strings(uint64_t start, uint32_t capacity, HexLabString* output, uint32_t& written) noexcept {
         written = 0;
         if (!supports_strings() || !project_) return -1;
+        if (!detail::initialize_page_records(output, capacity)) return -1;
         return api_->strings(api_->host_context, project_, start, capacity, output, &written);
+    }
+    int32_t strings_text(uint64_t start, uint32_t capacity,
+                         HexLabStringText* output, uint32_t& written) noexcept {
+        written = 0;
+        if (!supports_string_text() || !project_ ||
+            !detail::initialize_page_records(output, capacity)) return -1;
+        return api_->strings_text(api_->host_context, project_, start, capacity, output, &written);
+    }
+    int32_t strings_preview(uint64_t start, uint32_t capacity,
+                            HexLabStringText* output, uint32_t& written) noexcept {
+        return strings_text(start, capacity, output, written);
     }
     int32_t function_blocks(uint32_t address_space, uint64_t function_entry, uint64_t start,
                             uint32_t capacity, HexLabBasicBlock* output,
                             uint32_t& written) noexcept {
         written = 0;
         if (!supports_control_flow() || !project_) return -1;
+        if (!detail::initialize_page_records(output, capacity)) return -1;
         return api_->function_blocks(api_->host_context, project_, address_space,
                                      function_entry, start, capacity, output, &written);
     }
@@ -86,6 +190,7 @@ public:
                                HexLabInstruction* output, uint32_t& written) noexcept {
         written = 0;
         if (!supports_control_flow() || !project_) return -1;
+        if (!detail::initialize_page_records(output, capacity)) return -1;
         return api_->block_instructions(api_->host_context, project_, block_id,
                                         start, capacity, output, &written);
     }
@@ -93,6 +198,7 @@ public:
                              HexLabBlockSuccessor* output, uint32_t& written) noexcept {
         written = 0;
         if (!supports_control_flow() || !project_) return -1;
+        if (!detail::initialize_page_records(output, capacity)) return -1;
         return api_->block_successors(api_->host_context, project_, block_id,
                                       start, capacity, output, &written);
     }
@@ -107,6 +213,12 @@ public:
     int32_t bookmark(const HexLabProjectLocation& location, const char* label, bool remove = false) noexcept {
         if (!supports_edits() || !project_) return -1;
         return api_->bookmark(api_->host_context, project_, &location, label, remove ? 1u : 0u);
+    }
+    int32_t annotation_batch(std::uint64_t expected_edit_revision, std::uint64_t group,
+                             const HexLabProjectAnnotationEdit* edits, std::uint32_t count) noexcept {
+        if (!supports_annotation_batch() || !project_) return -1;
+        return api_->annotation_batch(api_->host_context, project_, expected_edit_revision,
+                                      group, edits, count);
     }
     int32_t read(const HexLabProjectLocation& location, uint32_t size, uint8_t* output) noexcept {
         if (!supports_read() || !project_) return -1;
@@ -124,6 +236,7 @@ public:
                   uint32_t& written) noexcept {
         written = 0;
         if (!supports_types() || !project_) return -1;
+        if (!detail::initialize_page_records(output, capacity)) return -1;
         return api_->types(api_->host_context, project_, start, capacity, output, &written);
     }
     int32_t assign_type(uint32_t address_space, uint64_t address, uint64_t type_id,
@@ -136,40 +249,63 @@ public:
                          uint32_t& written) noexcept {
         written = 0;
         if (!supports_declarations() || !project_) return -1;
+        if (!detail::initialize_page_records(output, capacity)) return -1;
         return api_->declarations(api_->host_context, project_, start, capacity, output, &written);
     }
     int32_t enum_values(uint64_t type_id, uint64_t start, uint32_t capacity,
                         HexLabEnumConstantRecord* output, uint32_t& written) noexcept {
         written = 0;
         if (!supports_declarations() || !project_) return -1;
+        if (!detail::initialize_page_records(output, capacity)) return -1;
         return api_->enum_values(api_->host_context, project_, type_id, start, capacity, output, &written);
     }
     bool supports_instructions() const noexcept {
-        return api_ && api_->struct_size >= offsetof(HexLabProjectApi, instructions) + sizeof(api_->instructions) && api_->instructions;
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, instructions) && api_->instructions;
     }
     bool supports_references() const noexcept {
-        return api_ && api_->struct_size >= offsetof(HexLabProjectApi, references) + sizeof(api_->references) && api_->references;
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, references) && api_->references;
+    }
+    bool supports_outgoing_references_range() const noexcept {
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, outgoing_references_range) &&
+               api_->outgoing_references_range;
     }
     bool supports_strings() const noexcept {
-        return api_ && api_->struct_size >= offsetof(HexLabProjectApi, strings) + sizeof(api_->strings) && api_->strings;
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, strings) && api_->strings;
     }
     bool supports_control_flow() const noexcept {
-        return api_ && api_->struct_size >= offsetof(HexLabProjectApi, block_successors) + sizeof(api_->block_successors) &&
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, block_successors) &&
                api_->function_blocks && api_->block_instructions && api_->block_successors;
     }
     bool supports_edits() const noexcept {
-        return api_ && api_->struct_size >= offsetof(HexLabProjectApi, bookmark) + sizeof(api_->bookmark) &&
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, bookmark) &&
                api_->rename && api_->comment && api_->bookmark;
     }
+    bool supports_annotation_batch() const noexcept {
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, annotation_batch) && api_->annotation_batch;
+    }
+    bool supports_history() const noexcept {
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, redo) && api_->undo && api_->redo;
+    }
+    bool supports_function_owners() const noexcept {
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, function_owners) && api_->function_owners;
+    }
+    bool supports_instruction_text() const noexcept {
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, block_instructions_text) &&
+               api_->instructions_text && api_->block_instructions_text;
+    }
+    bool supports_string_text() const noexcept {
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, strings_text) && api_->strings_text;
+    }
+    bool supports_string_preview() const noexcept { return supports_string_text(); }
     bool supports_read() const noexcept {
-        return api_ && api_->struct_size >= offsetof(HexLabProjectApi, read) + sizeof(api_->read) && api_->read;
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, read) && api_->read;
     }
     bool supports_types() const noexcept {
-        return api_ && api_->struct_size >= offsetof(HexLabProjectApi, assign_type) + sizeof(api_->assign_type) &&
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, assign_type) &&
                api_->import_header && api_->types && api_->assign_type;
     }
     bool supports_declarations() const noexcept {
-        return api_ && api_->struct_size >= offsetof(HexLabProjectApi, enum_values) + sizeof(api_->enum_values) &&
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabProjectApi, enum_values) &&
                api_->declarations && api_->enum_values;
     }
     void reset() noexcept {
@@ -187,9 +323,8 @@ class DebuggerClient {
 public:
     DebuggerClient() = default;
     explicit DebuggerClient(const HexLabHostApi* host) noexcept {
-        constexpr auto required = offsetof(HexLabHostApi, debugger_api) + sizeof(host->debugger_api);
-        if (host && host->struct_size >= required && host->debugger_api &&
-            host->debugger_api->struct_size >= offsetof(HexLabDebuggerApi, processes) + sizeof(host->debugger_api->processes) &&
+        if (HEXLAB_PLUGIN_HAS_FIELD(host, HexLabHostApi, debugger_api) && host->debugger_api &&
+            HEXLAB_PLUGIN_HAS_FIELD(host->debugger_api, HexLabDebuggerApi, processes) &&
             host->debugger_api->api_version == HEXLAB_DEBUGGER_API_VERSION &&
             host->debugger_api->create && host->debugger_api->close)
             api_ = host->debugger_api;
@@ -206,35 +341,190 @@ public:
     ~DebuggerClient() { reset(); }
     bool available() const noexcept { return api_ != nullptr; }
     bool supports(const void* member, std::size_t offset, std::size_t size) const noexcept {
-        return api_ && api_->struct_size >= offset + size && member;
+        return api_ && hexlab_plugin_field_available(api_, offsetof(HexLabDebuggerApi, struct_size),
+                                                       offset, size) && member;
     }
     int32_t create(uint32_t backend = HEXLAB_DEBUGGER_BACKEND_NATIVE) noexcept {
-        reset(); return api_ && api_->create ? api_->create(api_->host_context, backend, &session_) : -1;
+        reset();
+        if (!api_ || !api_->create) return -1;
+        session_ = nullptr;
+        const auto status = api_->create(api_->host_context, backend, &session_);
+        if (status != 0 || !session_) {
+            reset();
+            return status != 0 ? status : -1;
+        }
+        return 0;
+    }
+    int32_t processes(uint64_t start, uint32_t capacity,
+                      HexLabDebugProcess* output, uint32_t& written) const noexcept {
+        written = 0;
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, processes) ||
+            !api_->processes ||
+            !detail::initialize_page_records(output, capacity, HEXLAB_DEBUGGER_MAX_PAGE)) return -1;
+        return api_->processes(api_->host_context, session_, start, capacity, output, &written);
+    }
+    int32_t threads(std::uint64_t start, std::uint32_t capacity,
+                    HexLabDebugThread* output, std::uint32_t& written) const noexcept {
+        written = 0;
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, threads) ||
+            !api_->threads ||
+            !detail::initialize_page_records(output, capacity, HEXLAB_DEBUGGER_MAX_PAGE)) return -1;
+        return api_->threads(api_->host_context, session_, start, capacity, output, &written);
+    }
+    int32_t modules(std::uint64_t start, std::uint32_t capacity,
+                    HexLabDebugModule* output, std::uint32_t& written) const noexcept {
+        written = 0;
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, modules) ||
+            !api_->modules ||
+            !detail::initialize_page_records(output, capacity, HEXLAB_DEBUGGER_MAX_PAGE)) return -1;
+        return api_->modules(api_->host_context, session_, start, capacity, output, &written);
+    }
+    int32_t memory_regions(std::uint64_t start, std::uint32_t capacity,
+                           HexLabDebugMemoryRegion* output,
+                           std::uint32_t& written) const noexcept {
+        written = 0;
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, memory_regions) ||
+            !api_->memory_regions ||
+            !detail::initialize_page_records(output, capacity, HEXLAB_DEBUGGER_MAX_PAGE)) return -1;
+        return api_->memory_regions(api_->host_context, session_, start, capacity, output, &written);
+    }
+    int32_t launch(const HexLabDebuggerTarget& target, HexLabDebugProcess& process) noexcept {
+        process = {};
+        process.struct_size = sizeof(process);
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, launch) || !api_->launch)
+            return -1;
+        auto initialized_target = target;
+        initialized_target.struct_size = sizeof(initialized_target);
+        return api_->launch(api_->host_context, session_, &initialized_target, &process);
+    }
+    int32_t attach(std::uint64_t process_id, HexLabDebugProcess& process) noexcept {
+        process = {};
+        process.struct_size = sizeof(process);
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, attach) || !api_->attach)
+            return -1;
+        return api_->attach(api_->host_context, session_, process_id, &process);
+    }
+    int32_t connect_remote(const char* host_name, std::uint16_t port,
+                           HexLabDebugProcess& process) noexcept {
+        process = {};
+        process.struct_size = sizeof(process);
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, connect_remote) ||
+            !api_->connect_remote) return -1;
+        return api_->connect_remote(api_->host_context, session_, host_name, port, &process);
+    }
+    int32_t state(std::uint32_t& debugger_state, std::uint8_t& has_process,
+                  HexLabDebugProcess& process) const noexcept {
+        debugger_state = 0;
+        has_process = 0;
+        process = {};
+        process.struct_size = sizeof(process);
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, state) || !api_->state)
+            return -1;
+        return api_->state(api_->host_context, session_, &debugger_state, &has_process, &process);
+    }
+    int32_t detach() noexcept {
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, detach) || !api_->detach)
+            return -1;
+        return api_->detach(api_->host_context, session_);
+    }
+    int32_t request_interrupt() noexcept {
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, request_interrupt) ||
+            !api_->request_interrupt) return -1;
+        return api_->request_interrupt(api_->host_context, session_);
+    }
+    int32_t continue_event(std::uint64_t sequence, std::uint32_t status) noexcept {
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, continue_event) ||
+            !api_->continue_event) return -1;
+        return api_->continue_event(api_->host_context, session_, sequence, status);
+    }
+    int32_t single_step_event(std::uint64_t sequence, std::uint32_t status) noexcept {
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, single_step_event) ||
+            !api_->single_step_event) return -1;
+        return api_->single_step_event(api_->host_context, session_, sequence, status);
+    }
+    int32_t add_breakpoint(std::uint64_t address, std::uint32_t kind, std::uint8_t size,
+                           HexLabDebugBreakpoint& breakpoint) noexcept {
+        breakpoint = {};
+        breakpoint.struct_size = sizeof(breakpoint);
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, add_breakpoint) ||
+            !api_->add_breakpoint) return -1;
+        return api_->add_breakpoint(api_->host_context, session_, address, kind, size, &breakpoint);
+    }
+    int32_t remove_breakpoint(std::uint64_t id) noexcept {
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, remove_breakpoint) ||
+            !api_->remove_breakpoint) return -1;
+        return api_->remove_breakpoint(api_->host_context, session_, id);
+    }
+    int32_t set_breakpoint_enabled(std::uint64_t id, bool enabled) noexcept {
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, set_breakpoint_enabled) ||
+            !api_->set_breakpoint_enabled) return -1;
+        return api_->set_breakpoint_enabled(api_->host_context, session_, id, enabled ? 1u : 0u);
+    }
+    int32_t breakpoints(std::uint64_t start, std::uint32_t capacity,
+                        HexLabDebugBreakpoint* output, std::uint32_t& written) const noexcept {
+        written = 0;
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, breakpoints) ||
+            !api_->breakpoints ||
+            !detail::initialize_page_records(output, capacity, HEXLAB_DEBUGGER_MAX_PAGE)) return -1;
+        return api_->breakpoints(api_->host_context, session_, start, capacity, output, &written);
+    }
+    int32_t read_memory(std::uint64_t address, std::uint32_t size, std::uint8_t* output) const noexcept {
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, read_memory) ||
+            !api_->read_memory || !size || size > HEXLAB_DEBUGGER_MAX_IO || !output) return -1;
+        return api_->read_memory(api_->host_context, session_, address, size, output);
+    }
+    int32_t write_memory(std::uint64_t address, std::uint32_t size,
+                         const std::uint8_t* input) const noexcept {
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, write_memory) ||
+            !api_->write_memory || !size || size > HEXLAB_DEBUGGER_MAX_IO || !input) return -1;
+        return api_->write_memory(api_->host_context, session_, address, size, input);
+    }
+    int32_t read_registers(std::uint64_t thread_id, std::uint64_t start, std::uint32_t capacity,
+                           HexLabDebugRegister* output, std::uint32_t& written) const noexcept {
+        written = 0;
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, read_registers) ||
+            !api_->read_registers ||
+            !detail::initialize_page_records(output, capacity, HEXLAB_DEBUGGER_MAX_PAGE)) return -1;
+        return api_->read_registers(api_->host_context, session_, thread_id, start, capacity,
+                                    output, &written);
+    }
+    int32_t write_registers(std::uint64_t thread_id, std::uint32_t count,
+                            HexLabDebugRegister* input) const noexcept {
+        if (!session_ || !HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, write_registers) ||
+            !api_->write_registers ||
+            !detail::initialize_page_records(input, count, HEXLAB_DEBUGGER_MAX_PAGE) || !count) return -1;
+        return api_->write_registers(api_->host_context, session_, thread_id, count, input);
+    }
+    int32_t wait_event_text(std::uint32_t timeout_ms, HexLabDebugEventText& event) const noexcept {
+        event = {};
+        event.struct_size = sizeof(event);
+        if (!session_ || !supports_event_text()) return -1;
+        return api_->wait_event_text(api_->host_context, session_, timeout_ms, &event);
+    }
+    bool supports_event_text() const noexcept {
+        return HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, wait_event_text) &&
+               api_->wait_event_text;
     }
     int32_t set_breakpoint_ignore_count(uint64_t id, uint64_t count) const noexcept {
-        return session_ && supports(api_ ? api_->set_breakpoint_ignore_count : nullptr,
-                                    offsetof(HexLabDebuggerApi, set_breakpoint_ignore_count),
-                                    sizeof(api_->set_breakpoint_ignore_count))
+        return session_ && HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, set_breakpoint_ignore_count) &&
+            api_->set_breakpoint_ignore_count
             ? api_->set_breakpoint_ignore_count(api_->host_context, session_, id, count) : -1;
     }
     int32_t set_breakpoint_condition(uint64_t id, const char* expression) const noexcept {
-        return session_ && supports(api_ ? api_->set_breakpoint_condition : nullptr,
-                                    offsetof(HexLabDebuggerApi, set_breakpoint_condition),
-                                    sizeof(api_->set_breakpoint_condition))
+        return session_ && HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, set_breakpoint_condition) &&
+            api_->set_breakpoint_condition
             ? api_->set_breakpoint_condition(api_->host_context, session_, id, expression) : -1;
     }
     int32_t set_breakpoint_logpoint(uint64_t id, bool enabled, const char* message) const noexcept {
-        return session_ && supports(api_ ? api_->set_breakpoint_logpoint : nullptr,
-                                    offsetof(HexLabDebuggerApi, set_breakpoint_logpoint),
-                                    sizeof(api_->set_breakpoint_logpoint))
+        return session_ && HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, set_breakpoint_logpoint) &&
+            api_->set_breakpoint_logpoint
             ? api_->set_breakpoint_logpoint(api_->host_context, session_, id,
                                             enabled ? 1u : 0u, message) : -1;
     }
     int32_t breakpoint_rule(uint64_t id, HexLabDebugBreakpointRule& rule) const noexcept {
         rule = {}; rule.struct_size = sizeof(rule);
-        return session_ && supports(api_ ? api_->breakpoint_rule : nullptr,
-                                    offsetof(HexLabDebuggerApi, breakpoint_rule),
-                                    sizeof(api_->breakpoint_rule))
+        return session_ && HEXLAB_PLUGIN_HAS_FIELD(api_, HexLabDebuggerApi, breakpoint_rule) &&
+            api_->breakpoint_rule
             ? api_->breakpoint_rule(api_->host_context, session_, id, &rule) : -1;
     }
     void reset() noexcept {
@@ -255,9 +545,8 @@ class ActiveDocumentClient {
 public:
     ActiveDocumentClient() = default;
     explicit ActiveDocumentClient(const HexLabHostApi* host) noexcept {
-        constexpr auto required = offsetof(HexLabHostApi, active_document_api) + sizeof(host->active_document_api);
-        if (host && host->struct_size >= required && host->active_document_api &&
-            host->active_document_api->struct_size >= offsetof(HexLabActiveDocumentApi, navigate) + sizeof(host->active_document_api->navigate) &&
+        if (HEXLAB_PLUGIN_HAS_FIELD(host, HexLabHostApi, active_document_api) && host->active_document_api &&
+            HEXLAB_PLUGIN_HAS_FIELD(host->active_document_api, HexLabActiveDocumentApi, navigate) &&
             host->active_document_api->api_version == HEXLAB_ACTIVE_DOCUMENT_API_VERSION &&
             host->active_document_api->query && host->active_document_api->read && host->active_document_api->navigate)
             api_ = host->active_document_api;
@@ -289,9 +578,8 @@ class ActiveProjectBreakpointClient {
 public:
     ActiveProjectBreakpointClient() = default;
     explicit ActiveProjectBreakpointClient(const HexLabHostApi* host) noexcept {
-        constexpr auto required = offsetof(HexLabHostApi, active_project_breakpoint_api) + sizeof(host->active_project_breakpoint_api);
-        if (host && host->struct_size >= required && host->active_project_breakpoint_api &&
-            host->active_project_breakpoint_api->struct_size >= offsetof(HexLabActiveProjectBreakpointApi, set) + sizeof(host->active_project_breakpoint_api->set) &&
+        if (HEXLAB_PLUGIN_HAS_FIELD(host, HexLabHostApi, active_project_breakpoint_api) && host->active_project_breakpoint_api &&
+            HEXLAB_PLUGIN_HAS_FIELD(host->active_project_breakpoint_api, HexLabActiveProjectBreakpointApi, set) &&
             host->active_project_breakpoint_api->api_version == HEXLAB_ACTIVE_PROJECT_BREAKPOINT_API_VERSION &&
             host->active_project_breakpoint_api->snapshot && host->active_project_breakpoint_api->query && host->active_project_breakpoint_api->set)
             api_ = host->active_project_breakpoint_api;
@@ -303,6 +591,8 @@ public:
     }
     int32_t query(const HexLabActiveProjectToken& token, uint64_t start, uint32_t capacity,
                   HexLabProjectBreakpointRecord* output, uint32_t* written) const noexcept {
+        if (written) *written = 0;
+        if (!detail::initialize_page_records(output, capacity)) return -1;
         return api_ ? api_->query(api_->host_context, &token, start, capacity, output, written)
                     : HEXLAB_ACTIVE_DOCUMENT_FAILED;
     }
@@ -323,9 +613,8 @@ class ActiveDebuggerClient {
 public:
     ActiveDebuggerClient() = default;
     explicit ActiveDebuggerClient(const HexLabHostApi* host) noexcept {
-        constexpr auto required = offsetof(HexLabHostApi, active_debugger_api) + sizeof(host->active_debugger_api);
-        if (host && host->struct_size >= required && host->active_debugger_api &&
-            host->active_debugger_api->struct_size >= offsetof(HexLabActiveDebuggerApi, read_memory) + sizeof(host->active_debugger_api->read_memory) &&
+        if (HEXLAB_PLUGIN_HAS_FIELD(host, HexLabHostApi, active_debugger_api) && host->active_debugger_api &&
+            HEXLAB_PLUGIN_HAS_FIELD(host->active_debugger_api, HexLabActiveDebuggerApi, read_memory) &&
             host->active_debugger_api->api_version == HEXLAB_ACTIVE_DEBUGGER_API_VERSION &&
             host->active_debugger_api->query && host->active_debugger_api->threads &&
             host->active_debugger_api->read_registers && host->active_debugger_api->read_memory)

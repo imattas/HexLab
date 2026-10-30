@@ -3,7 +3,7 @@
 
 namespace hexlab {
 enum class ExchangeConflictPolicy { fail, skip, replace };
-enum class ExchangeRecordKind { annotation, bookmark, reference, region, function, type_definition, type_assignment, debug_variable, project_breakpoint };
+enum class ExchangeRecordKind { annotation, bookmark, reference, region, function, type_definition, type_assignment, debug_variable, project_breakpoint, patch };
 enum class ExchangeConflictResolution { kept_existing, imported, preserved_both };
 struct ExchangeConflict {
     ExchangeRecordKind kind = ExchangeRecordKind::annotation;
@@ -17,9 +17,10 @@ struct ExchangeImport {
     std::vector<ExchangeConflict> conflicts;
     std::size_t annotations = 0, bookmarks = 0, references = 0, regions = 0, functions = 0,
                 type_definitions = 0, type_assignments = 0, debug_variables = 0,
-                project_breakpoints = 0, skipped = 0;
+                project_breakpoints = 0, patches = 0, skipped = 0;
 };
-// Portable v7 also exchanges configured project breakpoints by stable file offset; runtime hit counts are excluded.
+// Portable v8 also exchanges configured byte patches by stable file offset and original/replacement bytes.
+// Portable v7 exchanges configured project breakpoints by stable file offset; runtime hit counts are excluded.
 // Portable v6 carries type and debug-variable records by portable names and source origins, never project IDs.
 // Input SHA256/size bind the exchange to identical original bytes; project/entity IDs are never serialized.
 HEXLAB_WORKSPACE_EXPORT Result<std::vector<std::byte>> export_project_exchange(const ProjectSnapshot &,

@@ -790,6 +790,18 @@ Result<std::shared_ptr<const ProjectState>> ProjectCollaboration::refresh(std::s
     });
 }
 
+Result<std::uint64_t> ProjectCollaboration::external_change_version(std::stop_token stop) {
+    return detail::guarded([&]() -> Result<std::uint64_t> {
+        std::lock_guard lock(impl_->mutex);
+        detail::Cancellation cancellation(*impl_->connection, stop);
+        auto query = take(impl_->connection->prepare("PRAGMA data_version"));
+        if (!take(query->step())) throw Failure{{ErrorCode::integrity, "SQLite data_version returned no value"}};
+        const auto version = take(query->integer(0));
+        if (version < 0) throw Failure{{ErrorCode::integrity, "SQLite data_version is negative"}};
+        return static_cast<std::uint64_t>(version);
+    });
+}
+
 Result<CollaborationSubmission> ProjectCollaboration::submit(
     std::uint64_t base_revision, const StateDelta& proposal, std::uint64_t group,
     std::stop_token stop) {

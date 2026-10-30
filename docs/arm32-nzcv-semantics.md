@@ -33,3 +33,11 @@ unmodeled shifter forms. Conditional execution is not applied: the caller
 decides whether the instruction executes and supplies the incoming flags for
 an executed instruction. This API does not model APSR side effects outside
 NZCV, exceptions, or a multi-instruction register/flag state.
+
+`evaluate_arm32_condition` computes the architectural EQ/NE, carry, sign,
+overflow, HI/LS, and GE/LT/GT/LE predicates from concrete NZCV values; AL
+returns true and condition 15 fails closed. The decoded
+`evaluate_arm32_instruction_predicate` applies A32 or Thumb predicate metadata,
+including an active Thumb IT condition. It returns no result when the Thumb IT
+state is unknown, and only reports whether the instruction is enabled: it does
+not execute the instruction, select a branch target, or update PC or NZCV.

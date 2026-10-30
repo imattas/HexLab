@@ -12,6 +12,12 @@
 
 namespace hexlab {
 namespace {
+constexpr std::size_t native_instruction_window = 15;
+constexpr std::size_t wasm_instruction_window = 32;
+std::size_t instruction_window(DecodeContext context) noexcept {
+    return context.architecture == Architecture::wasm && context.mode == ExecutionMode::wasm32
+        ? wasm_instruction_window : native_instruction_window;
+}
 bool arm_predicate_can_skip(const Instruction &instruction) {
     return instruction.arm && (instruction.arm->predicate == ArmPredicate::condition ||
                                instruction.arm->predicate == ArmPredicate::unknown_it);
@@ -39,12 +45,40 @@ bool backed_executable(const Image &image, Address address) {
     const auto *segment = image.segment_at(address);
     return segment && segment->executable && address.offset - segment->begin.offset < segment->file_size;
 }
+std::optional<Address> dex_direct_call_target(const Instruction &instruction, const Image &image,
+                                              const ImageMetadata &metadata) {
+    if (instruction.context.architecture != Architecture::dex || instruction.flow != FlowKind::call ||
+        !metadata.dex)
+        return {};
+    const auto bytes = instruction.encoded_bytes();
+    if (bytes.size() < 4)
+        return {};
+    const auto opcode = std::to_integer<std::uint8_t>(bytes[0]);
+    // Virtual/interface dispatch depends on the receiver; invoke-super also
+    // requires class lookup. Only direct and static method IDs resolve here.
+    if (opcode != 0x70 && opcode != 0x71 && opcode != 0x76 && opcode != 0x77)
+        return {};
+    const auto method_index = static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(bytes[2])) |
+        (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(bytes[3])) << 8);
+    const auto &methods = metadata.dex->code;
+    const auto method = std::lower_bound(methods.begin(), methods.end(), method_index,
+        [](const DexMethodCode &candidate, std::uint32_t index) { return candidate.method_index < index; });
+    if (method == methods.end() || method->method_index != method_index || method_index == UINT32_MAX)
+        return {};
+    const Address target{AddressSpaceId{method_index + 1}, 0};
+    const auto *segment = image.segment_at(target);
+    const auto context = image.context_at(target);
+    if (!segment || !segment->executable || !context || context.value().architecture != Architecture::dex ||
+        context.value().mode != ExecutionMode::dex)
+        return {};
+    return target;
+}
 class InstructionByteCache {
   public:
     explicit InstructionByteCache(const Image &image, std::size_t window_capacity = 15)
         : image_(image), window_capacity_(window_capacity) {}
 
-    Result<std::size_t> read(Address address, std::array<std::byte, 15> &bytes) {
+    Result<std::size_t> read(Address address, std::span<std::byte> bytes) {
         std::size_t copied = 0;
         while (copied < bytes.size()) {
             const auto at = advance(address, copied);
@@ -126,9 +160,10 @@ Result<DecodeResult> decode_at(const Image &image, Address address) {
         return Error{ErrorCode::unsupported, "CPU mode has no enabled decoder"};
     if (!backed_executable(image, address))
         return Error{ErrorCode::out_of_bounds, "Location has no initialized executable bytes"};
-    std::array<std::byte, 15> input{};
-    InstructionByteCache byte_cache(image);
-    const auto count = byte_cache.read(address, input);
+    const auto window = instruction_window(context.value());
+    std::array<std::byte, wasm_instruction_window> input{};
+    InstructionByteCache byte_cache(image, window);
+    const auto count = byte_cache.read(address, std::span(input).first(window));
     if (!count)
         return count.error();
     return decode_instruction(context.value(), std::span<const std::byte>(input).first(count.value()), address);
@@ -194,6 +229,30 @@ Result<AnalysisSnapshot> analyze(const Image &image, const ImageMetadata &metada
                 if (code_allowed(root.at))
                     output.candidates.push_back(root.at);
             }
+        // PE exports are public callable entry points even when stripped
+        // symbol/debug metadata provides no other root for the function.
+        // Forwarded exports have no local address and are intentionally
+        // absent from this image's reachable code.
+        for (const auto &symbol : metadata.exports) {
+            if (stop.stop_requested())
+                return Error{ErrorCode::canceled, "Reachable PE export analysis canceled"};
+            if (symbol.address && code_allowed(*symbol.address)) {
+                queue_root(*symbol.address);
+                output.candidates.push_back(*symbol.address);
+            }
+        }
+        if (metadata.dex)
+            for (const auto &method : metadata.dex->code) {
+                if (stop.stop_requested())
+                    return Error{ErrorCode::canceled, "Reachable DEX method analysis canceled"};
+                if (method.method_index == UINT32_MAX)
+                    continue;
+                const Address entry{AddressSpaceId{method.method_index + 1}, 0};
+                if (code_allowed(entry)) {
+                    queue_root(entry);
+                    output.candidates.push_back(entry);
+                }
+            }
         if (metadata.elf)
             for (const auto &symbol : metadata.elf->symbols) {
                 if (stop.stop_requested())
@@ -230,6 +289,28 @@ Result<AnalysisSnapshot> analyze(const Image &image, const ImageMetadata &metada
                 if (start.address && code_allowed(*start.address)) {
                     queue_root(*start.address);
                     output.candidates.push_back(*start.address);
+                }
+            }
+        }
+        // TLS callbacks execute independently of the PE entry point. Match
+        // function discovery's load-base translation so entry-seeded
+        // reachable analysis includes those loader-invoked code roots too.
+        if (metadata.pe && metadata.pe->tls) {
+            auto load_base = metadata.preferred_base;
+            for (const auto &segment : image.layout().segments)
+                if (segment.name == "headers") {
+                    load_base = segment.begin.offset;
+                    break;
+                }
+            for (const auto &callback : metadata.pe->tls->callbacks) {
+                if (stop.stop_requested())
+                    return Error{ErrorCode::canceled, "Reachable PE TLS callback analysis canceled"};
+                if (callback.rva > UINT64_MAX - load_base)
+                    continue;
+                const Address at{image.layout().space.id, load_base + callback.rva};
+                if (code_allowed(at)) {
+                    queue_root(at);
+                    output.candidates.push_back(at);
                 }
             }
         }
@@ -295,8 +376,9 @@ Result<AnalysisSnapshot> analyze(const Image &image, const ImageMetadata &metada
                           "Thumb control flow has no source-backed clear IT root or propagated IT state");
                 continue;
             }
-            std::array<std::byte, 15> input{};
-            const auto available = byte_cache.read(address, input);
+            const auto decode_window = instruction_window(context.value());
+            std::array<std::byte, wasm_instruction_window> input{};
+            const auto available = byte_cache.read(address, std::span(input).first(decode_window));
             if (!available)
                 return available.error();
             DecodeResult decoded;
@@ -312,8 +394,9 @@ Result<AnalysisSnapshot> analyze(const Image &image, const ImageMetadata &metada
             }
             if (!decoded.instruction) {
                 terminate(address,
-                          decoded.status == DecodeStatus::truncated &&
-                                  available.value() == image.code_window(address, 15) && available.value() < 15
+                    decoded.status == DecodeStatus::truncated &&
+                                  available.value() == image.code_window(address, decode_window) &&
+                                  available.value() < decode_window
                               ? StopReason::image_exclusion
                           : decoded.status == DecodeStatus::unsupported ? StopReason::unsupported
                           : decoded.status == DecodeStatus::invalid     ? StopReason::invalid
@@ -494,11 +577,19 @@ Result<AnalysisSnapshot> analyze(const Image &image, const ImageMetadata &metada
                 fallthrough();
                 continue;
             }
-            const auto resolved = relocation_index.value().control_target(image, instruction, stop);
-            if (!resolved)
-                return resolved.error();
-            if (resolved.value()) {
-                const auto target = *resolved.value();
+            std::optional<Address> resolved_target;
+            if (instruction.context.architecture == Architecture::dex && instruction.flow == FlowKind::call) {
+                resolved_target = instruction.direct_target
+                    ? instruction.direct_target
+                    : dex_direct_call_target(instruction, image, metadata);
+            } else {
+                const auto resolved = relocation_index.value().control_target(image, instruction, stop);
+                if (!resolved)
+                    return resolved.error();
+                resolved_target = resolved.value();
+            }
+            if (resolved_target) {
+                const auto target = *resolved_target;
                 ThumbITState target_it{};
                 if (arm_mode) {
                     if (!instruction.arm || (!instruction.arm->target_mode &&

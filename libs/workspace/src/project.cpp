@@ -32,6 +32,36 @@ std::shared_ptr<ProjectSnapshot> project_bytes(const ProjectSnapshot& before,std
     canceled(stop);return output;
 }
 namespace {
+// These messages are not part of LoadedImage::diagnostics: that source contains
+// only an aggregate context-issue count. Keep the decoder's exact detail and
+// bounded file provenance, without treating a context RVA as a mapped address.
+std::vector<database::TypeImportDiagnostic> minidump_context_findings(const MinidumpMetadata& metadata,std::stop_token stop){
+    std::vector<database::TypeImportDiagnostic> rows;
+    std::size_t bytes=0;
+    bool capped=false;
+    const auto add=[&](const MinidumpContext& context,std::string provenance){
+        provenance+="; context RVA "+std::to_string(context.source_rva)+", size "+std::to_string(context.source_size)+": ";
+        for(const auto& message:context.diagnostics){
+            canceled(stop);
+            const auto cost=provenance.size()+message.size()+256;
+            if(rows.size()>=2047 || provenance.size()+message.size()>65536 || cost>4*1024*1024-512-bytes){capped=true;return;}
+            database::TypeImportDiagnostic row;row.source="Minidump register context";row.message=provenance+message;
+            rows.push_back(std::move(row));bytes+=cost;
+        }
+    };
+    // Loader bounds threads at 65,536 and decoded contexts at 4,096. Preserve
+    // stream order and reserve a row/512 bytes for a visible partial marker.
+    const auto count=std::min<std::size_t>(65536,metadata.threads.size());
+    for(std::size_t i=0;i<count && !capped;++i){
+        canceled(stop);const auto& thread=metadata.threads[i];
+        if(thread.context)add(*thread.context,"Thread record "+std::to_string(i)+", id "+std::to_string(thread.id));
+    }
+    if(!capped && metadata.exception && metadata.exception->context)
+        add(*metadata.exception->context,"Exception thread id "+std::to_string(metadata.exception->thread_id));
+    capped=capped || count<metadata.threads.size();
+    if(capped){database::TypeImportDiagnostic row;row.source="Minidump register context";row.message="Partial context diagnostic report: the 2,048-row, 4 MiB, 64 KiB-message or 65,536-thread bound was reached; further context findings were not persisted.";rows.push_back(std::move(row));}
+    return rows;
+}
 std::shared_ptr<const database::ProjectState> project_delta(const database::ProjectState& before,const database::StateDelta& delta){
     auto state=std::make_shared<database::ProjectState>(before);auto user=std::make_shared<database::UserState>(*before.user);state->user=user;
     for(auto& item:delta.changes)std::visit([&](auto& change){using T=std::decay_t<decltype(change)>;if constexpr(std::is_same_v<T,database::PatchChange>)user->patches=change.after;else{
@@ -57,6 +87,11 @@ Result<std::shared_ptr<ProjectSession>> ProjectSession::attach_impl(std::shared_
     if(prepared->loaded && session->store_->mode()!=database::ProjectMode::read_only){
         take(session->store_->replace_loader_diagnostics(prepared->loaded->diagnostics,
             prepared->loaded->runtime_relocation_diagnostics,stop));
+        if(prepared->loaded->metadata.minidump){
+            const auto key=take(project_analysis_key(*prepared,options));
+            const auto diagnostics=minidump_context_findings(*prepared->loaded->metadata.minidump,stop);
+            take(session->store_->replace_minidump_context_diagnostics(key,diagnostics,stop));
+        }
         prepared->state=take(session->store_->snapshot());
     }
     if(!analyze && prepared->loaded){prepared->status=DerivedStatus::pending;prepared->reason="Analysis pending";}session->snapshot_=std::move(prepared);if(analyze)take(session->refresh_analysis(stop));return session;
@@ -106,6 +141,14 @@ Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::replace_type_impo
         take(store_->replace_type_import_diagnostics(diagnostics,stop));
         auto next=std::make_shared<ProjectSnapshot>(*snapshot_);next->state=take(store_->snapshot());snapshot_=std::move(next);return snapshot_;
     });
+}
+Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::upsert_decompiler_diagnostics(const AnalysisKey& key,Address function_entry,
+    std::span<const database::TypeImportDiagnostic> diagnostics,std::stop_token stop){
+    return project_detail::guarded([&]()->Result<std::shared_ptr<const ProjectSnapshot>>{using namespace project_detail;std::lock_guard lock(mutex_);canceled(stop);
+        take(store_->upsert_decompiler_diagnostics(key,function_entry,diagnostics,stop));auto next=std::make_shared<ProjectSnapshot>(*snapshot_);next->state=take(store_->snapshot());snapshot_=std::move(next);return snapshot_;});
+}
+Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::replace_reviewed_analysis_issue_keys(std::span<const std::string> keys,std::stop_token stop){
+    return project_detail::guarded([&]()->Result<std::shared_ptr<const ProjectSnapshot>>{using namespace project_detail;std::lock_guard lock(mutex_);canceled(stop);take(store_->replace_reviewed_analysis_issue_keys(keys,stop));auto next=std::make_shared<ProjectSnapshot>(*snapshot_);next->state=take(store_->snapshot());snapshot_=std::move(next);return snapshot_;});
 }
 Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::refresh_analysis(std::stop_token stop){return project_detail::guarded([&]()->Result<std::shared_ptr<const ProjectSnapshot>>{
     using namespace project_detail;std::lock_guard lock(mutex_);canceled(stop);if(!snapshot_->loaded)return snapshot_;auto key=take(project_analysis_key(*snapshot_,options_));if(snapshot_->basis && snapshot_->basis->key==key && snapshot_->pending_byte_ranges.ranges().empty() && snapshot_->basis->decisions==snapshot_->state->user->decisions)return snapshot_;

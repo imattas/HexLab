@@ -1,6 +1,8 @@
 #include "hexlab/workspace/project_analysis.hpp"
 #include "hexlab/analysis/derived_cache.hpp"
 #include "project_internal.hpp"
+#include <span>
+#include <string_view>
 namespace hexlab {
 Result<AnalysisKey> project_analysis_key(const ProjectSnapshot &snapshot, const AnalysisOptions &options) {
     return project_detail::guarded([&]() -> Result<AnalysisKey> {
@@ -15,6 +17,8 @@ Result<AnalysisKey> project_analysis_key(const ProjectSnapshot &snapshot, const 
         Sha256 hash;
         take(hash.update(recipe));
         key.recipe_fingerprint = hash.digest();
+        if (snapshot.loaded)
+            key.external_input_fingerprint = snapshot.loaded->external_input_fingerprint;
         return key;
     });
 }
@@ -37,7 +41,7 @@ Result<ProjectAnalysis> compute_project_analysis(const ProjectAnalysisRequest &r
             if (snapshot.loaded->metadata.firmware)
                 return Error{ErrorCode::unsupported,
                     "Firmware records do not identify a processor mode; instruction analysis is unavailable"};
-            if (!request.force_full && !snapshot.basis && request.cache.status == database::CacheStatus::hit &&
+            if (!request.force_full && snapshot.loaded->external_inputs_certified && !snapshot.basis && request.cache.status == database::CacheStatus::hit &&
                 request.cache.payload) {
                 auto cached = decode_derived(*request.cache.payload, *snapshot.loaded->image, *metadata,
                                              snapshot.state->user->decisions, request.options, request.key, stop);
@@ -52,7 +56,7 @@ Result<ProjectAnalysis> compute_project_analysis(const ProjectAnalysisRequest &r
                                           : database::CacheStatus::corrupt;
                 output.cache_reason = "Derived cache recompute required: " + cached.error().message;
             }
-            if (!request.force_full && snapshot.basis &&
+            if (!request.force_full && snapshot.loaded->external_inputs_certified && snapshot.basis &&
                 snapshot.basis->key.engine_fingerprint == request.key.engine_fingerprint) {
                 auto changes = effective_changes(*snapshot.basis->image->storage(), *snapshot.effective,
                                                  snapshot.pending_byte_ranges, stop);
@@ -76,7 +80,7 @@ Result<ProjectAnalysis> compute_project_analysis(const ProjectAnalysisRequest &r
             output.derived.full_reason = output.reason;
         } else {
             output.derived = std::move(derived.value());
-            if (!from_cache && request.encode_cache && snapshot.mode == database::ProjectMode::read_write) {
+            if (!from_cache && snapshot.loaded->external_inputs_certified && request.encode_cache && snapshot.mode == database::ProjectMode::read_write) {
                 auto encoded =
                     encode_derived(output.derived, stop, output.derived.counters.cache_serialization_decodes,
                                    request.options);

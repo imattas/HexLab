@@ -21,6 +21,7 @@ class GraphView final : public wxPanel {
     wxChoice *call_depth_;
     wxStaticText *status_;
     wxButton *show_listing_, *show_pseudocode_;
+    wxButton *copy_graph_json_ = nullptr;
     wxStaticText *search_status_;
     wxTextCtrl *search_;
     std::optional<Sha256Digest> search_graph_key_;
@@ -41,5 +42,6 @@ class GraphView final : public wxPanel {
     void refresh_items();
     void refresh_status();
     void find_node(int direction, bool restart);
+    void copy_graph_json();
 };
 } // namespace hexlab::desktop

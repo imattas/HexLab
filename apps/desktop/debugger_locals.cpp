@@ -24,9 +24,11 @@
 #include <charconv>
 #include <climits>
 #include <cstdio>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
+#include <span>
 #include <string_view>
 
 namespace hexlab::desktop {
@@ -211,6 +213,15 @@ std::optional<std::uint64_t> dwarf_register_number(Architecture architecture, st
             const auto index = parse_register_index(std::string_view(reg).substr(1));
             if (index && *index <= 31) return *index;
         }
+    } else if (architecture == Architecture::mips32) {
+        static constexpr std::string_view aliases[] = {"zero","at","v0","v1","a0","a1","a2","a3",
+            "t0","t1","t2","t3","t4","t5","t6","t7","s0","s1","s2","s3",
+            "s4","s5","s6","s7","t8","t9","k0","k1","gp","sp","s8","ra"};
+        for (std::uint64_t i = 0; i < std::size(aliases); ++i) if (reg == aliases[i]) return i;
+        if (reg.size() >= 2 && reg[0] == 'r') {
+            const auto index = parse_register_index(std::string_view(reg).substr(1));
+            if (index && *index <= 31) return *index;
+        }
     }
     return std::nullopt;
 }
@@ -226,6 +237,36 @@ std::optional<std::uint64_t> dwarf_reg_value(Architecture architecture, std::uin
                                               const std::vector<debugger::RegisterValue> &registers) {
     const auto *reg = dwarf_register(architecture, number, registers);
     return reg ? register_value(*reg) : std::nullopt;
+}
+
+std::optional<ElfMipsInstructionMode> mips_instruction_mode(
+    const std::vector<debugger::RegisterValue> &registers) {
+    std::optional<ElfMipsInstructionMode> selected;
+    std::optional<std::uint64_t> mips16, micromips;
+    for (const auto &reg : registers) {
+        std::optional<ElfMipsInstructionMode> described;
+        if (reg.target_architecture == "mips:16") described = ElfMipsInstructionMode::mips16;
+        else if (reg.target_architecture == "mips:micromips") described = ElfMipsInstructionMode::micromips;
+        if (described) {
+            if (selected && *selected != *described) return std::nullopt;
+            selected = described;
+        }
+        const auto name = lower(reg.name);
+        if (name != "mips16" && name != "micromips") continue;
+        const auto value = register_value(reg);
+        if (!value || *value > 1) return std::nullopt;
+        auto &observed = name == "mips16" ? mips16 : micromips;
+        if (observed && *observed != *value) return std::nullopt;
+        observed = *value;
+        if (*value == 0) continue;
+        const auto mode = name == "mips16" ? ElfMipsInstructionMode::mips16 :
+                                             ElfMipsInstructionMode::micromips;
+        if (selected && *selected != mode) return std::nullopt;
+        selected = mode;
+    }
+    if (selected == ElfMipsInstructionMode::mips16 && mips16 == 0) return std::nullopt;
+    if (selected == ElfMipsInstructionMode::micromips && micromips == 0) return std::nullopt;
+    return selected.value_or(ElfMipsInstructionMode::classic);
 }
 
 std::string hex_value(std::uint64_t value) {
@@ -246,6 +287,258 @@ std::uint8_t address_size(const Image &image) {
 constexpr std::array<std::string_view, 17> x64_register_names = {
     "RAX", "RDX", "RCX", "RBX", "RSI", "RDI", "RBP", "RSP",
     "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15", "RIP"};
+
+// Linux x86-64 rt_sigframe: pretcode, then ucontext_t; mcontext.gregs is
+// ordered as asm/sigcontext.h. We accept only an unambiguous candidate whose
+// FP image carries the kernel's XSAVE magic and matching trailing extent.
+std::optional<std::vector<debugger::RegisterValue>> linux_x64_signal_context(
+    std::uint64_t stack_pointer,
+    const std::function<Result<std::vector<std::byte>>(std::uint64_t, std::size_t)> &read_memory) {
+    constexpr std::uint64_t scan_bytes = 64 * 1024;
+    constexpr std::size_t frame_header = 8 + 40 + 192;
+    constexpr std::uint32_t xstate_magic1 = 0x46505853;
+    constexpr std::uint32_t xstate_magic2 = 0x46505845;
+    const auto read_u64 = [](std::span<const std::byte> bytes, std::size_t at) {
+        std::uint64_t value{};
+        for (unsigned i = 0; i < 8; ++i)
+            value |= std::uint64_t(std::to_integer<std::uint8_t>(bytes[at + i])) << (i * 8);
+        return value;
+    };
+    const auto read_u32 = [](std::span<const std::byte> bytes, std::size_t at) {
+        std::uint32_t value{};
+        for (unsigned i = 0; i < 4; ++i)
+            value |= std::uint32_t(std::to_integer<std::uint8_t>(bytes[at + i])) << (i * 8);
+        return value;
+    };
+    const auto read_u16 = [](std::span<const std::byte> bytes, std::size_t at) {
+        return std::uint16_t(std::to_integer<std::uint8_t>(bytes[at])) |
+            (std::uint16_t(std::to_integer<std::uint8_t>(bytes[at + 1])) << 8);
+    };
+    std::optional<std::vector<debugger::RegisterValue>> accepted;
+    if (stack_pointer > UINT64_MAX - 7) return {};
+    const auto end = stack_pointer > UINT64_MAX - scan_bytes ? UINT64_MAX : stack_pointer + scan_bytes;
+    if (end < frame_header) return {};
+    const auto last = end - frame_header;
+    for (auto candidate = (stack_pointer + 7) & ~std::uint64_t{7}; candidate <= last; candidate += 8) {
+        if (candidate > UINT64_MAX - frame_header) break;
+        auto bytes = read_memory(candidate, frame_header);
+        if (!bytes || bytes.value().size() != frame_header) continue;
+        const auto span = std::span<const std::byte>(bytes.value());
+        // ucontext starts after pretcode; mcontext starts after flags/link/stack.
+        const auto sc = std::size_t{8 + 40};
+        const auto fpstate = read_u64(span, sc + 184);
+        if (!fpstate || fpstate > UINT64_MAX - 512 || (fpstate & 15)) continue;
+        auto legacy = read_memory(fpstate, 512);
+        if (!legacy || legacy.value().size() != 512) continue;
+        auto fp = std::span<const std::byte>(legacy.value());
+        if (read_u32(fp, 464) != xstate_magic1) continue;
+        const auto extent = read_u32(fp, 468);
+        if (extent < 580 || extent > 65536 || fpstate > UINT64_MAX - extent) continue;
+        auto full = read_memory(fpstate, extent);
+        if (!full || full.value().size() != extent || read_u32(full.value(), extent - 4) != xstate_magic2) continue;
+
+        // sigcontext has fixed Linux kernel GPR offsets; reject non-user selectors
+        // and noncanonical addresses before publishing any saved register.
+        const auto rip = read_u64(span, sc + 128), rsp = read_u64(span, sc + 120);
+        const auto cs = read_u16(span, sc + 144), ss = read_u16(span, sc + 150);
+        const auto user_address = [](std::uint64_t value) { return value != 0 && value < (std::uint64_t{1} << 57); };
+        if (!user_address(rip) || !user_address(rsp) || (cs & 3) != 3 || (ss & 3) != 3) continue;
+        constexpr std::array<std::pair<std::string_view, std::size_t>, 17> fields = {{
+            {"RAX", 104}, {"RDX", 96}, {"RCX", 112}, {"RBX", 88}, {"RSI", 72}, {"RDI", 64},
+            {"RBP", 80}, {"RSP", 120}, {"R8", 0}, {"R9", 8}, {"R10", 16}, {"R11", 24},
+            {"R12", 32}, {"R13", 40}, {"R14", 48}, {"R15", 56}, {"RIP", 128}}};
+        std::vector<debugger::RegisterValue> regs;
+        regs.reserve(fields.size());
+        for (const auto &[name, offset] : fields) {
+            debugger::RegisterValue reg; reg.name = name; reg.byte_order = ByteOrder::little;
+            const auto value = read_u64(span, sc + offset);
+            reg.bytes.resize(8);
+            for (unsigned i = 0; i < 8; ++i) reg.bytes[i] = static_cast<std::byte>((value >> (i * 8)) & 0xff);
+            regs.push_back(std::move(reg));
+        }
+        if (accepted) return {}; // Multiple valid frames are ambiguous.
+        accepted = std::move(regs);
+        if (last - candidate < 8) break;
+    }
+    return accepted;
+}
+
+// Linux AArch64 rt_sigframe: siginfo_t, ucontext_t, then sigcontext.  The
+// fixed sigcontext saves x0-x30, sp, pc and pstate.  Its 4 KiB reserved area
+// contains aligned _aarch64_ctx records; FPSIMD and ESR are decoded while
+// unknown extension records are skipped only after validating their extents.
+std::optional<std::vector<debugger::RegisterValue>> linux_arm64_signal_context(
+    std::uint64_t stack_pointer,
+    const std::function<Result<std::vector<std::byte>>(std::uint64_t, std::size_t)> &read_memory) {
+    constexpr std::uint64_t scan_bytes = 64 * 1024;
+    constexpr std::size_t siginfo_size = 128;
+    constexpr std::size_t ucontext_prefix_size = 40;
+    constexpr std::size_t sigcontext_offset = siginfo_size + ucontext_prefix_size;
+    constexpr std::size_t sigcontext_fixed_size = 8 + 31 * 8 + 3 * 8;
+    constexpr std::size_t reserved_size = 4096;
+    constexpr std::size_t reserved_offset = sigcontext_offset + sigcontext_fixed_size;
+    constexpr std::size_t frame_size = reserved_offset + reserved_size;
+    constexpr std::uint32_t fpsimd_magic = 0x46508001;
+    constexpr std::uint32_t esr_magic = 0x45535201;
+    constexpr std::uint32_t extra_magic = 0x45585401;
+    constexpr std::size_t max_extra_bytes = 256 * 1024;
+
+    const auto read_u32 = [](std::span<const std::byte> bytes, std::size_t at) {
+        std::uint32_t value{};
+        for (unsigned i = 0; i < 4; ++i)
+            value |= std::uint32_t(std::to_integer<std::uint8_t>(bytes[at + i])) << (i * 8);
+        return value;
+    };
+    const auto read_u64 = [](std::span<const std::byte> bytes, std::size_t at) {
+        std::uint64_t value{};
+        for (unsigned i = 0; i < 8; ++i)
+            value |= std::uint64_t(std::to_integer<std::uint8_t>(bytes[at + i])) << (i * 8);
+        return value;
+    };
+    const auto append_scalar = [](std::vector<debugger::RegisterValue> &out, std::string name,
+                                  std::uint64_t value, std::size_t width, const char *group) {
+        debugger::RegisterValue reg;
+        reg.name = std::move(name);
+        reg.group = group;
+        reg.byte_order = ByteOrder::little;
+        reg.bytes.resize(width);
+        for (std::size_t i = 0; i < width; ++i)
+            reg.bytes[i] = static_cast<std::byte>((value >> (i * 8)) & 0xff);
+        out.push_back(std::move(reg));
+    };
+
+    if (stack_pointer > UINT64_MAX - 15) return {};
+    const auto first = (stack_pointer + 15) & ~std::uint64_t{15};
+    if (first > UINT64_MAX - scan_bytes - frame_size) return {};
+    // Read one bounded candidate window and inspect only the fixed PC/SP/PSTATE
+    // fields first. Full frame reads are reserved for plausible candidates.
+    const auto probe_size = static_cast<std::size_t>(scan_bytes) + sigcontext_offset + 8 + 31 * 8 + 3 * 8;
+    auto probe = read_memory(first, probe_size);
+    if (!probe || probe.value().size() != probe_size) return {};
+    const auto probe_span = std::span<const std::byte>(probe.value());
+
+    auto decode_candidate = [&](std::span<const std::byte> frame, std::uint64_t frame_address)
+        -> std::optional<std::vector<debugger::RegisterValue>> {
+        if (frame.size() != frame_size) return {};
+        const auto sc = sigcontext_offset;
+        const auto saved_sp = read_u64(frame, sc + 8 + 31 * 8);
+        const auto saved_pc = read_u64(frame, sc + 8 + 32 * 8);
+        const auto saved_pstate = read_u64(frame, sc + 8 + 33 * 8);
+        // EL0t is the only user mode represented by this 64-bit frame. Requiring
+        // aligned user SP and an aligned PC keeps ordinary stack data from being
+        // accepted as a saved signal context.
+        if (!saved_pc || (saved_pc & 3) || !saved_sp || (saved_sp & 15) ||
+            (saved_pstate & 0xf) != 0 || (saved_sp >> 56) != 0 || (saved_pc >> 56) != 0)
+            return {};
+
+        std::vector<debugger::RegisterValue> regs;
+        regs.reserve(31 + 3 + 32 * 2 + 3);
+        for (std::size_t i = 0; i < 31; ++i)
+            append_scalar(regs, "X" + std::to_string(i), read_u64(frame, sc + 8 + i * 8), 8, "general");
+        append_scalar(regs, "SP", saved_sp, 8, "general");
+        append_scalar(regs, "PC", saved_pc, 8, "general");
+        append_scalar(regs, "PSTATE", saved_pstate, 8, "status");
+
+        bool seen_fpsimd = false;
+        bool seen_esr = false;
+        std::function<bool(std::span<const std::byte>, bool, std::uint64_t)> parse_records;
+        parse_records = [&](std::span<const std::byte> area, bool allow_extra,
+                            std::uint64_t area_address) -> bool {
+            std::size_t offset = 0;
+            for (std::size_t record_count = 0; record_count < 512; ++record_count) {
+                if (offset > area.size() || area.size() - offset < 8 || (offset & 15)) return false;
+                const auto magic = read_u32(area, offset);
+                const auto size = read_u32(area, offset + 4);
+                if (!magic) return size == 0;
+                if (size < 16 || (size & 15) || size > area.size() - offset) return false;
+                if (magic == fpsimd_magic) {
+                    if (seen_fpsimd || size != 528) return false;
+                    seen_fpsimd = true;
+                    append_scalar(regs, "FPSR", read_u32(area, offset + 8), 4, "vector-status");
+                    append_scalar(regs, "FPCR", read_u32(area, offset + 12), 4, "vector-status");
+                    for (std::size_t i = 0; i < 32; ++i) {
+                        const auto begin = offset + 16 + i * 16;
+                        debugger::RegisterValue v;
+                        v.name = "V" + std::to_string(i);
+                        v.group = "vector";
+                        v.number = static_cast<std::uint32_t>(i);
+                        v.byte_order = ByteOrder::little;
+                        v.bytes.assign(area.begin() + static_cast<std::ptrdiff_t>(begin),
+                                       area.begin() + static_cast<std::ptrdiff_t>(begin + 16));
+                        regs.push_back(std::move(v));
+                        debugger::RegisterValue d;
+                        d.name = "D" + std::to_string(i);
+                        d.group = "vector";
+                        d.number = static_cast<std::uint32_t>(i);
+                        d.byte_order = ByteOrder::little;
+                        d.bytes.assign(area.begin() + static_cast<std::ptrdiff_t>(begin),
+                                       area.begin() + static_cast<std::ptrdiff_t>(begin + 8));
+                        regs.push_back(std::move(d));
+                    }
+                } else if (magic == esr_magic) {
+                    if (seen_esr || size != 16) return false;
+                    seen_esr = true;
+                    append_scalar(regs, "ESR", read_u64(area, offset + 8), 8, "system");
+                } else if (magic == extra_magic) {
+                    if (!allow_extra || size != 32 || offset + 40 > area.size() ||
+                        area_address > UINT64_MAX - offset - 40) return false;
+                    // The kernel ABI requires EXTRA_CONTEXT to be followed by
+                    // the reserved-area terminator, and its extension to end in
+                    // another terminator. Nested extra areas are rejected.
+                    if (read_u32(area, offset + 32) != 0 || read_u32(area, offset + 36) != 0)
+                        return false;
+                    const auto address = read_u64(area, offset + 8);
+                    const auto extent = read_u32(area, offset + 16);
+                    const auto expected_address = area_address + offset + 40;
+                    if (read_u32(area, offset + 20) || read_u32(area, offset + 24) ||
+                        read_u32(area, offset + 28) || !address || (address & 15) ||
+                        address != expected_address ||
+                        extent < 16 || extent > max_extra_bytes || (extent & 15) ||
+                        address > UINT64_MAX - extent)
+                        return false;
+                    auto extended = read_memory(address, extent);
+                    if (!extended || extended.value().size() != extent ||
+                        !parse_records(extended.value(), false, address))
+                        return false;
+                    return true;
+                }
+                offset += size;
+            }
+            return false;
+        };
+
+        const auto reserved = frame.subspan(reserved_offset, reserved_size);
+        if (frame_address > UINT64_MAX - reserved_offset ||
+            !parse_records(reserved, true, frame_address + reserved_offset)) return {};
+        return regs;
+    };
+
+    std::optional<std::vector<debugger::RegisterValue>> accepted;
+    const auto last = first + scan_bytes;
+    for (auto candidate = first; candidate <= last; candidate += 16) {
+        const auto offset64 = candidate - first;
+        if (offset64 > probe_span.size() - (sigcontext_offset + sigcontext_fixed_size)) break;
+        const auto offset = static_cast<std::size_t>(offset64);
+        const auto sc = offset + sigcontext_offset;
+        const auto saved_sp = read_u64(probe_span, sc + 8 + 31 * 8);
+        const auto saved_pc = read_u64(probe_span, sc + 8 + 32 * 8);
+        const auto pstate = read_u64(probe_span, sc + 8 + 33 * 8);
+        if (!saved_pc || (saved_pc & 3) || !saved_sp || (saved_sp & 15) ||
+            (pstate & 0xf) != 0 || (saved_sp >> 56) != 0 || (saved_pc >> 56) != 0)
+            continue;
+        if (candidate > UINT64_MAX - frame_size) break;
+        auto full = read_memory(candidate, frame_size);
+        if (!full || full.value().size() != frame_size) continue;
+        auto regs = decode_candidate(full.value(), candidate);
+        if (!regs) continue;
+        const auto pc = read_u64(full.value(), sigcontext_offset + 8 + 32 * 8);
+        if (!pc) continue;
+        if (accepted) return {}; // More than one plausible frame is ambiguous.
+        accepted = std::move(regs);
+        if (last - candidate < 16) break;
+    }
+    return accepted;
+}
 constexpr std::array<std::string_view, 22> arm64_register_names = {
     "X19", "X20", "X21", "X22", "X23", "X24", "X25", "X26", "X27", "X28",
     "X29", "X30", "SP", "PC", "D8", "D9", "D10", "D11", "D12", "D13", "D14", "D15"};
@@ -254,6 +547,9 @@ constexpr std::array<std::string_view, 16> arm_register_names = {
 constexpr std::array<std::string_view, 33> riscv_register_names = {
     "X0", "X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8", "X9", "X10", "X11", "X12", "X13", "X14", "X15",
     "X16", "X17", "X18", "X19", "X20", "X21", "X22", "X23", "X24", "X25", "X26", "X27", "X28", "X29", "X30", "X31", "PC"};
+constexpr std::array<std::string_view, 32> mips32_register_names = {
+    "ZERO", "AT", "V0", "V1", "A0", "A1", "A2", "A3", "T0", "T1", "T2", "T3", "T4", "T5", "T6", "T7",
+    "S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "T8", "T9", "K0", "K1", "GP", "SP", "S8", "RA"};
 
 std::optional<MachOUnwindRegister> macho_x64_register(std::string_view name) {
     const auto normalized = lower(name);
@@ -313,17 +609,42 @@ std::string byte_preview(std::span<const std::byte> bytes) {
     return result;
 }
 
-std::optional<std::uint64_t> pdb_register_number(Architecture architecture, std::uint16_t cv) {
+struct PdbRegisterLocation {
+    std::uint64_t dwarf_number = 0;
+    std::size_t width = 0;
+};
+
+std::optional<PdbRegisterLocation> pdb_register_location(Architecture architecture, std::uint16_t cv) {
     // CodeView register identifiers from cvconst.h. Keep this deliberately
     // narrow: an unknown identifier must never be treated as a guessed value.
     if (architecture == Architecture::x86_64) {
         static constexpr std::uint64_t dwarf_numbers[] = {0,3,2,1,4,5,6,7,8,9,10,11,12,13,14,15};
-        if (cv >= 328 && cv <= 343) return dwarf_numbers[cv - 328];
+        if (cv >= 328 && cv <= 343) return PdbRegisterLocation{dwarf_numbers[cv - 328], 8};
     } else if (architecture == Architecture::x86) {
         static constexpr std::uint16_t ids[] = {17,18,19,20,21,22,23,24};
-        for (std::uint64_t i = 0; i < std::size(ids); ++i) if (cv == ids[i]) return i;
+        for (std::uint64_t i = 0; i < std::size(ids); ++i)
+            if (cv == ids[i]) return PdbRegisterLocation{i, 4};
+    } else if (architecture == Architecture::arm64) {
+        // LLVM CodeViewRegisters.def / cvconst.h: W0-W30 are 10-40,
+        // X0-X28 are 50-78, then FP/LR/SP are 79-81. Do not map ZR/WZR:
+        // DWARF register 31 denotes SP in this evaluator.
+        if (cv >= 10 && cv <= 40) return PdbRegisterLocation{static_cast<std::uint64_t>(cv - 10), 4};
+        if (cv >= 50 && cv <= 78) return PdbRegisterLocation{static_cast<std::uint64_t>(cv - 50), 8};
+        if (cv == 79) return PdbRegisterLocation{29, 8};
+        if (cv == 80) return PdbRegisterLocation{30, 8};
+        if (cv == 81) return PdbRegisterLocation{31, 8};
     }
     return std::nullopt;
+}
+
+std::optional<std::uint64_t> pdb_register_value(Architecture architecture, std::uint16_t cv,
+                                                const std::vector<debugger::RegisterValue> &registers) {
+    const auto location = pdb_register_location(architecture, cv);
+    if (!location || location->width == 0 || location->width > 8) return std::nullopt;
+    auto value = dwarf_reg_value(architecture, location->dwarf_number, registers);
+    if (!value) return std::nullopt;
+    if (location->width < 8) *value &= (std::uint64_t{1} << (location->width * 8)) - 1;
+    return value;
 }
 
 // Bind the whole extent, never just its first byte. Section ordinals belong
@@ -574,6 +895,12 @@ std::vector<DebuggerStackFrame> debugger_stack_frames_at(
     std::size_t max_frames, std::uint64_t preferred_base, const ElfMetadata *elf, const PeMetadata *pe) {
     std::vector<DebuggerStackFrame> frames;
     if (architecture == Architecture::arm) runtime_pc &= ~UINT64_C(1);
+    const auto mips_mode = architecture == Architecture::mips32
+        ? mips_instruction_mode(registers)
+        : std::optional{ElfMipsInstructionMode::classic};
+    if (!mips_mode) return frames;
+    if (architecture == Architecture::mips32 && *mips_mode != ElfMipsInstructionMode::classic)
+        runtime_pc &= ~UINT64_C(1);
     if (!runtime_pc || !max_frames) return frames;
     max_frames = std::min<std::size_t>(max_frames, 128);
     frames.push_back({runtime_pc, {}, registers, 0});
@@ -647,16 +974,18 @@ std::vector<DebuggerStackFrame> debugger_stack_frames_at(
         return frames;
     }
     if (elf && (architecture == Architecture::x86_64 || architecture == Architecture::arm64 ||
-        architecture == Architecture::arm || architecture == Architecture::riscv32 || architecture == Architecture::riscv64) &&
+        architecture == Architecture::arm || architecture == Architecture::mips32 || architecture == Architecture::riscv32 || architecture == Architecture::riscv64) &&
         read_memory && runtime_pc >= module_base &&
         (!module_size || runtime_pc - module_base < module_size)) {
         const bool arm64 = architecture == Architecture::arm64;
         const bool arm = architecture == Architecture::arm;
+        const bool mips32 = architecture == Architecture::mips32;
         const bool riscv = architecture == Architecture::riscv32 || architecture == Architecture::riscv64;
-        const std::uint64_t sp_register = arm64 ? 31 : arm ? 13 : riscv ? 2 : 7;
+        const std::uint64_t sp_register = arm64 ? 31 : arm ? 13 : mips32 ? 29 : riscv ? 2 : 7;
         const auto width = static_cast<std::uint8_t>(elf->header.is_64 ? 8 : 4);
         const bool matching_elf = (architecture == Architecture::x86_64 && elf->header.machine == 62 && width == 8) ||
             (arm64 && elf->header.machine == 183 && width == 8) || (arm && elf->header.machine == 40 && width == 4) ||
+            (mips32 && elf->header.machine == 8 && width == 4) ||
             (architecture == Architecture::riscv32 && elf->header.machine == 243 && width == 4) ||
             (architecture == Architecture::riscv64 && elf->header.machine == 243 && width == 8);
         if (!matching_elf || elf->header.order != image.layout().space.order) return frames;
@@ -673,7 +1002,7 @@ std::vector<DebuggerStackFrame> debugger_stack_frames_at(
             const auto value = register_value(reg);
             if (number && value) {
                 // Scalar ARM/RISC-V snapshots must have the target's full width.
-                if ((arm || riscv) && (reg.bytes.size() != width || reg.byte_order != elf->header.order)) continue;
+                if ((arm || mips32 || riscv) && (reg.bytes.size() != width || reg.byte_order != elf->header.order)) continue;
                 if (const auto duplicate = context.find(*number); duplicate != context.end() && duplicate->second != *value)
                     return frames;
                 context[*number] = *value;
@@ -683,6 +1012,70 @@ std::vector<DebuggerStackFrame> debugger_stack_frames_at(
         auto current_runtime_pc = runtime_pc;
         std::uint64_t previous_sp = context.contains(sp_register) ? context.at(sp_register) : 0;
         std::vector<std::uint64_t> seen{runtime_pc};
+        // The first live PC may be inside a Linux signal handler. Recognize
+        // architecture-specific rt_sigframe records conservatively; ambiguous
+        // or malformed candidates leave the live context untouched.
+        if (architecture == Architecture::x86_64 && frames.size() < max_frames) {
+            if (const auto live_sp = context.find(7); live_sp != context.end()) {
+                auto saved = linux_x64_signal_context(live_sp->second, read_memory);
+                if (saved) {
+                    const auto saved_pc = std::find_if(saved->begin(), saved->end(), [](const auto &reg) { return reg.name == "RIP"; });
+                    const auto saved_sp = std::find_if(saved->begin(), saved->end(), [](const auto &reg) { return reg.name == "RSP"; });
+                    if (saved_pc != saved->end() && saved_sp != saved->end()) {
+                        const auto pc = register_value(*saved_pc), sp = register_value(*saved_sp);
+                        if (pc && sp && *pc >= module_base && (!module_size || *pc - module_base < module_size)) {
+                            const auto offset = *pc - module_base;
+                            const auto candidate_static_pc = static_base <= UINT64_MAX - offset ? static_base + offset : 0;
+                            const Address address{image.layout().space.id, candidate_static_pc};
+                            const auto *segment = candidate_static_pc ? image.segment_at(address) : nullptr;
+                            if (segment && segment->executable && image.code_window(address, 1)) {
+                                context.clear();
+                                for (const auto &reg : *saved) {
+                                    if (const auto number = dwarf_register_number(architecture, reg.name))
+                                        context[*number] = *register_value(reg);
+                                }
+                                frames.push_back({*pc, {}, std::move(*saved), frames.size()});
+                                current_runtime_pc = *pc;
+                                static_pc = candidate_static_pc;
+                                previous_sp = *sp;
+                                seen.push_back(*pc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (architecture == Architecture::arm64 && frames.size() < max_frames) {
+            if (const auto live_sp = context.find(31); live_sp != context.end()) {
+                auto saved = linux_arm64_signal_context(live_sp->second, read_memory);
+                if (saved) {
+                    const auto saved_pc = std::find_if(saved->begin(), saved->end(), [](const auto &reg) { return reg.name == "PC"; });
+                    const auto saved_sp = std::find_if(saved->begin(), saved->end(), [](const auto &reg) { return reg.name == "SP"; });
+                    if (saved_pc != saved->end() && saved_sp != saved->end()) {
+                        const auto pc = register_value(*saved_pc), sp = register_value(*saved_sp);
+                        if (pc && sp && *pc >= module_base && (!module_size || *pc - module_base < module_size)) {
+                            const auto offset = *pc - module_base;
+                            const auto candidate_static_pc = static_base <= UINT64_MAX - offset ? static_base + offset : 0;
+                            const Address address{image.layout().space.id, candidate_static_pc};
+                            const auto *segment = candidate_static_pc ? image.segment_at(address) : nullptr;
+                            if (segment && segment->executable && image.code_window(address, 1)) {
+                                context.clear();
+                                for (const auto &reg : *saved) {
+                                    if (const auto number = dwarf_register_number(architecture, reg.name)) {
+                                        if (const auto value = register_value(reg)) context[*number] = *value;
+                                    }
+                                }
+                                frames.push_back({*pc, {}, std::move(*saved), frames.size()});
+                                current_runtime_pc = *pc;
+                                static_pc = candidate_static_pc;
+                                previous_sp = *sp;
+                                seen.push_back(*pc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         while (frames.size() < max_frames) {
             const auto unwind = evaluate_elf_unwind(*elf, Address{{0}, static_pc}, context,
                 [&](std::uint64_t address, std::uint8_t memory_width) -> std::optional<std::uint64_t> {
@@ -695,9 +1088,12 @@ std::vector<DebuggerStackFrame> debugger_stack_frames_at(
                         value = (value << 8) | std::to_integer<std::uint8_t>(bytes.value()[index]);
                     }
                     return value;
-                });
+                }, *mips_mode);
             if (!unwind) break;
-            const auto next_pc = arm ? unwind.value().caller_pc & ~UINT64_C(1) : unwind.value().caller_pc;
+            const auto raw_next_pc = unwind.value().caller_pc;
+            const auto next_pc = arm ? raw_next_pc & ~UINT64_C(1) :
+                (mips32 && *mips_mode != ElfMipsInstructionMode::classic
+                    ? raw_next_pc & ~UINT64_C(1) : raw_next_pc);
             const auto sp = unwind.value().caller.find(sp_register);
             if (sp == unwind.value().caller.end() || !next_pc || next_pc == current_runtime_pc || sp->second <= previous_sp ||
                 std::find(seen.begin(), seen.end(), next_pc) != seen.end()) break;
@@ -710,9 +1106,9 @@ std::vector<DebuggerStackFrame> debugger_stack_frames_at(
             if (!next_segment || !next_segment->executable || !image.code_window(next_address, 1)) break;
             std::vector<debugger::RegisterValue> next_registers;
             const auto *register_names = arm64 ? arm64_register_names.data() : arm ? arm_register_names.data() :
-                riscv ? riscv_register_names.data() : x64_register_names.data();
+                mips32 ? mips32_register_names.data() : riscv ? riscv_register_names.data() : x64_register_names.data();
             const auto register_count = arm64 ? arm64_register_names.size() : arm ? arm_register_names.size() :
-                riscv ? riscv_register_names.size() : x64_register_names.size();
+                mips32 ? mips32_register_names.size() : riscv ? riscv_register_names.size() : x64_register_names.size();
             for (std::size_t i = 0; i < register_count; ++i) {
                 const auto number = dwarf_register_number(architecture, register_names[i]);
                 const bool riscv_pc = riscv && register_names[i] == "PC";
@@ -826,7 +1222,8 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
     std::uint64_t module_base, Architecture architecture,
     const std::vector<debugger::RegisterValue> &registers,
     const std::function<Result<std::vector<std::byte>>(std::uint64_t, std::size_t)> &read_memory,
-    std::optional<std::uint64_t> call_frame_cfa) {
+    std::optional<std::uint64_t> call_frame_cfa,
+    std::optional<std::uint64_t> tls_thread_pointer) {
     if (architecture == Architecture::arm) runtime_pc &= ~UINT64_C(1);
     std::vector<DebuggerLocalRow> rows;
     if (!project.functions || runtime_pc < module_base) return rows;
@@ -855,7 +1252,15 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
     const auto width = address_size(image);
     symbols::LocationEvaluationContext context;
     context.address_size = width;
+    context.target_big_endian = image.layout().space.order == ByteOrder::big;
     context.call_frame_cfa = call_frame_cfa;
+    if (architecture == Architecture::arm64 && tls_thread_pointer) {
+        const auto mask = width >= 8 ? UINT64_MAX : ((UINT64_C(1) << (width * 8)) - 1);
+        context.resolve_tls_address = [base = *tls_thread_pointer, mask](std::uint64_t offset) {
+            // AArch64 DWARF TLS offsets are target-width modular offsets from TPIDR_EL0.
+            return std::optional<std::uint64_t>((base + offset) & mask);
+        };
+    }
     const auto frame_context = image.context_at({image.layout().space.id, pc});
     const auto arm_frame_register = frame_context && frame_context.value().mode == ExecutionMode::thumb ? 7u : 11u;
     for (const auto &reg : registers) {
@@ -950,7 +1355,14 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
                     break;
                 }
                 case symbols::EvaluatedLocationKind::value:
-                    text += " value " + hex_value(piece.value);
+                    if (!piece.bytes.empty()) {
+                        const auto preview_size = std::min(piece.bytes.size(), max_piece_preview_bytes);
+                        text += " " + byte_preview(std::as_bytes(
+                            std::span<const std::uint8_t>(piece.bytes).first(preview_size)));
+                        if (preview_size < piece.bytes.size()) text += "...";
+                    } else {
+                        text += " value " + hex_value(piece.value);
+                    }
                     break;
                 }
                 return text;
@@ -1154,8 +1566,8 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
                     else if (architecture == Architecture::arm) fp_name = "r11";
                     for (const auto &reg : registers)
                         if (!fp_name.empty() && lower(reg.name) == fp_name) { base = register_value(reg); break; }
-                } else if (const auto number = pdb_register_number(architecture, active->register_id)) {
-                    base = dwarf_reg_value(architecture, *number, registers);
+                } else {
+                    base = pdb_register_value(architecture, active->register_id, registers);
                 }
                 if (base) {
                     const auto displacement = static_cast<std::int64_t>(active->frame_offset);
@@ -1203,8 +1615,7 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
                 if (fragment_size == 0 && row.value.empty()) row.value = "<empty member fragment>";
                 else if (fragment_size > 256 && row.value.empty()) row.value = "<type extent exceeds preview limit>";
                 if (row.value.empty()) {
-                    const auto number = pdb_register_number(architecture, active->register_id);
-                    const auto base = number ? dwarf_reg_value(architecture, *number, registers) : std::nullopt;
+                    const auto base = pdb_register_value(architecture, active->register_id, registers);
                     std::optional<std::uint64_t> slot;
                     if (base) {
                         const auto displacement = static_cast<std::int64_t>(active->frame_offset);
@@ -1289,10 +1700,13 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
                         else {
                             const auto &field = *matches.front();
                             const auto field_size = pdb_type_size(pe, field.type, architecture);
-                            const auto number = pdb_register_number(architecture, active->register_id);
-                            const auto *reg = number ? dwarf_register(architecture, *number, registers) : nullptr;
+                            const auto location = pdb_register_location(architecture, active->register_id);
+                            const auto *reg = location
+                                ? dwarf_register(architecture, location->dwarf_number, registers) : nullptr;
                             if (!field_size) row.value = "<unknown subfield type size>";
                             else if (!reg) row.value = "<register unavailable>";
+                            else if (!location || *field_size > location->width)
+                                row.value = "<subfield exceeds CodeView register width>";
                             else if (reg->bytes.size() < *field_size) row.value = "<register fragment too small>";
                             else {
                                 row.location = "register subfield at parent byte " +
@@ -1315,14 +1729,17 @@ std::vector<DebuggerLocalRow> debugger_locals_at(
                     }
                 }
             } else if (kind == PePdbLocalLocationKind::register_value) {
-                const auto number = pdb_register_number(architecture, active->register_id);
-                const auto *reg = number ? dwarf_register(architecture, *number, registers) : nullptr;
-                row.location = number ? "register " + std::to_string(*number) : "unavailable";
+                const auto location = pdb_register_location(architecture, active->register_id);
+                const auto *reg = location
+                    ? dwarf_register(architecture, location->dwarf_number, registers) : nullptr;
+                row.location = location ? "register " + std::to_string(location->dwarf_number) : "unavailable";
                 if (!reg) row.value = "<register unavailable>";
                 else if (!size) row.value = "<unknown type size>";
+                else if (!location || *size > location->width)
+                    row.value = "<value exceeds CodeView register width>";
                 else if (*size > 8) row.value = reg->bytes.size() >= *size
                     ? byte_preview(std::span<const std::byte>(reg->bytes).first(*size)) : "<register too small>";
-                else if (const auto value = register_value(*reg)) {
+                else if (const auto value = pdb_register_value(architecture, active->register_id, registers)) {
                     const auto bits = static_cast<unsigned>(*size) * 8;
                     const auto mask = bits == 64 ? UINT64_MAX : (std::uint64_t{1} << bits) - 1;
                     row.value = hex_value(*value & mask);

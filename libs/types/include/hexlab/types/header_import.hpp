@@ -31,6 +31,13 @@ struct HeaderImportOptions {
     std::uint8_t long_long_bytes = 8;
     std::uint8_t float_bytes = 4;
     std::uint8_t double_bytes = 8;
+    std::uint8_t long_double_bytes = 16;
+    // Zero keeps the legacy natural-width alignment for float and double.
+    // ABI profiles can set explicit alignments, including for x87 extended
+    // precision where storage width and alignment differ.
+    std::uint8_t float_alignment = 0;
+    std::uint8_t double_alignment = 0;
+    std::uint8_t long_double_alignment = 0;
     std::uint32_t max_input_bytes = 4u * 1024u * 1024u;
     std::uint32_t max_tokens = 250000;
     std::uint16_t max_nesting = 64;
@@ -82,6 +89,8 @@ struct HeaderImportResult {
     // keys; static declaration access/order is retained on the owning Type.
     std::map<std::string, HeaderSymbol, std::less<>> symbols;
     std::map<std::string, std::int64_t, std::less<>> enum_constants;
+    // Line number in the preprocessed token stream for each enumerator name.
+    std::map<std::string, std::uint32_t, std::less<>> enum_constant_source_lines;
     // Template declarations retain their parameter kinds and pack shape even
     // when no concrete specialization is instantiated in the imported header.
     std::map<std::string, HeaderTemplateDeclaration, std::less<>> templates;
@@ -98,7 +107,8 @@ struct HeaderImportResult {
 // #pragma pack forms are supported where the type model can retain their ABI
 // effects. Named nested and inline namespaces, qualified aggregate/enum/typedef names,
 // namespace aliases, bounded using-namespace lookup, qualified using-declarations, and scoped using type
-// aliases, scoped enums with default int representation, and nested function pointers
+// aliases, scoped enums with default int representation or a fixed integral
+// underlying type, and nested function pointers
 // are supported. Class/struct/union declarations may contain method prototypes,
 // class-scoped typedef/using type aliases, static data declarations, and access
 // labels. Aliases resolve from their declaration onward and export Owner::Alias;
@@ -115,11 +125,19 @@ struct HeaderImportResult {
 // Pack... template argument expands bound
 // type, integral, or template-name packs (including empty packs), with at most 32
 // concrete arguments. Alias <> lists can apply defaults or bind empty packs.
-// Compound expansion patterns and member/function-parameter pack expansions fail
-// explicitly. Concrete aggregate names retain their expanded arguments.
+// Compound argument patterns may substitute one bound pack into abstract types,
+// supported nested template-ids, or bounded integral expressions. Empty packs
+// contribute no arguments; every result is checked against its destination
+// parameter. Multiple distinct packs in one pattern, nested ellipses, and
+// member/function-parameter pack expansions fail explicitly. Concrete aggregate
+// names retain their expanded arguments.
 // Explicit/partial class-template specializations support type and integral
 // non-type parameters with fixed integer literals or direct parameter binding;
-// template-template parameters, packs, and expression patterns remain unsupported.
+// template-template parameters and compound non-type expression patterns remain
+// unsupported. Partial specializations of a primary consisting of one type pack
+// support one type-pack expansion pattern in the forms T*... and const T*...;
+// mixed primary parameters, explicit specializations of primary packs, non-type
+// packs, template-template packs, and compound pack patterns remain unsupported.
 // Template declarations and parameter kind/pack metadata are preserved in
 // HeaderImportResult::templates. Class templates use the structure layout model;
 // access labels are retained for methods and static data. Instance data-member

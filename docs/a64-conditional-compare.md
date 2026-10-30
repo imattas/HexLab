@@ -14,6 +14,12 @@ the computed nibble and the fallback. Its carry and overflow formulas use the
 operand width, so 32-bit `W` comparisons wrap at 32 bits. `AL` and `NV` select
 the arithmetic result without reading prior NZCV.
 
+`evaluate_a64_conditional_compare_instruction` provides the same operation for
+caller-supplied W/X source values and incoming NZCV bits. It validates the
+decoded register/immediate and fallback forms, NZCV read/write effects, and
+width, then returns only the resulting N/Z/C/V flags. Register sampling and
+committing NZCV remain caller-owned.
+
 Ordinary `ADDS`, `SUBS`, and `ANDS` now provide explicit NZCV values to SSA.
 The `CMP`, `CMN`, and `TST` aliases still have no destination register write.
 For A64 `ANDS`, both the immediate and shifted-register forms set `C=0` and

@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string_view>
 
 namespace hexlab::decompiler {
 namespace {
@@ -17,7 +18,7 @@ std::uint16_t unit(const Instruction &instruction, unsigned index) {
 }
 
 RegisterOperand vreg(std::uint16_t index) {
-    return {RegisterBank::dex_vreg, static_cast<std::uint8_t>(index), 32, false};
+    return {RegisterBank::dex_vreg, index, 32, false};
 }
 
 ValueType i32() { return {TypeKind::integer, 32, true}; }
@@ -26,6 +27,26 @@ ValueType f32() { return {TypeKind::floating, 32, false}; }
 ValueType f64() { return {TypeKind::floating, 64, false}; }
 ValueType unknown_type(unsigned bits) { return {TypeKind::unknown, static_cast<std::uint16_t>(bits), false}; }
 ValueType pointer32() { return {TypeKind::pointer, 32, false}; }
+ValueType boolean_type() { return {TypeKind::boolean, 1, false}; }
+std::string string_constant_preview(std::string_view value) {
+    constexpr std::size_t limit = 96;
+    constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    const auto count = std::min(value.size(), limit);
+    out.reserve(count * 4 + 16);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto c = static_cast<unsigned char>(value[i]);
+        if (c == '\\' || c == '"') { out.push_back('\\'); out.push_back(static_cast<char>(c)); }
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else if (c < 0x20 || c >= 0x7f) {
+            out += "\\x"; out.push_back(hex[c >> 4]); out.push_back(hex[c & 0x0f]);
+        } else out.push_back(static_cast<char>(c));
+    }
+    if (value.size() > count) out += "...";
+    return out;
+}
 ExpressionPtr reg(RegisterOperand value) {
     return std::make_shared<Expression>(Expression{i32(), RegisterValue{value}});
 }
@@ -64,6 +85,103 @@ struct DexCallResultShape {
     ValueType type;
 };
 
+struct DexParameterShape {
+    ValueType type;
+    std::uint8_t words = 1;
+};
+
+Result<ValueType> dex_type_value(const DexMetadata &metadata, std::uint32_t type_index) {
+    if (type_index >= metadata.type_descriptors.size())
+        return Error{ErrorCode::malformed, "DEX type index is outside retained descriptor metadata"};
+    const auto &descriptor = metadata.type_descriptors[type_index];
+    if (descriptor == "Z") return boolean_type();
+    if (descriptor == "B") return ValueType{TypeKind::integer, 8, true};
+    if (descriptor == "S") return ValueType{TypeKind::integer, 16, true};
+    if (descriptor == "C") return ValueType{TypeKind::integer, 16, false};
+    if (descriptor == "I") return i32();
+    if (descriptor == "J") return i64();
+    if (descriptor == "F") return f32();
+    if (descriptor == "D") return f64();
+    if (!descriptor.empty() && (descriptor.front() == 'L' || descriptor.front() == '[')) return pointer32();
+    return Error{ErrorCode::malformed, "DEX prototype references a non-value type descriptor"};
+}
+
+enum class DexDescriptorConstraint { any, class_type, array_type };
+
+Result<bool> validate_type_descriptor(const DexMetadata *metadata, std::uint32_t type_index,
+                                     DexDescriptorConstraint constraint,
+                                     std::string_view operation) {
+    if (!metadata) return true;
+    if (type_index >= metadata->type_descriptors.size())
+        return Error{ErrorCode::malformed, "DEX " + std::string(operation) +
+                     " type index is outside retained descriptor metadata"};
+    const auto &descriptor = metadata->type_descriptors[type_index];
+    const bool matches = !descriptor.empty() &&
+        (constraint == DexDescriptorConstraint::any ||
+         (constraint == DexDescriptorConstraint::class_type && descriptor.front() == 'L') ||
+         (constraint == DexDescriptorConstraint::array_type && descriptor.front() == '['));
+    if (!matches)
+        return Error{ErrorCode::malformed, "DEX " + std::string(operation) +
+                     " type descriptor has the wrong kind"};
+    return true;
+}
+
+Result<std::optional<std::vector<DexParameterShape>>> call_parameter_shapes(
+    const Instruction &instruction, const DexMetadata *metadata) {
+    if (!metadata || metadata->prototype_parameter_word_counts.empty() ||
+        metadata->prototype_parameter_offsets.empty() || metadata->type_descriptors.empty())
+        return std::optional<std::vector<DexParameterShape>>{};
+    const auto first = unit(instruction, 0);
+    const auto op = static_cast<std::uint8_t>(first & 0xff);
+    std::optional<std::uint32_t> proto_index;
+    bool receiver = false;
+    if ((op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78)) {
+        const auto method_index = unit(instruction, 1);
+        if (method_index >= metadata->method_prototype_indices.size())
+            return Error{ErrorCode::malformed, "DEX invoke method index is outside retained method metadata"};
+        proto_index = metadata->method_prototype_indices[method_index];
+        receiver = op != 0x71 && op != 0x77;
+    } else if (op == 0xfa || op == 0xfb) {
+        proto_index = unit(instruction, 3);
+        receiver = true;
+    } else if (op == 0xfc || op == 0xfd) {
+        const auto call_site_index = unit(instruction, 1);
+        if (call_site_index >= metadata->call_sites.size())
+            return Error{ErrorCode::malformed, "DEX invoke-custom call-site index is outside retained metadata"};
+        const auto &site = metadata->call_sites[call_site_index];
+        if (site.values.size() < 3 || site.values[2].type != 0x15 || site.values[2].payload > UINT32_MAX)
+            return std::optional<std::vector<DexParameterShape>>{};
+        proto_index = static_cast<std::uint32_t>(site.values[2].payload);
+    } else return std::optional<std::vector<DexParameterShape>>{};
+    if (*proto_index >= metadata->prototype_parameter_word_counts.size() ||
+        *proto_index + 1 >= metadata->prototype_parameter_offsets.size())
+        return Error{ErrorCode::malformed, "DEX invoke prototype is outside retained parameter metadata"};
+    const auto begin = metadata->prototype_parameter_offsets[*proto_index];
+    const auto end = metadata->prototype_parameter_offsets[*proto_index + 1];
+    if (begin > end || end > metadata->prototype_parameter_type_indices.size())
+        return Error{ErrorCode::malformed, "DEX prototype parameter type range is invalid"};
+    std::vector<DexParameterShape> shapes;
+    shapes.reserve((end - begin) + (receiver ? 1u : 0u));
+    std::uint32_t words = 0;
+    if (receiver) {
+        shapes.push_back({pointer32(), 1});
+        ++words;
+    }
+    for (auto index = begin; index < end; ++index) {
+        const auto type_index = metadata->prototype_parameter_type_indices[index];
+        auto type = dex_type_value(*metadata, type_index);
+        if (!type) return type.error();
+        const auto &descriptor = metadata->type_descriptors[type_index];
+        const auto width = static_cast<std::uint8_t>(descriptor == "J" || descriptor == "D" ? 2 : 1);
+        words += width;
+        shapes.push_back({type.value(), width});
+    }
+    const auto receiver_words = receiver ? 1u : 0u;
+    if (words < receiver_words || words - receiver_words != metadata->prototype_parameter_word_counts[*proto_index])
+        return Error{ErrorCode::malformed, "DEX prototype parameter word count disagrees with its type descriptors"};
+    return std::optional<std::vector<DexParameterShape>>{std::move(shapes)};
+}
+
 Result<DexCallResultShape> call_result_shape(const Instruction &instruction, const DexMetadata *metadata) {
     if (!metadata || metadata->prototype_return_kinds.empty()) return DexCallResultShape{};
     const auto first = unit(instruction, 0);
@@ -89,6 +207,15 @@ Result<DexCallResultShape> call_result_shape(const Instruction &instruction, con
     }
     if (*proto_index >= metadata->prototype_return_kinds.size())
         return Error{ErrorCode::malformed, "DEX invoke prototype index is outside retained metadata"};
+    if (*proto_index < metadata->prototype_return_type_indices.size() && !metadata->type_descriptors.empty()) {
+        const auto type_index = metadata->prototype_return_type_indices[*proto_index];
+        if (type_index >= metadata->type_descriptors.size())
+            return Error{ErrorCode::malformed, "DEX prototype return type is outside retained descriptor metadata"};
+        if (metadata->type_descriptors[type_index] == "V") return DexCallResultShape{true, true, {}};
+        auto type = dex_type_value(*metadata, type_index);
+        if (!type) return type.error();
+        return DexCallResultShape{true, false, type.value()};
+    }
     switch (metadata->prototype_return_kinds[*proto_index]) {
     case DexReturnKind::void_value: return DexCallResultShape{true, true, {}};
     case DexReturnKind::integer32: return DexCallResultShape{true, false, i32()};
@@ -101,48 +228,12 @@ Result<DexCallResultShape> call_result_shape(const Instruction &instruction, con
     return Error{ErrorCode::malformed, "DEX prototype has an invalid retained return kind"};
 }
 
-Result<std::optional<std::uint32_t>> call_parameter_word_count(const Instruction &instruction,
-                                                               const DexMetadata *metadata) {
-    if (!metadata || metadata->prototype_parameter_word_counts.empty()) return std::optional<std::uint32_t>{};
-    const auto first = unit(instruction, 0);
-    const auto op = static_cast<std::uint8_t>(first & 0xff);
-    std::optional<std::uint32_t> proto_index;
-    bool receiver = false;
-    if ((op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78)) {
-        const auto method_index = unit(instruction, 1);
-        if (method_index >= metadata->method_prototype_indices.size())
-            return Error{ErrorCode::malformed, "DEX invoke method index is outside retained method metadata"};
-        proto_index = metadata->method_prototype_indices[method_index];
-        receiver = op != 0x71 && op != 0x77;
-    } else if (op == 0xfa || op == 0xfb) {
-        proto_index = unit(instruction, 3);
-        receiver = true;
-    } else if (op == 0xfc || op == 0xfd) {
-        const auto call_site_index = unit(instruction, 1);
-        if (call_site_index >= metadata->call_sites.size())
-            return Error{ErrorCode::malformed, "DEX invoke-custom call-site index is outside retained metadata"};
-        const auto &site = metadata->call_sites[call_site_index];
-        if (site.values.size() < 3 || site.values[2].type != 0x15 || site.values[2].payload > UINT32_MAX)
-            return std::optional<std::uint32_t>{};
-        proto_index = static_cast<std::uint32_t>(site.values[2].payload);
-    } else return std::optional<std::uint32_t>{};
-    if (*proto_index >= metadata->prototype_parameter_word_counts.size())
-        return Error{ErrorCode::malformed, "DEX invoke prototype index is outside retained metadata"};
-    auto expected = metadata->prototype_parameter_word_counts[*proto_index];
-    if (receiver) {
-        if (expected == UINT32_MAX)
-            return Error{ErrorCode::malformed, "DEX invoke argument word count overflows"};
-        ++expected;
-    }
-    return std::optional<std::uint32_t>{expected};
-}
-
 bool dex_invoke_opcode(std::uint8_t op) {
     return (op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78) ||
            (op >= 0xfa && op <= 0xfd);
 }
 
-Result<Statement> lift_one(const Instruction &instruction) {
+Result<Statement> lift_one(const Instruction &instruction, const DexMetadata *metadata) {
     if (instruction.context.architecture != Architecture::dex || instruction.length < 2 ||
         instruction.length > instruction.bytes.size() || (instruction.length & 1))
         return Error{ErrorCode::unsupported, "DEX lifter received a non-Dalvik or malformed instruction"};
@@ -168,7 +259,8 @@ Result<Statement> lift_one(const Instruction &instruction) {
         if (op >= 0xc6 && op <= 0xcf) return 2;
         if (op >= 0xd0 && op <= 0xe2) return 4;
         if (op >= 0x7b && op <= 0x8f) return 2;
-        if ((op >= 0x44 && op <= 0x6d) || op == 0x23 || (op >= 0x6e && op <= 0x78))
+        if ((op >= 0x44 && op <= 0x6d) || (op >= 0xe3 && op <= 0xeb) ||
+            op == 0x23 || (op >= 0x6e && op <= 0x78))
             return op >= 0x6e && op <= 0x78 ? 6 : 4;
         if (op >= 0x9b && op <= 0xa5) return 4;
         if (op >= 0xbb && op <= 0xc5) return 2;
@@ -177,15 +269,13 @@ Result<Statement> lift_one(const Instruction &instruction) {
     if (expected_length && instruction.length != expected_length)
         return Error{ErrorCode::unsupported, "DEX instruction has an invalid encoded length"};
     auto require_reg = [&](std::uint16_t index) -> Result<RegisterOperand> {
-        if (index > 255)
-            return Error{ErrorCode::unsupported, "DEX register index exceeds the common IR register-key width"};
         return vreg(index);
     };
     auto require_wide = [&](std::uint16_t index) -> Result<RegisterOperand> {
-        // The common IR can name v0..v255. A Dalvik wide value occupies
-        // consecutive, non-overlapping vN/vN+1 slots.
-        if (index >= 255)
-            return Error{ErrorCode::unsupported, "DEX wide register pair exceeds the common IR register-key width"};
+        // A Dalvik wide value occupies consecutive, non-overlapping 32-bit
+        // slots. The common register operand stores the full 16-bit DEX index.
+        if (index == UINT16_MAX)
+            return Error{ErrorCode::unsupported, "DEX wide register pair exceeds the 16-bit register-index limit"};
         auto result = vreg(index);
         result.width = 64;
         return result;
@@ -310,23 +400,36 @@ Result<Statement> lift_one(const Instruction &instruction) {
         const auto value = static_cast<std::int32_t>(static_cast<std::int8_t>(hi) >> 4);
         return assign(hi & 15, constant(static_cast<std::uint32_t>(value)));
     }
-    if (op == 0x1a || op == 0x1b || op == 0x1c || op == 0xfe || op == 0xff) {
+    if (op == 0x1a || op == 0x1b || op == 0xfe || op == 0xff) {
         const auto index = op == 0x1b
             ? std::uint32_t(unit(instruction, 1)) | (std::uint32_t(unit(instruction, 2)) << 16)
             : std::uint32_t(unit(instruction, 1));
-        const auto description = op == 0x1c ? "DEX class constant type@" + std::to_string(index) :
-            op == 0xfe ? "DEX method-handle constant method_handle@" + std::to_string(index) :
+        const auto description = op == 0xfe ? "DEX method-handle constant method_handle@" + std::to_string(index) :
             op == 0xff ? "DEX method-type constant proto@" + std::to_string(index) :
                          "DEX string constant string@" + std::to_string(index);
         return assign(hi, unknown_value(pointer32(), description));
     }
+    if (op == 0x1c) {
+        const auto type_index = unit(instruction, 1);
+        auto valid = validate_type_descriptor(metadata, type_index, DexDescriptorConstraint::any,
+                                              "const-class");
+        if (!valid) return valid.error();
+        return assign(hi, unknown_value(pointer32(), "DEX class constant type@" +
+                                        std::to_string(type_index)));
+    }
     if (op == 0x1f) {
+        auto valid = validate_type_descriptor(metadata, unit(instruction, 1),
+                                              DexDescriptorConstraint::any, "check-cast");
+        if (!valid) return valid.error();
         auto object = require_reg(hi);
         if (!object) return object.error();
         return Statement{Intrinsic{"dex_check_cast_type@" + std::to_string(unit(instruction, 1)),
             {typed_reg(object.value(), pointer32())}, IntrinsicMemoryEffect::unknown}};
     }
     if (op == 0x20) {
+        auto valid = validate_type_descriptor(metadata, unit(instruction, 1),
+                                              DexDescriptorConstraint::any, "instance-of");
+        if (!valid) return valid.error();
         const auto destination_index = static_cast<std::uint16_t>(hi & 15);
         auto destination = require_reg(destination_index);
         auto object = require_reg(hi >> 4);
@@ -415,7 +518,10 @@ Result<Statement> lift_one(const Instruction &instruction) {
         }
         return assign(destination_index, binary(operation, std::move(left), std::move(right)));
     }
-    if (op == 0x0e) return Statement{Return{}};
+    // The optimized ODEX return-void-barrier has the same control-flow result
+    // as the standard return-void opcode; the barrier is a runtime scheduling
+    // detail that the shared IR does not represent separately.
+    if (op == 0x0e || op == 0xf1) return Statement{Return{}};
     if (op == 0x2b || op == 0x2c) {
         if (!instruction.dex_switch || !instruction.dex_switch->validated ||
             instruction.flow != FlowKind::switch_dispatch)
@@ -520,6 +626,40 @@ Result<Statement> lift_one(const Instruction &instruction) {
         default: return unknown_type(32);
         }
     };
+    const auto field_descriptor_type = [&](unsigned kind, std::uint16_t field_index)
+        -> Result<ValueType> {
+        if (!metadata) return dex_value_type(kind);
+        if (field_index >= metadata->field_identifiers.size())
+            return Error{ErrorCode::malformed, "DEX field index is outside retained identifier metadata"};
+        const auto &field = metadata->field_identifiers[field_index];
+        if (field.type_index >= metadata->type_descriptors.size())
+            return Error{ErrorCode::malformed, "DEX field type index is outside retained type metadata"};
+        const auto &descriptor = metadata->type_descriptors[field.type_index];
+        ValueType type;
+        bool matches_opcode = false;
+        if (descriptor == "I") { type = i32(); matches_opcode = kind == 0; }
+        else if (descriptor == "J") { type = i64(); matches_opcode = kind == 1; }
+        else if (!descriptor.empty() && (descriptor[0] == 'L' || descriptor[0] == '[')) {
+            type = pointer32(); matches_opcode = kind == 2;
+        } else if (descriptor == "Z") {
+            type = boolean_type(); matches_opcode = kind == 3;
+        } else if (descriptor == "B") {
+            type = ValueType{TypeKind::integer, 32, true}; matches_opcode = kind == 4;
+        } else if (descriptor == "C") {
+            type = ValueType{TypeKind::integer, 32, false}; matches_opcode = kind == 5;
+        } else if (descriptor == "S") {
+            type = ValueType{TypeKind::integer, 32, true}; matches_opcode = kind == 6;
+        } else if (descriptor == "F") {
+            type = f32(); matches_opcode = kind == 0;
+        } else if (descriptor == "D") {
+            type = f64(); matches_opcode = kind == 1;
+        } else {
+            return Error{ErrorCode::malformed, "DEX field has an invalid or unsupported type descriptor"};
+        }
+        if (!matches_opcode)
+            return Error{ErrorCode::malformed, "DEX field descriptor disagrees with the field opcode variant"};
+        return type;
+    };
     const auto emit_memory_result = [&](std::string name, std::vector<ExpressionPtr> operands,
                                         std::uint16_t destination_index, ValueType type,
                                         IntrinsicMemoryEffect memory) -> Result<Statement> {
@@ -542,6 +682,10 @@ Result<Statement> lift_one(const Instruction &instruction) {
                                   destination_index, i32(), IntrinsicMemoryEffect::read);
     }
     if (op == 0x22 || op == 0x23) {
+        auto valid = validate_type_descriptor(metadata, unit(instruction, 1),
+            op == 0x23 ? DexDescriptorConstraint::array_type : DexDescriptorConstraint::class_type,
+            op == 0x23 ? "new-array" : "new-instance");
+        if (!valid) return valid.error();
         const auto destination_index = static_cast<std::uint16_t>(op == 0x22 ? hi : (hi & 15));
         auto destination = require_reg(destination_index);
         if (!destination) return destination.error();
@@ -563,17 +707,36 @@ Result<Statement> lift_one(const Instruction &instruction) {
         const bool range = op == 0x25;
         const auto count = static_cast<unsigned>(range ? hi : ((first >> 12) & 15));
         const auto type_index = unit(instruction, 1);
+        auto element_type = unknown_type(32);
+        if (metadata) {
+            if (type_index >= metadata->type_descriptors.size())
+                return Error{ErrorCode::malformed, "DEX filled-new-array type index is outside retained type metadata"};
+            const auto &descriptor = metadata->type_descriptors[type_index];
+            if (descriptor.size() < 2 || descriptor.front() != '[')
+                return Error{ErrorCode::malformed, "DEX filled-new-array type is not an array descriptor"};
+            const std::string_view component(descriptor.data() + 1, descriptor.size() - 1);
+            if (component == "J" || component == "D")
+                return Error{ErrorCode::malformed, "DEX filled-new-array cannot initialize a wide-element array"};
+            if (component == "Z") element_type = boolean_type();
+            else if (component == "B" || component == "S")
+                element_type = ValueType{TypeKind::integer, 32, true};
+            else if (component == "C") element_type = ValueType{TypeKind::integer, 32, false};
+            else if (component == "I") element_type = i32();
+            else if (component == "F") element_type = f32();
+            else if (component.front() == '[' || component.front() == 'L') element_type = pointer32();
+            else return Error{ErrorCode::malformed, "DEX filled-new-array component descriptor is unsupported"};
+        }
         std::vector<ExpressionPtr> elements;
         elements.reserve(count + 1);
         elements.push_back(constant(type_index));
         if (range) {
             const auto start = static_cast<unsigned>(unit(instruction, 2));
-            if (count && start + count > 256)
-                return Error{ErrorCode::unsupported, "DEX filled-new-array/range exceeds the common IR register-key width"};
+            if (count && std::uint64_t(start) + count > std::uint64_t(UINT16_MAX) + 1)
+                return Error{ErrorCode::malformed, "DEX filled-new-array/range exceeds the 16-bit register-index limit"};
             for (unsigned i = 0; i < count; ++i) {
                 auto element = require_reg(static_cast<std::uint16_t>(start + i));
                 if (!element) return element.error();
-                elements.push_back(typed_reg(element.value(), unknown_type(32)));
+                elements.push_back(typed_reg(element.value(), element_type));
             }
         } else {
             const auto packed = unit(instruction, 2);
@@ -584,7 +747,7 @@ Result<Statement> lift_one(const Instruction &instruction) {
             for (unsigned i = 0; i < count; ++i) {
                 auto element = require_reg(static_cast<std::uint16_t>(registers[i]));
                 if (!element) return element.error();
-                elements.push_back(typed_reg(element.value(), unknown_type(32)));
+                elements.push_back(typed_reg(element.value(), element_type));
             }
         }
         return Statement{Intrinsic{"dex_filled_new_array_type@" + std::to_string(type_index),
@@ -615,8 +778,10 @@ Result<Statement> lift_one(const Instruction &instruction) {
         return Statement{Intrinsic{"dex_fill_array_data_payload@" + std::to_string(payload_offset),
             {typed_reg(array.value(), pointer32())}, IntrinsicMemoryEffect::write}};
     }
-    if ((op >= 0x44 && op <= 0x51) || (op >= 0x52 && op <= 0x6d)) {
+    if ((op >= 0x44 && op <= 0x51) || (op >= 0x52 && op <= 0x6d) ||
+        (op >= 0xe3 && op <= 0xeb)) {
         const bool array = op <= 0x51;
+        const bool volatile_field = op >= 0xe3 && op <= 0xeb;
         bool load = false;
         unsigned kind = 0;
         std::uint16_t value_index = 0;
@@ -636,24 +801,41 @@ Result<Statement> lift_one(const Instruction &instruction) {
             operands.push_back(reg(index.value()));
             name = "dex_" + std::string(load ? "aget" : "aput") + "_kind" + std::to_string(kind);
         } else {
-            const bool instance = op < 0x60;
+            const bool instance = volatile_field
+                ? (op == 0xe3 || op == 0xe4 || op == 0xe7 || op == 0xe8 || op == 0xe9)
+                : op < 0x60;
             if (instance) {
-                load = op <= 0x58;
-                kind = load ? static_cast<unsigned>(op - 0x52) : static_cast<unsigned>(op - 0x59);
+                if (volatile_field) {
+                    load = op == 0xe3 || op == 0xe7 || op == 0xe8;
+                    kind = op == 0xe7 ? 2u : (op == 0xe8 || op == 0xe9 ? 1u : 0u);
+                } else {
+                    load = op <= 0x58;
+                    kind = load ? static_cast<unsigned>(op - 0x52) : static_cast<unsigned>(op - 0x59);
+                }
                 value_index = hi & 15;
                 auto object = require_reg(hi >> 4);
                 if (!object) return object.error();
                 operands.push_back(typed_reg(object.value(), pointer32()));
             } else {
-                load = op <= 0x66;
-                kind = load ? static_cast<unsigned>(op - 0x60) : static_cast<unsigned>(op - 0x67);
+                if (volatile_field) {
+                    load = op == 0xe5 || op == 0xea;
+                    kind = op == 0xea || op == 0xeb ? 1u : 0u;
+                } else {
+                    load = op <= 0x66;
+                    kind = load ? static_cast<unsigned>(op - 0x60) : static_cast<unsigned>(op - 0x67);
+                }
                 value_index = hi;
             }
             operands.push_back(constant(unit(instruction, 1)));
             name = "dex_" + std::string(instance ? (load ? "iget" : "iput") : (load ? "sget" : "sput")) +
+                   (volatile_field ? "_volatile" : "") +
                    "_kind" + std::to_string(kind) + "_field@" + std::to_string(unit(instruction, 1));
         }
-        const auto type = dex_value_type(kind);
+        auto type_result = array || volatile_field
+            ? Result<ValueType>{dex_value_type(kind)}
+            : field_descriptor_type(kind, unit(instruction, 1));
+        if (!type_result) return type_result.error();
+        const auto type = type_result.value();
         if (load)
             return emit_memory_result(std::move(name), std::move(operands), value_index, type,
                                       IntrinsicMemoryEffect::read);
@@ -682,8 +864,8 @@ Result<Statement> lift_one(const Instruction &instruction) {
         if (range) {
             count = hi;
             first_register = unit(instruction, 2);
-            if (count && std::uint64_t(first_register) + count > 256)
-                return Error{ErrorCode::unsupported, "DEX invoke/range register span exceeds the common IR register-key width"};
+            if (count && std::uint64_t(first_register) + count > std::uint64_t(UINT16_MAX) + 1)
+                return Error{ErrorCode::unsupported, "DEX invoke/range register span exceeds the 16-bit register-index limit"};
         } else {
             count = (first >> 12) & 15;
             if (count > listed.size())
@@ -693,12 +875,44 @@ Result<Statement> lift_one(const Instruction &instruction) {
                       std::uint32_t((packed >> 8) & 15), std::uint32_t((packed >> 12) & 15),
                       std::uint32_t((first >> 8) & 15)};
         }
+        std::vector<std::uint16_t> argument_registers;
+        argument_registers.reserve(count);
+        for (std::uint32_t i = 0; i < count; ++i)
+            argument_registers.push_back(static_cast<std::uint16_t>(range ? first_register + i : listed[i]));
+        auto signature = call_parameter_shapes(instruction, metadata);
+        if (!signature) return signature.error();
         arguments.reserve(count + 1);
-        for (std::uint32_t i = 0; i < count; ++i) {
-            const auto index = range ? first_register + i : listed[i];
-            auto argument = require_reg(static_cast<std::uint16_t>(index));
-            if (!argument) return argument.error();
-            arguments.push_back(typed_reg(argument.value(), unknown_type(32)));
+        if (signature.value()) {
+            std::uint32_t expected_words = 0;
+            for (const auto &parameter : *signature.value()) expected_words += parameter.words;
+            if (expected_words != count)
+                return Error{ErrorCode::malformed, "DEX invoke register-word count does not match its prototype"};
+            std::size_t cursor = 0;
+            for (const auto &parameter : *signature.value()) {
+                if (parameter.words == 2) {
+                    if (cursor + 1 >= argument_registers.size() || argument_registers[cursor] == UINT16_MAX ||
+                        argument_registers[cursor + 1] != argument_registers[cursor] + 1)
+                        return Error{ErrorCode::malformed, "DEX wide invoke argument does not use an adjacent register pair"};
+                    auto argument = require_wide(argument_registers[cursor]);
+                    if (!argument) return argument.error();
+                    arguments.push_back(typed_reg(argument.value(), parameter.type));
+                    cursor += 2;
+                } else {
+                    if (cursor >= argument_registers.size())
+                        return Error{ErrorCode::malformed, "DEX invoke prototype consumes more words than encoded"};
+                    auto argument = require_reg(argument_registers[cursor++]);
+                    if (!argument) return argument.error();
+                    arguments.push_back(typed_reg(argument.value(), parameter.type));
+                }
+            }
+            if (cursor != argument_registers.size())
+                return Error{ErrorCode::malformed, "DEX invoke prototype does not consume all encoded argument words"};
+        } else {
+            for (const auto index : argument_registers) {
+                auto argument = require_reg(index);
+                if (!argument) return argument.error();
+                arguments.push_back(typed_reg(argument.value(), unknown_type(32)));
+            }
         }
         Intrinsic call;
         if (invoke_ext) {
@@ -745,6 +959,14 @@ Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const F
     LiftedFunction result{function.id, function.entry, {}, {}};
     if (function.blocks.size() > 1'000'000)
         return Error{ErrorCode::resource_limit, "DEX function exceeds the lifting block budget"};
+    std::optional<std::uint32_t> declared_register_count;
+    if (metadata && function.entry.space.value != 0 && function.entry.space.value - 1 <= UINT32_MAX) {
+        const auto method_index = static_cast<std::uint32_t>(function.entry.space.value - 1);
+        const auto method = std::lower_bound(metadata->code.begin(), metadata->code.end(), method_index,
+            [](const DexMethodCode &candidate, std::uint32_t index) { return candidate.method_index < index; });
+        if (method != metadata->code.end() && method->method_index == method_index)
+            declared_register_count = method->register_count;
+    }
     result.blocks.reserve(function.blocks.size());
     std::set<std::pair<std::uint64_t, std::uint64_t>> block_entries;
     for (const auto id : function.blocks) {
@@ -766,9 +988,20 @@ Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const F
         for (const auto &fact : source.instructions) {
             if (!fact) return Error{ErrorCode::invalid_argument, "DEX block contains a null instruction fact"};
             const auto &instruction = fact->instruction;
+            if (declared_register_count) {
+                for (const auto &operand : instruction.operands) {
+                    const auto *reg = std::get_if<RegisterOperand>(&operand);
+                    if (!reg || reg->bank != RegisterBank::dex_vreg) continue;
+                    const std::uint32_t slots = reg->width > 32 ? 2 : 1;
+                    if (reg->index >= *declared_register_count ||
+                        slots > *declared_register_count - reg->index)
+                        return Error{ErrorCode::malformed,
+                            "DEX register operand exceeds the method's declared register file"};
+                }
+            }
             if (instruction.opcode == Opcode::dex_switch && fact != source.instructions.back())
                 return Error{ErrorCode::malformed, "DEX switch is not the final instruction in its basic block"};
-            auto statement = lift_one(instruction);
+            auto statement = lift_one(instruction, metadata);
             if (!statement)
                 return Error{statement.error().code, "at method-relative 0x" + [&] {
                     constexpr char hex[] = "0123456789abcdef";
@@ -778,22 +1011,33 @@ Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const F
                     std::reverse(out.begin(), out.end());
                     return out;
                 }() + ": " + statement.error().message};
+            // Resolve DEX string constants through the loader's retained string
+            // table. Loading a constant can perform runtime resolution, so keep
+            // the memory effect explicit while preserving a bounded preview.
+            const auto opcode = static_cast<std::uint8_t>(unit(instruction, 0) & 0xff);
+            if (metadata && (opcode == 0x1a || opcode == 0x1b)) {
+                const auto string_index = opcode == 0x1a
+                    ? static_cast<std::uint32_t>(unit(instruction, 1))
+                    : static_cast<std::uint32_t>(unit(instruction, 1)) |
+                        (static_cast<std::uint32_t>(unit(instruction, 2)) << 16);
+                if (string_index >= metadata->strings.size())
+                    return Error{ErrorCode::malformed, "DEX const-string index is outside retained string metadata"};
+                Intrinsic load;
+                load.name = "dex_string_constant #" + std::to_string(string_index) + " \"" +
+                    string_constant_preview(metadata->strings[string_index]) + "\"";
+                load.memory_effect = IntrinsicMemoryEffect::unknown;
+                const RegisterOperand destination{RegisterBank::dex_vreg,
+                    static_cast<std::uint8_t>(unit(instruction, 0) >> 8), 32, false};
+                load.register_writes.push_back(destination);
+                load.register_output_values.push_back(unknown_value(pointer32(), load.name));
+                load.result_type = pointer32();
+                statement.value() = Statement{std::move(load)};
+            }
             // Dalvik integer division and remainder throw ArithmeticException
             // exactly when the divisor is zero. Preserve that exceptional edge
             // alongside the normal arithmetic result in the lifted block.
             const auto first = unit(instruction, 0);
             const auto op = static_cast<std::uint8_t>(first & 0xff);
-            if ((op >= 0x6e && op <= 0x78) || (op >= 0xfa && op <= 0xfd)) {
-                auto expected_words = call_parameter_word_count(instruction, metadata);
-                if (!expected_words) return expected_words.error();
-                if (expected_words.value()) {
-                    const auto encoded_words = (op == 0xfb || op == 0xfd || (op >= 0x74 && op <= 0x78))
-                        ? static_cast<std::uint32_t>(first >> 8)
-                        : static_cast<std::uint32_t>((first >> 12) & 15);
-                    if (encoded_words != *expected_words.value())
-                        return Error{ErrorCode::malformed, "DEX invoke register-word count does not match the retained prototype"};
-                }
-            }
             if (op >= 0x0a && op <= 0x0c) {
                 if (!previous_instruction || previous_instruction->address.space.value != instruction.address.space.value ||
                     previous_instruction->address.offset > UINT64_MAX - previous_instruction->length ||
@@ -811,7 +1055,7 @@ Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const F
                         return Error{ErrorCode::malformed, "DEX filled-new-array did not lift to a result-bearing intrinsic"};
                     const auto destination_index = static_cast<std::uint16_t>(first >> 8);
                     const RegisterOperand destination{RegisterBank::dex_vreg,
-                        static_cast<std::uint8_t>(destination_index), 32, false};
+                        destination_index, 32, false};
                     allocation->register_writes.push_back(destination);
                     allocation->register_output_values.push_back(unknown_value(pointer32(),
                         "DEX filled-new-array result with unresolved element type"));
@@ -822,8 +1066,8 @@ Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const F
                     if (!shape) return shape.error();
                     if (shape.value().known) {
                         const bool matches = op == 0x0a
-                            ? (shape.value().type.kind == TypeKind::integer || shape.value().type.kind == TypeKind::floating) &&
-                              shape.value().type.bits == 32
+                            ? (shape.value().type.kind == TypeKind::integer || shape.value().type.kind == TypeKind::floating ||
+                               shape.value().type.kind == TypeKind::boolean) && shape.value().type.bits <= 32
                             : op == 0x0b ? shape.value().type.bits == 64
                             : shape.value().type.kind == TypeKind::pointer && shape.value().type.bits == 32;
                         if (shape.value().is_void || !matches)
@@ -834,10 +1078,11 @@ Result<LiftedFunction> lift_dex_function(const FunctionRecord &function, const F
                         if (!call)
                             return Error{ErrorCode::malformed, "DEX invoke did not lift to a result-bearing intrinsic"};
                         const auto destination_index = static_cast<std::uint16_t>(first >> 8);
-                        if (shape.value().type.bits == 64 && destination_index >= 255)
-                            return Error{ErrorCode::malformed, "DEX wide move-result register pair exceeds the typed register model"};
+                        if (shape.value().type.bits == 64 && destination_index == UINT16_MAX)
+                            return Error{ErrorCode::malformed, "DEX wide move-result register pair exceeds the 16-bit register-index limit"};
                         const RegisterOperand destination{RegisterBank::dex_vreg,
-                            static_cast<std::uint8_t>(destination_index), shape.value().type.bits, false};
+                            destination_index,
+                            static_cast<std::uint16_t>(shape.value().type.bits > 32 ? 64 : 32), false};
                         call->register_writes.push_back(destination);
                         call->register_output_values.push_back(unknown_value(shape.value().type,
                             "DEX invocation result for immediately following move-result"));

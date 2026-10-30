@@ -102,7 +102,7 @@ std::uint64_t elf_cfi_add(std::uint64_t base, std::int64_t delta, std::uint64_t 
 std::uint64_t evaluate_elf_cfi_expression(std::span<const std::byte> expression, ByteOrder order,
     std::uint8_t width, std::uint64_t limit, const ElfUnwindContext &registers,
     const ElfUnwindMemoryReader &read, std::optional<std::uint64_t> cfa,
-    bool seed_cfa, bool riscv, std::size_t &operations) {
+    bool seed_cfa, bool zero_register_file, std::size_t &operations) {
     elf_cfi_require(!expression.empty(), ErrorCode::malformed, "ELF CFI expression is empty");
     elf_cfi_require(width == 4 || width == 8, ErrorCode::unsupported,
                     "ELF CFI expression address width is unsupported");
@@ -135,12 +135,12 @@ std::uint64_t evaluate_elf_cfi_expression(std::span<const std::byte> expression,
         return value;
     };
     const auto register_value = [&](std::uint64_t number) {
-        elf_cfi_require(number <= (riscv ? 31u : 15u), ErrorCode::unsupported,
+        elf_cfi_require(number <= (zero_register_file ? 31u : 15u), ErrorCode::unsupported,
                         "ELF CFI expression register is outside the integer context");
-        if (riscv && number == 0) {
+        if (zero_register_file && number == 0) {
             const auto found = registers.find(0);
             elf_cfi_require(found == registers.end() || found->second == 0, ErrorCode::malformed,
-                            "ELF CFI expression context has nonzero RISC-V x0");
+                            "ELF CFI expression context has nonzero architectural zero register");
             return std::uint64_t{0};
         }
         const auto found = registers.find(number);
@@ -369,25 +369,28 @@ void run_elf_integer_cfi(std::span<const std::byte> program, ByteOrder order, bo
 }
 
 Result<ElfUnwindResult> evaluate_elf_integer_unwind(const ElfMetadata &metadata, const ElfEhFrameFunction &fde,
-    Address pc, const ElfUnwindContext &context, const ElfUnwindMemoryReader &read) {
+    Address pc, const ElfUnwindContext &context, const ElfUnwindMemoryReader &read,
+    bool mips_compact_mode = false) {
     try {
         const bool arm = metadata.header.machine == 40;
+        const bool mips32 = metadata.header.machine == 8 && !metadata.header.is_64;
+        const bool riscv = metadata.header.machine == 243;
         const auto width = static_cast<std::uint8_t>(metadata.header.is_64 ? 8 : 4);
         const std::uint64_t limit = width == 4 ? UINT32_MAX : UINT64_MAX;
-        const std::uint64_t ra = arm ? 14 : 1;
-        const std::uint64_t sp = arm ? 13 : 2;
-        elf_cfi_require(arm || !(metadata.header.flags & ~0x17u), ErrorCode::unsupported,
+        const std::uint64_t ra = arm ? 14 : mips32 ? 31 : 1;
+        const std::uint64_t sp = arm ? 13 : mips32 ? 29 : 2;
+        elf_cfi_require(arm || mips32 || !(metadata.header.flags & ~0x17u), ErrorCode::unsupported,
             "RISC-V embedded, ILP32-on-RV64 or unknown ELF ABI flags are unsupported for CFI");
         elf_cfi_require(fde.code_alignment != 0 && fde.size != 0, ErrorCode::malformed, "ELF CFI has an empty range or zero code alignment");
         elf_cfi_require(fde.begin.offset <= limit && fde.size - 1 <= limit - fde.begin.offset && pc.offset <= limit,
             ErrorCode::overflow, "ELF CFI range exceeds target address width");
         elf_cfi_require(fde.return_register == ra, ErrorCode::unsupported, "ELF CIE uses an unsupported return-address column");
-        if (!arm) {
+        if (!arm && (riscv || mips32)) {
             const auto zero = context.find(0);
-            elf_cfi_require(zero == context.end() || zero->second == 0, ErrorCode::malformed, "ELF CFI context has nonzero RISC-V x0");
+            elf_cfi_require(zero == context.end() || zero->second == 0, ErrorCode::malformed, "ELF CFI context has nonzero architectural zero register");
         }
         const auto live = [&](std::uint64_t number) -> std::optional<std::uint64_t> {
-            if (!arm && number == 0) return 0;
+            if (!arm && (riscv || mips32) && number == 0) return 0;
             const auto found = context.find(number);
             if (found == context.end()) return {};
             elf_cfi_require(found->second <= limit, ErrorCode::overflow, "ELF CFI register exceeds target width");
@@ -419,12 +422,13 @@ Result<ElfUnwindResult> evaluate_elf_integer_unwind(const ElfMetadata &metadata,
         // is platform-defined; require an explicit CFI rule before exposing it.
         for (std::uint64_t number = 0; number <= (arm ? 15u : 31u); ++number) {
             const bool preserved = arm ? ((number >= 4 && number <= 8) || number == 10 || number == 11 || number == ra)
-                : (number <= 4 || number == 8 || number == 9 || (number >= 18 && number <= 27));
+                : mips32 ? ((number >= 16 && number <= 23) || number == 30 || number == ra)
+                         : (number <= 4 || number == 8 || number == 9 || (number >= 18 && number <= 27));
             if (preserved) if (const auto value = live(number)) result.caller[number] = *value;
         }
         for (const auto &[number, rule] : state.rules) {
-            if (!arm && number == 0) {
-                elf_cfi_require(rule.kind == ElfCfiRule::Kind::same, ErrorCode::unsupported, "ELF CFI cannot redefine RISC-V x0");
+            if (!arm && (riscv || mips32) && number == 0) {
+                elf_cfi_require(rule.kind == ElfCfiRule::Kind::same, ErrorCode::unsupported, "ELF CFI cannot redefine the architectural zero register");
                 result.caller[0] = 0;
                 continue;
             }
@@ -469,9 +473,13 @@ Result<ElfUnwindResult> evaluate_elf_integer_unwind(const ElfMetadata &metadata,
         const auto return_address = result.caller.find(ra);
         elf_cfi_require(return_address != result.caller.end(), ErrorCode::out_of_bounds, "ELF CFI return address is unavailable");
         result.caller_pc = return_address->second;
-        elf_cfi_require(arm ? ((result.caller_pc & 1) || !(result.caller_pc & 3)) : !(result.caller_pc & 1),
+        elf_cfi_require(arm ? ((result.caller_pc & 1) || !(result.caller_pc & 3)) :
+                            mips32 ? (mips_compact_mode ?
+                                ((result.caller_pc & 1) || !(result.caller_pc & 3)) :
+                                !(result.caller_pc & 3)) : !(result.caller_pc & 1),
             ErrorCode::malformed, "ELF CFI return address has invalid instruction alignment");
         if (arm) result.caller[15] = result.caller_pc; // Retain the Thumb state bit in register state.
+        if (mips32) result.caller[31] = result.caller_pc; // Preserve the compact-state bit in RA.
         if (state.rules.contains(sp)) {
             const auto restored_sp = result.caller.find(sp);
             elf_cfi_require(restored_sp != result.caller.end() && restored_sp->second == result.cfa,

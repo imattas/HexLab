@@ -12,15 +12,30 @@ instruction counts beside the existing block correspondence rows. The
 instruction changes. Function and block correspondence still preserve
 ambiguity; ambiguous blocks are never assigned an instruction diff.
 
-The frontend includes block-local sequences only when every instruction has a
-normalized fingerprint. Total retained block fingerprints are capped at four
-million per desktop image and two million per CLI image. Block-local alignment
-uses a four-million aggregate dynamic-programming cell budget per function
-match operation. If that budget runs out, affected summaries are explicitly
-marked as omitted. Comparison sessions store the derived block diffs in format
-version 7; readers continue to accept versions 1 through 6. Version 5 introduced
-block-local diffs; version 7 additionally preserves block instruction-similarity
-evidence.
+The frontend retains each available block instruction fingerprint together
+with its original zero-based instruction position. Opaque/unfingerprintable
+instructions therefore leave gaps instead of discarding all evidence from the
+block. The frontend still computes block-local alignment only when every
+instruction has a fingerprint; partial sequences are never presented as a
+complete diff. Total retained fingerprints and their position records share a
+four-million-item desktop image budget or two-million-item CLI image budget.
+Block-local alignment uses a four-million aggregate dynamic-programming cell
+budget per function match operation. If that budget runs out, affected
+summaries are explicitly marked as omitted.
+
+For matching, the engine compares the multiset of known instruction IDs and
+ordered adjacent pairs only when the original positions are consecutive.
+`BlockInstructionEvidence` reports old/new instruction coverage percentages;
+content similarity is scaled by the lower coverage before it influences the
+block score. Partial evidence cannot anchor a unique block hash match and
+cannot produce an instruction diff. This prevents a small known fragment from
+being treated as proof that two whole blocks are identical. Coverage is an
+availability measure, not a semantic confidence percentage.
+
+Comparison sessions store derived block diffs and similarity evidence in
+version 14; readers continue to accept versions 1 through 13. Older sessions
+with block similarity evidence are treated as complete evidence because their
+format only stored evidence from complete sequences.
 
 The fingerprints omit address-dependent branch targets and immediates where
 the shared instruction normalizer supports it. They do not prove semantic

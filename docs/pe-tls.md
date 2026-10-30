@@ -15,8 +15,14 @@ preferred-base image range before subtraction; template end may equal the image
 end, while start/index/callback-array locations must remain inside it. The raw
 template extent and index must map to initialized image bytes. Callback targets
 must resolve to initialized executable bytes, and malformed or unterminated
-callback arrays make PE metadata partial with a diagnostic. HexLab describes
-TLS data and does not execute callbacks or materialize per-thread TLS blocks.
+callback arrays make PE metadata partial with a diagnostic. HexLab does not
+execute callbacks or write a thread's TLS index slot.
+
+`materialize_pe_tls_template` builds a caller-owned per-thread data block from
+the initialized template bytes and the declared zero-fill tail. Its default
+64 MiB limit can be overridden by the caller. It uses the selected image load
+base while TLS RVAs stay normalized in metadata. The helper does not allocate
+a thread environment block or execute TLS callbacks.
 
 CLI inspection prints the normalized template start/end, index and callback
 array RVAs, zero-fill/characteristics, callback target RVA/VA rows, source file
@@ -26,3 +32,5 @@ rows; parsing retains its separate one-million-entry bound.
 Regression coverage includes PE32 and PE32+, RVA normalization, callback order,
 source provenance, truncated directories, unmapped arrays, and invalid callback
 targets in `tests/loader_tests.cpp`.
+
+The TLS `Characteristics` field is retained, but the loader rejects bits outside the defined four-bit alignment field and rejects reserved alignment code 15. This prevents malformed directory flags from being presented as valid TLS metadata.

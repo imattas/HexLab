@@ -15,11 +15,27 @@ integer.
 Callers may supply an `AbiDescription` to map integer/floating register
 positions and stack offsets to ABI argument positions and to state pointer
 width. Helpers provide ordered integer and stack slot maps for x86-64 Windows,
-x86-64 System V, AArch64, ARM32 AAPCS, RISC-V ILP32/LP64, and MIPS32 O32 /
-MIPS64 N64. The ARM32 and RISC-V/MIPS additions currently describe integer
-argument and return registers, caller-saved integer registers, and stack
-slots; they do not claim complete floating-point, vector, aggregate, or
-multi-register ABI classification. AArch64 additionally supports scalar
+x86-64 System V, x86-32 cdecl/stdcall/fastcall/thiscall, AArch64, ARM32 AAPCS, RISC-V
+ILP32/LP64, and MIPS32 O32 / MIPS64 N64. The x86-32 stdcall profile shares cdecl's stack
+argument locations and caller-saved registers while selecting callee-cleanup
+classification for explicit stdcall prototypes. Inferred function types retain
+the stdcall convention. The fastcall profile maps eligible scalar integer
+arguments through ECX and EDX, then uses entry-relative stack slots; explicit
+fastcall prototypes use the shared classifier's callee-cleanup and hidden
+result rules. Inferred function types retain the fastcall convention. The
+thiscall profile models ECX as the implicit receiver through the shared
+classifier and maps ordinary explicit parameters to stack slots; inferred
+parameter recovery does not invent a named receiver. Inferred function types
+retain the thiscall convention. These x86-32 profiles are opt-in through the
+API. The default ARM32 and RISC-V/MIPS
+profiles describe integer argument and return registers, caller-saved
+registers, and stack slots. ARM32
+also exposes an explicit `arm32_aapcs_vfp_abi()` profile for VFP PCS
+prototypes. It maps scalar floating arguments and one-to-four-member HFAs
+through S/D registers, including whole-HFA stack fallback. For variadic
+prototypes carrying the VFP variant, named fixed parameters use the AAPCS32
+base PCS as required by the shared classifier; call-site recovery can classify
+unnamed arguments only when their actual types are available. AArch64 additionally supports scalar
 floating-point registers and the limited HFA handling described below. In
 particular, those helpers should be
 selected only for the named data model and calling convention, rather than
@@ -56,6 +72,27 @@ ordered map is absent, the older integer-register plus exact-stack-offset
 heuristic is retained. This is a reviewable heuristic candidate; callers
 should not treat it as debug information or a confirmed signature. Results
 are deterministic and do not mutate the lifted function.
+An explicit prototype used with `arm32_aapcs_abi()` now uses the shared AAPCS32
+base-PCS classifier to constrain single-location scalar arguments and hidden
+aggregate-result pointers. For an aggregate result larger than four bytes, the
+hidden result buffer is the exact incoming `r0` pointer; direct calls and known
+external prototypes can transfer that result layout to the caller's matching
+output buffer. AAPCS32 split base-PCS aggregate arguments still require
+component-aware lifting. With `arm32_aapcs_vfp_abi()`, explicit non-variadic
+prototypes map scalar FP values and HFA members to classified VFP registers.
+HFAs that spill are mapped only when member starts are exact and ordered;
+arbitrary aggregate copies, partial stores, aliases between S/D register views,
+and call-site source ordering without a prototype remain unresolved. Variadic
+prototypes map only their named fixed parameters through the base PCS; the
+classifier applies default argument promotions to typed unnamed call-site
+arguments (narrow integer/bool to `int`, `float` to `double`) before placement.
+Unnamed arguments without call-site types and variadic vector arguments remain
+unsupported. HFA return types are retained for direct calls when the
+shared classifier proves a supported result placement, without reconstructing
+individual result members from unrelated IR values.
+This remains opt-in: callers must supply the correct ABI profile and an exact
+prototype, and the result is type-recovery evidence rather than automatic ABI
+detection.
 For multiple value-return paths, the candidate result type is retained only
 when every observed path has known, matching type evidence; mixed bare/value
 returns or conflicting/unknown typed paths remain untyped and suppress inferred
@@ -93,6 +130,14 @@ can still leave an unconstrained variable unknown. This currently covers typed
 IR comparison operators, not architecture flag predicates or register values
 nested inside other arithmetic expressions.
 
+Explicit Boolean-typed IR expressions now retain a Boolean type through SSA
+assignments and phi nodes when all incoming values agree. This lets Boolean
+comparison results and their copies display as `bool`/`_Bool` instead of an
+unsigned one-bit integer. Conflicting or incomplete phi evidence remains
+unknown under the existing exact-type merge rules. This relies on the lifted
+IR's explicit Boolean annotation; it does not infer Boolean types from
+zero/nonzero tests, branch conditions, or byte-sized integer values.
+
 An explicitly signed integer annotation on a register expression or memory
 load also supplies positive signedness evidence and propagates through the
 existing assignment data flow. The IR's default `is_signed == false` is not
@@ -100,6 +145,15 @@ treated as unsigned evidence because most lifted integer expressions use that
 default without classifying signedness. A later unsigned comparison that
 conflicts with already-proven signed evidence suppresses the scalar type rather
 than allowing one interpretation to silently take precedence.
+
+Arithmetic operations that explicitly encode signedness also constrain their
+direct register operands: ARM32 `SMULL`/`UMULL` and MIPS32/64 signed or unsigned
+HI/LO multiply/divide forms contribute signed-only or unsigned-only evidence.
+The evidence propagates through supported same-width copies; contradictory
+operations or comparisons leave the inferred integer type unknown. Generic
+`add`, `sub`, and `mul` operations remain neutral because their bitvector
+semantics do not identify a signed C type, and MIPS64 word operations do not
+transfer their low-word interpretation onto the full-width source register.
 
 Signedness-aware integer division and remainder operators (`sdiv`, `srem`,
 `udiv`, `urem`, and the AArch64 `a64_sdiv`/`a64_udiv` forms) now provide the
@@ -114,12 +168,39 @@ other operators, mixed interpretations suppress the inferred signedness, and
 only proven same-width copies carry the evidence onward. This does not infer a
 signed type for HI/LO results from the operation alone.
 
+Arithmetic right shift (`sar`) and explicit logical right shift (`lshr`) add
+signed and unsigned evidence, respectively, to their direct source register.
+That evidence follows only same-width, zero-displacement copies; if the same
+value is used by both forms, signedness remains ambiguous. Generic `shr` is
+left unclassified because some front ends use that spelling for signed shifts
+while machine decoders use it for logical shifts. Shift-count operands do not
+constrain signedness.
+
 Vector lane metadata (`element_kind`, `element_bits`, and `lanes`) now produces
 an immutable homogeneous vector type when its total width matches the IR value.
 Typed vector ABI slots and vector return registers carry that recovered type
 into candidate prototypes. Opaque vectors, conflicting vector phis, and
 unsupported lane kinds remain untyped with a diagnostic; the pass does not
 guess their element type or ABI position.
+
+Scalar floating arithmetic (`fadd`, `fsub`, `fmul`, and `fdiv` forms) can also
+classify direct register operands when the lifted result is explicitly
+floating-typed. This covers operands whose source expressions lack their own
+floating annotation. The recovery requires a direct register operand; for
+non-AArch64 banks its width must equal the result's scalar width, while
+AArch64 uses the existing S/D view checks. Explicit types, conflicting float
+evidence, vectors, width-changing operands, and non-arithmetic conversions
+remain outside this inference. It does not infer float types from opcode names
+alone or classify floating ABI slots without the existing ABI evidence.
+
+The typed `select_if` form carries type facts from its paired result arms only
+when both arms have the same IR type. Pointer status and signedness require
+matching evidence from both alternatives (or an explicit pointer/signed
+integer result type); the condition does not contribute result type evidence.
+Conflicting exact types or vector metadata remain ambiguous. For aggregate and
+indexed-pointer metadata, only identical facts present on both arms survive.
+This handles conditional value selection without treating a predicate or one
+branch alone as proof about the merged value.
 
 `format_pseudocode_with_types` composes stack-slot and type recovery with
 structured pseudocode formatting. When an explicit prototype or conservative
@@ -132,6 +213,12 @@ declarations for locals with concrete recovered types before the basic-block
 body, while leaving unsupported local declarators and uncertain slots out of
 the declaration list. The output remains heuristic pseudocode and retains
 instruction-origin comments; it does not become confirmed source debug data.
+The declarator renderer also handles recursively nested function-pointer
+locals and parameters using exact fixed type metadata. It retains parameter
+types, names (or deterministic `argN` fallbacks), and variadic markers for
+default calling-convention signatures; non-default function conventions and
+unsupported nested parameter declarators keep the generic function header or
+omit the local declaration.
 
 Each `RecoveredVariable` includes a stable display name and, for an observed
 incoming ABI register slot, its parameter index. Parameter names use ABI slot
@@ -163,9 +250,14 @@ sparse accesses, and different-width fields remain separate members. This is
 a shape heuristic based only on observed accesses and can mistake adjacent
 record fields for an array. Unsupported widths, oversized offsets, or
 overlapping members keep the conservative `byte*` pointee. Member names are
-synthetic, signedness and semantic types are unknown, and aliasing between
-different base registers is not resolved. Alias field propagation is bounded
-by the number of SSA facts; if a non-zero-offset cycle prevents convergence,
+synthetic. A member is rendered as signed only when every observed integer
+load at that byte offset and width carries an explicit signed integer marker;
+unsigned-only, mixed, or missing signedness evidence keeps the unsigned
+integer fallback. The marker follows the same proven constant-offset pointer
+alias paths as field widths. This does not infer signedness from later
+arithmetic uses, stores, debug information, or semantic names, and aliasing
+between different base registers is not resolved. Alias field propagation is
+bounded by the number of SSA facts; if a non-zero-offset cycle prevents convergence,
 aggregate layouts are suppressed and a diagnostic explains why.
 If one pointer fact observes different access widths at the same byte offset,
 the layout is ambiguous and aggregate inference for that pointer is suppressed.
@@ -177,7 +269,15 @@ pointer-to-structure prints as `base->field_N` only when the access width
 matches that exact member. Constant offsets into a recovered array member print
 as `base->field_N[index]` only for an exact element-width access. Unknown,
 ambiguous, partial-width, or overlapping accesses keep the ordinary memory
-expression.
+expression. A dynamic index is rendered through a declared fixed array member
+only when the displacement lands at that member or at a constant field offset
+inside its first structure element, the index has no additional shift or
+extension, and the additive index's memory scale equals the complete
+array-element size.
+Direct element access must also match the element width; indexed field access
+must match one unique field through a complete, non-overlapping element layout.
+Dynamic indices into arbitrary pointers, multiple dynamic array levels, and
+possibly overlapping member layouts remain raw memory expressions.
 When an explicit or recovered structure contains nested structures or fixed
 arrays of structures, typed pseudocode can also follow a flattened constant
 displacement through the complete member path, such as
@@ -185,9 +285,10 @@ displacement through the complete member path, such as
 have a bounded, complete, non-overlapping fixed layout; array size must agree
 with its element size and count. The resolver is capped at eight nesting
 levels and 4096 visited type/member steps. Unions, bitfields, virtual bases,
-anonymous members, incomplete extents, ambiguous paths, dynamic indices, and
-partial-width accesses retain the ordinary memory expression. This follows
-Ghidra's type-directed member and subscript rendering in its native C printer
+anonymous members, incomplete extents, ambiguous paths, dynamically indexed
+multiple array levels, and partial-width accesses retain the ordinary memory
+expression. This follows Ghidra's type-directed member and subscript rendering
+in its native C printer
 ([`printc.cc`](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/printc.cc)); HexLab applies its own stricter bounded layout checks.
 When a pointer-width load into a pointer-classified value, or a pointer-valued
 store, uses a constant-offset slot, that member is recovered as `void*` rather
@@ -196,7 +297,7 @@ constant pointer copies and offset aliases only when the same field extent is
 present in the destination layout. When a classified pointer member is loaded
 and that value is independently dereferenced at constant offsets, the member
 can point to a recovered nested structure. This follows observed pointer loads
-to a maximum of four nested pointee levels and one million combined memory
+to a maximum of eight nested pointee levels and one million combined memory
 observation, alias-graph traversal, layout, comparison, and type-emission work
 items per recovery. Cycles, excess
 depth/work, missing child layouts, and conflicting observations
@@ -301,7 +402,7 @@ same SSA value are discarded; explicit caller types and conflicting scalar,
 floating, or vector evidence remain authoritative. The transfer is limited to
 register-passed arguments with matching ABI slot maps and complete structures
 up to 1 MiB. It copies only supported scalar and pointer fields, caps arrays at
-4096 elements and nested pointee depth at four, with a separate one-million-
+4096 elements and nested pointee depth at eight, with a separate one-million-
 item per-function transfer budget and a cap of 4096 distinct caller values.
 Unions, unsupported field kinds, and pointers with unresolved named pointee
 definitions remain unsupported. All propagated shapes remain heuristic observations and do not
@@ -437,6 +538,31 @@ argument inference is emitted only when evidence occupies a contiguous prefix
 of one register class; seeing both integer and SIMD classes leaves source
 parameter ordering ambiguous.
 
+Within AArch64 FP recovery, `sN`, `dN`, and `qN` accesses share one physical
+SIMD register and SSA identity. A typed scalar `Assign`, call result, or
+intrinsic output identifies an S or D definition from its 32- or 64-bit result
+type. Direct `Assign` destinations and call-result registers in the S or D
+view also scope the definition to that written lane even when the payload type
+is unknown; this write-width evidence does not itself imply a floating-point
+type. The architectural write still invalidates the wider register
+version. Scalar arithmetic does not model the FPCR-dependent upper-lane
+preserve/clear behavior as a separate value. The supported scalar arithmetic
+intrinsic families are `FADD`, `FSUB`, `FMUL`, `FDIV`, `FMAX`, and `FMIN` in
+their S and D forms. A typed 128-bit vector result identifies a full-Q
+definition; this includes supported 64-bit vector arrangements whose upper
+half is zeroed. The supported vector-output intrinsic families are
+integer `VADD`/`VSUB`/`VAND`/`VORR`/`VEOR`/`SMAX`/`SMIN`/`UMAX`/`UMIN` and
+floating `FADD`/`FSUB`/`FMUL`/`FDIV`/`FMAX`/`FMIN`.
+Unrecognized intrinsics with only an untyped 128-bit clobber do not establish
+a full-Q or scalar definition.
+
+Vector-view uses do not erase a proven scalar S/D type, and scalar-view uses
+do not relabel a proven full-Q definition. When the definition is unknown,
+cross-view evidence stays conservative. A scalar SSA value observed through
+both S and D widths remains ambiguous. This pass does not represent upper-lane
+bits as separate SSA slices and does not infer a source type when no typed
+definition, recognized write-width evidence, or supported result width exists.
+
 
 ## Native call outputs
 
@@ -448,11 +574,12 @@ the stack pointer retain their register state. Other ABI helpers keep an empty
 caller-saved map and retain their existing conservative behavior.
 
 The pass deduplicates exact register outputs and includes overlapping register
-views present in the IR: GPR widths and high bytes, flags widths, and XMM/YMM
-views. Represented whole YMM registers on Windows also become unknown because
-the ABI preserves only the lower XMM6-XMM15 halves; their separate low XMM
-views remain preserved. No value is inferred for any volatile output, and
-partial SIMD preservation is not reconstructed as an expression.
+views present in the IR: GPR widths and high bytes, flags widths, and XMM/YMM/ZMM
+views. A caller-saved XMM or YMM write therefore invalidates any overlapping
+represented ZMM value. Represented whole YMM registers on Windows also become
+unknown because the ABI preserves only the lower XMM6-XMM15 halves; their
+separate low XMM views remain preserved. No value is inferred for any volatile
+output, and partial SIMD preservation is not reconstructed as an expression.
 
 `Call::register_writes` and its parallel `register_output_versions` describe
 these outputs. SSA captures selected ABI argument registers before defining

@@ -19,7 +19,8 @@ struct CoffLinkLimits {
 // supported machine (AMD64 or ordinary ARM64 COFF). ARM64 supports initialized
 // .text/.rdata/.data and zero-filled .bss, common/COMDAT selection, checked
 // absolute/relative fields, branches, ADR/ADRP and page-offset instructions.
-// ARM64 BigObj, unwind, imports, TLS and unsupported relocations reject.
+// BigObj section/symbol layouts are supported for both machines. ARM64
+// unwind, imports, TLS and unsupported relocations reject.
 HEXLAB_LOADERS_EXPORT Result<std::vector<std::byte>> link_coff_executable(
     std::span<const std::shared_ptr<const ByteStorage>>, std::string_view entry_symbol,
     std::stop_token = {}, CoffLinkLimits = {});

@@ -6,6 +6,7 @@
 #include <bit>
 #include <limits>
 #include <new>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 
@@ -36,14 +37,14 @@ Op lookup(std::uint16_t code){
   case 0x51:return known("stind.ref");case 0x52:return known("stind.i1");case 0x53:return known("stind.i2");case 0x54:return known("stind.i4");case 0x55:return known("stind.i8");case 0x56:return known("stind.r4");case 0x57:return known("stind.r8");case 0x58:return known("add");case 0x59:return known("sub");case 0x5a:return known("mul");case 0x5b:return known("div");case 0x5c:return known("div.un");case 0x5d:return known("rem");case 0x5e:return known("rem.un");case 0x5f:return known("and");case 0x60:return known("or");case 0x61:return known("xor");case 0x62:return known("shl");case 0x63:return known("shr");case 0x64:return known("shr.un");case 0x65:return known("neg");case 0x66:return known("not");
   case 0x67:return known("conv.i1");case 0x68:return known("conv.i2");case 0x69:return known("conv.i4");case 0x6a:return known("conv.i8");case 0x6b:return known("conv.r4");case 0x6c:return known("conv.r8");case 0x6d:return known("conv.u4");case 0x6e:return known("conv.u8");
   case 0x6f:return known("callvirt",OperandKind::token);case 0x70:return known("cpobj",OperandKind::token);case 0x71:return known("ldobj",OperandKind::token);case 0x72:return known("ldstr",OperandKind::token);case 0x73:return known("newobj",OperandKind::token);case 0x74:return known("castclass",OperandKind::token);case 0x75:return known("isinst",OperandKind::token);case 0x76:return known("conv.r.un");case 0x79:return known("unbox",OperandKind::token);case 0x7a:return known("throw");
-  case 0x7b:return known("ldfld",OperandKind::token);case 0x7c:return unsupported("ldflda",OperandKind::token);case 0x7d:return known("stfld",OperandKind::token);case 0x7e:return known("ldsfld",OperandKind::token);case 0x7f:return unsupported("ldsflda",OperandKind::token);case 0x80:return known("stsfld",OperandKind::token);case 0x81:return known("stobj",OperandKind::token);
-  case 0x82:return unsupported("conv.ovf.i1.un");case 0x83:return unsupported("conv.ovf.i2.un");case 0x84:return unsupported("conv.ovf.i4.un");case 0x85:return unsupported("conv.ovf.i8.un");case 0x86:return unsupported("conv.ovf.u1.un");case 0x87:return unsupported("conv.ovf.u2.un");case 0x88:return unsupported("conv.ovf.u4.un");case 0x89:return unsupported("conv.ovf.u8.un");case 0x8a:return unsupported("conv.ovf.i.un");case 0x8b:return unsupported("conv.ovf.u.un");
+  case 0x7b:return known("ldfld",OperandKind::token);case 0x7c:return known("ldflda",OperandKind::token);case 0x7d:return known("stfld",OperandKind::token);case 0x7e:return known("ldsfld",OperandKind::token);case 0x7f:return known("ldsflda",OperandKind::token);case 0x80:return known("stsfld",OperandKind::token);case 0x81:return known("stobj",OperandKind::token);
+  case 0x82:return unsupported("conv.ovf.i1.un");case 0x83:return unsupported("conv.ovf.i2.un");case 0x84:return unsupported("conv.ovf.i4.un");case 0x85:return unsupported("conv.ovf.i8.un");case 0x86:return unsupported("conv.ovf.u1.un");case 0x87:return unsupported("conv.ovf.u2.un");case 0x88:return unsupported("conv.ovf.u4.un");case 0x89:return unsupported("conv.ovf.u8.un");case 0x8a:return known("conv.ovf.i.un");case 0x8b:return known("conv.ovf.u.un");
   case 0x8c:return known("box",OperandKind::token);case 0x8d:return known("newarr",OperandKind::token);case 0x8e:return known("ldlen");case 0x8f:return known("ldelema",OperandKind::token);
   case 0x90:return known("ldelem.i1");case 0x91:return known("ldelem.u1");case 0x92:return known("ldelem.i2");case 0x93:return known("ldelem.u2");case 0x94:return known("ldelem.i4");case 0x95:return known("ldelem.u4");case 0x96:return known("ldelem.i8");case 0x97:return known("ldelem.i");case 0x98:return known("ldelem.r4");case 0x99:return known("ldelem.r8");case 0x9a:return known("ldelem.ref");case 0x9b:return known("stelem.i");case 0x9c:return known("stelem.i1");case 0x9d:return known("stelem.i2");case 0x9e:return known("stelem.i4");case 0x9f:return known("stelem.i8");case 0xa0:return known("stelem.r4");case 0xa1:return known("stelem.r8");case 0xa2:return known("stelem.ref");
-  case 0xa3:return unsupported("ldelem",OperandKind::token);case 0xa4:return unsupported("stelem",OperandKind::token);case 0xa5:return known("unbox.any",OperandKind::token);
+  case 0xa3:return known("ldelem",OperandKind::token);case 0xa4:return known("stelem",OperandKind::token);case 0xa5:return known("unbox.any",OperandKind::token);
   case 0xb3:return unsupported("conv.ovf.i1");case 0xb4:return unsupported("conv.ovf.i2");case 0xb5:return unsupported("conv.ovf.i4");case 0xb6:return unsupported("conv.ovf.i8");case 0xb7:return unsupported("conv.ovf.u1");case 0xb8:return unsupported("conv.ovf.u2");case 0xb9:return unsupported("conv.ovf.u4");case 0xba:return unsupported("conv.ovf.u8");
   case 0xc2:return unsupported("refanyval",OperandKind::token);case 0xc3:return unsupported("ckfinite");case 0xc6:return unsupported("mkrefany",OperandKind::token);
-  case 0xd0:return known("ldtoken",OperandKind::token);case 0xd1:return known("conv.u2");case 0xd2:return known("conv.u1");case 0xd3:return unsupported("conv.i");case 0xd4:return unsupported("conv.ovf.i");case 0xd5:return unsupported("conv.ovf.u");case 0xd6:return unsupported("add.ovf");case 0xd7:return unsupported("add.ovf.un");case 0xd8:return unsupported("mul.ovf");case 0xd9:return unsupported("mul.ovf.un");case 0xda:return unsupported("sub.ovf");case 0xdb:return unsupported("sub.ovf.un");case 0xdc:return known("endfinally");case 0xdd:return known("leave",OperandKind::branch32);case 0xde:return known("leave.s",OperandKind::branch8);case 0xdf:return known("stind.i");case 0xe0:return unsupported("conv.u");
+  case 0xd0:return known("ldtoken",OperandKind::token);case 0xd1:return known("conv.u2");case 0xd2:return known("conv.u1");case 0xd3:return known("conv.i");case 0xd4:return known("conv.ovf.i");case 0xd5:return known("conv.ovf.u");case 0xd6:return known("add.ovf");case 0xd7:return known("add.ovf.un");case 0xd8:return known("mul.ovf");case 0xd9:return known("mul.ovf.un");case 0xda:return known("sub.ovf");case 0xdb:return known("sub.ovf.un");case 0xdc:return known("endfinally");case 0xdd:return known("leave",OperandKind::branch32);case 0xde:return known("leave.s",OperandKind::branch8);case 0xdf:return known("stind.i");case 0xe0:return known("conv.u");
   case 0xfe00:return known("arglist");case 0xfe01:return known("ceq");case 0xfe02:return known("cgt");case 0xfe03:return known("cgt.un");case 0xfe04:return known("clt");case 0xfe05:return known("clt.un");
   case 0xfe06:return known("ldftn",OperandKind::token);case 0xfe07:return known("ldvirtftn",OperandKind::token);
   case 0xfe09:return known("ldarg",OperandKind::u16);case 0xfe0a:return known("ldarga",OperandKind::u16);case 0xfe0b:return known("starg",OperandKind::u16);case 0xfe0c:return known("ldloc",OperandKind::u16);case 0xfe0d:return known("ldloca",OperandKind::u16);case 0xfe0e:return known("stloc",OperandKind::u16);case 0xfe0f:return unsupported("localloc");case 0xfe11:return known("endfilter");case 0xfe12:return unsupported("unaligned.",OperandKind::u8);case 0xfe13:return known("volatile.");case 0xfe14:return known("tail.");case 0xfe15:return known("initobj",OperandKind::token);case 0xfe16:return known("constrained.",OperandKind::token);case 0xfe17:return known("cpblk");case 0xfe18:return known("initblk");case 0xfe19:return unsupported("no.",OperandKind::u8);case 0xfe1a:return known("rethrow");case 0xfe1c:return known("sizeof",OperandKind::token);case 0xfe1d:return unsupported("refanytype");case 0xfe1e:return known("readonly.");
@@ -107,9 +108,10 @@ Result<std::vector<CilInstruction>> decode_cil_instructions(std::span<const std:
 }
 namespace hexlab {
 namespace {
-Result<std::vector<std::byte>> read_managed_metadata_root(const LoadedImage &loaded) {
+Result<std::vector<std::byte>> read_managed_metadata_root(const LoadedImage &loaded,std::uint32_t* runtime_flags=nullptr) {
   if(!loaded.image || !loaded.metadata.pe)return Error{ErrorCode::invalid_argument,"Managed inspection requires a loaded PE image"};
   auto managed=parse_managed_pe(loaded);if(!managed)return managed.error();
+  if(runtime_flags)*runtime_flags=managed.value().flags;
   const auto directory=std::find_if(loaded.metadata.directories.begin(),loaded.metadata.directories.end(),[](const Directory& d){return d.index==14;});
   if(directory==loaded.metadata.directories.end() || !directory->location || directory->size<72)return Error{ErrorCode::unsupported,"PE image has no complete CLR runtime directory"};
   const auto base=loaded.load_base.value_or(loaded.metadata.preferred_base);
@@ -133,6 +135,24 @@ Result<std::vector<ManagedField>> inspect_managed_fields(const LoadedImage &load
 } catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR field catalog"};}
   catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR field catalog exceeds container limits"};}
 
+Result<std::vector<ManagedProperty>> inspect_managed_properties(const LoadedImage &loaded) try {
+  auto metadata=read_managed_metadata_root(loaded);if(!metadata)return metadata.error();
+  return parse_managed_properties(metadata.value());
+} catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR property catalog"};}
+  catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR property catalog exceeds container limits"};}
+
+Result<std::vector<ManagedEvent>> inspect_managed_events(const LoadedImage &loaded) try {
+  auto metadata=read_managed_metadata_root(loaded);if(!metadata)return metadata.error();
+  return parse_managed_events(metadata.value());
+} catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR event catalog"};}
+  catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR event catalog exceeds container limits"};}
+
+Result<std::vector<ManagedMarshalDescriptor>> inspect_managed_marshal_descriptors(const LoadedImage &loaded) try {
+  auto metadata=read_managed_metadata_root(loaded);if(!metadata)return metadata.error();
+  return parse_managed_marshal_descriptors(metadata.value());
+} catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR FieldMarshal catalog"};}
+  catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR FieldMarshal catalog exceeds container limits"};}
+
 Result<ManagedUserStringCatalog> inspect_managed_user_strings(const LoadedImage &loaded) try {
   auto metadata=read_managed_metadata_root(loaded);if(!metadata)return metadata.error();
   return parse_managed_user_strings(metadata.value());
@@ -140,7 +160,20 @@ Result<ManagedUserStringCatalog> inspect_managed_user_strings(const LoadedImage 
   catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR user-string catalog exceeds container limits"};}
 
 Result<std::vector<ManagedMethodAnalysis>> inspect_managed_methods(const LoadedImage& loaded,std::stop_token stop) try {
-  auto metadata_bytes=read_managed_metadata_root(loaded);if(!metadata_bytes)return metadata_bytes.error();
+  std::uint32_t runtime_flags=0;
+  auto metadata_bytes=read_managed_metadata_root(loaded,&runtime_flags);if(!metadata_bytes)return metadata_bytes.error();
+  std::uint16_t native_integer_bits=0;
+  const auto machine=loaded.metadata.machine;
+  const bool image64=machine==0x8664||machine==0xaa64||machine==0x0200;
+  // REQUIRED and PREFERRED are a two-bit field: both set means portable
+  // prefer-32, not a 32-bit requirement. A lone PREFERRED is reserved.
+  const auto width_flags=runtime_flags&0x00020002u;
+  if(image64&&!width_flags)native_integer_bits=64;
+  else if(!image64&&width_flags==2u)native_integer_bits=32;
+  else if(!width_flags&&(machine==0x01c0||machine==0x01c2||machine==0x01c4))native_integer_bits=32;
+  else if(!width_flags&&machine==0x014c&&!(runtime_flags&1u))native_integer_bits=32;
+  // ILONLY + I386 without 32BITREQUIRED is portable AnyCPU. Neither its
+  // PE32 storage format nor 32BITPREFERRED fixes the loaded runtime width.
   const auto base=loaded.load_base.value_or(loaded.metadata.preferred_base);
   auto methods=parse_managed_methods(metadata_bytes.value());if(!methods)return methods.error();
   auto call_signatures=parse_managed_call_signatures(metadata_bytes.value());
@@ -162,21 +195,115 @@ Result<std::vector<ManagedMethodAnalysis>> inspect_managed_methods(const LoadedI
   else user_string_error=user_strings.error();
   std::map<std::uint32_t,std::string> exception_type_names;
   std::map<std::uint32_t,ManagedAssemblyIdentity> exception_type_assemblies;
+  std::map<std::uint32_t,std::size_t> exception_type_owners;
   std::shared_ptr<const ManagedTypeCatalog> exception_type_catalog;
+  std::set<std::uint32_t> array_reference_type_tokens;
+  enum class CatchAncestry { exception, not_exception, unresolved };
+  std::map<std::uint32_t,const ManagedTypeDefinition*> exception_definitions;
+  std::map<std::uint32_t,const ManagedTypeReference*> exception_references;
+  std::map<std::uint32_t,const ManagedTypeSpecification*> exception_specifications;
+  std::uint32_t system_exception_token=0;
   auto type_catalog=parse_managed_type_catalog(metadata_bytes.value());
   if(type_catalog){
     exception_type_catalog=std::make_shared<const ManagedTypeCatalog>(std::move(type_catalog.value()));
+    const auto runtime_scope=[](const std::optional<ManagedAssemblyIdentity>& identity){
+      if(!identity)return false;
+      return identity->name=="System.Private.CoreLib"||identity->name=="mscorlib"||
+          identity->name=="System.Runtime"||identity->name=="netstandard";
+    };
+    std::set<std::uint32_t> runtime_value_bases;
+    for(const auto &type:exception_type_catalog->references)
+      if(runtime_scope(type.assembly_scope)&&(type.full_name=="System.ValueType"||type.full_name=="System.Enum"))
+        runtime_value_bases.insert(type.token);
+    if(runtime_scope(exception_type_catalog->assembly_identity))
+      for(const auto &type:exception_type_catalog->definitions)
+        if(type.full_name=="System.ValueType"||type.full_name=="System.Enum")runtime_value_bases.insert(type.token);
+    // A valid TypeDef whose base is not the runtime's ValueType/Enum is a
+    // reference type. TypeRef operands need stronger positive evidence because
+    // their declarations do not carry the class/value-type marker.
     for(const auto &type:exception_type_catalog->definitions)
+      if((type.base_type_token&& !runtime_value_bases.contains(type.base_type_token))||
+         type.full_name=="System.Object")
+        array_reference_type_tokens.insert(type.token);
+    static const std::set<std::string_view> known_runtime_classes{
+      "System.Object","System.String","System.Type","System.Array","System.Exception",
+      "System.Attribute","System.Delegate","System.MulticastDelegate","System.ValueType","System.Enum"
+    };
+    for(const auto &type:exception_type_catalog->references)
+      if(runtime_scope(type.assembly_scope)&&known_runtime_classes.contains(type.full_name))
+        array_reference_type_tokens.insert(type.token);
+    for(const auto &type:exception_type_catalog->specifications){
+      const ManagedTypeSignature *signature=&type.signature;
+      while(signature->type_spec_signature)signature=signature->type_spec_signature.get();
+      if(signature->element_type==0x12||signature->element_type==0x0e||signature->element_type==0x1c||
+         signature->element_type==0x14||signature->element_type==0x1d||
+         (signature->element_type==0x15&&!signature->generic_instance_is_value_type))
+        array_reference_type_tokens.insert(type.token);
+    }
+    for(const auto &type:exception_type_catalog->definitions) {
+      ++exception_type_owners[type.token];
+      exception_definitions.emplace(type.token,&type);
+      if(type.full_name=="System.Exception") {
+        if(system_exception_token) system_exception_token=UINT32_MAX;
+        else system_exception_token=type.token;
+      }
       if(!type.full_name.empty())exception_type_names.emplace(type.token,type.full_name);
+    }
     for(const auto &type:exception_type_catalog->references) {
+      ++exception_type_owners[type.token];
+      exception_references.emplace(type.token,&type);
       if(!type.full_name.empty())exception_type_names.emplace(type.token,type.full_name);
       if(type.assembly_scope)exception_type_assemblies.emplace(type.token,*type.assembly_scope);
     }
+    for(const auto &type:exception_type_catalog->specifications) {
+      ++exception_type_owners[type.token];
+      exception_specifications.emplace(type.token,&type);
+    }
   }
+  const auto catch_ancestry=[&](std::uint32_t token) {
+    if(!exception_type_catalog || !system_exception_token || system_exception_token==UINT32_MAX)
+      return CatchAncestry::unresolved;
+    std::set<std::uint32_t> visited;
+    auto current=token;
+    if((current>>24)==0x1b) {
+      const auto found=exception_specifications.find(current);
+      if(found==exception_specifications.end())return CatchAncestry::unresolved;
+      const ManagedTypeSignature *signature=&found->second->signature;
+      while(signature->type_spec_signature) signature=signature->type_spec_signature.get();
+      if(signature->element_type==0x15 && signature->generic_instance_is_value_type)
+        return CatchAncestry::not_exception;
+      current=signature->metadata_type_token;
+    }
+    if((current>>24)==0x01) {
+      const auto found=exception_references.find(current);
+      if(found==exception_references.end())return CatchAncestry::unresolved;
+      if(found->second->resolved_definition_token) current=*found->second->resolved_definition_token;
+      else return CatchAncestry::unresolved;
+    }
+    while(current) {
+      if(current==system_exception_token)return CatchAncestry::exception;
+      if(!visited.insert(current).second)return CatchAncestry::not_exception;
+      const auto found=exception_definitions.find(current);
+      if(found==exception_definitions.end()) {
+        if((current>>24)==0x01) return CatchAncestry::unresolved;
+        return CatchAncestry::not_exception;
+      }
+      current=found->second->base_type_token;
+      if(current && (current>>24)==0x01) {
+        const auto reference=exception_references.find(current);
+        if(reference==exception_references.end() || !reference->second->resolved_definition_token)
+          return CatchAncestry::unresolved;
+        current=*reference->second->resolved_definition_token;
+      }
+      if(current && (current>>24)==0x1b)return CatchAncestry::unresolved;
+    }
+    return CatchAncestry::not_exception;
+  };
   std::vector<ManagedMethodAnalysis> result;result.reserve(methods.value().size());
   for(auto& method:methods.value()){
     if(stop.stop_requested())return Error{ErrorCode::canceled,"Managed method inspection canceled"};
-    ManagedMethodAnalysis analysis;analysis.method=std::move(method);if(call_signatures)analysis.resolved_call_signatures=call_signatures.value();analysis.resolved_fields=field_catalog;analysis.resolved_exception_types=exception_type_catalog;
+    ManagedMethodAnalysis analysis;analysis.method=std::move(method);if(call_signatures)analysis.resolved_call_signatures=call_signatures.value();analysis.resolved_fields=field_catalog;analysis.resolved_exception_types=exception_type_catalog;analysis.resolved_array_reference_type_tokens=array_reference_type_tokens;
+    analysis.native_integer_bits=native_integer_bits;analysis.native_image_machine=machine;analysis.cli_runtime_flags=runtime_flags;
     if(!analysis.method.rva){analysis.status=ManagedMethodStatus::no_body;analysis.diagnostic="MethodDef has no IL RVA";result.push_back(std::move(analysis));continue;}
     if((analysis.method.impl_flags&3)!=0){analysis.status=ManagedMethodStatus::unsupported;analysis.diagnostic="MethodDef is native, runtime-provided, or uses a non-IL code type";result.push_back(std::move(analysis));continue;}
     auto fail=[&](const Error& error){analysis.status=ManagedMethodStatus::malformed;analysis.diagnostic=error.message;};
@@ -213,6 +340,51 @@ Result<std::vector<ManagedMethodAnalysis>> inspect_managed_methods(const LoadedI
     }
     auto raw=get(body_size);if(!raw){fail(raw.error());result.push_back(std::move(analysis));continue;}
     auto body=parse_cil_method_body(raw.value());if(!body){fail(body.error());result.push_back(std::move(analysis));continue;}
+    if(exception_type_catalog) {
+      const auto unresolved=std::find_if(body.value().exception_clauses.begin(),body.value().exception_clauses.end(),[&](const auto &clause) {
+        return clause.kind==CilExceptionKind::catch_clause &&
+               (!exception_type_owners.contains(clause.class_token) ||
+                exception_type_owners.at(clause.class_token)!=1);
+      });
+      if(unresolved!=body.value().exception_clauses.end()) {
+        analysis.status=ManagedMethodStatus::malformed;
+        analysis.diagnostic=exception_type_owners.contains(unresolved->class_token)
+          ? "CIL catch type token has ambiguous metadata row ownership"
+          : "CIL catch type token does not resolve to a TypeDef, TypeRef, or TypeSpec row";
+        result.push_back(std::move(analysis));continue;
+      }
+      bool invalid_catch_types=false;
+      for(const auto &clause:body.value().exception_clauses) {
+        if(clause.kind!=CilExceptionKind::catch_clause ||
+           (clause.class_token>>24)!=0x1b) continue;
+        const auto spec=std::find_if(exception_type_catalog->specifications.begin(),
+          exception_type_catalog->specifications.end(),[&](const auto &row){return row.token==clause.class_token;});
+        if(spec==exception_type_catalog->specifications.end()) continue;
+        const auto &signature=spec->signature;
+        const bool class_type=signature.element_type==0x12 ||
+          (signature.element_type==0x15 && !signature.generic_instance_is_value_type);
+        if(!class_type) {
+          analysis.status=ManagedMethodStatus::malformed;
+          analysis.diagnostic="CIL catch TypeSpec does not describe a runtime reference type";
+          invalid_catch_types=true;break;
+        }
+      }
+      if(invalid_catch_types){result.push_back(std::move(analysis));continue;}
+      bool invalid_exception_types=false;
+      for(const auto &clause:body.value().exception_clauses) {
+        if(clause.kind!=CilExceptionKind::catch_clause)continue;
+        const auto ancestry=catch_ancestry(clause.class_token);
+        if(ancestry==CatchAncestry::not_exception) {
+          analysis.status=ManagedMethodStatus::malformed;
+          analysis.diagnostic="CIL catch type is not assignable to the locally defined System.Exception";
+          invalid_exception_types=true;break;
+        }
+        if(ancestry==CatchAncestry::unresolved)
+          analysis.unresolved_exception_types.emplace(clause.class_token,
+            "Exception ancestry is unresolved in the loaded metadata catalogs");
+      }
+      if(invalid_exception_types){result.push_back(std::move(analysis));continue;}
+    }
     auto instructions=decode_cil_instructions(body.value().il);if(!instructions){fail(instructions.error());result.push_back(std::move(analysis));continue;}
     analysis.body=std::move(body.value());analysis.instructions=std::move(instructions.value());
     const auto uses_user_strings=std::any_of(analysis.instructions.begin(),analysis.instructions.end(),[](const auto &instruction){return std::string_view(instruction.mnemonic)=="ldstr";});

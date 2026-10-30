@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-  project(HexLabFirmware VERSION 0.1.0 LANGUAGES CXX)
+  project(HexLabFirmware VERSION 0.1.0 LANGUAGES C CXX)
   include(GNUInstallDirs)
   include(GenerateExportHeader)
   include(CTest)
@@ -15,7 +15,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   include(../../cmake/HexLabLibrary.cmake)
 endif()
 
-hexlab_add_library(firmware SOURCES src/firmware.cpp src/uefi_volume.cpp src/uefi_capsule.cpp DEPENDS hexlab::core)
+hexlab_add_library(firmware SOURCES src/firmware.cpp src/uefi_volume.cpp src/uefi_capsule.cpp src/uefi_auth_verify.cpp src/intel_fit.cpp src/intel_microcode.cpp
+  ../../third_party/uefi_lzma/LzmaDec.c ../../third_party/uefi_lzma/Bra86.c DEPENDS hexlab::core)
+target_link_libraries(hexlab_firmware PRIVATE hexlab_brotli_decoder)
+if(WIN32)
+  target_link_libraries(hexlab_firmware PRIVATE Crypt32)
+endif()
+target_include_directories(hexlab_firmware PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/uefi_lzma")
 if(BUILD_TESTING)
   add_executable(hexlab_firmware_tests ../../tests/firmware_tests.cpp)
   target_include_directories(hexlab_firmware_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../tests")
@@ -26,5 +32,11 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/firmware-formats.md"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/uefi-firmware-volume.md"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/uefi-brotli-compression.md"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/docs/uefi-fmp-capsule.md"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/intel-fit.md"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/intel-microcode.md"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")

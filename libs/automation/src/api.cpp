@@ -2,6 +2,7 @@
 #include "hexlab/decompiler/decompiler.hpp"
 #include "hexlab/decompiler/type_recovery.hpp"
 #include "hexlab/loaders/recipe.hpp"
+#include "hexlab/workspace/project_analysis.hpp"
 #include <algorithm>
 #include <type_traits>
 #include <unordered_map>
@@ -195,6 +196,38 @@ Result<std::vector<FunctionOwnerCandidate>> Project::function_owners(Address add
     std::sort(result.begin(),result.end(),[](const auto& a,const auto& b){return a.id<b.id;});
     return result;
 }
+Result<std::shared_ptr<const GraphModel>> Project::call_graph(
+    Address address, GraphOptions options, std::stop_token stop) const {
+    auto current = snapshot();
+    if (!current) return current.error();
+    if (stop.stop_requested()) return Error{ErrorCode::canceled, "Call graph query canceled"};
+    auto valid = derived_ok(*current.value());
+    if (!valid) return valid.error();
+    if (!current.value()->functions || !current.value()->references)
+        return Error{ErrorCode::unsupported, "Call graph requires recovered function and reference facts"};
+    auto source = project_analysis_key(*current.value(), current.value()->analysis_options);
+    if (!source) return source.error();
+    if (current.value()->derived_key != source.value() ||
+        current.value()->functions->key != source.value() ||
+        current.value()->references->key() != source.value())
+        return Error{ErrorCode::conflict, "Call graph facts belong to another project revision"};
+    const auto *function = unique_containing_function(*current.value()->functions, address);
+    if (!function) {
+        const auto owners = containing_functions(*current.value()->functions, address);
+        if (owners.size() > 1)
+            return Error{ErrorCode::conflict, "Address has multiple function owners; query function_owners and select an entry"};
+        return Error{ErrorCode::invalid_argument, "No recovered function owns the selected address"};
+    }
+    GraphLabels labels;
+    labels.revision = current.value()->state->revisions.edit;
+    labels.overrides.reserve(current.value()->state->user->annotations.size());
+    for (const auto &annotation : current.value()->state->user->annotations) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "Call graph query canceled"};
+        labels.overrides.push_back({annotation.location, annotation.name, annotation.comment});
+    }
+    return build_graph(*current.value()->functions, *current.value()->references,
+                       GraphKind::function_calls, function->id, options, labels, stop);
+}
 Result<std::optional<StackFrameInfo>> Project::stack_frame(Address address) const {
     auto s=snapshot();if(!s)return s.error();
     auto valid=derived_ok(*s.value());if(!valid)return valid.error();
@@ -231,8 +264,33 @@ Result<std::vector<StackSlotInfo>> Project::stack_slots(Address address,std::siz
     for(auto i=first;i<end;++i){
         const auto& row=rows[i];
         output.push_back({row.offset_from_entry_sp,row.width,row.access_details.size(),
-                          row.read,row.written,row.address_taken});
+                          row.read,row.written,row.address_taken,row.incoming_argument,
+                          row.outgoing_call_arguments.size(),row.incoming_argument_abi});
     }
+    return output;
+}
+Result<std::vector<StackSlotCallArgumentInfo>> Project::stack_slot_call_arguments(
+    Address address,std::size_t slot_index,std::size_t start,std::size_t count) const {
+    auto s=snapshot();if(!s)return s.error();auto valid=page_ok(count);if(!valid)return valid.error();
+    valid=derived_ok(*s.value());if(!valid)return valid.error();
+    std::vector<StackSlotCallArgumentInfo> output;
+    if(!s.value()->functions)return output;
+    const auto* function=unique_containing_function(*s.value()->functions,address);
+    if(!function){
+        const auto owners=containing_functions(*s.value()->functions,address);
+        if(owners.size()>1)return Error{ErrorCode::conflict,"Address has multiple function owners; query function_owners and select a function entry"};
+        return output;
+    }
+    const auto frame=std::find_if(s.value()->stack_frames.begin(),s.value()->stack_frames.end(),
+        [&](const auto& row){return row.function==function->id;});
+    if(frame==s.value()->stack_frames.end())return output;
+    if(slot_index>=frame->frame.slots.size())return Error{ErrorCode::invalid_argument,"Unknown stack-slot index"};
+    const auto& rows=frame->frame.slots[slot_index].outgoing_call_arguments;
+    const auto first=std::min(start,rows.size()),end=first+std::min(count,rows.size()-first);
+    output.reserve(end-first);
+    for(auto i=first;i<end;++i)
+        output.push_back({rows[i].source_instruction,rows[i].call_instruction,
+                          rows[i].source_instruction,rows[i].source_kind});
     return output;
 }
 Result<std::vector<StackSlotAccessInfo>> Project::stack_slot_accesses(
@@ -347,6 +405,44 @@ Result<std::vector<MappedSegment>> Project::segments(std::size_t start,std::size
     }
     return output;
 }
+Result<std::vector<Address>> Project::addresses_for_file_offset(FileOffset offset) const {
+    auto s=snapshot();if(!s)return s.error();
+    if(!s.value()->loaded || !s.value()->loaded->image)
+        return Error{ErrorCode::unsupported,"Project has no image mapping"};
+    return s.value()->loaded->image->to_addresses(offset);
+}
+Result<std::vector<ImportSymbol>> Project::pe_imports(std::size_t start,std::size_t count) const {
+    auto s=snapshot();if(!s)return s.error();auto valid=page_ok(count);if(!valid)return valid.error();
+    if(!s.value()->loaded)return Error{ErrorCode::unsupported,"Project has no image mapping"};
+    const auto& rows=s.value()->loaded->metadata.imports;
+    const auto first=std::min(start,rows.size()),end=first+std::min(count,rows.size()-first);
+    return std::vector<ImportSymbol>(rows.begin()+static_cast<std::ptrdiff_t>(first),
+                                     rows.begin()+static_cast<std::ptrdiff_t>(end));
+}
+Result<std::vector<ExportSymbol>> Project::pe_exports(std::size_t start,std::size_t count) const {
+    auto s=snapshot();if(!s)return s.error();auto valid=page_ok(count);if(!valid)return valid.error();
+    if(!s.value()->loaded)return Error{ErrorCode::unsupported,"Project has no image mapping"};
+    const auto& rows=s.value()->loaded->metadata.exports;
+    const auto first=std::min(start,rows.size()),end=first+std::min(count,rows.size()-first);
+    return std::vector<ExportSymbol>(rows.begin()+static_cast<std::ptrdiff_t>(first),
+                                     rows.begin()+static_cast<std::ptrdiff_t>(end));
+}
+Result<std::vector<ElfDynamicEntryInfo>> Project::elf_dynamic_entries(std::size_t start,std::size_t count) const {
+    auto s=snapshot();if(!s)return s.error();auto valid=page_ok(count);if(!valid)return valid.error();
+    const auto total=elf_dynamic_row_count(*s.value());
+    std::vector<ElfDynamicEntryInfo> output;
+    const auto end=std::min<std::uint64_t>(start,total);
+    const auto limit=end+std::min<std::uint64_t>(count,total-end);
+    output.reserve(static_cast<std::size_t>(limit-end));
+    for(auto row=end;row<limit;++row){
+        const auto item=elf_dynamic_row_at(*s.value(),row);
+        if(!item)continue;
+        output.push_back({item->table->source.section,item->table->source.file_offset,
+                          item->table->source.address,item->entry->index,item->entry->tag,
+                          item->entry->value,item->entry->string_value});
+    }
+    return output;
+}
 Result<std::vector<Reference>> Project::references(Location at,std::size_t start,std::size_t count) const {
     auto s=snapshot();if(!s)return s.error();auto valid=page_ok(count);if(!valid)return valid.error();
     valid=derived_ok(*s.value());if(!valid)return valid.error();
@@ -361,6 +457,20 @@ Result<ReferencePage> Project::incoming_references(Location at,std::size_t start
     valid=derived_ok(*s.value());if(!valid)return valid.error();
     if(!s.value()->references)return ReferencePage{};
     return s.value()->references->incoming(at,PageRequest{start,count});
+}
+Result<ReferencePage> Project::incoming_references_range(Address begin,std::uint64_t size,
+                                                         std::size_t start,std::size_t count) const {
+    auto s=snapshot();if(!s)return s.error();auto valid=page_ok(count);if(!valid)return valid.error();
+    valid=derived_ok(*s.value());if(!valid)return valid.error();
+    if(!s.value()->references)return ReferencePage{};
+    return s.value()->references->incoming_range(begin,size,PageRequest{start,count});
+}
+Result<ReferencePage> Project::outgoing_references_range(Address begin,std::uint64_t size,
+                                                         std::size_t start,std::size_t count) const {
+    auto s=snapshot();if(!s)return s.error();auto valid=page_ok(count);if(!valid)return valid.error();
+    valid=derived_ok(*s.value());if(!valid)return valid.error();
+    if(!s.value()->references)return ReferencePage{};
+    return s.value()->references->outgoing_range(begin,size,PageRequest{start,count});
 }
 Result<ReferencePage> Project::all_references(std::size_t start,std::size_t count) const {
     auto s=snapshot();if(!s)return s.error();auto valid=page_ok(count);if(!valid)return valid.error();
@@ -383,9 +493,26 @@ Result<std::vector<StringRecord>> Project::strings(std::size_t start,std::size_t
     for(auto i=std::min(start,rows.size()),end=i+std::min(count,rows.size()-i);i<end;++i)output.push_back(rows[i]);
     return output;
 }
-Result<SearchPage> Project::search(const SearchQuery& query,std::optional<SearchCursor> cursor,const SearchLimits& limits,std::stop_token stop) const {
+Result<SearchPage> Project::search(const SearchQuery& query,std::optional<SearchCursor> cursor,const SearchLimits& limits,
+                                  std::stop_token stop,std::optional<Location> start) const {
     auto current=snapshot();if(!current)return current.error();
-    return hexlab::search(*current.value(),query,std::move(cursor),limits,stop);
+    auto search_limits=limits;
+    if(start && !cursor){
+        if(const auto* file=std::get_if<FileOffset>(&*start)){
+            search_limits.start_offset=file->value;
+            search_limits.start_address.reset();
+        }
+        else {
+            const auto address=std::get<Address>(*start);
+            if(!current.value()->loaded || !current.value()->loaded->image)
+                return Error{ErrorCode::invalid_argument,"Address-based search start requires a mapped project image"};
+            auto mapped_file=current.value()->loaded->image->to_file_offset(address);
+            if(!mapped_file)return Error{ErrorCode::out_of_bounds,"Search start address is not backed by a unique file offset"};
+            search_limits.start_offset=mapped_file.value().value;
+            search_limits.start_address=address;
+        }
+    }
+    return hexlab::search(*current.value(),query,std::move(cursor),search_limits,stop);
 }
 Result<std::shared_ptr<const ProjectSnapshot>> Project::execute(const ProjectCommand& command,std::uint64_t group,std::stop_token stop) {
     auto valid=live_owner();if(!valid)return valid.error();return session_->execute(command,group,stop);
@@ -463,6 +590,22 @@ Result<std::shared_ptr<const ProjectSnapshot>> Project::redo(std::stop_token sto
 Result<std::shared_ptr<const ProjectSnapshot>> Project::analyze(std::stop_token stop) {
     auto valid=live_owner();if(!valid)return valid.error();return session_->refresh_analysis(stop);
 }
+Result<std::shared_ptr<const ProjectSnapshot>> Project::analyze(const AnalysisOptions &options,std::stop_token stop) {
+    auto valid=live_owner();if(!valid)return valid.error();
+    auto configured=session_->set_analysis_options(options);if(!configured)return configured.error();
+    auto result=session_->refresh_analysis(stop);
+    // Progress is a call-scoped runtime callback. Never retain a host callback
+    // in the live project after this synchronous analysis operation returns.
+    if(options.progress){
+        auto durable=options;durable.progress={};
+        auto cleared=session_->set_analysis_options(durable);
+        if(!cleared)return cleared.error();
+        if(!result)return result.error();
+        return cleared.value();
+    }
+    if(!result)return result.error();
+    return result.value();
+}
 Result<bool> Project::save(std::stop_token stop) {
     auto valid=live_owner();if(!valid)return valid.error();return store_->checkpoint(stop);
 }
@@ -472,6 +615,22 @@ Result<database::SavedProject> Project::save_as(const std::filesystem::path& pat
 Result<database::SavedProject> Project::backup_to(const std::filesystem::path& path,bool replace,std::stop_token stop) {
     auto valid=live_owner();if(!valid)return valid.error();
     return store_->backup_to(path,replace?database::ReplacePolicy::replace_existing:database::ReplacePolicy::fail_if_exists,stop);
+}
+Result<database::SourceArchiveResult> Project::archive_external_source(
+        const std::filesystem::path& path,database::SourceArchiveOptions options,std::stop_token stop) {
+    auto valid=live_owner();if(!valid)return valid.error();
+    return store_->archive_external_source(path,options,stop);
+}
+Result<database::SourceArchiveVerification> Project::verify_source_archive(
+        const std::filesystem::path& path,std::uint64_t max_bytes,std::stop_token stop) const {
+    auto valid=live_owner();if(!valid)return valid.error();
+    return store_->verify_source_archive(path,max_bytes,stop);
+}
+Result<database::SourceArchiveRestore> Project::restore_source_archive(
+        const std::filesystem::path& archive,const std::filesystem::path& output,
+        std::uint64_t max_bytes,std::stop_token stop) const {
+    auto valid=live_owner();if(!valid)return valid.error();
+    return store_->restore_source_archive(archive,output,max_bytes,stop);
 }
 Result<BackupRotationInfo> Project::backup_to_rotating(const std::filesystem::path& base,std::size_t retain,std::stop_token stop) {
     auto valid=live_owner();if(!valid)return valid.error();
@@ -496,6 +655,36 @@ Result<database::SavedProject> Project::restore_backup_in_place(const std::files
     auto valid=version_ok(version);if(!valid)return valid.error();
     return database::ProjectStore::restore_backup_in_place(backup,target,stop);
 }
+Result<database::ProjectRecoveryScan> Project::inspect_recovery_directory(
+        const std::filesystem::path& directory,std::uint32_t version,std::stop_token stop) {
+    auto valid=version_ok(version);if(!valid)return valid.error();
+    return database::ProjectStore::inspect_recovery_directory(directory,stop);
+}
+Result<database::SavedProject> Project::restore_recovery_artifact(
+        const std::filesystem::path& artifact,const std::filesystem::path& destination,
+        bool replace,std::uint32_t version,std::stop_token stop) {
+    auto valid=version_ok(version);if(!valid)return valid.error();
+    if(artifact.empty()||destination.empty())
+        return Error{ErrorCode::invalid_argument,"Recovery artifact and destination paths are required"};
+    const auto directory=artifact.has_parent_path()?artifact.parent_path():std::filesystem::path(".");
+    auto candidates=database::ProjectStore::discover_recovery_candidates(directory,stop);
+    if(!candidates)return candidates.error();
+    std::error_code path_error;
+    const auto requested=std::filesystem::absolute(artifact,path_error).lexically_normal();
+    if(path_error)return Error{ErrorCode::io,"Cannot resolve recovery artifact path: "+path_error.message()};
+    const database::ProjectRecoveryCandidate* selected=nullptr;
+    for(const auto& candidate:candidates.value()){
+        const auto same=std::filesystem::equivalent(candidate.path,artifact,path_error);
+        if(path_error)return Error{ErrorCode::io,"Cannot compare recovery artifact path: "+path_error.message()};
+        if(same){selected=&candidate;break;}
+        const auto discovered=std::filesystem::absolute(candidate.path,path_error).lexically_normal();
+        if(path_error)return Error{ErrorCode::io,"Cannot resolve discovered recovery artifact path: "+path_error.message()};
+        if(discovered==requested){selected=&candidate;break;}
+    }
+    if(!selected)return Error{ErrorCode::invalid_argument,"Path is not a fully validated HexLab recovery artifact"};
+    const auto policy=replace?database::ReplacePolicy::replace_existing:database::ReplacePolicy::fail_if_exists;
+    return database::ProjectStore::recover_candidate(*selected,destination,policy,stop);
+}
 Result<ExportReceipt> Project::export_binary(const std::filesystem::path& path,std::stop_token stop) {
     auto s=snapshot();if(!s)return s.error();return export_patched(*s.value(),path,database::ReplacePolicy::fail_if_exists,stop);
 }
@@ -516,7 +705,7 @@ Result<std::shared_ptr<Archive>> Archive::open(const std::filesystem::path &path
 Result<ArchiveSummary> Archive::summary() const {
     auto valid = owner(); if (!valid) return valid.error();
     return ArchiveSummary{archive_.members.size(), archive_.symbols.size(), archive_.has_symbol_index,
-                          archive_.symbol_index_complete, archive_.diagnostics};
+                          archive_.symbol_index_complete, archive_.diagnostics, archive_.thin, archive_.aix_big};
 }
 Result<std::vector<ArchiveMemberRecord>> Archive::members(std::size_t start, std::size_t count) const {
     auto valid = owner(); if (!valid) return valid.error();

@@ -10,6 +10,7 @@
 #include <bit>
 #include <limits>
 #include <map>
+#include <set>
 namespace hexlab::function_detail {
 namespace {
 const char *seed_kind_name(FunctionSeedKind kind) {
@@ -28,6 +29,15 @@ const char *seed_kind_name(FunctionSeedKind kind) {
     case FunctionSeedKind::dex_method: return "DEX defined method";
     case FunctionSeedKind::safe_seh: return "PE SafeSEH handler";
     case FunctionSeedKind::pogo: return "PE POGO function profile";
+    case FunctionSeedKind::wasm_export: return "WebAssembly function export";
+    case FunctionSeedKind::wasm_start: return "WebAssembly start function";
+    case FunctionSeedKind::wasm_element: return "WebAssembly element function reference";
+    case FunctionSeedKind::wasm_defined: return "WebAssembly defined function body";
+    case FunctionSeedKind::dwarf_subprogram: return "DWARF subprogram";
+    case FunctionSeedKind::m6502_nmi_vector: return "6502 NMI vector";
+    case FunctionSeedKind::m6502_reset_vector: return "6502 reset vector";
+    case FunctionSeedKind::m6502_irq_vector: return "6502 IRQ/BRK vector";
+    case FunctionSeedKind::dwarf_entry_point: return "DWARF alternate entry point";
     }
     return "unknown function evidence";
 }
@@ -40,9 +50,49 @@ std::string seed_provenance_text(const FunctionSeed &seed) {
         text += " (profile " + std::to_string(seed.pogo_evidence->profile_index) + ", row " +
                 std::to_string(seed.pogo_evidence->entry_index) + " @ file offset " +
                 std::to_string(seed.pogo_evidence->file_offset) + ")";
+    if (seed.wasm_export_evidence)
+        text += " (function " + std::to_string(seed.wasm_export_evidence->function_index) +
+                ", export " + std::to_string(seed.wasm_export_evidence->export_index) +
+                " @ file offset " + std::to_string(seed.wasm_export_evidence->entry_file_offset) + ")";
+    if (seed.wasm_start_evidence)
+        text += " (function " + std::to_string(seed.wasm_start_evidence->function_index) +
+                ", type " + std::to_string(seed.wasm_start_evidence->type_index) +
+                " @ file offset " + std::to_string(seed.wasm_start_evidence->entry_file_offset) + ")";
+    if (seed.wasm_element_evidence)
+        text += " (function " + std::to_string(seed.wasm_element_evidence->function_index) +
+                ", element " + std::to_string(seed.wasm_element_evidence->segment_index) + ":" +
+                std::to_string(seed.wasm_element_evidence->element_index) + " @ file offset " +
+                std::to_string(seed.wasm_element_evidence->entry_file_offset) + ")";
+    if (seed.wasm_defined_evidence)
+        text += " (function " + std::to_string(seed.wasm_defined_evidence->function_index) +
+                ", type " + std::to_string(seed.wasm_defined_evidence->type_index) +
+                ", body @ file offset " + std::to_string(seed.wasm_defined_evidence->body_file_offset) + ")";
+    if (seed.dwarf_evidence)
+        text += " (unit @ " + std::to_string(seed.dwarf_evidence->unit_offset) +
+                ", DIE @ " + std::to_string(seed.dwarf_evidence->die_offset) +
+                ", size " + std::to_string(seed.dwarf_evidence->record_size) + ")";
     if (seed.initializer_evidence) {
         const auto &evidence = *seed.initializer_evidence;
-        text += " (initializer slot";
+        const char *source_name = "initializer";
+        switch (evidence.source) {
+        case FunctionInitializerSource::elf_init: source_name = "ELF DT_INIT"; break;
+        case FunctionInitializerSource::elf_fini: source_name = "ELF DT_FINI"; break;
+        case FunctionInitializerSource::elf_preinit_array: source_name = "ELF DT_PREINIT_ARRAY"; break;
+        case FunctionInitializerSource::elf_init_array: source_name = "ELF DT_INIT_ARRAY"; break;
+        case FunctionInitializerSource::elf_fini_array: source_name = "ELF DT_FINI_ARRAY"; break;
+        case FunctionInitializerSource::elf_init_array_section: source_name = "ELF SHT_INIT_ARRAY"; break;
+        case FunctionInitializerSource::elf_fini_array_section: source_name = "ELF SHT_FINI_ARRAY"; break;
+        case FunctionInitializerSource::elf_ctors_section: source_name = "ELF .ctors"; break;
+        case FunctionInitializerSource::elf_dtors_section: source_name = "ELF .dtors"; break;
+        case FunctionInitializerSource::macho_mod_init_func: source_name = "Mach-O __mod_init_func"; break;
+        case FunctionInitializerSource::macho_routines: source_name = "Mach-O LC_ROUTINES"; break;
+        case FunctionInitializerSource::macho_mod_term_func: source_name = "Mach-O __mod_term_func"; break;
+        }
+        text += " (" + std::string(source_name) + " slot";
+        if (evidence.section)
+            text += " in section " + std::to_string(*evidence.section);
+        if (evidence.index)
+            text += " index " + std::to_string(*evidence.index);
         if (evidence.file_offset)
             text += " @ file offset " + std::to_string(*evidence.file_offset);
         for (const auto *rows : {&evidence.relocation_rows, &evidence.dyld_classic_rows,
@@ -120,6 +170,126 @@ std::optional<Address> dex_direct_call_target(const Instruction &instruction, co
     const auto context = image.context_at(target);
     if (!segment || !segment->executable || !context || context.value().architecture != Architecture::dex ||
         context.value().mode != ExecutionMode::dex) return {};
+    return target;
+}
+std::optional<Address> wasm_direct_call_target(const Instruction &instruction, const Image &image,
+                                                const ImageMetadata &metadata) {
+    if (instruction.context.architecture != Architecture::wasm ||
+        instruction.context.mode != ExecutionMode::wasm32 || instruction.flow != FlowKind::call ||
+        instruction.mnemonic_override != "call" || instruction.operands.size() != 1 || !metadata.wasm)
+        return {};
+    const auto *index = std::get_if<ImmediateOperand>(&instruction.operands.front());
+    const auto &wasm = *metadata.wasm;
+    const auto total_functions = static_cast<std::uint64_t>(wasm.imported_functions) + wasm.defined_functions;
+    if (!index || index->is_signed || index->effective_width != 32 || index->value < wasm.imported_functions ||
+        index->value >= total_functions || index->value >= wasm.function_type_indices.size())
+        return {}; // Imported calls have no local machine-code address.
+    const auto type_index = wasm.function_type_indices[static_cast<std::size_t>(index->value)];
+    if (type_index >= wasm.function_types.size() || index->value > UINT32_MAX)
+        return {};
+    const Address target{AddressSpaceId{static_cast<std::uint32_t>(index->value)}, 0};
+    const auto *segment = image.segment_at(target);
+    const auto context = image.context_at(target);
+    const auto storage_size = image.storage()->size();
+    if (!segment || segment->begin != target || !segment->executable || !segment->size ||
+        segment->file_begin.value > storage_size || segment->file_size > storage_size - segment->file_begin.value ||
+        segment->file_size != segment->size || image.code_window(target, segment->size) != segment->size ||
+        !context || context.value().architecture != Architecture::wasm ||
+        context.value().mode != ExecutionMode::wasm32)
+        return {};
+    return target;
+}
+std::optional<ExternalIdentity> wasm_import_call_target(const Instruction &instruction,
+                                                        const ImageMetadata &metadata) {
+    if (instruction.context.architecture != Architecture::wasm ||
+        instruction.context.mode != ExecutionMode::wasm32 || instruction.flow != FlowKind::call ||
+        instruction.mnemonic_override != "call" || instruction.operands.size() != 1 || !metadata.wasm)
+        return {};
+    const auto *index = std::get_if<ImmediateOperand>(&instruction.operands.front());
+    const auto &wasm = *metadata.wasm;
+    if (!index || index->is_signed || index->effective_width != 32 || index->value >= wasm.imported_functions ||
+        index->value >= wasm.function_type_indices.size())
+        return {};
+    const auto type_index = wasm.function_type_indices[static_cast<std::size_t>(index->value)];
+    if (type_index >= wasm.function_types.size())
+        return {};
+    const auto imported = std::find_if(wasm.imports.begin(), wasm.imports.end(), [&](const WasmImport &entry) {
+        return entry.kind == WasmExternalKind::function && entry.index == index->value &&
+               entry.function_type_index == type_index;
+    });
+    if (imported == wasm.imports.end())
+        return {};
+    ExternalIdentity identity;
+    identity.library = imported->module;
+    identity.name = imported->name;
+    identity.wasm_function_index = static_cast<std::uint32_t>(index->value);
+    identity.host_binding = imported->host_binding;
+    return identity;
+}
+std::optional<Address> local_x64_indirect_call_target(const Image &image, const RelocationResolver &relocations,
+                                                       const Instruction &instruction, std::stop_token stop) {
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || instruction.opcode != Opcode::call ||
+        instruction.flow != FlowKind::call || instruction.operands.size() != 1 ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::read})
+        return {};
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+    if (!memory || memory->data_width != 64 || memory->address_width != 64 || memory->segment ||
+        memory->base || memory->index || memory->scale != 1 || !memory->ip_relative ||
+        !memory->resolved_address || !memory->displacement_encoding ||
+        memory->displacement_encoding->size != 4 ||
+        memory->displacement_encoding->offset > instruction.length ||
+        memory->displacement_encoding->size > instruction.length - memory->displacement_encoding->offset)
+        return {};
+    const auto next = advance(instruction.address, instruction.length);
+    if (!next)
+        return {};
+    auto computed_slot = next.value().offset;
+    if (memory->displacement < 0) {
+        const auto magnitude = static_cast<std::uint64_t>(-(memory->displacement + 1)) + 1;
+        if (magnitude > computed_slot)
+            return {};
+        computed_slot -= magnitude;
+    } else {
+        const auto magnitude = static_cast<std::uint64_t>(memory->displacement);
+        if (magnitude > UINT64_MAX - computed_slot)
+            return {};
+        computed_slot += magnitude;
+    }
+    if (memory->resolved_address->space != next.value().space ||
+        memory->resolved_address->offset != computed_slot)
+        return {};
+    if (take(relocations.operand(instruction, 0, stop)).relocated())
+        return {};
+    const auto slot = *memory->resolved_address;
+    if (slot.space != instruction.address.space)
+        return {};
+    const auto *space = image.space(slot.space);
+    const auto *slot_segment = image.segment_at(slot);
+    if (!space || space->width_bits != 64 || !slot_segment || !slot_segment->readable || slot_segment->writable ||
+        slot.offset < slot_segment->begin.offset)
+        return {};
+    const auto relative = slot.offset - slot_segment->begin.offset;
+    if (relative > slot_segment->file_size || 8 > slot_segment->file_size - relative ||
+        image.plaintext_window(slot, 8) != 8)
+        return {};
+    (void)take(image.to_file_offset(slot));
+    if (take(relocations.data_at(image, slot, 8, stop)).relocated())
+        return {};
+    const auto bytes = take(image.read(slot, 8));
+    if (bytes.size() != 8)
+        return {};
+    ByteReader reader(bytes);
+    const auto raw_target = reader.read_u64(space->order);
+    if (!raw_target)
+        return {};
+    const Address target{slot.space, raw_target.value()};
+    const auto *target_segment = image.segment_at(target);
+    const auto target_context = image.context_at(target);
+    if (!target_segment || !target_segment->executable || target.offset < target_segment->begin.offset ||
+        target.offset - target_segment->begin.offset >= target_segment->file_size ||
+        image.plaintext_window(target, 1) != 1 || !target_context || target_context.value() != instruction.context)
+        return {};
     return target;
 }
 } // namespace
@@ -311,6 +481,34 @@ void Recovery::seed_roots() {
         canceled();
         root({FunctionSeedKind::entry, entry, {}, {}}, true);
     }
+    // A flat NMOS 6502 address space stores its NMI, reset, and IRQ/BRK
+    // vectors at fixed little-endian CPU addresses. Treat them as independent
+    // roots only when the vector bytes and their targets are mapped in the
+    // same 6502 execution context; this does not model bank-switching carts.
+    const std::array<std::pair<std::uint16_t, FunctionSeedKind>, 3> m6502_vectors{{
+        {0xfffa, FunctionSeedKind::m6502_nmi_vector},
+        {0xfffc, FunctionSeedKind::m6502_reset_vector},
+        {0xfffe, FunctionSeedKind::m6502_irq_vector},
+    }};
+    for (const auto &[offset, kind] : m6502_vectors) {
+        canceled();
+        const Address slot{image.layout().space.id, offset};
+        const auto vector_context = image.context_at(slot);
+        if (!vector_context || vector_context.value().architecture != Architecture::mos6502 ||
+            vector_context.value().mode != ExecutionMode::m6502)
+            continue;
+        const auto bytes = image.read(slot, 2);
+        if (!bytes) continue;
+        ByteReader reader(bytes.value());
+        const auto vector_target = reader.read_u16(ByteOrder::little);
+        if (!vector_target || vector_target.value() == 0) continue;
+        const Address entry{slot.space, vector_target.value()};
+        const auto target_context = image.context_at(entry);
+        if (!target_context || target_context.value().architecture != Architecture::mos6502 ||
+            target_context.value().mode != ExecutionMode::m6502)
+            continue;
+        root({kind, entry, slot, {}}, false);
+    }
     // ARM code-profile roots carry source-backed execution-state declarations
     // that may not also appear in the image's generic entry list. Preserve
     // them as independent function-seed evidence for mixed A32/Thumb images.
@@ -326,6 +524,183 @@ void Recovery::seed_roots() {
             root({FunctionSeedKind::dex_method,
                   Address{AddressSpaceId{method.method_index + 1}, 0}, {}, {}}, false);
         }
+    if (metadata.wasm) {
+        const auto &wasm = *metadata.wasm;
+        const auto total_functions = static_cast<std::uint64_t>(wasm.imported_functions) + wasm.defined_functions;
+        // A validated local body is independently discoverable even when no
+        // export, start entry, element, or direct call refers to it.
+        for (std::uint64_t function_index = wasm.imported_functions;
+             function_index < total_functions; ++function_index) {
+            canceled();
+            if (function_index > UINT32_MAX) {
+                output->complete = false;
+                continue;
+            }
+            const Address entry{AddressSpaceId{static_cast<std::uint32_t>(function_index)}, 0};
+            const auto reject = [&] {
+                output->complete = false;
+                output->candidates.push_back({entry, {}, FunctionStopReason::unsupported,
+                    "WebAssembly defined function lacks a validated local code body and type record"});
+            };
+            if (function_index >= wasm.function_type_indices.size()) {
+                reject();
+                continue;
+            }
+            const auto type_index = static_cast<std::uint64_t>(wasm.function_type_indices[function_index]);
+            if (type_index > UINT32_MAX) {
+                reject();
+                continue;
+            }
+            const auto *segment = image.segment_at(entry);
+            const auto context = image.context_at(entry);
+            const auto storage_size = image.storage()->size();
+            const bool body_source_valid = segment && segment->file_begin.value <= storage_size &&
+                segment->file_size <= storage_size - segment->file_begin.value;
+            if (type_index >= wasm.function_types.size() || !segment || segment->begin != entry ||
+                !segment->executable || !body_source_valid || segment->file_size != segment->size ||
+                !segment->size || image.code_window(entry, segment->size) != segment->size || !context ||
+                context.value().architecture != Architecture::wasm ||
+                context.value().mode != ExecutionMode::wasm32) {
+                reject();
+                continue;
+            }
+            FunctionSeed seed{FunctionSeedKind::wasm_defined, entry, {}, {}};
+            seed.wasm_defined_evidence = FunctionSeedWasmDefinedEvidence{
+                static_cast<std::uint32_t>(function_index), static_cast<std::uint32_t>(type_index),
+                segment->file_begin.value};
+            root(std::move(seed), false);
+        }
+        for (std::size_t export_index = 0; export_index < wasm.exports.size(); ++export_index) {
+            canceled();
+            const auto &exported = wasm.exports[export_index];
+            if (exported.kind != WasmExternalKind::function || exported.index < wasm.imported_functions)
+                continue; // Imported functions are host-provided and have no local code root.
+            const Address entry{AddressSpaceId{exported.index}, 0};
+            const auto reject = [&] {
+                output->complete = false;
+                output->candidates.push_back({entry, {}, FunctionStopReason::unsupported,
+                    "WebAssembly function export lacks a validated local code body and type record"});
+            };
+            const bool index_valid = exported.index < total_functions &&
+                exported.index < wasm.function_type_indices.size() && exported.function_type_index &&
+                *exported.function_type_index < wasm.function_types.size() &&
+                wasm.function_type_indices[exported.index] == *exported.function_type_index &&
+                export_index <= UINT32_MAX && exported.entry_index == export_index;
+            const auto *segment = image.segment_at(entry);
+            const auto context = image.context_at(entry);
+            const auto storage_size = image.storage()->size();
+            const bool source_valid = exported.section_file_offset.value < storage_size &&
+                exported.entry_file_offset.value >= exported.section_file_offset.value &&
+                exported.entry_file_offset.value < storage_size;
+            const bool body_source_valid = segment && segment->file_begin.value <= storage_size &&
+                segment->file_size <= storage_size - segment->file_begin.value;
+            if (!index_valid || !source_valid || !segment || segment->begin != entry || !segment->executable ||
+                !body_source_valid || segment->file_size != segment->size || !segment->size ||
+                image.code_window(entry, segment->size) != segment->size || !context ||
+                context.value().architecture != Architecture::wasm || context.value().mode != ExecutionMode::wasm32) {
+                reject();
+                continue;
+            }
+            FunctionSeed seed{FunctionSeedKind::wasm_export, entry, {}, {}};
+            seed.wasm_export_evidence = FunctionSeedWasmExportEvidence{
+                exported.index, static_cast<std::uint32_t>(export_index), *exported.function_type_index,
+                exported.section_file_offset.value, exported.entry_file_offset.value};
+            root(std::move(seed), false);
+        }
+        // Element segments are explicit references to functions that can be
+        // reached through table dispatch. They remain possible callees even
+        // when the table is imported, passive, or later mutated, so root each
+        // validated locally defined function referenced by any segment.
+        std::set<std::uint32_t> seeded_element_functions;
+        for (std::size_t segment_index = 0; segment_index < wasm.element_segments.size(); ++segment_index) {
+            canceled();
+            const auto &element_segment = wasm.element_segments[segment_index];
+            for (std::size_t element_index = 0;
+                 element_index < element_segment.function_indices.size(); ++element_index) {
+                canceled();
+                const auto function_index = element_segment.function_indices[element_index];
+                if (!function_index || *function_index < wasm.imported_functions ||
+                    *function_index >= total_functions || seeded_element_functions.contains(*function_index))
+                    continue;
+                const Address entry{AddressSpaceId{*function_index}, 0};
+                const auto type_index = *function_index < wasm.function_type_indices.size()
+                    ? wasm.function_type_indices[*function_index] : UINT32_MAX;
+                const auto *segment = image.segment_at(entry);
+                const auto context = image.context_at(entry);
+                const auto storage_size = image.storage()->size();
+                const bool source_valid = element_segment.section_file_offset.value < storage_size &&
+                    element_segment.entry_file_offset.value >= element_segment.section_file_offset.value &&
+                    element_segment.entry_file_offset.value < storage_size;
+                const bool body_source_valid = segment && segment->file_begin.value <= storage_size &&
+                    segment->file_size <= storage_size - segment->file_begin.value;
+                if (type_index >= wasm.function_types.size() || !source_valid || !segment ||
+                    segment->begin != entry || !segment->executable || !body_source_valid ||
+                    segment->file_size != segment->size || !segment->size ||
+                    image.code_window(entry, segment->size) != segment->size || !context ||
+                    context.value().architecture != Architecture::wasm ||
+                    context.value().mode != ExecutionMode::wasm32) {
+                    output->complete = false;
+                    output->candidates.push_back({entry, {}, FunctionStopReason::unsupported,
+                        "WebAssembly element function reference lacks a validated local code body and type record"});
+                    continue;
+                }
+                if (segment_index > UINT32_MAX || element_index > UINT32_MAX) {
+                    output->complete = false;
+                    output->candidates.push_back({entry, {}, FunctionStopReason::budget,
+                        "WebAssembly element provenance index exceeds the function-seed format"});
+                    continue;
+                }
+                seeded_element_functions.insert(*function_index);
+                FunctionSeed seed{FunctionSeedKind::wasm_element, entry, {}, {}};
+                seed.wasm_element_evidence = FunctionSeedWasmElementEvidence{
+                    *function_index, type_index, static_cast<std::uint32_t>(segment_index),
+                    static_cast<std::uint32_t>(element_index), element_segment.section_file_offset.value,
+                    element_segment.entry_file_offset.value, segment->file_begin.value};
+                root(std::move(seed), false);
+            }
+        }
+        // A WebAssembly start function executes automatically when the module
+        // is instantiated; it need not also be exported. Imported starts have
+        // no local body and are intentionally not treated as code roots.
+        if (wasm.start_function) {
+            canceled();
+            const auto &start = *wasm.start_function;
+            const auto index = start.function_index;
+            const Address entry{AddressSpaceId{index}, 0};
+            if (index >= wasm.imported_functions && index < total_functions &&
+                index < wasm.function_type_indices.size() &&
+                start.function_type_index < wasm.function_types.size() &&
+                wasm.function_type_indices[index] == start.function_type_index) {
+                const auto *segment = image.segment_at(entry);
+                const auto context = image.context_at(entry);
+                const auto storage_size = image.storage()->size();
+                const bool source_valid = start.section_file_offset.value < storage_size &&
+                    start.entry_file_offset.value >= start.section_file_offset.value &&
+                    start.entry_file_offset.value < storage_size;
+                const bool body_source_valid = segment && segment->file_begin.value <= storage_size &&
+                    segment->file_size <= storage_size - segment->file_begin.value;
+                if (segment && segment->begin == entry && segment->executable && body_source_valid &&
+                    segment->file_size == segment->size && segment->size &&
+                    image.code_window(entry, segment->size) == segment->size && context && source_valid &&
+                    context.value().architecture == Architecture::wasm &&
+                    context.value().mode == ExecutionMode::wasm32) {
+                    FunctionSeed seed{FunctionSeedKind::wasm_start, entry, {}, {}};
+                    seed.wasm_start_evidence = FunctionSeedWasmStartEvidence{
+                        index, start.function_type_index, start.section_file_offset.value,
+                        start.entry_file_offset.value};
+                    root(std::move(seed), false);
+                } else {
+                    output->complete = false;
+                    output->candidates.push_back({entry, {}, FunctionStopReason::unsupported,
+                        "WebAssembly start function lacks a validated local code body and type record"});
+                }
+            } else if (index >= wasm.imported_functions) {
+                output->complete = false;
+                output->candidates.push_back({entry, {}, FunctionStopReason::unsupported,
+                    "WebAssembly start function index or type does not resolve to a defined local function"});
+            }
+        }
+    }
     for (const auto &symbol : metadata.exports) {
         canceled();
         if (symbol.address)
@@ -333,6 +708,7 @@ void Recovery::seed_roots() {
     }
     AddressMap<std::uint64_t> elf_symbol_sizes;
     AddressSet conflicting_elf_symbol_sizes;
+    std::size_t ppc64_descriptor_symbols = 0;
     if (metadata.elf)
         for (const auto &symbol : metadata.elf->symbols) {
             canceled();
@@ -342,6 +718,46 @@ void Recovery::seed_roots() {
             // evidence in stripped binaries.
             if ((symbol.type == 2 || symbol.type == 10) && symbol.state == ElfSymbolState::defined &&
                 symbol.address) {
+                // In the PPC64 ELFv1 ABI, STT_FUNC values point into the
+                // non-executable .opd table. The first word of each 24-byte
+                // descriptor is the code entry; root that mode-validated
+                // target instead of treating the descriptor as instructions.
+                const auto abi_version = metadata.elf->header.flags & 0x3u;
+                if (metadata.elf->header.machine == 21 && metadata.elf->header.is_64 &&
+                    metadata.elf->header.object_type != 1 && metadata.elf->header.object_type != 4 &&
+                    abi_version != 2 && abi_version != 3 && symbol.type == 2 &&
+                    symbol.section_index < metadata.elf->sections.size()) {
+                    const auto &section = metadata.elf->sections[symbol.section_index];
+                    if (section.name == ".opd") {
+                        constexpr std::size_t descriptor_size = 24;
+                        constexpr std::size_t max_descriptor_symbols = 65536;
+                        if (++ppc64_descriptor_symbols > max_descriptor_symbols) {
+                            output->complete = false;
+                            break;
+                        }
+                        if (section.type != 1 || !(section.flags & 0x2) ||
+                            symbol.address->offset < section.address || section.size < descriptor_size ||
+                            symbol.address->offset - section.address > section.size - descriptor_size ||
+                            (symbol.address->offset - section.address) % descriptor_size != 0) {
+                            output->complete = false;
+                            continue;
+                        }
+                        auto bytes = image.read(*symbol.address, sizeof(std::uint64_t));
+                        if (!bytes || bytes.value().size() != sizeof(std::uint64_t)) {
+                            output->complete = false;
+                            continue;
+                        }
+                        ByteReader descriptor(bytes.value());
+                        auto target = descriptor.read_u64(metadata.elf->header.order);
+                        if (!target || !target.value()) {
+                            output->complete = false;
+                            continue;
+                        }
+                        const Address code_entry{symbol.address->space, target.value()};
+                        root({FunctionSeedKind::symbol, code_entry, *symbol.address, {}}, false);
+                        continue;
+                    }
+                }
                 root({FunctionSeedKind::symbol, *symbol.address, {}, {}}, false);
                 // A nonzero STT_FUNC size can bound an entry when no unwind
                 // range is available. Multiple symbol tables commonly carry
@@ -544,6 +960,168 @@ void Recovery::seed_roots() {
             }
         }
     }
+    // Static ET_EXEC images can retain initializer arrays as allocated ELF
+    // sections without carrying the corresponding dynamic tags. Treat these
+    // as section-derived evidence only when that array's dynamic tag is absent;
+    // this keeps section fallback distinct from dynamic-table interpretation.
+    if (metadata.elf && metadata.elf->header.object_type == 2) {
+        const auto has_dynamic_tag = [&](std::int64_t tag) {
+            for (const auto &table : metadata.elf->dynamic_tables)
+                for (const auto &entry : table.entries)
+                    if (entry.tag == tag) return true;
+            return false;
+        };
+        const auto width = metadata.elf->header.is_64 ? std::uint64_t{8} : std::uint64_t{4};
+        for (const auto &section : metadata.elf->sections) {
+            canceled();
+            const bool init_array = section.type == 14 && !has_dynamic_tag(25);
+            const bool fini_array = section.type == 15 && !has_dynamic_tag(26);
+            if ((!init_array && !fini_array) || !(section.flags & 0x2) || !section.size ||
+                section.size % width || section.address % width || section.offset % width ||
+                (section.entry_size && section.entry_size != width) ||
+                section.size > UINT64_MAX - section.offset || section.size / width > 65536) {
+                if ((init_array || fini_array) && section.size / width > 65536)
+                    output->complete = false;
+                continue;
+            }
+            for (std::uint64_t offset = 0; offset < section.size; offset += width) {
+                canceled();
+                if (offset > UINT64_MAX - section.address) break;
+                const Address slot{image.layout().space.id, section.address + offset};
+                const auto file = image.to_file_offset(slot);
+                if (!file || file.value().value != section.offset + offset ||
+                    image.plaintext_window(slot, width) != width) {
+                    output->complete = false;
+                    continue;
+                }
+                auto bytes = image.read(slot, width);
+                if (!bytes || bytes.value().size() != width) {
+                    output->complete = false;
+                    continue;
+                }
+                ByteReader reader(bytes.value());
+                std::optional<std::uint64_t> target_value;
+                if (width == 8) {
+                    auto value = reader.read_u64(metadata.elf->header.order);
+                    if (value) target_value = value.value();
+                } else {
+                    auto value = reader.read_u32(metadata.elf->header.order);
+                    if (value) target_value = value.value();
+                }
+                if (!target_value) { output->complete = false; continue; }
+                if (!*target_value) continue;
+                const Address target{image.layout().space.id, *target_value};
+                const auto *segment = image.segment_at(target);
+                if (!segment || !segment->executable || target.offset < segment->begin.offset ||
+                    target.offset - segment->begin.offset >= segment->file_size ||
+                    image.code_window(target, 1) != 1 || image.plaintext_window(target, 1) != 1)
+                    continue;
+                FunctionSeed seed{FunctionSeedKind::initializer, target, slot, {}};
+                FunctionSeedInitializerEvidence evidence;
+                evidence.source = init_array ? FunctionInitializerSource::elf_init_array_section
+                                             : FunctionInitializerSource::elf_fini_array_section;
+                evidence.section = section.index;
+                evidence.index = offset / width;
+                evidence.file_offset = section.offset + offset;
+                seed.initializer_evidence = std::move(evidence);
+                root(std::move(seed), false);
+            }
+        }
+        // Older toolchains emit legacy .ctors/.dtors pointer lists as
+        // allocated PROGBITS sections. These are only interpreted for ET_EXEC
+        // so the stored absolute pointers need no guessed load bias. The
+        // all-ones and null sentinels are ignored; every other slot is resolved
+        // through relocation metadata before raw bytes can be considered.
+        auto resolver_result = RelocationResolver::create(image, metadata, stop);
+        if (!resolver_result) {
+            output->complete = false;
+        } else {
+            const auto &resolver = resolver_result.value();
+            const auto width = metadata.elf->header.is_64 ? std::uint64_t{8} : std::uint64_t{4};
+            const auto all_ones = width == 8 ? UINT64_MAX : UINT32_MAX;
+            for (const auto &section : metadata.elf->sections) {
+                canceled();
+                const bool constructors = section.name == ".ctors";
+                const bool destructors = section.name == ".dtors";
+                if ((!constructors && !destructors) || section.type != 1 || !(section.flags & 0x2) ||
+                    !section.size)
+                    continue;
+                if (section.size % width || section.size / width > 65536 ||
+                    (section.entry_size && section.entry_size != width) || section.size > UINT64_MAX - section.address ||
+                    section.size > UINT64_MAX - section.offset) {
+                    output->complete = false;
+                    continue;
+                }
+                for (std::uint64_t offset = 0; offset < section.size; offset += width) {
+                    canceled();
+                    const Address slot{image.layout().space.id, section.address + offset};
+                    const auto file = image.to_file_offset(slot);
+                    const auto *slot_segment = image.segment_at(slot);
+                    const bool file_backed_slot = slot_segment && slot_segment->readable &&
+                        !slot_segment->writable && slot.offset >= slot_segment->begin.offset &&
+                        slot.offset - slot_segment->begin.offset <= slot_segment->file_size &&
+                        width <= slot_segment->file_size - (slot.offset - slot_segment->begin.offset);
+                    if (!file || file.value().value != section.offset + offset ||
+                        !file_backed_slot || image.plaintext_window(slot, width) != width) {
+                        output->complete = false;
+                        continue;
+                    }
+                    auto resolved = resolver.data_at(image, slot, static_cast<std::uint8_t>(width), stop);
+                    if (!resolved) {
+                        output->complete = false;
+                        continue;
+                    }
+                    std::optional<std::uint64_t> target_value;
+                    if (resolved.value().address) {
+                        target_value = resolved.value().address->offset;
+                        if (resolved.value().address->space != image.layout().space.id) {
+                            output->complete = false;
+                            continue;
+                        }
+                    } else if (resolved.value().relocated()) {
+                        output->complete = false;
+                        continue;
+                    } else {
+                        auto bytes = image.read(slot, static_cast<std::size_t>(width));
+                        if (!bytes || bytes.value().size() != width) {
+                            output->complete = false;
+                            continue;
+                        }
+                        ByteReader reader(bytes.value());
+                        if (width == 8) {
+                            const auto value = reader.read_u64(metadata.elf->header.order);
+                            if (value) target_value = value.value();
+                        } else {
+                            const auto value = reader.read_u32(metadata.elf->header.order);
+                            if (value) target_value = value.value();
+                        }
+                    }
+                    if (!target_value) {
+                        output->complete = false;
+                        continue;
+                    }
+                    if (*target_value == 0 || *target_value == all_ones)
+                        continue;
+                    const Address target{image.layout().space.id, *target_value};
+                    const auto *segment = image.segment_at(target);
+                    if (!segment || !segment->executable || target.offset < segment->begin.offset ||
+                        target.offset - segment->begin.offset >= segment->file_size ||
+                        image.code_window(target, 1) != 1 || image.plaintext_window(target, 1) != 1)
+                        continue;
+                    FunctionSeed seed{FunctionSeedKind::initializer, target, slot, {}};
+                    FunctionSeedInitializerEvidence evidence;
+                    evidence.source = constructors ? FunctionInitializerSource::elf_ctors_section
+                                                   : FunctionInitializerSource::elf_dtors_section;
+                    evidence.section = section.index;
+                    evidence.index = offset / width;
+                    evidence.file_offset = section.offset + offset;
+                    evidence.relocation_rows = resolved.value().relocations;
+                    seed.initializer_evidence = std::move(evidence);
+                    root(std::move(seed), false);
+                }
+            }
+        }
+    }
     // Validated DWARF FDE ranges are compiler/linker function-boundary evidence.
     // The ELF metadata row retains the exact source section and FDE byte extent.
     if (metadata.elf)
@@ -554,15 +1132,36 @@ void Recovery::seed_roots() {
             seed.unwind_evidence = FunctionSeedUnwindEvidence{range.section, range.file_offset, range.record_size};
             root(std::move(seed), false);
         }
-    // A validated EHABI row establishes a linked ARM function entry, but its
-    // successor row is not used to claim a precise function extent.
-    if (metadata.elf)
-        for (const auto &function : metadata.elf->arm_ehabi_functions) {
+    // Ordered EHABI rows identify successive function starts. Use a successor
+    // as an ownership bound only when both starts lie in the same initialized
+    // executable segment and the complete interval is backed by file bytes.
+    // The final row has no inferred extent because its successor may be a
+    // linker sentinel or lie beyond this image's mapped code.
+    if (metadata.elf) {
+        const auto &functions = metadata.elf->arm_ehabi_functions;
+        for (std::size_t i = 0; i < functions.size(); ++i) {
             canceled();
+            const auto &function = functions[i];
+            if (i + 1 < functions.size()) {
+                const auto &next = functions[i + 1];
+                if (next.begin.space == function.begin.space && next.begin.offset > function.begin.offset) {
+                    const auto *segment = image.segment_at(function.begin);
+                    if (segment && segment->executable && image.segment_at(next.begin) == segment &&
+                        function.begin.offset >= segment->begin.offset && next.begin.offset >= segment->begin.offset) {
+                        const auto relative = function.begin.offset - segment->begin.offset;
+                        const auto size = next.begin.offset - function.begin.offset;
+                        if (relative < segment->file_size && size <= segment->file_size - relative &&
+                            relative < segment->size && size <= segment->size - relative &&
+                            image.code_window(function.begin, size) == size)
+                            metadata_chunks[function.begin].push_back({function.begin, size, {}});
+                    }
+                }
+            }
             FunctionSeed seed{FunctionSeedKind::unwind, function.begin, {}, {}};
             seed.unwind_evidence = FunctionSeedUnwindEvidence{function.section, function.file_offset, 8};
             root(std::move(seed), false);
         }
+    }
     if (metadata.macho) {
         const bool valid_slice = metadata.macho->selected_slice < metadata.macho->container.slices.size();
         if (!valid_slice) output->complete = false;
@@ -572,10 +1171,13 @@ void Recovery::seed_roots() {
         if (!valid_slice || !resolver_result) output->complete = false;
         else for (const auto &section : metadata.macho->sections) {
             canceled();
-            // S_MOD_INIT_FUNC_POINTERS is the Mach-O section type used for
-            // __mod_init_func. Resolve each slot through relocation/dyld data
-            // before considering an unrelocated pointer word.
-            if (section.name != "__mod_init_func" || (section.flags & 0xffu) != 9u)
+            // S_MOD_INIT_FUNC_POINTERS and S_MOD_TERM_FUNC_POINTERS contain
+            // loader-invoked routines. Resolve each slot through relocation/
+            // dyld data before considering an unrelocated pointer word.
+            const auto section_type = section.flags & 0xffu;
+            const bool is_initializer = section.name == "__mod_init_func" && section_type == 9u;
+            const bool is_terminator = section.name == "__mod_term_func" && section_type == 10u;
+            if (!is_initializer && !is_terminator)
                 continue;
             if (!section.file_offset) { output->complete = false; continue; }
             if (section.size % pointer_width || section.size / pointer_width > 65536) {
@@ -621,7 +1223,8 @@ void Recovery::seed_roots() {
                 if (target) {
                     FunctionSeed seed{FunctionSeedKind::initializer, *target, slot, {}};
                     FunctionSeedInitializerEvidence evidence;
-                    evidence.source = FunctionInitializerSource::macho_mod_init_func;
+                    evidence.source = is_initializer ? FunctionInitializerSource::macho_mod_init_func
+                                                     : FunctionInitializerSource::macho_mod_term_func;
                     evidence.section = section.ordinal;
                     evidence.index = offset / pointer_width;
                     evidence.file_offset = file.value;
@@ -677,6 +1280,41 @@ void Recovery::seed_roots() {
                 continue;
             metadata_chunks[*function.address].push_back({*function.address, function.size, {}});
             root({FunctionSeedKind::unwind, *function.address, {}, {}}, false);
+        }
+        // The compact-unwind index maps each entry to the next entry (or the
+        // next index-row boundary for the final page entry). Use that linker
+        // interval as a recovery boundary only after rechecking its complete
+        // initialized executable backing. A stronger extent already attached
+        // to the same root remains authoritative.
+        for (const auto &function : metadata.macho->compact_unwind_functions) {
+            canceled();
+            if (!function.address || function.size == 0 ||
+                !AddressRange::create(*function.address, function.size)) {
+                output->complete = false;
+                continue;
+            }
+            const auto *segment = image.segment_at(*function.address);
+            if (!segment || !segment->executable || function.address->offset < segment->begin.offset) {
+                output->complete = false;
+                continue;
+            }
+            const auto relative = function.address->offset - segment->begin.offset;
+            if (relative >= segment->file_size || function.size > segment->file_size - relative ||
+                relative >= segment->size || function.size > segment->size - relative ||
+                image.code_window(*function.address, function.size) != function.size) {
+                output->complete = false;
+                continue;
+            }
+            if (metadata_chunks.contains(*function.address))
+                continue;
+            const auto interval_end = function.address->offset + function.size;
+            const auto conflicting_root = root_entries.upper_bound(*function.address);
+            if (conflicting_root != root_entries.end() && conflicting_root->space == function.address->space &&
+                conflicting_root->offset < interval_end) {
+                output->complete = false;
+                continue;
+            }
+            metadata_chunks[*function.address].push_back({*function.address, function.size, {}});
         }
     }
     // PDB procedures are compiler-declared function boundaries. Consume them
@@ -1020,6 +1658,136 @@ void Recovery::seed_roots() {
             continue;
         metadata_chunks[entry].push_back({entry, size, {}});
     }
+    // Imported DWARF subprogram ranges can recover stripped ELF function
+    // entries and discontiguous chunks; alternate entry-point DIEs add only
+    // their exact code PCs. Keep subprogram bounds subordinate to explicit,
+    // unwind, POGO, and ELF symbol extents already accepted above. The loader
+    // structurally validates each DIE; rebase virtual addresses to the current
+    // image and validate complete ranges before trusting ownership boundaries.
+    if (metadata.elf && metadata.elf->dwarf_info && metadata.elf->header.object_type != 1 &&
+        metadata.elf->header.object_type != 4) {
+        std::uint64_t load_bias = 0;
+        bool load_bias_valid = true;
+        if (!image.layout().segments.empty()) {
+            const auto mapped_base = std::min_element(image.layout().segments.begin(), image.layout().segments.end(),
+                [](const auto &a, const auto &b) { return a.begin.offset < b.begin.offset; })->begin.offset;
+            if (mapped_base >= metadata.preferred_base)
+                load_bias = mapped_base - metadata.preferred_base;
+            else {
+                output->complete = false;
+                load_bias_valid = false;
+            }
+        }
+        AddressMap<std::vector<FunctionChunk>> candidate_ranges;
+        AddressSet conflicting_ranges;
+        for (const auto &symbol : metadata.elf->dwarf_info->symbols) {
+            canceled();
+            if (symbol.kind == symbols::SymbolKind::entry_point) {
+                if (symbol.origin.record_size == 0 || !symbol.ranges.empty() || !load_bias_valid) {
+                    output->complete = false;
+                    continue;
+                }
+                const auto mapped_entry = checked_add(symbol.address, load_bias);
+                if (!mapped_entry) {
+                    output->complete = false;
+                    continue;
+                }
+                FunctionSeed seed{FunctionSeedKind::dwarf_entry_point,
+                    Address{image.layout().space.id, mapped_entry.value()}, {}, {}};
+                seed.dwarf_evidence = FunctionSeedDwarfEvidence{symbol.origin.unit_offset,
+                    symbol.origin.record_offset, symbol.origin.record_size};
+                root(std::move(seed), false);
+                continue;
+            }
+            if (symbol.kind != symbols::SymbolKind::function || symbol.ranges.empty() ||
+                symbol.origin.record_size == 0 || !load_bias_valid)
+                continue;
+            std::vector<FunctionChunk> chunks;
+            chunks.reserve(symbol.ranges.size());
+            bool valid = true;
+            for (const auto &range : symbol.ranges) {
+                canceled();
+                if (range.begin >= range.end) { valid = false; break; }
+                const auto begin_offset = checked_add(range.begin, load_bias);
+                const auto end_offset = checked_add(range.end, load_bias);
+                if (!begin_offset || !end_offset || end_offset.value() <= begin_offset.value()) {
+                    valid = false;
+                    break;
+                }
+                const Address begin{image.layout().space.id, begin_offset.value()};
+                const auto size = end_offset.value() - begin_offset.value();
+                if (!AddressRange::create(begin, size)) { valid = false; break; }
+                const auto *segment = image.segment_at(begin);
+                const Address last{begin.space, end_offset.value() - 1};
+                if (!segment || !segment->executable || image.segment_at(last) != segment ||
+                    begin.offset < segment->begin.offset) { valid = false; break; }
+                const auto relative = begin.offset - segment->begin.offset;
+                if (relative >= segment->file_size || size > segment->file_size - relative ||
+                    relative >= segment->size || size > segment->size - relative ||
+                    image.code_window(begin, size) != size) { valid = false; break; }
+                chunks.push_back({begin, size, {}});
+            }
+            if (!valid || chunks.empty()) {
+                output->complete = false;
+                continue;
+            }
+            std::sort(chunks.begin(), chunks.end(), [](const auto &a, const auto &b) {
+                if (AddressLess{}(a.begin, b.begin)) return true;
+                if (AddressLess{}(b.begin, a.begin)) return false;
+                return a.size < b.size;
+            });
+            chunks.erase(std::unique(chunks.begin(), chunks.end(), [](const auto &a, const auto &b) {
+                return a.begin == b.begin && a.size == b.size;
+            }), chunks.end());
+            for (std::size_t i = 1; i < chunks.size(); ++i) {
+                if (chunks[i - 1].begin.space == chunks[i].begin.space &&
+                    chunks[i].begin.offset < chunks[i - 1].begin.offset + chunks[i - 1].size) {
+                    valid = false;
+                    break;
+                }
+            }
+            const Address entry = chunks.front().begin;
+            const auto context = image.context_at(entry);
+            const auto mapped_symbol = checked_add(symbol.address, load_bias);
+            if (!valid || !context || !mapped_symbol || mapped_symbol.value() != chunks.front().begin.offset) {
+                output->complete = false;
+                continue;
+            }
+            for (const auto &chunk : chunks) {
+                const Address last{chunk.begin.space, chunk.begin.offset + chunk.size - 1};
+                const auto chunk_context = image.context_at(chunk.begin);
+                const auto last_context = image.context_at(last);
+                if (!chunk_context || !last_context || chunk_context.value() != context.value() ||
+                    last_context.value() != context.value()) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid) {
+                output->complete = false;
+                continue;
+            }
+            FunctionSeed seed{FunctionSeedKind::dwarf_subprogram, entry, {}, {}};
+            seed.dwarf_evidence = FunctionSeedDwarfEvidence{symbol.origin.unit_offset,
+                symbol.origin.record_offset, symbol.origin.record_size};
+            root(std::move(seed), false);
+            if (!roots.contains(entry) || definitions.contains(entry) || metadata_chunks.contains(entry))
+                continue;
+            if (const auto found = candidate_ranges.find(entry); found == candidate_ranges.end())
+                candidate_ranges.emplace(entry, std::move(chunks));
+            else if (found->second != chunks)
+                conflicting_ranges.insert(entry);
+        }
+        for (auto &[entry, chunks] : candidate_ranges) {
+            canceled();
+            if (conflicting_ranges.contains(entry)) {
+                output->complete = false;
+                continue;
+            }
+            if (!metadata_chunks.contains(entry))
+                metadata_chunks.emplace(entry, std::move(chunks));
+        }
+    }
     all_seeds = roots;
 }
 Node &Recovery::node(Address address, ThumbITState incoming_it) {
@@ -1124,20 +1892,27 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
             };
             const auto padding = static_cast<size_t>((4 - ((address.offset + 1) & 3)) & 3);
             const auto switch_header = 1 + padding;
+            constexpr size_t max_jvm_instruction_extent = 65535;
             std::optional<size_t> required;
             if (input[0] == std::byte{0xaa} && available >= switch_header + 12) {
                 const auto low = read_u32(switch_header + 4);
                 const auto high = read_u32(switch_header + 8);
                 if (high >= low) {
                     const auto count = std::uint64_t(std::int64_t(high) - low) + 1;
-                    if (count <= 1024) required = switch_header + 12 + static_cast<size_t>(count) * 4;
+                    const auto header_extent = switch_header + 12;
+                    if (header_extent <= max_jvm_instruction_extent &&
+                        count <= (max_jvm_instruction_extent - header_extent) / 4)
+                        required = header_extent + static_cast<size_t>(count) * 4;
                 }
             } else if (input[0] == std::byte{0xab} && available >= switch_header + 8) {
                 const auto pairs = read_u32(switch_header + 4);
-                if (pairs >= 0 && pairs <= 1024)
-                    required = switch_header + 8 + static_cast<size_t>(pairs) * 8;
+                const auto header_extent = switch_header + 8;
+                if (pairs >= 0 && header_extent <= max_jvm_instruction_extent &&
+                    static_cast<std::uint64_t>(pairs) <=
+                        (max_jvm_instruction_extent - header_extent) / 8)
+                    required = header_extent + static_cast<size_t>(pairs) * 8;
             }
-            if (required && *required > available && *required <= 65535) {
+            if (required && *required > available && *required <= max_jvm_instruction_extent) {
                 read_window(*required);
                 decoded = decode_window();
             }
@@ -1191,7 +1966,8 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
         }
         value.fact = std::move(fact);
     }
-    const auto &instruction = value.fact->instruction;
+    const auto fact_owner = value.fact;
+    const auto &instruction = fact_owner->instruction;
     if (delayed_slots.contains(address)) {
         if ((instruction.opcode == Opcode::opaque && instruction.operands.empty()) || instruction.opcode == Opcode::x86_opaque ||
             instruction.flow != FlowKind::fallthrough || instruction.delay_slots) {
@@ -1215,6 +1991,28 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
     }
     auto flow_target = take(relocations.control_target(image, instruction, stop));
     if (!flow_target) flow_target = dex_direct_call_target(instruction, image, metadata);
+    if (!flow_target) flow_target = wasm_direct_call_target(instruction, image, metadata);
+    auto external_call_target = wasm_import_call_target(instruction, metadata);
+    if (!flow_target && !external_call_target && instruction.flow == FlowKind::call) {
+        const auto operand_index = analysis_detail::control_operand_index(instruction);
+        if (operand_index < instruction.operands.size()) {
+            if (const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[operand_index]);
+                memory && memory->resolved_address) {
+                const auto imported = imported_call_slots.find(*memory->resolved_address);
+                if (imported != imported_call_slots.end()) {
+                    external_call_target = imported->second;
+                } else if (auto local = local_x64_indirect_call_target(image, relocations, instruction, stop);
+                           local && !permission(*local)) {
+                    flow_target = *local;
+                    const auto file = take(image.to_file_offset(*memory->resolved_address));
+                    take(value.window.include(file, 8));
+                    auto dependent_fact = std::make_shared<InstructionFact>(*value.fact);
+                    take(dependent_fact->reads.include(file, 8));
+                    value.fact = std::move(dependent_fact);
+                }
+            }
+        }
+    }
     if (analysis_detail::has_delay_slot(instruction)) {
         const auto slot = take(analysis_detail::delay_slot_address(instruction));
         delayed_slots.insert(slot);
@@ -1314,18 +2112,24 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
         value.call = true;
         value.call_guard = executes_with;
         value.call_target = arm_target_matches() ? flow_target : std::nullopt;
+        value.external_call_target = std::move(external_call_target);
         if (value.call_target && target_it().known)
             thumb_states.emplace(*value.call_target, target_it());
-        if (!value.call_target)
+        if (!value.call_target && !value.external_call_target)
             value.call_issue = FunctionStop{
                 address,
                 instruction.context.architecture == Architecture::arm && flow_target ? FunctionStopReason::unsupported
                                                                                  : unresolved(),
                 instruction.context.architecture == Architecture::arm && flow_target
                     ? "ARM call target conflicts with source-backed execution-state metadata"
-                    : "Call target remains unresolved"};
-        else if (auto denied = permission(*value.call_target))
-            value.call_issue = FunctionStop{address, *denied, "Call target has no permitted initialized code"};
+                    : instruction.context.architecture == Architecture::wasm &&
+                              instruction.mnemonic_override == "call"
+                          ? "WebAssembly direct call does not resolve to a validated local body or function import"
+                          : "Call target remains unresolved"};
+        else if (value.call_target) {
+            if (auto denied = permission(*value.call_target))
+                value.call_issue = FunctionStop{address, *denied, "Call target has no permitted initialized code"};
+        }
         continuation(BlockEdgeKind::call_continuation, executes_with, true);
         if (instruction.context.architecture == Architecture::arm && skips_with)
             continuation(BlockEdgeKind::conditional_false, skips_with);
@@ -1512,9 +2316,9 @@ void Recovery::discover() {
     std::deque<Address> pending_functions;
     for (const auto &[entry, seeds] : all_seeds)
         pending_functions.push_back(entry);
-    AddressSet done;
-    AddressSet switch_scanned;
-    size_t memberships = 0;
+    auto &done = discovered_functions;
+    auto &switch_scanned = discovered_switches;
+    auto &memberships = discovery_memberships;
     while (!pending_functions.empty() && !discovery_exhausted) {
         canceled();
         const auto entry = pending_functions.front();
@@ -1768,7 +2572,8 @@ void Recovery::assign_owners() {
         };
         const auto record_call = [&](FunctionCall call) {
             const auto duplicate = std::any_of(output->calls.begin(), output->calls.end(), [&](const auto &old) {
-                return old.owner == call.owner && old.source == call.source && old.tail_candidate == call.tail_candidate;
+                return old.owner == call.owner && old.source == call.source && old.tail_candidate == call.tail_candidate &&
+                       old.external_target == call.external_target;
             });
             if (!duplicate) output->calls.push_back(std::move(call));
         };
@@ -1822,7 +2627,7 @@ void Recovery::assign_owners() {
                     if (target != functions.end())
                         callee = target->second->id;
                 }
-                record_call({function->id, at, current.call_target, callee, false});
+                record_call({function->id, at, current.call_target, callee, false, current.external_call_target});
             }
             for (const auto &edge : current.edges) {
                 if (!edge.target)
@@ -1918,6 +2723,117 @@ void Recovery::prune_unowned_seeds() {
     }
     assign_owners();
 }
+void Recovery::resolve_wasm_indirect_calls() {
+    if (!metadata.wasm || !output->complete || output->omitted_functions || output->omitted_blocks ||
+        !output->candidates.empty() || !output->conflicts.empty())
+        return;
+    const auto &wasm = *metadata.wasm;
+    if (wasm.imported_tables != 0 || wasm.defined_tables != 1 || !wasm.initial_table_complete ||
+        std::any_of(wasm.exports.begin(), wasm.exports.end(), [](const WasmExport &entry) {
+            return entry.kind == WasmExternalKind::table;
+        }))
+        return;
+    for (const auto &[entry, function] : functions) {
+        (void)entry;
+        canceled();
+        if (!function || !function->complete) return;
+    }
+
+    std::map<std::uint32_t, std::uint32_t> table_elements;
+    for (const auto &element : wasm.initial_table_elements) {
+        canceled();
+        if (element.function_index >= wasm.function_type_indices.size()) return;
+        const auto [found, inserted] = table_elements.emplace(element.slot, element.function_index);
+        if (!inserted && found->second != element.function_index) return;
+    }
+
+    std::set<std::uint32_t> defined_spaces;
+    std::map<Address, const InstructionFact *, AddressLess> instruction_ends;
+    AddressSet ambiguous_ends;
+    for (const auto &[address, node] : nodes) {
+        canceled();
+        const auto &fact = node.fact;
+        if (!fact || fact->instruction.context.architecture != Architecture::wasm ||
+            fact->instruction.context.mode != ExecutionMode::wasm32)
+            continue;
+        const auto &instruction = fact->instruction;
+        if (instruction.address.space.value >= wasm.imported_functions &&
+            instruction.address.space.value - wasm.imported_functions < wasm.defined_functions)
+            defined_spaces.insert(instruction.address.space.value);
+        const auto &mnemonic = instruction.mnemonic_override;
+        if (instruction.opcode == Opcode::opaque || mnemonic == "table.set" || mnemonic == "table.init" ||
+            mnemonic == "table.copy" || mnemonic == "table.grow" || mnemonic == "table.fill")
+            return;
+        if (!instruction.length || instruction.address.offset > UINT64_MAX - instruction.length) return;
+        const Address end{instruction.address.space, instruction.address.offset + instruction.length};
+        const auto [found, inserted] = instruction_ends.emplace(end, fact.get());
+        if (!inserted) ambiguous_ends.insert(end);
+    }
+    if (defined_spaces.size() != wasm.defined_functions) return;
+    for (std::uint64_t index = wasm.imported_functions;
+         index < std::uint64_t{wasm.imported_functions} + wasm.defined_functions; ++index) {
+        canceled();
+        if (!defined_spaces.contains(static_cast<std::uint32_t>(index))) return;
+    }
+
+    for (auto &call : output->calls) {
+        canceled();
+        if (call.target || call.external_target || call.tail_candidate) continue;
+        const auto node = nodes.find(call.source);
+        if (node == nodes.end() || !node->second.fact) continue;
+        const auto &instruction = node->second.fact->instruction;
+        if (instruction.context.architecture != Architecture::wasm ||
+            instruction.context.mode != ExecutionMode::wasm32 || instruction.flow != FlowKind::call ||
+            instruction.mnemonic_override != "call_indirect" || instruction.operands.size() != 2)
+            continue;
+        const auto *required_type = std::get_if<ImmediateOperand>(&instruction.operands[0]);
+        const auto *table_index = std::get_if<ImmediateOperand>(&instruction.operands[1]);
+        if (!required_type || required_type->is_signed || required_type->effective_width != 32 ||
+            required_type->value >= wasm.function_types.size() || !table_index || table_index->is_signed ||
+            table_index->effective_width != 32 || table_index->value != 0)
+            continue;
+        if (ambiguous_ends.contains(call.source)) continue;
+        const auto previous = instruction_ends.find(call.source);
+        if (previous == instruction_ends.end()) continue;
+        const auto &constant = previous->second->instruction;
+        if (constant.address.space != call.source.space || constant.mnemonic_override != "i32.const" ||
+            constant.operands.size() != 1)
+            continue;
+        const auto *slot_operand = std::get_if<ImmediateOperand>(&constant.operands.front());
+        if (!slot_operand || !slot_operand->is_signed || slot_operand->effective_width != 32) continue;
+        const auto slot = static_cast<std::uint32_t>(slot_operand->value);
+        if (slot >= wasm.initial_table_element_count) continue;
+        const auto element = table_elements.find(slot);
+        if (element == table_elements.end()) continue;
+        const auto function_index = element->second;
+        if (wasm.function_type_indices[function_index] != required_type->value) continue;
+        if (function_index < wasm.imported_functions) {
+            const auto imported = std::find_if(wasm.imports.begin(), wasm.imports.end(), [&](const WasmImport &entry) {
+                return entry.kind == WasmExternalKind::function && entry.index == function_index &&
+                       entry.function_type_index == required_type->value;
+            });
+            if (imported == wasm.imports.end()) continue;
+            ExternalIdentity identity;
+            identity.library = imported->module;
+            identity.name = imported->name;
+            identity.wasm_function_index = function_index;
+            identity.host_binding = imported->host_binding;
+            call.external_target = std::move(identity);
+            continue;
+        }
+        const Address target{AddressSpaceId{function_index}, 0};
+        const auto *segment = image.segment_at(target);
+        const auto context = image.context_at(target);
+        if (!segment || segment->begin != target || !segment->executable || !segment->size ||
+            segment->file_size != segment->size || !context || context.value().architecture != Architecture::wasm ||
+            context.value().mode != ExecutionMode::wasm32)
+            continue;
+        const auto callee = functions.find(target);
+        if (callee == functions.end()) continue;
+        call.target = target;
+        call.callee = callee->second->id;
+    }
+}
 std::shared_ptr<const FunctionSnapshot> Recovery::run() {
     canceled();
     report_progress("instruction-discovery", 0, options.instruction_budget);
@@ -1931,6 +2847,7 @@ std::shared_ptr<const FunctionSnapshot> Recovery::run() {
     trusted_seeds();
     assign_owners();
     prune_unowned_seeds();
+    resolve_wasm_indirect_calls();
     build_blocks(*this);
     finish_functions(*this);
     build_dependencies(*this);
@@ -1944,18 +2861,122 @@ std::shared_ptr<const FunctionSnapshot> Recovery::run() {
 }
 } // namespace hexlab::function_detail
 namespace hexlab {
+namespace {
+struct SemanticDecoderManifest {
+    std::vector<std::byte> identity;
+    std::vector<AnalysisOptions::SemanticDecoderInput> inputs;
+};
+
+std::optional<SemanticDecoderManifest> capture_semantic_decoder_manifest(const AnalysisOptions &options) noexcept {
+    if (!options.semantic_decoder || !options.semantic_decoder_identity || !options.semantic_decoder_read_set)
+        return {};
+    try {
+        SemanticDecoderManifest manifest{options.semantic_decoder_identity(), options.semantic_decoder_read_set()};
+        if (manifest.identity.size() > 1024 * 1024 || manifest.inputs.size() > 4096)
+            return {};
+        std::sort(manifest.inputs.begin(), manifest.inputs.end(), [](const auto &a, const auto &b) {
+            return a.identity < b.identity;
+        });
+        std::size_t total = 0;
+        std::size_t total_ranges = 0;
+        for (std::size_t i = 0; i < manifest.inputs.size(); ++i) {
+            auto &input = manifest.inputs[i];
+            const bool digest_missing = std::all_of(input.sha256.begin(), input.sha256.end(),
+                                                    [](std::byte value) { return value == std::byte{}; });
+            if (input.identity.empty() || input.identity.size() > 4096 ||
+                input.identity.find('\0') != std::string::npos ||
+                digest_missing ||
+                input.identity.size() > 1024 * 1024 - total ||
+                (i && manifest.inputs[i - 1].identity == input.identity))
+                return {};
+            total += input.identity.size();
+            if (input.image_reads.size() > 65536 - total_ranges)
+                return {};
+            total_ranges += input.image_reads.size();
+            ReadSet normalized;
+            for (const auto &range : input.image_reads) {
+                if (!range.size || !normalized.include(range.begin, range.size))
+                    return {};
+            }
+            input.image_reads.assign(normalized.ranges().begin(), normalized.ranges().end());
+        }
+        return manifest;
+    } catch (...) {
+        return {};
+    }
+}
+} // namespace
+
+bool semantic_decoder_read_set_complete(const AnalysisOptions &options) noexcept {
+    if (!options.semantic_decoder)
+        return true;
+    return capture_semantic_decoder_manifest(options).has_value();
+}
+bool semantic_decoder_image_reads_intersect(const AnalysisOptions &options,
+                                             std::span<const FileRange> changed_ranges,
+                                             std::uint64_t image_size) noexcept {
+    if (!options.semantic_decoder)
+        return false;
+    const auto manifest = capture_semantic_decoder_manifest(options);
+    if (!manifest)
+        return true;
+    try {
+        ReadSet declared;
+        for (const auto &input : manifest->inputs)
+            for (const auto &range : input.image_reads) {
+                if (range.begin.value > image_size || range.size > image_size - range.begin.value ||
+                    !declared.include(range.begin, range.size))
+                    return true;
+            }
+        ReadSet changed;
+        for (const auto &range : changed_ranges) {
+            if (!range.size || range.begin.value > image_size || range.size > image_size - range.begin.value ||
+                !changed.include(range.begin, range.size))
+                return true;
+        }
+        std::size_t read_index = 0, changed_index = 0;
+        const auto reads = declared.ranges();
+        const auto changes = changed.ranges();
+        while (read_index < reads.size() && changed_index < changes.size()) {
+            const auto &read = reads[read_index];
+            const auto &change = changes[changed_index];
+            const auto read_end = read.begin.value + read.size;
+            const auto changed_end = change.begin.value + change.size;
+            if (read.begin.value < changed_end && change.begin.value < read_end)
+                return true;
+            if (read_end <= change.begin.value)
+                ++read_index;
+            else
+                ++changed_index;
+        }
+        return false;
+    } catch (...) {
+        return true;
+    }
+}
 Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     Sha256 hash;
     constexpr std::string_view version =
-        "hexlab-functions-v63/mips32-cop1-branch-likely-v1/mips64-eh-frame-roots-v1/pe-x86-fpo-roots-and-extents-v1/riscv-bitwise-immediate-addresses-v1/dex-method-roots-call-edges-v2/dex-relative-control-operands-v1/dex-payload-data-v1/riscv-vfrsqrt7-vfrec7-v1/a64-preserving-bitfield-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/mips64-special-conditional-traps-v1/evex-packed-fp-broadcast-v1/evex-packed-fp-compare-mask-v1/wasm-br-table-12-case-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v2/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-profile-roots-and-predicated-thumb-pc-flow-v4/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v4/guard-multiblock-v1/unicode-strings-v2/windows1253-1255-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/pe-pogo-function-roots-v1"
+        "hexlab-functions-v94/semantic-decoder-manifest-single-capture-v2/x64-rip-indirect-call-slot-target-v1/riscv64-lw-signed-pointer-load-v1/mips64-bitfield-relocation-guard-v1/m6502-vector-roots-v1/wasm-direct-call-edges-v1/wasm-constant-call-indirect-function-edges-v1/a64-add-sub-carry-v1/riscv-masked-integer-reductions-v1/dex-register-index-16-v1/x64-loop-counter-alias-v1/elf-et-exec-section-init-fini-array-roots-v1/elf-legacy-ctors-dtors-roots-v1/windows-x64-shadow-store-call-provenance-v1/mips32-gpr-conditional-moves-v1/ppc-popcntb-v1/ppc-addze-addme-lift-v1/x86-implicit-multiply-lift-v1/x86-bit-scan-lift-v1/x86-bit-test-lift-v1/x86-movemask-lift-v2/x86-palignr-fallthrough-v1/x86-ssse3-pabs-lift-v1/ppc64-rldic-reference-v1/ppc64-rldcl-rldcr-reference-v1/a64-extr-reference-v1/a64-madd-msub-reference-v1/a64-conditional-select-nzcv-v1/mips32-cop1-conditional-moves-v1/riscv-bitwise-stack-copies-v1/mips32-cop1-branch-likely-v1/mips64-eh-frame-roots-v1/pe-x86-fpo-roots-and-extents-v1/riscv-bitwise-immediate-addresses-v1/dex-method-roots-call-edges-v2/dex-relative-control-operands-v1/dex-payload-data-v1/riscv-vfrsqrt7-vfrec7-v1/a64-preserving-bitfield-v1/a64-ubfm-sbfm-address-reference-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/mips64-shift-rotate-reference-v1/mips64-special-conditional-traps-v1/evex-packed-fp-broadcast-v1/wasm-br-table-12-case-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v2/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v4/guard-multiblock-v1/unicode-strings-v3/windows1253-1255-strings-v1/iso8859-10-13-14-16-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/pe-pogo-function-roots-v1/elf-powerpc-eh-frame-roots-v1/macho-compact-unwind-extents-v1/ppc64-elfv1-opd-symbol-roots-v1/wasm-export-function-roots-v1/wasm-start-function-root-v1/wasm-element-function-roots-v1/wasm-all-defined-function-roots-v1/m6502-reference-producer-graph-v1/riscv64-lwu-pointer-load-v1/riscv-zbb-count-reference-v1/mips64-dclz-dclo-reference-v1/elf-dwarf-entrypoint-roots-v1"
+        "mips64-word-shift-reference-v1/wasm-import-call-identities-v1/wasm-constant-call-indirect-reference-v1/"
         "elf-reference-provenance-v1/elf-arithmetic-v2/macho-symbol-roots-v1/macho-relocation-flow-v1/"
-        "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/riscv-vfclass-vfsqrt-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1/pe-safe-seh-function-roots-v1";
+        "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/riscv-vfclass-vfsqrt-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1/pe-safe-seh-function-roots-v1/macho-mod-term-function-roots-v1/elf-dwarf-subprogram-roots-v1/thumb2-movw-movt-reference-v1/riscv-addiw-address-reference-v1/aapcs32-stack-argument-slots-v1/mips-o32-stack-argument-slots-v1/mips-n64-stack-argument-slots-v1/a64-32bit-pointer-load-references-v1/ebcdic-cp037-string-candidates-v1/mips64-special2-mul-address-reference-v1/ppc32-rlwinm-address-reference-v1/ppc64-rldimi-address-reference-v1/riscv-outgoing-stack-store-provenance-v1/thumb-tbb-aligned-pc-target-v1/mips64-word-rotr-address-reference-v1/native-import-slot-call-identities-v1/windows932-string-candidates-v1";
     (void)hash.update(std::as_bytes(std::span(version)));
     for (auto value : {options.min_string_characters, options.instruction_budget, options.string_budget,
                        options.string_scan_work_budget,
                        options.function_budget, options.block_budget, options.membership_budget})
         (void)hash.update(encode_u64(value));
-    if (options.semantic_decoder_identity) {
+    std::optional<SemanticDecoderManifest> decoder_manifest;
+    if (options.semantic_decoder) {
+        decoder_manifest = capture_semantic_decoder_manifest(options);
+        if (decoder_manifest) {
+            (void)hash.update(encode_u64(decoder_manifest->identity.size()));
+            (void)hash.update(decoder_manifest->identity);
+        } else {
+            constexpr std::string_view failed_identity = "semantic-decoder-identity-unavailable";
+            (void)hash.update(std::as_bytes(std::span(failed_identity)));
+        }
+    } else if (options.semantic_decoder_identity) {
         try {
             const auto identity = options.semantic_decoder_identity();
             (void)hash.update(encode_u64(identity.size()));
@@ -1966,6 +2987,32 @@ Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
         }
     } else {
         (void)hash.update(encode_u64(0));
+    }
+    constexpr std::string_view read_set_domain = "semantic-decoder-external-read-set-v2";
+    (void)hash.update(std::as_bytes(std::span(read_set_domain)));
+    if (!options.semantic_decoder) {
+        (void)hash.update(encode_u64(0));
+    } else if (!decoder_manifest) {
+        // A stable marker makes the fingerprint deterministic, while callers
+        // separately prohibit cache/incremental reuse for this uncertified case.
+        (void)hash.update(encode_u64(2));
+    } else {
+        try {
+            (void)hash.update(encode_u64(1));
+            (void)hash.update(encode_u64(decoder_manifest->inputs.size()));
+            for (const auto &input : decoder_manifest->inputs) {
+                (void)hash.update(encode_u64(input.identity.size()));
+                (void)hash.update(std::as_bytes(std::span(input.identity)));
+                (void)hash.update(input.sha256);
+                (void)hash.update(encode_u64(input.image_reads.size()));
+                for (const auto &range : input.image_reads) {
+                    (void)hash.update(encode_u64(range.begin.value));
+                    (void)hash.update(encode_u64(range.size));
+                }
+            }
+        } catch (...) {
+            (void)hash.update(encode_u64(2));
+        }
     }
     return hash.digest();
 }
@@ -1996,7 +3043,10 @@ Result<std::shared_ptr<const FunctionSnapshot>> recover(const Image &image, cons
     try {
         function_detail::Recovery recovery(image, metadata, decisions, options, stop);
         recovery.output->key = std::move(key);
-        return recovery.run();
+        auto result = recovery.run();
+        if (result->key && result->key->engine_fingerprint != function_engine_fingerprint(options))
+            return Error{ErrorCode::conflict, "Semantic decoder set changed during function recovery"};
+        return result;
     } catch (const function_detail::Failure &failure) {
         return failure.error;
     } catch (const std::bad_alloc &) {

@@ -649,7 +649,9 @@ X87StackState transfer_x87_stack_state(const X87StackState &input, const Instruc
     const bool writes_tag = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
         [](RegisterOperand reg) { return reg.bank == RegisterBank::x87_tag; });
     const bool frees_tag = name == "ffree" || name == "ffreep";
-    if (writes_tag && !instruction.x87_stack_delta && !frees_tag) result.tags.fill(std::nullopt);
+    const bool tag_transfer = name == "fxch" || name == "fst" || name == "fstp";
+    if (writes_tag && !instruction.x87_stack_delta && !frees_tag && !tag_transfer)
+        result.tags.fill(std::nullopt);
     // Explicit ST destinations can change a value's tag class. Invalidate
     // those physical tags before applying any implicit push/pop transition.
     if (result.top) {
@@ -660,7 +662,25 @@ X87StackState transfer_x87_stack_state(const X87StackState &input, const Instruc
             if (!reg || reg->bank != RegisterBank::x87 || reg->index >= 8) continue;
             auto &tag = result.tags[(*result.top + reg->index) & 7];
             if (frees_tag) tag = X87Tag::empty;
+            else if (tag_transfer) continue; // Apply the exact copy/swap below.
             else tag.reset();
+        }
+        if (name == "fxch") {
+            std::uint8_t other = 0xff;
+            for (const auto &operand : instruction.operands)
+                if (const auto *reg = std::get_if<RegisterOperand>(&operand);
+                    reg && reg->bank == RegisterBank::x87 && reg->index < 8) {
+                    other = reg->index;
+                    break;
+                }
+            if (other < 8) std::swap(result.tags[*result.top], result.tags[(*result.top + other) & 7]);
+        } else if (name == "fst" || name == "fstp") {
+            for (const auto &operand : instruction.operands)
+                if (const auto *reg = std::get_if<RegisterOperand>(&operand);
+                    reg && reg->bank == RegisterBank::x87 && reg->index < 8) {
+                    result.tags[(*result.top + reg->index) & 7] = input.tags[*input.top];
+                    break;
+                }
         }
     }
     if (instruction.x87_stack_delta > 0) {
@@ -693,6 +713,51 @@ X87StackState transfer_x87_stack_state(const X87StackState &input, const Instruc
     return result;
 }
 
+X87PendingExceptionResult evaluate_x87_pending_exception(
+    const X87PendingExceptionRequest &request) noexcept {
+    constexpr std::uint16_t exception_mask = 0x003f;
+    X87PendingExceptionResult result;
+    result.status_word = request.status_word;
+    result.unmasked_exception_flags = static_cast<std::uint8_t>(
+        request.status_word & static_cast<std::uint16_t>(~request.control_word) & exception_mask);
+    if (result.unmasked_exception_flags == 0) return result;
+    result.status_word = static_cast<std::uint16_t>(result.status_word | fsw_error_summary | fsw_busy);
+    result.delivery = request.native_mode ? X87ExceptionDelivery::math_fault
+                                          : X87ExceptionDelivery::external_irq13;
+    return result;
+}
+
+X87StackFaultResult evaluate_x87_stack_fault(const X87StackFaultRequest &request) noexcept {
+    constexpr std::uint16_t invalid_operation = 1u << 0;
+    constexpr std::uint16_t stack_fault = 1u << 6;
+    constexpr std::uint16_t c1 = 1u << 9;
+    auto status = static_cast<std::uint16_t>(request.status_word | invalid_operation | stack_fault);
+    status = static_cast<std::uint16_t>(status & ~c1);
+    if (request.overflow) status = static_cast<std::uint16_t>(status | c1);
+    const auto pending = evaluate_x87_pending_exception(
+        {request.control_word, status, request.native_mode});
+    return {pending.status_word, (request.control_word & invalid_operation) != 0, pending};
+}
+
+X87ClearExceptionsResult evaluate_x87_clear_exceptions(std::uint16_t status_word) noexcept {
+    // IE/DE/ZE/OE/UE/PE, SF, ES, and B are cleared; TOP and C0-C3 are retained.
+    return {static_cast<std::uint16_t>(status_word & ~std::uint16_t{0x80ff})};
+}
+
+X87InitializeResult evaluate_x87_initialize() noexcept {
+    X87InitializeResult result;
+    result.stack.top = std::uint8_t{0};
+    result.stack.tags.fill(X87Tag::empty);
+    return result;
+}
+
+X87StackState retire_x87_stack_state(const X87StackState &input, const Instruction &instruction,
+                                     const X87PendingExceptionResult &pending,
+                                     bool instruction_completed) noexcept {
+    if (!instruction_completed || (instruction.x87_waiting && pending.pending())) return input;
+    return transfer_x87_stack_state(input, instruction);
+}
+
 std::optional<std::uint8_t> x87_physical_register(const X87StackState &state,
                                                    std::uint8_t logical_st) noexcept {
     if (!state.top || logical_st >= 8) return {};
@@ -706,9 +771,30 @@ std::optional<X87Relation> compare_x87_binary80(X87Binary80 left, X87Binary80 ri
     return compare_decoded(a, b);
 }
 
+std::optional<X87SignOperationResult> evaluate_x87_sign_operation(
+    const X87SignOperationRequest &request) noexcept {
+    auto value = request.value;
+    switch (request.operation) {
+    case X87SignOperation::change:
+        value.sign_exponent ^= sign_mask;
+        break;
+    case X87SignOperation::clear:
+        value.sign_exponent &= static_cast<std::uint16_t>(~sign_mask);
+        break;
+    default:
+        return {};
+    }
+    return X87SignOperationResult{value, static_cast<std::uint16_t>(request.status_word & ~(1u << 9))};
+}
+
 std::optional<X87CompareResult> evaluate_x87_compare(const X87CompareRequest &request) noexcept {
     const auto left = decode(request.left), right = decode(request.right);
     const bool invalid = is_invalid_kind(left.kind, request.kind) || is_invalid_kind(right.kind, request.kind);
+    const auto is_denormal = [](const Decoded &operand) noexcept {
+        return operand.kind == Class::finite && operand.exponent == 0 &&
+               operand.significand != 0 && (operand.significand & integer_bit) == 0;
+    };
+    const bool denormal = is_denormal(left) || is_denormal(right);
     const auto relation = (left.kind == Class::unsupported || right.kind == Class::unsupported ||
                            is_nan(left.kind) || is_nan(right.kind))
                               ? X87Relation::unordered
@@ -720,6 +806,7 @@ std::optional<X87CompareResult> evaluate_x87_compare(const X87CompareRequest &re
     // unmasked invalid exception; C0/C2/C3 are retired below by form.
     result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
     result.invalid_operation = invalid;
+    result.denormal_operand = denormal;
 
     if (invalid) result.status_word |= fsw_invalid;
     if (invalid && !masked) {
@@ -730,12 +817,91 @@ std::optional<X87CompareResult> evaluate_x87_compare(const X87CompareRequest &re
         return result;
     }
 
+    if (denormal) {
+        result.status_word |= fsw_denormal;
+        if ((request.control_word & fcw_denormal_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_denormal);
+            result.completed = false;
+            if (request.kind == X87CompareKind::fcomi || request.kind == X87CompareKind::fucomi)
+                result.eflags = request.eflags & ~(eflags_af | eflags_sf | eflags_of);
+            return result;
+        }
+    }
+
     const bool writes_eflags = request.kind == X87CompareKind::fcomi || request.kind == X87CompareKind::fucomi;
     if (writes_eflags)
         result.eflags = with_eflags(request.eflags, relation);
     else
         result.status_word = with_condition_codes(result.status_word, relation);
     return result;
+}
+
+std::optional<X87CompareResult> evaluate_x87_test(const X87TestRequest &request) noexcept {
+    X87CompareRequest comparison;
+    comparison.left = request.value;
+    comparison.right = {0, 0}; // Canonical positive binary80 zero.
+    comparison.control_word = request.control_word;
+    comparison.status_word = request.status_word;
+    comparison.kind = X87CompareKind::fcom;
+    return evaluate_x87_compare(comparison);
+}
+
+X87ConditionalMoveResult evaluate_x87_conditional_move(
+    const X87ConditionalMoveRequest &request) noexcept {
+    const bool cf = (request.eflags & eflags_cf) != 0;
+    const bool zf = (request.eflags & eflags_zf) != 0;
+    const bool pf = (request.eflags & eflags_pf) != 0;
+    bool move = false;
+    switch (request.condition) {
+    case X87ConditionalMoveCondition::below: move = cf; break;
+    case X87ConditionalMoveCondition::equal: move = zf; break;
+    case X87ConditionalMoveCondition::below_or_equal: move = cf || zf; break;
+    case X87ConditionalMoveCondition::unordered: move = pf; break;
+    case X87ConditionalMoveCondition::not_below: move = !cf; break;
+    case X87ConditionalMoveCondition::not_equal: move = !zf; break;
+    case X87ConditionalMoveCondition::not_below_or_equal: move = !cf && !zf; break;
+    case X87ConditionalMoveCondition::ordered: move = !pf; break;
+    }
+    return {move ? request.source : request.destination, request.eflags, move};
+}
+
+X87ExamineResult evaluate_x87_examine(const X87ExamineRequest &request) noexcept {
+    constexpr std::uint64_t explicit_integer_bit = std::uint64_t{1} << 63;
+    constexpr std::uint16_t condition_mask = fsw_c0 | fsw_c1 | fsw_c2 | fsw_c3;
+    const auto exponent = static_cast<std::uint16_t>(request.value.sign_exponent & exponent_mask);
+    const bool negative = (request.value.sign_exponent & sign_mask) != 0;
+    X87ExamineClass classification = X87ExamineClass::unsupported;
+    if (request.empty) {
+        classification = X87ExamineClass::empty;
+    } else if (exponent == exponent_mask) {
+        if (request.value.significand & explicit_integer_bit) {
+            classification = request.value.significand == explicit_integer_bit
+                ? X87ExamineClass::infinity : X87ExamineClass::nan;
+        }
+    } else if (exponent == 0) {
+        if (request.value.significand == 0)
+            classification = X87ExamineClass::zero;
+        else
+            classification = (request.value.significand & explicit_integer_bit)
+                ? X87ExamineClass::normal // pseudo-denormal encodes the minimum normal value
+                : X87ExamineClass::denormal;
+    } else if (request.value.significand & explicit_integer_bit) {
+        classification = X87ExamineClass::normal;
+    }
+
+    std::uint16_t condition = 0;
+    switch (classification) {
+    case X87ExamineClass::unsupported: break; // C3:C2:C0 = 000
+    case X87ExamineClass::nan: condition = fsw_c0; break;
+    case X87ExamineClass::normal: condition = fsw_c2; break;
+    case X87ExamineClass::infinity: condition = fsw_c2 | fsw_c0; break;
+    case X87ExamineClass::zero: condition = fsw_c3; break;
+    case X87ExamineClass::empty: condition = fsw_c3 | fsw_c0; break;
+    case X87ExamineClass::denormal: condition = fsw_c3 | fsw_c2; break;
+    }
+    auto status = static_cast<std::uint16_t>(request.status_word & ~condition_mask);
+    status = static_cast<std::uint16_t>(status | condition | (negative ? fsw_c1 : 0));
+    return {classification, status, negative};
 }
 
 std::optional<X87IntegerConvertResult>
@@ -1287,6 +1453,41 @@ evaluate_x87_square_root(const X87SquareRootRequest &request) noexcept {
     return result;
 }
 
+std::optional<X87ScaleResult> evaluate_x87_scale(const X87ScaleRequest &request) noexcept {
+    const auto value = decode(request.value);
+    const auto scale = decode(request.scale);
+    const auto value_raw_exponent = static_cast<std::uint16_t>(request.value.sign_exponent & exponent_mask);
+    const auto scale_raw_exponent = static_cast<std::uint16_t>(request.scale.sign_exponent & exponent_mask);
+    if ((value.kind != Class::zero && value.kind != Class::finite) ||
+        (scale.kind != Class::zero && scale.kind != Class::finite) ||
+        (value.kind == Class::finite && value_raw_exponent == 0) ||
+        (scale.kind == Class::finite && scale_raw_exponent == 0))
+        return {};
+
+    if (value.kind == Class::zero)
+        return X87ScaleResult{request.value, static_cast<std::uint16_t>(request.status_word & ~fsw_c1)};
+
+    std::int64_t integral_scale = 0;
+    if (scale.kind == Class::finite) {
+        const auto unbiased_scale_exponent = static_cast<int>(scale.exponent) - 16383;
+        // Larger magnitudes cannot keep a finite binary80 ST(0) normal.
+        if (unbiased_scale_exponent > 14) return {};
+        if (unbiased_scale_exponent >= 0) {
+            const auto magnitude = scale.significand >> (63 - unbiased_scale_exponent);
+            integral_scale = static_cast<std::int64_t>(magnitude);
+        }
+        if (scale.negative) integral_scale = -integral_scale;
+    }
+
+    auto result_value = request.value;
+    const auto unbiased_value_exponent = static_cast<int>(value.exponent) - 16383;
+    const auto result_exponent = unbiased_value_exponent + integral_scale;
+    if (result_exponent < -16382 || result_exponent > 16383) return {};
+    result_value.sign_exponent = static_cast<std::uint16_t>(
+        (request.value.sign_exponent & sign_mask) | static_cast<std::uint16_t>(result_exponent + 16383));
+    return X87ScaleResult{result_value, static_cast<std::uint16_t>(request.status_word & ~fsw_c1)};
+}
+
 X87UnaryResult evaluate_x87_unary(X87Binary80 value, std::uint16_t status_word,
                                   X87UnaryArithmetic operation) noexcept {
     if (operation == X87UnaryArithmetic::change_sign)
@@ -1294,6 +1495,72 @@ X87UnaryResult evaluate_x87_unary(X87Binary80 value, std::uint16_t status_word,
     else
         value.sign_exponent &= static_cast<std::uint16_t>(~sign_mask);
     return {value, status_word};
+}
+
+std::optional<X87ExtractResult> evaluate_x87_extract(const X87ExtractRequest &request) noexcept {
+    const auto decoded = decode(request.value);
+    if (decoded.kind == Class::unsupported) return std::nullopt;
+    X87ExtractResult result;
+    result.status_word = request.status_word;
+    if (is_nan(decoded.kind)) {
+        result.invalid_operation = decoded.kind == Class::signaling_nan;
+        if (result.invalid_operation) {
+            if ((request.control_word & fcw_invalid_mask) == 0) {
+                result.status_word = signal_exception(result.status_word, fsw_invalid);
+                result.completed = false;
+                return result;
+            }
+            result.status_word = static_cast<std::uint16_t>(result.status_word | fsw_invalid);
+        }
+        // FXTRACT has two floating outputs. Propagate the same sign/payload
+        // to both, quieting a masked SNaN without converting through host FP.
+        result.significand = quiet_nan(request.value);
+        result.exponent = result.significand;
+        return result;
+    }
+    if (decoded.kind == Class::zero) {
+        result.zero_divide = true;
+        if ((request.control_word & fcw_zero_divide_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_zero_divide);
+            result.completed = false;
+            return result;
+        }
+        result.status_word = static_cast<std::uint16_t>(result.status_word | fsw_zero_divide);
+        result.significand = request.value;
+        result.exponent = {integer_bit, static_cast<std::uint16_t>(exponent_mask | sign_mask)};
+        return result;
+    }
+    if (decoded.kind == Class::infinity) {
+        result.significand = {integer_bit, static_cast<std::uint16_t>((decoded.negative ? sign_mask : 0) | 0x3fff)};
+        result.exponent = {integer_bit, exponent_mask};
+        return result;
+    }
+    const bool denormal = (request.value.sign_exponent & exponent_mask) == 0 &&
+                          request.value.significand != 0 && (request.value.significand & integer_bit) == 0;
+    if (denormal) {
+        result.denormal_operand = true;
+        if ((request.control_word & fcw_denormal_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_denormal);
+            result.completed = false;
+            return result;
+        }
+        result.status_word = static_cast<std::uint16_t>(result.status_word | fsw_denormal);
+    }
+    const auto leading = static_cast<int>(63 - std::countl_zero(decoded.significand));
+    const int effective_exponent = decoded.exponent == 0 ? 1 : decoded.exponent;
+    const int exponent = effective_exponent - 16383 - 63 + leading;
+    const auto normalized = decoded.significand << (63 - leading);
+    result.significand = {normalized, static_cast<std::uint16_t>((decoded.negative ? sign_mask : 0) | 0x3fff)};
+    if (exponent == 0) {
+        result.exponent = {0, 0};
+    } else {
+        const auto magnitude = static_cast<std::uint64_t>(exponent < 0 ? -exponent : exponent);
+        const auto exponent_leading = static_cast<unsigned>(63 - std::countl_zero(magnitude));
+        const auto exponent_significand = magnitude << (63 - exponent_leading);
+        result.exponent = {exponent_significand,
+            static_cast<std::uint16_t>((exponent < 0 ? sign_mask : 0) | (16383 + exponent_leading))};
+    }
+    return result;
 }
 
 std::optional<X87RealLoadResult>
@@ -1436,6 +1703,115 @@ evaluate_x87_store_real(const X87RealStoreRequest &request) noexcept {
         result.destination_bits.reset();
         result.completed = false;
     }
+    return result;
+}
+
+std::optional<X87Binary80>
+evaluate_x87_load_packed_bcd(const X87PackedBcdLoadRequest &request) noexcept {
+    std::uint64_t magnitude = 0;
+    std::uint64_t place = 1;
+    for (std::size_t byte = 0; byte < 9; ++byte) {
+        const auto packed = request.source[byte];
+        const auto low = static_cast<std::uint8_t>(packed & 0xf);
+        const auto high = static_cast<std::uint8_t>(packed >> 4);
+        if (low > 9 || high > 9) return {};
+        magnitude += std::uint64_t(low) * place;
+        place *= 10;
+        magnitude += std::uint64_t(high) * place;
+        place *= 10;
+    }
+
+    X87Binary80 result{};
+    const bool negative = (request.source[9] & 0x80) != 0;
+    result.sign_exponent = negative ? sign_mask : 0;
+    if (magnitude == 0) return result;
+    const auto highest = static_cast<unsigned>(63 - std::countl_zero(magnitude));
+    result.significand = magnitude << (63 - highest);
+    result.sign_exponent = static_cast<std::uint16_t>(result.sign_exponent | (16383 + highest));
+    return result;
+}
+
+std::optional<X87PackedBcdStoreResult>
+evaluate_x87_store_packed_bcd(const X87PackedBcdStoreRequest &request) noexcept {
+    constexpr std::uint64_t largest_bcd_integer = 999999999999999999ULL;
+    const auto decoded = decode(request.value);
+    std::uint16_t input_status = request.status_word;
+    const bool denormal_operand = decoded.kind == Class::finite && decoded.exponent == 0 &&
+                                  (decoded.significand & integer_bit) == 0;
+    if (denormal_operand) {
+        input_status |= fsw_denormal;
+        if ((request.control_word & fcw_denormal_mask) == 0) {
+            X87PackedBcdStoreResult result;
+            result.status_word = signal_exception(input_status, fsw_denormal);
+            result.completed = false;
+            return result;
+        }
+    }
+    X87IntegerConvertRequest conversion;
+    conversion.value = request.value;
+    conversion.control_word = static_cast<std::uint16_t>(request.control_word |
+        fcw_invalid_mask | fcw_precision_mask);
+    conversion.status_word = input_status;
+    conversion.destination_width = 64;
+    const auto converted = evaluate_x87_to_integer(conversion);
+    if (!converted) return {};
+
+    X87PackedBcdStoreResult result;
+    result.status_word = converted->status_word;
+    result.completed = true;
+    result.precision = converted->precision;
+    result.invalid_operation = converted->invalid_operation;
+    result.rounded_up = (converted->status_word & fsw_c1) != 0;
+    const auto indefinite = [] {
+        std::array<std::uint8_t, 10> bytes{};
+        bytes[8] = 0xc0;
+        bytes[9] = 0xff;
+        return bytes;
+    };
+    if (converted->invalid_operation) {
+        if ((request.control_word & fcw_invalid_mask) == 0) {
+            result.status_word = signal_exception(static_cast<std::uint16_t>(input_status | fsw_invalid), fsw_invalid);
+            result.completed = false;
+        } else result.destination = indefinite();
+        return result;
+    }
+    if (!converted->destination_bits) return {};
+
+    const auto signed_value = std::bit_cast<std::int64_t>(*converted->destination_bits);
+    const bool negative = signed_value < 0 || (signed_value == 0 && decoded.negative);
+    const auto magnitude = negative ? std::uint64_t{0} - *converted->destination_bits
+                                    : *converted->destination_bits;
+    if (magnitude > largest_bcd_integer) {
+        result.invalid_operation = true;
+        result.precision = false;
+        result.rounded_up = false;
+        result.status_word = static_cast<std::uint16_t>(input_status & ~fsw_c1) | fsw_invalid;
+        if ((request.control_word & fcw_invalid_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_invalid);
+            result.completed = false;
+            return result;
+        }
+        result.destination = indefinite();
+        return result;
+    }
+
+    if (result.precision && (request.control_word & fcw_precision_mask) == 0) {
+        result.status_word = signal_exception(result.status_word, fsw_precision);
+        result.completed = false;
+        return result;
+    }
+
+    std::array<std::uint8_t, 10> bytes{};
+    auto remaining = magnitude;
+    for (std::size_t byte = 0; byte < 9; ++byte) {
+        const auto low = static_cast<std::uint8_t>(remaining % 10);
+        remaining /= 10;
+        const auto high = static_cast<std::uint8_t>(remaining % 10);
+        remaining /= 10;
+        bytes[byte] = static_cast<std::uint8_t>(low | (high << 4));
+    }
+    bytes[9] = negative ? 0x80 : 0;
+    result.destination = bytes;
     return result;
 }
 

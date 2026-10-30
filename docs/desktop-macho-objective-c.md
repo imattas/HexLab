@@ -26,6 +26,12 @@ The page filter searches kind, owner, name, address, status, provenance, and det
 case-insensitively. Filtering is debounced while typing and preserves each
 visible row's original address target. The filter affects only the displayed
 rows; it does not change the scan or type-import plan.
+Click a column header to sort the displayed rows by that column. Clicking the
+same header reverses the direction; choosing another column starts ascending.
+Text comparisons are case-insensitive, with exact text and original scan order
+as deterministic tie-breakers. Sorting composes with the current filter and
+retains the selected record when it remains visible; navigation, pseudocode,
+and copy actions continue to resolve through the original scan-row mapping.
 
 Use **Copy selected row** to copy the selected visible record as labeled text,
 including its full kind, owner, name, address, status, provenance, and details
@@ -64,8 +70,34 @@ with different content or provenance is reported as a conflict and left
 untouched. The import reports records skipped because their layouts or
 addresses are not proven. If multiple runtime records resolve to the same
 class name, all records for that name are skipped so duplicate declarations
-cannot make the atomic project import fail. It does not infer superclass storage, property
-backing ivars, protocol conformance methods, category overrides, or a
-metaclass object layout. When an instance layout cannot be represented but
-parsed instance methods exist, the class declaration is retained as an
-incomplete aggregate with those methods.
+cannot make the atomic project import fail.
+
+Superclass storage is imported when each superclass address links exactly to a
+scanned class with a unique resolved name and validated instance layout. The
+planner builds ancestors before descendants regardless of class-list order.
+Each derived aggregate embeds its concrete superclass storage at offset zero
+as `__objc_super`; inherited ivars remain visible inside that member. The
+embedded aggregate contains storage only, so inherited methods retain their
+own class declarations. Its bytes do not depend on resolving a same-name
+project definition. Any gap after the base and before local ivars remains
+opaque. Local ivars must begin at or beyond `class_ro_t.instanceStart`, and
+the superclass size cannot exceed that boundary.
+
+The superclass walk is iterative and capped at 32 classes, including the root.
+Cycles, unresolved or unscanned bases, ambiguous class identities, invalid
+ancestor layouts, conflicting generated member names, and overlapping base
+storage produce skip diagnostics and retain eligible local methods in an
+incomplete class declaration. Superclass alignment and runtime instance
+sliding are not inferred. The existing byte alignment and exact runtime
+metadata offsets are preserved. Property backing ivars, protocol conformance
+methods, category overrides, and metaclass object layouts are not inferred.
+
+For each class's directly adopted protocols, the scanner now checks required
+instance and class method selectors against that class's validated methods and
+the validated methods of scanned categories attached to it. Each requirement
+reports its selector, implementation entry, and status in the Binary Metadata
+protocol-reference row. Missing selectors are reported only when the overall
+scan and relevant method lists are complete; otherwise the result is explicitly
+unverified. This does not follow inherited protocol adoption, prove runtime
+conformance across dynamically loaded libraries, or import protocol
+requirements into project types.

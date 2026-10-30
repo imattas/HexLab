@@ -98,6 +98,67 @@ std::uint64_t gnu_count(const Reader &reader, const VirtualReader &input, std::u
     }
     return last + 1;
 }
+
+std::uint32_t gnu_hash(std::string_view name) {
+    std::uint32_t hash = 5381;
+    for (const auto character : name)
+        hash = hash * 33u + static_cast<unsigned char>(character);
+    return hash;
+}
+
+void validate_gnu_hash(const Reader &reader, const VirtualReader &input, std::uint64_t address, bool wide,
+                       std::span<const ElfSymbol> symbols, Budget &budget, std::stop_token stop) {
+    const auto header = input.bytes(address, 16);
+    const auto buckets = reader.value(header.bytes, 0, 4);
+    const auto first_symbol = reader.value(header.bytes, 4, 4);
+    const auto bloom_words = reader.value(header.bytes, 8, 4);
+    const auto shift = reader.value(header.bytes, 12, 4);
+    require(symbols.size() <= symbol_limit && symbols.size() >= first_symbol,
+            "GNU ELF hash symbol range exceeds the dynamic symbol table");
+    const auto word_bits = wide ? 64u : 32u;
+    const auto word_size = wide ? 8u : 4u;
+    const auto bloom_bytes = bloom_words * word_size;
+    const auto bloom = input.bytes(add(address, 16), bloom_bytes);
+    const auto bucket_at = add(add(address, 16), bloom_bytes);
+    const auto bucket_data = input.bytes(bucket_at, buckets * 4);
+    const auto chain_at = add(bucket_at, buckets * 4);
+    const auto chain_data = input.bytes(chain_at, (symbols.size() - first_symbol) * 4);
+    budget.include(symbols.size());
+    std::vector<bool> seen(symbols.size(), false);
+    for (std::uint64_t bucket = 0; bucket < buckets; ++bucket) {
+        canceled(stop);
+        auto index = reader.value(bucket_data.bytes, static_cast<std::size_t>(bucket * 4), 4);
+        if (index == 0)
+            continue;
+        require(index >= first_symbol && index < symbols.size(), "GNU ELF hash bucket is outside symbol table");
+        for (;;) {
+            canceled(stop);
+            require(index < symbols.size(), "GNU ELF hash chain exceeds dynamic symbol table");
+            const auto symbol_index = static_cast<std::size_t>(index);
+            require(!seen[symbol_index], "GNU ELF hash bucket chains overlap");
+            seen[symbol_index] = true;
+            const auto hash = gnu_hash(symbols[static_cast<std::size_t>(index)].name);
+            require(hash % buckets == bucket, "GNU ELF hash symbol is in the wrong bucket");
+            const auto chain = reader.value(chain_data.bytes, static_cast<std::size_t>((index - first_symbol) * 4), 4);
+            require((chain & ~std::uint64_t{1}) == (hash & ~std::uint32_t{1}),
+                    "GNU ELF hash chain value disagrees with symbol name");
+            const auto bloom_index = ((hash / word_bits) % bloom_words) * word_size;
+            const auto bloom_word = reader.value(bloom.bytes, static_cast<std::size_t>(bloom_index), word_size);
+            const auto first_bit = hash % word_bits;
+            const auto second_bit = (hash >> shift) % word_bits;
+            require((bloom_word & (UINT64_C(1) << first_bit)) &&
+                        (bloom_word & (UINT64_C(1) << second_bit)),
+                    "GNU ELF hash bloom filter omits a dynamic symbol");
+            if (chain & 1)
+                break;
+            ++index;
+        }
+    }
+    for (std::size_t index = static_cast<std::size_t>(first_symbol); index < symbols.size(); ++index) {
+        canceled(stop);
+        require(seen[index], "GNU ELF hash omits a symbol in its indexed range");
+    }
+}
 } // namespace
 void read_dynamic_symbols(const Reader &reader, const Image &image, ElfMetadata &metadata, ElfDynamicTable &dynamic,
                           const std::map<std::int64_t, std::uint64_t> &values, ByteView names, Budget &budget,
@@ -183,6 +244,11 @@ void read_dynamic_symbols(const Reader &reader, const Image &image, ElfMetadata 
         require(values.at(10) <= strings.size, string_bounds_error.c_str());
         validate_virtual_file(image, {{0}, values.at(5)}, values.at(10), {strings.offset}, stop);
         validate_alias(*candidate);
+        if (values.contains(0x6ffffef5))
+            validate_gnu_hash(reader, input, values.at(0x6ffffef5), wide,
+                              std::span<const ElfSymbol>(metadata.symbols).subspan(
+                                  static_cast<std::size_t>(*candidate->symbol_begin),
+                                  static_cast<std::size_t>(*candidate->count)), budget, stop);
         candidate->count_source = origin;
         dynamic.symbol_table = candidate->source;
         return;
@@ -192,6 +258,11 @@ void read_dynamic_symbols(const Reader &reader, const Image &image, ElfMetadata 
         if (table.source == source) {
             require(table.stride == stride && table.count == count, "ELF dynamic symbol aliases conflict");
             validate_alias(table);
+            if (values.contains(0x6ffffef5))
+                validate_gnu_hash(reader, input, values.at(0x6ffffef5), wide,
+                                  std::span<const ElfSymbol>(metadata.symbols).subspan(
+                                      static_cast<std::size_t>(*table.symbol_begin),
+                                      static_cast<std::size_t>(*table.count)), budget, stop);
             dynamic.symbol_table = source;
             return;
         }
@@ -223,6 +294,10 @@ void read_dynamic_symbols(const Reader &reader, const Image &image, ElfMetadata 
         resolve_symbol(symbol, image, metadata);
         metadata.symbols.push_back(std::move(symbol));
     }
+    if (values.contains(0x6ffffef5))
+        validate_gnu_hash(reader, input, values.at(0x6ffffef5), wide,
+                          std::span<const ElfSymbol>(metadata.symbols).subspan(begin, static_cast<std::size_t>(*count)),
+                          budget, stop);
     metadata.symbol_tables.push_back({source, stride, count, begin, origin});
     dynamic.symbol_table = source;
 }

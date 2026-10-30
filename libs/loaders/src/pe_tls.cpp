@@ -28,6 +28,11 @@ Result<std::size_t> read_tls(const Image& image, const Directory& directory, boo
         const auto callbacks_va = get(width * 3, width);
         const auto zero_fill = static_cast<std::uint32_t>(get(width * 4, 4));
         const auto characteristics = static_cast<std::uint32_t>(get(width * 4 + 4, 4));
+        constexpr std::uint32_t tls_alignment_mask = 0x00f00000u;
+        require((characteristics & ~tls_alignment_mask) == 0,
+                "PE TLS characteristics contains reserved bits");
+        require(((characteristics & tls_alignment_mask) >> 20) <= 14,
+                "PE TLS characteristics contains a reserved alignment code");
         PeTlsDirectory tls;
         tls.zero_fill = zero_fill;
         tls.characteristics = characteristics;

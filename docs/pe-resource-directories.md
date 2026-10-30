@@ -35,3 +35,15 @@ Raw payload spans remain available for unsupported encodings and other
 manifest metadata. `hexlab_cli inspect` reports decoded identities and
 execution-level requests with bounded output; these fields are descriptive and
 do not imply that Windows will grant the requested access level.
+
+For numeric `RT_GROUP_ICON` (type ID 14), the loader decodes the bounded
+`GRPICONDIR` header and up to 256 14-byte icon entries. Entries retain their
+dimensions (where a zero byte means 256 pixels), color count, planes, bit depth,
+declared payload size, icon resource ID, and exact source spans. A group entry
+links to an `RT_ICON` leaf only when exactly one same-language resource has the
+referenced numeric ID; unresolved or ambiguous links remain explicit. The
+shared image parse budget is 4 MiB. Invalid or truncated group metadata stays
+available as a partial structured record alongside the original raw resource
+payload. `hexlab_cli inspect` lists groups and entries with a 256-group/4,096-
+entry output cap. The loader does not decode icon image pixels or infer which
+icon Windows will select for a particular display context.

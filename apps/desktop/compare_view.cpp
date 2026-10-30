@@ -1,4 +1,5 @@
 #include "compare_view.hpp"
+#include "main_frame.hpp"
 #include "hexlab/processors/instruction.hpp"
 #include <wx/sizer.h>
 #include <wx/stattext.h>
@@ -64,9 +65,12 @@ wxString function_diff_kind_text(compare::InstructionDiffKind kind) {
     }
     return "Unknown";
 }
-wxString instruction_range(std::uint64_t start, std::uint64_t count) {
+wxString instruction_range(std::uint64_t start, std::uint64_t count,
+                           const std::optional<compare::FunctionAddress> &location) {
     if (!count) return "-";
-    return number(start) + ".." + number(start + count);
+    auto result = number(start) + ".." + number(start + count);
+    if (location) result += " @ " + function_address(location->entry, location->address_space);
+    return result;
 }
 std::string lower_ascii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -90,11 +94,14 @@ std::string csv_field(std::string_view value) {
 std::string csv_row(std::initializer_list<std::string> fields) {
     std::string result;
     bool first = true;
+    std::size_t count = 0;
     for (const auto &field : fields) {
         if (!first) result += ',';
         first = false;
         result += csv_field(field);
+        ++count;
     }
+    while (count++ < 26) result += ',';
     result += "\r\n";
     return result;
 }
@@ -153,6 +160,7 @@ std::optional<std::uint64_t> compare_instruction_fingerprint(const Instruction &
         hash.add(static_cast<std::uint64_t>(instruction.arm->predicate));
         hash.add(static_cast<std::uint64_t>(instruction.arm->exchange));
         hash.add(instruction.arm->flags_written); hash.add(instruction.arm->flags_known);
+        hash.add(instruction.arm->q_flag_may_set);
         hash.add(instruction.arm->writes_pc); hash.add(instruction.arm->writeback);
     } else hash.add(UINT64_MAX);
     return hash.value;
@@ -255,14 +263,19 @@ CompareView::CompareView(wxWindow *parent, compare::Report report, wxString old_
                          std::function<void(const compare::FunctionMatch &)> navigate_old_function,
                          std::vector<compare::FunctionBodyDiff> function_body_diffs,
                          std::function<void(const compare::ChangeRun &)> navigate_new,
-                         std::function<void(const compare::FunctionMatch &)> navigate_new_function)
-    : wxFrame(parent, wxID_ANY, "Binary Comparison", wxDefaultPosition, wxSize(900, 560)),
+                         std::function<void(const compare::FunctionMatch &)> navigate_new_function,
+                         std::function<void(const compare::FunctionAddress &)> navigate_old_instruction,
+                         std::function<void(const compare::FunctionAddress &)> navigate_new_instruction)
+    : wxFrame(parent, wxID_ANY, "Binary Comparison", wxDefaultPosition, wxDefaultSize),
       report_(std::move(report)), function_matches_(std::move(functions)),
       function_body_diffs_(std::move(function_body_diffs)),
       old_name_(std::move(old_name)), new_name_(std::move(new_name)), navigate_old_(std::move(navigate_old)),
       navigate_old_function_(std::move(navigate_old_function)), navigate_new_(std::move(navigate_new)),
-      navigate_new_function_(std::move(navigate_new_function)) {
+      navigate_new_function_(std::move(navigate_new_function)),
+      navigate_old_instruction_(std::move(navigate_old_instruction)),
+      navigate_new_instruction_(std::move(navigate_new_instruction)) {
     SetName("binary-compare-view");
+    SetClientSize(FromDIP(wxSize(900, 560)));
     CreateStatusBar();
     auto *menu_bar = new wxMenuBar;
     auto *file = new wxMenu;
@@ -280,7 +293,8 @@ CompareView::CompareView(wxWindow *parent, compare::Report report, wxString old_
     auto summary = wxString("Old: ") + old_name_ + "    New: " + new_name_ + "\n" +
                    "Compared " + number(s.compared_bytes) + " bytes; equal " + number(s.equal_bytes) +
                    ", changed " + number(s.changed_bytes) + ", added " + number(s.added_bytes) +
-                   ", removed " + number(s.removed_bytes) + "\nMatched regions " + number(s.matched_regions) +
+                   ", removed " + number(s.removed_bytes) + ", ignored " + number(s.ignored_bytes) +
+                   " bytes\nMatched regions " + number(s.matched_regions) +
                    ", added regions " + number(s.added_regions) + ", removed regions " + number(s.removed_regions);
     box->Add(new wxStaticText(this, wxID_ANY, summary), 0, wxEXPAND | wxALL, FromDIP(8));
     auto *pages = new wxNotebook(this, wxID_ANY);
@@ -288,6 +302,7 @@ CompareView::CompareView(wxWindow *parent, compare::Report report, wxString old_
     auto *byte_box = new wxBoxSizer(wxVERTICAL);
     runs_ = new wxListCtrl(byte_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxLC_REPORT | wxLC_SINGLE_SEL);
     runs_->SetName("compare-runs");
+    runs_->SetToolTip("Byte comparison runs. Use Up/Down to select and Enter or double-click to inspect a run.");
     for (auto [title, width] : {std::pair{"Kind", 90}, {"Region", 240}, {"Old address", 150}, {"New address", 150}, {"Bytes", 100}})
         runs_->AppendColumn(title, wxLIST_FORMAT_LEFT, FromDIP(width));
     auto *controls = new wxBoxSizer(wxHORIZONTAL);
@@ -328,6 +343,42 @@ CompareView::CompareView(wxWindow *parent, compare::Report report, wxString old_
     byte_page->SetSizer(byte_box);
     pages->AddPage(byte_page, "Bytes");
 
+    auto *region_page = new wxPanel(pages);
+    auto *region_box = new wxBoxSizer(wxVERTICAL);
+    auto *region_controls = new wxBoxSizer(wxHORIZONTAL);
+    region_search_ = new wxTextCtrl(region_page, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+    region_search_->SetName("compare-region-search");
+    region_search_->SetMaxLength(2048);
+    region_search_->SetHint("Filter by status, region, address, or byte count");
+    region_controls->Add(region_search_, 1, wxRIGHT, FromDIP(4));
+    auto *apply_region_filter = new wxButton(region_page, wxID_ANY, "Filter");
+    apply_region_filter->SetName("compare-region-filter-apply");
+    region_controls->Add(apply_region_filter, 0, wxRIGHT, FromDIP(4));
+    auto *clear_region_filter = new wxButton(region_page, wxID_ANY, "Clear");
+    clear_region_filter->SetName("compare-region-filter-clear");
+    region_controls->Add(clear_region_filter, 0);
+    region_box->Add(region_controls, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(8));
+    region_count_ = new wxStaticText(region_page, wxID_ANY, "");
+    region_count_->SetName("compare-region-count");
+    region_box->Add(region_count_, 0, wxEXPAND | wxALL, FromDIP(8));
+    regions_ = new wxListCtrl(region_page, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                              wxLC_REPORT | wxLC_SINGLE_SEL);
+    regions_->SetName("compare-region-summaries");
+    for (auto [title, width] : {std::pair{"Status", 90}, {"Region", 220}, {"Old address", 140},
+                                {"New address", 140}, {"Old bytes", 95}, {"New bytes", 95},
+                                {"Equal", 90}, {"Changed", 90}, {"Ignored", 90}, {"Added", 90}, {"Removed", 90}})
+        regions_->AppendColumn(title, wxLIST_FORMAT_LEFT, FromDIP(width));
+    refresh_regions();
+    apply_region_filter->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { refresh_regions(); });
+    clear_region_filter->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        region_search_->Clear();
+        refresh_regions();
+    });
+    region_search_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent &) { refresh_regions(); });
+    region_box->Add(regions_, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(8));
+    region_page->SetSizer(region_box);
+    pages->AddPage(region_page, "Regions");
+
     auto *function_page = new wxPanel(pages);
     auto *function_box = new wxBoxSizer(wxVERTICAL);
     auto *function_filters = new wxBoxSizer(wxHORIZONTAL);
@@ -355,9 +406,11 @@ CompareView::CompareView(wxWindow *parent, compare::Report report, wxString old_
     functions_ = new wxListCtrl(function_page, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                 wxLC_REPORT | wxLC_SINGLE_SEL);
     functions_->SetName("compare-functions");
+    functions_->SetToolTip("Function matches. Use Up/Down to select and Enter or double-click to navigate to the old function.");
     for (auto [title, width] : {std::pair{"Status", 105}, {"Old name", 180}, {"Old entry", 140},
                                 {"New name", 180}, {"New entry", 140}, {"Confidence", 90},
-                                {"Base", 70}, {"Call links", 80}, {"Round", 60}, {"Body diff", 90}})
+                                {"Base", 70}, {"Call links", 80}, {"Round", 60}, {"Body diff", 90},
+                                {"Score evidence", 190}, {"Call target delta", 170}})
         functions_->AppendColumn(title, wxLIST_FORMAT_LEFT, FromDIP(width));
     function_box->Add(functions_, 1, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(8));
     refresh_functions();
@@ -383,6 +436,16 @@ CompareView::CompareView(wxWindow *parent, compare::Report report, wxString old_
         "Select a matched function to inspect its instruction alignment.");
     function_diff_summary_->SetName("compare-function-diff-summary");
     function_box->Add(function_diff_summary_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(8));
+    auto *instruction_navigation = new wxBoxSizer(wxHORIZONTAL);
+    function_diff_old_ = new wxButton(function_page, wxID_ANY, "Go to old instruction");
+    function_diff_new_ = new wxButton(function_page, wxID_ANY, "Go to new instruction");
+    function_diff_old_->SetName("compare-function-diff-go-old");
+    function_diff_new_->SetName("compare-function-diff-go-new");
+    function_diff_old_->Enable(false);
+    function_diff_new_->Enable(false);
+    instruction_navigation->Add(function_diff_old_, 0, wxRIGHT, FromDIP(4));
+    instruction_navigation->Add(function_diff_new_, 0);
+    function_box->Add(instruction_navigation, 0, wxLEFT | wxRIGHT | wxTOP, FromDIP(8));
     function_diff_runs_ = new wxListCtrl(function_page, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                          wxLC_REPORT | wxLC_SINGLE_SEL);
     function_diff_runs_->SetName("compare-function-diff-runs");
@@ -390,6 +453,26 @@ CompareView::CompareView(wxWindow *parent, compare::Report report, wxString old_
     function_diff_runs_->AppendColumn("Old index / range", wxLIST_FORMAT_LEFT, FromDIP(220));
     function_diff_runs_->AppendColumn("New index / range", wxLIST_FORMAT_LEFT, FromDIP(220));
     function_box->Add(function_diff_runs_, 1, wxEXPAND | wxALL, FromDIP(8));
+    function_diff_runs_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &) {
+        update_instruction_navigation();
+    });
+    function_diff_runs_->Bind(wxEVT_LIST_ITEM_DESELECTED, [this](wxListEvent &) {
+        update_instruction_navigation();
+    });
+    function_diff_old_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        const auto row = function_diff_runs_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+        if (row >= 0 && static_cast<std::size_t>(row) < visible_instruction_runs_.size()) {
+            const auto &run = visible_instruction_runs_[static_cast<std::size_t>(row)];
+            if (run.old_address && navigate_old_instruction_) navigate_old_instruction_(*run.old_address);
+        }
+    });
+    function_diff_new_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        const auto row = function_diff_runs_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+        if (row >= 0 && static_cast<std::size_t>(row) < visible_instruction_runs_.size()) {
+            const auto &run = visible_instruction_runs_[static_cast<std::size_t>(row)];
+            if (run.new_address && navigate_new_instruction_) navigate_new_instruction_(*run.new_address);
+        }
+    });
     function_page->SetSizer(function_box);
     pages->AddPage(function_page, "Functions");
     box->Add(pages, 1, wxEXPAND | wxALL, FromDIP(8));
@@ -425,8 +508,12 @@ void CompareView::export_csv() {
     output << csv_row({"record_type", "old_input", "new_input", "status", "region", "old_address",
                        "new_address", "size_bytes", "confidence_percent", "base_confidence_percent",
                        "supporting_call_neighbors", "call_graph_round", "old_name", "new_name",
+                       "shape_similarity", "instruction_similarity", "histogram_similarity", "cfg_similarity",
+                       "exact_name", "name_floor_applied",
                        "summary_metric", "summary_value", "old_instruction_start", "old_instruction_count",
-                       "new_instruction_start", "new_instruction_count"});
+                       "new_instruction_start", "new_instruction_count", "old_region_size", "new_region_size",
+                       "compared_bytes", "equal_bytes", "changed_bytes", "ignored_bytes", "added_bytes", "removed_bytes",
+                       "old_instruction_address", "new_instruction_address"});
     const auto &summary = report_.summary;
     const auto summary_row = [&](std::string label, std::uint64_t value) {
         output << csv_row({"summary", utf8(old_name_), utf8(new_name_), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
@@ -435,23 +522,52 @@ void CompareView::export_csv() {
     summary_row("Compared bytes", summary.compared_bytes);
     summary_row("Equal bytes", summary.equal_bytes);
     summary_row("Changed bytes", summary.changed_bytes);
+    summary_row("Ignored bytes", summary.ignored_bytes);
     summary_row("Added bytes", summary.added_bytes);
     summary_row("Removed bytes", summary.removed_bytes);
     summary_row("Matched regions", summary.matched_regions);
     summary_row("Added regions", summary.added_regions);
     summary_row("Removed regions", summary.removed_regions);
+    for (const auto &region : report_.regions) {
+        const auto kind = region.kind == compare::RegionChangeKind::matched ? "matched" :
+            region.kind == compare::RegionChangeKind::added ? "added" : "removed";
+        output << csv_row({"region", utf8(old_name_), utf8(new_name_), kind, region.region_key,
+            csv_address(region.old_address), csv_address(region.new_address), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+            {}, {}, {}, {}, {}, std::to_string(region.old_size), std::to_string(region.new_size),
+            std::to_string(region.compared_bytes), std::to_string(region.equal_bytes),
+            std::to_string(region.changed_bytes), std::to_string(region.ignored_bytes),
+            std::to_string(region.added_bytes), std::to_string(region.removed_bytes)});
+    }
     for (const auto &run : report_.runs)
         output << csv_row({"byte_run", utf8(old_name_), utf8(new_name_), utf8(compare_kind_text(run.kind)), run.region_key,
                            csv_address(run.old_address), csv_address(run.new_address), std::to_string(run.size), {}, {}, {}, {}, {}, {}, {}, {},
                            {}, {}, {}, {}});
-    for (const auto &match : function_matches_)
+    for (const auto &match : function_matches_) {
+        const auto &score = match.evidence.score_breakdown;
         output << csv_row({"function", utf8(old_name_), utf8(new_name_), utf8(compare_function_kind_text(match.kind)), {},
                            function_address(match.old_entry, match.old_space).ToStdString(),
                            function_address(match.new_entry, match.new_space).ToStdString(), {},
                            std::to_string(match.confidence), std::to_string(match.evidence.base_confidence),
                            std::to_string(match.evidence.supporting_call_neighbors),
-                           std::to_string(match.evidence.call_graph_round), match.old_name, match.new_name, {}, {},
+                           std::to_string(match.evidence.call_graph_round), match.old_name, match.new_name,
+                           score.available ? std::to_string(score.shape_similarity) : std::string{},
+                           score.instruction_available ? std::to_string(score.instruction_similarity) : std::string{},
+                           score.histogram_available ? std::to_string(score.histogram_similarity) : std::string{},
+                           score.cfg_available ? std::to_string(score.cfg_similarity) : std::string{},
+                           score.available ? (score.exact_name ? "true" : "false") : std::string{},
+                           score.available ? (score.name_floor_applied ? "true" : "false") : std::string{}, {}, {},
                            {}, {}, {}, {}});
+    }
+    for (const auto &match : function_matches_) {
+        if (!match.call_targets.available) continue;
+        for (const auto &[label, value] : std::array<std::pair<const char *, std::uint64_t>, 4>{{
+                 {"unchanged", match.call_targets.unchanged}, {"added", match.call_targets.added},
+                 {"removed", match.call_targets.removed}, {"ambiguous", match.call_targets.ambiguous}}})
+            output << csv_row({"function_call_targets", utf8(old_name_), utf8(new_name_), "available", {},
+                csv_address(match.old_entry), csv_address(match.new_entry),
+                {}, {}, {}, {}, {}, match.old_name, match.new_name, label, std::to_string(value),
+                {}, {}, {}, {}});
+    }
     for (const auto &body : function_body_diffs_) {
         const auto match = std::find_if(function_matches_.begin(), function_matches_.end(), [&](const auto &value) {
             return value.old_entry && value.new_entry && *value.old_entry == body.old_entry &&
@@ -476,7 +592,9 @@ void CompareView::export_csv() {
                 wxString::Format("0x%llX", static_cast<unsigned long long>(body.new_entry)).ToStdString(),
                 {}, {}, {}, {}, {}, old_function, new_function, {}, {},
                 std::to_string(run.old_start), std::to_string(run.old_count),
-                std::to_string(run.new_start), std::to_string(run.new_count)});
+                std::to_string(run.new_start), std::to_string(run.new_count), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                run.old_address ? function_address(run.old_address->entry, run.old_address->address_space).ToStdString() : std::string{},
+                run.new_address ? function_address(run.new_address->entry, run.new_address->address_space).ToStdString() : std::string{}});
     }
     output.flush();
     if (!output) {
@@ -504,6 +622,13 @@ void CompareView::save_session_as() {
                      wxOK | wxICON_ERROR, this);
         return;
     }
+    session_path_ = path;
+    for (auto *ancestor = GetParent(); ancestor; ancestor = ancestor->GetParent()) {
+        if (auto *main_frame = dynamic_cast<MainFrame *>(ancestor)) {
+            main_frame->TrackComparisonSession(this, path);
+            break;
+        }
+    }
     SetStatusText("Comparison session saved");
 }
 void CompareView::open_session() {
@@ -522,6 +647,13 @@ void CompareView::open_session() {
     auto *view = new CompareView(this, std::move(session.report), wxString::FromUTF8(session.old_name),
         wxString::FromUTF8(session.new_name), std::move(session.functions), {}, {},
         std::move(session.function_body_diffs));
+    view->set_session_path(path);
+    for (auto *ancestor = GetParent(); ancestor; ancestor = ancestor->GetParent()) {
+        if (auto *main_frame = dynamic_cast<MainFrame *>(ancestor)) {
+            main_frame->TrackComparisonSession(view, path);
+            break;
+        }
+    }
     view->Show();
 }
 void CompareView::refresh_runs() {
@@ -546,6 +678,46 @@ void CompareView::refresh_runs() {
     }
     if (run_count_) run_count_->SetLabel(number(visible_runs_.size()) + " / " + number(report_.runs.size()));
 }
+
+void CompareView::refresh_regions() {
+    regions_->DeleteAllItems();
+    if (!report_.region_summaries_available) {
+        region_count_->SetLabel("Per-region summaries were not stored in this session.");
+        return;
+    }
+    constexpr std::size_t region_display_limit = 100'000;
+    const auto scanned = std::min(region_display_limit, report_.regions.size());
+    const auto query = lower_ascii(utf8(region_search_->GetValue()));
+    std::size_t matches = 0;
+    for (std::size_t i = 0; i < scanned; ++i) {
+        const auto &row = report_.regions[i];
+        const char *kind = row.kind == compare::RegionChangeKind::matched ? "Matched" :
+            row.kind == compare::RegionChangeKind::added ? "Added" : "Removed";
+        const auto old_address = row.old_address ? address(*row.old_address) : wxString{};
+        const auto new_address = row.new_address ? address(*row.new_address) : wxString{};
+        const auto old_size = number(row.old_size), new_size = number(row.new_size);
+        const auto equal = number(row.equal_bytes), changed = number(row.changed_bytes);
+        const auto ignored = number(row.ignored_bytes), added = number(row.added_bytes), removed = number(row.removed_bytes);
+        const auto searchable = lower_ascii(std::string(kind) + " " + row.region_key + " " + utf8(old_address) + " " +
+            utf8(new_address) + " " + utf8(old_size) + " " + utf8(new_size) + " " + utf8(equal) + " " +
+            utf8(changed) + " " + utf8(ignored) + " " + utf8(added) + " " + utf8(removed));
+        if (!query.empty() && searchable.find(query) == std::string::npos) continue;
+        ++matches;
+        const auto item = regions_->InsertItem(regions_->GetItemCount(), kind);
+        const auto set = [&](int column, const wxString &value) { regions_->SetItem(item, column, value); };
+        set(1, from_utf8(row.region_key));
+        set(2, old_address); set(3, new_address);
+        set(4, old_size); set(5, new_size);
+        set(6, equal); set(7, changed); set(8, ignored); set(9, added); set(10, removed);
+    }
+    const auto omitted = report_.regions.size() - scanned;
+    auto status = wxString::Format("%llu matching / %llu scanned region summaries",
+        static_cast<unsigned long long>(matches), static_cast<unsigned long long>(scanned));
+    if (omitted)
+        status += wxString::Format("; %llu additional rows omitted", static_cast<unsigned long long>(omitted));
+    region_count_->SetLabel(status);
+}
+
 void CompareView::activate_run(std::size_t index) {
     if (index < report_.runs.size() && report_.runs[index].old_address && navigate_old_)
         navigate_old_(report_.runs[index]);
@@ -556,6 +728,8 @@ void CompareView::activate_run_new(std::size_t index) {
 }
 void CompareView::show_function_diff(std::size_t index) {
     function_diff_runs_->DeleteAllItems();
+    visible_instruction_runs_.clear();
+    update_instruction_navigation();
     if (index >= function_matches_.size()) {
         function_diff_summary_->SetLabel("Select a function match to inspect its instruction alignment.");
         return;
@@ -595,10 +769,11 @@ void CompareView::show_function_diff(std::size_t index) {
         summary += " Block instruction diff budget exhausted; unresolved instruction summaries are omitted.";
     function_diff_summary_->SetLabel(summary);
     for (const auto &run : diff.runs) {
+        visible_instruction_runs_.push_back(run);
         const auto row = function_diff_runs_->InsertItem(function_diff_runs_->GetItemCount(),
                                                          function_diff_kind_text(run.kind));
-        function_diff_runs_->SetItem(row, 1, instruction_range(run.old_start, run.old_count));
-        function_diff_runs_->SetItem(row, 2, instruction_range(run.new_start, run.new_count));
+        function_diff_runs_->SetItem(row, 1, instruction_range(run.old_start, run.old_count, run.old_address));
+        function_diff_runs_->SetItem(row, 2, instruction_range(run.new_start, run.new_count, run.new_address));
         if (run.semantic.available) function_diff_runs_->SetItem(row, 0,
             function_diff_kind_text(run.kind) + wxString::Format(" (op %llu, flow %llu, operand %llu, effect %llu)",
                 static_cast<unsigned long long>(run.semantic.opcode_changes),
@@ -615,6 +790,11 @@ void CompareView::show_function_diff(std::size_t index) {
                            block.kind == compare::BlockMatchKind::added ? "Block added" :
                            block.kind == compare::BlockMatchKind::removed ? "Block removed" : "Block ambiguous";
         wxString block_label = kind;
+        if (block.instruction_evidence.available)
+            block_label += wxString::Format(" (instruction evidence %u%% old / %u%% new%s)",
+                static_cast<unsigned>(block.instruction_evidence.old_coverage_percent),
+                static_cast<unsigned>(block.instruction_evidence.new_coverage_percent),
+                block.instruction_evidence.complete ? ", complete" : ", partial");
         if (block.instruction_diff_available) {
             const auto &local = block.instruction_diff;
             block_label += wxString::Format(
@@ -639,6 +819,15 @@ void CompareView::show_function_diff(std::size_t index) {
         const auto row = function_diff_runs_->InsertItem(function_diff_runs_->GetItemCount(), "Block rows omitted");
         function_diff_runs_->SetItem(row, 1, from_utf8(std::to_string(block_rows.size() - count)));
     }
+    update_instruction_navigation();
+}
+void CompareView::update_instruction_navigation() {
+    if (!function_diff_old_ || !function_diff_new_ || !function_diff_runs_) return;
+    const auto selected = function_diff_runs_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+    const bool has_row = selected >= 0 && static_cast<std::size_t>(selected) < visible_instruction_runs_.size();
+    const auto *run = has_row ? &visible_instruction_runs_[static_cast<std::size_t>(selected)] : nullptr;
+    function_diff_old_->Enable(run && run->old_address && bool(navigate_old_instruction_));
+    function_diff_new_->Enable(run && run->new_address && bool(navigate_new_instruction_));
 }
 void CompareView::refresh_functions() {
     if (!functions_) return;
@@ -680,8 +869,27 @@ void CompareView::refresh_functions() {
                     body.new_space == match.new_space;
             }) != function_body_diffs_.end();
         functions_->SetItem(row, 9, has_body_diff ? "Available" : "Unavailable");
+        const auto &score = match.evidence.score_breakdown;
+        if (score.available) {
+            wxString text = wxString::Format("shape %u", score.shape_similarity);
+            if (score.instruction_available) text += wxString::Format(" insn %u", score.instruction_similarity);
+            if (score.histogram_available) text += wxString::Format(" hist %u", score.histogram_similarity);
+            if (score.cfg_available) text += wxString::Format(" CFG %u", score.cfg_similarity);
+            if (score.exact_name) text += score.name_floor_applied ? " name floor" : " exact name";
+            functions_->SetItem(row, 10, text);
+        } else functions_->SetItem(row, 10, "Unavailable");
+    const auto &calls = match.call_targets;
+    functions_->SetItem(row, 11, calls.available
+        ? wxString::Format("= %llu  + %llu  - %llu  ? %llu",
+            static_cast<unsigned long long>(calls.unchanged),
+            static_cast<unsigned long long>(calls.added),
+            static_cast<unsigned long long>(calls.removed),
+            static_cast<unsigned long long>(calls.ambiguous))
+        : wxString("Unavailable"));
     }
     if (function_diff_runs_) function_diff_runs_->DeleteAllItems();
+    visible_instruction_runs_.clear();
+    update_instruction_navigation();
     if (function_diff_summary_)
         function_diff_summary_->SetLabel("Select a matched function to inspect its instruction alignment.");
 }

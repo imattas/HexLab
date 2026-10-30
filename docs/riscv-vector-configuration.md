@@ -204,7 +204,18 @@ injection is bitwise and does not raise flags. Floating arithmetic, dynamic
 rounding, inexact/underflow/overflow/divide-by-zero flags, and wider or
 half-precision lanes remain outside the evaluator.
 
-Reductions, conversions, reciprocal and reciprocal-square-root estimates,
+The floating reduction evaluator also supports `vfredmin` and `vfredmax` for
+SEW 32 and 64. It starts from `vs1[0]`, folds active `vs2` lanes in increasing
+lane order, skips masked-off lanes, writes only `vd[0]`, and preserves the
+remaining destination lanes. The reduction uses the same minimumNumber and
+maximumNumber behavior as the elementwise min/max operations, including signed
+zero selection, canonical NaN for two NaN inputs, numeric selection for one NaN,
+and NV for signaling NaNs. Because vector reductions require `vstart=0`, the
+evaluator rejects nonzero `vstart` rather than returning a partial result. The
+unordered and ordered floating sum reductions and their rounding behavior
+remain unsupported.
+
+Conversions, reciprocal and reciprocal-square-root estimates,
 widening floating-point arithmetic, half-precision
 vector operations, and all other vector floating-point encodings remain
 unsupported. A recognized FP funct6 with a reserved operand class is invalid;
@@ -255,4 +266,10 @@ outside the model.
 
 ## Integer reduction subset
 
-The decoder recognizes unmasked integer `vredsum.vs`, `vredand.vs`, `vredor.vs`, `vredxor.vs`, `vredminu.vs`, `vredmin.vs`, `vredmaxu.vs`, and `vredmax.vs` in the OPMVV encoding class. `vm` must be one; `.vv` and scalar-seed interpretations are not accepted. The explicit operands are `vd, vs2, vs1`: `vs1[0]` is the seed and `vs2` supplies the reduction elements. The destination remains a vector register, since the operation writes element zero and has tail/prestart preservation dependencies. The instruction also reads `vl`, `vtype`, and `vstart`, and resets `vstart` through the common vector effect path. The bounded configuration evaluator supports SEW 8/16/32/64 and LMUL m1/2/4/8 and mf2/mf4/mf8; it rejects unsupported SEW/LMUL encodings. Decoder validation is encoding-class exact but cannot validate dynamic vtype or register-group alignment without configuration state. Masked reductions, widening reductions, and floating-point reductions remain unsupported.
+The decoder recognizes unmasked integer `vredsum.vs`, `vredand.vs`, `vredor.vs`, `vredxor.vs`, `vredminu.vs`, `vredmin.vs`, `vredmaxu.vs`, and `vredmax.vs` in the OPMVV encoding class. `vm` must be one; `.vv` and scalar-seed interpretations are not accepted. The explicit operands are `vd, vs2, vs1`: `vs1[0]` is the seed and `vs2` supplies the reduction elements. The destination remains a vector register, since the operation writes element zero and has tail/prestart preservation dependencies. The instruction also reads `vl`, `vtype`, and `vstart`, and resets `vstart` through the common vector effect path. The bounded configuration evaluator supports SEW 8/16/32/64 and LMUL m1/2/4/8 and mf2/mf4/mf8; it rejects unsupported SEW/LMUL encodings. Decoder validation is encoding-class exact but cannot validate dynamic vtype or register-group alignment without configuration state. Masked integer reductions, widening reductions, and floating-point reductions beyond the bounded base subset below remain unsupported.
+
+## Floating-point reduction subset
+
+The decoder supports the single-width FP reduction forms `vfredusum.vs`, `vfredosum.vs`, `vfredmin.vs`, and `vfredmax.vs` in OPFVV. All accept either value of `vm`; masked forms retain the `v0` predicate dependency. Operands are `vd, vs2, vs1`, where `vs1[0]` seeds the reduction and active `vs2` elements provide inputs. The destination is a vector register with old-destination/prestart/tail dependencies. `vl`, `vtype`, and `vstart` are tracked, as are accumulated `fflags`; sum reductions also depend on `frm`. Decompilation emits named typed intrinsics with these dependencies rather than evaluating floating-point reductions. Exact reduction values, exception behavior, widening reductions, and vector lengths outside the bounded configuration evaluator remain outside this implementation.
+
+The funct6 assignments and ordered/unordered behavior follow the [RISC-V Vector Extension, section 30.1.14.3](https://docs.riscv.org/reference/isa/unpriv/v-st-ext.html#vector-single-width-floating-point-reduction-instructions).

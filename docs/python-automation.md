@@ -6,6 +6,22 @@ CLI/native application. With no script, it opens an interactive Python console.
 `import hexlab` is available in this embedded interpreter. It is not installed
 into a system Python and does not shell out to the CLI.
 
+The runner accepts Python script, command, and module modes:
+
+```powershell
+hexlab_python analyze.py sample.hxproj --summary
+hexlab_python -c "import hexlab; print(hexlab.API_VERSION)"
+hexlab_python -m package.tool sample.hxproj
+hexlab_python --help
+```
+
+Script arguments are exposed through `sys.argv` after the script path. In
+`-c` mode, `sys.argv[0]` is `-c` and following arguments remain available; in
+`-m` mode, the module name and following arguments are preserved, with module
+execution delegated to Python's `runpy`. The current working directory is added
+to the import path for command and module mode, matching Python's usual local
+script workflow. With no arguments, the runner opens its interactive console.
+
 The native `hexlab::automation::Project` bridge always builds when its library is
 included. CPython discovery and linking occur only with
 `HEXLAB_ENABLE_PYTHON_AUTOMATION=ON` (default OFF). The eight existing engine DLLs
@@ -20,6 +36,17 @@ The [debug-information workbench](python-debug-information.md) adds read-only
 symbol/DWARF import previews, revision-pinned imports through the native workspace
 commands, and bounded inspection of persisted local/parameter locations and raw
 debug expressions.
+
+The `Project.function_signature_catalog()` and
+`Project.recognize_function_signatures()` methods expose bounded masked-byte
+catalog creation and recovered-entry recognition. Catalog creation takes an
+ordered list of 1..4096 recovered function IDs and returns the portable text
+catalog; recognition consumes that text and reports candidates and ambiguity
+without changing names. Both calls accept `expected_revision` and `cancel`, and
+raise `ProjectChangedDuringQuery` if the project changes while the operation is
+running. Prefix options default to 128 bytes and eight exact bytes, with the
+native hard cap of 256 bytes. Recognition uses the native signature-work limits
+and caps catalog input at 64 MiB.
 
 ## Build and test
 
@@ -77,6 +104,31 @@ with hexlab.Project.open("sample.hxproj", readonly=False) as project:
     summary = project.export_analysis_json("analysis.json", page_size=1024)
     print(summary["function_count"], summary["instruction_count"], summary["reference_count"])
 ```
+
+Create a reusable normalized fingerprint catalog from a selected function
+batch. The selection order is preserved, and the whole operation fails if any
+ID is duplicated, stale, or cannot be fingerprinted:
+
+```python
+from pathlib import Path
+
+metadata = project.snapshot()
+if metadata["function_count"] > 4096:
+    raise ValueError("select no more than 4096 functions")
+ids = [row["id"] for row in project.iter_functions(max_rows=4096)]
+catalog_text = project.function_fingerprint_catalog(
+    ids, "internal library release 4",
+    expected_revision=metadata["edit_revision"],
+)
+Path("library.fingerprint").write_text(catalog_text, encoding="utf-8")
+```
+
+The returned text uses the existing normalized fingerprint catalog v1 format.
+The API caps selections at 4096 IDs, validates per-function instruction/block
+and token-byte options, and raises `ProjectChangedDuringQuery` if the project
+changes during extraction. Supplying `expected_revision` also rejects an edit
+that happened before its snapshot was captured. The cancel argument accepts a
+`CancellationToken`.
 
 Named type graphs are editable through `TypeSpec`, a detached Python value DSL
 that maps to HexLab's validated native type model. Member offsets, aggregate
@@ -140,10 +192,28 @@ method to interrupt the native scan; cancellation raises `AnalysisCancelled` and
 does not return a partial page. `source_complete` distinguishes a completed scan
 from a complete decoded instruction source.
 
-For full effective-byte searches, `iter_search_bytes()` and
-`iter_search_text()` follow revision-bound cursors and yield matches without
-collecting the full result set. Both accept `page_size` (1..4096), optional
-`max_rows`, and `cancel`. A source edit between pages raises
+Each Python string record includes a `script_hint` alongside its encoding name.
+The hint classifies the retained UTF-8 preview (at most 256 Unicode scalars) into
+a coarse script family such as Latin, Cyrillic, Greek, Hebrew, Arabic, Thai, Han,
+Kana, Hangul, or Other. Multiple recognized families produce `Mixed`; text with
+no recognized letters, or malformed UTF-8, produces `unknown`. This is a display
+hint rather than language, locale, or source-encoding detection.
+
+Pass `start=FileOffset(offset)` to begin from an inclusive file offset or
+`start=Address(space, offset)` to begin from a mapped virtual address. Address
+starts require unique file-backed bytes; immediate searches also use the
+address to select among instructions sharing a file offset. The first page
+starts there without wrapping. Continuation cursors carry their own position;
+iterators apply `start` only to the first page.
+
+`search_text()` and `iter_search_text()` accept `case_sensitive=False` to fold
+ASCII `A`–`Z` while matching. Other encoded bytes remain exact; this does not
+perform Unicode case folding.
+
+For full searches, `iter_search_bytes()`, `iter_search_text()`, and
+`iter_search_immediate()` follow revision-bound cursors and yield matches
+without collecting the full result set. Each accepts `page_size` (1..4096),
+optional `max_rows`, and `cancel`. A source edit between pages raises
 `ProjectChangedDuringQuery`; reaching `max_rows` intentionally stops early.
 Keep the page methods when you need each `SearchPage`'s scan counters or
 completion metadata.
@@ -160,8 +230,35 @@ and comments are returned by `presentation(location)` and changed with
 `update_type()`, and `assign_type()`. These edits go through the normal validated
 project command path and persistent grouped history.
 
+`addresses_for_file_offset(offset)` returns every initialized virtual alias
+for a source file byte in stable address order. An empty list means the byte
+has no virtual backing. This makes aliased file bytes queryable without
+treating valid multiple mappings as an ambiguity error.
+
+For ELF inputs, `elf_dynamic_entries(start=0, count=256)` pages the loader's
+decoded dynamic-table entries. Each row carries its source section (when
+section-backed), table file offset and mapped address, entry index, signed tag,
+raw value, and optional decoded string value. `iter_elf_dynamic_entries()`
+streams multiple tables in loader order through bounded pages. Non-ELF images
+and ELF images without dynamic tables return an empty page. This is descriptive
+loader metadata: it does not resolve symbols or apply relocations. Use the
+loader-specific ELF metadata tools when full symbol or relocation records are
+needed.
+
+For PE images, `pe_imports(start=0, count=256)` and `pe_exports(start=0,
+count=256)` expose the bounded loader tables. Import rows preserve library,
+name or ordinal, thunk and IAT addresses, and whether the row is a delay import.
+Export rows retain ordinal, optional name, mapped address, and forwarder.
+Ordinal-only exports and forwarders remain distinct rows; an absent mapped
+address is returned as `None`. Non-PE images return empty pages. The
+`iter_pe_imports()` and `iter_pe_exports()` helpers page through the tables
+without accumulating native query results in a single call.
+
 `references(location)` returns outgoing code and data xrefs;
 `incoming_references()` and `all_references()` provide reverse and global pages.
+`outgoing_references_range(address, size)` pages source xrefs for a nonempty
+half-open virtual-address range; its iterator pins all pages to one workspace
+capture and supports cancellation.
 Rows retain typed address or file-offset endpoints, reference kind, and external
 or unresolved target provenance. Like function and instruction enumeration,
 xref queries require fresh or incomplete current derived analysis; call
@@ -172,7 +269,8 @@ retain their existing cancellation paths.
 For scripts that need a complete table walk, `iter_functions()`,
 `iter_instructions()`, `iter_segments()`, `iter_strings()`, `iter_annotations()`,
 `iter_types()`, `iter_type_assignments()`, `iter_references(location)`,
-`iter_incoming_references(location)`, and `iter_all_references()` yield rows page by page instead of retaining the whole
+`iter_incoming_references(location)`, `iter_outgoing_references_range(address, size)`,
+and `iter_all_references()` yield rows page by page instead of retaining the whole
 table in memory. Each accepts `page_size` from 1 through 4096 (default 256).
 They use the same native page queries and stale-analysis checks as the explicit
 page methods. General workspace iterators now capture one immutable workspace
@@ -235,6 +333,26 @@ on the live source before taking a new capture. Archive symbol metadata belongs
 to its separate read-only archive owner; member byte reads are not a workspace
 capture and do not promise isolation from external changes to that archive file.
 
+`Project.audit_history(after_step=0, max_steps=256,
+max_delta_bytes=16*1024*1024, expected_revision=None, cancel=None)` verifies one
+bounded durable-history page without changing the project. It returns a
+`HistoryAuditPage` with the verified row count, delta bytes, source revisions,
+and `next_after_step`/`has_more` continuation state. Audit checks database-defined
+metadata, payload extents, and inverse pairing; it does not prove that the
+external input file is intact or recover arbitrary corrupt history. Like other
+durable history queries, this requires the live owner and is unsupported on a
+workspace capture.
+
+`iter_history_audit(page_steps=256, page_bytes=16*1024*1024,
+max_pages=4096, total_bytes=512*1024*1024, ...)` yields pages while pinning the
+first page's edit revision. Cancellation uses the normal history cancellation
+token path. Page limits are at most 4096 entries/128 MiB; the iterator's total
+byte budget is an aggregate cap across returned pages. If the iterator stops
+with `has_more`, resume from that page's `next_after_step` and
+`source_revisions['edit']`. A budget smaller than the next stored delta can
+produce a native resource-limit error; raise the budget and retry from the same
+cursor.
+
 `read(location, count, cancel=None)` retains its one-MiB per-call bound. Native
 reads release the GIL and check the token before and after the storage operation;
 the underlying bounded storage read is not interrupted midway. Use a capture
@@ -260,18 +378,44 @@ Cancellation is checked between block, instruction, and xref pages. The walk
 uses one captured workspace, so a source edit or reanalysis cannot mix generations.
 The method requires current analysis and never modifies project history.
 
+Native consumers use the corresponding
+`automation::Project::call_graph(Address, GraphOptions, stop_token)` operation.
+It returns the shared `GraphModel` type with graph nodes, call/reference edges,
+omission counts, and a completeness flag; `GraphOptions::call_depth`,
+`node_budget`, and `edge_budget` bound the neighborhood. It resolves the
+selected function from the supplied address and rejects shared-tail ambiguity
+so callers can use `function_owners()` to choose an exact function entry. The
+same core graph builder powers the CLI and desktop graph views.
+
+Python also exposes that native graph model directly as
+`call_graph_model(address, call_depth=1, node_budget=1000,
+edge_budget=10000, cancel=None)`. It returns the native graph JSON schema as a
+detached dictionary (including typed node and edge records, `complete`, and
+omission counts). The depth range is 1..4, node budget 1..1,000,000, and edge
+budget 1..4,000,000. Cancellation is passed into both native graph collection
+and serialization. Use this API when the shared native `GraphModel` semantics
+are needed; the existing Python `call_graph()` remains an instruction-bounded
+reachable-call report with its own result shape and limits.
+
 ```python
 entry = hexlab.Address(0, 0x401000)
 graph = project.call_graph(entry, max_functions=256, max_edges=4096)
 print(graph["complete"], len(graph["nodes"]), len(graph["edges"]))
 for edge in graph["edges"]:
     print(edge["caller"], edge["source"], edge["target_function"] or edge["target"])
+
+token = hexlab.CancellationToken()
+model = project.call_graph_model(entry, call_depth=2, node_budget=512,
+                                 edge_budget=4096, cancel=token)
+print(model["complete"], model["omitted_nodes"], model["omitted_edges"])
 ```
 
-`export_analysis_json(path, page_size=4096, cancel=None, progress=None)` is the
+`export_analysis_json(path, page_size=4096, cancel=None, progress=None,
+include_cfg=False)` is the
 headless batch workflow: refresh current analysis, enumerate functions,
 instructions, mapped segments, references, and strings, then publish one UTF-8
-JSON report. The schema is versioned by `schema_version: 1` and `api_version: 1`;
+JSON report. The default schema is versioned by `schema_version: 1` and
+`api_version: 1`;
 the ordered top-level tables are stable, row-object keys are serialized in sorted
 order, instruction bytes use lowercase hexadecimal in `bytes_hex`, and virtual
 addresses/file offsets retain explicit typed objects. References include
@@ -291,7 +435,13 @@ and the runner releases the GIL while native analysis runs so another Python
 thread can call `token.cancel()`. Cancellation raises `hexlab.AnalysisCancelled`.
 `progress(stage, completed, total)` receives
 `analysis`, `functions`, `instructions`, `segments`, `references`, and `strings`
-stage updates; callback exceptions propagate and prevent publication. The exporter
+stage updates; callback exceptions propagate and prevent publication. Setting
+`include_cfg=True` opts into schema version 2, which preserves every version-1
+table and appends `blocks` and `block_successors`. Each block includes its owning
+`function_entry`; each edge includes its `block_id` and owning `function_entry`.
+Block IDs are meaningful only within the captured analysis and are not stable
+across reanalysis. CFG rows are streamed through bounded pages and report
+progress under the `blocks` and `block_successors` stage names. The exporter
 checks edit, byte, and decision revisions around page reads and before publication;
 an edit during collection raises `ProjectChangedDuringExport` and discards the
 temporary report. Cancellation from a plain predicate is cooperative between native
@@ -347,20 +497,26 @@ Methods:
 | `iter_functions(page_size=256)`, `iter_instructions(page_size=256)` | Stream complete function/instruction tables a bounded page at a time |
 | `call_graph(address, max_functions=1024, max_edges=16384, max_instructions=1000000, cancel=None)` | Bounded reachable direct-call graph from one captured workspace, with external edges, unresolved-call accounting and cancellation |
 | `iter_segments(page_size=256)`, `iter_strings(page_size=256)`, `iter_all_references(page_size=256)` | Stream mapped segments, scanned strings, or all indexed references a bounded page at a time |
+| `addresses_for_file_offset(offset)` | Resolve every initialized virtual alias of one source byte; unmapped offsets return an empty list |
+| `pe_imports(start=0, count=256)`, `iter_pe_imports(page_size=256)` | Read PE import names/ordinals, thunk/IAT addresses, and delay-load status; non-PE projects return no rows |
+| `pe_exports(start=0, count=256)`, `iter_pe_exports(page_size=256)` | Read PE export ordinals, optional mapped names/addresses, and forwarders; non-PE projects return no rows |
+| `elf_dynamic_entries(start=0, count=256)`, `iter_elf_dynamic_entries(page_size=256)` | Read ELF dynamic-table entries and optional decoded string values; non-ELF projects return no rows |
 | `references(location, start=0, count=256)` | Outgoing source/kind and typed location, external or unresolved target; includes numeric `kind` and stable textual `kind_name`; max4096 rows |
 | `incoming_references(location, start=0, count=256)` | Bounded references targeting a typed address or file offset, with total count and next offset for paging; max4096 rows |
+| `incoming_references_range(address, size, start=0, count=256)`, `iter_incoming_references_range(address, size, page_size=256, max_rows=None, cancel=None)` | Bounded virtual target-range xrefs and snapshot-pinned streaming; matches target/association addresses inside a nonempty half-open range |
+| `outgoing_references_range(address, size, start=0, count=256)`, `iter_outgoing_references_range(address, size, page_size=256, max_rows=None, cancel=None)` | Bounded virtual source-range xrefs and snapshot-pinned streaming; includes all reference kinds in source-address order |
 | `all_references(start=0, count=256)` | Page every current reference-index row, including non-instruction sources; max4096 rows |
-| `search_bytes(pattern, cursor=None, max_results=256, cancel=None)` | Paged masked search over effective bytes; two-character octets accept hex digits or `?` in each nibble, such as `A?`, `?F`, or `??`; a cancellation token interrupts the native scan |
-| `search_text(text, encoding="utf8", cursor=None, max_results=256, cancel=None)` | Paged ASCII, UTF-8, UTF-16LE/BE, or UTF-32LE/BE search over effective bytes; supports cancellation |
-| `iter_search_bytes(pattern, page_size=256, max_rows=None, cancel=None)`, `iter_search_text(text, encoding="utf8", page_size=256, max_rows=None, cancel=None)` | Yield full effective-byte/text search matches across revision-bound pages; bounded and cancellable |
-| `search_immediate(value, width=64, signed=False, cursor=None, max_results=256, cancel=None)` | Paged immediate-operand search over current decoded facts; supports cancellation |
+| `search_bytes(pattern, cursor=None, max_results=256, cancel=None, start=None)` | Paged masked search over effective bytes; optional `start` is a `FileOffset` or mapped `Address`; supports cancellation |
+| `search_text(text, encoding="utf8", case_sensitive=True, cursor=None, max_results=256, cancel=None, start=None)` | Paged encoded-text search over effective bytes; optional ASCII-only case folding and typed start location |
+| `iter_search_bytes(pattern, page_size=256, max_rows=None, cancel=None, start=None)`, `iter_search_text(text, encoding="utf8", case_sensitive=True, page_size=256, max_rows=None, cancel=None, start=None)`, `iter_search_immediate(value, width=64, signed=False, page_size=256, max_rows=None, cancel=None, start=None)` | Yield byte/text/immediate matches across revision-bound pages; apply start only to the first page |
+| `search_immediate(value, width=64, signed=False, cursor=None, max_results=256, cancel=None, start=None)` | Paged immediate-operand search over current decoded facts; optional mapped address start disambiguates aliases |
 | `rename`, `comment`, `bookmark`, `patch` | Validated normal commands; optional `group=0`; patch max1MiB and optional `expected_revision` compare against the snapshot's edit revision |
 | `define_code`, `define_data`, `define_function`, `suppress_function` | Normal decision validation; instruction boundaries enforced |
 | `set_function_chunks(entry, [(Address,size), ...])` | Explicit chunk command, max4096 ranges |
 | `set_reference(source, target, kind="data", remove=False)` | Normal user reference command; kinds code/data/call/jump/read/write/address |
 | `TypeSpec.*(...)`, `define_type(name, spec)`, `update_type(id, name, spec)`, `assign_type(address, id, remove=False)` | Build validated recursive types, persist/edit definitions and assign them at mapped addresses |
 | `Archive.open(path)`, `archive.summary`, `archive.members(...)`, `archive.symbols(...)`, `archive.read_member(index, offset, count)` | Read-only archive metadata and bounded regular-member data; Python also provides page and byte iterators |
-| `undo()`, `redo()`, `analyze()` | Existing history/reanalysis semantics; mutations return detached snapshot metadata |
+| `undo()`, `redo()`, `analyze(...)` | Existing history/reanalysis semantics; analyze accepts bounded budgets, a progress callback, and cancellation; mutations return detached snapshot metadata |
 | `save()` | Checkpoint current project; each successful command is already durable |
 | `save_as(path)` | Write an independent copy; keep this object bound to its original project |
 | `export_binary(path)` | Original input layout plus canonical patches; refuse existing/protected destinations |
@@ -383,6 +539,31 @@ for loader-linked, far, external and unresolved control targets. No runtime
 register/segment state is fabricated. Reference kind and execution mode values
 are native enum ordinals and are not string guesses.
 
+`Project.analyze(...)` accepts optional `instruction_budget` (max 50,000,000),
+`function_budget` (1,000,000), `block_budget` (10,000,000),
+`membership_budget` (100,000,000), `string_budget` (10,000,000),
+`string_scan_work_budget` (500,000,000), and `min_string_characters` (64).
+Each supplied value must be a positive integer within its documented cap;
+omitted values preserve the current configuration. `progress(stage, completed,
+total)` receives bounded native function-recovery updates with stages
+`instruction-discovery` and `complete`. The callback runs while the native
+analysis has released the GIL, so other Python threads can request cancellation.
+Return `False` to stop and raise `hexlab.AnalysisCancelled`; return `None` or
+another truthy value to continue. If the callback raises, its original exception
+propagates and analysis stops. Progress callbacks are call-scoped and are not
+retained by the project after `analyze` returns. This brings configurable
+function-recovery budgets and progress reporting to Python; custom semantic
+decoder injection remains a native C++ API capability.
+
+```python
+def report(stage, completed, total):
+    print(stage, completed, "/", total)
+    return True
+
+project.analyze(instruction_budget=2_000_000, function_budget=200_000,
+                progress=report)
+```
+
 `incoming_references(target)` exposes the reverse-reference index directly, so
 scripts can answer â€œwhat calls or accesses this location?â€ without scanning each
 instruction and querying its outgoing edges. It returns a `ReferencePage` with
@@ -390,6 +571,27 @@ instruction and querying its outgoing edges. It returns a `ReferencePage` with
 `incoming_references(target, start=page.next)` until `next is None`. Results
 retain the native reference kind and source location. The query requires current
 derived analysis and rejects stale projects.
+
+`incoming_references_range(address, size)` and
+`iter_incoming_references_range(address, size)` extend the same query to a
+half-open virtual-address range. They match references whose numeric target or
+resolved association falls within `[address, address + size)`, including
+references to interior bytes of a data object. A row matching both indexes is
+returned once, in stable reference-index order. The page API returns the same
+`ReferencePage` shape; the iterator pins all pages to one captured generation
+and supports bounded page size, an optional row cap, and cancellation. The
+range must be nonempty and must not overflow the address space. This mirrors the
+native incoming-range query; file-offset and mapped-file range variants are
+not exposed by the Python automation API.
+
+`outgoing_references_range(address, size)` and
+`iter_outgoing_references_range(address, size)` query sources in that same
+half-open virtual range. They preserve reference kind and typed targets,
+including external and unresolved records, and page in source-address order.
+The iterator keeps one immutable project capture for its lifetime. The native
+automation API exposes the same operation as
+`Project::outgoing_references_range(Address, size, start, count)`; the query
+requires current derived analysis and rejects empty or overflowing ranges.
 
 ## Function graph inspection
 
@@ -516,6 +718,16 @@ Every event must be explicitly acknowledged with `continue_event(sequence)` or
 `single_step(sequence)` before waiting for another. Use `interrupt()` to request
 a stop while the process runs. `connect_remote(host, port)` selects GDB Remote
 Serial Protocol, and the context manager detaches an active target on close.
+For a connected extended-remote session, `launch(executable, arguments,
+working_directory=..., environment=...)` can start a new remote inferior.
+`environment` is an ordered sequence of `(name, value)` changes; use `None` to
+unset a target variable and `""` to set it to an empty value. It is bounded to
+256 unique changes, 64 KiB total UTF-8 name/value data, 4096 bytes per name,
+and 16 KiB per value. Native launch rejects nonempty environment changes.
+Feature advertisement, packet-size, reset, working-directory, and acknowledged
+exit requirements remain enforced by the GDB RSP client. The CLI currently has
+no interactive GDB RSP client surface.
+
 For a server that negotiated multiprocess extended-remote, use `processes()`
 to list inferiors, `attach_remote_process(pid)` to select a different listed
 inferior, and `detach_remote_process(pid)` to detach a secondary inferior while
@@ -548,6 +760,17 @@ must not own or block on the session. It creates `DebuggerSession` on a private
 worker thread, pumps stop events there, and returns detached event dictionaries
 through `get_event(timeout=...)`. Operations are submitted by name and return a
 `DebuggerJob`; call `job.result(timeout)` to retrieve the result or exception.
+`iter_events(poll_interval=0.1, max_events=None, cancel=None)` yields detached
+events as they arrive, stops when the worker exits or the optional event cap is
+reached, and checks its cancellation token between bounded queue waits. The
+poll interval is limited to 10 ms..10 s; cancellation does not discard events
+already removed from the queue. `debugger.status` returns a detached
+`DebuggerWorkerStatus` snapshot with `ready`, `closing`, `stopped`, and `failed`
+lifecycle flags; failure type; active job ID; queued job/input/event counts;
+and the pending stop sequence. It is safe to inspect from a controller thread
+and never calls into the debug backend. Counters are point-in-time observations
+and can change immediately, so use them for orchestration and diagnostics rather
+than capacity reservations.
 For example:
 
 ```python
@@ -555,6 +778,7 @@ with hexlab.DebuggerWorker() as debugger:
     process = debugger.submit("launch", "./sample", ["--version"]).result(10)
     event = debugger.get_event(timeout=10)
     print(process["architecture"], event["sequence"], event["kind"])
+    print(debugger.status)
     debugger.submit("continue_event", event["sequence"]).result(5)
 ```
 
@@ -684,17 +908,21 @@ The console does not attach to unsaved, in-memory binary imports.
 
 Python execution runs away from the wx event thread. The **Cancel** button
 raises `KeyboardInterrupt` at Python trace points and requests the active
-command's native cancellation token. Calls to `project.analyze()` and
-`project.export_analysis_json()` use that token by default; cancellable
+command's native cancellation token. Calls to `project.analyze()`,
+`project.export_analysis_json()`, `project.save()`, `project.save_as()`, and
+`project.export_binary()` use that token by default. The checkpoint, copy, and
+binary-export bindings release the GIL around native work, allowing other
+Python threads to run while SQLite or the image writer is busy. Headless
+scripts can also pass `cancel=hexlab.CancellationToken()` explicitly. A
+requested native cancellation raises `hexlab.AnalysisCancelled`. Cancellable
 `DebuggerSession.wait_event()` calls poll in slices of at most 50 ms. A script
 can retain an old token safely, but it only controls the command that created
 it. Closing the frame requests both forms of cancellation and joins the worker
 before releasing the project handle.
 
 Cancellation is cooperative. Python code that does not reach trace points,
-blocking native or filesystem operations other than analysis and debugger
-event waits, and Python finalizers may delay cancellation or shutdown until they
-return. Each input is limited to 1 MiB, pending commands to 32, captured output
+non-cancellable native or filesystem operations, and Python finalizers may
+delay cancellation or shutdown until they return. Each input is limited to 1 MiB, pending commands to 32, captured output
 to 256 KiB per command, and visible history to 256 Ki characters. Python
 remains trusted code with the process's normal filesystem and operating-system
 permissions; output and command limits are resource bounds, not a security
@@ -707,7 +935,13 @@ for a non-daemon thread that never exits.
 
 Scripts can apply up to 4096 names, comments, and bookmark edits through one `ProjectSession` batch. The native layer validates each command against the preceding projected state and commits the combined delta as one durable history step; a failure leaves the project unchanged. Pass the edit revision captured while building a manifest so stale work fails with a conflict before commit. `apply_annotations(rows, group=..., expected_revision=..., merge="replace")` accepts dictionaries containing `location` and any of `name`, `comment`, or `bookmark`; `bookmark=None` removes the existing bookmark. Names require virtual addresses, while comments and bookmarks may use virtual addresses or file offsets. `merge="preserve"` fills only empty names/comments and absent bookmarks using a complete snapshot, with a 4096-row ceiling; it leaves a populated value intact, skips clear/removal requests, preserves names already used at another address in the same space, and creates no history step if nothing changes. The batch's combined text is capped at 16 MiB.
 
-`libs/automation/examples/import_annotations.py` imports a JSON array with bounded manifest size and row count. Before opening the project for editing, it reports all conflicting repeated assignments to the same name, comment, or bookmark at one location, with both manifest row indices. Repeated non-empty names assigned to different virtual addresses in one address space are reported the same way. Any manifest conflict aborts before a project is opened, so the manifest cannot silently overwrite its own earlier values. `--merge replace` (the default) applies manifest values over existing project fields, subject to native batch validation. `--merge preserve` fills only empty name/comment fields and absent bookmarks, and skips attempted replacements/removals while reporting how many fields it skipped. It also preserves a name already used elsewhere in the same address space. Preserve mode uses the bounded project snapshot; it refuses projects with more than 4096 existing annotations or bookmarks rather than making decisions from truncated data. Example:
+`libs/automation/examples/import_annotations.py` imports the versioned JSON envelope, legacy JSON array, or bounded CSV manifest. Before opening the project for editing, it reports all conflicting repeated assignments to the same name, comment, or bookmark at one location, with both manifest row indices. Repeated non-empty names assigned to different virtual addresses in one address space are reported the same way. Any manifest conflict aborts before a project is opened, so the manifest cannot silently overwrite its own earlier values. `--merge replace` (the default) applies manifest values over existing project fields, subject to native batch validation. `--merge preserve` fills only empty name/comment fields and absent bookmarks, and skips attempted replacements/removals while reporting how many fields it skipped. It also preserves a name already used elsewhere in the same address space. Preserve mode uses the bounded project snapshot; it refuses projects with more than 4096 existing annotations or bookmarks rather than making decisions from truncated data. The same helper exports that snapshot as CSV with `--export`, for example:
+
+```text
+hexlab_python import_annotations.py project.hxproj labels.csv --export
+```
+
+`Project.export_annotations_csv(path)` combines annotations and bookmarks at each location into `location_kind,space,offset,name,comment,bookmark` columns. It writes UTF-8 with hexadecimal offsets and atomically creates the destination only if it does not already exist. The exporter pins a complete snapshot, checks the source edit revision again before publishing, and follows the same 4096-row and 16 MiB bounds as JSON export. Example:
 
 ```json
 [
@@ -718,11 +952,61 @@ Scripts can apply up to 4096 names, comments, and bookmark edits through one `Pr
 
 Run it with `hexlab_python import_annotations.py project.hxproj annotations.json --merge preserve` to fill gaps without replacing existing notes. The helper pins the filtered import to the project's current edit revision and saves after a successful one-step import. Invalid commands and replace-mode conflicts are rejected by native batch validation; the batch remains atomic and makes no partial edits. A preserve import with no fields to add exits without creating a history step.
 
+CSV may be selected explicitly with `--format csv` or inferred from a `.csv`
+suffix. Its header requires `location_kind,offset`, accepts optional `space`,
+and accepts any subset of `name,comment,bookmark`; unknown or duplicate columns
+are rejected. A data row uses `location_kind=va` with a `space`, or
+`location_kind=file` with `space` blank. Offsets and spaces accept decimal or
+base-prefixed unsigned 64-bit integers. Empty annotation cells are omitted, so
+CSV imports cannot clear names/comments or remove bookmarks; omit a column to
+leave that field untouched. CSV is strict UTF-8 (an optional BOM is accepted),
+bounded to 16 MiB and 4096 rows, and feeds the same duplicate-conflict checks,
+revision-pinned native validation, and one-step atomic commit as JSON.
+
 For mixed project commands, use `Project.apply_batch()` to combine annotations,
 patches, code/data definitions, function/chunk decisions, user references,
 type assignments/type updates, and saved breakpoints in one revision-pinned
 operation. Its operation tuples, resource limits, and cancellation behavior are
 documented in [python-automation-batches.md](python-automation-batches.md).
+
+## Project recovery discovery
+
+`Project.inspect_recovery_directory(directory, cancel=None)` performs the
+same read-only, bounded validation used by the project recovery CLI. It returns
+`candidates` for complete HexLab `.hexlab-save-*.tmp` and
+`.hexlab-previous-*.tmp` artifacts whose project data and retained history
+pass validation, plus `issues` with bounded filename/reason diagnostics for
+matching artifacts that were rejected. Scan counts include `visited_entries`,
+`matching_names`, `rejected_entries`, and `omitted_issues`. Each candidate has
+its path, UUID, kind, and edit/byte/decision revisions captured at discovery.
+The result includes `complete` and `omitted_candidates`; if either the
+8,192-entry or 256-name cap is reached, the returned prefix is explicitly
+incomplete. The stricter `discover_recovery_candidates()` call fails with a
+resource-limit error instead of silently returning a prefix.
+Restore one displayed candidate as a separate project with
+`Project.restore_recovery_artifact(artifact, output, replace=False, cancel=None)`.
+The operation rescans the containing directory, refuses an incomplete scan,
+revalidates the selected file's exact identity and history before publication,
+and returns the output path and fresh project UUID. The recovery source remains
+unchanged. `replace=True` opts into the database layer's checked replacement
+path. The scan and restore do not repair arbitrary damaged databases.
+
+`share/hexlab/examples/python/restore_recovery.py` lists candidates and restores
+the one selected with `--index`:
+
+```powershell
+hexlab_python share/hexlab/examples/python/restore_recovery.py .\projects .\recovered.hxproj --index 0
+```
+
+The example refuses an incomplete scan. It prints candidate kinds, UUIDs and
+revision triples before restoring; rerun it with the desired index to select a
+different artifact. Cancellation raises `AnalysisCancelled` when requested
+during discovery or publication.
+
+Scans examine at most 8,192 directory entries and 256 matching names, retain
+at most 64 diagnostics, and verify retained history within a shared budget of
+65,536 steps and 512 MiB. Cancellation raises `AnalysisCancelled` when the
+provided token is requested during scanning.
 
 ## Project backups
 
@@ -743,3 +1027,12 @@ owner for the target first, call
 `Project.restore_backup_in_place(backup, target, api_version=API_VERSION)`, then
 reopen the target so its workspace snapshot reflects the restored database.
 Restore preserves the backup project UUID and history.
+
+For projects with an external source file, `archive_external_source(path,
+max_bytes=256*1024*1024, cancel=None)` creates a bounded source archive.
+`verify_source_archive(path, max_bytes=1024*1024*1024, cancel=None)` checks the
+archive against this project's UUID and input identity. Its result reports the
+archive path, UUID, input size, and verified byte count.
+`restore_source_archive(archive, output, max_bytes=..., cancel=None)` writes
+the verified input to a new path without changing project provenance. These
+methods accept cancellation tokens; configurable work is capped at 1 GiB.

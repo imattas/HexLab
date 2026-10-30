@@ -24,6 +24,17 @@ and implicit-pointer operations are not imported or evaluated. The symbol
 evaluator supports `DW_OP_entry_value` when callers supply separate entry-state
 register and memory readers, but this desktop table does not currently supply
 those readers, so locations requiring entry-state data remain unavailable here.
+The evaluator also decodes and handles `DW_OP_form_tls_address`. On Linux
+AArch64, the desktop passes the selected stopped thread's `NT_ARM_TLS`
+`TPIDR_EL0` snapshot as the TLS base and applies the DWARF offset at the target
+address width. If the backend or kernel does not provide that register, or on
+other architectures, the resolver stays absent and affected TLS locations
+remain explicitly unavailable. The desktop does not infer a TLS base from
+module layout or another thread's state.
+`DW_OP_implicit_value` blocks up to eight bytes are displayed as scalar values
+using the image's target byte order. Larger blocks are decoded within a 64 KiB
+input cap but remain unavailable because the current scalar location result
+cannot preserve arbitrary byte sequences.
 DWARF 5 defines comparison and branch behavior in section 2.5.1.5:
 [DWARF v5 standard](https://dwarfstd.org/doc/DWARF5.pdf).
 

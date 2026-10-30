@@ -11,9 +11,13 @@
 #include <wx/textdlg.h>
 #include <wx/dialog.h>
 #include <wx/stattext.h>
+#include <wx/config.h>
+#include <wx/clipbrd.h>
+#include <wx/dataobj.h>
 #include <algorithm>
 #include <array>
 #include <string_view>
+#include <utility>
 #include <map>
 #include <charconv>
 #include <sstream>
@@ -35,9 +39,71 @@
 
 namespace hexlab::desktop {
 namespace {
+constexpr long maximum_persisted_filter_characters = 2048;
+constexpr std::size_t maximum_persisted_project_filters = 32;
+constexpr std::size_t maximum_persisted_project_order_characters =
+    maximum_persisted_project_filters * 33 - 1;
+std::string project_filter_key(const database::ProjectUuid &uuid) {
+    constexpr char digits[] = "0123456789abcdef";
+    std::string key;
+    key.reserve(uuid.size() * 2);
+    for (const auto byte : uuid) {
+        const auto value = std::to_integer<unsigned char>(byte);
+        key.push_back(digits[value >> 4]);
+        key.push_back(digits[value & 0x0f]);
+    }
+    return key;
+}
+
+std::vector<std::string> parse_project_filter_order(std::string_view raw) {
+    std::vector<std::string> result;
+    std::size_t at = 0;
+    while (at < raw.size() && result.size() < maximum_persisted_project_filters) {
+        const auto end = raw.find(';', at);
+        const auto token = raw.substr(at, end == std::string_view::npos ? raw.size() - at : end - at);
+        if (token.size() == 32 && std::all_of(token.begin(), token.end(), [](unsigned char ch) {
+                return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+            }))
+            result.emplace_back(token);
+        if (end == std::string_view::npos) break;
+        at = end + 1;
+    }
+    return result;
+}
+
 std::string utf8(const wxString &value) {
     auto encoded = value.utf8_str();
     return {encoded.data(), encoded.length()};
+}
+
+std::string escape_tsv_field(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    constexpr char hex[] = "0123456789ABCDEF";
+    for (const unsigned char byte : value) {
+        switch (byte) {
+        case '\\': escaped += "\\\\"; break;
+        case '\t': escaped += "\\t"; break;
+        case '\r': escaped += "\\r"; break;
+        case '\n': escaped += "\\n"; break;
+        default:
+            if (byte < 0x20 || byte == 0x7f) {
+                escaped += "\\x";
+                escaped.push_back(hex[byte >> 4]);
+                escaped.push_back(hex[byte & 0x0f]);
+            } else {
+                escaped.push_back(static_cast<char>(byte));
+            }
+            break;
+        }
+    }
+    return escaped;
+}
+
+std::string hex_number(std::uint64_t value) {
+    std::ostringstream output;
+    output << "0x" << std::hex << value;
+    return output.str();
 }
 
 std::string pdb_declaration_kind(types::PdbAggregateDeclarationKind kind) {
@@ -133,24 +199,44 @@ Result<types::LibrarySourceIdentity> portable_source_identity(const ProjectSnaps
     return types::LibrarySourceIdentity{project.state->input.size, project.state->input.sha256, hash.digest()};
 }
 
-Result<bool> validate_portable_type_references(const types::LibraryBundle &bundle,
-                                              const database::UserState &destination,
-                                              bool validate_assignments) {
-    std::set<std::string, std::less<>> available;
-    for (const auto &row : destination.types) available.insert(row.name);
-    for (const auto &entry : bundle.entries) available.insert(entry.name);
-    // Keep the desktop import path on the same graph walker as the CLI. This
-    // includes less common nested edges such as virtual-base vbptr types and
-    // applies both node and edge budgets before the command is constructed.
-    auto graph = types::validate_library_references(bundle, available, 262144);
-    if (!graph) return graph.error();
-    // Assignments are ignored when the input/recipe identity differs. In that
-    // case definitions remain importable even if an old assignment names a
-    // type absent from the destination.
-    if (validate_assignments) for (const auto &assignment : bundle.assignments)
-        if (assignment.type_name.empty() || !available.contains(assignment.type_name))
-            return Error{ErrorCode::malformed, "Type assignment refers to missing definition " + assignment.type_name};
-    return true;
+Result<Sha256Digest> hash_original_range(const ByteStorage &storage, FileOffset offset, std::uint64_t size) {
+    if (offset.value > storage.size() || size > storage.size() - offset.value)
+        return Error{ErrorCode::invalid_argument, "Type assignment byte range is outside the source input"};
+    Sha256 hash;
+    for (std::uint64_t done = 0; done < size;) {
+        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(64u * 1024u, size - done));
+        auto bytes = storage.read_at(FileOffset{offset.value + done}, count);
+        if (!bytes) return bytes.error();
+        if (bytes.value().bytes.size() != count)
+            return Error{ErrorCode::io, "Type assignment source range read was incomplete"};
+        auto updated = hash.update(bytes.value().bytes);
+        if (!updated) return updated.error();
+        done += count;
+    }
+    return hash.digest();
+}
+
+Result<std::optional<types::LibraryAssignment::SourceBytes>> assignment_source_bytes(
+    const ProjectSnapshot &project, Location location, const types::Type &type,
+    std::uint64_t &remaining_budget) {
+    const auto *file = std::get_if<FileOffset>(&location);
+    if (!file || !type.size() || !*type.size() || *type.size() > remaining_budget || !project.original)
+        return std::optional<types::LibraryAssignment::SourceBytes>{};
+    if (file->value > project.original->size() || *type.size() > project.original->size() - file->value)
+        return std::optional<types::LibraryAssignment::SourceBytes>{};
+    auto digest = hash_original_range(*project.original, *file, *type.size());
+    if (!digest) return digest.error();
+    remaining_budget -= *type.size();
+    return std::optional<types::LibraryAssignment::SourceBytes>{{*type.size(), digest.value()}};
+}
+
+Result<bool> assignment_source_bytes_match(const ProjectSnapshot &project, FileOffset file,
+                                           const types::LibraryAssignment::SourceBytes &witness) {
+    if (!project.original || file.value > project.original->size() ||
+        witness.size > project.original->size() - file.value) return false;
+    auto digest = hash_original_range(*project.original, file, witness.size);
+    if (!digest) return digest.error();
+    return digest.value() == witness.sha256;
 }
 }
 
@@ -169,6 +255,7 @@ void TypeSymbolsView::portable_type_library() {
         auto identity = portable_source_identity(*project_);
         if (!identity) { wxMessageBox(wxString::FromUTF8(identity.error().message), "Type Library", wxOK | wxICON_ERROR, this); return; }
         bundle.source_identity = identity.value();
+        bundle.file_offset_identity = types::LibraryBinaryIdentity{identity.value().input_size, identity.value().input_sha256};
         for (const auto &row : project_->state->user->types) {
             std::optional<types::LibraryTypeOrigin> origin;
             if (row.origin) origin = types::LibraryTypeOrigin{row.origin->source_id, row.origin->section,
@@ -176,11 +263,14 @@ void TypeSymbolsView::portable_type_library() {
             bundle.entries.push_back({row.name, row.type, std::move(origin),
                 static_cast<types::LibraryDeclarationKind>(row.declaration_kind)});
         }
+        std::uint64_t witness_budget = 64u * 1024u * 1024u;
         for (const auto &assignment : project_->state->user->type_assignments) {
             const auto found = std::find_if(project_->state->user->types.begin(), project_->state->user->types.end(),
                 [&](const auto &row) { return row.id == assignment.type_id; });
             if (found == project_->state->user->types.end()) { wxMessageBox("An assignment refers to a missing type definition.", "Type Library", wxOK | wxICON_ERROR, this); return; }
-            bundle.assignments.push_back({assignment.location, found->name});
+            auto source_bytes = assignment_source_bytes(*project_, assignment.location, *found->type, witness_budget);
+            if (!source_bytes) { wxMessageBox(wxString::FromUTF8(source_bytes.error().message), "Type Library", wxOK | wxICON_ERROR, this); return; }
+            bundle.assignments.push_back({assignment.location, found->name, std::move(source_bytes.value())});
         }
         auto bytes = types::encode_library_bundle(bundle, portable_type_library_limit);
         if (!bytes) { wxMessageBox(wxString::FromUTF8(bytes.error().message), "Type Library", wxOK | wxICON_ERROR, this); return; }
@@ -207,10 +297,27 @@ void TypeSymbolsView::portable_type_library() {
     if (!decoded) { wxMessageBox(wxString::FromUTF8(decoded.error().message), "Type Library", wxOK | wxICON_ERROR, this); return; }
     auto &bundle = decoded.value();
     const auto current_identity = portable_source_identity(*project_);
-    const bool identity_matches = current_identity && bundle.source_identity && *bundle.source_identity == current_identity.value();
-    auto graph = validate_portable_type_references(bundle, *project_->state->user, identity_matches);
-    if (!graph) { wxMessageBox(wxString::FromUTF8(graph.error().message), "Type Library", wxOK | wxICON_ERROR, this); return; }
-    const std::size_t skipped_assignments = identity_matches ? 0 : bundle.assignments.size();
+    std::optional<types::LibrarySourceIdentity> destination_source;
+    if (current_identity) destination_source = current_identity.value();
+    const types::LibraryBinaryIdentity destination_binary{
+        project_->state->input.size, project_->state->input.sha256};
+    std::set<std::string, std::less<>> available;
+    for (const auto &row : project_->state->user->types) available.insert(row.name);
+    types::LibraryAssignmentSourceVerifier verify_source_bytes;
+    if (project_->original) verify_source_bytes = [this](FileOffset file,
+        const types::LibraryAssignment::SourceBytes &witness) {
+        return assignment_source_bytes_match(*project_, file, witness);
+    };
+    auto prepared = types::prepare_library_import(bundle, available, destination_source,
+        destination_binary, verify_source_bytes, 262144);
+    if (!prepared) { wxMessageBox(wxString::FromUTF8(prepared.error().message), "Type Library", wxOK | wxICON_ERROR, this); return; }
+    const auto &applicable_assignments = prepared.value().assignments.applicable;
+    const auto &skipped_assignment_rows = prepared.value().assignments.skipped;
+    const auto assignment_selected = [&](const auto &assignment) {
+        return std::find(applicable_assignments.begin(), applicable_assignments.end(), assignment) != applicable_assignments.end();
+    };
+    const std::size_t selected_assignments = applicable_assignments.size();
+    const std::size_t skipped_assignments = skipped_assignment_rows.size();
     std::map<std::string, const database::TypeDefinition *, std::less<>> existing;
     for (const auto &row : project_->state->user->types) existing.emplace(row.name, &row);
     std::size_t new_count = 0, same_count = 0, conflict_count = 0;
@@ -223,7 +330,8 @@ void TypeSymbolsView::portable_type_library() {
         else ++conflict_count;
     }
     std::size_t assignment_same = 0, assignment_conflicts = 0;
-    if (identity_matches) for (const auto &assignment : bundle.assignments) {
+    if (selected_assignments) for (const auto &assignment : bundle.assignments) {
+        if (!assignment_selected(assignment)) continue;
         auto found = std::find_if(project_->state->user->type_assignments.begin(), project_->state->user->type_assignments.end(),
             [&](const auto &row) { return row.location == assignment.location; });
         if (found == project_->state->user->type_assignments.end()) continue;
@@ -233,8 +341,18 @@ void TypeSymbolsView::portable_type_library() {
     }
     wxString summary = wxString::Format("Definitions: %llu new, %llu identical, %llu conflicting. Assignments: %llu compatible, %llu identical, %llu conflicting.",
         static_cast<unsigned long long>(new_count), static_cast<unsigned long long>(same_count), static_cast<unsigned long long>(conflict_count),
-        static_cast<unsigned long long>(identity_matches ? bundle.assignments.size() : 0), static_cast<unsigned long long>(assignment_same), static_cast<unsigned long long>(assignment_conflicts));
-    if (skipped_assignments) summary += wxString::Format("\n\nSource identity does not match this project; %llu assignments will be skipped. Definitions remain importable.", static_cast<unsigned long long>(skipped_assignments));
+        static_cast<unsigned long long>(selected_assignments), static_cast<unsigned long long>(assignment_same), static_cast<unsigned long long>(assignment_conflicts));
+    if (skipped_assignments) {
+        std::array<std::size_t, 4> skipped_by_reason{};
+        for (const auto &skipped : skipped_assignment_rows)
+            ++skipped_by_reason[static_cast<std::size_t>(skipped.reason)];
+        summary += wxString::Format("\n\n%llu assignments will be skipped: %llu source identity mismatch, %llu binary identity mismatch, %llu source-byte verifier unavailable, %llu source-byte mismatch. Definitions remain importable.",
+            static_cast<unsigned long long>(skipped_assignments),
+            static_cast<unsigned long long>(skipped_by_reason[static_cast<std::size_t>(types::LibraryAssignmentSkipReason::source_identity_mismatch)]),
+            static_cast<unsigned long long>(skipped_by_reason[static_cast<std::size_t>(types::LibraryAssignmentSkipReason::binary_identity_mismatch)]),
+            static_cast<unsigned long long>(skipped_by_reason[static_cast<std::size_t>(types::LibraryAssignmentSkipReason::source_byte_verifier_unavailable)]),
+            static_cast<unsigned long long>(skipped_by_reason[static_cast<std::size_t>(types::LibraryAssignmentSkipReason::source_bytes_mismatch)]));
+    }
     summary += "\n\nChoose how conflicting rows should be handled.";
     wxArrayString policies; policies.Add("Keep existing rows"); policies.Add("Replace conflicting rows");
     wxSingleChoiceDialog policy(this, summary, "Preview type-library import", policies);
@@ -256,7 +374,8 @@ void TypeSymbolsView::portable_type_library() {
         if (entry.origin) origin = database::DwarfSourceOrigin{entry.origin->source_id, entry.origin->section, entry.origin->unit_offset, entry.origin->record_offset, entry.origin->record_size};
         command.definitions.push_back({entry.name, entry.type, existing_id, std::move(origin), static_cast<database::DeclarationKind>(entry.declaration_kind), std::move(expected)});
     }
-    if (identity_matches) for (const auto &assignment : bundle.assignments) {
+    if (selected_assignments) for (const auto &assignment : bundle.assignments) {
+        if (!assignment_selected(assignment)) continue;
         auto current = std::find_if(project_->state->user->type_assignments.begin(), project_->state->user->type_assignments.end(),
             [&](const auto &row) { return row.location == assignment.location; });
         if (current != project_->state->user->type_assignments.end()) {
@@ -312,7 +431,9 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
                          wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(5));
     type_filter_ = new wxTextCtrl(type_page, wxID_ANY);
     type_filter_->SetName("type-definition-filter");
+    type_filter_->SetMaxLength(maximum_persisted_filter_characters);
     type_filter_->SetHint("Filter by name or type shape");
+    type_filter_->SetHelpText("Filter type definitions by name or type shape. Press Ctrl+F to focus this filter.");
     type_search_bar->Add(type_filter_, 1, wxEXPAND);
     type_layout->Add(type_search_bar, 0, wxEXPAND | wxALL, FromDIP(4));
     wxArrayString abi_choices{"x86-32", "x86-64", "AArch64", "AArch32"};
@@ -335,7 +456,9 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
                                wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(5));
     assignment_filter_ = new wxTextCtrl(assignment_page, wxID_ANY);
     assignment_filter_->SetName("type-assignment-filter");
+    assignment_filter_->SetMaxLength(maximum_persisted_filter_characters);
     assignment_filter_->SetHint("Filter by address or type name");
+    assignment_filter_->SetHelpText("Filter assignments by address or type name. Press Ctrl+F to focus this filter.");
     assignment_search_bar->Add(assignment_filter_, 1, wxEXPAND);
     assignment_layout->Add(assignment_search_bar, 0, wxEXPAND | wxALL, FromDIP(4));
     assignments_ = new VirtualTable(assignment_page, "type-assignments", {"Address", "Type"});
@@ -348,7 +471,9 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
                            wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(5));
     symbol_filter_ = new wxTextCtrl(symbol_page, wxID_ANY);
     symbol_filter_->SetName("importable-symbol-filter");
+    symbol_filter_->SetMaxLength(maximum_persisted_filter_characters);
     symbol_filter_->SetHint("Filter by symbol name or address");
+    symbol_filter_->SetHelpText("Filter imported symbols by name or address. Press Ctrl+F to focus this filter.");
     symbol_search_bar->Add(symbol_filter_, 1, wxEXPAND);
     symbol_layout->Add(symbol_search_bar, 0, wxEXPAND | wxALL, FromDIP(4));
     symbols_ = new VirtualTable(symbol_page, "importable-symbols", {"Address", "Symbol"});
@@ -363,6 +488,11 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
     go_to_variable_function_->SetName("debug-variable-go-to-function");
     variable_layout->Add(go_to_variable_function_, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
     go_to_variable_function_->Disable();
+    go_to_variable_range_ = new wxButton(variable_page, wxID_ANY, "Go to active location range");
+    go_to_variable_range_->SetName("debug-variable-go-to-range");
+    go_to_variable_range_->SetToolTip("Navigate to the executable start of the selected variable's active PC range, or its first mapped range.");
+    variable_layout->Add(go_to_variable_range_, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
+    go_to_variable_range_->Disable();
     variable_page->SetSizer(variable_layout);
     auto *pdb_id_page = new wxPanel(pages_);
     auto *pdb_id_layout = new wxBoxSizer(wxVERTICAL);
@@ -389,8 +519,16 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
         "Import PDB Types to inspect source-scoped class declarations. These rows are preview-only and are not persisted in project aggregate types or layout.");
     pdb_declaration_status_->SetName("pdb-aggregate-declaration-status");
     pdb_declaration_layout->Add(pdb_declaration_status_, 0, wxEXPAND | wxALL, FromDIP(4));
+    copy_pdb_declaration_ = new wxButton(pdb_declaration_page, wxID_ANY, "Copy selected declaration");
+    copy_pdb_declaration_->SetName("pdb-aggregate-declaration-copy");
+    copy_pdb_declaration_->SetToolTip("Copy the selected source-scoped PDB declaration and its displayed fields as one TSV record.");
+    copy_pdb_declaration_->Enable(false);
+    pdb_declaration_layout->Add(copy_pdb_declaration_, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
+    pdb_declaration_copy_status_ = new wxStaticText(pdb_declaration_page, wxID_ANY, "Select a PDB declaration to copy");
+    pdb_declaration_copy_status_->SetName("pdb-aggregate-declaration-copy-status");
+    pdb_declaration_layout->Add(pdb_declaration_copy_status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
     pdb_declarations_ = new VirtualTable(pdb_declaration_page, "pdb-aggregate-declarations",
-        {"Owner", "Aggregate TPI", "Kind", "Name", "Type", "Access", "Dispatch", "Virtual slot", "This type", "Ordinal"});
+        {"Owner", "Aggregate TPI", "Kind", "Name", "Type", "Access", "Dispatch", "Virtual slot", "This type", "Ordinal", "Byte offset", "TPI record offset"});
     pdb_declarations_->SetColumnWidth(0, FromDIP(230));
     pdb_declarations_->SetColumnWidth(1, FromDIP(120));
     pdb_declarations_->SetColumnWidth(2, FromDIP(95));
@@ -404,6 +542,14 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
         "Import PDB Types to inspect typed CodeView global and module data symbols. Navigation requires a uniquely matching loaded PE.");
     pdb_data_symbol_status_->SetName("pdb-data-symbol-status");
     pdb_data_symbol_layout->Add(pdb_data_symbol_status_, 0, wxEXPAND | wxALL, FromDIP(4));
+    copy_pdb_data_symbol_ = new wxButton(pdb_data_symbol_page, wxID_ANY, "Copy selected symbol");
+    copy_pdb_data_symbol_->SetName("pdb-data-symbol-copy");
+    copy_pdb_data_symbol_->SetToolTip("Copy the selected cached PDB data symbol and its displayed details as one TSV record.");
+    copy_pdb_data_symbol_->Enable(false);
+    pdb_data_symbol_layout->Add(copy_pdb_data_symbol_, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
+    pdb_data_symbol_copy_status_ = new wxStaticText(pdb_data_symbol_page, wxID_ANY, "Select a PDB data symbol to copy");
+    pdb_data_symbol_copy_status_->SetName("pdb-data-symbol-copy-status");
+    pdb_data_symbol_layout->Add(pdb_data_symbol_copy_status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
     pdb_data_symbols_ = new VirtualTable(pdb_data_symbol_page, "pdb-data-symbols",
         {"Name", "Type", "Section", "Section offset", "TPI index", "Source", "Module / object", "Status"});
     pdb_data_symbols_->SetColumnWidth(0, FromDIP(240));
@@ -444,6 +590,21 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
     });
     pdb_ids_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &) { refresh_pdb_function_id_details(); });
     pdb_ids_->Bind(wxEVT_LIST_ITEM_DESELECTED, [this](wxListEvent &) { refresh_pdb_function_id_details(); });
+    pdb_declarations_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &) {
+        const auto row = pdb_declarations_->selected_row();
+        const bool available = row && *row < pdb_aggregate_declarations_.size();
+        copy_pdb_declaration_->Enable(available);
+        if (pdb_declaration_copy_status_)
+            pdb_declaration_copy_status_->SetLabel(available ? "Selected PDB declaration ready to copy"
+                                                            : "Select a PDB declaration to copy");
+    });
+    pdb_declarations_->Bind(wxEVT_LIST_ITEM_DESELECTED, [this](wxListEvent &) {
+        const auto row = pdb_declarations_->selected_row();
+        const bool available = row && *row < pdb_aggregate_declarations_.size();
+        copy_pdb_declaration_->Enable(available);
+        if (pdb_declaration_copy_status_ && !available)
+            pdb_declaration_copy_status_->SetLabel("Select a PDB declaration to copy");
+    });
     types_->Bind(wxEVT_LIST_ITEM_DESELECTED, [this](wxListEvent &) {
         if (refreshing_types_) return;
         edit_->Enable(project_ && project_->mode == database::ProjectMode::read_write && static_cast<bool>(submit_) &&
@@ -452,8 +613,8 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
             selected_type_id_.reset();
         refresh_layout();
     });
-    type_filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { refresh_types(); });
-    assignment_filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { refresh(); });
+    type_filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { save_filter_preferences(); refresh_types(); });
+    assignment_filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { save_filter_preferences(); refresh(); });
     layout_abi_->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { refresh_layout(); });
     assign_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { assign_type(); });
     remove_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { remove_assignment(); });
@@ -462,13 +623,32 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
     import_pdb_types_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { import_pdb_types(); });
     import_dwarf_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { import_dwarf_info(); });
     portable_library_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { portable_type_library(); });
-    symbol_filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { refresh_symbols(); });
+    Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &event) {
+        if (event.ControlDown() && (event.GetKeyCode() == 'F' || event.GetKeyCode() == 'f')) {
+            wxTextCtrl *filter = nullptr;
+            switch (pages_->GetSelection()) {
+            case 0: filter = type_filter_; break;
+            case 1: filter = assignment_filter_; break;
+            case 2: filter = symbol_filter_; break;
+            default: break;
+            }
+            if (filter) {
+                filter->SetFocus();
+                filter->SelectAll();
+                return;
+            }
+        }
+        event.Skip();
+    });
+    symbol_filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { save_filter_preferences(); refresh_symbols(); });
     pdb_data_symbols_->activate = [this](std::size_t row) {
         if (document_ && row < pdb_data_symbol_rows_.size() && pdb_data_symbol_rows_[row].address && navigate)
             navigate(*document_, project_, Location{*pdb_data_symbol_rows_[row].address});
     };
     pdb_data_symbols_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &) { refresh_pdb_data_symbol_details(); });
     pdb_data_symbols_->Bind(wxEVT_LIST_ITEM_DESELECTED, [this](wxListEvent &) { refresh_pdb_data_symbol_details(); });
+    copy_pdb_data_symbol_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_selected_pdb_data_symbol(); });
+    copy_pdb_declaration_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_selected_pdb_aggregate_declaration(); });
     variables_->Bind(wxEVT_LIST_ITEM_SELECTED,[this](wxListEvent &){refresh_variable_details();});
     variables_->Bind(wxEVT_LIST_ITEM_DESELECTED,[this](wxListEvent &){refresh_variable_details();});
     go_to_variable_function_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
@@ -479,6 +659,11 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
             return;
         navigate(*document_, project_, Location{project_->state->user->debug_variables[*selected].function_entry});
     });
+    go_to_variable_range_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        const auto destination = selected_debug_variable_range_start();
+        if (document_ && project_ && destination && navigate)
+            navigate(*document_, project_, Location{*destination});
+    });
     assignments_->activate = [this](std::size_t row) {
         if (!document_ || !project_ || !project_->state || row >= visible_assignment_indices_.size() || !navigate)
             return;
@@ -486,11 +671,16 @@ TypeSymbolsView::TypeSymbolsView(wxWindow *parent) : wxPanel(parent) {
         if (index < project_->state->user->type_assignments.size())
             navigate(*document_, project_, project_->state->user->type_assignments[index].location);
     };
+    load_filter_preferences();
     refresh();
 }
 void TypeSymbolsView::update(std::optional<DocumentId> document, std::shared_ptr<const ProjectSnapshot> project,
                              std::optional<Location> selection,
                              std::function<void(ProjectCommand)> submit) {
+    if (document != document_) {
+        remember_document_filters();
+        restore_document_filters(document);
+    }
     const bool project_changed = document != document_ || !project || !project->state || !project_ || !project_->state ||
         project->state->uuid != project_->state->uuid;
     if (project_changed) {
@@ -509,6 +699,7 @@ void TypeSymbolsView::update(std::optional<DocumentId> document, std::shared_ptr
     document_ = document;
     project_ = std::move(project);
     submit_ = std::move(submit);
+    if (project_changed) restore_project_filter_preferences();
     selected_address_.reset();
     if (project_ && selection) {
         if (auto address = std::get_if<Address>(&*selection))
@@ -531,6 +722,124 @@ void TypeSymbolsView::update(std::optional<DocumentId> document, std::shared_ptr
     }
     if (project_changed) refresh_pdb_function_ids();
     refresh();
+}
+void TypeSymbolsView::remember_document_filters() {
+    if (!document_) return;
+    const auto id = document_->value;
+    document_filter_states_.insert_or_assign(id, FilterState{
+        type_filter_ ? type_filter_->GetValue() : wxString{},
+        symbol_filter_ ? symbol_filter_->GetValue() : wxString{},
+        assignment_filter_ ? assignment_filter_->GetValue() : wxString{}});
+    std::erase(document_filter_lru_, id);
+    document_filter_lru_.push_back(id);
+    constexpr std::size_t maximum_saved_documents = 32;
+    while (document_filter_lru_.size() > maximum_saved_documents) {
+        document_filter_states_.erase(document_filter_lru_.front());
+        document_filter_lru_.erase(document_filter_lru_.begin());
+    }
+}
+void TypeSymbolsView::restore_document_filters(std::optional<DocumentId> document) {
+    if (!document) {
+        if (type_filter_) type_filter_->ChangeValue(wxString{});
+        if (symbol_filter_) symbol_filter_->ChangeValue(wxString{});
+        if (assignment_filter_) assignment_filter_->ChangeValue(wxString{});
+        return;
+    }
+    const auto id = document->value;
+    const auto found = document_filter_states_.find(id);
+    if (found == document_filter_states_.end()) {
+        if (preferences_pending_first_document_) {
+            preferences_pending_first_document_ = false;
+            document_filter_states_.insert_or_assign(id, FilterState{
+                type_filter_ ? type_filter_->GetValue() : wxString{},
+                symbol_filter_ ? symbol_filter_->GetValue() : wxString{},
+                assignment_filter_ ? assignment_filter_->GetValue() : wxString{}});
+            document_filter_lru_.push_back(id);
+            return;
+        }
+        if (type_filter_) type_filter_->ChangeValue(wxString{});
+        if (symbol_filter_) symbol_filter_->ChangeValue(wxString{});
+        if (assignment_filter_) assignment_filter_->ChangeValue(wxString{});
+        return;
+    }
+    if (type_filter_) type_filter_->ChangeValue(found->second.types);
+    if (symbol_filter_) symbol_filter_->ChangeValue(found->second.symbols);
+    if (assignment_filter_) assignment_filter_->ChangeValue(found->second.assignments);
+    std::erase(document_filter_lru_, id);
+    document_filter_lru_.push_back(id);
+}
+void TypeSymbolsView::load_filter_preferences() {
+    auto *config = wxConfigBase::Get(false);
+    if (!config) return;
+    wxString value;
+    if (config->Read("MetadataContextFilters/Types", &value) && value.length() <= maximum_persisted_filter_characters)
+        type_filter_->ChangeValue(value);
+    value.clear();
+    if (config->Read("MetadataContextFilters/Symbols", &value) && value.length() <= maximum_persisted_filter_characters)
+        symbol_filter_->ChangeValue(value);
+    value.clear();
+    if (config->Read("MetadataContextFilters/Assignments", &value) && value.length() <= maximum_persisted_filter_characters)
+        assignment_filter_->ChangeValue(value);
+}
+void TypeSymbolsView::save_filter_preferences() const {
+    auto *config = wxConfigBase::Get(false);
+    if (!config || !type_filter_ || !symbol_filter_ || !assignment_filter_) return;
+    const auto types = type_filter_->GetValue().Left(maximum_persisted_filter_characters);
+    const auto symbols = symbol_filter_->GetValue().Left(maximum_persisted_filter_characters);
+    const auto assignments = assignment_filter_->GetValue().Left(maximum_persisted_filter_characters);
+    config->Write("MetadataContextFilters/Types", types);
+    config->Write("MetadataContextFilters/Symbols", symbols);
+    config->Write("MetadataContextFilters/Assignments", assignments);
+    if (!project_ || !project_->state) return;
+
+    const auto key = project_filter_key(project_->state->uuid);
+    const auto base = "MetadataContextFilters/Projects/" + key;
+    const auto types_path = base + "/Types";
+    const auto symbols_path = base + "/Symbols";
+    const auto assignments_path = base + "/Assignments";
+    config->Write(wxString::FromUTF8(types_path.c_str()), types);
+    config->Write(wxString::FromUTF8(symbols_path.c_str()), symbols);
+    config->Write(wxString::FromUTF8(assignments_path.c_str()), assignments);
+
+    wxString stored_order;
+    config->Read("MetadataContextFilters/ProjectOrder", &stored_order);
+    auto order = stored_order.length() <= maximum_persisted_project_order_characters
+        ? parse_project_filter_order(utf8(stored_order)) : std::vector<std::string>{};
+    std::erase(order, key);
+    order.push_back(key);
+    while (order.size() > maximum_persisted_project_filters) {
+        const auto expired = order.front();
+        order.erase(order.begin());
+        const auto expired_group = "MetadataContextFilters/Projects/" + expired;
+        config->DeleteGroup(wxString::FromUTF8(expired_group.c_str()));
+    }
+    std::string encoded_order;
+    for (const auto &entry : order) {
+        if (!encoded_order.empty()) encoded_order.push_back(';');
+        encoded_order += entry;
+    }
+    config->Write("MetadataContextFilters/ProjectOrder", wxString::FromUTF8(encoded_order.c_str()));
+}
+
+void TypeSymbolsView::restore_project_filter_preferences() {
+    if (!project_ || !project_->state) return;
+    auto *config = wxConfigBase::Get(false);
+    if (!config) return;
+    const auto base = "MetadataContextFilters/Projects/" + project_filter_key(project_->state->uuid);
+    const auto types_path = base + "/Types";
+    const auto symbols_path = base + "/Symbols";
+    const auto assignments_path = base + "/Assignments";
+    wxString types, symbols, assignments;
+    if (!config->Read(wxString::FromUTF8(types_path.c_str()), &types) ||
+        !config->Read(wxString::FromUTF8(symbols_path.c_str()), &symbols) ||
+        !config->Read(wxString::FromUTF8(assignments_path.c_str()), &assignments) ||
+        types.length() > maximum_persisted_filter_characters ||
+        symbols.length() > maximum_persisted_filter_characters ||
+        assignments.length() > maximum_persisted_filter_characters)
+        return;
+    type_filter_->ChangeValue(types);
+    symbol_filter_->ChangeValue(symbols);
+    assignment_filter_->ChangeValue(assignments);
 }
 void TypeSymbolsView::refresh() {
     auto project = project_;
@@ -789,14 +1098,36 @@ void TypeSymbolsView::refresh_layout() {
     }
     layout_details_->SetValue(text(report.str()));
 }
+std::optional<Address> TypeSymbolsView::selected_debug_variable_range_start() const {
+    if (!project_ || !project_->state || !project_->loaded || !project_->loaded->image)
+        return {};
+    const auto selected = variables_->selected_row();
+    if (!selected || *selected >= project_->state->user->debug_variables.size()) return {};
+    const auto &variable = project_->state->user->debug_variables[*selected];
+    const auto &image = *project_->loaded->image;
+    std::optional<Address> first_mapped;
+    for (const auto &range : variable.location_ranges) {
+        if (range.begin >= range.end) continue;
+        const Address start{variable.function_entry.space, range.begin};
+        const auto *segment = image.segment_at(start);
+        if (!segment || !segment->executable) continue;
+        if (!first_mapped) first_mapped = start;
+        if (selected_address_ && selected_address_->space == variable.function_entry.space &&
+            selected_address_->offset >= range.begin && selected_address_->offset < range.end)
+            return start;
+    }
+    return first_mapped;
+}
+
 void TypeSymbolsView::refresh_variable_details() {
     if(!variable_details_)return;
-    if(!project_||!project_->state){variable_details_->SetValue("Open a project and select a DWARF variable.");go_to_variable_function_->Disable();return;}
+    if(!project_||!project_->state){variable_details_->SetValue("Open a project and select a DWARF variable.");go_to_variable_function_->Disable();go_to_variable_range_->Disable();return;}
     const auto selected=variables_->selected_row();
     if(!selected||*selected>=project_->state->user->debug_variables.size()){
-        variable_details_->SetValue("Select a variable to inspect its DWARF source and unevaluated location expression.");go_to_variable_function_->Disable();return;
+        variable_details_->SetValue("Select a variable to inspect its DWARF source and unevaluated location expression.");go_to_variable_function_->Disable();go_to_variable_range_->Disable();return;
     }
     go_to_variable_function_->Enable(static_cast<bool>(navigate));
+    go_to_variable_range_->Enable(static_cast<bool>(navigate) && selected_debug_variable_range_start().has_value());
     const auto& variable=project_->state->user->debug_variables[*selected];
     std::ostringstream details;details<<variable.name<<" â€” "<<(variable.is_parameter?"parameter":"local")
         <<" in function 0x"<<std::hex<<variable.function_entry.offset<<"\nSource: "<<variable.origin.source_id
@@ -804,8 +1135,9 @@ void TypeSymbolsView::refresh_variable_details() {
         <<" ("<<std::dec<<variable.origin.record_size<<" bytes)\nScope DIE: 0x"<<std::hex<<variable.scope_offset<<"\n";
     if(!variable.location_ranges.empty()){
         details<<"Location-list ranges: "<<std::dec<<variable.location_ranges.size()<<"\n";
-        if(selected_address_)details<<"Selected PC: 0x"<<std::hex<<selected_address_->offset<<"\n";
-        bool matched=false;for(std::size_t i=0;i<variable.location_ranges.size();++i){const auto& range=variable.location_ranges[i];const bool active=selected_address_&&selected_address_->offset>=range.begin&&selected_address_->offset<range.end;matched|=active;
+        if(selected_address_)details<<"Selected PC: space "<<std::dec<<selected_address_->space.value
+            <<" 0x"<<std::hex<<selected_address_->offset<<"\n";
+        bool matched=false;for(std::size_t i=0;i<variable.location_ranges.size();++i){const auto& range=variable.location_ranges[i];const bool active=selected_address_&&selected_address_->space==variable.function_entry.space&&selected_address_->offset>=range.begin&&selected_address_->offset<range.end;matched|=active;
             details<<(active?"Selected ":"Range ")<<i<<": [0x"<<std::hex<<range.begin<<", 0x"<<range.end<<")"<<(active?" (active at selected PC)":"")<<"\n";
             if(active||!selected_address_){details<<"  Raw expression: ";for(std::size_t j=0;j<range.expression.size();++j){if(j)details<<' ';details<<std::setw(2)<<std::setfill('0')<<static_cast<unsigned>(range.expression[j]);}details<<"\n  Decoded operations:\n";for(const auto& op:range.operations)details<<"    +0x"<<std::hex<<op.expression_offset<<"  "<<location_operation(op)<<"\n";}
         }
@@ -938,10 +1270,27 @@ void TypeSymbolsView::import_header() {
     options.target_abi = target_selection == 2 ? types::Abi::x86_32
                          : target_selection == 3 ? types::Abi::aarch64
                          : target_selection == 4 ? types::Abi::aarch32 : types::Abi::x86_64;
-    if (target_selection == 0) options.long_bytes = 4;
-    else if (target_selection == 2 || target_selection == 4) {
+    if (target_selection == 0) {
+        options.long_bytes = 4;
+        // Microsoft C gives long double the same storage and alignment as double.
+        options.long_double_bytes = options.double_bytes;
+        options.long_double_alignment = options.double_bytes;
+    }
+    else if (target_selection == 1 || target_selection == 3) {
+        options.long_double_bytes = 16;
+        options.long_double_alignment = 16;
+    }
+    else if (target_selection == 2) {
         options.pointer_bytes = 4;
         options.long_bytes = 4;
+        options.long_double_bytes = 12;
+        options.long_double_alignment = 4;
+    }
+    else if (target_selection == 4) {
+        options.pointer_bytes = 4;
+        options.long_bytes = 4;
+        options.long_double_bytes = 8;
+        options.long_double_alignment = 8;
     }
     auto parsed = types::import_c_header(source, options);
     if (!parsed) {
@@ -1083,6 +1432,9 @@ void TypeSymbolsView::refresh_pdb_aggregate_declarations() {
     status += ". These rows are preview-only and are not persisted in project aggregate types or layout.";
     if (pdb_declaration_status_) pdb_declaration_status_->SetLabel(status);
     pdb_declarations_->clear_selection();
+    if (copy_pdb_declaration_) copy_pdb_declaration_->Disable();
+    if (pdb_declaration_copy_status_)
+        pdb_declaration_copy_status_->SetLabel("Select a PDB declaration to copy");
     pdb_declarations_->populate(count, [this](std::size_t row, int column) {
         if (row >= pdb_aggregate_declarations_.size()) return wxString{};
         const auto &item = pdb_aggregate_declarations_[row];
@@ -1099,13 +1451,74 @@ void TypeSymbolsView::refresh_pdb_aggregate_declarations() {
         case 7: value = item.virtual_slot; break;
         case 8: value = item.this_type; break;
         case 9: return wxString::Format("%u", static_cast<unsigned>(item.declaration_ordinal));
+        case 10: value = item.byte_offset; break;
+        case 11: return item.has_source_record
+            ? wxString::Format("0x%08x", static_cast<unsigned>(item.source_record_offset)) : wxString("-");
         default: return wxString{};
         }
         auto rendered = text(value);
         if (rendered.length() > 512) rendered = rendered.Left(509) + "...";
         return rendered;
     });
-    pdb_declarations_->fit_columns({0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
+    pdb_declarations_->fit_columns({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+}
+
+void TypeSymbolsView::copy_selected_pdb_aggregate_declaration() {
+    constexpr std::size_t clipboard_limit = 64 * 1024;
+    const auto selected = pdb_declarations_ ? pdb_declarations_->selected_row() : std::nullopt;
+    if (!selected || *selected >= pdb_aggregate_declarations_.size()) {
+        if (pdb_declaration_copy_status_)
+            pdb_declaration_copy_status_->SetLabel("Select a PDB declaration first");
+        return;
+    }
+    const auto &item = pdb_aggregate_declarations_[*selected];
+    const auto namespace_index = static_cast<unsigned>(item.name_space);
+    std::vector<std::pair<std::string, std::string>> fields = {
+        {"PDB identity", pdb_id_identity_},
+        {"Owner", item.owner},
+        {"Namespace index", std::to_string(namespace_index)},
+        {"Aggregate TPI index", hex_number(item.aggregate_type_index)},
+        {"Declaration ordinal", std::to_string(item.declaration_ordinal)},
+        {"Kind", item.kind},
+        {"Name", item.name},
+        {"Type", item.type.empty() ? "<unresolved>" : item.type},
+        {"Access", item.access},
+        {"Dispatch", item.dispatch},
+        {"Virtual slot", item.virtual_slot},
+        {"This type", item.this_type},
+        {"Byte offset", item.byte_offset.empty() ? "unavailable" : item.byte_offset},
+        {"TPI record offset", item.has_source_record ? hex_number(item.source_record_offset) : "unavailable"}};
+    std::string record;
+    for (const auto &[label, value] : fields) {
+        if (!record.empty()) record.push_back('\t');
+        record += label;
+        record.push_back('=');
+        record += escape_tsv_field(value);
+        if (record.size() > clipboard_limit) {
+            if (pdb_declaration_copy_status_)
+                pdb_declaration_copy_status_->SetLabel("Selected declaration TSV exceeds the 64 KiB clipboard limit");
+            return;
+        }
+    }
+    const auto output = wxString::FromUTF8(record.data(), record.size());
+    if (utf8(output) != record) {
+        if (pdb_declaration_copy_status_)
+            pdb_declaration_copy_status_->SetLabel("Selected declaration TSV is not valid UTF-8");
+        return;
+    }
+    if (!wxTheClipboard || !wxTheClipboard->Open()) {
+        if (pdb_declaration_copy_status_)
+            pdb_declaration_copy_status_->SetLabel("Clipboard is unavailable");
+        return;
+    }
+    auto data = std::make_unique<wxTextDataObject>(output);
+    const bool stored = wxTheClipboard->SetData(data.get());
+    if (stored) data.release();
+    const bool flushed = stored && wxTheClipboard->Flush();
+    wxTheClipboard->Close();
+    if (pdb_declaration_copy_status_)
+        pdb_declaration_copy_status_->SetLabel(flushed ? "Copied selected PDB declaration TSV record"
+                                                       : "Clipboard copy failed");
 }
 
 void TypeSymbolsView::refresh_pdb_data_symbols() {
@@ -1156,11 +1569,15 @@ void TypeSymbolsView::refresh_pdb_data_symbol_details() {
     if (!pdb_data_symbol_details_ || !pdb_data_symbols_) return;
     const auto selected = pdb_data_symbols_->selected_row();
     if (!selected || *selected >= pdb_data_symbol_rows_.size()) {
+        if (copy_pdb_data_symbol_) copy_pdb_data_symbol_->Enable(false);
         pdb_data_symbol_details_->ChangeValue(
             "Select a data symbol to inspect its exact CodeView type reference and source provenance.");
+        if (pdb_data_symbol_copy_status_) pdb_data_symbol_copy_status_->SetLabel("Select a PDB data symbol to copy");
         return;
     }
     const auto &item = pdb_data_symbol_rows_[*selected];
+    if (copy_pdb_data_symbol_) copy_pdb_data_symbol_->Enable(true);
+    if (pdb_data_symbol_copy_status_) pdb_data_symbol_copy_status_->SetLabel("Selected PDB data symbol ready to copy");
     std::ostringstream detail;
     detail << "Name: " << item.name << "\nType: "
            << (item.type.empty() ? "unresolved" : item.type)
@@ -1185,6 +1602,67 @@ void TypeSymbolsView::refresh_pdb_data_symbol_details() {
     auto value = text(detail.str());
     if (value.length() > 4096) value = value.Left(4093) + "...";
     pdb_data_symbol_details_->ChangeValue(value);
+}
+
+void TypeSymbolsView::copy_selected_pdb_data_symbol() {
+    constexpr std::size_t clipboard_limit = 64 * 1024;
+    if (!pdb_data_symbols_ || !pdb_data_symbol_details_) {
+        if (pdb_data_symbol_copy_status_) pdb_data_symbol_copy_status_->SetLabel("PDB data symbol details are unavailable");
+        return;
+    }
+    const auto selected = pdb_data_symbols_->selected_row();
+    if (!selected || *selected >= pdb_data_symbol_rows_.size()) {
+        if (pdb_data_symbol_copy_status_) pdb_data_symbol_copy_status_->SetLabel("Select a PDB data symbol first");
+        return;
+    }
+    const auto &item = pdb_data_symbol_rows_[*selected];
+    std::vector<std::pair<std::string, std::string>> fields = {
+        {"Name", utf8(text(item.name))},
+        {"Type", utf8(text(item.type.empty() ? "<unresolved>" : item.type))},
+        {"Section", std::to_string(item.section)},
+        {"Section offset", hex_number(item.section_offset)},
+        {"TPI index", hex_number(item.type_index)},
+        {"Source", utf8(text(item.source))},
+        {"Module", utf8(text(item.module))},
+        {"Object", utf8(text(item.object))},
+        {"Status", utf8(text(item.status))},
+        {"CodeView record kind", hex_number(item.record_kind)},
+        {"CodeView record offset", hex_number(item.record_offset)},
+        {"Rendered details", utf8(pdb_data_symbol_details_->GetValue())}};
+    if (item.address)
+        fields.emplace_back("Mapped address", hex_number(item.address->offset));
+    else
+        fields.emplace_back("Mapped address", "unavailable");
+
+    std::string record;
+    for (const auto &[label, value] : fields) {
+        if (!record.empty()) record.push_back('\t');
+        record += label;
+        record.push_back('=');
+        record += escape_tsv_field(value);
+        if (record.size() > clipboard_limit) {
+            if (pdb_data_symbol_copy_status_)
+                pdb_data_symbol_copy_status_->SetLabel("Selected PDB symbol TSV exceeds the 64 KiB clipboard limit");
+            return;
+        }
+    }
+    const auto output = wxString::FromUTF8(record.data(), record.size());
+    if (utf8(output) != record) {
+        if (pdb_data_symbol_copy_status_) pdb_data_symbol_copy_status_->SetLabel("Selected PDB symbol TSV is not valid UTF-8");
+        return;
+    }
+    if (!wxTheClipboard || !wxTheClipboard->Open()) {
+        if (pdb_data_symbol_copy_status_) pdb_data_symbol_copy_status_->SetLabel("Clipboard is unavailable");
+        return;
+    }
+    auto data = std::make_unique<wxTextDataObject>(output);
+    const bool stored = wxTheClipboard->SetData(data.get());
+    if (stored) data.release();
+    const bool flushed = stored && wxTheClipboard->Flush();
+    wxTheClipboard->Close();
+    if (pdb_data_symbol_copy_status_)
+        pdb_data_symbol_copy_status_->SetLabel(flushed ? "Copied selected PDB data symbol TSV record"
+                                                       : "Clipboard copy failed");
 }
 
 void TypeSymbolsView::import_pdb_types() {
@@ -1337,6 +1815,16 @@ void TypeSymbolsView::import_pdb_types() {
             row.kind = pdb_declaration_kind(declaration.kind);
             row.name = declaration.name;
             if (declaration.type) row.type = types::format(*declaration.type);
+            else if (declaration.source_type_index)
+                row.type = "CodeView TPI type 0x" + [&] {
+                    std::ostringstream out; out << std::hex << declaration.source_type_index; return out.str();
+                }();
+            row.source_record_offset = declaration.source_record_offset;
+            row.has_source_record = declaration.source_type_index != 0;
+            if (declaration.vfptr_byte_offset) {
+                std::ostringstream out; out << "0x" << std::hex << *declaration.vfptr_byte_offset;
+                row.byte_offset = out.str();
+            }
             switch (declaration.attributes & 3u) {
             case 1: row.access = "private"; break;
             case 2: row.access = "protected"; break;
@@ -1584,7 +2072,7 @@ void TypeSymbolsView::import_pdb_types() {
     if (selected_pdb_matches_image) {
         std::size_t identity_matches = 0;
         for (const auto &codeview : loaded_pe->codeview)
-            if (codeview.guid == database.value().info.guid && codeview.age == database.value().info.age)
+            if (codeview.rsds && codeview.guid == database.value().info.guid && codeview.age == database.value().info.age)
                 ++identity_matches;
         selected_pdb_matches_image = identity_matches == 1;
     }

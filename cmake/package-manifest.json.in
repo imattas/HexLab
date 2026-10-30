@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "product": "HexLab",
   "version": "@PROJECT_VERSION@",
   "target": {
@@ -20,6 +20,22 @@
   "runtime_targets": [
 @HEXLAB_PACKAGE_RUNTIME_TARGETS@
   ],
+  "conditional_host_requirements": [
+    {
+      "condition": "Windows build using MSVC",
+      "runtime": "Microsoft Visual C++ 2022 Redistributable",
+      "architecture": "@HEXLAB_PACKAGE_ARCH@",
+      "bundled": false
+    }
+  ],
+  "notices": {
+    "overview": "share/hexlab/docs/third-party.md",
+    "license_directory": "share/hexlab/licenses",
+    "includes_wxwidgets": @HEXLAB_PACKAGE_NOTICES_WX@,
+    "files": [
+@HEXLAB_PACKAGE_NOTICE_FILES@
+    ]
+  },
   "desktop_included": @HEXLAB_PACKAGE_HAS_DESKTOP@,
   "native_plugin_abi": {
     "major": @HEXLAB_PLUGIN_ABI_MAJOR@,

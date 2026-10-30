@@ -21,6 +21,21 @@ Result<database::HistoryPage> Project::history(std::uint64_t after, std::size_t 
     return store_->history_page(expected.value_or(current.value()->state->revisions.edit), after, count, stop);
 }
 
+Result<database::HistoryAuditPage> Project::audit_history(std::uint64_t after,
+    database::HistoryAuditLimits limits, std::optional<std::uint64_t> expected,
+    std::stop_token stop) const {
+    auto current = snapshot(); if (!current) return current.error();
+    if (!store_) return Error{ErrorCode::unsupported, "A workspace capture does not retain the durable history log; audit the live project"};
+    const auto edit = expected.value_or(current.value()->state->revisions.edit);
+    if (edit != current.value()->state->revisions.edit)
+        return Error{ErrorCode::conflict, "Project edit revision changed; refresh before retrying history audit"};
+    auto page = store_->audit_history(edit, after, limits, stop);
+    if (!page) return page.error();
+    if (page.value().uuid != current.value()->state->uuid)
+        return Error{ErrorCode::conflict, "History audit page belongs to a different project identity"};
+    return page.value();
+}
+
 Result<std::shared_ptr<const HistoricalState>> Project::preview_history(std::uint64_t target,
     database::HistoryPreviewLimits limits, std::optional<std::uint64_t> expected, std::stop_token stop) const {
     auto current = snapshot(); if (!current) return current.error();

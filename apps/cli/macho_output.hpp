@@ -2,9 +2,12 @@
 #include "hexlab/workspace/navigation.hpp"
 #include "hexlab/analysis/macho_objc.hpp"
 #include "hexlab/analysis/macho_objc_types.hpp"
+#include "hexlab/loaders/macho.hpp"
 #include "demangle_output.hpp"
+#include <algorithm>
 #include <iomanip>
 #include <sstream>
+#include <string_view>
 namespace hexlab::cli {
 inline std::string macho_hex(std::uint64_t value) {
     std::ostringstream out;
@@ -106,7 +109,14 @@ inline void macho_objc_property_line(std::ostream &out, const MachOObjCProperty 
         << (property.nonatomic ? "nonatomic," : "") << (property.dynamic ? "dynamic," : "")
         << " getter=" << (property.custom_getter ? macho_text(*property.custom_getter) : "default")
         << " setter=" << (property.custom_setter ? macho_text(*property.custom_setter) : "default")
-        << " backing-ivar=" << (property.backing_ivar ? macho_text(*property.backing_ivar) : "unspecified") << '\n';
+        << " backing-ivar=" << (property.backing_ivar ? macho_text(*property.backing_ivar) : "unspecified")
+        << " backing-ivar-link=" << macho_text(property.backing_ivar_link_status)
+        << " backing-ivar-index=" << (property.backing_ivar_index
+            ? std::to_string(*property.backing_ivar_index) : "-")
+        << " getter-link=" << macho_text(property.getter_link_status)
+        << " getter-method=" << (property.getter_method ? macho_hex(property.getter_method->offset) : "-")
+        << " setter-link=" << macho_text(property.setter_link_status)
+        << " setter-method=" << (property.setter_method ? macho_hex(property.setter_method->offset) : "-") << '\n';
 }
 inline void macho_description(std::ostream &out, const ImageMetadata &metadata, const Image *image) {
     if (!metadata.macho)
@@ -145,9 +155,41 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
         for (const auto &tool : row.tools)
             out << "    tool id=" << tool.tool << " version=" << macho_version(tool.version) << '\n';
     }
+    constexpr std::size_t max_linker_option_rows = 256;
+    out << "Mach-O linker options: " << m.linker_options.size() << '\n';
+    const auto shown_linker_options = std::min(m.linker_options.size(), max_linker_option_rows);
+    for (std::size_t index = 0; index < shown_linker_options; ++index) {
+        const auto &option = m.linker_options[index];
+        out << "  command=" << option.command_index << " option=" << option.option_index
+            << " value=\"" << macho_text(option.option) << "\" string-file="
+            << macho_hex(option.string_file_offset) << " record=file:"
+            << macho_hex(option.record_file_offset) << '\n';
+    }
+    if (shown_linker_options < m.linker_options.size())
+        out << "  linker-option-output-capped=true omitted="
+            << m.linker_options.size() - shown_linker_options << '\n';
     for (const auto &row : m.source_versions)
         out << "  source-version command=" << row.command_index << " version=" << row.major << '.' << row.minor
             << '.' << row.patch << '.' << row.build << '.' << row.prerelease << " packed=" << macho_hex(row.packed)
+            << " record=file:" << macho_hex(row.record_file_offset) << '\n';
+    const auto uuid_count = std::min<std::size_t>(m.uuids.size(), 16);
+    for (std::size_t index = 0; index < uuid_count; ++index) {
+        const auto &row = m.uuids[index];
+        std::ostringstream value;
+        value << std::hex << std::setfill('0');
+        for (std::size_t byte = 0; byte < row.bytes.size(); ++byte) {
+            if (byte == 4 || byte == 6 || byte == 8 || byte == 10) value << '-';
+            value << std::setw(2) << unsigned(row.bytes[byte]);
+        }
+        out << "  uuid command=" << row.command_index << " value=" << value.str()
+            << " value-file=" << macho_hex(row.value_file_offset)
+            << " record=file:" << macho_hex(row.record_file_offset) << '\n';
+    }
+    if (m.uuids.size() > uuid_count)
+        out << "  uuid rows omitted=" << (m.uuids.size() - uuid_count) << " (CLI limit 16)\n";
+    for (const auto &row : m.notes)
+        out << "  note command=" << row.command_index << " owner=" << macho_text(row.data_owner)
+            << " data=file:" << macho_hex(row.data_offset.value) << " size=" << macho_hex(row.data_size)
             << " record=file:" << macho_hex(row.record_file_offset) << '\n';
     for (const auto &row : m.segments)
         out << "  segment command=" << row.command_index << " name=" << macho_text(row.name)
@@ -198,6 +240,10 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
     for (const auto &row : m.paths)
         out << "  path command=" << row.command_index << " type=" << macho_hex(row.command)
             << " name=" << macho_text(row.name) << " record=file:" << macho_hex(row.record_file_offset) << '\n';
+    for (const auto &row : m.dyld_environments)
+        out << "  dyld-environment command=" << row.command_index << " value=" << macho_text(row.value)
+            << " string-offset=" << macho_hex(row.name_offset)
+            << " record=file:" << macho_hex(row.record_file_offset) << '\n';
     for (const auto &row : m.entries) {
         out << "  entry command=" << row.command_index << " type=" << macho_hex(row.command) << " flavor=" << row.flavor
             << " count=" << row.count << " record=file:" << macho_hex(row.record_file_offset);
@@ -228,6 +274,22 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
                 << " count=" << row.tables[n].count << " stride=" << row.tables[n].stride << '\n';
         for (std::size_t n = 0; n < row.indirect_symbols.size(); ++n)
             out << "    indirect-symbol #" << n << " value=" << macho_hex(row.indirect_symbols[n]) << '\n';
+    }
+    out << "Mach-O indirect symbol bindings: " << m.indirect_symbol_bindings.size()
+        << " complete=" << m.indirect_symbol_bindings_complete << '\n';
+    for (const auto &row : m.indirect_symbol_bindings) {
+        out << "  indirect-binding dysymtab=" << row.dynamic_symbol_table_command
+            << " section=" << row.section_ordinal << " section-type=" << macho_hex(row.section_type)
+            << " slot=" << row.slot_index << " section-offset=" << macho_hex(row.section_offset)
+            << " indirect-index=" << row.indirect_table_index << " raw-symbol=" << macho_hex(row.raw_symbol_index)
+            << " kind=" << unsigned(row.kind);
+        if (row.symbol_table_command)
+            out << " symbol-table=" << *row.symbol_table_command;
+        if (row.symbol_index)
+            out << " symbol-index=" << *row.symbol_index;
+        if (row.slot_file_offset)
+            out << " file=" << macho_hex(row.slot_file_offset->value);
+        out << '\n';
     }
     out << "Mach-O relocations: " << m.relocations.size() << " complete=" << m.relocations_complete << '\n';
     for (std::size_t n = 0; n < m.relocation_tables.size(); ++n) {
@@ -342,11 +404,17 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
         if (row.file_place)
             out << " field=file:" << macho_hex(row.file_place->value);
         if (row.target) {
-            out << " payload=" << macho_hex(*row.target) << " header-relative=" << row.target_is_offset;
-            if (m.chained_starts[row.starts].pointer_format == 13)
+            out << " payload=" << macho_hex(*row.target)
+                << " header-relative=" << (row.target_is_offset && !row.target_base_kind);
+            if (m.chained_starts[row.starts].pointer_format == 4 ||
+                m.chained_starts[row.starts].pointer_format == 13)
                 out << " shared-cache-relative=1";
             out << " high8=" << macho_hex(row.high8);
         }
+        if (row.cache_level) out << " cache-level=" << unsigned(*row.cache_level);
+        if (row.target_base_kind)
+            out << " target-base=" << (*row.target_base_kind == MachOChainedTargetBaseKind::cache_level
+                ? "cache-level-base-unavailable" : "shared-cache-base-unavailable");
         if (row.import_index)
             out << " import-index=" << *row.import_index;
         if (row.import_row)
@@ -357,6 +425,15 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
         if (row.authenticated)
             out << " pac-key=" << macho_pac_key(row.key) << '(' << unsigned(row.key) << ')'
                 << " diversity=" << row.diversity << " address-diversity=" << row.address_diversity;
+        out << '\n';
+    }
+    for (const auto &row : m.chain_start_offsets) {
+        out << "  firmware-chain-start section=" << row.section_ordinal << " index=" << row.index
+            << " format=" << row.pointer_format << " coordinate-flags=" << row.coordinate_flags
+            << " raw-offset=" << macho_hex(row.raw_offset) << " record=file:" << macho_hex(row.record_file_offset)
+            << " complete=" << row.complete;
+        if (row.pointer_address) out << " address=" << format_location(*row.pointer_address, image);
+        if (row.pointer_file_offset) out << " pointer=file:" << macho_hex(row.pointer_file_offset->value);
         out << '\n';
     }
     out << "Mach-O protections: complete=" << m.protections_complete << '\n';
@@ -370,10 +447,22 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
         out << "  encryption command=" << row.command_index << " type=" << macho_hex(row.command)
             << " file=" << macho_hex(row.offset.value) << " size=" << row.size << " cryptid=" << row.cryptid
             << " pad=" << macho_hex(row.pad) << " record=file:" << macho_hex(row.record_file_offset) << '\n';
+    const auto data_in_code_kind_name = [](MachODataInCodeKind kind) -> std::string_view {
+        switch (kind) {
+        case MachODataInCodeKind::data: return "data";
+        case MachODataInCodeKind::jump_table8: return "jump-table8";
+        case MachODataInCodeKind::jump_table16: return "jump-table16";
+        case MachODataInCodeKind::jump_table32: return "jump-table32";
+        case MachODataInCodeKind::absolute_jump_table32: return "absolute-jump-table32";
+        }
+        return "unknown";
+    };
     for (const auto &row : m.data_in_code) {
         out << "  data-in-code table=" << row.table << " index=" << row.index
-            << " raw-offset=" << macho_hex(row.raw_offset) << " length=" << row.length << " kind=" << row.kind
-            << " record=file:" << macho_hex(row.record_file_offset);
+            << " raw-offset=" << macho_hex(row.raw_offset) << " length=" << row.length << " kind=";
+        if (row.decoded_kind) out << data_in_code_kind_name(*row.decoded_kind) << '(' << row.kind << ')';
+        else out << "unknown(" << row.kind << ')';
+        out << " record=file:" << macho_hex(row.record_file_offset);
         if (row.offset)
             out << " field=file:" << macho_hex(row.offset->value);
         else
@@ -383,6 +472,9 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
     for (const auto &row : m.code_signatures)
         out << "  signature command=" << row.command_index << " file=" << macho_hex(row.offset.value)
             << " size=" << row.size << " authentication=unavailable\n";
+    std::uint64_t code_hash_budget = 256ULL * 1024 * 1024;
+    std::size_t code_directory_checks = 0;
+    constexpr std::size_t max_code_directory_checks = 8;
     for (const auto &row : m.code_signature_blobs) {
         out << "    signature-blob signature=" << row.signature << " index=" << row.index
             << " slot=" << macho_hex(row.slot_type) << " magic=" << macho_hex(row.magic)
@@ -397,8 +489,36 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
                 << " page-size-exp=" << unsigned(row.page_size_exponent);
         else
             out << " kind=uninterpreted";
-        out << " verification=unavailable\n";
+        if (image && row.code_directory && code_directory_checks < max_code_directory_checks && code_hash_budget) {
+            MachOCodeDirectoryHashLimits limits;
+            limits.max_code_bytes = code_hash_budget;
+            const auto verification = verify_macho_code_directory_hashes(
+                *image, metadata, row.signature, row.index, {}, limits);
+            ++code_directory_checks;
+            if (verification) {
+                code_hash_budget -= std::min<std::uint64_t>(code_hash_budget, verification.value().code_limit);
+                out << " code-page-hashes=" << (verification.value().matches ? "match" : "mismatch")
+                    << " verified-slots=" << verification.value().verified_slots
+                    << " mismatches=" << verification.value().mismatch_count;
+                constexpr std::size_t mismatch_preview_limit = 16;
+                const auto mismatch_rows = std::min(mismatch_preview_limit, verification.value().mismatch_slots.size());
+                if (mismatch_rows) {
+                    out << " mismatch-slots=";
+                    for (std::size_t i = 0; i < mismatch_rows; ++i) {
+                        if (i) out << ',';
+                        out << verification.value().mismatch_slots[i];
+                    }
+                }
+            } else {
+                out << " code-page-hashes=unavailable reason=" << macho_text(verification.error().message);
+            }
+        } else {
+            out << " code-page-hashes=not-checked";
+        }
+        out << " CMS-signature-and-trust=not-checked\n";
     }
+    if (image && (code_directory_checks >= max_code_directory_checks || !code_hash_budget))
+        out << "  CodeDirectory verification budget exhausted; additional blobs were not checked.\n";
     if (image) {
         auto objc = scan_macho_objc_classes(*image, metadata);
         if (!objc) {
@@ -419,6 +539,14 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
                     << " superclass=" << (row.superclass_address ? format_location(*row.superclass_address, image) : "-")
                     << " superclass-pointer=" << macho_text(row.superclass_pointer_status)
                     << " superclass-name=" << (row.superclass_name ? macho_text(*row.superclass_name) : "-")
+                    << " metaclass=" << (row.metaclass_address ? format_location(*row.metaclass_address, image) : "-")
+                    << " metaclass-pointer=" << macho_text(row.metaclass_pointer_status)
+                    << " metaclass-name=" << (row.metaclass_name ? macho_text(*row.metaclass_name) : "-")
+                    << " metaclass-name-status=" << macho_text(row.metaclass_name_status)
+                    << " metaclass-ro=" << (row.metaclass_ro_address ? format_location(*row.metaclass_ro_address, image) : "-")
+                    << " metaclass-ro-pointer=" << macho_text(row.metaclass_ro_pointer_status)
+                    << " metaclass-flags=" << (row.metaclass_flags ? macho_hex(*row.metaclass_flags) : "-")
+                    << " metaclass-flag-semantics=" << (row.metaclass_flags ? macho_objc_class_ro_flags(*row.metaclass_flags) : "-")
                     << " class-ro=" << (row.class_ro_address ? format_location(*row.class_ro_address, image) : "-")
                     << " class-ro-pointer=" << macho_text(row.class_ro_pointer_status)
                     << " flags=" << (row.flags ? macho_hex(*row.flags) : "-")
@@ -476,6 +604,7 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
                     << " class-methods=" << macho_text(category.class_methods.status)
                     << " protocols=" << macho_text(category.protocols.status)
                     << " properties=" << macho_text(category.instance_properties.status)
+                     << " class-properties=" << macho_text(category.class_properties_status)
                     << " complete=" << category.complete << '\n';
                 for (const auto &method : category.instance_methods.methods)
                     macho_objc_method_line(out, method, image, "objc-category-method");
@@ -488,6 +617,8 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
                         << " status=" << macho_text(protocol.pointer_status) << '/' << macho_text(protocol.name_status) << '\n';
                 for (const auto &property : category.instance_properties.properties)
                     macho_objc_property_line(out, property, image, "objc-category-property");
+                for (const auto &property : category.class_properties.properties)
+                    macho_objc_property_line(out, property, image, "objc-category-class-property");
             }
             out << "Objective-C protocols: " << objc.value().protocols.size() << '\n';
             for (std::size_t i = 0; i < objc.value().protocols.size(); ++i) {
@@ -498,6 +629,8 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
                     << " address=" << (protocol.address ? format_location(*protocol.address, image) : "-")
                     << " name=" << (protocol.name ? macho_text(*protocol.name) : "-")
                     << " status=" << macho_text(protocol.pointer_status) << '/' << macho_text(protocol.name_status)
+                    << " runtime-size=" << (protocol.runtime_size ? std::to_string(*protocol.runtime_size) : "unavailable")
+                    << " class-properties=" << macho_text(protocol.class_properties_status)
                     << " complete=" << protocol.complete << '\n';
                 const auto emit_methods = [&](const MachOObjCList &list, std::string_view label) {
                     for (const auto &method : list.methods)
@@ -509,6 +642,8 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
                 emit_methods(protocol.optional_class_methods, "objc-protocol-optional-class-method");
                 for (const auto &property : protocol.instance_properties.properties)
                     macho_objc_property_line(out, property, image, "objc-protocol-property");
+                for (const auto &property : protocol.class_properties.properties)
+                    macho_objc_property_line(out, property, image, "objc-protocol-class-property");
                 for (const auto &adopted : protocol.adopted_protocols.protocol_references)
                     out << "    objc-protocol-adopts slot=" << format_location(adopted.slot, image)
                         << " target=" << (adopted.address ? format_location(*adopted.address, image) : "-")

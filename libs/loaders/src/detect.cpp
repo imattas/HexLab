@@ -46,8 +46,11 @@ Result<DetectedFormat> detect_format(const ByteStorage &storage) {
                                                    std::byte{'c'}, std::byte{'h'}, std::byte{'>'}, std::byte{'\n'}};
         constexpr std::array<std::byte, 8> thin_magic{std::byte{'!'}, std::byte{'<'}, std::byte{'t'}, std::byte{'h'},
                                                      std::byte{'i'}, std::byte{'n'}, std::byte{'>'}, std::byte{'\n'}};
+        constexpr std::array<std::byte, 8> aix_big_magic{std::byte{'<'}, std::byte{'b'}, std::byte{'i'}, std::byte{'g'},
+                                                         std::byte{'a'}, std::byte{'f'}, std::byte{'>'}, std::byte{'\n'}};
         if (std::equal(archive.value().bytes.begin(), archive.value().bytes.end(), ar_magic.begin()) ||
-            std::equal(archive.value().bytes.begin(), archive.value().bytes.end(), thin_magic.begin()))
+            std::equal(archive.value().bytes.begin(), archive.value().bytes.end(), thin_magic.begin()) ||
+            std::equal(archive.value().bytes.begin(), archive.value().bytes.end(), aix_big_magic.begin()))
             return DetectedFormat::ar_candidate;
     }
     if (storage.size() < 2)

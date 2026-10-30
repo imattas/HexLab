@@ -105,10 +105,13 @@ Result<DecodeResult> manual_decode(const DocumentSnapshot &document, Address add
         return context.error();
     if (!processor_capabilities(context.value()).can_decode)
         return Error{ErrorCode::unsupported, "This processor mode has no manual decoder"};
-    std::array<std::byte, 15> input{};
+    const std::size_t decode_window = context.value().architecture == Architecture::wasm &&
+            context.value().mode == ExecutionMode::wasm32
+        ? 32u : 15u;
+    std::array<std::byte, 32> input{};
     std::size_t count = 0;
     auto cursor = address;
-    while (count < input.size()) {
+    while (count < decode_window) {
         auto segment = image.segment_at(cursor);
         if (!segment)
             break;
@@ -121,7 +124,7 @@ Result<DecodeResult> manual_decode(const DocumentSnapshot &document, Address add
         if (relative >= segment->file_size)
             break;
         auto amount =
-            std::min<uint64_t>(image.code_window(cursor, input.size() - count), segment->file_size - relative);
+            std::min<uint64_t>(image.code_window(cursor, decode_window - count), segment->file_size - relative);
         if (!amount)
             break;
         if (region)

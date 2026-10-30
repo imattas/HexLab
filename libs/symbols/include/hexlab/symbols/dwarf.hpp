@@ -29,7 +29,8 @@ struct DwarfV4Sections {
 };
 
 // Identity parsed from the bounded DWARF v5 .debug_sup header. `filename` is
-// an untrusted hint and is never opened by the importer.
+// an untrusted hint; the top-level file loader restricts it to a same-directory
+// basename before opening any supplementary source.
 struct DwarfSupplementaryIdentity {
     bool present = false;
     std::uint16_t version = 5;
@@ -298,7 +299,16 @@ struct SourceOrigin {
     bool operator==(const SourceOrigin &) const = default;
 };
 
-enum class SymbolKind : std::uint8_t { function, object };
+struct DwarfDeclarationLocation {
+    // Raw DW_AT_decl_file index in the owning unit's line table.
+    std::optional<std::uint64_t> file_index;
+    std::optional<std::uint64_t> line, column;
+    bool operator==(const DwarfDeclarationLocation &) const = default;
+};
+
+// An entry_point is an alternate code entry and does not imply a complete
+// DW_TAG_subprogram extent or callable function type.
+enum class SymbolKind : std::uint8_t { function, object, entry_point };
 
 struct ImportedSymbol {
     std::string name;
@@ -311,6 +321,10 @@ struct ImportedSymbol {
     types::TypePtr type;
     struct Range { std::uint64_t begin = 0, end = 0; bool operator==(const Range &) const = default; };
     std::vector<Range> ranges;
+    // Raw standard DW_AT_linkage_name from this ranged subprogram DIE, when present.
+    std::optional<std::string> linkage_name;
+    // Direct declaration coordinates from this subprogram DIE, when present.
+    std::optional<DwarfDeclarationLocation> declaration_location;
     bool operator==(const ImportedSymbol &) const = default;
 };
 
@@ -324,6 +338,8 @@ struct ImportedType {
     bool is_typedef = false;
     bool is_const = false;
     bool is_volatile = false;
+    bool is_restrict = false;
+    bool is_atomic = false;
     bool operator==(const ImportedType &) const = default;
 };
 
@@ -337,8 +353,8 @@ struct ImportedTypeSignature {
 
 // A validated DWARF v2-v5 location-expression instruction. The
 // decoder accepts address, literal/register/base-register, fbreg/CFA, constant,
-// dereference, integer stack manipulation/arithmetic and signed comparisons,
-// plus, piece/bit_piece, stack_value, entry_value, and bra/skip operations.
+// dereference, TLS address conversion, integer stack manipulation/arithmetic and signed comparisons,
+// plus, piece/bit_piece, stack_value, implicit scalar values, entry_value, and bra/skip operations.
 // Entry-value blocks nest at most 16 levels and share a 4096-operation decode
 // budget. Other opcodes return ErrorCode::unsupported; truncated operands and
 // invalid branch targets return malformed. Register numbers are target-defined;
@@ -346,9 +362,9 @@ struct ImportedTypeSignature {
 // Unused operands are 0.
 enum class LocationOperationKind : std::uint8_t {
     address, literal, register_location, base_register_plus_offset,
-    frame_base_relative, call_frame_cfa, unsigned_constant, signed_constant,
+    frame_base_relative, call_frame_cfa, tls_address, unsigned_constant, signed_constant,
     dereference, dereference_sized, plus, plus_unsigned, piece, bit_piece,
-    stack_value, stack_operation, branch, branch_if_nonzero, entry_value
+    stack_value, implicit_value, stack_operation, branch, branch_if_nonzero, entry_value
 };
 
 struct LocationOperation {
@@ -357,6 +373,7 @@ struct LocationOperation {
     std::int64_t signed_operand = 0;
     std::uint32_t expression_offset = 0;
     std::uint64_t second_unsigned_operand = 0;
+    std::vector<std::uint8_t> block_operand;
     std::vector<LocationOperation> nested_operations;
     bool operator==(const LocationOperation &) const = default;
 };
@@ -371,12 +388,16 @@ struct EvaluatedLocation {
 // process itself; absent registers, frame/CFA bases, or memory are errors.
 struct LocationEvaluationContext {
     std::uint8_t address_size = 8;
+    bool target_big_endian = false;
     std::optional<std::uint64_t> frame_base;
     std::optional<std::uint64_t> call_frame_cfa;
     std::function<std::optional<std::uint64_t>(std::uint64_t)> read_register;
     // Entry-state registers are distinct from current stopped-state registers.
     // This callback is used only inside DW_OP_entry_value nested expressions.
     std::function<std::optional<std::uint64_t>(std::uint64_t)> read_entry_register;
+    // Resolve a DW_OP_form_tls_address offset for the selected stopped thread.
+    // The evaluator does not infer a module TLS base or read process state.
+    std::function<std::optional<std::uint64_t>(std::uint64_t)> resolve_tls_address;
     std::function<hexlab::Result<std::uint64_t>(std::uint64_t, std::uint8_t)> read_memory;
     // Entry-state memory is distinct from current memory and is used only
     // inside DW_OP_entry_value nested expressions.
@@ -410,6 +431,8 @@ struct ImportedVariable {
     // DWARF v2-v5 PC-scoped expressions, retained as ranges instead of
     // flattened to whichever entry happens to match during import.
     std::vector<LocationRange> location_ranges;
+    // Direct declaration coordinates from this variable/parameter DIE.
+    std::optional<DwarfDeclarationLocation> declaration_location;
     bool operator==(const ImportedVariable &) const = default;
 };
 
@@ -421,10 +444,21 @@ HEXLAB_SYMBOLS_EXPORT hexlab::Result<EvaluatedLocation> evaluate_imported_variab
     const ImportedVariable &variable, std::uint64_t pc, const LocationEvaluationContext &context);
 
 struct ImportedEnumerator {
+    struct ExactValue {
+        // Exact storage bits interpreted according to is_signed and the enum's
+        // underlying type. Negative signed values use two's-complement bits.
+        std::uint64_t bits = 0;
+        bool is_signed = true;
+        bool operator==(const ExactValue &) const = default;
+    };
     std::string name;
     std::string enum_type_name;
+    // Legacy signed projection retained for source compatibility. Consumers
+    // should prefer exact_value when it is present.
     std::int64_t value = 0;
     SourceOrigin origin;
+    // Appended so existing four-field aggregate initializers remain valid.
+    std::optional<ExactValue> exact_value;
     bool operator==(const ImportedEnumerator &) const = default;
 };
 

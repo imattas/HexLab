@@ -18,9 +18,12 @@ ID, including in a multi-threaded process. The x86-64 path exposes the 64-bit
 general, x87, and XMM register state; the AArch64 path exposes x0-x30, SP, PC,
 and CPSR. On Apple Silicon, the AArch64 register view also exposes
 `v0`-`v31`, `fpsr`, and `fpcr` through the separate `ARM_NEON_STATE64` Mach
-thread-state flavor. Register writes validate names and widths before applying
-the vector state; if the subsequent general-register update fails, the prior
-vector state is restored. Memory reads use `mach_vm_read_overwrite`; writes use
+thread-state flavor. The AArch64 view also includes `w0`-`w30` as four-byte
+low-half aliases, `wsp` as the four-byte low half of `sp`, and `fp`/`lr` as
+aliases for `x29`/`x30`. Writes through W aliases zero-extend; a batch cannot
+write two aliases of the same X register or both `sp` and `wsp`. Register writes
+validate names and widths before applying the vector state; if the subsequent
+general-register update fails, the prior vector state is restored. Memory reads use `mach_vm_read_overwrite`; writes use
 `mach_vm_write` and preserve original bytes beneath owned software breakpoints.
 Software traps use `INT3` on x86-64 and aligned `BRK` instructions on AArch64.
 For writes to non-writable regions, the backend temporarily requests write
@@ -30,8 +33,14 @@ original protection. Code-signing policy or mapping limits can still reject
 code patches, and a protection-restore failure is returned explicitly.
 Breakpoint state is restored on removal or detach. Module enumeration reads
 the stopped process's 64-bit dyld image information, and memory-region
-enumeration uses Mach VM region queries. Hardware breakpoints and watchpoints
-remain unsupported.
+enumeration uses Mach VM region queries. On x86-64, the backend can install
+one-byte execution breakpoints and write/access data watchpoints in the four
+hardware comparator slots they share. When a SIGTRAP reports comparator-hit
+bits in DR6, the event includes the matching owned breakpoint IDs and
+addresses; the hit bits are cleared before the event is resumed. Read-only
+watchpoints remain unsupported. AArch64 data comparator programming and
+precise ESR-based watchpoint hit attribution are available; hardware execute
+breakpoints are not yet supported on that architecture.
 
 Darwin task suspension is held while the backend inspects a stopped target,
 which gives thread enumeration and register access a process-wide stop

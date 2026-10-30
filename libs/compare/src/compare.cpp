@@ -1,7 +1,9 @@
 #include "hexlab/compare/compare.hpp"
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <queue>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -45,11 +47,13 @@ std::uint32_t histogram_similarity(const std::vector<std::uint32_t> &left,
     }
     return low;
 }
-bool valid(const RegionView &r) {
+bool valid(const RegionView &r, std::stop_token stop) {
     if (r.key.empty() || (!r.bytes.empty() && r.bytes.size() - 1 > UINT64_MAX - r.address)) return false;
     std::uint64_t previous_end = 0;
     bool first = true;
+    std::size_t range_index = 0;
     for (const auto &range : r.ignored_ranges) {
+        if ((range_index++ & 0xffu) == 0 && stop.stop_requested()) return false;
         if (!range.size || range.offset > r.bytes.size() || range.size > r.bytes.size() - range.offset ||
             (!first && range.offset < previous_end)) return false;
         previous_end = range.offset + range.size;
@@ -57,14 +61,19 @@ bool valid(const RegionView &r) {
     }
     return true;
 }
-std::optional<Error> validate(const ImageView &image) {
+std::optional<Error> validate(const ImageView &image, std::stop_token stop) {
     std::unordered_set<std::string> keys;
     std::uint64_t ignored_ranges = 0;
+    std::size_t region_index = 0;
     for (const auto &r : image.regions) {
+        if ((region_index++ & 0xffu) == 0 && stop.stop_requested())
+            return Error{ErrorCode::canceled, "comparison canceled"};
         if (r.key.empty()) return Error{ErrorCode::invalid_argument, "region key must not be empty"};
         if (!r.bytes.empty() && r.bytes.size() - 1 > UINT64_MAX - r.address)
             return Error{ErrorCode::overflow, "region address extent overflows"};
-        if (!valid(r)) return Error{ErrorCode::invalid_argument, "ignored byte ranges must be nonempty, ordered, disjoint, and inside the region"};
+        if (!valid(r, stop)) return stop.stop_requested()
+            ? std::optional<Error>{Error{ErrorCode::canceled, "comparison canceled"}}
+            : std::optional<Error>{Error{ErrorCode::invalid_argument, "ignored byte ranges must be nonempty, ordered, disjoint, and inside the region"}};
         if (r.ignored_ranges.size() > 1'000'000 - ignored_ranges)
             return Error{ErrorCode::resource_limit, "ignored byte range count exceeds budget"};
         ignored_ranges += r.ignored_ranges.size();
@@ -208,7 +217,9 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
         return Error{ErrorCode::invalid_argument, "function CFG edge target is outside its block list"};
     std::uint64_t fingerprint_items = 0, histogram_items = 0, call_edges = 0, semantic_items = 0;
     const auto count_semantics = [&](const auto &items, std::size_t expected) -> bool {
-        if ((!items.empty() && items.size() != expected) ||
+        // Semantic-only frontends may omit the duplicate top-level fingerprint
+        // vector; every semantic record still carries its normalized identity.
+        if ((!items.empty() && expected != 0 && items.size() != expected) ||
             items.size() > options.max_semantic_items - semantic_items) return false;
         semantic_items += items.size();
         return true;
@@ -216,8 +227,10 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
     const auto count_fingerprints = [&](auto functions) -> bool {
         for (const auto &fn : functions) {
             if (!count_semantics(fn.instruction_semantics, fn.instruction_fingerprints.size())) return false;
-            if (fn.instruction_fingerprints.size() > options.max_fingerprint_items - fingerprint_items) return false;
-            fingerprint_items += fn.instruction_fingerprints.size();
+            const auto instruction_items = fn.instruction_fingerprints.empty()
+                ? fn.instruction_semantics.size() : fn.instruction_fingerprints.size();
+            if (instruction_items > options.max_fingerprint_items - fingerprint_items) return false;
+            fingerprint_items += instruction_items;
             if (fn.cfg_fingerprints.size() > options.max_fingerprint_items - fingerprint_items) return false;
             fingerprint_items += fn.cfg_fingerprints.size();
             if (fn.cfg_blocks.size() > options.max_fingerprint_items - fingerprint_items) return false;
@@ -230,12 +243,31 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
                     block.instruction_semantics.size() > options.max_semantic_items - semantic_items)
                     return false;
                 semantic_items += block.instruction_semantics.size();
+                const auto total_instructions = block.instruction_count ? block.instruction_count
+                                                                         : block.instruction_fingerprints.size();
+                if ((!block.instruction_fingerprints_available &&
+                     (!block.instruction_fingerprints.empty() || !block.instruction_fingerprint_positions.empty())) ||
+                    block.instruction_fingerprint_positions.size() &&
+                        block.instruction_fingerprint_positions.size() != block.instruction_fingerprints.size() ||
+                    block.instruction_fingerprints.size() > total_instructions ||
+                    (block.instruction_fingerprints_complete &&
+                     block.instruction_fingerprints.size() != total_instructions) ||
+                    (!block.instruction_fingerprints_available && block.instruction_fingerprints_complete && total_instructions))
+                    return false;
+                std::uint64_t previous_position = 0;
+                for (std::size_t i = 0; i < block.instruction_fingerprint_positions.size(); ++i) {
+                    const auto position = block.instruction_fingerprint_positions[i];
+                    if (position >= total_instructions || (i && position <= previous_position)) return false;
+                    previous_position = position;
+                }
                 if (block.successors.size() > options.max_fingerprint_items - fingerprint_items) return false;
                 fingerprint_items += block.successors.size();
-                if ((!block.instruction_fingerprints_available && !block.instruction_fingerprints.empty()) ||
-                    block.instruction_fingerprints.size() > options.max_fingerprint_items - fingerprint_items)
+                if (block.instruction_fingerprints.size() > options.max_fingerprint_items - fingerprint_items)
                     return false;
                 fingerprint_items += block.instruction_fingerprints.size();
+                if (block.instruction_fingerprint_positions.size() > options.max_fingerprint_items - fingerprint_items)
+                    return false;
+                fingerprint_items += block.instruction_fingerprint_positions.size();
                 for (const auto &edge : block.successors)
                     if (edge.target >= fn.cfg_blocks.size()) return false;
             }
@@ -252,7 +284,10 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
     const auto phases = 1ull + (refine ? options.max_call_graph_rounds : 0);
     if (pair_count > UINT64_MAX / phases)
         return Error{ErrorCode::overflow, "function progress estimate overflows"};
-    const auto total_work = pair_count * phases;
+    const auto matching_work = pair_count * phases;
+    if (call_edges > UINT64_MAX - matching_work)
+        return Error{ErrorCode::overflow, "function progress estimate overflows"};
+    const auto total_work = matching_work + call_edges;
     std::uint64_t visited = 0;
     const auto progress = [&](bool force = false) {
         return !options.stop_token.stop_requested() &&
@@ -271,6 +306,11 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
         for (const auto &fn : functions) {
             if (options.stop_token.stop_requested()) return false;
             prepared.push_back(fn.instruction_fingerprints);
+            if (prepared.back().empty() && !fn.instruction_semantics.empty()) {
+                prepared.back().reserve(fn.instruction_semantics.size());
+                for (const auto &instruction : fn.instruction_semantics)
+                    prepared.back().push_back(instruction.fingerprint);
+            }
             std::sort(prepared.back().begin(), prepared.back().end());
             prepared_cfg.push_back(fn.cfg_fingerprints);
             std::sort(prepared_cfg.back().begin(), prepared_cfg.back().end());
@@ -307,7 +347,13 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
         for (const auto &function : functions) {
             if (options.stop_token.stop_requested()) return false;
             std::vector<std::uint64_t> sketch;
-            if (!sequence_sketch(function.instruction_fingerprints, options.stop_token, sketch)) return false;
+            auto instructions = function.instruction_fingerprints;
+            if (instructions.empty() && !function.instruction_semantics.empty()) {
+                instructions.reserve(function.instruction_semantics.size());
+                for (const auto &instruction : function.instruction_semantics)
+                    instructions.push_back(instruction.fingerprint);
+            }
+            if (!sequence_sketch(instructions, options.stop_token, sketch)) return false;
             if (sketch.size() > options.max_sequence_items - sequence_items) return false;
             sequence_items += sketch.size();
             prepared.push_back(std::move(sketch));
@@ -338,12 +384,16 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
         const auto denom = static_cast<std::uint64_t>(left.size()) + right.size();
         return denom ? static_cast<std::uint32_t>((200 * common) / denom) : 100u;
     };
+    struct ScoredCandidate { std::uint32_t total = 0; FunctionScoreBreakdown detail{}; };
     const auto similarity = [&](const FunctionFeature &a, const FunctionFeature &b,
                                 const auto &left, const auto &right,
                                 const auto &left_cfg, const auto &right_cfg,
-                                const auto &left_sequence, const auto &right_sequence) -> std::uint32_t {
-        if (a.architecture != b.architecture) return 0;
+                                const auto &left_sequence, const auto &right_sequence) -> ScoredCandidate {
+        ScoredCandidate result;
+        if (a.architecture != b.architecture) return result;
         const bool named = !a.name.empty() && a.name == b.name;
+        result.detail.available = true;
+        result.detail.exact_name = named;
         const auto shape_weight = weights.instruction_count_weight + weights.block_count_weight +
                                   weights.call_count_weight;
         const auto shape = static_cast<std::uint32_t>(
@@ -352,6 +402,8 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
              static_cast<std::uint64_t>(ratio(a.block_count, b.block_count)) * weights.block_count_weight +
              static_cast<std::uint64_t>(ratio(a.call_count, b.call_count)) * weights.call_count_weight) /
             shape_weight);
+        result.detail.shape_available = true;
+        result.detail.shape_similarity = shape;
         std::uint32_t score = shape;
         if (!left.empty() || !right.empty()) {
             // Multiset Dice similarity is independent of instruction order and load address.
@@ -362,10 +414,14 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
                     (static_cast<std::uint64_t>(ordered_score) * weights.sequence_weight +
                      static_cast<std::uint64_t>(fingerprint_score) * (100u - weights.sequence_weight)) / 100u);
             }
+            result.detail.instruction_available = true;
+            result.detail.instruction_similarity = fingerprint_score;
             score = (fingerprint_score * weights.fingerprint_weight +
                      shape * (100u - weights.fingerprint_weight)) / 100u;
         } else if (!a.opcode_histogram.empty() || !b.opcode_histogram.empty()) {
             const auto hist = histogram_similarity(a.opcode_histogram, b.opcode_histogram);
+            result.detail.histogram_available = true;
+            result.detail.histogram_similarity = hist;
             score = (hist * weights.histogram_weight + shape * (100u - weights.histogram_weight)) / 100u;
         } else {
             // Coarse counts alone are not enough to assert a correspondence.
@@ -373,13 +429,19 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
         }
         if (!left_cfg.empty() || !right_cfg.empty()) {
             const auto cfg_score = multiset_similarity(left_cfg, right_cfg);
+            result.detail.cfg_available = true;
+            result.detail.cfg_similarity = cfg_score;
             score = (cfg_score * weights.cfg_weight + score * (100u - weights.cfg_weight)) / 100u;
         }
-        if (named) score = std::max(score, weights.same_name_floor);
-        return score;
+        if (named && score < weights.same_name_floor) {
+            score = weights.same_name_floor;
+            result.detail.name_floor_applied = true;
+        }
+        result.total = score;
+        return result;
     };
 
-    std::vector<std::uint32_t> scores(static_cast<std::size_t>(pair_count));
+    std::vector<ScoredCandidate> scores(static_cast<std::size_t>(pair_count));
     std::vector<std::uint32_t> old_best(old_functions.size()), new_best(new_functions.size());
     std::uint64_t cfg_comparison_items = 0;
     for (std::size_t oi = 0; oi < old_functions.size(); ++oi) {
@@ -393,14 +455,15 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
                                 std::min(options.max_cfg_comparison_items, cfg_comparison_items))
                 return Error{ErrorCode::invalid_argument, "function CFG comparison budget exceeded"};
             cfg_comparison_items += cfg_items;
-            const auto score = similarity(old_functions[oi], new_functions[ni], old_fingerprints[oi],
+            const auto scored = similarity(old_functions[oi], new_functions[ni], old_fingerprints[oi],
                                           new_fingerprints[ni],
                                           (!old_cfg_graph[oi].empty() && !new_cfg_graph[ni].empty())
                                               ? old_cfg_graph[oi] : old_cfg[oi],
                                           (!old_cfg_graph[oi].empty() && !new_cfg_graph[ni].empty())
                                               ? new_cfg_graph[ni] : new_cfg[ni],
                                           old_sequence[oi], new_sequence[ni]);
-            scores[oi * new_functions.size() + ni] = score;
+            scores[oi * new_functions.size() + ni] = scored;
+            const auto score = scored.total;
             old_best[oi] = std::max(old_best[oi], score);
             new_best[ni] = std::max(new_best[ni], score);
             ++visited;
@@ -412,14 +475,14 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
         if (old_best[oi] < options.minimum_confidence) return false;
         std::size_t count = 0;
         for (std::size_t ni = 0; ni < new_functions.size(); ++ni)
-            if (old_best[oi] - scores[oi * new_functions.size() + ni] <= options.ambiguity_margin) ++count;
+            if (old_best[oi] - scores[oi * new_functions.size() + ni].total <= options.ambiguity_margin) ++count;
         return count > 1;
     };
     const auto tied_new = [&](std::size_t ni) {
         if (new_best[ni] < options.minimum_confidence) return false;
         std::size_t count = 0;
         for (std::size_t oi = 0; oi < old_functions.size(); ++oi)
-            if (new_best[ni] - scores[oi * new_functions.size() + ni] <= options.ambiguity_margin) ++count;
+            if (new_best[ni] - scores[oi * new_functions.size() + ni].total <= options.ambiguity_margin) ++count;
         return count > 1;
     };
     const auto unmatched = std::numeric_limits<std::size_t>::max();
@@ -429,13 +492,14 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
         if (options.stop_token.stop_requested()) return Error{ErrorCode::canceled, "function matching canceled"};
         if (old_best[oi] == 0 || old_best[oi] < options.minimum_confidence) continue;
         std::size_t best_ni = 0;
-        while (best_ni < new_functions.size() && scores[oi * new_functions.size() + best_ni] != old_best[oi]) ++best_ni;
+        while (best_ni < new_functions.size() && scores[oi * new_functions.size() + best_ni].total != old_best[oi]) ++best_ni;
         const bool ambiguous = tied_old(oi) || best_ni == new_functions.size() || tied_new(best_ni) ||
                                new_best[best_ni] != old_best[oi];
         if (ambiguous) continue;
         old_to_new[oi] = best_ni;
         new_to_old[best_ni] = oi;
         evidence[oi].base_confidence = old_best[oi];
+        evidence[oi].score_breakdown = scores[oi * new_functions.size() + best_ni].detail;
     }
 
     const auto build_graph = [&](auto functions) -> Result<CallGraph> {
@@ -491,7 +555,7 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
                 for (std::size_t ni = 0; ni < new_functions.size(); ++ni) {
                     ++visited;
                     if (!progress()) return Error{ErrorCode::canceled, "function matching canceled"};
-                    const auto score = scores[oi * new_functions.size() + ni];
+                    const auto score = scores[oi * new_functions.size() + ni].total;
                     if (old_to_new[oi] != unmatched || new_to_old[ni] != unmatched ||
                         old_functions[oi].architecture != new_functions[ni].architecture ||
                         score == 0 || score < options.minimum_confidence || old_best[oi] - score > options.ambiguity_margin ||
@@ -514,13 +578,16 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
                 const auto ni = candidates[oi];
                 if (old_counts[oi] != 1 || new_counts[ni] != 1) continue;
                 old_to_new[oi] = ni; new_to_old[ni] = oi;
-                evidence[oi] = {scores[oi * new_functions.size() + ni], supports[oi], static_cast<std::uint32_t>(round)};
+                evidence[oi].base_confidence = scores[oi * new_functions.size() + ni].total;
+                evidence[oi].supporting_call_neighbors = supports[oi];
+                evidence[oi].call_graph_round = static_cast<std::uint32_t>(round);
+                evidence[oi].score_breakdown = scores[oi * new_functions.size() + ni].detail;
                 changed = true;
             }
             if (!changed) break;
         }
     }
-    visited = total_work;
+    visited = matching_work;
     if (!progress(true)) return Error{ErrorCode::canceled, "function matching canceled"};
     std::vector<FunctionMatch> result;
     result.reserve(old_functions.size() + new_functions.size());
@@ -540,6 +607,82 @@ Result<std::vector<FunctionMatch>> match_functions_detailed(
     for (std::size_t ni = 0; ni < new_functions.size(); ++ni)
         if (new_to_old[ni] == unmatched) result.push_back({FunctionMatchKind::added, {}, new_functions[ni].entry, 0, 0,
                                             new_functions[ni].address_space, {}, new_functions[ni].name});
+
+    // Summarize outgoing in-image direct-call target changes only when both
+    // frontends explicitly provide complete call-target sets for the matched
+    // caller. Target pairs are compared through the final ambiguity-preserving
+    // function mapping, never by their raw addresses.
+    using QualifiedEntry = std::pair<std::uint32_t, std::uint64_t>;
+    std::map<QualifiedEntry, std::size_t> match_by_old, match_by_new;
+    std::map<QualifiedEntry, const FunctionFeature *> feature_by_old, feature_by_new;
+    for (std::size_t i = 0; i < old_functions.size(); ++i) {
+        if (options.stop_token.stop_requested()) return Error{ErrorCode::canceled, "function matching canceled"};
+        feature_by_old.emplace(QualifiedEntry{old_functions[i].address_space, old_functions[i].entry}, &old_functions[i]);
+    }
+    for (std::size_t i = 0; i < new_functions.size(); ++i) {
+        if (options.stop_token.stop_requested()) return Error{ErrorCode::canceled, "function matching canceled"};
+        feature_by_new.emplace(QualifiedEntry{new_functions[i].address_space, new_functions[i].entry}, &new_functions[i]);
+    }
+    for (std::size_t i = 0; i < result.size(); ++i) {
+        if (options.stop_token.stop_requested()) return Error{ErrorCode::canceled, "function matching canceled"};
+        const auto &match = result[i];
+        if (match.old_entry) match_by_old.emplace(QualifiedEntry{match.old_space, *match.old_entry}, i);
+        if (match.new_entry) match_by_new.emplace(QualifiedEntry{match.new_space, *match.new_entry}, i);
+    }
+    for (auto &caller : result) {
+        if (options.stop_token.stop_requested()) return Error{ErrorCode::canceled, "function matching canceled"};
+        if (caller.kind != FunctionMatchKind::matched || !caller.old_entry || !caller.new_entry) continue;
+        const auto old_source = feature_by_old.find({caller.old_space, *caller.old_entry});
+        const auto new_source = feature_by_new.find({caller.new_space, *caller.new_entry});
+        if (old_source == feature_by_old.end() || new_source == feature_by_new.end() ||
+            !old_source->second->direct_calls_complete || !new_source->second->direct_calls_complete) continue;
+        auto &summary = caller.call_targets;
+        summary.available = true;
+        std::set<QualifiedEntry> old_calls, new_calls;
+        for (const auto &target : old_source->second->direct_calls) {
+            if (options.stop_token.stop_requested()) return Error{ErrorCode::canceled, "function matching canceled"};
+            old_calls.emplace(target.address_space, target.entry);
+            ++visited;
+            if (!progress()) return Error{ErrorCode::canceled, "function matching canceled"};
+        }
+        for (const auto &target : new_source->second->direct_calls) {
+            if (options.stop_token.stop_requested()) return Error{ErrorCode::canceled, "function matching canceled"};
+            new_calls.emplace(target.address_space, target.entry);
+            ++visited;
+            if (!progress()) return Error{ErrorCode::canceled, "function matching canceled"};
+        }
+        for (const auto &target : old_calls) {
+            if (options.stop_token.stop_requested()) return Error{ErrorCode::canceled, "function matching canceled"};
+            const auto mapped = match_by_old.find(target);
+            if (mapped == match_by_old.end()) { ++summary.ambiguous; continue; }
+            const auto &callee = result[mapped->second];
+            if (callee.kind == FunctionMatchKind::matched && callee.new_entry) {
+                if (new_calls.contains({callee.new_space, *callee.new_entry})) ++summary.unchanged;
+                else ++summary.removed;
+            } else if (callee.kind == FunctionMatchKind::removed) {
+                ++summary.removed;
+            } else {
+                ++summary.ambiguous;
+            }
+        }
+        for (const auto &target : new_calls) {
+            if (options.stop_token.stop_requested()) return Error{ErrorCode::canceled, "function matching canceled"};
+            const auto mapped = match_by_new.find(target);
+            if (mapped == match_by_new.end()) { ++summary.ambiguous; continue; }
+            const auto &callee = result[mapped->second];
+            if (callee.kind == FunctionMatchKind::matched && callee.old_entry) {
+                if (!old_calls.contains({callee.old_space, *callee.old_entry})) ++summary.added;
+            } else if (callee.kind == FunctionMatchKind::added) {
+                ++summary.added;
+            } else if (callee.kind == FunctionMatchKind::ambiguous) {
+                ++summary.ambiguous;
+            } else {
+                ++summary.ambiguous;
+            }
+        }
+    }
+    visited = total_work;
+    if (!progress(true)) return Error{ErrorCode::canceled, "function matching canceled"};
     return result;
 }
 
@@ -561,36 +704,67 @@ Result<Report> compare(const ImageView &old_image, const ImageView &new_image,
                        const CompareOptions &options) {
     if (options.resync_anchor_bytes == 0 || options.resync_anchor_bytes > 64)
         return Error{ErrorCode::invalid_argument, "resynchronization anchor length must be between 1 and 64 bytes"};
-    if (auto e = validate(old_image)) return *e;
-    if (auto e = validate(new_image)) return *e;
+    if (options.stop_token.stop_requested()) return Error{ErrorCode::canceled, "comparison canceled"};
+    if (auto e = validate(old_image, options.stop_token)) return *e;
+    if (auto e = validate(new_image, options.stop_token)) return *e;
+    if (old_image.regions.size() > 2'000'000 || new_image.regions.size() > 2'000'000 ||
+        old_image.regions.size() > 2'000'000 - std::min<std::size_t>(new_image.regions.size(), 2'000'000))
+        return Error{ErrorCode::resource_limit, "comparison region count exceeds 2 million"};
     std::unordered_map<std::string, const RegionView *> newer;
-    for (const auto &r : new_image.regions) newer.emplace(r.key, &r);
+    std::size_t setup_index = 0;
+    for (const auto &r : new_image.regions) {
+        if ((setup_index++ & 0xffu) == 0 && options.stop_token.stop_requested())
+            return Error{ErrorCode::canceled, "comparison canceled"};
+        newer.emplace(r.key, &r);
+    }
     std::unordered_map<std::string, const RegionView *> older;
-    for (const auto &r : old_image.regions) older.emplace(r.key, &r);
+    setup_index = 0;
+    for (const auto &r : old_image.regions) {
+        if ((setup_index++ & 0xffu) == 0 && options.stop_token.stop_requested())
+            return Error{ErrorCode::canceled, "comparison canceled"};
+        older.emplace(r.key, &r);
+    }
     std::unordered_set<std::string> visited;
     std::uint64_t total = 0;
-    for (const auto &r : old_image.regions) if (!increment(total, r.bytes.size()))
-        return Error{ErrorCode::overflow, "comparison size overflows"};
+    setup_index = 0;
+    for (const auto &r : old_image.regions) {
+        if ((setup_index++ & 0xffu) == 0 && options.stop_token.stop_requested())
+            return Error{ErrorCode::canceled, "comparison canceled"};
+        if (!increment(total, r.bytes.size())) return Error{ErrorCode::overflow, "comparison size overflows"};
+    }
+    setup_index = 0;
     for (const auto &r : new_image.regions) {
+        if ((setup_index++ & 0xffu) == 0 && options.stop_token.stop_requested())
+            return Error{ErrorCode::canceled, "comparison canceled"};
         const auto found = older.find(r.key);
         const auto old_size = found == older.end() ? 0 : found->second->bytes.size();
         if (r.bytes.size() > old_size && !increment(total, r.bytes.size() - old_size))
             return Error{ErrorCode::overflow, "comparison size overflows"};
     }
     Report report;
+    report.region_summaries_available = true;
     std::uint64_t progressed = 0, since_callback = 0;
+    std::optional<ChangeRun> last_logical_run;
+    bool last_logical_run_retained = false;
     const auto canceled = [&]() { return options.stop_token.stop_requested(); };
     const auto emit = [&](ChangeKind kind, const std::string &key, std::optional<std::uint64_t> old_addr,
                           std::optional<std::uint64_t> new_addr) {
-        if (!report.runs.empty()) {
-            auto &last = report.runs.back();
-            if (last.kind == kind && last.region_key == key && last.size != UINT64_MAX &&
-                ((!old_addr && !last.old_address) || (old_addr && last.old_address && *old_addr == *last.old_address + last.size)) &&
-                ((!new_addr && !last.new_address) || (new_addr && last.new_address && *new_addr == *last.new_address + last.size))) {
-                ++last.size; return;
-            }
+        const auto follows = [](const auto &address, const auto &previous, std::uint64_t size) {
+            return (!address && !previous) || (address && previous && size <= UINT64_MAX - *previous &&
+                                                *address == *previous + size);
+        };
+        if (last_logical_run && last_logical_run->kind == kind && last_logical_run->region_key == key &&
+            last_logical_run->size != UINT64_MAX && follows(old_addr, last_logical_run->old_address, last_logical_run->size) &&
+            follows(new_addr, last_logical_run->new_address, last_logical_run->size)) {
+            ++last_logical_run->size;
+            if (last_logical_run_retained) ++report.runs.back().size;
+            return;
         }
-        report.runs.push_back({kind, key, old_addr, new_addr, 1});
+        if (report.total_runs != UINT64_MAX) ++report.total_runs;
+        last_logical_run = ChangeRun{kind, key, old_addr, new_addr, 1};
+        last_logical_run_retained = report.runs.size() < options.max_change_runs;
+        if (last_logical_run_retained) report.runs.push_back(*last_logical_run);
+        else report.runs_truncated = true;
     };
     const auto account_progress = [&](bool force = false) -> bool {
         if (canceled()) return false;
@@ -609,6 +783,13 @@ Result<Report> compare(const ImageView &old_image, const ImageView &new_image,
         const auto found = newer.find(old_region.key);
         if (found == newer.end()) {
             ++report.summary.removed_regions;
+            RegionSummary region;
+            region.region_key = old_region.key;
+            region.kind = RegionChangeKind::removed;
+            region.old_address = old_region.address;
+            region.old_size = old_region.bytes.size();
+            region.removed_bytes = old_region.bytes.size();
+            report.regions.push_back(std::move(region));
             for (std::size_t i = 0; i < old_region.bytes.size(); ++i) {
                 emit(ChangeKind::removed, old_region.key, old_region.address + i, {});
                 if (!increment(report.summary.removed_bytes) || !account_byte()) return Error{ErrorCode::canceled, "comparison canceled"};
@@ -618,18 +799,25 @@ Result<Report> compare(const ImageView &old_image, const ImageView &new_image,
         visited.insert(old_region.key);
         ++report.summary.matched_regions;
         const auto &new_region = *found->second;
+        RegionSummary region;
+        region.region_key = old_region.key;
+        region.kind = RegionChangeKind::matched;
+        region.old_address = old_region.address;
+        region.new_address = new_region.address;
+        region.old_size = old_region.bytes.size();
+        region.new_size = new_region.bytes.size();
         std::size_t old_i = 0, new_i = 0;
         const auto old_size = old_region.bytes.size();
         const auto new_size = new_region.bytes.size();
         const auto compare_pair = [&](std::size_t oi, std::size_t ni) -> bool {
-            if (!increment(report.summary.compared_bytes)) return false;
+            if (!increment(report.summary.compared_bytes) || !increment(region.compared_bytes)) return false;
             if (ignored_at(old_region, oi) || ignored_at(new_region, ni)) {
-                if (!increment(report.summary.ignored_bytes)) return false;
+                if (!increment(report.summary.ignored_bytes) || !increment(region.ignored_bytes)) return false;
             } else if (old_region.bytes[oi] == new_region.bytes[ni]) {
-                if (!increment(report.summary.equal_bytes)) return false;
+                if (!increment(report.summary.equal_bytes) || !increment(region.equal_bytes)) return false;
             } else {
                 emit(ChangeKind::changed, old_region.key, old_region.address + oi, new_region.address + ni);
-                if (!increment(report.summary.changed_bytes)) return false;
+                if (!increment(report.summary.changed_bytes) || !increment(region.changed_bytes)) return false;
             }
             return account_byte();
         };
@@ -708,14 +896,14 @@ Result<Report> compare(const ImageView &old_image, const ImageView &new_image,
             }
             while (anchor->first > paired) {
                 emit(ChangeKind::removed, old_region.key, old_region.address + old_i, {});
-                if (!increment(report.summary.removed_bytes) || !account_byte())
+                if (!increment(report.summary.removed_bytes) || !increment(region.removed_bytes) || !account_byte())
                     return Error{ErrorCode::canceled, "comparison canceled or counter overflow"};
                 ++old_i;
                 --anchor->first;
             }
             while (anchor->second > paired) {
                 emit(ChangeKind::added, new_region.key, {}, new_region.address + new_i);
-                if (!increment(report.summary.added_bytes) || !account_byte())
+                if (!increment(report.summary.added_bytes) || !increment(region.added_bytes) || !account_byte())
                     return Error{ErrorCode::canceled, "comparison canceled or counter overflow"};
                 ++new_i;
                 --anchor->second;
@@ -723,15 +911,23 @@ Result<Report> compare(const ImageView &old_image, const ImageView &new_image,
         }
         for (std::size_t i = old_i; i < old_size; ++i) {
             emit(ChangeKind::removed, old_region.key, old_region.address + i, {});
-            if (!increment(report.summary.removed_bytes) || !account_byte()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (!increment(report.summary.removed_bytes) || !increment(region.removed_bytes) || !account_byte()) return Error{ErrorCode::canceled, "comparison canceled"};
         }
         for (std::size_t i = new_i; i < new_size; ++i) {
             emit(ChangeKind::added, new_region.key, {}, new_region.address + i);
-            if (!increment(report.summary.added_bytes) || !account_byte()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (!increment(report.summary.added_bytes) || !increment(region.added_bytes) || !account_byte()) return Error{ErrorCode::canceled, "comparison canceled"};
         }
+        report.regions.push_back(std::move(region));
     }
     for (const auto &region : new_image.regions) if (!visited.contains(region.key)) {
         ++report.summary.added_regions;
+        RegionSummary summary;
+        summary.region_key = region.key;
+        summary.kind = RegionChangeKind::added;
+        summary.new_address = region.address;
+        summary.new_size = region.bytes.size();
+        summary.added_bytes = region.bytes.size();
+        report.regions.push_back(std::move(summary));
         for (std::size_t i = 0; i < region.bytes.size(); ++i) {
             emit(ChangeKind::added, region.key, {}, region.address + i);
             if (!increment(report.summary.added_bytes) || !account_byte()) return Error{ErrorCode::canceled, "comparison canceled"};

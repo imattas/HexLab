@@ -27,6 +27,49 @@ std::string command_string(const Reader &reader, const MachOLoadCommand &command
     budget.include(count + size);
     return {reinterpret_cast<const char *>(bytes.bytes.data()), size};
 }
+void linker_options(const Reader &reader, const MachOLoadCommand &command, const MachOSlice &slice,
+                    MachOMetadata &metadata, Budget &budget, std::stop_token stop) {
+    constexpr std::uint32_t maximum_options = 4096;
+    constexpr std::uint32_t maximum_command_bytes = 1024 * 1024;
+    constexpr std::size_t maximum_option_bytes = 4096;
+    require(slice.header.file_type == 1,
+            "Mach-O LC_LINKER_OPTION is only supported in MH_OBJECT files", ErrorCode::unsupported);
+    require(command.size >= 12, "Truncated Mach-O LC_LINKER_OPTION command");
+    require(command.size <= maximum_command_bytes,
+            "Mach-O linker-option command exceeds byte limit", ErrorCode::resource_limit);
+    const auto bytes = reader.bytes(command.file_offset - slice.offset, command.size);
+    const auto count = static_cast<std::uint32_t>(reader.value(bytes.bytes, 8, 4));
+    require(count <= maximum_options,
+            "Mach-O linker-option count exceeds limit", ErrorCode::resource_limit);
+    std::size_t cursor = 12;
+    std::uint32_t index = 0;
+    while (cursor < bytes.bytes.size()) {
+        canceled(stop);
+        while (cursor < bytes.bytes.size() && bytes.bytes[cursor] == std::byte{0}) ++cursor;
+        if (cursor == bytes.bytes.size()) break;
+        require(index < count, "Mach-O linker-option command contains more strings than declared");
+        const auto begin = cursor;
+        const auto end = std::find(bytes.bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
+                                   bytes.bytes.end(), std::byte{0});
+        require(end != bytes.bytes.end(), "Unterminated Mach-O linker option");
+        const auto length = static_cast<std::size_t>(end - (bytes.bytes.begin() + static_cast<std::ptrdiff_t>(begin)));
+        require(length != 0, "Mach-O linker option is empty");
+        require(length <= maximum_option_bytes,
+                "Mach-O linker option exceeds length limit", ErrorCode::resource_limit);
+        MachOLinkerOption row;
+        row.command_index = command.index;
+        row.option_index = index;
+        row.record_file_offset = command.file_offset;
+        row.string_file_offset = command.file_offset + begin;
+        row.option.assign(reinterpret_cast<const char *>(bytes.bytes.data() + begin), length);
+        budget.include(sizeof(MachOLinkerOption) + length);
+        metadata.linker_options.push_back(std::move(row));
+        cursor = static_cast<std::size_t>(end - bytes.bytes.begin()) + 1;
+        ++index;
+    }
+    require(index == count, "Mach-O LC_LINKER_OPTION string count does not match payload");
+    budget.include(command.size);
+}
 bool dylib(std::uint32_t command) {
     return command == 0xc || command == 0xd || command == 0x80000018 || command == 0x8000001f || command == 0x20 ||
            command == 0x80000023;
@@ -197,6 +240,33 @@ void source_version(const Reader &reader, const MachOLoadCommand &command, MachO
     row.prerelease = static_cast<std::uint32_t>(row.packed & 0x3ff);
     budget.include(sizeof(MachOSourceVersion));
     metadata.source_versions.push_back(std::move(row));
+}
+void uuid(const Reader &reader, const MachOLoadCommand &command, const MachOSlice &slice,
+          MachOMetadata &metadata, Budget &budget) {
+    require(command.size == 24, "Mach-O LC_UUID must be exactly 24 bytes");
+    const auto fixed = reader.bytes(command.file_offset - slice.offset, 24);
+    MachOUuid row;
+    row.command_index = command.index;
+    row.record_file_offset = command.file_offset;
+    row.value_file_offset = command.file_offset + 8;
+    for (std::size_t byte = 0; byte < row.bytes.size(); ++byte)
+        row.bytes[byte] = static_cast<std::uint8_t>(std::to_integer<unsigned>(fixed.bytes[8 + byte]));
+    budget.include(sizeof(MachOUuid));
+    metadata.uuids.push_back(std::move(row));
+}
+void note(const Reader &reader, const MachOLoadCommand &command, const MachOSlice &slice,
+          MachOMetadata &metadata, Budget &budget) {
+    require(command.size == 40, "Mach-O LC_NOTE must be 40 bytes");
+    const auto fixed = reader.bytes(command.file_offset - slice.offset, 40);
+    MachONote row;
+    row.command_index = command.index;
+    row.record_file_offset = command.file_offset;
+    row.data_owner.assign(reinterpret_cast<const char *>(fixed.bytes.data() + 8), 16);
+    const auto raw_offset = reader.value(fixed.bytes, 24, 8);
+    row.data_size = reader.value(fixed.bytes, 32, 8);
+    row.data_offset = reader.file(raw_offset, row.data_size);
+    budget.include(sizeof(MachONote) + row.data_owner.size());
+    metadata.notes.push_back(std::move(row));
 }
 void fileset_entry(const Reader &reader, const MachOLoadCommand &command, const MachOSlice &slice,
                    MachOMetadata &metadata, Budget &budget, std::stop_token stop) {
@@ -382,6 +452,7 @@ void compact_unwind(const Reader &reader, const MachOSlice &slice, const Image &
             const auto entries = reader.bytes(base + directory.page + entry_offset,
                                                static_cast<std::size_t>(entry_count) * stride);
             std::uint32_t previous = 0;
+            const auto first_function = functions.size();
             for (std::uint32_t item = 0; item < entry_count; ++item) {
                 canceled(stop);
                 std::uint32_t function_offset = 0, encoding = 0;
@@ -437,9 +508,16 @@ void compact_unwind(const Reader &reader, const MachOSlice &slice, const Image &
                 require(executable(image, address), "Mach-O compact-unwind function is outside initialized executable bytes");
                 const auto source = reader.file(base + directory.page + entry_offset + std::uint64_t(item) * stride, stride);
                 functions.push_back({section.ordinal, page, item, encoding, source.value, function_offset, address});
+                if (functions.size() > first_function + 1) {
+                    auto &prior = functions[functions.size() - 2];
+                    prior.size = function_offset - prior.function_offset;
+                }
                 roots.push_back({UINT32_MAX, source.value, function_offset, address});
                 budget.include(sizeof(MachOFunctionStart));
             }
+            auto &last = functions.back();
+            last.size = std::uint64_t(rows[page + 1].function) - last.function_offset;
+            require(last.size != 0, "Mach-O compact-unwind terminal interval is empty");
         }
     }
     for (auto &function : functions) metadata.compact_unwind_functions.push_back(std::move(function));
@@ -1105,12 +1183,12 @@ void eh_frame(const Reader &reader, const MachOSlice &slice, const Image &image,
 }
 } // namespace
 bool supported_command(std::uint32_t command) {
-    return command == 1 || command == 0x19 || command == 2 || command == 0xb || dylib(command) || command == 0xe ||
+    return command == 1 || command == 0x19 || command == 2 || command == 0xb || command == 0x1b || dylib(command) || command == 0xe ||
            command == 0xf || command == 0x8000001c || command == 0x80000028 || command == 4 || command == 5 ||
            command == 0x11 || command == 0x1a || command == 0x26 || command == 0x22 || command == 0x80000022 || command == 0x80000033 ||
            command == 0x80000034 || command == 0x29 || command == 0x1d || command == 0x21 || command == 0x2c ||
            command == 0x32 || command == 0x24 || command == 0x25 || command == 0x2f || command == 0x30 ||
-           command == 0x2a || command == 0x35;
+           command == 0x2a || command == 0x31 || command == 0x35;
 }
 void read_commands(const ByteStorage &storage, const Image &image, MachOMetadata &metadata, Budget &budget,
                    std::stop_token stop) {
@@ -1154,6 +1232,16 @@ void read_commands(const ByteStorage &storage, const Image &image, MachOMetadata
             row.name = command_string(reader, command, slice.offset, row.name_offset, 24, budget);
             budget.include(sizeof(MachOLibrary));
             metadata.libraries.push_back(std::move(row));
+        } else if (command.command == 0x80000027) {
+            require(command.size >= 12, "Truncated Mach-O LC_DYLD_ENVIRONMENT command");
+            const auto fixed = reader.bytes(command.file_offset - slice.offset, 12);
+            MachODyldEnvironment row;
+            row.command_index = command.index;
+            row.record_file_offset = command.file_offset;
+            row.name_offset = static_cast<std::uint32_t>(reader.value(fixed.bytes, 8, 4));
+            row.value = command_string(reader, command, slice.offset, row.name_offset, 12, budget);
+            budget.include(sizeof(MachODyldEnvironment));
+            metadata.dyld_environments.push_back(std::move(row));
         } else if (command.command == 0xe || command.command == 0xf || command.command == 0x8000001c) {
             require(command.size >= 12, "Truncated Mach-O path command");
             const auto fixed = reader.bytes(command.file_offset - slice.offset, 12);
@@ -1214,10 +1302,16 @@ void read_commands(const ByteStorage &storage, const Image &image, MachOMetadata
             build_version(reader, command, metadata, budget, stop);
         } else if (command.command == 0x2a) {
             source_version(reader, command, metadata, budget);
+        } else if (command.command == 0x1b) {
+            uuid(reader, command, slice, metadata, budget);
+        } else if (command.command == 0x31) {
+            note(reader, command, slice, metadata, budget);
         } else if (command.command == 0x26) {
             function_starts(reader, command, slice, image, metadata, text_base, budget, stop);
         } else if (command.command == 0x35) {
             fileset_entry(reader, command, slice, metadata, budget, stop);
+        } else if (command.command == 0x2d) {
+            linker_options(reader, command, slice, metadata, budget, stop);
         }
     }
     compact_unwind(reader, slice, image, metadata, text_base, budget, stop);

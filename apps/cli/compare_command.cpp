@@ -6,6 +6,7 @@
 #include "hexlab/analysis/functions.hpp"
 #include "hexlab/processors/instruction.hpp"
 #include "hexlab/workspace/document.hpp"
+#include "hexlab/image/metadata.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -117,6 +119,7 @@ std::optional<std::uint64_t> instruction_fingerprint(const Instruction &instruct
         hash.add(static_cast<std::uint64_t>(instruction.arm->predicate));
         hash.add(static_cast<std::uint64_t>(instruction.arm->exchange));
         hash.add(instruction.arm->flags_written); hash.add(instruction.arm->flags_known);
+        hash.add(instruction.arm->q_flag_may_set);
         hash.add(instruction.arm->writes_pc); hash.add(instruction.arm->writeback);
     } else hash.add(UINT64_MAX);
     return hash.value;
@@ -146,6 +149,7 @@ std::vector<compare::FunctionFeature> function_features(const FunctionSnapshot &
     features.reserve(snapshot.functions.size());
     std::map<std::uint64_t, std::size_t> feature_by_id;
     std::uint64_t cfg_instruction_fingerprint_budget = 2'000'000;
+    std::uint64_t instruction_address_budget = 1'000'000;
     for (const auto &function : snapshot.functions) {
         if (!function) continue;
         compare::FunctionFeature feature;
@@ -175,24 +179,30 @@ std::vector<compare::FunctionFeature> function_features(const FunctionSnapshot &
                 compare::CfgBlockFeature block_feature;
                 std::vector<std::uint32_t> opcodes;
                 bool block_fingerprints_complete = true;
-                for (const auto &fact : block->second->instructions) if (fact) {
+                std::uint64_t instruction_position = 0;
+                for (const auto &fact : block->second->instructions) {
+                    if (!fact) {
+                        block_fingerprints_complete = false;
+                        ++instruction_position;
+                        continue;
+                    }
                     opcodes.push_back(static_cast<std::uint32_t>(fact->instruction.opcode));
                     const auto fingerprint = instruction_fingerprint(fact->instruction);
-                    if (!fingerprint || block_feature.instruction_fingerprints.size() >=
-                                            cfg_instruction_fingerprint_budget) {
+                    if (!fingerprint || cfg_instruction_fingerprint_budget <
+                                            (block_feature.instruction_fingerprints.size() + 1) * 2) {
                         block_fingerprints_complete = false;
-                    } else if (block_fingerprints_complete) {
+                    } else {
                         block_feature.instruction_fingerprints.push_back(*fingerprint);
+                        block_feature.instruction_fingerprint_positions.push_back(instruction_position);
                         block_feature.instruction_semantics.push_back(::hexlab::app::compare_semantic_feature(fact->instruction, *fingerprint));
                     }
+                    ++instruction_position;
                 }
-                if (block_fingerprints_complete) {
-                    block_feature.instruction_fingerprints_available = true;
-                    cfg_instruction_fingerprint_budget -= block_feature.instruction_fingerprints.size();
-                } else {
-                    block_feature.instruction_fingerprints.clear();
-                    block_feature.instruction_semantics.clear();
-                }
+                block_feature.instruction_count = instruction_position;
+                block_feature.instruction_fingerprints_available = !block_feature.instruction_fingerprints.empty();
+                block_feature.instruction_fingerprints_complete = block_fingerprints_complete &&
+                    block_feature.instruction_fingerprints.size() == instruction_position;
+                cfg_instruction_fingerprint_budget -= block_feature.instruction_fingerprints.size() * 2;
                 std::sort(opcodes.begin(), opcodes.end());
                 auto hash = mix(offset_basis, opcodes.size());
                 for (const auto opcode : opcodes) hash = mix(hash, opcode);
@@ -213,6 +223,7 @@ std::vector<compare::FunctionFeature> function_features(const FunctionSnapshot &
             }
         }
         bool fingerprint_complete = true;
+        bool instruction_addresses_complete = true;
         for (const auto block_id : function->blocks) {
             const auto found = blocks.find(block_id.value);
             if (found == blocks.end()) continue;
@@ -226,20 +237,39 @@ std::vector<compare::FunctionFeature> function_features(const FunctionSnapshot &
                 if (fingerprint_complete) {
                     if (const auto fingerprint = instruction_fingerprint(fact->instruction)) {
                         feature.instruction_fingerprints.push_back(*fingerprint);
+                        if (instruction_addresses_complete && instruction_address_budget) {
+                            feature.instruction_addresses.push_back({fact->instruction.address.offset,
+                                                                     fact->instruction.address.space.value});
+                            --instruction_address_budget;
+                        } else {
+                            instruction_addresses_complete = false;
+                        }
                         feature.instruction_semantics.push_back(::hexlab::app::compare_semantic_feature(fact->instruction, *fingerprint));
-                    } else { fingerprint_complete = false; feature.instruction_fingerprints.clear(); feature.instruction_semantics.clear(); }
+                    } else {
+                        fingerprint_complete = false;
+                        feature.instruction_fingerprints.clear();
+                        feature.instruction_addresses.clear();
+                        feature.instruction_semantics.clear();
+                    }
                 }
             }
         }
+        if (fingerprint_complete && !instruction_addresses_complete)
+            feature.instruction_addresses.clear();
         feature_by_id.emplace(function->id.value, features.size());
+        feature.direct_calls_complete = snapshot.complete;
         features.push_back(std::move(feature));
     }
+    std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> feature_by_address;
+    for (std::size_t i = 0; i < features.size(); ++i)
+        feature_by_address.emplace(std::pair{features[i].address_space, features[i].entry}, i);
     for (const auto &call : snapshot.calls) {
         const auto owner = feature_by_id.find(call.owner.value);
         if (owner == feature_by_id.end()) continue;
         auto &feature = features[owner->second];
         ++feature.call_count;
-        if (call.target) feature.direct_calls.push_back({call.target->offset, call.target->space.value});
+        if (call.target && feature_by_address.contains({call.target->space.value, call.target->offset}))
+            feature.direct_calls.push_back({call.target->offset, call.target->space.value});
     }
     for (auto &feature : features) {
         auto &calls = feature.direct_calls;
@@ -255,13 +285,17 @@ struct CompareInput {
     std::vector<std::string> keys;
     std::vector<std::uint64_t> addresses;
     std::vector<ByteView> views;
+    std::vector<std::vector<compare::RegionView::IgnoredRange>> ignored_ranges;
     compare::ImageView image;
 };
 
-Result<CompareInput> make_compare_input(const Image &image) {
+Result<CompareInput> make_compare_input(const Image &image, const ImageMetadata &metadata,
+                                       std::stop_token stop) {
     CompareInput input;
     std::map<std::string, std::size_t> occurrences;
+    std::vector<const Segment *> selected_segments;
     for (const auto &segment : image.layout().segments) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "comparison canceled"};
         const auto storage_size = image.storage()->size();
         if (segment.file_begin.value >= storage_size) continue;
         const auto count = std::min(segment.file_size, storage_size - segment.file_begin.value);
@@ -274,10 +308,122 @@ Result<CompareInput> make_compare_input(const Image &image) {
         input.keys.push_back(base + "#" + std::to_string(occurrences[base]++));
         input.addresses.push_back(segment.begin.offset);
         input.views.push_back(std::move(view.value()));
+        selected_segments.push_back(&segment);
+    }
+    input.ignored_ranges.resize(input.views.size());
+    constexpr std::size_t relocation_item_budget = 1'000'000;
+    std::size_t relocation_items = 0;
+    const auto add_file_field = [&](FileOffset place, std::uint64_t size) -> Result<bool> {
+        if (!size || size > 64) return true;
+        for (std::size_t index = 0; index < selected_segments.size(); ++index) {
+            if ((index & 0xffu) == 0 && stop.stop_requested())
+                return Error{ErrorCode::canceled, "comparison canceled"};
+            const auto &segment = *selected_segments[index];
+            const auto region_size = input.views[index].bytes.size();
+            if (place.value < segment.file_begin.value) continue;
+            const auto offset = place.value - segment.file_begin.value;
+            if (offset > region_size || size > region_size - offset) continue;
+            if (++relocation_items > relocation_item_budget)
+                return Error{ErrorCode::resource_limit, "comparison relocation mask exceeds one million fields"};
+            input.ignored_ranges[index].push_back({offset, size});
+        }
+        return true;
+    };
+    const auto add_address_field = [&](Address place, std::uint64_t size) -> Result<bool> {
+        const auto file_place = image.to_file_offset(place);
+        if (!file_place) return true;
+        return add_file_field(file_place.value(), size);
+    };
+    std::size_t visited_relocations = 0;
+    const auto check_cancel = [&]() {
+        return ((visited_relocations++ & 0xffu) == 0) && stop.stop_requested();
+    };
+    if (metadata.elf) {
+        for (const auto &relocation : metadata.elf->relocations) {
+            if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (!relocation.field_size || relocation.kind == ElfRelocationKind::unknown ||
+                relocation.kind == ElfRelocationKind::copy || relocation.kind == ElfRelocationKind::symbol_size ||
+                relocation.kind == ElfRelocationKind::tls || relocation.kind == ElfRelocationKind::ifunc)
+                continue;
+            const auto result = relocation.file_place
+                ? add_file_field(*relocation.file_place, *relocation.field_size)
+                : (relocation.place ? add_address_field(*relocation.place, *relocation.field_size) : Result<bool>(true));
+            if (!result) return result.error();
+        }
+    }
+    if (metadata.macho) {
+        for (const auto &relocation : metadata.macho->relocations) {
+            if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (!relocation.field_size || relocation.auxiliary || relocation.kind == MachORelocationKind::pair ||
+                relocation.kind == MachORelocationKind::addend || relocation.kind == MachORelocationKind::unknown)
+                continue;
+            const auto result = relocation.file_place
+                ? add_file_field(*relocation.file_place, relocation.field_size)
+                : (relocation.place ? add_address_field(*relocation.place, relocation.field_size) : Result<bool>(true));
+            if (!result) return result.error();
+        }
+        for (const auto &fixup : metadata.macho->dyld_fixups) {
+            if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (!fixup.field_size) continue;
+            const auto result = fixup.file_place
+                ? add_file_field(*fixup.file_place, fixup.field_size)
+                : (fixup.place ? add_address_field(*fixup.place, fixup.field_size) : Result<bool>(true));
+            if (!result) return result.error();
+        }
+        for (const auto &pointer : metadata.macho->chained_pointers) {
+            if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (!pointer.field_size) continue;
+            const auto result = pointer.file_place
+                ? add_file_field(*pointer.file_place, pointer.field_size)
+                : (pointer.place ? add_address_field(*pointer.place, pointer.field_size) : Result<bool>(true));
+            if (!result) return result.error();
+        }
+        for (const auto &pointer : metadata.macho->firmware_chained_pointers) {
+            if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (!pointer.field_size) continue;
+            const auto result = add_file_field(pointer.file_place, pointer.field_size);
+            if (!result) return result.error();
+        }
+    }
+    if (metadata.pe && (image.layout().architecture == Architecture::x86 ||
+                        image.layout().architecture == Architecture::x86_64)) {
+        for (const auto &relocation : metadata.relocations) {
+            if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            std::uint64_t width = 0;
+            switch (relocation.type) {
+            case 1: case 2: case 4: width = 2; break;
+            case 3: width = 4; break;
+            case 10: width = 8; break;
+            default: break;
+            }
+            if (!width) continue;
+            auto result = add_address_field(relocation.address, width);
+            if (!result) return result.error();
+        }
+    }
+    for (auto &ranges : input.ignored_ranges) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "comparison canceled"};
+        std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b) {
+            return std::tie(a.offset, a.size) < std::tie(b.offset, b.size);
+        });
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "comparison canceled"};
+        std::vector<compare::RegionView::IgnoredRange> merged;
+        merged.reserve(ranges.size());
+        for (const auto &range : ranges) {
+            if (stop.stop_requested()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (merged.empty() || range.offset > merged.back().offset + merged.back().size) {
+                merged.push_back(range);
+                continue;
+            }
+            const auto end = std::max(merged.back().offset + merged.back().size, range.offset + range.size);
+            merged.back().size = end - merged.back().offset;
+        }
+        ranges = std::move(merged);
     }
     input.image.regions.reserve(input.views.size());
     for (std::size_t index = 0; index < input.views.size(); ++index) {
-        input.image.regions.push_back({input.keys[index], input.addresses[index], input.views[index].bytes});
+        input.image.regions.push_back({input.keys[index], input.addresses[index], input.views[index].bytes,
+                                       input.ignored_ranges[index]});
     }
     return input;
 }
@@ -357,6 +503,7 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
             throw std::invalid_argument("function limit exceeds addressable memory");
         if (instruction_limit > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
             throw std::invalid_argument("instruction diff limit exceeds addressable memory");
+        options.max_change_runs = run_limit;
 
         OpenRequest old_request;
         old_request.path = paths[0];
@@ -374,8 +521,10 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
             err << "New image: " << new_document.error().message << '\n';
             return 1;
         }
-        auto old_input = make_compare_input(*old_document.value()->image);
-        auto new_input = make_compare_input(*new_document.value()->image);
+        auto old_input = make_compare_input(*old_document.value()->image, old_document.value()->metadata,
+                                            options.stop_token);
+        auto new_input = make_compare_input(*new_document.value()->image, new_document.value()->metadata,
+                                            options.stop_token);
         if (!old_input || !new_input) {
             err << "Comparison input: " << (!old_input ? old_input.error().message : new_input.error().message) << '\n';
             return 1;
@@ -388,6 +537,7 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
         const auto &summary = report.value().summary;
         if (json_output) {
             std::optional<compare::Result<std::vector<compare::FunctionMatch>>> function_result;
+            std::vector<compare::FunctionFeature> old_features, new_features;
             if (match_functions) {
                 auto old_functions = recover_functions(*old_document.value()->image,
                     old_document.value()->metadata, {}, {}, {});
@@ -398,8 +548,8 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
                         << (!old_functions ? old_functions.error().message : new_functions.error().message) << '\n';
                     return 1;
                 }
-                auto old_features = function_features(*old_functions.value(), old_document.value()->metadata);
-                auto new_features = function_features(*new_functions.value(), new_document.value()->metadata);
+                old_features = function_features(*old_functions.value(), old_document.value()->metadata);
+                new_features = function_features(*new_functions.value(), new_document.value()->metadata);
                 function_result.emplace(compare::match_functions_detailed(
                     old_features, new_features, function_options));
                 if (!*function_result) {
@@ -408,13 +558,31 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
                 }
             }
             const auto shown_runs = std::min<std::size_t>(report.value().runs.size(), static_cast<std::size_t>(run_limit));
-            out << "{\"schema\":\"" << (match_functions ? "hexlab.compare.v2" : "hexlab.compare.v1")
+            out << "{\"schema\":\"" << (match_functions ? "hexlab.compare.v7" : "hexlab.compare.v2")
                 << "\",\"summary\":{\"compared_bytes\":" << summary.compared_bytes
                 << ",\"equal_bytes\":" << summary.equal_bytes << ",\"changed_bytes\":" << summary.changed_bytes
                 << ",\"added_bytes\":" << summary.added_bytes << ",\"removed_bytes\":" << summary.removed_bytes
                 << ",\"ignored_bytes\":" << summary.ignored_bytes << ",\"matched_regions\":" << summary.matched_regions
                 << ",\"added_regions\":" << summary.added_regions << ",\"removed_regions\":" << summary.removed_regions
-                << "},\"total_runs\":" << report.value().runs.size() << ",\"runs\":[";
+                << "},\"total_regions\":" << report.value().regions.size() << ",\"regions\":[";
+            const auto shown_regions = std::min<std::size_t>(report.value().regions.size(), static_cast<std::size_t>(run_limit));
+            for (std::size_t i = 0; i < shown_regions; ++i) {
+                const auto &region = report.value().regions[i];
+                const char *kind = region.kind == compare::RegionChangeKind::matched ? "matched" :
+                    region.kind == compare::RegionChangeKind::added ? "added" : "removed";
+                if (i) out << ',';
+                out << "{\"kind\":" << json_string(kind) << ",\"region\":" << json_string(region.region_key)
+                    << ",\"old_address\":";
+                if (region.old_address) out << json_string(address(*region.old_address)); else out << "null";
+                out << ",\"new_address\":";
+                if (region.new_address) out << json_string(address(*region.new_address)); else out << "null";
+                out << ",\"old_size\":" << region.old_size << ",\"new_size\":" << region.new_size
+                    << ",\"compared\":" << region.compared_bytes << ",\"equal\":" << region.equal_bytes
+                    << ",\"changed\":" << region.changed_bytes << ",\"ignored\":" << region.ignored_bytes
+                    << ",\"added_bytes\":" << region.added_bytes << ",\"removed_bytes\":" << region.removed_bytes << '}';
+            }
+            out << "],\"omitted_regions\":" << (report.value().regions.size() - shown_regions)
+                << ",\"total_runs\":" << report.value().total_runs << ",\"runs\":[";
             for (std::size_t i = 0; i < shown_runs; ++i) {
                 const auto &run = report.value().runs[i];
                 const char *kind = run.kind == compare::ChangeKind::changed ? "changed"
@@ -427,7 +595,7 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
                 if (run.new_address) out << json_string(address(*run.new_address)); else out << "null";
                 out << '}';
             }
-            out << "],\"omitted_runs\":" << (report.value().runs.size() - shown_runs);
+            out << "],\"omitted_runs\":" << (report.value().total_runs - shown_runs);
             if (function_result) {
                 std::uint64_t matched_count = 0, ambiguous_count = 0, added_count = 0, removed_count = 0;
                 for (const auto &match : function_result->value()) {
@@ -441,6 +609,22 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
                 const auto &matches = function_result->value();
                 const auto shown_matches = std::min<std::size_t>(matches.size(),
                     static_cast<std::size_t>(function_limit));
+                std::uint64_t remaining_instruction_runs = instruction_limit;
+                std::uint64_t remaining_block_summaries = 2'000;
+                std::uint64_t remaining_partial_evidence = 2'000;
+                const auto write_semantic = [&](const compare::InstructionChangeEvidence &evidence) {
+                    out << "{\"available\":" << (evidence.available ? "true" : "false")
+                        << ",\"opcode\":" << evidence.opcode_changes
+                        << ",\"flow\":" << evidence.flow_changes
+                        << ",\"operand\":" << evidence.operand_changes
+                        << ",\"effect\":" << evidence.effect_changes
+                        << ",\"unclassified\":" << evidence.unclassified_changes << '}';
+                };
+                const auto write_instruction_address = [&](const std::optional<compare::FunctionAddress> &location) {
+                    if (!location) { out << "null"; return; }
+                    out << "{\"address\":" << json_string(address(location->entry))
+                        << ",\"space\":" << location->address_space << '}';
+                };
                 out << ",\"functions\":{\"matched\":" << matched_count
                     << ",\"ambiguous\":" << ambiguous_count << ",\"added\":" << added_count
                     << ",\"removed\":" << removed_count << ",\"total_matches\":" << matches.size()
@@ -458,10 +642,143 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
                         << json_string(match.old_name) << ",\"new_address\":";
                     if (match.new_entry) out << json_string(address(*match.new_entry)); else out << "null";
                     out << ",\"new_space\":" << match.new_space << ",\"new_name\":"
-                        << json_string(match.new_name) << ",\"evidence\":{\"base_confidence\":"
+                        << json_string(match.new_name) << ",\"call_targets\":{\"available\":"
+                        << (match.call_targets.available ? "true" : "false")
+                        << ",\"unchanged\":" << match.call_targets.unchanged
+                        << ",\"added\":" << match.call_targets.added
+                        << ",\"removed\":" << match.call_targets.removed
+                        << ",\"ambiguous\":" << match.call_targets.ambiguous
+                        << "},\"evidence\":{\"base_confidence\":"
                         << match.evidence.base_confidence << ",\"supporting_call_neighbors\":"
                         << match.evidence.supporting_call_neighbors << ",\"call_graph_round\":"
-                        << match.evidence.call_graph_round << "}}";
+                        << match.evidence.call_graph_round << ",\"score_breakdown\":";
+                    const auto &score = match.evidence.score_breakdown;
+                    if (!score.available) out << "null";
+                    else {
+                        out << "{\"shape\":" << score.shape_similarity << ",\"instruction\":";
+                        if (score.instruction_available) out << score.instruction_similarity; else out << "null";
+                        out << ",\"histogram\":";
+                        if (score.histogram_available) out << score.histogram_similarity; else out << "null";
+                        out << ",\"cfg\":";
+                        if (score.cfg_available) out << score.cfg_similarity; else out << "null";
+                        out << ",\"exact_name\":" << (score.exact_name ? "true" : "false")
+                            << ",\"name_floor_applied\":" << (score.name_floor_applied ? "true" : "false") << '}';
+                    }
+                    out << '}';
+                    if (match.kind != compare::FunctionMatchKind::matched || !match.old_entry || !match.new_entry) {
+                        out << '}';
+                        continue;
+                    }
+                    const auto old_feature = std::find_if(old_features.begin(), old_features.end(), [&](const auto &feature) {
+                        return feature.entry == *match.old_entry && feature.address_space == match.old_space;
+                    });
+                    const auto new_feature = std::find_if(new_features.begin(), new_features.end(), [&](const auto &feature) {
+                        return feature.entry == *match.new_entry && feature.address_space == match.new_space;
+                    });
+                    if (old_feature == old_features.end() || new_feature == new_features.end()) {
+                        out << ",\"details_available\":false}";
+                        continue;
+                    }
+                    compare::FunctionBlockMatchOptions block_options;
+                    auto block_mapping = compare::correspond_function_blocks(old_feature->cfg_blocks,
+                        new_feature->cfg_blocks, block_options);
+                    out << ",\"blocks\":";
+                    if (!block_mapping) {
+                        out << "null";
+                    } else {
+                        const auto &mapping = block_mapping.value();
+                        out << "{\"matched\":" << mapping.matched << ",\"added\":" << mapping.added
+                            << ",\"removed\":" << mapping.removed << ",\"ambiguous\":" << mapping.ambiguous
+                            << ",\"budget_exhausted\":" << (mapping.budget_exhausted ? "true" : "false")
+                            << ",\"instruction_budget_exhausted\":"
+                            << (mapping.instruction_diff_budget_exhausted ? "true" : "false")
+                            << ",\"partial_instruction_evidence\":[";
+                        bool first_partial_evidence = true;
+                        std::uint64_t omitted_partial_evidence = 0;
+                        for (const auto &block : mapping.blocks) {
+                            const auto &evidence = block.instruction_evidence;
+                            if (!evidence.available || evidence.complete) continue;
+                            if (!remaining_partial_evidence) { ++omitted_partial_evidence; continue; }
+                            --remaining_partial_evidence;
+                            if (!first_partial_evidence) out << ',';
+                            first_partial_evidence = false;
+                            out << "{\"old_block\":";
+                            if (block.old_block) out << *block.old_block; else out << "null";
+                            out << ",\"new_block\":";
+                            if (block.new_block) out << *block.new_block; else out << "null";
+                            out << ",\"old_coverage_percent\":" << unsigned(evidence.old_coverage_percent)
+                                << ",\"new_coverage_percent\":" << unsigned(evidence.new_coverage_percent)
+                                << ",\"fingerprint_similarity_percent\":" << evidence.fingerprint_similarity
+                                << ",\"adjacency_available\":" << (evidence.adjacency_available ? "true" : "false")
+                                << ",\"adjacency_similarity_percent\":" << evidence.adjacency_similarity << '}';
+                        }
+                        out << "],\"omitted_partial_instruction_evidence\":" << omitted_partial_evidence
+                            << ",\"changed_blocks\":[";
+                        bool first_block = true;
+                        std::uint64_t omitted_blocks = 0;
+                        for (const auto &block : mapping.blocks) {
+                            const auto &diff = block.instruction_diff;
+                            if (!block.instruction_diff_available || (!diff.changed_instructions &&
+                                !diff.removed_instructions && !diff.added_instructions)) continue;
+                            if (!remaining_block_summaries) { ++omitted_blocks; continue; }
+                            --remaining_block_summaries;
+                            if (!first_block) out << ',';
+                            first_block = false;
+                            out << "{\"old_block\":";
+                            if (block.old_block) out << *block.old_block; else out << "null";
+                            out << ",\"new_block\":";
+                            if (block.new_block) out << *block.new_block; else out << "null";
+                            out << ",\"equal\":" << diff.equal_instructions
+                                << ",\"changed\":" << diff.changed_instructions
+                                << ",\"removed\":" << diff.removed_instructions
+                                << ",\"added\":" << diff.added_instructions << ",\"semantic\":";
+                            write_semantic(diff.semantic);
+                            out << '}';
+                        }
+                        out << "],\"omitted_changed_blocks\":" << omitted_blocks << '}';
+                    }
+                    out << ",\"instruction_diff\":";
+                    if (old_feature->instruction_fingerprints.empty() || new_feature->instruction_fingerprints.empty()) {
+                        out << "null";
+                    } else {
+                        auto body = compare::diff_function_instructions_detailed(old_feature->instruction_fingerprints,
+                            new_feature->instruction_fingerprints, old_feature->instruction_semantics,
+                            new_feature->instruction_semantics);
+                        if (!body) {
+                            out << "null";
+                        } else {
+                            auto &diff = body.value();
+                            ::hexlab::app::attach_instruction_addresses(diff, *old_feature, *new_feature);
+                            out << "{\"equal\":" << diff.equal_instructions << ",\"changed\":"
+                                << diff.changed_instructions << ",\"removed\":" << diff.removed_instructions
+                                << ",\"added\":" << diff.added_instructions << ",\"semantic\":";
+                            write_semantic(diff.semantic);
+                            out << ",\"changes\":[";
+                            bool first_change = true;
+                            std::uint64_t omitted_changes = 0;
+                            for (const auto &run : diff.runs) {
+                                if (run.kind == compare::InstructionDiffKind::equal) continue;
+                                if (!remaining_instruction_runs) { ++omitted_changes; continue; }
+                                --remaining_instruction_runs;
+                                if (!first_change) out << ',';
+                                first_change = false;
+                                const char *run_kind = run.kind == compare::InstructionDiffKind::changed ? "changed" :
+                                    run.kind == compare::InstructionDiffKind::removed ? "removed" : "added";
+                                out << "{\"kind\":" << json_string(run_kind)
+                                    << ",\"old_start\":" << run.old_start << ",\"old_count\":" << run.old_count
+                                    << ",\"new_start\":" << run.new_start << ",\"new_count\":" << run.new_count
+                                    << ",\"old_address\":";
+                                write_instruction_address(run.old_address);
+                                out << ",\"new_address\":";
+                                write_instruction_address(run.new_address);
+                                out << ",\"semantic\":";
+                                write_semantic(run.semantic);
+                                out << '}';
+                            }
+                            out << "],\"omitted_changes\":" << omitted_changes << '}';
+                        }
+                    }
+                    out << '}';
                 }
                 out << "],\"omitted_matches\":" << (matches.size() - shown_matches) << '}';
             }
@@ -470,9 +787,24 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
         }
         out << "Compared bytes: " << summary.compared_bytes << "\nEqual: " << summary.equal_bytes
             << "\nChanged: " << summary.changed_bytes << "\nAdded: " << summary.added_bytes
-            << "\nRemoved: " << summary.removed_bytes << "\nMatched regions: " << summary.matched_regions
+            << "\nRemoved: " << summary.removed_bytes << "\nIgnored: " << summary.ignored_bytes
+            << "\nMatched regions: " << summary.matched_regions
             << "\nAdded regions: " << summary.added_regions << "\nRemoved regions: " << summary.removed_regions
-            << "\nChange runs: " << report.value().runs.size() << '\n';
+            << "\nChange runs: " << report.value().total_runs << '\n';
+        const auto shown_regions = std::min<std::size_t>(report.value().regions.size(), static_cast<std::size_t>(run_limit));
+        out << "Region summaries: " << report.value().regions.size() << '\n';
+        for (std::size_t i = 0; i < shown_regions; ++i) {
+            const auto &region = report.value().regions[i];
+            const char *kind = region.kind == compare::RegionChangeKind::matched ? "matched" :
+                region.kind == compare::RegionChangeKind::added ? "added" : "removed";
+            out << "region " << kind << ' ' << region.region_key << " old-size=" << region.old_size
+                << " new-size=" << region.new_size << " compared=" << region.compared_bytes
+                << " equal=" << region.equal_bytes << " changed=" << region.changed_bytes
+                << " ignored=" << region.ignored_bytes << " added=" << region.added_bytes
+                << " removed=" << region.removed_bytes << '\n';
+        }
+        if (shown_regions < report.value().regions.size())
+            out << "... " << (report.value().regions.size() - shown_regions) << " regions omitted (use --limit)\n";
         const auto shown = std::min<std::size_t>(report.value().runs.size(), static_cast<std::size_t>(run_limit));
         for (std::size_t i = 0; i < shown; ++i) {
             const auto &run = report.value().runs[i];
@@ -483,8 +815,8 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
             if (run.new_address) out << " new=" << address(*run.new_address);
             out << '\n';
         }
-        if (shown < report.value().runs.size())
-            out << "... " << (report.value().runs.size() - shown) << " runs omitted (use --limit)\n";
+        if (shown < report.value().total_runs)
+            out << "... " << (report.value().total_runs - shown) << " runs omitted (use --limit)\n";
         if (match_functions) {
             auto old_functions = recover_functions(*old_document.value()->image, old_document.value()->metadata, {}, {}, {});
             auto new_functions = recover_functions(*new_document.value()->image, new_document.value()->metadata, {}, {}, {});
@@ -524,7 +856,21 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
                 if (match.new_entry) out << " new=" << (match.new_space ? std::to_string(match.new_space) + ":" : "") << address(*match.new_entry);
                 if (!match.new_name.empty()) out << " new-name=\"" << match.new_name << '"';
                 out << " call-neighbors=" << match.evidence.supporting_call_neighbors
-                    << " graph-round=" << match.evidence.call_graph_round << '\n';
+                    << " graph-round=" << match.evidence.call_graph_round;
+                if (match.evidence.score_breakdown.available) {
+                    const auto &score = match.evidence.score_breakdown;
+                    out << " shape=" << score.shape_similarity;
+                    if (score.instruction_available) out << " instruction=" << score.instruction_similarity;
+                    if (score.histogram_available) out << " histogram=" << score.histogram_similarity;
+                    if (score.cfg_available) out << " cfg=" << score.cfg_similarity;
+                    if (score.name_floor_applied) out << " name-floor";
+                }
+                if (match.call_targets.available)
+                    out << " call-targets(unchanged=" << match.call_targets.unchanged
+                        << ",added=" << match.call_targets.added << ",removed=" << match.call_targets.removed
+                        << ",ambiguous=" << match.call_targets.ambiguous << ')';
+                else out << " call-targets=unavailable";
+                out << '\n';
                 if (match.kind != compare::FunctionMatchKind::matched || !match.old_entry || !match.new_entry) continue;
                 const auto old_feature = std::find_if(old_features.begin(), old_features.end(), [&](const auto &feature) {
                     return feature.entry == *match.old_entry && feature.address_space == match.old_space;
@@ -545,6 +891,22 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
                     if (block_mapping.value().instruction_diff_budget_exhausted)
                         out << " instruction-budget=exhausted";
                     out << '\n';
+                    std::uint64_t shown_partial_evidence = 0;
+                    for (const auto &block : block_mapping.value().blocks) {
+                        const auto &evidence = block.instruction_evidence;
+                        if (!evidence.available || evidence.complete || shown_partial_evidence >= 2000) continue;
+                        ++shown_partial_evidence;
+                        out << "  block-evidence old=";
+                        if (block.old_block) out << *block.old_block; else out << "-";
+                        out << " new=";
+                        if (block.new_block) out << *block.new_block; else out << "-";
+                        out << " coverage=" << unsigned(evidence.old_coverage_percent) << '%'
+                            << '/' << unsigned(evidence.new_coverage_percent) << "% similarity="
+                            << evidence.fingerprint_similarity << "% adjacency=";
+                        if (evidence.adjacency_available) out << evidence.adjacency_similarity << '%';
+                        else out << "unavailable";
+                        out << '\n';
+                    }
                     std::uint64_t omitted_block_summaries = 0;
                     for (const auto &block : block_mapping.value().blocks) {
                         if (!block.instruction_diff_available ||
@@ -579,6 +941,7 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
                     new_feature->instruction_fingerprints, old_feature->instruction_semantics,
                     new_feature->instruction_semantics);
                 if (!body) continue;
+                ::hexlab::app::attach_instruction_addresses(body.value(), *old_feature, *new_feature);
                 out << "  instructions equal=" << body.value().equal_instructions << " changed="
                     << body.value().changed_instructions << " removed=" << body.value().removed_instructions
                     << " added=" << body.value().added_instructions << " semantic(opcode=" << body.value().semantic.opcode_changes
@@ -591,7 +954,12 @@ int run_compare_cli(std::span<const std::wstring_view> arguments, std::ostream &
                     const char *run_kind = run.kind == compare::InstructionDiffKind::changed ? "changed" :
                         run.kind == compare::InstructionDiffKind::removed ? "removed" : "added";
                     out << "    " << run_kind << " old-index=" << run.old_start << "+" << run.old_count
-                        << " new-index=" << run.new_start << "+" << run.new_count << '\n';
+                        << " new-index=" << run.new_start << "+" << run.new_count;
+                    if (run.old_address) out << " old-va=" << run.old_address->address_space << ':'
+                                             << address(run.old_address->entry);
+                    if (run.new_address) out << " new-va=" << run.new_address->address_space << ':'
+                                             << address(run.new_address->entry);
+                    out << '\n';
                     --remaining_instruction_runs;
                 }
                 if (omitted_instruction_runs)

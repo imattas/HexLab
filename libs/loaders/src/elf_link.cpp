@@ -629,8 +629,10 @@ static Result<std::vector<std::byte>> link_elf64_impl(
                 require(relocation.explicit_addend && relocation.addend,
                         "ELF link subset supports RELA relocations only", ErrorCode::unsupported);
                 const auto type = relocation.type;
-                const std::size_t width = machine == 183 ? aarch64_width(type) : type == 0 ? 0 : (type == 1 || type == 24 ? 8 : 4);
-                require(machine == 183 || type == 0 || type == 1 || type == 2 || type == 4 || type == 10 || type == 11 || type == 24,
+                const std::size_t width = machine == 183 ? aarch64_width(type) :
+                    type == 0 ? 0 : (type == 1 || type == 24 ? 8 :
+                    (type == 12 || type == 13 ? 2 : (type == 14 || type == 15 ? 1 : 4)));
+                require(machine == 183 || type == 0 || type == 1 || type == 2 || type == 4 || type == 10 || type == 11 || type == 12 || type == 13 || type == 14 || type == 15 || type == 24,
                         "Unsupported x86-64 ELF relocation type " + std::to_string(type), ErrorCode::unsupported);
                 require(relocation.offset <= target_bytes.size() && width <= target_bytes.size() - relocation.offset,
                         std::string("ELF relocation field exceeds ") + target_name, ErrorCode::malformed);
@@ -700,7 +702,13 @@ static Result<std::vector<std::byte>> link_elf64_impl(
                     const auto instruction = width == 4 ? static_cast<std::uint32_t>(read_le(
                         std::span<const std::byte>(target_bytes).subspan(static_cast<std::size_t>(relocation.offset), 4))) : 0;
                     result = aarch64_relocation(type, target, *relocation.addend, place, instruction);
-                } else if (type == 1) result = add_signed(target, *relocation.addend);
+                } else if (type == 1 || type == 12 || type == 14) {
+                    result = add_signed(target, *relocation.addend);
+                    if (type == 12)
+                        require(result <= UINT16_MAX, "R_X86_64_16 relocation overflows", ErrorCode::unsupported);
+                    else if (type == 14)
+                        require(result <= UINT8_MAX, "R_X86_64_8 relocation overflows", ErrorCode::unsupported);
+                }
                 else if (type == 10) {
                     result = add_signed(target, *relocation.addend);
                     require(result <= UINT32_MAX, "R_X86_64_32 relocation overflows", ErrorCode::unsupported);
@@ -717,6 +725,10 @@ static Result<std::vector<std::byte>> link_elf64_impl(
                     const auto signed_result = pc_value(target, *relocation.addend, place);
                     if (type == 2 || type == 4)
                         require(signed_result >= INT32_MIN && signed_result <= INT32_MAX, "R_X86_64_PC32/PLT32 relocation overflows", ErrorCode::unsupported);
+                    else if (type == 13)
+                        require(signed_result >= INT16_MIN && signed_result <= INT16_MAX, "R_X86_64_PC16 relocation overflows", ErrorCode::unsupported);
+                    else if (type == 15)
+                        require(signed_result >= INT8_MIN && signed_result <= INT8_MAX, "R_X86_64_PC8 relocation overflows", ErrorCode::unsupported);
                     result = static_cast<std::uint64_t>(signed_result);
                 }
                 for (std::size_t b = 0; b < width; ++b)

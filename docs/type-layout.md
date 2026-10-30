@@ -47,12 +47,28 @@ each member layout still reports its bit width and position. This simple unit
 grouping follows the imported CodeView allocation boundaries and does not claim
 to emulate every compiler's bitfield allocation ABI.
 
+`LayoutOptions::bitfield_policy` defaults to `recorded`, preserving those
+source storage offsets and bit positions. Callers that know the source uses
+Microsoft C/C++ allocation may explicitly choose
+`BitfieldLayoutPolicy::microsoft`. That policy recomputes bitfield units in
+declaration order, starts a new unit when the storage size/alignment changes or
+the next field will not fit, and assigns bits from least to most significant.
+It supports 1-, 2-, and 4-byte units only. The architecture-level `Abi` option
+does not select a compiler bitfield policy. See [bitfield-layout.md](bitfield-layout.md)
+for the selection and unsupported cases.
+
 The type codec persists each member's optional bit width and bit offset beside
 its ordinary type and byte offset, so project save/load retains the bitfield
 graph without a new codec record form. Named references are serialized as
 symbolic leaves; workspace layout resolves them against the immutable snapshot's
 named type table and reports missing or ambiguous definitions rather than
 guessing.
+
+Type records are bounded symmetrically on encode and decode: each text field is
+limited to 65,536 bytes, each aggregate/enum/function metadata collection to
+100,000 entries, and the full record to 16 MiB. The encoder rejects graphs that
+would exceed a decoder limit, so it never emits a record that its own decoder
+cannot accept solely because a collection or text field is too large.
 
 Callers can pass `LayoutOptions{maximum_member_alignment}` to model common
 packing caps, such as `#pragma pack(1)` or `#pragma pack(4)`. A zero value keeps

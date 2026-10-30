@@ -6,6 +6,30 @@ The managed loader preserves bounded CLR exception-handling sections on `CilMeth
 
 Before constructing a dispatch graph, the lifter validates nonempty bounded ranges, catch-token tags, instruction boundaries, and contiguous instruction coverage. An interval sweep accepts disjoint scopes, identical protected tries, and strict lexical containment. Each nested try, its handlers, and its filters must share one enclosing scope. Crossing intervals, aliased handler/filter ranges, and constructs whose nested try and handlers belong to different outer scopes are rejected as unsupported. A clause's handler or filter overlapping its own try is malformed. Filters and catches can be nested in an enclosing try or catch handler; additional EH constructs inside a filter, finally, or fault handler are unsupported. In particular, nested EH inside finally/fault requires saved unwind state and must not overwrite the active continuation register.
 
+Loaded-image method inspection also checks each catch token against the parsed
+assembly type catalog. When that catalog is available, a catch token whose
+TypeDef, TypeRef, or TypeSpec row does not exist marks the method malformed
+with a specific diagnostic instead of allowing a dangling token into the
+dispatch graph. Duplicate token ownership is rejected as ambiguous. A
+resolved TypeSpec catch must describe a class reference or class generic
+instantiation; value-type, array, variable, and other non-class signatures are
+malformed catch types. A row-backed TypeRef whose target assembly is not
+available remains unresolved rather than being treated as invalid. The
+loader follows known TypeDef base chains when the module defines a unique
+`System.Exception`: proven descendants (including `System.Exception`) remain
+valid, and a complete local chain ending elsewhere is malformed. A chain that
+reaches an unresolved TypeRef or TypeSpec is retained with an explicit
+unresolved-ancestry entry on `ManagedMethodAnalysis`. If `System.Exception` is
+absent or ambiguous, ancestry is unresolved. Thus unresolved runtime identity
+is distinct from proven non-exception ancestry.
+The
+standalone `parse_cil_method_body` routine has no metadata root and therefore
+validates only the catch token's table tag and nonzero row index. If the
+assembly type catalog itself cannot be parsed, row-existence validation is
+unavailable and catch-token resolution remains incomplete. This partial check
+does not prove that an unresolved class derives from `System.Exception`;
+external hierarchy validation and ambiguous bindings remain incomplete.
+
 Try, handler, filter, and region-end offsets become basic-block boundaries. Terminating instructions split subsequent dead code into separate blocks. Every `endfinally` is also a block boundary, so a multi-instruction handler has an identifiable continuation source. Catch and filter-handler entries begin with one opaque managed exception reference; filter code begins with the same reference. Finally and fault entries begin with an empty evaluation stack. Protected-try entries require an empty stack, and declared zero `max_stack` cannot accommodate a catch/filter entry. Local and argument values remain opaque according to the ordinary CIL lifting rules.
 
 `endfilter` consumes exactly one result and rejects a known result type other than int32 or a comparison boolean; an unknown result type remains opaque. Nonzero selects the filter's handler, and zero continues clause search. An explicit `throw` or conservatively possible exception during filter execution follows its false-result continuation and preserves search for the original exception. `rethrow` in filter code remains unsupported. Elsewhere, `rethrow` requires a catch/filter handler and an empty evaluation stack. `endfinally` requires an enclosing finally/fault handler and an empty evaluation stack. `ret` cannot exit a protected try, filter, or handler; `leave` cannot exit a finally/fault handler. Ordinary fallthrough out of a protected try, into or out of a handler/filter, or past the end of an EH method is malformed. Existing explicit branches or switches crossing EH boundaries without `leave`, and `leave` transfers entering protected regions or handlers, remain unsupported.
@@ -38,3 +62,10 @@ Multiple catches, valid nested regions, nonadjacent layouts, differing leave tar
 The catch-entry object, nested search, filter, and unwind rules are described by ECMA-335 Partition I, sections 12.4.2.5-12.4.2.6, and Partition III's `endfilter`, `endfinally`, `leave`, `ret`, and `rethrow` definitions ([ECMA-335, 6th edition](https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf)).
 
 The public loader and decompiler result structures carry this metadata, so consumers must be rebuilt against both updated headers. The relevant library targets are `hexlab_loaders` and `hexlab_decompiler`.
+
+Checked native integer conversions also enter this dispatch machinery, with a
+dedicated source block and pre-instruction exceptional memory state. Their
+typed `TrapEdge` records preserve the OverflowException predicate, and an
+unhandled conversion outside EH still has an explicit exceptional exit.
+Checked-conversion CFG edges remain conservative and the result incomplete;
+see [native integer conversions](managed-cil-native-conversions.md).

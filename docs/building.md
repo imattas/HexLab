@@ -91,7 +91,10 @@ launcher with a scalable icon. The DEB installs under `/usr` and uses
 `dpkg-shlibdeps` to declare host runtime-library dependencies. To install it on
 Debian or Ubuntu, run `sudo apt install ./HexLab-*-Linux-*.deb`. The TGZ can be
 extracted to a chosen prefix and run from its `bin/` directory; its executables
-use relative runtime paths to find the bundled libraries.
+use relative runtime paths to find the bundled libraries. The macOS desktop
+preset's arm64 plus x86_64 package is named with the `Darwin-universal2` suffix,
+independent of which CPU architecture runs CMake; single-architecture builds
+retain their architecture-specific suffix.
 
 When `HEXLAB_ENABLE_PYTHON_AUTOMATION=ON`, the desktop embeds the system CPython
 runtime instead of bundling a Python distribution. On Linux the DEB dependency
@@ -156,7 +159,7 @@ The project backend has schema/input/history tests plus process-kill tests for t
 
 Shared project-command tests cover annotations, decisions, grouped patches, failed transactions, stale facts and file-only recovery after header edits. Graph tests independently parse JSON and render a fixture from deterministic SCC layout coordinates. Patch-export tests compare complete files against literal edits and verify receipt hashes with Windows `Get-FileHash`; exports protect input/project/backing identities and reject destinations with journal companions. The project CLI uses these services; the wx desktop uses these same services.
 
-Incremental tests verify actual skipped decoding and shared unchanged function/block records; ownership and reference indexes are rebuilt conservatively, and changed bytes rescan the full string domain when narrower boundaries are not proven. Optional complete-derived caches are bounded to 64 MiB. Loading validates effective bytes and typed instruction records, rewalks rooted ownership, rebuilds references and scans strings before adopting cached models. Encoding also validates instruction records. Recovery and cache-load validation have separate counters; these checks do not claim a cache hit avoids all analysis work. Invalid caches recompute without changing user history or repairing read-only projects.
+Incremental tests verify actual skipped decoding and shared unchanged function/block records; ownership and reference indexes are rebuilt conservatively, and changed bytes rescan the full string domain when narrower boundaries are not proven. Optional complete-derived caches are bounded to 64 MiB. Loading validates effective bytes and typed instruction records, rewalks rooted ownership, rebuilds references and validates cached string previews as strict UTF-8 with scalar counts consistent with each record. Cached mapped string addresses must resolve from their retained file offsets in the current image. Encoding also validates instruction records. Recovery and cache-load validation have separate counters; these checks do not claim a cache hit avoids all analysis work. Invalid caches recompute without changing user history or repairing read-only projects.
 
 Actor tests synchronize late completions, close/reopen, Save As, cancellation and input-lease retirement with explicit barriers. Each writer owns its SQL connection; the shared pool has exactly two workers. Search tests compare masked streaming pages against an independent literal matcher and cover effective patches, Unicode, unique contiguous mappings, split instruction file ranges, immediate widths and stale cursors. Search patterns are limited to 4096 encoded bytes, pages to 4096 hits, and retained per-document history to 100000 hits. Each page has separate candidate/comparison budgets; reaching a budget returns a continuation. Immediate results explicitly report partial decoded-source coverage. Both the project CLI and native Find dialogs expose search with per-document result history.
 

@@ -13,6 +13,14 @@ manual code-region roots are admitted before metadata-derived roots. Omitted
 automatic roots remain ownership boundaries, so the cap cannot make their
 bytes silently merge into another function.
 
+For flat NMOS 6502 images, the NMI, reset, and IRQ/BRK vector words at
+`$FFFA`, `$FFFC`, and `$FFFE` can seed function entries. A vector is used only
+when its two little-endian bytes are readable in a mapped 6502 context and its
+nonzero target has that same architecture/mode; the vector slot is retained as
+the seed source. Ordinary executable-byte, root conflict, and budget checks
+still apply. This does not model cartridge banking, mirrored vector windows,
+or console-specific interrupt remapping.
+
 ARM predicate handling tracks possible NZCV valuations during function
 recovery. A32 condition codes and the condition attached to each Thumb IT
 slot guard both execution and skip edges. For conditional branches, the taken
@@ -150,6 +158,42 @@ predict which implementation it returns. The ordinary executable, initialized
 byte, context, relocation, and budget checks still apply. This does not
 discover implementations selected only at runtime, and undefined IFUNC
 symbols do not create roots.
+
+Validated imported ELF DWARF subprogram DIEs also establish function roots,
+including functions omitted from the ELF symbol table. Their half-open code
+ranges are rebased to the current image and become ownership chunks only when
+every range is fully backed by initialized executable bytes and uses the same
+decoder context. Conflicting DIE ranges at one entry are kept as root evidence
+but do not bound ownership. Explicit user chunks, unwind ranges, POGO extents,
+and ELF symbol extents retain precedence. Range-less/unmapped subprograms and
+relocatable-object DWARF are not used for function discovery; Thumb roots still
+need source-backed IT-state metadata or a validated EHABI entry.
+
+DWARF `DW_TAG_entry_point` records are kept separately from subprograms. A
+named entry point with a direct `DW_AT_low_pc` can seed analysis at that exact
+PC after the normal mapped-code and execution-context checks. The record does
+not claim a function extent, code chunk, or callable prototype; indexed
+`DW_FORM_addrx` entry PCs and entry points without a direct name are not used.
+
+For ELF64 PowerPC ELFv1 images, a defined `STT_FUNC` whose section is
+`.opd` names a 24-byte function descriptor rather than executable code.
+Recovery validates the descriptor's aligned, initialized section extent,
+reads its first target-width word using the ELF byte order, and seeds that
+code address through the normal executable and mapped-context checks. The
+other descriptor words are not interpreted, descriptors without initialized
+targets do not create roots, and ELFv2 is not treated as descriptor-based.
+This supplies roots only; it does not infer descriptor relocation, TOC
+semantics, or function extents.
+
+For static ELF `ET_EXEC` images, allocated `SHT_INIT_ARRAY` and
+`SHT_FINI_ARRAY` sections can also provide initializer/finalizer roots when
+the corresponding `DT_INIT_ARRAY` or `DT_FINI_ARRAY` tag is absent. Entries
+must be aligned, pointer-width slots backed by initialized section bytes and
+are decoded using the ELF byte order. Only nonzero targets in initialized
+executable bytes are retained. Evidence identifies the section and slot
+separately from dynamic-tag evidence. This fallback does not apply to
+`ET_DYN` or relocatable objects, does not interpret dynamic tags as section
+metadata, and does not resolve relocations in the section entries.
 
 For PE32 images, validated SafeSEH handler RVAs also seed function entries.
 The loader checks table bounds, strict ordering, initialized executable

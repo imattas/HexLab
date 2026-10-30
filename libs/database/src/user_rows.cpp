@@ -54,7 +54,7 @@ Result<std::vector<DebugLocationRange>> decode_location_ranges(std::span<const s
     size_t cursor=0;const auto number=[&](unsigned width)->std::optional<std::uint64_t>{if(width>bytes.size()-cursor)return {};std::uint64_t value=0;while(width--)value=(value<<8)|std::to_integer<unsigned>(bytes[cursor++]);return value;};
     auto count=number(4);if(!count||*count>4096)return Error{ErrorCode::malformed,"Invalid DWARF location range count"};std::vector<DebugLocationRange> result;size_t expr_total=0,ops_total=0;
     bool default_seen=false; for(std::uint64_t i=0;i<*count;++i){auto begin=number(8),end=number(8),size=number(4);const bool is_default=begin&&end&&*begin==UINT64_MAX&&*end==UINT64_MAX;if(!begin||!end||!size||(*begin>=*end&&!is_default)||(is_default&&default_seen)||*size>65536-expr_total||*size>bytes.size()-cursor)return Error{ErrorCode::malformed,"Invalid DWARF location range"};default_seen|=is_default;DebugLocationRange row;row.begin=*begin;row.end=*end;expr_total+=*size;for(std::uint64_t j=0;j<*size;++j)row.expression.push_back(std::to_integer<std::uint8_t>(bytes[cursor++]));auto ops=number(4);if(!ops||*ops>4096-ops_total||*ops>(bytes.size()-cursor)/29)return Error{ErrorCode::malformed,"Invalid DWARF range operation count"};ops_total+=*ops;
-        for(std::uint64_t j=0;j<*ops;++j){DebugLocationOperation op;op.kind=static_cast<std::uint8_t>(*number(1));op.unsigned_operand=*number(8);op.signed_operand=static_cast<std::int64_t>(*number(8));op.expression_offset=static_cast<std::uint32_t>(*number(4));op.second_unsigned_operand=*number(8);if(op.kind>15||row.expression.empty()||op.expression_offset>=row.expression.size())return Error{ErrorCode::malformed,"Invalid DWARF range operation"};row.operations.push_back(op);}result.push_back(std::move(row));
+        for(std::uint64_t j=0;j<*ops;++j){DebugLocationOperation op;op.kind=static_cast<std::uint8_t>(*number(1));op.unsigned_operand=*number(8);op.signed_operand=static_cast<std::int64_t>(*number(8));op.expression_offset=static_cast<std::uint32_t>(*number(4));op.second_unsigned_operand=*number(8);if(op.kind>20||(op.kind==16&&op.second_unsigned_operand>9)||row.expression.empty()||op.expression_offset>=row.expression.size())return Error{ErrorCode::malformed,"Invalid DWARF range operation"};row.operations.push_back(op);}result.push_back(std::move(row));
     } if(cursor!=bytes.size())return Error{ErrorCode::malformed,"Trailing DWARF range bytes"};return result;
 }
 namespace {
@@ -79,8 +79,8 @@ void sync_project_breakpoints(Connection& connection,const std::vector<ProjectBr
                               const std::vector<ProjectBreakpoint>& after) {
     const auto find=[](const auto& rows,std::uint64_t id){auto it=std::lower_bound(rows.begin(),rows.end(),id,[](const auto& row,std::uint64_t value){return row.id<value;});return it!=rows.end()&&it->id==id?&*it:nullptr;};
     auto remove=take(connection.prepare("DELETE FROM project_breakpoints WHERE id=?1"));
-    auto insert=take(connection.prepare("INSERT INTO project_breakpoints(id,address,kind,enabled,size,condition,logpoint,log_message,ignore_count,hit_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"));
-    auto update=take(connection.prepare("UPDATE project_breakpoints SET address=?2,kind=?3,enabled=?4,size=?5,condition=?6,logpoint=?7,log_message=?8,ignore_count=?9 WHERE id=?1"));
+    auto insert=take(connection.prepare("INSERT INTO project_breakpoints(id,address,kind,enabled,size,condition,logpoint,log_message,ignore_count,hit_count,one_shot) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"));
+    auto update=take(connection.prepare("UPDATE project_breakpoints SET address=?2,kind=?3,enabled=?4,size=?5,condition=?6,logpoint=?7,log_message=?8,ignore_count=?9,one_shot=?10 WHERE id=?1"));
     const auto bind=[&](Statement& sql,const ProjectBreakpoint& row){
         take(sql.bind_blob(1,encode_u64(row.id)));take(sql.bind_blob(2,take(encode_location(Location{row.address}))));
         take(sql.bind_integer(3,static_cast<unsigned>(row.kind)));take(sql.bind_integer(4,row.enabled));take(sql.bind_integer(5,row.size));
@@ -88,7 +88,7 @@ void sync_project_breakpoints(Connection& connection,const std::vector<ProjectBr
         take(sql.bind_blob(9,encode_u64(row.ignore_count)));
     };
     for(const auto& row:before)if(!find(after,row.id)){take(remove->bind_blob(1,encode_u64(row.id)));take(remove->step());take(remove->reset());}
-    for(const auto& row:after){const auto* old=find(before,row.id);if(old&&*old==row)continue;auto& sql=old?*update:*insert;bind(sql,row);if(!old)take(sql.bind_blob(10,encode_u64(row.hit_count)));take(sql.step());take(sql.reset());}
+    for(const auto& row:after){const auto* old=find(before,row.id);if(old&&*old==row)continue;auto& sql=old?*update:*insert;bind(sql,row);if(old)take(sql.bind_integer(10,row.one_shot));else{take(sql.bind_blob(10,encode_u64(row.hit_count)));take(sql.bind_integer(11,row.one_shot));}take(sql.step());take(sql.reset());}
 }
 }
 void write_user_state(Connection& connection,const UserState& before,const UserState& after){

@@ -36,6 +36,14 @@ memory-writing intrinsics with decoded stack deltas. The lifter has no proven
 FCW/FSW values or concrete memory input for these instructions, so it does not
 invent a converted store value or claim exception retirement.
 
+`FRNDINT` carries a typed 80-bit rounded-value edge alongside its unknown FSW
+output, retaining control/status dependencies and exception effects in the
+intrinsic. A literal result folds only when the processor evaluator completes
+under all four FCW rounding modes and all produce identical binary80 payloads.
+Rounding-sensitive values, unsupported encodings, and unmasked precision
+exceptions remain symbolic; folding does not claim a concrete precision flag
+or exception retirement.
+
 The decoder reports `FCOMI`, `FUCOMI`, `FCOMIP`, and `FUCOMIP` as reads of two
 80-bit stack registers, writes to x87 status, and writes to EFLAGS. The
 decompiler preserves each instruction as an `x87_<mnemonic>` intrinsic, so the
@@ -62,3 +70,7 @@ only interprets the architecturally defined condition bits. The pass does not
 distinguish `FCOM` from `FUCOM` exception signaling, model x87 TOP or concrete
 logical stack rotation (although push/pop depth is retained), or make
 rounding/exception state precise for arithmetic.
+
+## FLD ST(i) value copies
+
+`FLD ST(i)` retains the source payload as an explicit x87 register-output value while separately preserving the push depth and unknown FSW/FTW outputs. When TOP is proven, the decompiler's existing stack remapper reads the source against pre-instruction TOP and writes the copy to the newly exposed physical slot. Unknown TOP remains represented by the logical stack boundary and does not fabricate a physical placement. This models the copy itself; stack overflow and pending exception delivery remain outside the lifter.

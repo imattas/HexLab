@@ -7,12 +7,15 @@ namespace {
 constexpr std::uint32_t sht_gnu_versym = 0x6fffffff;
 constexpr std::uint32_t sht_gnu_verdef = 0x6ffffffd;
 constexpr std::uint32_t sht_gnu_verneed = 0x6ffffffe;
+constexpr std::uint16_t version_definition_base = 0x0001;
 constexpr std::uint16_t version_hidden_mask = 0x8000;
 constexpr std::uint16_t version_index_mask = 0x7fff;
 
 struct VersionName {
     std::string name;
     std::optional<std::string> file;
+    std::uint16_t flags = 0;
+    std::uint32_t hash = 0;
     bool operator==(const VersionName &) const = default;
 };
 
@@ -60,8 +63,10 @@ std::string virtual_string(const Reader &reader, const Image &image, std::uint64
     return value;
 }
 
-void insert_version(std::map<std::uint16_t, VersionName> &versions, std::uint16_t index, VersionName value) {
-    require(index > 1, "Invalid GNU ELF version index");
+void insert_version(std::map<std::uint16_t, VersionName> &versions, std::uint16_t index, VersionName value,
+                    bool allow_base = false) {
+    require(index > 1 || (allow_base && index == 1 && (value.flags & version_definition_base)),
+            "Invalid GNU ELF version index");
     const auto found = versions.find(index);
     if (found != versions.end()) {
         require(found->second == value, "Conflicting GNU ELF version indexes");
@@ -81,8 +86,10 @@ std::map<std::uint16_t, VersionName> read_dynamic_definitions(
         canceled(stop);
         const auto record = virtual_at(reader, image, address, offset, 20, budget, stop);
         const auto version = reader.value(record.bytes, 0, 2);
+        const auto flags = static_cast<std::uint16_t>(reader.value(record.bytes, 2, 2));
         const auto index = static_cast<std::uint16_t>(reader.value(record.bytes, 4, 2) & version_index_mask);
         const auto aux_count = reader.value(record.bytes, 6, 2);
+        const auto hash = static_cast<std::uint32_t>(reader.value(record.bytes, 8, 4));
         const auto aux_offset = reader.value(record.bytes, 12, 4);
         const auto next = reader.value(record.bytes, 16, 4);
         require(version == 1 && aux_count && aux_offset >= 20,
@@ -104,7 +111,7 @@ std::map<std::uint16_t, VersionName> read_dynamic_definitions(
                 require(aux_next == 0, "GNU ELF dynamic version definition has extra auxiliary records");
         }
         budget.include(sizeof(VersionName) + sizeof(std::pair<const std::uint16_t, VersionName>) + 3 * sizeof(void *));
-        insert_version(result, index, {std::move(primary_name), {}});
+        insert_version(result, index, {std::move(primary_name), {}, flags, hash}, true);
         if (record_index + 1 < count) {
             require(next >= 20, "Invalid GNU ELF dynamic version definition link");
             offset = add(offset, next);
@@ -136,12 +143,14 @@ std::map<std::uint16_t, VersionName> read_dynamic_requirements(
         for (std::uint64_t aux_index = 0; aux_index < aux_count; ++aux_index) {
             canceled(stop);
             const auto aux = virtual_at(reader, image, address, aux_cursor, 16, budget, stop);
+            const auto hash = static_cast<std::uint32_t>(reader.value(aux.bytes, 0, 4));
+            const auto flags = static_cast<std::uint16_t>(reader.value(aux.bytes, 4, 2));
             const auto other = static_cast<std::uint16_t>(reader.value(aux.bytes, 6, 2));
             const auto name_index = reader.value(aux.bytes, 8, 4);
             const auto aux_next = reader.value(aux.bytes, 12, 4);
             auto name = virtual_string(reader, image, string_address, string_size, name_index, budget, stop, strings);
             budget.include(sizeof(VersionName) + sizeof(std::pair<const std::uint16_t, VersionName>) + 3 * sizeof(void *));
-            insert_version(result, other & version_index_mask, {std::move(name), file});
+            insert_version(result, other & version_index_mask, {std::move(name), file, flags, hash});
             if (aux_index + 1 < aux_count) {
                 require(aux_next >= 16, "Invalid GNU ELF dynamic version requirement auxiliary link");
                 aux_cursor = add(aux_cursor, aux_next);
@@ -161,20 +170,27 @@ void attach_version(ElfSymbol &symbol, std::uint16_t raw, const std::map<std::ui
     const auto index = static_cast<std::uint16_t>(raw & version_index_mask);
     const bool hidden = (raw & version_hidden_mask) != 0;
     std::optional<std::string> name, file;
+    std::optional<std::uint16_t> flags;
+    std::optional<std::uint32_t> hash;
     if (index > 1) {
         const auto version = versions.find(index);
         require(version != versions.end(), "GNU ELF symbol version index has no definition/requirement");
         name = version->second.name;
         file = version->second.file;
+        flags = version->second.flags;
+        hash = version->second.hash;
     }
-    if (symbol.version_index || symbol.version_hidden || symbol.version_name || symbol.version_file)
+    if (symbol.version_index || symbol.version_hidden || symbol.version_name || symbol.version_file ||
+        symbol.version_flags || symbol.version_hash)
         require(symbol.version_index == index && symbol.version_hidden == hidden && symbol.version_name == name &&
-                    symbol.version_file == file,
+                    symbol.version_file == file && symbol.version_flags == flags && symbol.version_hash == hash,
                 "GNU ELF section and dynamic symbol-version metadata conflict");
     symbol.version_index = index;
     symbol.version_hidden = hidden;
     symbol.version_name = std::move(name);
     symbol.version_file = std::move(file);
+    symbol.version_flags = flags;
+    symbol.version_hash = hash;
 }
 
 std::map<std::uint16_t, VersionName> read_definitions(const Reader &reader, const ElfMetadata &metadata,
@@ -193,8 +209,10 @@ std::map<std::uint16_t, VersionName> read_definitions(const Reader &reader, cons
         require(section.size - offset >= 20, "Truncated GNU ELF version definition");
         const auto record = reader.bytes(section.offset + offset, 20);
         const auto version = reader.value(record.bytes, 0, 2);
+        const auto flags = static_cast<std::uint16_t>(reader.value(record.bytes, 2, 2));
         const auto index = static_cast<std::uint16_t>(reader.value(record.bytes, 4, 2) & version_index_mask);
         const auto count = reader.value(record.bytes, 6, 2);
+        const auto hash = static_cast<std::uint32_t>(reader.value(record.bytes, 8, 4));
         const auto aux_offset = reader.value(record.bytes, 12, 4);
         const auto next = reader.value(record.bytes, 16, 4);
         require(version == 1 && count && aux_offset >= 20 && aux_offset <= section.size - offset - 8,
@@ -203,7 +221,7 @@ std::map<std::uint16_t, VersionName> read_definitions(const Reader &reader, cons
         const auto name_index = reader.value(aux.bytes, 0, 4);
         budget.include(sizeof(VersionName) + sizeof(std::pair<const std::uint16_t, VersionName>) +
                        3 * sizeof(void *));
-        insert_version(result, index, {string_at(reader, strings, name_index, budget, cache), {}});
+        insert_version(result, index, {string_at(reader, strings, name_index, budget, cache), {}, flags, hash}, true);
         auto aux_cursor = offset + aux_offset;
         for (std::uint64_t i = 1; i < count; ++i) {
             require(aux_cursor <= section.size && section.size - aux_cursor >= 8,
@@ -251,13 +269,15 @@ std::map<std::uint16_t, VersionName> read_requirements(const Reader &reader, con
             require(aux_cursor <= section.size && section.size - aux_cursor >= 16,
                     "Truncated GNU ELF version requirement auxiliary");
             const auto aux = reader.bytes(section.offset + aux_cursor, 16);
+            const auto hash = static_cast<std::uint32_t>(reader.value(aux.bytes, 0, 4));
+            const auto flags = static_cast<std::uint16_t>(reader.value(aux.bytes, 4, 2));
             const auto name_index = reader.value(aux.bytes, 8, 4);
             const auto other = static_cast<std::uint16_t>(reader.value(aux.bytes, 6, 2));
             const auto aux_next = reader.value(aux.bytes, 12, 4);
             budget.include(sizeof(VersionName) + sizeof(std::pair<const std::uint16_t, VersionName>) +
                            3 * sizeof(void *));
             insert_version(result, other & version_index_mask,
-                           {string_at(reader, strings, name_index, budget, cache), file});
+                           {string_at(reader, strings, name_index, budget, cache), file, flags, hash});
             if (i + 1 < count) {
                 require(aux_next >= 16 && aux_next <= section.size - aux_cursor,
                         "GNU ELF version auxiliary link is outside section");

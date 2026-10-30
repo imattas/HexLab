@@ -55,6 +55,7 @@ class BytesView final : public wxPanel {
     struct TypedRow {
         Location location;
         std::array<wxString, 4> cells;
+        std::optional<Address> pointer_target;
     };
     explicit BytesView(wxWindow *);
     void set_document(std::shared_ptr<const DocumentSnapshot>);
@@ -65,8 +66,11 @@ class BytesView final : public wxPanel {
   private:
     VirtualTable *table_, *typed_table_ = nullptr;
     wxStaticText *typed_status_ = nullptr;
+    wxStaticText *firmware_record_status_ = nullptr;
     wxStaticText *patch_help_ = nullptr;
-    wxButton *assign_type_ = nullptr, *patch_bytes_ = nullptr;
+    wxButton *assign_type_ = nullptr, *patch_bytes_ = nullptr, *follow_typed_pointer_ = nullptr;
+    wxButton *export_page_ = nullptr;
+    wxButton *firmware_record_ = nullptr;
     BytesPage page_{FileOffset{0}, {}, {}};
     std::shared_ptr<const DocumentSnapshot> document_;
     std::optional<Location> selection_;
@@ -74,8 +78,13 @@ class BytesView final : public wxPanel {
     std::vector<TypedRow> typed_rows_;
     void render();
     void update_patch_availability();
+    void update_firmware_record_action();
+    void navigate_to_firmware_record();
     void patch_selected_bytes();
+    void export_page();
     void refresh_typed_data();
+    void update_typed_pointer_action();
+    void follow_typed_pointer();
     void apply_type();
 };
 } // namespace hexlab::desktop

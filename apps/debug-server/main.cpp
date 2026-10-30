@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -105,6 +106,14 @@ std::string hex_u64(std::uint64_t value) {
     std::array<char, 16> out{};
     const auto [end, error] = std::to_chars(out.data(), out.data() + out.size(), value, 16);
     return error == std::errc{} ? std::string(out.data(), end) : std::string{};
+}
+std::string absolute_utf8_path(std::string_view path) {
+    std::error_code error;
+    const std::u8string input(reinterpret_cast<const char8_t*>(path.data()), path.size());
+    const auto absolute = std::filesystem::absolute(std::filesystem::path(input), error);
+    if (error) return {};
+    const auto utf8 = absolute.lexically_normal().u8string();
+    return std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size());
 }
 int hex_digit(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -385,6 +394,7 @@ struct ServerState {
     DebugSession& session;
     RspConnection& connection;
     bool attached_existing_process = false;
+    std::string executable_path;
     std::vector<RegisterInfo> registers;
     std::vector<hexlab::debugger::ThreadInfo> thread_page;
     std::size_t next_thread = 0;
@@ -553,7 +563,10 @@ std::string memory_map_xml(std::vector<hexlab::debugger::MemoryRegion> regions) 
     std::optional<std::uint64_t> previous_last;
     for (const auto& region : regions) {
         if (!region.length || region.length - 1 > UINT64_MAX - region.start ||
-            (previous_last && region.start <= *previous_last) || region.type.size() > 32 * 1024)
+            (previous_last && region.start <= *previous_last) || region.type.size() > 32 * 1024 ||
+            (region.flash_block_size && (region.type != "flash" || !*region.flash_block_size ||
+                *region.flash_block_size > region.length || region.start % *region.flash_block_size != 0 ||
+                region.length % *region.flash_block_size != 0)))
             return {};
         previous_last = region.start + region.length - 1;
         // XML 1.0 cannot represent these characters, even as numeric entities.
@@ -564,9 +577,12 @@ std::string memory_map_xml(std::vector<hexlab::debugger::MemoryRegion> regions) 
                                       region.executable ? 'x' : '-'};
         // Standard RSP memory types provide a useful fallback for peers that
         // do not understand the permission and native-label properties.
-        xml += "<memory type=\"" + std::string(region.writable ? "ram" : "rom") +
+        const auto standard_type = region.type == "flash" ? "flash" : (region.writable ? "ram" : "rom");
+        xml += "<memory type=\"" + std::string(standard_type) +
             "\" start=\"0x" + hex_u64(region.start) + "\" length=\"0x" + hex_u64(region.length) +
             "\"><property name=\"permissions\">" + permissions + "</property>";
+        if (region.flash_block_size)
+            xml += "<property name=\"blocksize\">0x" + hex_u64(*region.flash_block_size) + "</property>";
         xml += "<property name=\"hexlab-type\">" + xml_escape(region.type) + "</property>";
         xml += "</memory>";
         if (xml.size() > max_memory_map_xml) return {};
@@ -830,6 +846,8 @@ std::string handle_command(ServerState& state, std::string_view command, bool& c
     if (command == "?") return state.event ? stop_reply(state, *state.event) : "S05";
     if (command.starts_with("qSupported")) {
         std::string features = "PacketSize=2000;swbreak+;QStartNoAckMode+;qXfer:features:read+;vContSupported+";
+        if (!state.executable_path.empty() && state.executable_path.size() <= 64 * 1024)
+            features += ";qXfer:exec-file:read+";
         const auto modules = state.session.modules();
         state.libraries_supported = static_cast<bool>(modules) &&
             modules.value().size() <= hexlab::debugger::max_inspection_modules;
@@ -905,6 +923,18 @@ std::string handle_command(ServerState& state, std::string_view command, bool& c
         if (offset >= xml.size()) return "l";
         const auto amount = std::min<std::uint64_t>(length, xml.size() - static_cast<std::size_t>(offset));
         return std::string(offset + amount < xml.size() ? "m" : "l") + xml.substr(static_cast<std::size_t>(offset), static_cast<std::size_t>(amount));
+    }
+    if (command.starts_with("qXfer:exec-file:read::")) {
+        if (state.executable_path.empty() || state.executable_path.size() > 64 * 1024) return {};
+        const auto range = command.substr(std::string_view("qXfer:exec-file:read::").size());
+        const auto comma = range.find(','); std::uint64_t offset{}, length{};
+        if (comma == std::string_view::npos || !parse_u64(range.substr(0, comma), offset) ||
+            !parse_u64(range.substr(comma + 1), length) || !length || length > max_packet - 2 ||
+            offset > state.executable_path.size()) return "E01";
+        const auto amount = std::min<std::uint64_t>(length, state.executable_path.size() - static_cast<std::size_t>(offset));
+        const bool more = offset + amount < state.executable_path.size();
+        return std::string(more ? "m" : "l") + state.executable_path.substr(
+            static_cast<std::size_t>(offset), static_cast<std::size_t>(amount));
     }
     if (command.starts_with("qXfer:libraries:read::")) {
         if (!state.libraries_supported) return {};
@@ -1181,9 +1211,10 @@ std::optional<std::string> resume_and_wait(ServerState& state, std::string_view 
     return stop_reply(state, *state.event);
 }
 
-int serve(Socket socket, DebugSession& session, DebugEvent initial, bool attached_existing_process) {
+int serve(Socket socket, DebugSession& session, DebugEvent initial, bool attached_existing_process,
+          std::string executable_path = {}) {
     RspConnection connection(socket);
-    ServerState state{session, connection, attached_existing_process}; state.event = std::move(initial);
+    ServerState state{session, connection, attached_existing_process, std::move(executable_path)}; state.event = std::move(initial);
     state.target_exited = state.event->kind == EventKind::process_exited;
     if (!initialize_registers(state)) {
         std::cerr << "Debugger backend has no usable target thread/register context.\n";
@@ -1258,7 +1289,8 @@ int run(int argc, char** argv) {
     auto initial = session.wait_event(30s);
     if (!initial) { std::cerr << "No initial debug stop: " << initial.error().message << '\n'; (void)session.detach(); return 1; }
     std::cout << "Client connected; target " << target.value().name << " (pid " << target.value().id << ") is stopped.\n";
-    return serve(client.get(), session, std::move(initial.value()), options.attach.has_value());
+    return serve(client.get(), session, std::move(initial.value()), options.attach.has_value(),
+        options.executable ? absolute_utf8_path(*options.executable) : std::string{});
 }
 } // namespace
 

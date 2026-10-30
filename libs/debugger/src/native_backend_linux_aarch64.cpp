@@ -1,5 +1,6 @@
 #include "hexlab/debugger/debugger.hpp"
 #include "elf_process_architecture.hpp"
+#include "linux_proc_task_state.hpp"
 
 #include <algorithm>
 #include <array>
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <signal.h>
 #include <string>
@@ -41,14 +43,19 @@ constexpr unsigned long nt_fpregset = 2;
 // Linux arm64 UAPI notes in <linux/elf.h>. Keep local values so old userspace
 // headers still build the backend while the kernel remains the capability
 // authority through GETREGSET.
+constexpr unsigned long nt_arm_tls = 0x401;
 constexpr unsigned long nt_arm_hw_break = 0x402;
 constexpr unsigned long nt_arm_hw_watch = 0x403;
 constexpr unsigned long nt_arm_sve = 0x405;
 constexpr unsigned long nt_arm_pac_mask = 0x406;
+constexpr unsigned long nt_arm_ssve = 0x40b;
+constexpr unsigned long nt_arm_za = 0x40c;
+constexpr unsigned long nt_arm_zt = 0x40d;
 constexpr std::size_t aarch64_reg_count = 34; // x0-x30, sp, pc, pstate
 constexpr std::size_t aarch64_hwdebug_max_slots = 16;
 constexpr std::size_t aarch64_sve_max_vl = 8192; // Linux UAPI __SVE_VL_MAX (512 quadwords).
 constexpr std::size_t aarch64_sve_max_regset_size = 512 * 1024;
+constexpr std::size_t aarch64_za_max_payload = 1024 * 1024;
 struct Aarch64HwdebugRegister {
     std::uint64_t address{};
     std::uint32_t control{};
@@ -103,6 +110,11 @@ struct Aarch64PacMask {
     std::uint64_t instruction{};
 };
 static_assert(sizeof(Aarch64PacMask) == 16);
+struct Aarch64TlsState {
+    std::uint64_t tpidr_el0{};
+    std::uint64_t tpidr2_el0{};
+};
+static_assert(sizeof(Aarch64TlsState) == 16);
 // Linux arm64 UAPI user_fpsimd_state: NT_FPREGSET exposes this fixed legacy
 // FPSIMD image even when the task also has a larger SVE vector length.
 struct alignas(16) Aarch64FpsimdRegs {
@@ -228,6 +240,7 @@ struct Aarch64SveState {
     Aarch64SveHeader header{};
     std::vector<std::byte> bytes;
     bool has_sve_registers = false;
+    unsigned long note = nt_arm_sve;
 };
 
 bool valid_sve_vl(std::uint16_t vl) {
@@ -261,40 +274,49 @@ Result<Aarch64SveLayout> sve_layout(std::uint16_t vl) {
     return layout;
 }
 
-Result<Aarch64SveState> get_sve_state(pid_t tid) {
+Result<Aarch64SveState> get_sve_state(pid_t tid, unsigned long note = nt_arm_sve) {
+    const std::string regset = note == nt_arm_ssve ? "NT_ARM_SSVE" : "NT_ARM_SVE";
     Aarch64SveHeader header{};
     iovec header_io{&header, sizeof(header)};
-    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(nt_arm_sve), &header_io) != 0) {
+    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(note), &header_io) != 0) {
         const int error = errno;
         if (error == EINVAL || error == EIO || error == ENODEV || error == ENOSYS)
-            return Error{ErrorCode::unsupported, "Linux AArch64 NT_ARM_SVE state is unavailable"};
+            return Error{ErrorCode::unsupported, "Linux AArch64 " + regset + " state is unavailable"};
         errno = error;
-        return sys_error("PTRACE_GETREGSET NT_ARM_SVE header");
+        return sys_error(("PTRACE_GETREGSET " + regset + " header").c_str());
     }
     if (header_io.iov_len != sizeof(header))
-        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_SVE header has an unexpected size"};
+        return Error{ErrorCode::malformed, "Linux AArch64 " + regset + " header has an unexpected size"};
     constexpr std::uint16_t known_flags = sve_regs_mask | sve_vl_inherit | sve_vl_onexec;
     if (header.reserved != 0 || (header.flags & ~known_flags) != 0 ||
         (header.flags & sve_regs_mask) > sve_regs_sve || !valid_sve_vl(header.max_vl) ||
         !valid_sve_vl(header.vl) || header.vl > header.max_vl ||
         header.size < sizeof(header) || header.max_size < header.size ||
         header.max_size > aarch64_sve_max_regset_size)
-        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_SVE header exceeds validated bounds"};
+        return Error{ErrorCode::malformed, "Linux AArch64 " + regset + " header exceeds validated bounds"};
 
     Aarch64SveState state;
     state.header = header;
+    state.note = note;
     state.has_sve_registers = (header.flags & sve_regs_mask) == sve_regs_sve;
+    if (note == nt_arm_ssve) {
+        auto maximum = sve_layout(header.max_vl); if (!maximum) return maximum.error();
+        if (header.max_size < maximum.value().minimum_size)
+            return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_SSVE maximum size cannot hold its maximum vector length"};
+    }
     if (header.size == sizeof(header)) {
         // The kernel exposes a header-only NT_ARM_SVE view while another vector
         // mode (notably SME streaming mode) owns the live state. Do not silently
         // substitute the FPSIMD alias and lose that state.
         if (state.has_sve_registers)
-            return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_SVE marks registers active but supplies no payload"};
+            return Error{ErrorCode::malformed, "Linux AArch64 " + regset + " marks registers active but supplies no payload"};
         return state;
     }
     if (header.size > aarch64_sve_max_regset_size)
-        return Error{ErrorCode::resource_limit, "Linux AArch64 NT_ARM_SVE payload exceeds the debugger allocation limit"};
+        return Error{ErrorCode::resource_limit, "Linux AArch64 " + regset + " payload exceeds the debugger allocation limit"};
     const auto mode = header.flags & sve_regs_mask;
+    if (note == nt_arm_ssve && mode != sve_regs_sve)
+        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_SSVE cannot supply an FPSIMD payload"};
     std::size_t minimum_size = 0;
     if (mode == sve_regs_sve) {
         auto layout = sve_layout(header.vl); if (!layout) return layout.error();
@@ -302,39 +324,111 @@ Result<Aarch64SveState> get_sve_state(pid_t tid) {
     } else if (mode == sve_regs_fpsimd) {
         minimum_size = sizeof(Aarch64SveHeader) + sizeof(Aarch64FpsimdRegs);
     } else {
-        return Error{ErrorCode::unsupported, "Linux AArch64 NT_ARM_SVE reports an unknown register format"};
+        return Error{ErrorCode::unsupported, "Linux AArch64 " + regset + " reports an unknown register format"};
     }
     if (header.size < minimum_size || header.max_size < minimum_size)
-        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_SVE payload is shorter than its UAPI register layout"};
+        return Error{ErrorCode::malformed, "Linux AArch64 " + regset + " payload is shorter than its UAPI register layout"};
     state.bytes.resize(header.size);
     iovec io{state.bytes.data(), state.bytes.size()};
-    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(nt_arm_sve), &io) != 0) {
+    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(note), &io) != 0) {
         const int error = errno;
         if (error == EINVAL || error == EIO || error == ENODEV || error == ENOSYS)
-            return Error{ErrorCode::unsupported, "Linux AArch64 NT_ARM_SVE state became unavailable"};
+            return Error{ErrorCode::unsupported, "Linux AArch64 " + regset + " state became unavailable"};
         errno = error;
-        return sys_error("PTRACE_GETREGSET NT_ARM_SVE payload");
+        return sys_error(("PTRACE_GETREGSET " + regset + " payload").c_str());
     }
     if (io.iov_len != header.size)
-        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_SVE payload was truncated"};
+        return Error{ErrorCode::malformed, "Linux AArch64 " + regset + " payload was truncated"};
     Aarch64SveHeader received{};
     std::memcpy(&received, state.bytes.data(), sizeof(received));
     if (std::memcmp(&received, &header, sizeof(header)) != 0)
-        return Error{ErrorCode::busy, "Linux AArch64 NT_ARM_SVE header changed while reading stopped thread state"};
+        return Error{ErrorCode::busy, "Linux AArch64 " + regset + " header changed while reading stopped thread state"};
     return state;
 }
 
-Status set_sve_state(pid_t tid, const Aarch64SveState& state) {
-    if (state.bytes.empty() || state.bytes.size() != state.header.size ||
-        state.bytes.size() > aarch64_sve_max_regset_size)
-        return Error{ErrorCode::malformed, "refusing to write incomplete Linux AArch64 NT_ARM_SVE state"};
-    iovec io{const_cast<std::byte*>(state.bytes.data()), state.bytes.size()};
-    if (ptrace(PTRACE_SETREGSET, tid, reinterpret_cast<void*>(nt_arm_sve), &io) != 0) {
+struct Aarch64ZaState {
+    // user_za_header has the same fixed field layout as user_sve_header,
+    // but uses only the inheritance flags, with no SVE register-format bit.
+    Aarch64SveHeader header{};
+    std::vector<std::byte> bytes;
+};
+
+Result<Aarch64ZaState> get_za_state(pid_t tid) {
+    Aarch64ZaState state;
+    auto& header = state.header;
+    iovec header_io{&header, sizeof(header)};
+    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(nt_arm_za), &header_io) != 0) {
         const int error = errno;
         if (error == EINVAL || error == EIO || error == ENODEV || error == ENOSYS)
-            return Error{ErrorCode::unsupported, "Linux AArch64 NT_ARM_SVE state cannot be written"};
+            return Error{ErrorCode::unsupported, "Linux AArch64 NT_ARM_ZA state is unavailable"};
+        errno = error; return sys_error("PTRACE_GETREGSET NT_ARM_ZA header");
+    }
+    if (header_io.iov_len != sizeof(header) || header.reserved || (header.flags & ~sve_vl_inherit) ||
+        !valid_sve_vl(header.vl) || !valid_sve_vl(header.max_vl) || header.vl > header.max_vl ||
+        header.size < sizeof(header) || header.max_size < header.size)
+        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_ZA header exceeds validated bounds"};
+    const auto maximum_matrix = static_cast<std::size_t>(header.max_vl) * header.max_vl;
+    if (header.max_size < sizeof(header) + maximum_matrix)
+        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_ZA maximum size cannot hold its maximum vector length"};
+    if (header.size == sizeof(header)) return state; // PSTATE.ZA is inactive; do not invent a zero matrix.
+    const auto matrix_bytes = static_cast<std::size_t>(header.vl) * header.vl;
+    if (header.size < sizeof(header) + matrix_bytes)
+        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_ZA payload is shorter than its matrix layout"};
+    if (header.size > sizeof(header) + aarch64_za_max_payload)
+        return Error{ErrorCode::resource_limit, "Linux AArch64 ZA state exceeds the 1 MiB payload limit"};
+    state.bytes.resize(header.size);
+    iovec io{state.bytes.data(), state.bytes.size()};
+    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(nt_arm_za), &io) != 0) {
+        const int error = errno;
+        if (error == EINVAL || error == EIO || error == ENODEV || error == ENOSYS)
+            return Error{ErrorCode::unsupported, "Linux AArch64 NT_ARM_ZA state became unavailable"};
+        errno = error; return sys_error("PTRACE_GETREGSET NT_ARM_ZA payload");
+    }
+    if (io.iov_len != header.size)
+        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_ZA payload was truncated"};
+    Aarch64SveHeader received{};
+    std::memcpy(&received, state.bytes.data(), sizeof(received));
+    if (std::memcmp(&received, &header, sizeof(header)))
+        return Error{ErrorCode::busy, "Linux AArch64 NT_ARM_ZA header changed while reading stopped thread state"};
+    return state;
+}
+
+Result<std::array<std::byte, 64>> get_zt_state(pid_t tid) {
+    std::array<std::byte, 64> bytes{};
+    iovec io{bytes.data(), bytes.size()};
+    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(nt_arm_zt), &io) != 0) {
+        const int error = errno;
+        if (error == EINVAL || error == EIO || error == ENODEV || error == ENOSYS)
+            return Error{ErrorCode::unsupported, "Linux AArch64 NT_ARM_ZT state is unavailable"};
+        errno = error; return sys_error("PTRACE_GETREGSET NT_ARM_ZT");
+    }
+    if (io.iov_len != bytes.size())
+        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_ZT must contain one 64-byte register"};
+    return bytes;
+}
+
+Status set_sve_state(pid_t tid, const Aarch64SveState& state) {
+    if (state.note != nt_arm_sve && state.note != nt_arm_ssve)
+        return Error{ErrorCode::invalid_argument, "refusing to write an unknown Linux AArch64 SVE regset"};
+    const std::string regset = state.note == nt_arm_ssve ? "NT_ARM_SSVE" : "NT_ARM_SVE";
+    if (state.bytes.empty() || state.bytes.size() != state.header.size ||
+        state.bytes.size() > aarch64_sve_max_regset_size)
+        return Error{ErrorCode::malformed, "refusing to write incomplete Linux AArch64 " + regset + " state"};
+    Aarch64SveHeader payload_header{};
+    std::memcpy(&payload_header, state.bytes.data(), sizeof(payload_header));
+    if (std::memcmp(&payload_header, &state.header, sizeof(payload_header)) != 0)
+        return Error{ErrorCode::malformed, "refusing to write Linux AArch64 " + regset + " state with a mismatched header"};
+    auto current = get_sve_state(tid, state.note);
+    if (!current) return current.error();
+    if (std::memcmp(&current.value().header, &state.header, sizeof(state.header)) != 0)
+        return Error{ErrorCode::busy, "Linux AArch64 " + regset + " metadata changed before register write"};
+    iovec io{const_cast<std::byte*>(state.bytes.data()), state.bytes.size()};
+    if (ptrace(PTRACE_SETREGSET, tid, reinterpret_cast<void*>(state.note), &io) != 0) {
+        const int error = errno;
+        if (error == EINVAL || error == EIO || error == ENODEV || error == ENOSYS)
+            return Error{ErrorCode::unsupported, "Linux AArch64 " + regset + " state cannot be written"};
         errno = error;
-        return sys_error("PTRACE_SETREGSET NT_ARM_SVE");
+        return sys_error(("PTRACE_SETREGSET " + regset).c_str());
     }
     return std::monostate{};
 }
@@ -353,6 +447,22 @@ Result<Aarch64PacMask> get_pac_mask(pid_t tid) {
         return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_PAC_MASK regset has an unexpected size"};
     return mask;
 }
+Result<std::pair<Aarch64TlsState, bool>> get_tls_state(pid_t tid) {
+    Aarch64TlsState state{};
+    iovec io{&state, sizeof(state)};
+    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(nt_arm_tls), &io) != 0) {
+        const int error = errno;
+        if (error == EINVAL || error == EIO || error == ENODEV || error == ENOSYS)
+            return Error{ErrorCode::unsupported, "Linux AArch64 NT_ARM_TLS state is unavailable"};
+        errno = error;
+        return sys_error("PTRACE_GETREGSET NT_ARM_TLS");
+    }
+    // Older kernels expose only TPIDR_EL0 (8 bytes); newer kernels append
+    // TPIDR2_EL0, reporting zero when that architectural register is absent.
+    if (io.iov_len != sizeof(state.tpidr_el0) && io.iov_len != sizeof(state))
+        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_TLS regset has an unexpected size"};
+    return std::pair{state, io.iov_len == sizeof(state)};
+}
 }
 
 class LinuxAarch64Backend final : public Backend {
@@ -366,13 +476,14 @@ class LinuxAarch64Backend final : public Backend {
         explicit WaitScope(LinuxAarch64Backend &value, std::optional<std::chrono::milliseconds> timeout = {})
             : backend(value), owner(!value.wait_deadline_) {
             if (owner) {
+                std::lock_guard gate(backend.wait_gate_mutex_);
                 backend.wait_stop_requested_.store(false);
                 const auto duration = timeout ? std::min(backend.wait_timeout_, std::max(*timeout, std::chrono::milliseconds(0))) : backend.wait_timeout_;
                 backend.wait_deadline_ = Clock::now() + duration;
                 backend.wait_active_.store(true);
             }
         }
-        ~WaitScope() { if (owner) { backend.wait_active_.store(false); backend.wait_deadline_.reset(); } }
+        ~WaitScope() { if (owner) { std::lock_guard gate(backend.wait_gate_mutex_); backend.wait_active_.store(false); backend.wait_deadline_.reset(); } }
     };
     struct EventPollScope {
         bool &flag;
@@ -396,6 +507,8 @@ public:
     }
 
     Result<ProcessInfo> launch(const Target& target) override {
+        if (!target.remote_environment.empty())
+            return Error{ErrorCode::unsupported, "remote environment changes are not supported by native launch"};
         WaitScope scope(*this);
         if (startup_cleanup_) { auto cleanup = cleanup_startup(); if (!cleanup) return cleanup.error(); }
         if (pid_) return Error{ErrorCode::busy, "backend already owns a debug target"};
@@ -593,21 +706,54 @@ public:
         clear(); return std::monostate{};
     }
     Status request_interrupt() override {
+        std::lock_guard gate(wait_gate_mutex_);
+        if (pending_ || requested_thread_interrupt_.has_value())
+            return Error{ErrorCode::busy, "an event or thread-qualified interrupt is already pending"};
         // The active poller owns the mutable ptrace state. Cancellation may be
         // requested concurrently without walking its thread sets.
         if (wait_active_.load()) { wait_stop_requested_.store(true); return std::monostate{}; }
         return interrupt_running_threads(false);
     }
+    Status request_thread_interrupt(ThreadId thread) override {
+        std::lock_guard gate(wait_gate_mutex_);
+        if (!pid_ || exited_ || pending_)
+            return Error{ErrorCode::invalid_argument, "thread interrupt requires a running target with no pending event"};
+        if (wait_active_.load())
+            return Error{ErrorCode::busy, "cannot target a thread while the ptrace event poller is active"};
+        if (thread == 0 || thread > static_cast<ThreadId>(std::numeric_limits<pid_t>::max()))
+            return Error{ErrorCode::invalid_argument, "thread interrupt requires a valid session thread ID"};
+        const auto tid = static_cast<pid_t>(thread);
+        if (!tracked_.contains(tid) || !seized_.contains(tid))
+            return Error{ErrorCode::invalid_argument, "thread is not a seized thread owned by this session"};
+        if (stopped_.contains(tid) || deferred_.contains(tid) || initial_children_.contains(tid))
+            return Error{ErrorCode::invalid_argument, "thread interrupt requires a known-running thread"};
+        if (!interrupting_.empty() || requested_thread_interrupt_.has_value() || wait_stop_requested_.load() ||
+            step_pending_ || hardware_step_state_ || step_breakpoint_ || resume_blocked_ ||
+            !rollback_threads_.empty() || !hardware_unconfigured_threads_.empty())
+            return Error{ErrorCode::busy, "another interrupt, step, rollback, or breakpoint configuration is in progress"};
+        interrupting_.insert(tid);
+        requested_thread_interrupt_ = tid;
+        if (ptrace(PTRACE_INTERRUPT, tid, nullptr, nullptr) != 0) {
+            interrupting_.erase(tid);
+            requested_thread_interrupt_.reset();
+            if (errno == ESRCH)
+                return Error{ErrorCode::invalid_argument, "thread exited before the interrupt was accepted"};
+            return sys_error("PTRACE_INTERRUPT selected thread");
+        }
+        return std::monostate{};
+    }
+    bool supports_thread_interrupt() const noexcept override { return true; }
     Result<DebugEvent> wait_event(std::chrono::milliseconds timeout) override {
         WaitScope scope(*this, timeout);
         EventPollScope event_scope(event_polling_);
         if (!pid_) return Error{ErrorCode::invalid_argument, "no debug target is attached"};
         if (pending_) return Error{ErrorCode::busy, "previous debug event has not been continued"};
-        if (initial_) { initial_ = false; DebugEvent e{++seq_, EventKind::breakpoint, static_cast<ProcessId>(pid_), static_cast<ThreadId>(pid_), 0, "exec or attach stop", static_cast<std::uint32_t>(last_signal_)}; pending_ = e.sequence; pending_thread_ = pid_; pending_signal_ = 0; return e; }
+        if (initial_) { initial_ = false; DebugEvent e{++seq_, EventKind::breakpoint, static_cast<ProcessId>(pid_), static_cast<ThreadId>(pid_), 0, "exec or attach stop", static_cast<std::uint32_t>(last_signal_)}; pending_ = e.sequence; pending_thread_ = pid_; pending_signal_ = 0; pending_thread_interrupt_ = false; return e; }
         const std::vector<pid_t> waiting_children(initial_children_.begin(), initial_children_.end());
         for (const auto child : waiting_children) { auto ready = finish_cloned_thread(child); if (!ready) return ready.error(); }
         do {
             pid_t tid = 0; int status{};
+            bool requested_thread_interrupt = false;
             if (!deferred_.empty()) { const auto it = deferred_.begin(); tid = it->first; status = it->second; deferred_.erase(it); }
             else for (const auto candidate : tracked_) {
                 const auto waited = waitpid(candidate, &status, WNOHANG | __WALL);
@@ -625,12 +771,16 @@ public:
                     }
                     if (pending_hardware_execute_ && pending_thread_ == tid) pending_hardware_execute_ = false;
                     tracked_.erase(tid); stopped_.erase(tid); seized_.erase(tid); interrupting_.erase(tid);
+                    if (requested_thread_interrupt_ == tid) requested_thread_interrupt_.reset();
                     e.kind = tid == pid_ ? EventKind::process_exited : EventKind::thread_exited;
                     e.code = static_cast<std::uint32_t>(WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
                     e.message = tid == pid_ ? "process exited" : "thread exited";
                     if (tid == pid_) exited_ = true;
                 } else if (WIFSTOPPED(status)) {
                     stopped_.insert(tid); interrupting_.erase(tid); last_signal_ = WSTOPSIG(status); const auto ptrace_event = static_cast<unsigned>(status) >> 16;
+                    const bool was_thread_interrupt = requested_thread_interrupt_ == tid;
+                    if (was_thread_interrupt) requested_thread_interrupt_.reset();
+                    requested_thread_interrupt = was_thread_interrupt && ptrace_event == PTRACE_EVENT_STOP && last_signal_ == SIGTRAP;
                     pending_signal_ = ptrace_event == 0 ? last_signal_ : 0;
                     if (ptrace_event == PTRACE_EVENT_CLONE) {
                         deferred_[tid] = status;
@@ -644,8 +794,12 @@ public:
                     } else {
                         auto regs = get_regs(tid); const auto pc = regs ? regs.value().value[32] : 0;
                         e.address = pc; e.code = static_cast<std::uint32_t>(last_signal_); e.message = "ptrace stop";
-                        e.kind = last_signal_ == SIGTRAP && ptrace_event != PTRACE_EVENT_STOP ? EventKind::breakpoint : EventKind::exception;
-                        if (ptrace_event == PTRACE_EVENT_STOP) e.message = "interrupt stop";
+                        const bool debugger_interrupt = ptrace_event == PTRACE_EVENT_STOP && last_signal_ == SIGTRAP;
+                        e.kind = debugger_interrupt ? EventKind::interrupted :
+                            last_signal_ == SIGTRAP && ptrace_event != PTRACE_EVENT_STOP
+                                ? EventKind::breakpoint : EventKind::exception;
+                        if (debugger_interrupt) e.message = "debugger interrupt";
+                        else if (ptrace_event == PTRACE_EVENT_STOP) e.message = "group stop";
                         if (last_signal_ == SIGTRAP && ptrace_event == 0) {
                             siginfo_t info{};
                             if (ptrace(PTRACE_GETSIGINFO, tid, nullptr, &info) == 0 && info.si_code == TRAP_HWBKPT) {
@@ -690,7 +844,37 @@ public:
                             constexpr std::array<std::byte, 4> brk{std::byte{0x00}, std::byte{0x00}, std::byte{0x20}, std::byte{0xd4}};
                             if (enabled_.contains(*step_breakpoint_) && !write_raw(*step_breakpoint_, brk)) return sys_error("reinsert BRK after displaced instruction");
                             step_breakpoint_.reset(); step_thread_ = 0; step_pending_ = false;
-                            if (last_signal_ == SIGTRAP && !hardware_trap) e.kind = EventKind::single_step;
+                            if (last_signal_ == SIGTRAP && !hardware_trap) {
+                                e.kind = EventKind::single_step;
+                                if (deferred_breakpoint_resumes_) {
+                                    std::vector<pid_t> resumed;
+                                    for (const auto& [resume_tid, signal] : *deferred_breakpoint_resumes_) {
+                                        if (ptrace(PTRACE_CONT, resume_tid, nullptr,
+                                                   reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) == 0) {
+                                            stopped_.erase(resume_tid);
+                                            deferred_signals_.erase(resume_tid);
+                                            resumed.push_back(resume_tid);
+                                            continue;
+                                        }
+                                        const auto error = sys_error("PTRACE_CONT deferred AArch64 breakpoint schedule");
+                                        rollback_threads_ = resumed;
+                                        auto rollback = stop_threads_for_rollback(resumed);
+                                        if (!rollback) {
+                                            resume_blocked_ = true;
+                                            e.message += "; deferred-schedule rollback failed: " + rollback.error().message;
+                                        } else rollback_threads_.clear();
+                                        e.kind = EventKind::exception;
+                                        e.message += "; deferred schedule failed: " + error.message;
+                                        break;
+                                    }
+                                    if (resumed.size() == deferred_breakpoint_resumes_->size()) {
+                                        deferred_breakpoint_resumes_.reset();
+                                        continue;
+                                    }
+                                    deferred_breakpoint_resumes_.reset();
+                                }
+                            }
+                            deferred_breakpoint_resumes_.reset();
                         } else if (step_pending_ && step_thread_ == tid) {
                             step_pending_ = false; step_thread_ = 0;
                             if (last_signal_ == SIGTRAP && !hardware_trap && !hardware_step_restore_failed)
@@ -705,7 +889,7 @@ public:
                         step_pending_ = false; step_thread_ = 0;
                     }
                 }
-                if (e.kind != EventKind::process_exited) {
+                if (e.kind != EventKind::process_exited && !requested_thread_interrupt) {
                     auto stopped = stop_all_threads();
                     if (!stopped) e.message += "; peer suspension incomplete: " + stopped.error().message;
                 }
@@ -713,7 +897,7 @@ public:
                     e.message += "; " + hardware_configuration_error_;
                     hardware_configuration_error_.clear();
                 }
-                pending_ = e.sequence; pending_thread_ = tid; return e;
+                pending_ = e.sequence; pending_thread_ = tid; pending_thread_interrupt_ = requested_thread_interrupt; return e;
             }
             auto progress = wait_progress(); if (!progress) return progress.error();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -726,21 +910,30 @@ public:
         auto rollback = recover_resume_rollback(); if (!rollback) return rollback;
         if (exited_) { clear(); return std::monostate{}; }
         auto configured = ensure_hardware_breakpoints_configured(); if (!configured) return configured;
+        if (pending_thread_interrupt_) {
+            const auto tid = pending_thread_;
+            const int signal = disposition == ContinueStatus::handled ? 0 : pending_signal_;
+            if (ptrace(PTRACE_CONT, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) != 0)
+                return sys_error("PTRACE_CONT interrupted AArch64 thread");
+            stopped_.erase(tid);
+            pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false;
+            return std::monostate{};
+        }
         auto safe = require_all_threads_stopped(); if (!safe) return safe;
         const auto tid = pending_thread_;
         if (pending_breakpoint_ && disposition == ContinueStatus::handled) {
             auto stepped = begin_breakpoint_step(tid, *pending_breakpoint_); if (!stepped) return stepped;
-            pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_breakpoint_.reset(); return std::monostate{};
+            pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false; pending_breakpoint_.reset(); return std::monostate{};
         }
         if (pending_hardware_execute_ && disposition == ContinueStatus::handled) {
             auto stepped = begin_hardware_execute_step(tid, pending_hardware_execute_address_);
             if (!stepped) return stepped;
-            pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_hardware_execute_ = false;
+            pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false; pending_hardware_execute_ = false;
             return std::monostate{};
         }
         const int signal = disposition == ContinueStatus::handled ? 0 : pending_signal_;
         auto resumed = resume_stopped_threads(tid, signal); if (!resumed) return resumed;
-        pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_breakpoint_.reset(); pending_hardware_execute_ = false; return std::monostate{};
+        pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false; pending_breakpoint_.reset(); pending_hardware_execute_ = false; return std::monostate{};
     }
     Status continue_thread_event(std::uint64_t sequence, ThreadId thread, ContinueStatus disposition) override {
         WaitScope scope(*this);
@@ -760,7 +953,7 @@ public:
             if (ptrace(PTRACE_CONT, pending_thread_, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) != 0) return sys_error("PTRACE_CONT selected thread");
             stopped_.erase(pending_thread_);
         }
-        pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_breakpoint_.reset(); pending_hardware_execute_ = false; return std::monostate{};
+        pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false; pending_breakpoint_.reset(); pending_hardware_execute_ = false; return std::monostate{};
     }
     Status resume_threads_event(std::uint64_t sequence, std::span<const ThreadResumeAction> actions) override {
         WaitScope scope(*this);
@@ -816,6 +1009,40 @@ public:
                     return static_cast<pid_t>(action->thread) == step_thread_;
                 })))
                 return Error{ErrorCode::busy, "cannot schedule an AArch64 thread while a single-step result is pending"};
+            if (pending_breakpoint_ && !pending_hardware_execute_) {
+                const auto owner_action = std::find_if(actions.begin(), actions.end(), [&](const auto& action) {
+                    return static_cast<pid_t>(action.thread) == owner;
+                });
+                if (owner_action == actions.end() || owner_action->kind != ThreadResumeKind::continue_execution ||
+                    std::any_of(runnable.begin(), runnable.end(), [](const auto* action) {
+                        return action->kind != ThreadResumeKind::continue_execution;
+                    }))
+                    return Error{ErrorCode::unsupported,
+                        "an AArch64 software-breakpoint step-over schedule requires the event owner and selected peers to continue"};
+                std::vector<std::pair<pid_t, int>> deferred_resumes;
+                deferred_resumes.reserve(runnable.size());
+                for (const auto* action : runnable) {
+                    const auto tid = static_cast<pid_t>(action->thread);
+                    const int queued = signal_for(*action);
+                    const int delivered = action->signal_disposition == ContinueStatus::handled ? 0 : queued;
+                    if (tid == owner && delivered != 0)
+                        return Error{ErrorCode::unsupported,
+                            "cannot combine AArch64 software-breakpoint step-over with delivery of the owner's pending signal"};
+                    deferred_resumes.emplace_back(tid, delivered);
+                }
+                auto stepped = begin_breakpoint_step(owner, *pending_breakpoint_, std::move(deferred_resumes));
+                if (!stepped) return stepped;
+                for (const auto& action : actions) {
+                    const auto stopped_tid = static_cast<pid_t>(action.thread);
+                    if (action.kind != ThreadResumeKind::stop) continue;
+                    const int signal = signal_for(action);
+                    if (action.signal_disposition == ContinueStatus::handled) deferred_signals_.erase(stopped_tid);
+                    else if (signal != 0) deferred_signals_[stopped_tid] = signal;
+                }
+                pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false;
+                pending_breakpoint_.reset(); pending_hardware_execute_ = false;
+                return std::monostate{};
+            }
             if (pending_breakpoint_ || pending_hardware_execute_)
                 return Error{ErrorCode::unsupported, "cannot run a multi-thread AArch64 schedule while stepping over a breakpoint"};
             auto configured = ensure_hardware_breakpoints_configured(); if (!configured) return configured;
@@ -876,7 +1103,7 @@ public:
                 if (action.signal_disposition == ContinueStatus::handled) deferred_signals_.erase(tid);
                 else if (signal != 0) deferred_signals_[tid] = signal;
             }
-            pending_.reset(); pending_thread_ = 0; pending_signal_ = 0;
+            pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false;
             pending_breakpoint_.reset(); pending_hardware_execute_ = false;
             return std::monostate{};
         }
@@ -919,7 +1146,7 @@ public:
             if (action.signal_disposition == ContinueStatus::handled) deferred_signals_.erase(stopped_tid);
             else if (signal != 0) deferred_signals_[stopped_tid] = signal;
         }
-        pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_breakpoint_.reset(); pending_hardware_execute_ = false;
+        pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false; pending_breakpoint_.reset(); pending_hardware_execute_ = false;
         return std::monostate{};
     }
     Status single_step_event(std::uint64_t sequence, ContinueStatus disposition) override {
@@ -931,17 +1158,47 @@ public:
         const int signal = disposition == ContinueStatus::handled ? 0 : pending_signal_;
         if (pending_breakpoint_ && disposition == ContinueStatus::handled) {
             auto stepped = begin_breakpoint_step(tid, *pending_breakpoint_); if (!stepped) return stepped;
-            pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_breakpoint_.reset();
+            pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false; pending_breakpoint_.reset();
             return std::monostate{};
         }
         if (pending_hardware_execute_ && disposition == ContinueStatus::handled) {
             auto stepped = begin_hardware_execute_step(tid, pending_hardware_execute_address_);
             if (!stepped) return stepped;
-            pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_hardware_execute_ = false;
+            pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false; pending_hardware_execute_ = false;
             return std::monostate{};
         }
         if (ptrace(PTRACE_SINGLESTEP, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) != 0) return sys_error("PTRACE_SINGLESTEP");
-        pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_breakpoint_.reset(); pending_hardware_execute_ = false; stopped_.erase(tid); step_thread_ = tid; step_pending_ = true; return std::monostate{};
+        pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false; pending_breakpoint_.reset(); pending_hardware_execute_ = false; stopped_.erase(tid); step_thread_ = tid; step_pending_ = true; return std::monostate{};
+    }
+    bool supports_memory_tag_read() const noexcept override { return pid_ != 0; }
+    Result<std::vector<std::byte>> read_memory_tags(std::uint64_t address, std::size_t size,
+        std::int32_t type, std::size_t max_tag_bytes) override {
+        if (!pid_) return Error{ErrorCode::invalid_argument, "no debug target is attached"};
+        if (type != 1)
+            return Error{ErrorCode::unsupported, "Linux AArch64 exposes MTE allocation tags only (tag type 1)"};
+        if (!size || size > max_inspection_read || address > UINT64_MAX - size ||
+            !max_tag_bytes || max_tag_bytes > 1024 * 1024)
+            return Error{ErrorCode::invalid_argument, "invalid MTE tag-read range or result limit"};
+        auto safe = require_all_threads_stopped(); if (!safe) return safe.error();
+        const auto offset = static_cast<std::size_t>(address & 0xfu);
+        const auto tag_count = (offset + size + 15u) / 16u;
+        if (tag_count > max_tag_bytes)
+            return Error{ErrorCode::resource_limit, "MTE allocation-tag result exceeds the requested byte limit"};
+        std::vector<std::byte> tags(tag_count);
+        iovec vector{tags.data(), tags.size()};
+        const auto tid = *stopped_.begin();
+        errno = 0;
+        constexpr auto ptrace_peek_mte_tags = static_cast<__ptrace_request>(33);
+        if (ptrace(ptrace_peek_mte_tags, tid,
+                reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)), &vector) != 0) {
+            if (errno == EOPNOTSUPP || errno == ENOSYS)
+                return Error{ErrorCode::unsupported, "kernel or target mapping does not support MTE allocation-tag reads"};
+            return sys_error("PTRACE_PEEKMTETAGS");
+        }
+        if (vector.iov_len > tags.size())
+            return Error{ErrorCode::malformed, "PTRACE_PEEKMTETAGS returned more tags than requested"};
+        tags.resize(vector.iov_len);
+        return tags;
     }
     Result<std::vector<std::byte>> read_memory(std::uint64_t address, std::size_t size) override {
         if (!pid_ || size > max_inspection_read || address > UINT64_MAX - size) return Error{ErrorCode::invalid_argument, "invalid memory read range"};
@@ -960,6 +1217,19 @@ public:
             i += count;
         }
         return out;
+    }
+    Result<std::vector<std::byte>> signal_info() override {
+        if (!pid_ || !pending_ || pending_thread_ <= 0 || !tracked_.contains(pending_thread_))
+            return Error{ErrorCode::unsupported, "there is no pending Linux signal event with a readable siginfo record"};
+        siginfo_t info{};
+        if (ptrace(PTRACE_GETSIGINFO, pending_thread_, nullptr, &info) != 0) {
+            if (errno == EINVAL || errno == EIO)
+                return Error{ErrorCode::unsupported, "the pending Linux ptrace event has no readable siginfo record"};
+            return sys_error("PTRACE_GETSIGINFO");
+        }
+        std::vector<std::byte> bytes(sizeof(info));
+        std::memcpy(bytes.data(), &info, sizeof(info));
+        return bytes;
     }
     Status write_memory(std::uint64_t address, std::span<const std::byte> bytes) override {
         if (!pid_ || bytes.size() > max_inspection_read || address > UINT64_MAX - bytes.size()) return Error{ErrorCode::invalid_argument, "invalid memory write range"};
@@ -997,7 +1267,17 @@ public:
     Result<std::vector<ThreadInfo>> threads() override {
         if (!pid_) return Error{ErrorCode::invalid_argument, "no debug target is attached"};
         std::vector<ThreadInfo> out; std::error_code ec; const auto path = "/proc/" + std::to_string(pid_) + "/task";
-        for (std::filesystem::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) { pid_t tid{}; if (!parse_pid(it->path().filename().string(), tid)) continue; if (out.size() >= max_inspection_threads) return Error{ErrorCode::resource_limit, "target thread count exceeds the inspection limit"}; const auto state = !tracked_.contains(tid) ? ThreadState::unknown : (stopped_.contains(tid) ? ThreadState::stopped : ThreadState::running); out.push_back({static_cast<ThreadId>(tid), proc_name(tid), state}); }
+        for (std::filesystem::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
+            pid_t tid{};
+            if (!parse_pid(it->path().filename().string(), tid)) continue;
+            if (out.size() >= max_inspection_threads)
+                return Error{ErrorCode::resource_limit, "target thread count exceeds the inspection limit"};
+            const auto state = !tracked_.contains(tid) ? ThreadState::unknown
+                : (stopped_.contains(tid) ? ThreadState::stopped : ThreadState::running);
+            ThreadInfo thread{static_cast<ThreadId>(tid), proc_name(tid), state};
+            thread.native_state = detail::linux_proc_task_state(pid_, tid);
+            out.push_back(std::move(thread));
+        }
         if (ec) return Error{ErrorCode::io, "failed to enumerate target threads: " + ec.message()}; return out;
     }
     Result<std::vector<ThreadRunState>> thread_run_states() override {
@@ -1046,7 +1326,7 @@ public:
     }
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread) override {
         auto valid = require_stopped_thread(thread); if (!valid) return valid.error();
-        auto regs = get_regs(static_cast<pid_t>(thread)); if (!regs) return regs.error(); std::vector<RegisterValue> out; out.reserve(names.size() + 34);
+        auto regs = get_regs(static_cast<pid_t>(thread)); if (!regs) return regs.error(); std::vector<RegisterValue> out; out.reserve(names.size() + 35);
         for (std::size_t i = 0; i < names.size(); ++i) {
             RegisterValue r; r.name = names[i]; r.bytes.resize(8); r.byte_order = ByteOrder::little;
             r.group = i == 33 ? "status" : "general";
@@ -1065,13 +1345,14 @@ public:
             std::memcpy(r.bytes.data(), &regs.value().value[alias.second.index], r.bytes.size());
             out.push_back(std::move(r));
         }
-        auto append_bytes = [&](std::string name, const std::byte* data, std::size_t size) {
+        auto append_bytes = [&](std::string name, const std::byte* data, std::size_t size, const char* group = "vector") {
             RegisterValue reg; reg.name = std::move(name); reg.byte_order = ByteOrder::little;
-            reg.group = "vector";
+            reg.group = group;
             reg.bytes.assign(data, data + size); out.push_back(std::move(reg));
         };
-        auto append_u16 = [&](const char* name, std::uint16_t value) {
+        auto append_u16 = [&](const char* name, std::uint16_t value, const char* group = "vector") {
             RegisterValue reg; reg.name = name; reg.byte_order = ByteOrder::little; reg.bytes.resize(sizeof(value));
+            reg.group = group;
             std::memcpy(reg.bytes.data(), &value, sizeof(value)); out.push_back(std::move(reg));
         };
         auto append_fpsimd = [&](const Aarch64FpsimdRegs& fp) {
@@ -1086,16 +1367,15 @@ public:
         };
         auto sve = get_sve_state(static_cast<pid_t>(thread));
         if (sve) {
-            // A header-only optional vector view must not hide a valid GPR
-            // snapshot. Its vector payload cannot safely be substituted.
-            if (sve.value().bytes.empty()) return out;
             append_u16("sve_vl", sve.value().header.vl);
             append_u16("sve_max_vl", sve.value().header.max_vl);
-            if (!sve.value().has_sve_registers) {
+            // A header-only view has no normal vector payload. Continue reading
+            // streaming/SME/TLS/PAC state rather than ending the whole snapshot.
+            if (!sve.value().bytes.empty() && !sve.value().has_sve_registers) {
                 Aarch64FpsimdRegs fp{};
                 std::memcpy(&fp, sve.value().bytes.data() + sizeof(Aarch64SveHeader), sizeof(fp));
                 append_fpsimd(fp);
-            } else {
+            } else if (!sve.value().bytes.empty()) {
                 auto layout = sve_layout(sve.value().header.vl); if (!layout) return layout.error();
                 const auto vl = static_cast<std::size_t>(sve.value().header.vl);
                 for (std::size_t i = 0; i < 32; ++i) {
@@ -1121,6 +1401,44 @@ public:
             if (!fp && fp.error().code != ErrorCode::unsupported) return fp.error();
             if (fp) append_fpsimd(fp.value());
         } else return sve.error();
+        auto ssve = get_sve_state(static_cast<pid_t>(thread), nt_arm_ssve);
+        if (ssve) {
+            const bool streaming = !ssve.value().bytes.empty();
+            append_u16("sme_streaming", streaming ? 1 : 0, "sme");
+            append_u16("ssve_vl", ssve.value().header.vl, "sme");
+            append_u16("ssve_max_vl", ssve.value().header.max_vl, "sme");
+            if (streaming) {
+                if (sve && sve.value().has_sve_registers)
+                    return Error{ErrorCode::busy, "normal and streaming SVE registers are simultaneously live in the stopped snapshot"};
+                auto layout = sve_layout(ssve.value().header.vl); if (!layout) return layout.error();
+                const auto vl = static_cast<std::size_t>(ssve.value().header.vl);
+                const auto* data = ssve.value().bytes.data();
+                for (std::size_t i = 0; i < 32; ++i)
+                    append_bytes("ssve_z" + std::to_string(i), data + layout.value().z_offset + i * vl, vl, "streaming-vector");
+                for (std::size_t i = 0; i < 16; ++i)
+                    append_bytes("ssve_p" + std::to_string(i), data + layout.value().p_offset + i * vl / 8, vl / 8, "streaming-vector");
+                // The kernel supplies zero for FFR when streaming FA64 is absent.
+                append_bytes("ssve_ffr", data + layout.value().ffr_offset, vl / 8, "streaming-vector");
+                append_bytes("ssve_fpsr", data + layout.value().fpsr_offset, 4, "streaming-vector");
+                append_bytes("ssve_fpcr", data + layout.value().fpcr_offset, 4, "streaming-vector");
+            }
+        } else if (ssve.error().code != ErrorCode::unsupported) return ssve.error();
+        auto za = get_za_state(static_cast<pid_t>(thread));
+        if (za) {
+            if (ssve && za.value().header.vl != ssve.value().header.vl)
+                return Error{ErrorCode::busy, "SME streaming vector lengths differ between stopped SSVE and ZA snapshots"};
+            append_u16("za_active", za.value().bytes.empty() ? 0 : 1, "sme");
+            append_u16("za_vl", za.value().header.vl, "sme");
+            append_u16("za_max_vl", za.value().header.max_vl, "sme");
+            if (!za.value().bytes.empty()) {
+                const auto vl = static_cast<std::size_t>(za.value().header.vl);
+                for (std::size_t row = 0; row < vl; ++row)
+                    append_bytes("za_row" + std::to_string(row), za.value().bytes.data() + sizeof(Aarch64SveHeader) + row * vl, vl, "matrix");
+            }
+        } else if (za.error().code != ErrorCode::unsupported) return za.error();
+        auto zt = get_zt_state(static_cast<pid_t>(thread));
+        if (zt) append_bytes("zt0", zt.value().data(), zt.value().size(), "matrix");
+        else if (zt.error().code != ErrorCode::unsupported) return zt.error();
         auto pac_mask = get_pac_mask(static_cast<pid_t>(thread));
         if (pac_mask) {
             auto append_pac_mask = [&](const char* name, std::uint64_t value) {
@@ -1131,11 +1449,71 @@ public:
             append_pac_mask("pac_data_mask", pac_mask.value().data);
             append_pac_mask("pac_instruction_mask", pac_mask.value().instruction);
         } else if (pac_mask.error().code != ErrorCode::unsupported) return pac_mask.error();
+        auto tls = get_tls_state(static_cast<pid_t>(thread));
+        if (tls) {
+            append_bytes("tpidr_el0", reinterpret_cast<const std::byte*>(&tls.value().first.tpidr_el0), 8, "thread");
+            if (tls.value().second)
+                append_bytes("tpidr2_el0", reinterpret_cast<const std::byte*>(&tls.value().first.tpidr2_el0), 8, "thread");
+        } else if (tls.error().code != ErrorCode::unsupported) return tls.error();
         return out;
     }
     Status write_registers(ThreadId thread, std::span<const RegisterValue> writes) override {
         auto valid = require_stopped_thread(thread); if (!valid) return valid;
         const auto tid = static_cast<pid_t>(thread);
+        if (std::any_of(writes.begin(), writes.end(), [](const RegisterValue& reg) {
+                return reg.name.starts_with("ssve_");
+            })) {
+            auto streaming = get_sve_state(tid, nt_arm_ssve);
+            if (!streaming) return streaming.error();
+            if (streaming.value().bytes.empty() || !streaming.value().has_sve_registers)
+                return Error{ErrorCode::unsupported, "Linux AArch64 streaming SVE state is inactive"};
+            const auto vl = static_cast<std::size_t>(streaming.value().header.vl);
+            auto layout = sve_layout(streaming.value().header.vl); if (!layout) return layout.error();
+            auto parse_ssve_index = [](std::string_view name, std::string_view prefix,
+                                       std::size_t count, std::size_t& index) {
+                if (!name.starts_with(prefix)) return false;
+                const auto digits = name.substr(prefix.size());
+                if (digits.empty() || (digits.size() > 1 && digits.front() == '0')) return false;
+                std::size_t value{};
+                const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), value);
+                if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size() || value >= count) return false;
+                index = value;
+                return true;
+            };
+            std::set<std::string> seen_streaming;
+            for (const auto& reg : writes) {
+                if (!reg.name.starts_with("ssve_") ||
+                    (reg.byte_order && *reg.byte_order != ByteOrder::little))
+                    return Error{ErrorCode::invalid_argument, "streaming SVE writes must contain only little-endian SSVE registers"};
+                if (!seen_streaming.insert(reg.name).second)
+                    return Error{ErrorCode::invalid_argument, "streaming SVE write contains a duplicate register"};
+                std::size_t index{};
+                std::size_t expected{};
+                if (parse_ssve_index(reg.name, "ssve_z", 32, index)) expected = vl;
+                else if (parse_ssve_index(reg.name, "ssve_p", 16, index)) expected = vl / 8;
+                else if (reg.name == "ssve_ffr") expected = vl / 8;
+                else if (reg.name == "ssve_fpsr" || reg.name == "ssve_fpcr") expected = sizeof(std::uint32_t);
+                else return Error{ErrorCode::invalid_argument, "unknown Linux AArch64 streaming SVE register"};
+                if (reg.bytes.size() != expected)
+                    return Error{ErrorCode::invalid_argument, "streaming SVE register width does not match the stopped thread vector length"};
+            }
+            if (writes.empty()) return std::monostate{};
+            auto after = streaming.value();
+            for (const auto& reg : writes) {
+                std::size_t index{};
+                if (parse_ssve_index(reg.name, "ssve_z", 32, index))
+                    std::memcpy(after.bytes.data() + layout.value().z_offset + index * vl, reg.bytes.data(), vl);
+                else if (parse_ssve_index(reg.name, "ssve_p", 16, index))
+                    std::memcpy(after.bytes.data() + layout.value().p_offset + index * (vl / 8), reg.bytes.data(), vl / 8);
+                else if (reg.name == "ssve_ffr")
+                    std::memcpy(after.bytes.data() + layout.value().ffr_offset, reg.bytes.data(), vl / 8);
+                else if (reg.name == "ssve_fpsr")
+                    std::memcpy(after.bytes.data() + layout.value().fpsr_offset, reg.bytes.data(), sizeof(std::uint32_t));
+                else if (reg.name == "ssve_fpcr")
+                    std::memcpy(after.bytes.data() + layout.value().fpcr_offset, reg.bytes.data(), sizeof(std::uint32_t));
+            }
+            return set_sve_state(tid, after);
+        }
         bool has_gpr = false, has_vector = false, has_sve_specific = false;
         std::array<bool, aarch64_reg_count> writes_gpr{};
         std::array<bool, 32> writes_v{}, writes_z{}, writes_d{};
@@ -1150,6 +1528,9 @@ public:
             return true;
         };
         for (const auto& reg : writes) {
+            if (reg.name.starts_with("ssve_") || reg.name.starts_with("za_") ||
+                reg.name == "sme_streaming" || reg.name == "zt0" || reg.name == "tpidr2_el0")
+                return Error{ErrorCode::unsupported, "SME streaming, matrix and TPIDR2 snapshots are read-only"};
             if (reg.byte_order && *reg.byte_order != ByteOrder::little)
                 return Error{ErrorCode::invalid_argument, "AArch64 register writes require little-endian bytes"};
             if (!seen.insert(reg.name).second)
@@ -1203,10 +1584,14 @@ public:
         std::optional<Aarch64SveState> sve_before, sve_after;
         std::optional<Aarch64FpsimdRegs> fp_before, fp_after;
         if (has_vector) {
+            auto streaming = get_sve_state(tid, nt_arm_ssve);
+            if (streaming && !streaming.value().bytes.empty())
+                return Error{ErrorCode::unsupported, "vector writes while SME streaming is active could exit streaming mode; snapshots are read-only"};
+            if (!streaming && streaming.error().code != ErrorCode::unsupported) return streaming.error();
             auto sve = get_sve_state(tid);
             if (sve) {
                 if (sve.value().bytes.empty())
-                    return Error{ErrorCode::unsupported, "Linux AArch64 SVE regset is inactive for this thread; streaming SME state is not exposed"};
+                    return Error{ErrorCode::unsupported, "Linux AArch64 normal SVE regset is inactive for this thread"};
                 sve_before = std::move(sve.value());
                 sve_after = *sve_before;
                 if (has_sve_specific && !sve_before->has_sve_registers)
@@ -1484,7 +1869,8 @@ private:
     }
     void forget_thread(pid_t tid) {
         tracked_.erase(tid); stopped_.erase(tid); seized_.erase(tid);
-        interrupting_.erase(tid); deferred_.erase(tid); initial_children_.erase(tid);
+        interrupting_.erase(tid); if (requested_thread_interrupt_ == tid) requested_thread_interrupt_.reset();
+        deferred_.erase(tid); initial_children_.erase(tid);
         deferred_signals_.erase(tid);
         hardware_unconfigured_threads_.erase(tid);
     }
@@ -1786,7 +2172,8 @@ private:
         hardware_configuration_error_.clear();
         return std::monostate{};
     }
-    Status begin_breakpoint_step(pid_t tid, std::uint64_t address) {
+    Status begin_breakpoint_step(pid_t tid, std::uint64_t address,
+                                 std::vector<std::pair<pid_t, int>> deferred_resumes = {}) {
         auto safe = require_all_threads_stopped(); if (!safe) return safe;
         auto configured = ensure_hardware_breakpoints_configured(); if (!configured) return configured;
         auto regs = get_regs(tid); if (!regs) return regs.error();
@@ -1801,6 +2188,7 @@ private:
             return error;
         }
         step_breakpoint_ = address; step_thread_ = tid; step_pending_ = true; stopped_.erase(tid);
+        if (!deferred_resumes.empty()) deferred_breakpoint_resumes_ = std::move(deferred_resumes);
         return std::monostate{};
     }
     Status stop_all_threads() {
@@ -1849,7 +2237,8 @@ private:
                             deferred_[tid] = status;
                             auto child = track_cloned_thread(tid);
                             if (!child) return child;
-                        } else if (!(WSTOPSIG(status) == SIGTRAP && event == PTRACE_EVENT_STOP)) deferred_[tid] = status;
+                        } else if (!(WSTOPSIG(status) == SIGTRAP && event == PTRACE_EVENT_STOP) ||
+                                   requested_thread_interrupt_ == tid) deferred_[tid] = status;
                     } else {
                         forget_thread(tid); deferred_[tid] = status;
                     }
@@ -2012,9 +2401,9 @@ private:
         }
         return std::monostate{};
     }
-    void clear() { initial_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; pid_ = 0; tracked_.clear(); stopped_.clear(); seized_.clear(); deferred_.clear(); deferred_signals_.clear(); interrupting_.clear(); rollback_threads_.clear(); resume_blocked_ = false; hardware_unconfigured_threads_.clear(); hardware_configuration_error_.clear(); hardware_step_state_.reset(); pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_hardware_execute_address_ = 0; initial_ = false; exited_ = false; step_breakpoint_.reset(); step_thread_ = 0; step_pending_ = false; breakpoints_.clear(); originals_.clear(); extra_originals_.clear(); ids_.clear(); enabled_.clear(); hardware_breakpoints_.clear(); }
-    pid_t pid_ = 0, pending_thread_ = 0, step_thread_ = 0; int pending_signal_ = 0; bool initial_ = false, exited_ = false, step_pending_ = false; std::uint64_t seq_ = 0; BreakpointId next_id_ = 1; int last_signal_ = SIGTRAP;
-    std::set<pid_t> tracked_, stopped_, seized_, interrupting_; std::map<pid_t, int> deferred_, deferred_signals_; std::vector<pid_t> rollback_threads_; bool resume_blocked_ = false; std::optional<std::uint64_t> pending_, pending_breakpoint_, step_breakpoint_;
+    void clear() { initial_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; pid_ = 0; tracked_.clear(); stopped_.clear(); seized_.clear(); deferred_.clear(); deferred_signals_.clear(); interrupting_.clear(); requested_thread_interrupt_.reset(); rollback_threads_.clear(); resume_blocked_ = false; hardware_unconfigured_threads_.clear(); hardware_configuration_error_.clear(); hardware_step_state_.reset(); pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false; pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_hardware_execute_address_ = 0; initial_ = false; exited_ = false; step_breakpoint_.reset(); deferred_breakpoint_resumes_.reset(); step_thread_ = 0; step_pending_ = false; breakpoints_.clear(); originals_.clear(); extra_originals_.clear(); ids_.clear(); enabled_.clear(); hardware_breakpoints_.clear(); }
+    pid_t pid_ = 0, pending_thread_ = 0, step_thread_ = 0; int pending_signal_ = 0; bool initial_ = false, exited_ = false, step_pending_ = false, pending_thread_interrupt_ = false; std::uint64_t seq_ = 0; BreakpointId next_id_ = 1; int last_signal_ = SIGTRAP;
+    std::mutex wait_gate_mutex_; std::set<pid_t> tracked_, stopped_, seized_, interrupting_; std::optional<pid_t> requested_thread_interrupt_; std::map<pid_t, int> deferred_, deferred_signals_; std::vector<pid_t> rollback_threads_; bool resume_blocked_ = false; std::optional<std::uint64_t> pending_, pending_breakpoint_, step_breakpoint_; std::optional<std::vector<std::pair<pid_t, int>>> deferred_breakpoint_resumes_;
     std::map<std::uint64_t, std::byte> breakpoints_, originals_; std::map<std::uint64_t, std::array<std::byte, 3>> extra_originals_; std::map<BreakpointId, std::uint64_t> ids_; std::set<std::uint64_t> enabled_;
     std::vector<Aarch64HardwareBreakpoint> hardware_breakpoints_;
     std::set<pid_t> hardware_unconfigured_threads_;

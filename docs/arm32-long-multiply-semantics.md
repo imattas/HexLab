@@ -1,0 +1,7 @@
+﻿# A32 and Thumb-2 long multiply semantics
+
+`evaluate_arm32_long_multiply_instruction` handles decoded `UMULL`, `UMLAL`, `SMULL`, and `SMLAL` instructions from A32 and Thumb-2. Thumb-2 T1 long-multiply encodings are normalized to the existing A32 semantic opcode after validating their fixed operation bits and register pair. The returned 64-bit value is the architectural `RdHi:RdLo` bit pattern. Unsigned forms multiply two unsigned 32-bit inputs; signed forms multiply their signed 32-bit interpretations. Accumulate forms add the caller-supplied prior 64-bit `RdHi:RdLo` value modulo 2^64.
+
+For Thumb-2, `Rn` and `Rm` are the multiplicands, and the encoded `RdLo`/`RdHi` pair is retained in that operand order. The second halfword's top bit and bits 7:4 are fixed zero; the top-bit check is required because `RdLo` occupies only bits 14:12. PC operands and identical low/high destinations are rejected. Neighboring selectors, including UMAAL, remain unsupported. Thumb IT predication remains attached to the decoded instruction; these forms do not update flags.
+
+Record forms update N from bit 63 and Z from whether the complete 64-bit result is zero. C and V are preserved from incoming NZCV. The evaluator validates the decoded destination/source pair, operand access modes, and flag metadata. Callers supply runtime register values, evaluate the ARM condition predicate separately, and commit the result. It does not model cycle timing or partial execution.

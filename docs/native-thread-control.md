@@ -24,9 +24,15 @@ While a `DEBUG_EVENT` is pending, Windows holds the debuggee process threads;
 the snapshot reports them as stopped. Outside a pending event, the backend
 reports `unknown` because Windows does not provide a race-free query for
 arbitrary target-owned suspension counts. The event owner can be continued or
-single-stepped using the existing debug-event protocol. Peer schedules are
-explicitly unsupported: `ContinueDebugEvent` resumes the process as a unit,
-and the backend does not claim atomic peer-thread scheduling.
+single-stepped using the existing debug-event protocol. Filtered schedules
+hold omitted threads with exactly one debugger-owned suspend count before
+`ContinueDebugEvent`; a continue-only schedule can hold the event owner while
+selected peers run. On x86/x64, the owner may single-step alongside selected
+continuing peers unless an owned software breakpoint must be displaced. A peer
+event cancels the outstanding step and restores only the owner's trap-flag bit
+before another resume. ARM64 supports a narrower mixed schedule for hardware
+execute-breakpoint step-over. These schedules are not processor-atomic; see
+[thread resume schedules](../libs/debugger/docs/thread-resume-schedules.md).
 
 These snapshots describe debugger-observed states, not application-level
 intent. Thread creation/exit can still race a thread-list refresh; an ID is

@@ -3,15 +3,17 @@
 #include <wx/settings.h>
 #include <wx/sizer.h>
 #include <algorithm>
+#include <set>
 #include <span>
 
 namespace hexlab::desktop {
 namespace {
-constexpr std::size_t thread_limit = 65536, register_limit = 128, prefix_limit = 1232;
+constexpr std::size_t thread_limit = 65536, register_limit = 128, prefix_limit = 1232,
+                      handle_operation_preview_limit = 4096;
 wxString number(std::uint64_t value) { return wxString::Format("0x%llX", static_cast<unsigned long long>(value)); }
 wxString decimal(std::uint64_t value) { return wxString::Format("%llu", static_cast<unsigned long long>(value)); }
 wxString architecture(std::uint16_t value) {
-    switch (value) { case 0: return "x86"; case 5: return "ARM32"; case 9: return "AMD64"; case 12: return "ARM64"; }
+    switch (value) { case 0: return "x86"; case 5: return "ARM32"; case 9: return "AMD64"; case 12: return "ARM64"; case 0x8003: return "Breakpad ARM64"; }
     return "unsupported (" + decimal(value) + ")";
 }
 wxString context_status(MinidumpContextStatus value) {
@@ -98,6 +100,9 @@ MinidumpView::MinidumpView(wxWindow *parent) : wxPanel(parent) {
     auto *box = new wxBoxSizer(wxVERTICAL);
     status_ = new wxStaticText(this, wxID_ANY, "No Minidump metadata");
     status_->SetName("minidump-status");
+    modules_ = new VirtualTable(this, "minidump-modules",
+        {"Module", "Base / size", "PDB binding", "Bound sidecar", "Symbols"});
+    modules_->SetMinSize(FromDIP(wxSize(-1, 100)));
     contexts_ = new VirtualTable(this, "minidump-contexts",
         {"Record", "Thread", "Thread name", "Context status", "Architecture", "Context file / size", "Requested / decoded", "Stack / exception address"});
     contexts_->SetMinSize(FromDIP(wxSize(-1, 160)));
@@ -132,31 +137,148 @@ MinidumpView::MinidumpView(wxWindow *parent) : wxPanel(parent) {
     detail_buttons->Add(context_bytes_, 0, wxALL, 4); detail_buttons->Add(record_go_, 0, wxALL, 4);
     detail_box->Add(details_, 1, wxEXPAND); detail_box->Add(detail_buttons, 0, wxEXPAND);
     detail_page->SetSizer(detail_box);
+    auto *handle_page = new wxPanel(tabs);
+    auto *handle_box = new wxBoxSizer(wxVERTICAL);
+    handle_operation_status_ = new wxStaticText(handle_page, wxID_ANY, "No captured handle operation list");
+    handle_operation_status_->SetName("minidump-handle-operation-status");
+    handle_operations_ = new VirtualTable(handle_page, "minidump-handle-operations",
+        {"Handle", "Process / thread", "Operation", "Backtrace", "First return address", "Source record"});
+    handle_operation_details_ = new wxTextCtrl(handle_page, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize,
+        wxTE_MULTILINE | wxTE_READONLY | wxTE_DONTWRAP);
+    handle_operation_details_->SetName("minidump-handle-operation-details");
+    handle_operation_details_->SetFont(wxSystemSettings::GetFont(wxSYS_ANSI_FIXED_FONT));
+    handle_record_go_ = new wxButton(handle_page, wxID_ANY, "Go to operation record bytes");
+    handle_return_go_ = new wxButton(handle_page, wxID_ANY, "Go to first mapped trace address");
+    handle_record_go_->SetName("minidump-handle-operation-record-go");
+    handle_return_go_->SetName("minidump-handle-operation-address-go");
+    handle_record_go_->Enable(false); handle_return_go_->Enable(false);
+    auto *handle_buttons = new wxBoxSizer(wxHORIZONTAL);
+    handle_buttons->Add(handle_record_go_, 0, wxALL, 4);
+    handle_buttons->Add(handle_return_go_, 0, wxALL, 4);
+    handle_box->Add(handle_operation_status_, 0, wxEXPAND | wxALL, 4);
+    handle_box->Add(handle_operations_, 1, wxEXPAND);
+    handle_box->Add(handle_operation_details_, 1, wxEXPAND | wxTOP, 4);
+    handle_box->Add(handle_buttons, 0, wxEXPAND);
+    handle_page->SetSizer(handle_box);
     tabs->AddPage(register_page, "Registers"); tabs->AddPage(detail_page, "Context bytes and provenance");
-    box->Add(status_, 0, wxEXPAND | wxALL, 4); box->Add(contexts_, 1, wxEXPAND);
+    tabs->AddPage(handle_page, "Handle operation traces");
+    box->Add(status_, 0, wxEXPAND | wxALL, 4); box->Add(modules_, 0, wxEXPAND);
+    box->Add(contexts_, 1, wxEXPAND);
     box->Add(tabs, 2, wxEXPAND | wxTOP, 4); SetSizer(box);
     contexts_->activate = [this](std::size_t row) { select_context(row); };
     registers_->activate = [this](std::size_t row) { select_register(row); };
+    handle_operations_->activate = [this](std::size_t row) { select_handle_operation(row); };
+    handle_operations_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &event) {
+        if (event.GetIndex() >= 0) select_handle_operation(static_cast<std::size_t>(event.GetIndex()));
+    });
     const auto bind_go = [this](wxButton *button, std::optional<Location> *target) {
         button->Bind(wxEVT_BUTTON, [this, target](wxCommandEvent &) { if (*target && navigate) navigate(**target); });
     };
     bind_go(register_go_, &register_target_); bind_go(register_bytes_, &register_source_);
     bind_go(context_bytes_, &context_source_); bind_go(record_go_, &record_target_);
+    bind_go(handle_record_go_, &handle_record_source_); bind_go(handle_return_go_, &handle_return_target_);
     set_document({});
 }
 
 void MinidumpView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
     if (document_ && document_ == document) return;
     document_ = std::move(document); context_row_.reset();
+    handle_record_source_.reset(); handle_return_target_.reset();
     register_target_.reset(); register_source_.reset(); context_source_.reset(); record_target_.reset();
     for (auto *button : {register_go_, register_bytes_, context_bytes_, record_go_}) button->Enable(false);
-    contexts_->populate(0, {}); registers_->populate(0, {}); details_->ChangeValue({});
+    modules_->populate(0, {}); contexts_->populate(0, {}); registers_->populate(0, {}); details_->ChangeValue({});
+    handle_operations_->populate(0, {}); handle_operation_details_->ChangeValue({});
+    repeated_handle_rows_.clear();
+    handle_operation_status_->SetLabel("No captured handle operation list");
+    handle_record_go_->Enable(false); handle_return_go_->Enable(false);
     register_status_->SetLabel("Select a context");
     const auto *dump = metadata(document_);
     if (!dump) { status_->SetLabel("No Minidump metadata in this document"); return; }
     const auto threads = std::min(dump->threads.size(), thread_limit);
+    const auto module_count = dump->modules.size();
+    modules_->populate(module_count, [dump](std::size_t row, int column) {
+        if (row >= dump->modules.size()) return wxString{};
+        const auto &module = dump->modules[row];
+        switch (column) {
+        case 0: return clipped(module.name);
+        case 1: return number(module.image_base) + " / " + number(module.image_size);
+        case 2:
+            switch (module.pdb_status) {
+            case MinidumpPdbStatus::unavailable: return wxString("unavailable");
+            case MinidumpPdbStatus::missing: return wxString("missing");
+            case MinidumpPdbStatus::malformed: return wxString("malformed");
+            case MinidumpPdbStatus::mismatch: return wxString("identity mismatch");
+            case MinidumpPdbStatus::ambiguous: return wxString("ambiguous");
+            case MinidumpPdbStatus::matched: return wxString("matched");
+            case MinidumpPdbStatus::unsupported_identity: return wxString("unsupported identity");
+            }
+            return wxString("unknown");
+        case 3: return clipped(module.bound_pdb_path);
+        case 4: return decimal(module.pdb_symbol_count) +
+            (module.pdb_symbols_complete ? " (complete)" : module.pdb_symbol_count ? " (bounded)" : "");
+        }
+        return wxString{};
+    });
+    modules_->fit_columns({0, 1, 2, 3, 4});
+    repeated_handle_rows_.clear();
+    if (dump->handle_operations) {
+        const auto &list = *dump->handle_operations;
+        const auto displayed = std::min(list.operations.size(), handle_operation_preview_limit);
+        repeated_handle_rows_.resize(list.operations.size(), false);
+        std::set<std::pair<std::uint32_t, std::uint64_t>> seen_handles;
+        std::size_t repeated_rows = 0, zero_handles = 0, unknown_operations = 0;
+        for (std::size_t i = 0; i < list.operations.size(); ++i) {
+            const auto &operation = list.operations[i];
+            if (operation.handle && !seen_handles.emplace(operation.process_id, operation.handle).second) {
+                repeated_handle_rows_[i] = true;
+                ++repeated_rows;
+            }
+            if (!operation.handle && operation.operation_type != 0) ++zero_handles;
+            if (operation.operation_type > 3) ++unknown_operations;
+        }
+        handle_operation_status_->SetLabel(wxString::Format(
+            "%zu/%zu historical rows shown; %zu repeated-handle rows; %zu zero-handle operations; %zu unknown operation codes; entry %u bytes, header %u bytes",
+            displayed, list.operations.size(), repeated_rows, zero_handles, unknown_operations,
+            list.entry_size, list.header_size));
+        handle_operations_->populate(displayed, [this](std::size_t row, int column) {
+            const auto *current = metadata(document_);
+            if (!current || !current->handle_operations || row >= current->handle_operations->operations.size()) return wxString{};
+            const auto &operation = current->handle_operations->operations[row];
+            switch (column) {
+            case 0: return number(operation.handle);
+            case 1: return decimal(operation.process_id) + " / " + decimal(operation.thread_id);
+            case 2:
+                switch (operation.operation_type) {
+                case 0: return wxString("unused"); case 1: return wxString("open");
+                case 2: return wxString("close"); case 3: return wxString("bad reference");
+                default: return wxString("unknown (") + decimal(operation.operation_type) + ")";
+                }
+            case 3: return decimal(operation.backtrace_depth) + " addresses; index " + decimal(operation.backtrace_index);
+            case 4: return operation.backtrace_depth ? number(operation.return_addresses[0]) : wxString{};
+            case 5: return number(operation.record_file_offset.value);
+            default: return wxString{};
+            }
+        });
+        handle_operations_->fit_columns({0, 1, 2, 3, 4, 5});
+        if (!list.operations.empty()) {
+            handle_operations_->select_row(0);
+            select_handle_operation(0);
+        } else handle_operation_details_->ChangeValue("The stream is present and explicitly contains no operations.");
+    } else {
+        handle_operation_status_->SetLabel("Handle operation stream is absent");
+        handle_operation_details_->ChangeValue("This dump does not contain a HandleOperationListStream.");
+    }
     status_->SetLabel(architecture(dump->processor_architecture) + ": " + decimal(dump->threads.size()) +
         " threads; exception " + (dump->exception ? "present" : "absent") +
+        "; assertion " + (dump->assertion ? "present" : "absent") +
+        (dump->system_memory_info ? wxString("; system memory ") + decimal(dump->system_memory_info->physical_page_count) +
+            " pages × " + decimal(dump->system_memory_info->page_size) + " bytes; " +
+            decimal(dump->system_memory_info->processor_count) + " processors" : wxString{}) +
+        (dump->process_info ? wxString("; process metadata") +
+            (dump->process_info->process_id ? wxString(" id ") + decimal(*dump->process_info->process_id) : wxString{}) +
+            (dump->process_info->processor_current_mhz
+                ? wxString(" CPU ") + decimal(*dump->process_info->processor_current_mhz) + " MHz" : wxString{})
+            : wxString{}) +
         "; metadata " + (document_->metadata_complete ? "complete" : "partial") +
         (threads < dump->threads.size() ? "; thread preview limited to 65536" : ""));
     const auto count = threads + (dump->exception ? 1u : 0u);
@@ -165,11 +287,53 @@ void MinidumpView::set_document(std::shared_ptr<const DocumentSnapshot> document
     if (count) { contexts_->select_row(0); select_context(0); }
     else {
         wxString notes = "No thread or exception context descriptors.\n";
+        if (dump->assertion) {
+            const auto &assertion = *dump->assertion;
+            notes += "Breakpad assertion type " + decimal(assertion.type) + ", line " + decimal(assertion.line) +
+                ", stream file " + number(assertion.stream_file_offset.value) + "\nExpression: " +
+                clipped(assertion.expression) + "\nFunction: " + clipped(assertion.function) +
+                "\nFile: " + clipped(assertion.file) + "\n";
+        }
         for (std::size_t i = 0; i < std::min<std::size_t>(dump->diagnostics.size(), 16); ++i)
             notes += "Dump note: " + clipped(dump->diagnostics[i]) + "\n";
         if (dump->diagnostics.size() > 16) notes += "Additional dump notes omitted\n";
         details_->ChangeValue(notes);
     }
+}
+
+void MinidumpView::select_handle_operation(std::size_t row) {
+    const auto *dump = metadata(document_);
+    if (!dump || !dump->handle_operations || row >= dump->handle_operations->operations.size()) return;
+    handle_record_source_.reset(); handle_return_target_.reset();
+    const auto &operation = dump->handle_operations->operations[row];
+    handle_record_source_ = source_location(*document_, operation.record_file_offset, operation.record_size);
+    const auto trace_depth = std::min<std::size_t>(operation.backtrace_depth, operation.return_addresses.size());
+    for (std::size_t index = 0; index < trace_depth; ++index) {
+        handle_return_target_ = mapped_location(*document_, operation.return_addresses[index]);
+        if (handle_return_target_) break;
+    }
+    handle_record_go_->Enable(handle_record_source_.has_value());
+    handle_return_go_->Enable(handle_return_target_.has_value());
+    static constexpr const char *operation_names[] = {"unused", "open", "close", "bad reference"};
+    const auto type = operation.operation_type < std::size(operation_names)
+        ? wxString(operation_names[operation.operation_type])
+        : wxString::Format("unknown (%u)", operation.operation_type);
+    wxString report = "Historical handle operation\nHandle: " + number(operation.handle) +
+        "\nProcess / thread: " + decimal(operation.process_id) + " / " + decimal(operation.thread_id) +
+        "\nOperation: " + type + "\nSpare/alignment: " + number(operation.spare) +
+        "\nBacktrace depth / index: " + decimal(operation.backtrace_depth) + " / " + decimal(operation.backtrace_index) +
+        "\nRecord file offset / size: " + number(operation.record_file_offset.value) + " / " + decimal(operation.record_size) +
+        "\nReturn-address array file offset: " + number(operation.return_addresses_file_offset.value) + "\n";
+    for (std::size_t index = 0; index < trace_depth; ++index)
+        report += wxString::Format("[%02zu] ", index) + number(operation.return_addresses[index]) + "\n";
+    if (row < repeated_handle_rows_.size() && repeated_handle_rows_[row])
+        report += "\nThis process/handle pair appears in an earlier captured row; duplicate historical rows are retained.";
+    if (!operation.handle && operation.operation_type != 0)
+        report += "\nThe operation has a zero handle value; the raw record is retained without inferring validity.";
+    if (operation.operation_type > 3)
+        report += "\nThis operation code is not one of the four documented values; the raw value is retained.";
+    report += "\nAddresses are captured historical trace data; no stack unwinding or operation success is inferred.";
+    handle_operation_details_->ChangeValue(report);
 }
 
 wxString MinidumpView::context_cell(std::size_t row, int column) const {
@@ -211,6 +375,13 @@ void MinidumpView::select_context(std::size_t row) {
     wxString description = context_cell(row, 0) + " thread " + decimal(item->thread_id) +
         "\nRecord file: " + number(item->record.value) + "\nContext file: " + number(item->rva) +
         "; original size: " + decimal(item->size) + " bytes\n";
+    if (dump->assertion) {
+        const auto &assertion = *dump->assertion;
+        description += "\nBreakpad assertion type: " + decimal(assertion.type) +
+            "; line: " + decimal(assertion.line) + "; stream file: " +
+            number(assertion.stream_file_offset.value) + "\nExpression: " + clipped(assertion.expression) +
+            "\nFunction: " + clipped(assertion.function) + "\nFile: " + clipped(assertion.file) + "\n";
+    }
     if (const auto *name = thread_name(*dump, item->thread_id))
         description += "Thread name: " + clipped(name->name) + "; name row: " + number(name->record_file_offset.value) +
             "; string: " + number(name->string_file_offset.value) + "\n";
@@ -218,6 +389,9 @@ void MinidumpView::select_context(std::size_t row) {
         "; flags: " + number(item->exception->flags) + "; address: " + number(item->exception->address) + "\n";
     else description += "Stack: " + number(item->thread->stack_address) + " + " + number(item->thread->stack_size) +
         "; file: " + number(item->thread->stack_rva) + "; TEB: " + number(item->thread->teb) + "\n";
+    if (item->thread && item->thread->extended_record)
+        description += "Backing store: " + number(item->thread->backing_store_address) + " + " +
+            number(item->thread->backing_store_size) + "; file: " + number(item->thread->backing_store_rva) + "\n";
     const auto *c = item->context;
     if (c) {
         description += "Status: " + context_status(c->status) + "; architecture: " + architecture(c->processor_architecture) +

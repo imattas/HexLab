@@ -76,6 +76,9 @@ struct Writer {
         number(value.decision_revision);
         append(value.recipe_fingerprint);
         append(value.engine_fingerprint);
+        flag(value.external_input_fingerprint.has_value());
+        if (value.external_input_fingerprint)
+            append(*value.external_input_fingerprint);
     }
     void reads(const ReadSet &reads) {
         count(reads.ranges().size());
@@ -153,7 +156,7 @@ struct Reader {
             return {};
         return address();
     }
-    AnalysisKey key() {
+    AnalysisKey key(bool has_external_fingerprint = true) {
         AnalysisKey out;
         out.input.size = number();
         auto d = read(32);
@@ -164,6 +167,12 @@ struct Reader {
         std::copy(d.begin(), d.end(), out.recipe_fingerprint.begin());
         d = read(32);
         std::copy(d.begin(), d.end(), out.engine_fingerprint.begin());
+        if (has_external_fingerprint && flag()) {
+            d = read(32);
+            Sha256Digest external{};
+            std::copy(d.begin(), d.end(), external.begin());
+            out.external_input_fingerprint = external;
+        }
         return out;
     }
     ReadSet reads() {

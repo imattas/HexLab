@@ -33,6 +33,8 @@ enum class MachOMetadataKind {
     eh_frame_call_site,
     eh_frame_action,
     eh_frame_type_info,
+    chain_start_offset,
+    dyld_environment,
     count
 };
 struct MachOMetadataRow {

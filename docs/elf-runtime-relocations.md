@@ -8,8 +8,9 @@ remain attached to the source image. A copy-on-write overlay holds changes, so
 neither the input file nor the original loaded image is modified.
 
 For ordinary dynamic REL/RELA records, the supported profiles include
-little-endian ELF32 i386, ARM, RISC-V, and the bounded x32 relative subset,
-plus little-endian ELF64 x86-64, AArch64, PPC64, and RISC-V `ET_DYN` records,
+little-endian ELF32 i386, RISC-V, and the bounded x32 relative subset;
+ELF32 ARM and PowerPC in either byte order; little-endian ELF64 x86-64, AArch64,
+PPC64, and RISC-V `ET_DYN` records; and the MIPS32 REL profile in either byte order,
 with these types:
 
 | Architecture | Relocation | Type | Formula |
@@ -20,6 +21,8 @@ with these types:
 | i386 | `R_386_GLOB_DAT` | 6 | `S` |
 | i386 | `R_386_JMP_SLOT` | 7 | `S` |
 | ARM | `R_ARM_ABS32` | 2 | `(S + A) | T` (low 32 bits) |
+| ARM | `R_ARM_ABS16` | 5 | `S + A` (signed-or-unsigned 16-bit field) |
+| ARM | `R_ARM_ABS8` | 8 | `S + A` (signed-or-unsigned 8-bit field) |
 | ARM | `R_ARM_REL32` | 3 | `((S + A) | T) - P` (low 32 bits) |
 | ARM | `R_ARM_PREL31` | 42 | `((S + A) | T) - P` (signed 31-bit result; preserve place bit 31) |
 | ARM | `R_ARM_ABS32_NOI` | 55 | `S + A` (low 32 bits, no Thumb bit) |
@@ -39,6 +42,7 @@ with these types:
 | x86-64 | `R_X86_64_RELATIVE` | 8 | `B + A` |
 | x86-64 | `R_X86_64_GLOB_DAT` | 6 | `S` |
 | x86-64 | `R_X86_64_JUMP_SLOT` | 7 | `S` |
+| x86-64 | `R_X86_64_RELATIVE64` | 38 | `B + A` (64-bit field) |
 | AArch64 | `R_AARCH64_ABS64` | 257 | `S + A` (low 64 bits) |
 | AArch64 | `R_AARCH64_ABS32` | 258 | `S + A` (check `[-2^31, 2^32-1]`) |
 | AArch64 | `R_AARCH64_ABS16` | 259 | `S + A` (check `[-2^15, 2^16-1]`) |
@@ -53,8 +57,14 @@ with these types:
 | PPC64 | `R_PPC64_GLOB_DAT` | 20 | `S + A` (low 64 bits) |
 | PPC64 | `R_PPC64_JMP_SLOT` | 21 | `S` |
 | PPC64 | `R_PPC64_RELATIVE` | 22 | `B + A` |
+| s390x | `R_390_8` | 1 | `S + A` (upper 56 bits must be zero) |
+| s390x | `R_390_16` | 3 | `S + A` (upper 48 bits all zero or all one) |
+| s390x | `R_390_32` | 4 | `S + A` (low 32 bits) |
 | s390x | `R_390_64` | 22 | `S + A` (low 64 bits) |
+| s390x | `R_390_PC16` | 16 | `S + A - P` (half16 signed-or-unsigned range) |
+| s390x | `R_390_PC16DBL` | 17 | `(S + A - P) >> 1` (signed 16-bit field) |
 | s390x | `R_390_PC32` | 5 | `S + A - P` (low 32 bits) |
+| s390x | `R_390_PC32DBL` | 19 | `(S + A - P) >> 1` (word32 field) |
 | s390x | `R_390_GLOB_DAT` | 10 | `S + A` (low 64 bits) |
 | s390x | `R_390_JMP_SLOT` | 11 | `S` |
 | s390x | `R_390_RELATIVE` | 12 | `B + A` |
@@ -62,6 +72,10 @@ with these types:
 | RISC-V LP64 | `R_RISCV_64` | 2 | `S + A` (low 64 bits) |
 | RISC-V LP64 | `R_RISCV_RELATIVE` | 3 | `B + A` |
 | RISC-V LP64 | `R_RISCV_JUMP_SLOT` | 5 | `S` |
+| MIPS32 | `R_MIPS_REL32` | 3 | `B + A` for symbol index zero; `S + A` for a validated nonzero symbol (REL, low 32 bits) |
+| PPC32 | `R_PPC_ADDR32` | 1 | `S + A` (signed-or-unsigned 32-bit field) |
+| PPC32 | `R_PPC_GLOB_DAT` | 20 | `S + A` (signed-or-unsigned 32-bit field) |
+| PPC32 | `R_PPC_RELATIVE` | 22 | `B + A` (32-bit field) |
 
 The x32 profile is deliberately limited to the two relative relocations above:
 `R_X86_64_RELATIVE` applies at the ELF32 class width, while
@@ -72,7 +86,10 @@ reference table is the [x86-64 psABI](https://github.com/hjl-tools/x86-psABI/wik
 Ghidra independently names type 38 `R_X86_64_RELATIVE64` in its
 [`X86_64_ElfRelocationType`](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/x86/src/main/java/ghidra/app/util/bin/format/elf/relocation/X86_64_ElfRelocationType.java)
 enum. Other x32 relocation types remain unapplied until their class-specific
-field widths and formulas are modeled.
+field widths and formulas are modeled. ELF64 x86-64 also accepts
+`R_X86_64_RELATIVE64` as a base-relative relocation with an eight-byte field;
+the ordinary x86-64 `R_X86_64_RELATIVE` remains pointer-sized. Both paths
+require symbol index zero and preserve checked load-bias-plus-addend handling.
 
 The RISC-V profile applies the same pointer-sized relative and jump-slot
 operations for ILP32 and LP64, and supports the ABI's 32-bit absolute dynamic
@@ -85,19 +102,32 @@ binding; the loader does not discover or load libraries. ELF32 RELATIVE REL
 addends are read as unsigned 32-bit pointer words; RELA records use their
 signed explicit addend before the 32-bit result check.
 
-The ARM profile is little-endian ELF32 `ET_DYN` and supports dynamic REL and
-RELA records for `R_ARM_ABS32`, `R_ARM_REL32`, `R_ARM_PREL31`,
+The ARM profile is ELF32 `ET_DYN` in either byte order and supports dynamic REL and
+RELA records for `R_ARM_ABS32`, `R_ARM_ABS16`, `R_ARM_ABS8`, `R_ARM_REL32`, `R_ARM_PREL31`,
 `R_ARM_ABS32_NOI`, `R_ARM_REL32_NOI`, `R_ARM_GLOB_DAT`, `R_ARM_JUMP_SLOT`,
-and `R_ARM_RELATIVE`. REL addends are sampled from the original four-byte
-target, except REL `JUMP_SLOT`, whose ABI addend is zero. For ordinary ARM
-symbol relocations, `T` is the Thumb bit from the resolved symbol address;
+and `R_ARM_RELATIVE`. REL addends are sampled from the original target at the
+relocation's field width, except `GLOB_DAT` and `JUMP_SLOT`, whose ABI formula
+is `S` and ignores `A` in both REL and RELA form. For ordinary ARM symbol
+relocations, `T` is the Thumb bit from the resolved symbol address;
 the NOI forms omit it. `REL32` and `PREL31` use runtime place `P`. PREL31
 sign-extends the implicit addend from bits 30:0, checks the final signed
-31-bit range, and preserves bit 31 in the destination word. All ARM targets
-must be complete four-byte fields in writable initialized load memory and
-four-byte aligned. ELF32 addresses and rebased extents must fit in 32 bits.
-Big-endian ARM, TLS, IFUNC, COPY, instruction relocations, and other ARM types
-remain unapplied.
+31-bit range, and preserves bit 31 in the destination word. `ABS16` and `ABS8`
+sign-extend their two-byte and one-byte REL addends, respectively. They compute
+`S + A` modulo 2^32, then accept either a signed or unsigned result of the
+destination width: `[-32768, 65535]` or `[-128, 255]`. A Thumb function's
+discriminator bit is stripped from `S`; odd data-symbol addresses retain their
+low bit, and no `T` bit is added. These fields are byte-aligned and must fit
+entirely in writable initialized load memory with exact file provenance.
+Relocation words and implicit addends use the byte order recorded in the ELF
+header, including for big-endian images. The bounded profile only updates these
+data fields; instruction relocations and BE8 instruction-byte rewriting are
+not attempted. Out-of-range results are skipped with a relocation-specific diagnostic.
+Other ARM targets must be complete four-byte fields in writable initialized
+load memory and four-byte aligned. ELF32 addresses and rebased extents must
+fit in 32 bits. These narrow data formulas, REL addends, alignment, and
+overflow rules follow [AAELF32 static data relocations](https://github.com/ARM-software/abi-aa/blob/main/aaelf32/aaelf32.rst#static-data-relocations).
+TLS, IFUNC, COPY, instruction relocations, and other ARM types remain
+unapplied.
 
 The AArch64 profile supports dynamic `ABS64`, `ABS32`, `ABS16`, `PREL64`,
 `PREL32`, and `PREL16` data relocations. `ABS64` and `PREL64` write low 64-bit
@@ -110,7 +140,7 @@ and JUMP26, remain unapplied, as do other AArch64 dynamic relocation types and
 the separate AArch64 P32/ELF32 profile. These formulas and overflow ranges
 follow the [AAELF64 data relocation table](https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst#static-data-relocations).
 
-The little-endian PPC64 ELF64 profile applies `R_PPC64_RELATIVE`,
+The PPC64 ELF64 profile applies `R_PPC64_RELATIVE`,
 `R_PPC64_ADDR32`, `R_PPC64_ADDR64`, `R_PPC64_GLOB_DAT`, and `R_PPC64_JMP_SLOT` from dynamic RELA tables. Relative
 records use `B + A` and require symbol index zero. `ADDR32` and `ADDR64` use
 `S + A`; `ADDR32` must fit `[-2^31, 2^32-1]` and writes the low 32 bits; `ADDR64` writes the
@@ -120,36 +150,68 @@ be complete, writable, initialized fields aligned to their width. `JMP_SLOT` wri
 resolved symbol address as a scalar pointer; PLT instruction sequences are not
 interpreted. External symbols use the
 same exact caller-supplied dependency and GNU-version binding rules as other
-supported symbol relocations; big-endian PPC64 and other PPC64 dynamic
-relocation types remain skipped.
+supported symbol relocations. These bounded data and pointer relocations are
+handled in either ELF byte order, with patch fields encoded using the ELF
+header's byte order. PPC64 instruction-field, TLS, COPY, IFUNC, and other
+dynamic relocation types remain skipped.
 
 The s390x profile applies big-endian ELF64 `ET_DYN` dynamic RELA records for
-`R_390_PC32`, `R_390_RELATIVE`, `R_390_64`, `R_390_GLOB_DAT`, and
-`R_390_JMP_SLOT`.
+`R_390_8/16/32`, `R_390_PC16/PC16DBL/PC32/PC32DBL`, `R_390_RELATIVE`,
+`R_390_64`, `R_390_GLOB_DAT`, and `R_390_JMP_SLOT`.
 `RELATIVE` requires symbol index zero and uses checked `B + A`; `64` and
 `GLOB_DAT` use `S + A` with the ABI's low-64-bit result, while `JMP_SLOT`
 writes `S` and ignores its RELA addend. `PC32` computes `S + A - P`, requires
 signed-32-bit representability and an even result, then stores the ABI word32
 value in a complete four-byte field, as specified by the
-[zSeries ELF ABI](https://refspecs.linuxfoundation.org/ELF/zSeries/lzsabi0_zSeries/x1633.html); it requires a valid
+[zSeries ELF ABI](https://refspecs.linuxbase.org/ELF/zSeries/lzsabi0_zSeries.pdf); it requires a valid
 runtime place and exact symbol resolution but no eight-byte alignment. The
-other four types require aligned, complete eight-byte fields in writable
+ABI evaluates these expressions modulo 64 bits. `R_390_8` requires zero upper
+56 bits; `R_390_16` accepts upper 48 bits that are all zero or all one; and
+`R_390_32` stores the low 32 bits. `PC16` applies the same upper-48-bit rule
+to `S + A - P`. `PC16DBL` and `PC32DBL` require an even `S + A - P`,
+arithmetically shift it right by one, and range-check the scaled result as
+signed 16 or 32 bits respectively. The 8-bit field needs no alignment, 16-bit
+fields require two-byte alignment, and the 32-bit fields require four-byte
+alignment except `PC32DBL`, whose ABI field alignment is two bytes. The
+remaining 64-bit types require aligned, complete eight-byte fields in writable
 initialized load memory, and their
 file-backed provenance must agree with the original image. Defined symbols
 must resolve inside the image or be absolute; undefined symbols require the
 same exact caller-supplied dependency and version binding used by other
 supported symbol relocations. s390x REL records, little-endian s390x, TLS,
-COPY, IFUNC, instruction relocations, and other relocation types remain
+COPY, IFUNC, other instruction relocations, and other relocation types remain
 unapplied.
+
+The MIPS32 profile applies only `R_MIPS_REL32` (type 3) from dynamic REL
+tables in either byte order. A zero symbol index uses the image-base adjustment
+plus the unsigned 32-bit implicit addend. A validated nonzero symbol index uses
+the defined in-image symbol address or an exact caller-supplied dependency and
+version binding, plus the unsigned 32-bit implicit addend. Both results are
+written modulo 32 bits. The target must be a complete, aligned, writable,
+initialized four-byte field. ELF64 MIPS, RELA, instruction/GOT/TLS relocations,
+and other MIPS relocation types remain unapplied.
+
+The PPC32 profile applies dynamic `R_PPC_RELATIVE`, `R_PPC_ADDR32`, and
+`R_PPC_GLOB_DAT` type 22/1/20 records in ELF32 `ET_DYN` images, in either byte
+order. REL rows take `A` from the target word; RELA rows use the explicit
+addend. Relative rows require symbol index zero and `B + A` to fit the 32-bit
+address space. `ADDR32` and `GLOB_DAT` require a validated nonzero symbol index
+and accept an in-image definition or an exact caller-supplied dependency and
+version binding. Their `S + A` results must fit the signed-or-unsigned 32-bit
+range. Targets are aligned, four-byte, writable initialized fields. PPC32
+instruction relocations, jump slots, GOT/TLS, COPY/IFUNC, and other relocation
+types remain unapplied.
 
 ELF64 pointer relocations and `R_X86_64_64` targets must be complete
 eight-byte fields in writable, initialized load memory. The x86-64 `PC32`,
-`32`, and `32S` records patch complete four-byte fields under the same target
-checks. Their explicit RELA addends are preserved as signed 64-bit values;
-runtime `P` for `PC32` is the relocation place plus load bias. `R_X86_64_64`
-stores the low 64 bits of `S + A`; `R_X86_64_32` applies only when the
-mathematical result is in `[0, UINT32_MAX]`; `R_X86_64_32S` and
-`R_X86_64_PC32` apply only when their mathematical results fit signed 32 bits.
+`PC64`, `PC16`, `PC8`, `32`, and `32S` records patch fields of their ABI widths
+under the same target checks. Their explicit RELA addends are preserved as
+signed 64-bit values; runtime `P` is the relocation place plus load bias.
+`R_X86_64_64` stores the low 64 bits of `S + A`; `R_X86_64_PC64` stores the
+low 64 bits of `S + A - P`; `R_X86_64_PC32`, `PC16`, and `PC8` apply only when
+the mathematical result fits the respective signed field. `R_X86_64_32`
+applies only when the mathematical result is in `[0, UINT32_MAX]`; `R_X86_64_32S`
+applies only when its mathematical result fits signed 32 bits.
 Out-of-range values and unavailable addends or places are skipped with a row
 diagnostic. ELF32 i386 targets must be complete four-byte fields
 in writable, initialized load memory. Its RELATIVE addend is the unsigned
@@ -159,8 +221,11 @@ are checked against the 32-bit address space. i386 `R_386_32` and `R_386_PC32`
 use the original four-byte REL field as the exact unsigned 32-bit implicit
 addend; their ABI `word32` results retain the low 32 bits. `R_386_PC32` uses
 the rebased runtime place `P`. The i386 psABI specifies REL records for its
-dynamic linker; i386 RELA rows remain skipped. RELATIVE requires symbol index
-zero. ELF64 RELA uses its
+dynamic linker. For compatibility, this loader also accepts ELF32 RELA rows for
+these same four simple relocation types: `RELATIVE`, `32`, `GLOB_DAT`, and
+`JMP_SLOT`; explicit signed addends are used for `RELATIVE` and `32`, while the
+ABI formulas for `GLOB_DAT` and `JMP_SLOT` ignore the addend. RELATIVE requires
+symbol index zero. Other i386 relocation types remain skipped. ELF64 RELA uses its
 explicit signed addend; ELF64 REL uses the signed 64-bit value sampled from
 the original target bytes. Symbol-slot relocations require a validated nonzero
 symbol index tied to the relocation table's symbol table. They apply only
@@ -232,3 +297,31 @@ The formulas follow the [i386 System V ABI relocation table](https://refspecs.li
 the [x86-64 System V ABI relocation table](https://refspecs.linuxfoundation.org/elf/x86_64-SysV-psABI.pdf),
 the [AAELF64 relocation table](https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst),
 and the [64-bit PowerPC ELF ABI relocation table](https://refspecs.linuxfoundation.org/ELF/ppc64/PPC-elf64abi.pdf).
+
+The little-endian x86-64 profile also applies dynamic R_X86_64_SIZE32 and R_X86_64_SIZE64: both compute Z + A, where Z is the referenced ELF symbol's declared size. SIZE32 requires the mathematical result to fit an unsigned 32-bit field; SIZE64 stores the low 64 bits. For undefined symbols, callers must include the export's symbol_size in ElfRuntimeSymbolBinding; omitted sizes default to zero. Other symbol-size relocation architectures and runtime linker behaviors remain unsupported.
+
+### Deriving bindings from loaded dependencies
+
+`resolve_elf_runtime_symbol_bindings` derives `ElfRuntimeSymbolBinding` rows
+from dependency images that the caller has already loaded. Supply one loaded
+image, load bias, `DT_NEEDED` name, and optional aliases for each dependency.
+Names are matched against the requester's ordered `DT_NEEDED` entries. Every
+dependency must resolve to exactly one supplied image; missing or ambiguous
+entries are returned as diagnostics and produce no bindings, so resolution
+does not guess at precedence from an incomplete dependency set.
+
+The resolver scans only dynamic symbol tables. It considers defined global
+and weak symbols with default or protected visibility, and excludes TLS,
+GNU IFUNC, hidden/internal, and unsupported symbol types. It computes regular
+symbol addresses from the supplied load bias and leaves absolute symbols
+unchanged. Unversioned imports follow `DT_NEEDED` order and match only
+unversioned or explicitly default-version exports. Versioned imports require
+both an exact GNU version name and the exact `DT_VERNEED` dependency spelling.
+The resulting rows can be passed to `apply_elf_runtime_relocations`.
+
+This is caller-directed metadata resolution, not a system dynamic linker. It
+does not search the filesystem, establish that supplied files correspond to
+the declared names, model global-scope interposition or runtime namespaces,
+resolve TLS/IFUNC/copy relocations, invoke resolver code, or implement weak
+undefined-symbol fallback. Dependency, symbol-scan, binding, and diagnostic
+limits bound work; exceeding a limit returns an incomplete result.

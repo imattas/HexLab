@@ -3,8 +3,8 @@
 #include <optional>
 namespace hexlab {
 struct BytePattern {std::string text;bool operator==(const BytePattern&)const=default;};
-enum class TextEncoding {ascii,utf8,utf16le,utf16be,utf32le,utf32be};
-struct TextQuery {std::string text;TextEncoding encoding=TextEncoding::utf8;bool case_sensitive=true;bool operator==(const TextQuery&)const=default;}; // Case folding is ASCII-only.
+enum class TextEncoding {ascii,utf8,utf16le,utf16be,utf32le,utf32be,windows1252,iso8859_1};
+struct TextQuery {std::string text;TextEncoding encoding=TextEncoding::utf8;bool case_sensitive=true;bool operator==(const TextQuery&)const=default;}; // Case folding is ASCII-only for every encoding.
 enum class ImmediateInterpretation {signed_value,unsigned_value};
 struct ImmediateQuery {std::string value;std::uint16_t width=64;ImmediateInterpretation interpretation=ImmediateInterpretation::unsigned_value;bool operator==(const ImmediateQuery&)const=default;};
 using SearchQuery=std::variant<BytePattern,TextQuery,ImmediateQuery>;
@@ -15,6 +15,7 @@ struct SearchSource {
 struct SearchCursor {
     AnalysisKey source_key;Sha256Digest query_fingerprint{};
     std::uint64_t next_offset=0,next_instruction=0;std::uint32_t next_operand=0;
+    std::optional<std::uint64_t> end_offset;
     bool operator==(const SearchCursor&)const=default;
 };
 struct SearchMatch {
@@ -39,6 +40,9 @@ struct SearchLimits {
     // If the offset came from a VA selection, use it to disambiguate decoded
     // instructions that alias the same file byte in immediate searches.
     std::optional<Address> start_address;
+    // Optional exclusive file offset; values past this document's extent are
+    // clipped to its size so one bound can be used across multiple documents.
+    std::optional<std::uint64_t> end_offset;
 };
 struct SearchPage {
     AnalysisKey source_key;Sha256Digest query_fingerprint{};

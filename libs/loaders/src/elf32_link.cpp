@@ -36,12 +36,20 @@ std::uint32_t read32(std::span<const std::byte> bytes) {
            (std::to_integer<std::uint32_t>(bytes[2]) << 16) |
            (std::to_integer<std::uint32_t>(bytes[3]) << 24);
 }
-struct Placement { std::uint16_t output_section = 0; std::uint64_t offset = 0, size = 0; };
+std::uint16_t read16(std::span<const std::byte> bytes) {
+    require(bytes.size() == 2, "ELF32 relocation addend has an invalid width");
+    return std::to_integer<std::uint16_t>(bytes[0]) |
+           (std::to_integer<std::uint16_t>(bytes[1]) << 8);
+}
+struct Placement {
+    std::uint16_t output_section = 0;
+    std::uint64_t offset = 0, local_offset = 0, size = 0;
+};
 struct Object {
     ElfMetadata elf;
     std::map<std::uint32_t, Placement> sections;
     std::array<std::vector<std::byte>, 4> bytes;
-    std::array<bool, 4> seen_sections{};
+    std::array<std::uint64_t, 4> local_ends{};
 };
 struct Definition {
     std::size_t object = 0;
@@ -180,10 +188,10 @@ Result<std::vector<std::byte>> link_elf32_i386_text(
         std::array<std::uint64_t, 4> ends{}, alignments{1, 1, 1, 1};
         std::size_t symbol_count = 0, relocation_count = 0;
         const auto section_index = [](std::string_view section_name) -> std::optional<std::uint16_t> {
-            if (section_name == ".text") return std::uint16_t{1};
-            if (section_name == ".rodata") return std::uint16_t{2};
-            if (section_name == ".data") return std::uint16_t{3};
-            if (section_name == ".bss") return std::uint16_t{4};
+            if (section_name == ".text" || section_name.starts_with(".text.")) return std::uint16_t{1};
+            if (section_name == ".rodata" || section_name.starts_with(".rodata.")) return std::uint16_t{2};
+            if (section_name == ".data" || section_name.starts_with(".data.")) return std::uint16_t{3};
+            if (section_name == ".bss" || section_name.starts_with(".bss.")) return std::uint16_t{4};
             return {};
         };
         for (const auto &input : inputs) {
@@ -207,29 +215,30 @@ Result<std::vector<std::byte>> link_elf32_i386_text(
                 if (!(section.flags & 2)) continue;
                 const auto output_section = section_index(section.name);
                 require(output_section.has_value() &&
-                            ((section.name == ".bss" && section.type == 8) ||
-                             (section.name != ".bss" && section.type == 1)),
+                            ((*output_section == 4 && section.type == 8) ||
+                             (*output_section != 4 && section.type == 1)),
                         "ELF32 link subset supports allocated .text/.rodata/.data/.bss only; found " + section.name,
                         ErrorCode::unsupported);
-                if (section.name == ".text")
+                if (*output_section == 1)
                     require((section.flags & 5) == 4, "ELF32 .text must be executable and non-writable", ErrorCode::unsupported);
-                if (section.name == ".rodata")
+                if (*output_section == 2)
                     require((section.flags & (1 | 4)) == 0, "ELF32 .rodata must be read-only", ErrorCode::unsupported);
-                if (section.name == ".data" || section.name == ".bss")
+                if (*output_section == 3 || *output_section == 4)
                     require((section.flags & 3) == 1, "ELF32 data sections must be writable and non-executable", ErrorCode::unsupported);
                 require(!object.sections.contains(section.index), "Duplicate ELF32 section index", ErrorCode::malformed);
                 const auto output_index = static_cast<std::size_t>(*output_section - 1);
-                require(!object.seen_sections[output_index],
-                        "ELF32 link subset does not support multiple same-name allocated sections", ErrorCode::unsupported);
-                object.seen_sections[output_index] = true;
                 const auto alignment = std::max<std::uint64_t>(1, section.alignment);
                 alignments[output_index] = std::max(alignments[output_index], alignment);
-                ends[output_index] = align_up(ends[output_index], alignment);
-                require(ends[output_index] <= limits.max_output_bytes && section.size <= limits.max_output_bytes - ends[output_index],
+                const auto output_offset = align_up(ends[output_index], alignment);
+                const auto local_offset = align_up(object.local_ends[output_index], alignment);
+                require(output_offset <= limits.max_output_bytes && section.size <= limits.max_output_bytes - output_offset,
                         "ELF32 merged section exceeds output limit", ErrorCode::resource_limit);
-                object.sections.emplace(section.index, Placement{*output_section, ends[output_index], section.size});
+                require(local_offset <= limits.max_output_bytes && section.size <= limits.max_output_bytes - local_offset,
+                        "ELF32 per-object section storage exceeds output limit", ErrorCode::resource_limit);
+                object.sections.emplace(section.index, Placement{*output_section, output_offset, local_offset, section.size});
                 if (*output_section == 4) {
-                    ends[output_index] += section.size;
+                    ends[output_index] = output_offset + section.size;
+                    object.local_ends[output_index] = local_offset + section.size;
                 } else {
                     require(section.size <= std::numeric_limits<std::size_t>::max(),
                             "ELF32 input section exceeds host address space", ErrorCode::resource_limit);
@@ -237,8 +246,13 @@ Result<std::vector<std::byte>> link_elf32_i386_text(
                     if (!view) throw Failure{view.error()};
                     require(view.value().bytes.size() == section.size, "Incomplete ELF32 input section read", ErrorCode::io);
                     auto &destination = object.bytes[output_index];
+                    require(local_offset <= std::numeric_limits<std::size_t>::max() &&
+                                section.size <= std::numeric_limits<std::size_t>::max() - local_offset,
+                            "ELF32 object section storage exceeds host address space", ErrorCode::resource_limit);
+                    destination.resize(static_cast<std::size_t>(local_offset), std::byte{0});
                     destination.insert(destination.end(), view.value().bytes.begin(), view.value().bytes.end());
-                    ends[output_index] += section.size;
+                    ends[output_index] = output_offset + section.size;
+                    object.local_ends[output_index] = local_offset + section.size;
                 }
             }
             require(std::any_of(object.sections.begin(), object.sections.end(), [](const auto &row) { return row.second.output_section == 1; }),
@@ -290,8 +304,8 @@ Result<std::vector<std::byte>> link_elf32_i386_text(
             return {placement->second.offset + symbol.value, placement->second.output_section};
         };
         const auto resolve = [&](std::size_t oi, std::uint32_t relocation_symbol_index,
-                                 std::uint32_t symbol_table_section) -> std::uint64_t {
-            if (relocation_symbol_index == 0) return 0;
+                                 std::uint32_t symbol_table_section) -> std::pair<std::uint64_t, std::uint16_t> {
+            if (relocation_symbol_index == 0) return {0, 0};
             const auto table = std::find_if(objects[oi].elf.symbol_tables.begin(), objects[oi].elf.symbol_tables.end(),
                 [&](const auto &candidate) { return candidate.source.section && *candidate.source.section == symbol_table_section; });
             require(table != objects[oi].elf.symbol_tables.end() && table->symbol_begin && table->count &&
@@ -303,16 +317,16 @@ Result<std::vector<std::byte>> link_elf32_i386_text(
             if (symbol.binding == 0) {
                 require(symbol.state == ElfSymbolState::defined || symbol.state == ElfSymbolState::absolute,
                         "Unresolved local ELF32 relocation symbol: " + symbol.name, ErrorCode::unsupported);
-                return mapped_symbol(oi, symbol).first;
+                return mapped_symbol(oi, symbol);
             }
             const auto found = definitions.find(symbol.name);
             if (found == definitions.end()) {
                 require(symbol.binding == 2, "Unresolved strong ELF32 relocation symbol: " + symbol.name, ErrorCode::unsupported);
-                return 0;
+                return {0, 0};
             }
             const auto &definition = found->second;
-            if (definition.common) return definition.common_offset;
-            return mapped_symbol(definition.object, objects[definition.object].elf.symbols[definition.symbol_index]).first;
+            if (definition.common) return {definition.common_offset, 4};
+            return mapped_symbol(definition.object, objects[definition.object].elf.symbols[definition.symbol_index]);
         };
         for (std::size_t oi = 0; oi < objects.size(); ++oi) {
             auto &object = objects[oi];
@@ -330,32 +344,51 @@ Result<std::vector<std::byte>> link_elf32_i386_text(
                         "ELF32 relocations into unsupported sections are rejected", ErrorCode::unsupported);
                 require(!relocation.explicit_addend, "ELF32 link subset expects SHT_REL implicit addends", ErrorCode::unsupported);
                 const auto type = relocation.type;
-                require(type == 0 || type == 1 || type == 2 || type == 4,
+                require(type == 0 || type == 1 || type == 2 || type == 4 ||
+                            (type >= 20 && type <= 23),
                         "Unsupported i386 ELF relocation type " + std::to_string(type), ErrorCode::unsupported);
                 if (type == 0) continue;
                 require(relocation.symbol_table.has_value() && relocation.symbol_table->section.has_value() &&
                             relocation.symbol_index_validated,
                         "ELF32 relocation symbol table/index is unavailable", ErrorCode::unsupported);
                 auto &bytes = object.bytes[placement->second.output_section - 1];
-                const auto width = std::size_t{4};
+                const auto width = type == 20 || type == 21 ? std::size_t{2} :
+                                   type == 22 || type == 23 ? std::size_t{1} : std::size_t{4};
                 require(relocation.offset <= placement->second.size && width <= placement->second.size - relocation.offset,
                         "ELF32 relocation field exceeds target section", ErrorCode::malformed);
-                const auto offset = static_cast<std::size_t>(relocation.offset);
+                const auto local_offset = placement->second.local_offset + relocation.offset;
+                require(local_offset <= std::numeric_limits<std::size_t>::max(),
+                        "ELF32 relocation local offset exceeds host address space", ErrorCode::resource_limit);
+                const auto offset = static_cast<std::size_t>(local_offset);
                 require(offset <= bytes.size() && width <= bytes.size() - offset,
                         "ELF32 relocation field exceeds merged output", ErrorCode::malformed);
-                const auto addend = static_cast<std::int32_t>(read32(std::span<const std::byte>(bytes).subspan(offset, width)));
-                const auto symbol = resolve(oi, relocation.symbol_index, *relocation.symbol_table->section);
+                std::int64_t addend = 0;
+                if (width == 4)
+                    addend = static_cast<std::int32_t>(read32(std::span<const std::byte>(bytes).subspan(offset, width)));
+                else if (width == 2)
+                    addend = static_cast<std::int16_t>(read16(std::span<const std::byte>(bytes).subspan(offset, width)));
+                else
+                    addend = static_cast<std::int8_t>(std::to_integer<std::uint8_t>(bytes[offset]));
+                const auto resolved_symbol = resolve(oi, relocation.symbol_index, *relocation.symbol_table->section);
+                const auto symbol = resolved_symbol.first;
                 std::int64_t result = static_cast<std::int64_t>(symbol) + addend;
-                if (type == 2 || type == 4) result -= static_cast<std::int64_t>(placement->second.offset + relocation.offset);
-                std::uint32_t encoded = 0;
-                if (type == 1) encoded = static_cast<std::uint32_t>(static_cast<std::uint64_t>(symbol) +
-                                                                      static_cast<std::uint32_t>(addend));
-                else {
+                const bool pc_relative = type == 2 || type == 4 || type == 21 || type == 23;
+                if (type == 21 || type == 23)
+                    require(resolved_symbol.second == placement->second.output_section,
+                            "R_386_PC16/R_386_PC8 cross-section targets have no known linked section base",
+                            ErrorCode::unsupported);
+                if (pc_relative) result -= static_cast<std::int64_t>(placement->second.offset + relocation.offset);
+                if (type == 2 || type == 4) {
                     require(result >= INT32_MIN && result <= INT32_MAX,
                             "R_386_PC32/R_386_PLT32 relocation overflows", ErrorCode::unsupported);
-                    encoded = static_cast<std::uint32_t>(result);
+                } else if (type == 21) {
+                    require(result >= INT16_MIN && result <= INT16_MAX,
+                            "R_386_PC16 relocation overflows signed 16-bit field", ErrorCode::unsupported);
+                } else if (type == 23) {
+                    require(result >= INT8_MIN && result <= INT8_MAX,
+                            "R_386_PC8 relocation overflows signed 8-bit field", ErrorCode::unsupported);
                 }
-                put(bytes, offset, encoded, 4);
+                put(bytes, offset, static_cast<std::uint64_t>(result), width);
             }
         }
 
@@ -398,15 +431,13 @@ Result<std::vector<std::byte>> link_elf32_i386_text(
                 if (placement.output_section == 4) continue;
                 auto &destination = output_sections[placement.output_section - 1];
                 const auto &source = object.bytes[placement.output_section - 1];
-                const auto local = static_cast<std::size_t>(placement.offset);
-                const auto begin = local >= source.size() ? 0 : local;
-                (void)begin;
-                // Object byte vectors are kept as full merged buffers; copy each placement's byte extent.
-                require(placement.size <= source.size(),
+                // Each object stores source sections in its own aligned local buffer.
+                require(placement.local_offset <= source.size() && placement.size <= source.size() - placement.local_offset,
                         "ELF32 object section copy exceeds its buffer", ErrorCode::malformed);
                 if (destination.size() < placement.offset) destination.resize(static_cast<std::size_t>(placement.offset));
-                destination.insert(destination.end(), source.begin(),
-                                   source.begin() + static_cast<std::ptrdiff_t>(placement.size));
+                const auto begin = source.begin() + static_cast<std::ptrdiff_t>(placement.local_offset);
+                destination.insert(destination.end(), begin,
+                                   begin + static_cast<std::ptrdiff_t>(placement.size));
             }
         }
         canceled(stop);

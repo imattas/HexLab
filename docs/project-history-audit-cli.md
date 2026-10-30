@@ -9,6 +9,8 @@ hexlab_cli project history audit sample.hxproj
 hexlab_cli project history audit sample.hxproj --page-steps 512 --page-bytes 33554432
 hexlab_cli project history audit sample.hxproj --max-pages 4 --json
 hexlab_cli project history audit sample.hxproj --expected-edit 17 --after-step 2048 --json
+hexlab_cli project history audit sample.hxproj --verify-input --json
+hexlab_cli project history audit sample.hxproj --verify-history --json
 ```
 
 The first invocation captures the current edit revision and pins every page to
@@ -35,6 +37,24 @@ corresponding byte budget before resuming that page. The command exits 0 when th
 history range is complete, 3 when another page can be resumed, and 1 on I/O,
 integrity, or revision errors. Invalid options exit 2.
 
-The report verifies history payload structure and inverse pairing. It does not
-replay every command or prove the current project state equals its history
-cursor; use bounded exact-step history preview for replay validation.
+The base report verifies history payload structure and inverse pairing.
+`--verify-history` additionally runs bounded semantic verification after all
+requested structural pages complete: rewind to an empty root, forward replay
+through every redo command, durable cursor agreement and historical original
+patch checks against verified embedded input. It adds audit JSON schema version
+3 and a `semantic_verification` object with `verified`, `budget_limited` or
+`not_run` status. Overall status stays partial and exit status is 3 if semantic
+verification was requested but did not finish, including when structural
+`has_more` is false. The standalone `project history verify` command can run that
+step independently. See [semantic verification CLI](project-history-verification-cli.md)
+for its four separate replay budgets, report fields and retry behavior.
+
+`--verify-input` additionally resolves the external source path recorded in the
+project provenance, checks its size, and hashes it with SHA-256 against the
+embedded input identity. A relative provenance path is resolved beside the
+project file. Missing provenance, unreadable input, size changes, or digest
+mismatches are reported as errors; the command does not modify the project.
+Text output reports the verified path. JSON uses schema version 2 when this
+option is present and includes `input_verification` with status, path, size,
+and digest. This checks the currently reachable source file; it does not
+validate unrelated files or history recovery artifacts.

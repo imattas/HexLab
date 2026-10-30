@@ -7,7 +7,7 @@ processor.arc,processor,ARC,absent,open,,P01,8
 processor.avr,processor,AVR,absent,open,,P01,8
 processor.pdp11,processor,PDP-11,absent,open,,P01,8
 processor.fr,processor,FR,absent,open,,P01,8
-processor.mos6502,processor,6502/65C02,partial,partial,"libs/processors/src/m6502.cpp; tests/processor_modes_tests.cpp; tests/raw_profiles_tests.cpp; tests/function_tests.cpp; tests/reference_tests.cpp; tests/decompiler/m6502_lifting_tests.cpp; docs/m6502.md; NMOS 6502 legal-opcode slice integrated; 65C02 extensions and undocumented opcodes remain",P01,8
+processor.mos6502,processor,6502/65C02,partial,partial,"libs/processors/src/m6502.cpp; tests/processor_modes_tests.cpp; tests/raw_profiles_tests.cpp; tests/function_tests.cpp; tests/reference_tests.cpp; tests/decompiler/m6502_lifting_tests.cpp; docs/m6502.md; NMOS 6502 documented opcodes plus bounded stable unofficial subset including KIL terminal traps; remaining/unstable unofficial opcodes and 65C02 extensions remain",P01,8
 processor.w65c816,processor,65C816,absent,open,,P01,8
 processor.z80,processor,Z80,absent,open,,P01,8
 processor.h8,processor,H8,absent,open,,P01,8
@@ -22,7 +22,7 @@ processor.i860,processor,860XR,absent,open,,P01,8
 processor.i960,processor,960,absent,open,,P01,8
 processor.x86,processor,x86,partial,partial,tests/x86_32_decoder_tests.cpp; docs/x86-32-coverage.csv; raw/PE32 recovery/cache/editing and CLI/wx selection integrated; selected Win32 CPU oracle and Release/install acceptance passed; x86-16 absent,P01,4
 processor.x87,processor,x87,partial,partial,libs/processors/src/x64_x87.cpp; tests/x86_16_decoder_tests.cpp; tests/x86_32_decoder_tests.cpp; docs/x87-decoder-coverage.md; D8-DF decode and stack register/effect coverage,P01,8
-processor.x86_simd,processor,x86 SIMD,partial,partial,libs/processors/src/x64_simd.cpp; tests/x64_simd_tests.cpp; docs/x64-simd-coverage.md; SSE2 integer subset and scalar single/double operations tested,P01,8
+processor.x86_simd,processor,x86 SIMD,partial,partial,"libs/processors/src/x64_simd.cpp; libs/processors/src/x64_decode.cpp; libs/processors/include/hexlab/processors/x86_alignr_semantics.hpp; tests/x64_simd_tests.cpp; docs/x64-simd-coverage.md; SSE2 integer/scalar subset, SSSE3/AVX2 lane-local PALIGNR and VPALIGNR decode/evaluation; broader ISA families remain incomplete",P01,8
 processor.jvm,processor,JVM,absent,open,,P01,8
 processor.kr1878,processor,KR1878,absent,open,,P01,8
 processor.cli,processor,.NET CLI,absent,open,,P01,8

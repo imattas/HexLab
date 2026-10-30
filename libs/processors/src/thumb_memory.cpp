@@ -1,5 +1,77 @@
 #include "thumb_internal.hpp"
 namespace hexlab::thumb_detail {
+bool memory_wide(Instruction &i, std::uint16_t first, std::uint16_t second) {
+    const auto invalid_exclusive_reg = [](unsigned r) { return r == 13 || r == 15; };
+    const auto load_word = (first & 0xfff0u) == 0xe850u;
+    const auto load_byte_half = (first & 0xfff0u) == 0xe8d0u;
+    const auto store_word = (first & 0xfff0u) == 0xe840u;
+    const auto store_byte_half = (first & 0xfff0u) == 0xe8c0u;
+    const auto rt = (second >> 12) & 15u;
+    const auto rn = first & 15u;
+    if (load_word && (second & 0x0f00u) == 0x0f00u) {
+        if (invalid_exclusive_reg(rn) || invalid_exclusive_reg(rt))
+            return false;
+        ArmMemoryOperand address{reg(rn)};
+        address.data_width = 32;
+        address.offset = static_cast<std::uint32_t>((second & 0xffu) * 4u);
+        i.opcode = Opcode::arm_ldrex;
+        i.operands = {reg(rt), address};
+        i.access = {OperandAccess::write, OperandAccess::address};
+        read(i, reg(rn));
+        i.register_writes.push_back(reg(rt));
+        i.memory_read = true;
+        return true;
+    }
+    if (store_word) {
+        const auto data = rt;
+        const auto status = (second >> 8) & 15u;
+        if (invalid_exclusive_reg(rn) || invalid_exclusive_reg(data) || invalid_exclusive_reg(status) ||
+            rn == status || data == status)
+            return false;
+        ArmMemoryOperand address{reg(rn)};
+        address.data_width = 32;
+        address.offset = static_cast<std::uint32_t>((second & 0xffu) * 4u);
+        i.opcode = Opcode::arm_strex;
+        i.operands = {reg(status), reg(data), address};
+        i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::address};
+        read(i, reg(rn)); read(i, reg(data));
+        i.register_writes.push_back(reg(status));
+        i.memory_write = true;
+        return true;
+    }
+    if (load_byte_half && ((second & 0x0fffu) == 0x0f4fu || (second & 0x0fffu) == 0x0f5fu)) {
+        if (invalid_exclusive_reg(rn) || invalid_exclusive_reg(rt))
+            return false;
+        ArmMemoryOperand address{reg(rn)};
+        const bool half = (second & 0x00f0u) == 0x0050u;
+        address.data_width = half ? 16 : 8;
+        i.opcode = half ? Opcode::arm_ldrexh : Opcode::arm_ldrexb;
+        i.operands = {reg(rt), address};
+        i.access = {OperandAccess::write, OperandAccess::address};
+        read(i, reg(rn));
+        i.register_writes.push_back(reg(rt));
+        i.memory_read = true;
+        return true;
+    }
+    if (store_byte_half && ((second & 0x0ff0u) == 0x0f40u || (second & 0x0ff0u) == 0x0f50u)) {
+        const auto status = second & 15u;
+        if (invalid_exclusive_reg(rn) || invalid_exclusive_reg(rt) || invalid_exclusive_reg(status) ||
+            rn == status || rt == status)
+            return false;
+        ArmMemoryOperand address{reg(rn)};
+        const bool half = (second & 0x00f0u) == 0x0050u;
+        address.data_width = half ? 16 : 8;
+        i.opcode = half ? Opcode::arm_strexh : Opcode::arm_strexb;
+        i.operands = {reg(status), reg(rt), address};
+        i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::address};
+        read(i, reg(rn)); read(i, reg(rt));
+        i.register_writes.push_back(reg(status));
+        i.memory_write = true;
+        return true;
+    }
+    return false;
+}
+
 bool memory(Instruction &i, std::uint16_t h) {
     const auto rn = (h >> 3) & 7, rt = h & 7;
     if ((h & 0xf800) == 0x4800) {

@@ -48,7 +48,9 @@ HEXLAB_LOADERS_EXPORT Result<std::vector<std::byte>> link_elf64_aarch64_executab
 
 // Produces a bounded ELF32 little-endian i386 ET_REL from compatible ET_REL
 // inputs. Merges allocated .text/.rodata/.data/.bss and applies SHT_REL
-// R_386_NONE, R_386_32, R_386_PC32, and R_386_PLT32 relocations.
+// R_386_NONE, R_386_32, R_386_PC32, R_386_PLT32, R_386_16, R_386_PC16,
+// R_386_8, and R_386_PC8 relocations. Narrow PC-relative fields are limited
+// to same-output-section references with signed-range-checked displacements.
 HEXLAB_LOADERS_EXPORT Result<std::vector<std::byte>> link_elf32_i386_text(
     std::span<const std::shared_ptr<const ByteStorage>>, std::stop_token = {}, ElfLinkLimits = {});
 

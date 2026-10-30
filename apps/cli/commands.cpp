@@ -14,18 +14,30 @@
 #include "module_symbol_resolution.hpp"
 #include "demangle_output.hpp"
 #include "hexlab/analysis/relocations.hpp"
+#include "hexlab/analysis/functions.hpp"
+#include "hexlab/analysis/strings.hpp"
+#include "hexlab/analysis/module_dependencies.hpp"
+#include "hexlab/analysis/pe_module_dependencies.hpp"
 #include "hexlab/core/version.hpp"
 #include "hexlab/workspace/workspace.hpp"
 #include "hexlab/workspace/project_actor.hpp"
 #include "hexlab/database/project_state.hpp"
 #include "hexlab/loaders/ar.hpp"
+#include "hexlab/loaders/xcoff64.hpp"
 #include "hexlab/loaders/jar.hpp"
+#include "hexlab/loaders/jvm_module_path.hpp"
 #include "hexlab/loaders/firmware.hpp"
 #include "hexlab/loaders/elf.hpp"
 #include "hexlab/loaders/elf_link.hpp"
+#include "hexlab/loaders/macho.hpp"
 #include "hexlab/loaders/coff_link.hpp"
 #include "hexlab/loaders/macho_link.hpp"
 #include "hexlab/loaders/loader.hpp"
+#include "hexlab/loaders/dex_container.hpp"
+#include "hexlab/loaders/dex_archive.hpp"
+#include "hexlab/loaders/vdex.hpp"
+#include "hexlab/loaders/dex.hpp"
+#include "hexlab/image/file_storage.hpp"
 #include "hexlab/processors/format.hpp"
 #include "hexlab/processors/decoder.hpp"
 #include "hexlab/plugins/runtime.hpp"
@@ -33,12 +45,15 @@
 #include "hexlab/decompiler/optimizer.hpp"
 #include "hexlab/decompiler/type_recovery.hpp"
 #include <algorithm>
+#include <charconv>
 #include <cctype>
+#include <cwctype>
 #include <iomanip>
 #include <sstream>
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <map>
 #include <optional>
 #include <set>
@@ -134,28 +149,6 @@ std::string json_quote(std::string_view value) {
     }
     result.push_back('"');
     return result;
-}
-std::filesystem::path reserve_temporary_file() {
-    const auto directory = std::filesystem::temp_directory_path();
-#ifdef _WIN32
-    wchar_t name[MAX_PATH]{};
-    if (!GetTempFileNameW(directory.c_str(), L"hxar", 0, name))
-        throw std::runtime_error("Cannot reserve a temporary file for the selected archive member");
-    return std::filesystem::path(name);
-#else
-    auto pattern = (directory / "hexlab-ar-member-XXXXXX").string();
-    std::vector<char> name(pattern.begin(), pattern.end());
-    name.push_back('\0');
-    const int descriptor = mkstemp(name.data());
-    if (descriptor < 0)
-        throw std::runtime_error("Cannot reserve a temporary file for the selected archive member");
-    if (close(descriptor) != 0) {
-        std::error_code ignored;
-        std::filesystem::remove(std::filesystem::path(name.data()), ignored);
-        throw std::runtime_error("Cannot close the reserved temporary file");
-    }
-    return std::filesystem::path(name.data());
-#endif
 }
 void write_archive_output(const std::filesystem::path &path, std::span<const std::byte> bytes, bool replace) {
 #ifdef _WIN32
@@ -276,7 +269,7 @@ int processors_command(std::span<const std::wstring_view> arguments, std::ostrea
         return 2;
     }
     if (json) {
-        out << "{\"schema\":\"hexlab.processor-inventory.v1\",\"scope\":\"decoder\",\"variants\":[";
+        out << "{\"schema\":\"hexlab.processor-inventory.v2\",\"scope\":\"decoder-and-selected-downstream\",\"variants\":[";
         bool first = true;
         for (const auto &variant : processor_variant_inventory()) {
             if (!first) out << ',';
@@ -307,6 +300,20 @@ int processors_command(std::span<const std::wstring_view> arguments, std::ostrea
                 out << processor_inventory_json_string(capability.reason);
             else
                 out << "null";
+            const auto write_labels = [&](std::string_view name, std::span<const std::string_view> labels) {
+                out << "," << processor_inventory_json_string(name) << ":[";
+                for (std::size_t index = 0; index < labels.size(); ++index) {
+                    if (index) out << ',';
+                    out << processor_inventory_json_string(labels[index]);
+                }
+                out << ']';
+            };
+            out << ",\"coverage\":{";
+            write_labels("instruction_families", variant.coverage.instruction_families);
+            write_labels("analysis", variant.coverage.analysis);
+            write_labels("decompiler", variant.coverage.decompiler);
+            write_labels("debugger", variant.coverage.debugger);
+            out << '}';
             out << '}';
         }
         out << "]}\n";
@@ -335,23 +342,37 @@ int processors_command(std::span<const std::wstring_view> arguments, std::ostrea
 void usage(std::ostream &out) {
     out << "Usage: hexlab_cli [--help | --version]\n"
            "       hexlab_cli inspect <path> [options]\n"
-           "       hexlab_cli disassemble <path> [options]\n\n"
+           "       hexlab_cli disassemble <path> [options] [--json]\n\n"
+           "       hexlab_cli functions <path> [options] [--limit <count>] [--json]\n\n"
            "       hexlab_cli decompile <path> [options]\n\n"
            "       hexlab_cli compare <old-image> <new-image> [--window <bytes>] [--anchor <bytes>] [--limit <runs>] [--functions]\n\n"
-           "       hexlab_cli modules [--graph] <binary>...  (graph mode traverses dependencies from the first file)\n\n"
+           "       hexlab_cli modules [--sysroot <dir>] [--discover] [--search-dir <dir>] [--target-cwd <dir>] [--lib-token <value>] [--platform-token <value>] [--graph] <binary>...\n\n"
+           "       hexlab_cli pe-deps --sysroot <dir> [--search-dir <dir>] [--windows-defaults] <PE image>\n\n"
            "       hexlab_cli project --help  (persistent projects and editing)\n\n"
-           "       hexlab_cli plugins scan <directory> [--json] [--strict]  (data-only native plugin discovery)\n\n"
+           "       hexlab_cli plugins scan|dependencies <directory> [--json] [--strict]  (data-only native plugin discovery)\n\n"
            "       hexlab_cli processors [--json]  (supported decoder variants)\n\n"
-           "       hexlab_cli archive list <archive>\n"
-           "       hexlab_cli archive link-select <archive> --root-object <ET_REL>\n"
+           "       hexlab_cli archive list <archive> [--thin-root <directory>]\n"
+           "       hexlab_cli archive link-select <archive> --root-object <ET_REL|XCOFF64>\n"
+           "       hexlab_cli archive link-audit <archive> --root-object <ET_REL|XCOFF64>\n"
            "       hexlab_cli archive link-exec <archive> --root-object <ET_REL> --entry <symbol> --output <ET_EXEC>\n"
            "       hexlab_cli archive link-pe <archive> --root-object <COFF .obj> --entry <symbol> --output <PE .exe>\n"
            "       hexlab_cli archive link-macho <archive> --root-object <Mach-O .o> --entry <symbol> --output <Mach-O executable>\n"
            "       hexlab_cli archive extract <archive> --member <index> --output <path> [--replace]\n"
-           "       hexlab_cli archive open <archive> --member <index> --project <project.hxproj> [--replace]\n\n"
+           "       hexlab_cli archive open <archive> --member <index> --project <project.hxproj> [--replace]\n"
+           "       Thin archive reads/link actions require --thin-root <directory>\n\n"
            "       hexlab_cli jar list <package.jar>\n"
-           "       hexlab_cli jar inspect <package.jar> --member <index>\n\n"
-           "       hexlab_cli firmware inspect <path> --format ihex|srec|uefi|uefi-capsule\n\n"
+           "       hexlab_cli jar inspect <package.jar> --member <index>\n"
+           "       hexlab_cli jar list --volume <path> --volume <path> ...\n"
+           "       hexlab_cli jar inspect --volume <path> --volume <path> ... --member <index>\n\n"
+           "       hexlab_cli dex container <path> [--json]  (inventory DEX 041 logical members)\n"
+           "       hexlab_cli dex load-container <path> [--json]  (parse every DEX 041 member)\n\n"
+           "       hexlab_cli dex apk <path> [--json]  (load Android APK multidex entries)\n\n"
+           "       hexlab_cli dex vdex <path> [--json]  (inventory Android VDEX 027 sections and DEX members)\n\n"
+           "       hexlab_cli jvm module-path [--release <feature>] [--module-path <dir-or-jar>]... [--class-path <dir-or-jar>]...\n\n"
+           "       hexlab_cli macho chained-targets <image> [--shared-cache-base <address>] [--cache-level-base <0..3> <address>]...\n"
+           "       hexlab_cli firmware inspect <path> --format ihex|srec|uefi|uefi-capsule\n"
+           "       hexlab_cli firmware inspect <path> --fit-offset <file-offset> --format fit\n\n"
+           "       hexlab_cli firmware inspect <path> --microcode-offset <file-offset> --format intel-microcode\n\n"
            "Input options:\n  --format auto|pe|elf|raw|macho|wasm|dex|jvm\n"
            "  --pe-runtime arm64|x64-compatible  (select an ARM64X PE process view)\n"
            "  --slice <index>  (Mach-O universal slice; zero-based, auto or macho format)\n"
@@ -360,18 +381,252 @@ void usage(std::ostream &out) {
            "  --arm-profile <file>  (raw ARM/Thumb/data declarations; replaces arch/base/entry)\n"
            "  --plugin <module>  (load a native plugin for detection and display decoding; repeatable)\n"
            "  --pdb <file> --pdb-search <directory>  (local PE PDB binding; no network lookup)\n"
-           "  --dwarf-supplementary-package <file>  (explicit ELF DWARF v5 supplementary DWP; no filename lookup)\n"
+           "  --dwarf-supplementary-package <file>  (explicit supplementary ELF/DWP; otherwise a safe local .debug_sup hint may be used)\n"
            "Analysis options:\n  --instruction-budget <count> --string-budget <count> --show-strings\n"
            "  --min-string-length <count>\n"
+           "Function inventory options (with `functions`): --limit <count> (default 10000, max 100000)\n"
            "Addresses use decimal or 0x-prefixed hexadecimal. Use -- before an option-like path.\n";
 }
 
+std::string_view function_seed_name(FunctionSeedKind kind) {
+    switch (kind) {
+    case FunctionSeedKind::entry: return "entry";
+    case FunctionSeedKind::export_symbol: return "export-symbol";
+    case FunctionSeedKind::direct_call: return "direct-call";
+    case FunctionSeedKind::user_function: return "user-function";
+    case FunctionSeedKind::user_code: return "user-code";
+    case FunctionSeedKind::symbol: return "symbol";
+    case FunctionSeedKind::unwind: return "unwind";
+    case FunctionSeedKind::arm_context_root: return "arm-context-root";
+    case FunctionSeedKind::tls_callback: return "tls-callback";
+    case FunctionSeedKind::initializer: return "initializer";
+    case FunctionSeedKind::guard_cf: return "guard-cf";
+    case FunctionSeedKind::dex_method: return "dex-method";
+    case FunctionSeedKind::safe_seh: return "safe-seh";
+    case FunctionSeedKind::pogo: return "pogo";
+    case FunctionSeedKind::wasm_export: return "wasm-export";
+    case FunctionSeedKind::wasm_start: return "wasm-start";
+    case FunctionSeedKind::wasm_element: return "wasm-element";
+    case FunctionSeedKind::wasm_defined: return "wasm-defined";
+    case FunctionSeedKind::dwarf_subprogram: return "dwarf-subprogram";
+    case FunctionSeedKind::m6502_nmi_vector: return "m6502-nmi-vector";
+    case FunctionSeedKind::m6502_reset_vector: return "m6502-reset-vector";
+    case FunctionSeedKind::m6502_irq_vector: return "m6502-irq-vector";
+    case FunctionSeedKind::dwarf_entry_point: return "dwarf-entry-point";
+    }
+    return "unknown";
+}
+
+std::string_view function_stop_name(FunctionStopReason reason) {
+    switch (reason) {
+    case FunctionStopReason::ret: return "return";
+    case FunctionStopReason::trap: return "trap";
+    case FunctionStopReason::unsupported: return "unsupported";
+    case FunctionStopReason::invalid: return "invalid";
+    case FunctionStopReason::truncated: return "truncated";
+    case FunctionStopReason::unmapped: return "unmapped";
+    case FunctionStopReason::uninitialized: return "uninitialized";
+    case FunctionStopReason::non_executable: return "non-executable";
+    case FunctionStopReason::manual_data: return "manual-data";
+    case FunctionStopReason::overlap: return "overlap";
+    case FunctionStopReason::indirect: return "indirect";
+    case FunctionStopReason::budget: return "budget";
+    case FunctionStopReason::target_overflow: return "target-overflow";
+    case FunctionStopReason::chunk_boundary: return "chunk-boundary";
+    case FunctionStopReason::tail_candidate: return "tail-candidate";
+    case FunctionStopReason::elf_relocation: return "elf-relocation";
+    case FunctionStopReason::macho_relocation: return "macho-relocation";
+    case FunctionStopReason::macho_dyld: return "macho-dyld";
+    case FunctionStopReason::image_exclusion: return "image-exclusion";
+    }
+    return "unknown";
+}
+
+int functions_report(const DocumentSnapshot &document, const std::filesystem::path &input,
+                     const AnalysisOptions &options, std::size_t limit, bool json,
+                     std::ostream &out, std::ostream &err) {
+    auto recovered = recover_functions(*document.image, document.metadata, {}, options, {});
+    if (!recovered) {
+        err << "Function recovery: " << recovered.error().message << '\n';
+        return 1;
+    }
+    const auto &snapshot = *recovered.value();
+    const auto count = (std::min)(limit, snapshot.functions.size());
+    std::map<std::uint64_t, const BasicBlock *> blocks;
+    for (const auto &block : snapshot.blocks)
+        if (block) blocks.emplace(block->id.value, block.get());
+    std::map<std::pair<std::uint32_t, std::uint64_t>, std::vector<std::string>> names;
+    for (const auto &symbol : document.metadata.exports)
+        if (symbol.address && symbol.name)
+            names[{symbol.address->space.value, symbol.address->offset}].push_back(*symbol.name);
+    std::map<std::uint64_t, std::vector<const FunctionCall *>> calls;
+    for (const auto &call : snapshot.calls)
+        calls[call.owner.value].push_back(&call);
+    constexpr std::size_t per_function_detail_limit = 256;
+    constexpr std::size_t call_detail_budget = 100000;
+    std::size_t emitted_call_details = 0;
+    if (json) {
+        out << "{\"schema\":\"hexlab.function-inventory.v1\",\"input\":"
+            << processor_inventory_json_string(path_text(input))
+            << ",\"complete\":" << (snapshot.complete ? "true" : "false")
+            << ",\"function_count\":" << snapshot.functions.size()
+            << ",\"returned_count\":" << count
+            << ",\"truncated\":" << (count < snapshot.functions.size() ? "true" : "false")
+            << ",\"functions\":[";
+    } else {
+        out << "Functions: " << snapshot.functions.size()
+            << (snapshot.complete ? " recovered" : " recovered (analysis partial)")
+            << "; showing " << count << "\n";
+    }
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto &function = *snapshot.functions[index];
+        std::uint64_t instruction_count = 0;
+        for (const auto id : function.blocks) {
+            const auto found = blocks.find(id.value);
+            if (found != blocks.end()) instruction_count += found->second->instructions.size();
+        }
+        const auto function_name = names.find({function.entry.space.value, function.entry.offset});
+        const auto call_group = calls.find(function.id.value);
+        const std::size_t call_count = call_group == calls.end() ? 0 : call_group->second.size();
+        if (json) {
+            if (index) out << ',';
+            out << "{\"id\":" << function.id.value << ",\"entry\":"
+                << processor_inventory_json_string(format_location(function.entry, document.image.get()))
+                << ",\"name\":";
+            if (function_name == names.end() || function_name->second.empty()) out << "null";
+            else out << processor_inventory_json_string(safe_text(function_name->second.front()));
+            out << ",\"complete\":" << (function.complete ? "true" : "false")
+                << ",\"thunk\":" << (function.thunk ? "true" : "false")
+                << ",\"block_count\":" << function.blocks.size()
+                << ",\"instruction_count\":" << instruction_count << ",\"chunks\":[";
+            const auto chunk_count = (std::min)(per_function_detail_limit, function.chunks.size());
+            for (std::size_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+                if (chunk_index) out << ',';
+                const auto &chunk = function.chunks[chunk_index];
+                out << "{\"begin\":" << processor_inventory_json_string(format_location(chunk.begin, document.image.get()))
+                    << ",\"size\":" << chunk.size << ",\"block_count\":" << chunk.blocks.size() << '}';
+            }
+            out << "],\"chunks_total\":" << function.chunks.size()
+                << ",\"chunks_omitted\":" << function.chunks.size() - chunk_count << ",\"seeds\":[";
+            const auto seed_count = (std::min)(per_function_detail_limit, function.seeds.size());
+            for (std::size_t seed_index = 0; seed_index < seed_count; ++seed_index) {
+                if (seed_index) out << ',';
+                out << processor_inventory_json_string(function_seed_name(function.seeds[seed_index].kind));
+            }
+            out << "],\"seeds_total\":" << function.seeds.size()
+                << ",\"seeds_omitted\":" << function.seeds.size() - seed_count << ",\"stops\":[";
+            const auto stop_count = (std::min)(per_function_detail_limit, function.stops.size());
+            for (std::size_t stop_index = 0; stop_index < stop_count; ++stop_index) {
+                if (stop_index) out << ',';
+                const auto &stop = function.stops[stop_index];
+                out << "{\"address\":" << processor_inventory_json_string(format_location(stop.address, document.image.get()))
+                    << ",\"reason\":" << processor_inventory_json_string(function_stop_name(stop.reason))
+                    << ",\"detail\":" << processor_inventory_json_string(safe_text(stop.detail)) << '}';
+            }
+            out << "],\"stops_total\":" << function.stops.size()
+                << ",\"stops_omitted\":" << function.stops.size() - stop_count << ",\"calls\":[";
+            const auto call_detail_count = (std::min)(call_count, call_detail_budget - emitted_call_details);
+            if (call_group != calls.end()) {
+                for (std::size_t call_index = 0; call_index < call_detail_count; ++call_index) {
+                    if (call_index) out << ',';
+                    const auto &call = *call_group->second[call_index];
+                    out << "{\"source\":" << processor_inventory_json_string(format_location(call.source, document.image.get()))
+                        << ",\"target\":";
+                    if (call.target) out << processor_inventory_json_string(format_location(*call.target, document.image.get()));
+                    else out << "null";
+                    out << ",\"callee_id\":";
+                    if (call.callee) out << call.callee->value;
+                    else out << "null";
+                    out << ",\"tail_candidate\":" << (call.tail_candidate ? "true" : "false")
+                        << ",\"external\":";
+                    if (call.external_target) {
+                        out << "{\"library\":" << processor_inventory_json_string(safe_text(call.external_target->library))
+                            << ",\"name\":";
+                        if (call.external_target->name)
+                            out << processor_inventory_json_string(safe_text(*call.external_target->name));
+                        else out << "null";
+                        out << ",\"ordinal\":";
+                        if (call.external_target->ordinal) out << *call.external_target->ordinal;
+                        else out << "null";
+                        out << ",\"wasm_function_index\":";
+                        if (call.external_target->wasm_function_index) out << *call.external_target->wasm_function_index;
+                        else out << "null";
+                        out << ",\"host_binding\":";
+                        if (call.external_target->host_binding)
+                            out << processor_inventory_json_string(safe_text(*call.external_target->host_binding));
+                        else out << "null";
+                        out << '}';
+                    } else out << "null";
+                    out << '}';
+                }
+            }
+            emitted_call_details += call_detail_count;
+            out << "],\"calls_total\":" << call_count
+                << ",\"calls_omitted\":" << call_count - call_detail_count << "}";
+        } else {
+            out << "  " << format_location(function.entry, document.image.get());
+            if (function_name != names.end() && !function_name->second.empty())
+                out << "  " << safe_text(function_name->second.front());
+            out << "  blocks=" << function.blocks.size() << " instructions=" << instruction_count
+                << " chunks=" << function.chunks.size() << " calls=" << call_count
+                << (function.thunk ? " thunk" : "") << (function.complete ? " complete" : " partial") << '\n';
+        }
+    }
+    if (json) {
+        out << "]}\n";
+    } else if (count < snapshot.functions.size()) {
+        out << "  " << snapshot.functions.size() - count << " function(s) omitted by --limit\n";
+    }
+    return snapshot.complete && count == snapshot.functions.size() && !snapshot.functions.empty() ? 0 : 3;
+}
+
 int modules_command(std::span<const std::wstring_view> arguments, std::ostream &out, std::ostream &err) {
-    const bool graph_mode = !arguments.empty() && arguments.front() == L"--graph";
-    const auto inputs = graph_mode ? arguments.subspan(1) : arguments;
+    std::optional<std::filesystem::path> sysroot;
+    std::optional<std::filesystem::path> target_working_directory;
+    std::string lib_token, platform_token;
+    std::vector<std::filesystem::path> discovery_directories;
+    bool graph_mode = false, discover = false;
+    std::size_t option_count = 0;
+    while (option_count < arguments.size()) {
+        const auto option = arguments[option_count];
+        if (option == L"--") { ++option_count; break; }
+        if (option == L"--graph") graph_mode = true;
+        else if (option == L"--discover") discover = true;
+        else if (option == L"--sysroot" || option == L"--search-dir" || option == L"--target-cwd" ||
+                 option == L"--lib-token" || option == L"--platform-token") {
+            if (++option_count == arguments.size()) {
+                err << "Missing module discovery option value.\n"; return 2;
+            }
+            if (option == L"--sysroot") sysroot = std::filesystem::path(arguments[option_count]);
+            else if (option == L"--target-cwd") target_working_directory = std::filesystem::path(arguments[option_count]);
+            else if (option == L"--lib-token" || option == L"--platform-token") {
+                std::string value;
+                for (const auto c : arguments[option_count]) {
+                    if (c < 0 || c > 0x7f) {
+                        err << "ELF loader token values must contain ASCII path characters.\n"; return 2;
+                    }
+                    value.push_back(static_cast<char>(c));
+                }
+                (option == L"--lib-token" ? lib_token : platform_token) = std::move(value);
+            } else {
+                if (discovery_directories.size() >= 128) {
+                    err << "Module discovery accepts at most 128 explicit search directories.\n"; return 2;
+                }
+                discovery_directories.emplace_back(arguments[option_count]);
+            }
+        } else break;
+        ++option_count;
+    }
+    const auto inputs = arguments.subspan(option_count);
     if ((graph_mode && inputs.empty()) || (!graph_mode && inputs.size() < 2)) {
-        err << "Usage: hexlab_cli modules [--graph] <binary>...\n"
-               "       In graph mode the first binary is the root; later files are supplied candidates.\n";
+        err << "Usage: hexlab_cli modules [--sysroot <directory>] [--discover] [--search-dir <directory>] [--target-cwd <directory>] [--lib-token <value>] [--platform-token <value>] [--graph] <binary>...\n"
+               "       Graph mode starts at the first binary. Discovery requires --graph and --sysroot.\n";
+        return 2;
+    }
+    if ((sysroot && !graph_mode) || (discover && (!graph_mode || !sysroot)) ||
+        (!discovery_directories.empty() && !discover) ||
+        ((target_working_directory || !lib_token.empty() || !platform_token.empty()) && !discover)) {
+        err << "--discover requires --graph and --sysroot; --search-dir and target path substitutions require --discover.\n";
         return 2;
     }
     constexpr std::size_t max_graph_modules = 4096;
@@ -398,6 +653,33 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
         std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return value;
     };
+    const auto elf_soname_alias = [&](const Module &module) -> std::optional<std::string> {
+        const auto &metadata = module.document->metadata.elf;
+        if (!metadata) return {};
+        bool conflicting_sonames = false;
+        std::optional<std::string> alias;
+        for (const auto &table : metadata->dynamic_tables) {
+            for (const auto &entry : table.entries) {
+                if (entry.tag != 14 || !entry.string_value || entry.string_value->empty() ||
+                    entry.string_value->size() > 32768 ||
+                    entry.string_value->find_first_of("/\\:") != std::string::npos ||
+                    entry.string_value->find('\0') != std::string::npos)
+                    continue;
+                auto candidate = leaf(*entry.string_value);
+                if (candidate.empty()) continue;
+                if (alias && *alias != candidate) {
+                    conflicting_sonames = true;
+                    break;
+                }
+                alias = std::move(candidate);
+            }
+            if (conflicting_sonames) break;
+        }
+        return conflicting_sonames ? std::optional<std::string>{} : alias;
+    };
+    std::vector<std::optional<std::string>> elf_soname_aliases;
+    elf_soname_aliases.reserve(modules.size());
+    for (const auto &module : modules) elf_soname_aliases.push_back(elf_soname_alias(module));
     auto path_key = [](const std::filesystem::path &path) {
         auto value = path.lexically_normal().generic_string();
 #ifdef _WIN32
@@ -406,6 +688,345 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
 #endif
         return value;
     };
+    std::optional<std::filesystem::path> canonical_sysroot;
+    if (sysroot) {
+        std::error_code ec;
+        canonical_sysroot = std::filesystem::canonical(*sysroot, ec);
+        if (ec || !std::filesystem::is_directory(*canonical_sysroot)) {
+            err << "Invalid --sysroot directory: " << path_text(*sysroot) << '\n';
+            return 2;
+        }
+    }
+    ElfDependencyPathContext path_context;
+    path_context.target_working_directory = target_working_directory;
+    path_context.lib_token = lib_token;
+    path_context.platform_token = platform_token;
+    auto is_under_root = [](const std::filesystem::path &candidate, const std::filesystem::path &root) {
+        auto c = candidate.begin(), r = root.begin();
+        for (; r != root.end(); ++r, ++c) {
+            if (c == candidate.end()) return false;
+#ifdef _WIN32
+            auto left = c->wstring(), right = r->wstring();
+            std::transform(left.begin(), left.end(), left.begin(), ::towlower);
+            std::transform(right.begin(), right.end(), right.begin(), ::towlower);
+            if (left != right) return false;
+#else
+            if (*c != *r) return false;
+#endif
+        }
+        return true;
+    };
+    struct DiscoveredDependency {
+        std::vector<std::size_t> providers;
+        std::size_t unsupported_paths = 0, escaped_paths = 0, incompatible_files = 0, filesystem_errors = 0;
+        bool depth_limited = false;
+        bool inherited_path_context_conflict = false;
+        bool weak_dependency = false;
+        std::string dependency_kind;
+    };
+    std::map<std::size_t, std::map<std::string, DiscoveredDependency>> discovered_dependencies;
+    const auto supplied_count = modules.size();
+    if (discover && !modules.front().document->metadata.elf && !modules.front().document->metadata.macho) {
+        err << "Filesystem dependency discovery currently requires an ELF or Mach-O root.\n";
+        return 2;
+    }
+    if (discover && modules.front().document->metadata.elf) {
+        std::map<std::string, std::size_t> module_ids;
+        std::map<std::string, std::shared_ptr<const DocumentSnapshot>> loaded_files;
+        for (std::size_t index = 0; index < modules.size(); ++index) {
+            std::error_code ec;
+            const auto canonical = std::filesystem::canonical(modules[index].path, ec);
+            if (!ec) {
+                const auto key = path_key(canonical);
+                module_ids.try_emplace(key, index);
+                loaded_files.try_emplace(key, modules[index].document);
+            }
+        }
+        ElfDependencyDiscoveryLimits remaining;
+        struct PendingModule {
+            std::size_t index = 0, depth = 0;
+            std::vector<ElfDependencyFileCandidate> inherited_rpath;
+            std::size_t inherited_unsupported_rpath = 0;
+        };
+        std::vector<PendingModule> pending{{0, 0, {}, 0}};
+        std::set<std::size_t> queued{0};
+        std::map<std::size_t, std::vector<ElfDependencyFileCandidate>> inherited_contexts{{0, {}}};
+        std::map<std::size_t, std::size_t> inherited_unsupported_contexts{{0, 0}};
+        std::set<std::size_t> inherited_context_conflicts;
+        const auto same_inherited_context = [&](const auto &left, const auto &right,
+                                                std::size_t left_unsupported,
+                                                std::size_t right_unsupported) {
+            if (left_unsupported != right_unsupported) return false;
+            if (left.size() != right.size()) return false;
+            for (std::size_t i = 0; i < left.size(); ++i)
+                if (path_key(left[i].path) != path_key(right[i].path) ||
+                    left[i].search_entry_file_offset != right[i].search_entry_file_offset)
+                    return false;
+            return true;
+        };
+        out << "ELF sysroot file discovery (all compatible candidates retained):\n";
+        for (std::size_t cursor = 0; cursor < pending.size(); ++cursor) {
+            const auto current = pending[cursor];
+            const auto source = current.index;
+            const auto depth = current.depth;
+            const auto source_document = modules[source].document;
+            const auto &metadata = source_document->metadata.elf;
+            if (!metadata) continue;
+            auto current_path_context = path_context;
+            current_path_context.inherited_rpath = current.inherited_rpath;
+            current_path_context.inherited_unsupported_rpath = current.inherited_unsupported_rpath;
+            auto found = discover_elf_dependency_files(*metadata, modules[source].path,
+                *canonical_sysroot, discovery_directories, remaining, {}, current_path_context);
+            if (!found) { err << path_text(modules[source].path) << ": " << found.error().message << '\n'; return 1; }
+            const auto &report = found.value();
+            remaining.dependency_rows -= report.raw_dependency_rows;
+            remaining.metadata_entries -= report.metadata_entries;
+            remaining.name_bytes -= report.name_bytes;
+            remaining.path_bytes -= report.path_bytes;
+            remaining.probes -= report.probes;
+            remaining.candidates -= report.candidates;
+            for (const auto &row : report.rows) {
+                const auto tag_name = row.kind == ElfDependencyFileRow::Kind::auxiliary ? "DT_AUXILIARY"
+                    : row.kind == ElfDependencyFileRow::Kind::filter ? "DT_FILTER" : "DT_NEEDED";
+                out << "  [" << source << "] " << row.name << ' ' << tag_name << " @file:"
+                    << hex(row.dynamic_entry_file_offset) << '\n';
+                if (row.kind != ElfDependencyFileRow::Kind::needed) {
+                    for (const auto &candidate : row.candidates)
+                        out << "    inventory candidate " << path_text(candidate.path) << '\n';
+                    if (row.candidates.empty())
+                        out << "    no sysroot candidate (unsupported=" << row.unsupported_paths
+                            << ", escaped=" << row.escaped_paths << ", filesystem-errors="
+                            << row.filesystem_errors << ")\n";
+                    continue;
+                }
+                auto &resolution = discovered_dependencies[source][row.name];
+                resolution.unsupported_paths = row.unsupported_paths;
+                resolution.escaped_paths = row.escaped_paths;
+                resolution.filesystem_errors = row.filesystem_errors;
+                for (const auto &candidate : row.candidates) {
+                    const auto key = path_key(candidate.path);
+                    auto loaded = loaded_files.find(key);
+                    if (loaded == loaded_files.end()) {
+                        if (depth + 1 >= max_graph_depth) { resolution.depth_limited = true; continue; }
+                        if (loaded_files.size() >= max_graph_modules) {
+                            err << "Dependency discovery exceeds 4096 distinct inspected files.\n"; return 2;
+                        }
+                        OpenRequest request;
+                        request.path = candidate.path;
+                        request.run_analysis = false;
+                        auto document = load_document(request, {{loaded_files.size()}, 1}, {});
+                        if (!document) { err << path_text(candidate.path) << ": " << document.error().message << '\n'; return 1; }
+                        loaded = loaded_files.emplace(key, document.value()).first;
+                    }
+                    const auto &provider = loaded->second->metadata.elf;
+                    const auto incompatibility = provider ? elf_abi_incompatibility(metadata->header, provider->header)
+                        : std::optional<std::string>{"candidate is not ELF"};
+                    if (incompatibility) {
+                        ++resolution.incompatible_files;
+                        out << "    rejected " << path_text(candidate.path) << ": " << *incompatibility << '\n';
+                        continue;
+                    }
+                    auto id = module_ids.find(key);
+                    if (id == module_ids.end()) {
+                        if (depth + 1 >= max_graph_depth) { resolution.depth_limited = true; continue; }
+                        if (modules.size() >= max_graph_modules) {
+                            err << "Dependency discovery exceeds 4096 graph modules.\n"; return 2;
+                        }
+                        id = module_ids.emplace(key, modules.size()).first;
+                        modules.push_back({candidate.path, loaded->second});
+                    }
+                    resolution.providers.push_back(id->second);
+                    const char *via = candidate.source == ElfDependencyPathSource::needed_path ? "DT_NEEDED path" :
+                        candidate.source == ElfDependencyPathSource::runpath ? "DT_RUNPATH" :
+                        candidate.source == ElfDependencyPathSource::rpath ? "DT_RPATH" :
+                        candidate.source == ElfDependencyPathSource::inherited_rpath ? "inherited DT_RPATH" :
+                        "--search-dir";
+                    out << "    [" << id->second << "] " << path_text(candidate.path) << " via " << via;
+                    if (candidate.search_entry_file_offset) out << " @file:" << hex(*candidate.search_entry_file_offset);
+                    out << '\n';
+                }
+                std::sort(resolution.providers.begin(), resolution.providers.end());
+                resolution.providers.erase(std::unique(resolution.providers.begin(), resolution.providers.end()),
+                    resolution.providers.end());
+                // Expand only an unambiguous edge; selecting among competing
+                // providers would invent a link map. All candidates remain visible.
+                if (resolution.providers.size() == 1 && depth + 1 < max_graph_depth) {
+                    const auto provider_id = resolution.providers.front();
+                    auto child_context = current.inherited_rpath;
+                    for (const auto &directory : report.inherited_rpath) {
+                        const bool duplicate = std::any_of(child_context.begin(), child_context.end(),
+                            [&](const auto &prior) {
+                                return path_key(prior.path) == path_key(directory.path) &&
+                                       prior.search_entry_file_offset == directory.search_entry_file_offset;
+                            });
+                        if (!duplicate) child_context.push_back(directory);
+                    }
+                    const auto child_unsupported_rpath = report.inherited_unsupported_rpath;
+                    if (queued.insert(provider_id).second) {
+                        inherited_contexts.emplace(provider_id, child_context);
+                        inherited_unsupported_contexts.emplace(provider_id, child_unsupported_rpath);
+                        pending.push_back({provider_id, depth + 1, std::move(child_context),
+                                           child_unsupported_rpath});
+                    } else if (const auto prior = inherited_contexts.find(provider_id);
+                               prior != inherited_contexts.end() &&
+                               !same_inherited_context(prior->second, child_context,
+                                   inherited_unsupported_contexts.at(provider_id), child_unsupported_rpath)) {
+                        inherited_context_conflicts.insert(provider_id);
+                    }
+                }
+            }
+        }
+        for (const auto source : inherited_context_conflicts)
+            for (auto &[name, resolution] : discovered_dependencies[source]) {
+                (void)name;
+                resolution.inherited_path_context_conflict = true;
+            }
+        out << "Discovered " << modules.size() - supplied_count << " additional ELF modules; "
+            << 100000 - remaining.probes << " exact file probes; "
+            << inherited_context_conflicts.size() << " modules had distinct inherited RPATH contexts.\n";
+    }
+    if (discover && modules.front().document->metadata.macho) {
+        std::map<std::string, std::size_t> module_ids;
+        std::map<std::string, std::shared_ptr<const DocumentSnapshot>> loaded_files;
+        for (std::size_t index = 0; index < modules.size(); ++index) {
+            std::error_code ec;
+            const auto canonical = std::filesystem::canonical(modules[index].path, ec);
+            if (!ec) {
+                const auto key = path_key(canonical);
+                module_ids.try_emplace(key, index);
+                loaded_files.try_emplace(key, modules[index].document);
+            }
+        }
+        const auto root_macho = modules.front().document->metadata.macho;
+        if (!root_macho || root_macho->selected_slice >= root_macho->container.slices.size()) {
+            err << "Mach-O root has no selected architecture slice.\n"; return 2;
+        }
+        const auto root_header = root_macho->container.slices[root_macho->selected_slice].header;
+        MachODependencyDiscoveryLimits remaining;
+        struct PendingMachO { std::size_t index = 0, depth = 0; MachODependencyPathContext context; };
+        MachODependencyPathContext root_context;
+        if (root_header.file_type == 2) root_context.executable_path = modules.front().path;
+        std::vector<PendingMachO> pending{{0, 0, root_context}};
+        std::set<std::size_t> queued{0};
+        std::map<std::size_t, MachODependencyPathContext> prior_contexts{{0, root_context}};
+        std::set<std::size_t> context_conflicts;
+        out << "Mach-O sysroot file discovery (all compatible candidates retained):\n";
+        constexpr std::uint32_t lc_load_weak_dylib = 0x80000018;
+        constexpr std::uint32_t lc_reexport_dylib = 0x8000001f;
+        constexpr std::uint32_t lc_load_upward_dylib = 0x80000023;
+        auto same_context = [&](const MachODependencyPathContext &a, const MachODependencyPathContext &b) {
+            if (a.executable_path != b.executable_path || a.inherited_unsupported_rpaths != b.inherited_unsupported_rpaths ||
+                a.inherited_rpaths.size() != b.inherited_rpaths.size()) return false;
+            for (std::size_t i = 0; i < a.inherited_rpaths.size(); ++i)
+                if (path_key(a.inherited_rpaths[i].path) != path_key(b.inherited_rpaths[i].path) ||
+                    a.inherited_rpaths[i].command_file_offset != b.inherited_rpaths[i].command_file_offset) return false;
+            return true;
+        };
+        for (std::size_t cursor = 0; cursor < pending.size(); ++cursor) {
+            const auto current = pending[cursor];
+            const auto source = current.index;
+            const auto source_macho = modules[source].document->metadata.macho;
+            if (!source_macho) continue;
+            auto found = discover_macho_dependency_files(*source_macho, modules[source].path,
+                *canonical_sysroot, current.context, remaining);
+            if (!found) { err << path_text(modules[source].path) << ": " << found.error().message << '\n'; return 1; }
+            const auto &report = found.value();
+            remaining.dependency_rows -= report.rows.size();
+            remaining.metadata_entries -= report.metadata_entries;
+            remaining.name_bytes -= report.name_bytes;
+            remaining.path_bytes -= report.path_bytes;
+            remaining.probes -= report.probes;
+            remaining.candidates -= report.candidates;
+            remaining.rpaths -= report.inherited_rpaths.size() - current.context.inherited_rpaths.size();
+            for (const auto &row : report.rows) {
+                auto &resolution = discovered_dependencies[source][row.name];
+                resolution.unsupported_paths = row.unsupported_paths;
+                resolution.escaped_paths = row.escaped_paths;
+                resolution.filesystem_errors = row.filesystem_errors;
+                resolution.weak_dependency = row.load_command == lc_load_weak_dylib;
+                resolution.dependency_kind = row.load_command == lc_load_weak_dylib ? "LC_LOAD_WEAK_DYLIB" :
+                    row.load_command == lc_reexport_dylib ? "LC_REEXPORT_DYLIB" :
+                    row.load_command == lc_load_upward_dylib ? "LC_LOAD_UPWARD_DYLIB" : "LC_LOAD_DYLIB";
+                out << "  [" << source << "] " << row.name << " " << resolution.dependency_kind
+                    << " command[" << row.load_command_index << "] @file:" << hex(row.load_command_file_offset) << '\n';
+                for (const auto &candidate : row.candidates) {
+                    const auto key = path_key(candidate.path);
+                    auto loaded = loaded_files.find(key);
+                    if (loaded == loaded_files.end()) {
+                        if (current.depth + 1 >= max_graph_depth) { resolution.depth_limited = true; continue; }
+                        if (loaded_files.size() >= max_graph_modules) { err << "Dependency discovery exceeds 4096 distinct inspected files.\n"; return 2; }
+                        OpenRequest request; request.path = candidate.path; request.run_analysis = false;
+                        auto document = load_document(request, {{loaded_files.size()}, 1}, {});
+                        if (!document) { err << path_text(candidate.path) << ": " << document.error().message << '\n'; return 1; }
+                        loaded = loaded_files.emplace(key, document.value()).first;
+                    }
+                    const auto &provider = loaded->second->metadata.macho;
+                    if (!provider || provider->selected_slice >= provider->container.slices.size()) {
+                        ++resolution.incompatible_files; out << "    rejected " << path_text(candidate.path) << ": not a selected Mach-O slice\n"; continue;
+                    }
+                    auto selected_provider = loaded->second;
+                    const auto &provider_header = provider->container.slices[provider->selected_slice].header;
+                    if (provider_header.cpu_type != root_header.cpu_type || provider_header.cpu_subtype != root_header.cpu_subtype) {
+                        std::optional<std::uint32_t> compatible_slice;
+                        for (const auto &slice : provider->container.slices)
+                            if (slice.header.cpu_type == root_header.cpu_type && slice.header.cpu_subtype == root_header.cpu_subtype) {
+                                compatible_slice = slice.index; break;
+                            }
+                        if (!compatible_slice) {
+                            ++resolution.incompatible_files; out << "    rejected " << path_text(candidate.path) << ": CPU type/subtype mismatch\n"; continue;
+                        }
+                        OpenRequest request; request.path = candidate.path; request.run_analysis = false;
+                        request.macho = MachOOptions{*compatible_slice};
+                        auto document = load_document(request, {{loaded_files.size()}, 1}, {});
+                        if (!document || !document.value()->metadata.macho) {
+                            ++resolution.incompatible_files; out << "    rejected " << path_text(candidate.path) << ": matching slice could not be loaded\n"; continue;
+                        }
+                        selected_provider = document.value();
+                        loaded->second = selected_provider;
+                    }
+                    auto id = module_ids.find(key);
+                    if (id == module_ids.end()) {
+                        if (current.depth + 1 >= max_graph_depth) { resolution.depth_limited = true; continue; }
+                        if (modules.size() >= max_graph_modules) { err << "Dependency discovery exceeds 4096 graph modules.\n"; return 2; }
+                        id = module_ids.emplace(key, modules.size()).first;
+                        modules.push_back({candidate.path, selected_provider});
+                    } else if (id->second < modules.size()) {
+                        // A supplied universal file may have been opened with a
+                        // different default slice. Keep the graph node aligned
+                        // with the root architecture selected above.
+                        modules[id->second].document = selected_provider;
+                    }
+                    resolution.providers.push_back(id->second);
+                    const auto via = candidate.source == MachODependencyPathSource::rpath ? "LC_RPATH" :
+                        candidate.source == MachODependencyPathSource::loader_path ? "@loader_path" :
+                        candidate.source == MachODependencyPathSource::executable_path ? "@executable_path" : "install name";
+                    out << "    [" << id->second << "] " << path_text(candidate.path) << " via " << via;
+                    if (candidate.rpath_command_file_offset) out << " rpath@file:" << hex(*candidate.rpath_command_file_offset);
+                    out << '\n';
+                }
+                std::sort(resolution.providers.begin(), resolution.providers.end());
+                resolution.providers.erase(std::unique(resolution.providers.begin(), resolution.providers.end()), resolution.providers.end());
+                if (resolution.providers.size() == 1 && current.depth + 1 < max_graph_depth) {
+                    const auto child = resolution.providers.front();
+                    auto child_context = current.context;
+                    child_context.inherited_rpaths = report.inherited_rpaths;
+                    child_context.inherited_unsupported_rpaths = report.inherited_unsupported_rpaths;
+                    if (queued.insert(child).second) {
+                        prior_contexts.emplace(child, child_context);
+                        pending.push_back({child, current.depth + 1, std::move(child_context)});
+                    } else if (const auto previous = prior_contexts.find(child); previous != prior_contexts.end() &&
+                               !same_context(previous->second, child_context)) context_conflicts.insert(child);
+                }
+            }
+        }
+        for (const auto source : context_conflicts)
+            for (auto &[name, resolution] : discovered_dependencies[source]) { (void)name; resolution.inherited_path_context_conflict = true; }
+        out << "Discovered " << modules.size() - supplied_count << " additional Mach-O modules; "
+            << 100000 - remaining.probes << " exact file probes; " << context_conflicts.size()
+            << " modules had distinct inherited LC_RPATH contexts.\n";
+    }
+    while (elf_soname_aliases.size() < modules.size())
+        elf_soname_aliases.push_back(elf_soname_alias(modules[elf_soname_aliases.size()]));
     auto dependencies_for = [](const ImageMetadata &metadata, std::size_t row_limit, std::size_t byte_limit,
                                bool include_macho_id)
         -> std::optional<std::vector<std::string>> {
@@ -433,6 +1054,30 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
         if (exceeded) return std::nullopt;
         return deps;
     };
+    auto elf_search_paths = [](const ImageMetadata &metadata, bool &has_runpath) {
+        std::vector<std::string> paths;
+        has_runpath = false;
+        if (!metadata.elf) return paths;
+        std::vector<std::string> rpath, runpath;
+        for (const auto &table : metadata.elf->dynamic_tables)
+            for (const auto &entry : table.entries) {
+                if (entry.tag == 15 && entry.string_value) rpath.push_back(*entry.string_value);
+                if (entry.tag == 29 && entry.string_value) runpath.push_back(*entry.string_value);
+            }
+        has_runpath = !runpath.empty();
+        const auto &selected = has_runpath ? runpath : rpath;
+        for (const auto &item : selected) {
+            std::size_t begin = 0;
+            while (begin <= item.size()) {
+                const auto end = item.find(':', begin);
+                const auto length = (end == std::string::npos ? item.size() : end) - begin;
+                if (length) paths.emplace_back(item.substr(begin, length));
+                if (end == std::string::npos) break;
+                begin = end + 1;
+            }
+        }
+        return paths;
+    };
     auto sort_dependencies = [&leaf](std::vector<std::string> &deps) {
         std::sort(deps.begin(), deps.end(), [&leaf](const auto &a, const auto &b) {
             const auto left = leaf(a), right = leaf(b);
@@ -451,9 +1096,17 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
             if (deps.empty()) { out << "  (no dependency names in parsed metadata)\n"; continue; }
             for (const auto &dep : deps) {
                 std::vector<std::string> providers;
-                for (const auto &candidate : modules)
-                    if (&candidate != &module && leaf(path_text(candidate.path)) == leaf(dep))
-                        providers.push_back(path_text(candidate.path));
+                for (std::size_t candidate_index = 0; candidate_index < modules.size(); ++candidate_index) {
+                    const auto &candidate = modules[candidate_index];
+                    if (&candidate == &module) continue;
+                    const auto requested = leaf(dep);
+                    const auto candidate_name = leaf(path_text(candidate.path));
+                    const bool soname_match = candidate_name != requested && elf_soname_aliases[candidate_index] &&
+                        *elf_soname_aliases[candidate_index] == requested;
+                    if (candidate_name == requested || soname_match)
+                        providers.push_back(path_text(candidate.path) +
+                            (soname_match ? " (DT_SONAME alias)" : ""));
+                }
                 out << "  " << dep << " -> ";
                 if (providers.empty()) out << "unresolved (not supplied)";
                 else if (providers.size() == 1) out << "resolved: " << providers.front();
@@ -465,6 +1118,9 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
         struct Edge {
             std::string name;
             const std::vector<std::size_t> *providers = nullptr;
+            const DiscoveredDependency *discovery = nullptr;
+            std::size_t incompatible_pe_providers = 0;
+            bool soname_alias_match = false;
         };
         std::vector<std::vector<Edge>> graph(modules.size());
         std::size_t edge_count = 0;
@@ -472,11 +1128,22 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
         std::size_t dependency_name_bytes = 0;
         std::map<std::string, std::vector<std::size_t>> providers_by_basename;
         std::map<std::string, std::set<std::string>> provider_paths_by_basename;
+        std::map<std::string, std::size_t> supplied_by_canonical_path;
+        std::vector<std::unique_ptr<std::vector<std::size_t>>> path_buckets;
         for (std::size_t candidate = 0; candidate < modules.size(); ++candidate) {
-            const auto basename = leaf(path_text(modules[candidate].path));
             const auto normalized_path = path_key(modules[candidate].path);
-            if (provider_paths_by_basename[basename].insert(normalized_path).second)
-                providers_by_basename[basename].push_back(candidate);
+            const auto add_provider_alias = [&](const std::string &alias) {
+                if (provider_paths_by_basename[alias].insert(normalized_path).second)
+                    providers_by_basename[alias].push_back(candidate);
+            };
+            add_provider_alias(leaf(path_text(modules[candidate].path)));
+            if (elf_soname_aliases[candidate]) add_provider_alias(*elf_soname_aliases[candidate]);
+            if (canonical_sysroot) {
+                std::error_code ec;
+                auto canonical = std::filesystem::canonical(modules[candidate].path, ec);
+                if (!ec && is_under_root(canonical, *canonical_sysroot))
+                    supplied_by_canonical_path[path_key(canonical)] = candidate;
+            }
         }
         for (std::size_t source = 0; source < modules.size(); ++source) {
             auto deps_result = dependencies_for(modules[source].document->metadata,
@@ -498,20 +1165,96 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
             graph[source].reserve(deps.size());
             for (auto &dep : deps) {
                 Edge edge{std::move(dep), {}};
+                bool path_resolution_authoritative = false;
+                if (discover && (modules[source].document->metadata.elf || modules[source].document->metadata.macho)) {
+                    path_resolution_authoritative = true;
+                    const auto importer = discovered_dependencies.find(source);
+                    if (importer != discovered_dependencies.end()) {
+                        const auto found = importer->second.find(edge.name);
+                        if (found != importer->second.end()) {
+                            edge.discovery = &found->second;
+                            edge.providers = &found->second.providers;
+                        }
+                    }
+                }
+                if (!discover && canonical_sysroot && modules[source].document->metadata.elf) {
+                    bool has_runpath = false;
+                    const auto search_paths = elf_search_paths(modules[source].document->metadata, has_runpath);
+                    std::vector<std::size_t> path_matches;
+                    std::error_code ec;
+                    const auto importer_path = std::filesystem::canonical(modules[source].path, ec);
+                    if (!ec && is_under_root(importer_path, *canonical_sysroot)) {
+                        path_resolution_authoritative = !search_paths.empty();
+                        for (auto directory : search_paths) {
+                            constexpr std::string_view origin1 = "${ORIGIN}", origin2 = "$ORIGIN";
+                            const auto origin = importer_path.parent_path();
+                            for (std::size_t at = 0; (at = directory.find(origin1, at)) != std::string::npos;)
+                                directory.replace(at, origin1.size(), origin.generic_string());
+                            for (std::size_t at = 0; (at = directory.find(origin2, at)) != std::string::npos;)
+                                directory.replace(at, origin2.size(), origin.generic_string());
+                            // Only origin-relative entries are currently interpreted; other loader tokens
+                            // and ambient paths are deliberately not searched.
+                            if (directory.find('$') != std::string::npos) continue;
+                            auto path = std::filesystem::path(directory);
+                            if (path.is_relative()) path = origin / path;
+                            auto candidate_path = std::filesystem::canonical(path / std::filesystem::path(dep), ec);
+                            if (ec) { ec.clear(); continue; }
+                            if (!is_under_root(candidate_path, *canonical_sysroot)) continue;
+                            const auto found = supplied_by_canonical_path.find(path_key(candidate_path));
+                            if (found != supplied_by_canonical_path.end()) path_matches.push_back(found->second);
+                        }
+                    }
+                    if (!path_matches.empty()) {
+                        std::sort(path_matches.begin(), path_matches.end());
+                        path_matches.erase(std::unique(path_matches.begin(), path_matches.end()), path_matches.end());
+                        // A path match is authoritative; ambiguity is retained in the graph.
+                        path_buckets.push_back(std::make_unique<std::vector<std::size_t>>(std::move(path_matches)));
+                        edge.providers = path_buckets.back().get();
+                    } else if (path_resolution_authoritative) {
+                        // A declared bounded search path takes precedence over basename matching.
+                        edge.providers = nullptr;
+                    }
+                }
                 const auto providers = providers_by_basename.find(leaf(edge.name));
-                if (providers != providers_by_basename.end()) edge.providers = &providers->second;
+                if (!edge.providers && providers != providers_by_basename.end() &&
+                    !path_resolution_authoritative) {
+                    for (const auto candidate : providers->second)
+                        if (leaf(path_text(modules[candidate].path)) != leaf(edge.name) &&
+                            elf_soname_aliases[candidate] && *elf_soname_aliases[candidate] == leaf(edge.name))
+                            edge.soname_alias_match = true;
+                    if (is_pe_module(modules[source].document->metadata)) {
+                        std::vector<std::size_t> compatible;
+                        for (const auto candidate : providers->second) {
+                            const auto compatibility = classify_pe_module_compatibility(
+                                modules[source].document->metadata, modules[candidate].document->metadata);
+                            if (compatibility == PeModuleCompatibility::compatible)
+                                compatible.push_back(candidate);
+                            else
+                                ++edge.incompatible_pe_providers;
+                        }
+                        if (!compatible.empty()) {
+                            path_buckets.push_back(std::make_unique<std::vector<std::size_t>>(std::move(compatible)));
+                            edge.providers = path_buckets.back().get();
+                        }
+                    } else {
+                        edge.providers = &providers->second;
+                    }
+                }
                 graph[source].push_back(std::move(edge));
             }
         }
 
-        out << "Recursive dependency graph (only supplied files; maximum depth " << max_graph_depth << ")\n";
-        out << "Supplied node identities (input order):\n";
+        out << "Recursive dependency graph (" << (discover ? "supplied and discovered files" : "only supplied files")
+            << "; maximum depth " << max_graph_depth << ")\n";
+        out << (discover ? "Node identities (supplied input order, then discovery order):\n"
+                         : "Supplied node identities (input order):\n");
         std::map<std::string, std::size_t> first_path;
         std::map<std::string, std::size_t> first_basename;
         for (std::size_t index = 0; index < modules.size(); ++index) {
             const auto key = path_key(modules[index].path);
             const auto basename = leaf(path_text(modules[index].path));
             out << "  [" << index << "] " << path_text(modules[index].path);
+            if (index >= supplied_count) out << " (discovered)";
             if (const auto same_path = first_path.find(key); same_path != first_path.end())
                 out << " (duplicate supplied path of [" << same_path->second << "])";
             else if (const auto same_basename = first_basename.find(basename);
@@ -533,9 +1276,34 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
             if (graph[current].empty())
                 out << std::string((depth + 1) * 2, ' ') << "(no dependency names in parsed metadata)\n";
             for (const auto &edge : graph[current]) {
-                out << std::string((depth + 1) * 2, ' ') << edge.name << " -> ";
+                out << std::string((depth + 1) * 2, ' ') << edge.name;
+                if (edge.soname_alias_match) out << " (DT_SONAME alias)";
+                if (edge.discovery && (edge.discovery->unsupported_paths || edge.discovery->filesystem_errors ||
+                                       edge.discovery->inherited_path_context_conflict))
+                    out << " (partial search" << (edge.discovery->dependency_kind.empty() ? "" : ", " + edge.discovery->dependency_kind)
+                        << ": " << edge.discovery->unsupported_paths << " unsupported paths, "
+                        << edge.discovery->filesystem_errors << " filesystem errors"
+                        << (edge.discovery->inherited_path_context_conflict
+                                ? (modules[current].document->metadata.macho ? ", distinct inherited LC_RPATH contexts; first path retained" :
+                                   ", distinct inherited DT_RPATH contexts; first path retained") : "")
+                        << ")";
+                out << " -> ";
                 if (!edge.providers || edge.providers->empty()) {
-                    out << "unresolved (not supplied)\n";
+                    out << (discover ? (edge.discovery && edge.discovery->weak_dependency
+                        ? "unresolved weak dependency (no discovered provider)" : "unresolved (no discovered provider)")
+                        : "unresolved (not supplied)");
+                    if (edge.discovery) {
+                        if (edge.discovery->unsupported_paths) out << "; unsupported search/path forms: " << edge.discovery->unsupported_paths;
+                        if (edge.discovery->escaped_paths) out << "; sysroot escapes rejected: " << edge.discovery->escaped_paths;
+                        if (edge.discovery->incompatible_files) out << "; incompatible files: " << edge.discovery->incompatible_files;
+                        if (edge.discovery->filesystem_errors) out << "; filesystem errors: " << edge.discovery->filesystem_errors;
+                        if (edge.discovery->depth_limited) out << "; discovery depth limit reached";
+                        if (edge.discovery->inherited_path_context_conflict)
+                            out << "; distinct inherited DT_RPATH contexts; first path retained";
+                    } else if (discover) out << "; importer was not expanded";
+                    if (edge.incompatible_pe_providers)
+                        out << "; rejected incompatible PE providers: " << edge.incompatible_pe_providers;
+                    out << '\n';
                     continue;
                 }
                 if (edge.providers->size() != 1) {
@@ -571,10 +1339,12 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
             color[current] = 2;
         };
         visit(0, 0);
-        out << "Expanded " << expanded << " of " << modules.size() << " supplied modules; "
+        out << "Expanded " << expanded << " of " << modules.size()
+            << (discover ? " graph modules; " : " supplied modules; ")
             << edge_count << " dependency rows.\n";
         if (expanded < modules.size()) {
-            out << "Some supplied modules were not expanded because they are unreachable from the root";
+            out << (discover ? "Some graph modules were not expanded because they are unreachable or ambiguous from the root"
+                             : "Some supplied modules were not expanded because they are unreachable from the root");
             if (depth_limited) out << " or beyond the depth limit";
             out << ".\n";
         }
@@ -588,13 +1358,105 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
     print_macho_import_resolutions(supplied, out);
     return 0;
 }
+int pe_dependency_files_command(std::span<const std::wstring_view> arguments,
+                                std::ostream &out, std::ostream &err) {
+    std::optional<std::filesystem::path> sysroot;
+    std::vector<std::filesystem::path> search_directories;
+    std::optional<std::filesystem::path> input;
+    bool windows_defaults = false;
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        const auto argument = arguments[index];
+        if (argument == L"--windows-defaults") {
+            windows_defaults = true;
+        } else if (argument == L"--sysroot" || argument == L"--search-dir") {
+            if (++index == arguments.size()) {
+                err << "Missing PE dependency option value.\n";
+                return 2;
+            }
+            const std::filesystem::path value(arguments[index]);
+            if (argument == L"--sysroot") {
+                if (sysroot) { err << "--sysroot may be specified once.\n"; return 2; }
+                sysroot = value;
+            } else {
+                if (search_directories.size() >= 128) {
+                    err << "PE dependency discovery accepts at most 128 search directories.\n";
+                    return 2;
+                }
+                search_directories.push_back(value);
+            }
+        } else if (argument.starts_with(L"--")) {
+            err << "Unknown PE dependency option: " << wide_to_utf8(argument) << '\n';
+            return 2;
+        } else if (input) {
+            err << "PE dependency discovery accepts one input image.\n";
+            return 2;
+        } else {
+            input = std::filesystem::path(argument);
+        }
+    }
+    if (!input || !sysroot) {
+        err << "Usage: hexlab_cli pe-deps --sysroot <directory> [--search-dir <directory>] [--windows-defaults] <PE image>\n";
+        return 2;
+    }
+
+    OpenRequest request;
+    request.path = *input;
+    request.format = Format::pe;
+    request.run_analysis = false;
+    auto document = load_document(request, {{0}, 1}, {});
+    if (!document) {
+        err << path_text(*input) << ": " << document.error().message << '\n';
+        return 1;
+    }
+    if (!document.value()->metadata.pe) {
+        err << path_text(*input) << ": PE metadata is unavailable.\n";
+        return 1;
+    }
+
+    const auto target_bitness = document.value()->metadata.format == "PE32"
+        ? PeDependencyTargetBitness::pe32
+        : document.value()->metadata.format == "PE32+"
+            ? PeDependencyTargetBitness::pe32_plus : PeDependencyTargetBitness::unspecified;
+    auto report = discover_pe_dependency_files(document.value()->metadata.imports, *input, *sysroot, search_directories,
+                                                {}, {}, windows_defaults, target_bitness);
+    if (!report) {
+        err << path_text(*input) << ": " << report.error().message << '\n';
+        return 1;
+    }
+    for (const auto &row : report.value().rows) {
+        out << row.name << " [" << (row.eager_load ? "eager" : "")
+            << (row.eager_load && row.delay_load ? "," : "")
+            << (row.delay_load ? "delay-load" : "") << "]:\n";
+        if (row.candidates.empty()) out << "  unresolved\n";
+        for (const auto &candidate : row.candidates) {
+            out << "  [search rank " << candidate.precedence << "] " << path_text(candidate.path) << " via "
+                << (candidate.source == PeDependencyPathSource::importer_directory
+                        ? "importer directory" :
+                    candidate.source == PeDependencyPathSource::explicit_directory ? "explicit search directory" :
+                    candidate.source == PeDependencyPathSource::windows_system_directory ? "sysroot Windows/System32" :
+                    candidate.source == PeDependencyPathSource::windows_wow64_system_directory ? "sysroot Windows/SysWOW64" :
+                        "sysroot Windows directory");
+            if (row.effective_precedence && candidate.precedence == *row.effective_precedence)
+                out << " (effective rank)";
+            else out << " (shadowed by an earlier rank)";
+            out << '\n';
+        }
+        if (row.escaped_paths) out << "  rejected escaped paths: " << row.escaped_paths << '\n';
+        if (row.filesystem_errors) out << "  filesystem errors: " << row.filesystem_errors << '\n';
+    }
+    out << "Scanned " << report.value().directory_entries << " entries; retained "
+        << report.value().candidates << " candidate files.\n";
+    return 0;
+}
+
 int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
     if (args.size() == 1 && args[0] == L"--help") {
         out << "Usage: hexlab_cli plugins scan <directory> [--json] [--strict]\n"
                "       hexlab_cli plugins dependencies <directory> [--json] [--strict]\n"
                "Scans direct native plugin candidates and bounded .hexlab-plugin sidecars without loading modules.\n"
                "dependencies also reports advisory host/candidate/missing/ambiguous requirement providers.\n"
-               "--strict returns status 3 after reporting malformed manifests or unresolved requirements.\n";
+               "scan also reports duplicate manifest plugin IDs; --strict returns status 3 for duplicate IDs,\n"
+               "malformed manifests, integrity failures, or unresolved requirements.\n";
         return 0;
     }
     const bool dependency_report = !args.empty() && args[0] == L"dependencies";
@@ -620,15 +1482,48 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
             err << "Plugin scan: " << scanned.error().message << '\n';
             return 1;
         }
+        std::map<std::string, std::vector<std::string>> duplicate_identity_paths;
+        for (const auto &candidate : scanned.value())
+            if (candidate.manifest)
+                duplicate_identity_paths[candidate.manifest->id].push_back(candidate.path);
+        for (auto it = duplicate_identity_paths.begin(); it != duplicate_identity_paths.end();) {
+            if (it->second.size() < 2) it = duplicate_identity_paths.erase(it);
+            else ++it;
+        }
+        auto write_duplicate_identities_json = [&]() {
+            out << "\"duplicate_identities\":[";
+            bool first_identity = true;
+            for (const auto &[id, paths] : duplicate_identity_paths) {
+                if (!first_identity) out << ',';
+                first_identity = false;
+                out << "{\"id\":" << json_quote(id) << ",\"paths\":[";
+                for (std::size_t i = 0; i < paths.size(); ++i) {
+                    if (i) out << ',';
+                    out << json_quote(paths[i]);
+                }
+                out << "]}";
+            }
+            out << ']';
+        };
+        auto write_duplicate_identities_text = [&]() {
+            for (const auto &[id, paths] : duplicate_identity_paths) {
+                out << "Duplicate plugin identity " << id << ':';
+                for (const auto &path : paths) out << " " << path;
+                out << '\n';
+            }
+        };
         if (dependency_report) {
             struct RequirementRow {
                 plugins::PluginInfo::VersionedCapability capability;
                 std::string resolution;
                 std::vector<std::pair<std::string, std::string>> providers;
+                std::optional<std::size_t> candidate_provider;
+                std::string provider_status = "not-applicable";
             };
             struct CandidateRow {
                 const plugins::PluginCandidate *candidate = nullptr;
                 std::vector<RequirementRow> requirements;
+                std::string dependency_status = "ready";
             };
             std::vector<CandidateRow> report;
             report.reserve(scanned.value().size());
@@ -649,7 +1544,8 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
                         if (host != candidate.requirement_preflight.end()) {
                             item.resolution = "host";
                         } else {
-                            for (const auto &provider : scanned.value()) {
+                            for (std::size_t provider_index = 0; provider_index < scanned.value().size(); ++provider_index) {
+                                const auto &provider = scanned.value()[provider_index];
                                 if (!provider.manifest || provider.path == candidate.path) continue;
                                 const auto &provider_manifest = *provider.manifest;
                                 const auto capability = std::find_if(provider_manifest.capabilities.begin(),
@@ -658,10 +1554,17 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
                                                declared.major_version == required.major_version &&
                                                declared.minor_version >= required.minor_version;
                                     });
-                                if (capability != provider_manifest.capabilities.end())
+                                if (capability != provider_manifest.capabilities.end()) {
                                     item.providers.emplace_back(provider_manifest.id, provider.path);
+                                }
                             }
-                            if (item.providers.size() == 1) item.resolution = "candidate";
+                            if (item.providers.size() == 1) {
+                                item.resolution = "candidate";
+                                item.candidate_provider = static_cast<std::size_t>(std::find_if(
+                                    scanned.value().begin(), scanned.value().end(), [&](const auto &provider) {
+                                        return provider.path == item.providers.front().second;
+                                    }) - scanned.value().begin());
+                            }
                             else if (item.providers.size() > 1) item.resolution = "ambiguous";
                         }
                         row.requirements.push_back(std::move(item));
@@ -669,23 +1572,63 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
                 }
                 report.push_back(std::move(row));
             }
-            std::size_t failure_count = 0;
-            for (const auto &row : report) {
-                if (!row.candidate->manifest) {
-                    // Without a readable manifest, the dependency set is
-                    // unknown, so a strict preflight cannot call it clean.
-                    ++failure_count;
-                    continue;
+
+            enum class DependencyState { ready, manifest_unavailable, unavailable, ambiguous, cycle, depth_limit };
+            auto state_name = [](DependencyState state) -> const char * {
+                switch (state) {
+                case DependencyState::ready: return "ready";
+                case DependencyState::manifest_unavailable: return "manifest_unavailable";
+                case DependencyState::unavailable: return "unavailable";
+                case DependencyState::ambiguous: return "ambiguous";
+                case DependencyState::cycle: return "cycle";
+                case DependencyState::depth_limit: return "depth_limit";
                 }
-                for (const auto &requirement : row.requirements)
-                    if (requirement.resolution == "unavailable" || requirement.resolution == "ambiguous")
-                        ++failure_count;
-            }
+                return "manifest_unavailable";
+            };
+            std::vector<std::uint8_t> visit_state(report.size(), 0);
+            std::vector<DependencyState> dependency_states(report.size(), DependencyState::ready);
+            std::function<DependencyState(std::size_t, std::size_t)> resolve_candidate;
+            resolve_candidate = [&](std::size_t index, std::size_t depth) -> DependencyState {
+                if (visit_state[index] == 1) return DependencyState::cycle;
+                if (visit_state[index] == 2) return dependency_states[index];
+                if (!report[index].candidate->manifest) {
+                    visit_state[index] = 2;
+                    return dependency_states[index] = DependencyState::manifest_unavailable;
+                }
+                if (depth >= 256) {
+                    visit_state[index] = 2;
+                    return dependency_states[index] = DependencyState::depth_limit;
+                }
+                visit_state[index] = 1;
+                auto state = DependencyState::ready;
+                for (auto &requirement : report[index].requirements) {
+                    if (requirement.resolution == "host") continue;
+                    if (requirement.resolution == "unavailable") { state = DependencyState::unavailable; break; }
+                    if (requirement.resolution == "ambiguous") { state = DependencyState::ambiguous; break; }
+                    if (!requirement.candidate_provider) { state = DependencyState::manifest_unavailable; break; }
+                    const auto provider_state = resolve_candidate(*requirement.candidate_provider, depth + 1);
+                    requirement.provider_status = state_name(provider_state);
+                    if (provider_state != DependencyState::ready) { state = provider_state; break; }
+                }
+                visit_state[index] = 2;
+                return dependency_states[index] = state;
+            };
+            for (std::size_t index = 0; index < report.size(); ++index)
+                report[index].dependency_status = state_name(resolve_candidate(index, 0));
+            for (auto &row : report)
+                for (auto &requirement : row.requirements)
+                    if (requirement.candidate_provider)
+                        requirement.provider_status = state_name(resolve_candidate(*requirement.candidate_provider, 0));
+
+            std::size_t failure_count = 0;
+            for (const auto &row : report)
+                if (row.dependency_status != "ready") ++failure_count;
             if (json) {
                 out << "{\"directory\":" << json_quote(path_text(directory))
                     << ",\"loaded\":false,\"advisory\":true,\"strict\":" << (strict ? "true" : "false")
-                    << ",\"failure_count\":" << failure_count << ",\"count\":" << report.size()
-                    << ",\"candidates\":[";
+                    << ",\"failure_count\":" << failure_count << ",\"count\":" << report.size() << ',';
+                write_duplicate_identities_json();
+                out << ",\"candidates\":[";
                 for (std::size_t i = 0; i < report.size(); ++i) {
                     const auto &row = report[i];
                     if (i) out << ',';
@@ -693,6 +1636,7 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
                     if (row.candidate->manifest) out << json_quote(row.candidate->manifest->id);
                     else out << "null";
                     out << ",\"manifest_error\":" << json_quote(row.candidate->manifest_error)
+                        << ",\"dependency_status\":" << json_quote(row.dependency_status)
                         << ",\"requirements\":[";
                     for (std::size_t r = 0; r < row.requirements.size(); ++r) {
                         const auto &requirement = row.requirements[r];
@@ -701,6 +1645,7 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
                             << ",\"major\":" << requirement.capability.major_version
                             << ",\"minimum_minor\":" << requirement.capability.minor_version
                             << ",\"resolution\":" << json_quote(requirement.resolution)
+                            << ",\"provider_dependency_status\":" << json_quote(requirement.provider_status)
                             << ",\"providers\":[";
                         for (std::size_t p = 0; p < requirement.providers.size(); ++p) {
                             if (p) out << ',';
@@ -712,39 +1657,52 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
                     out << "]}";
                 }
                 out << "]}\n";
-                return strict && failure_count ? 3 : 0;
+                return strict && (failure_count || !duplicate_identity_paths.empty()) ? 3 : 0;
             }
             out << "Dependency preflight for " << path_text(directory) << " (advisory; no modules loaded)\n";
             for (const auto &row : report) {
                 out << row.candidate->path;
                 if (!row.candidate->manifest) {
                     out << (row.candidate->manifest_error.empty() ? "\n  no manifest; requirements unknown\n"
-                                                                  : "\n  invalid manifest: " + safe_text(row.candidate->manifest_error) + "\n");
+                                                                  : "\n  rejected or invalid manifest: " + safe_text(row.candidate->manifest_error) + "\n");
                     continue;
                 }
-                out << "\n  " << row.candidate->manifest->id;
+                out << "\n  " << row.candidate->manifest->id
+                    << "\n  manifest dependency graph: " << row.dependency_status;
                 if (row.requirements.empty()) out << "\n  no declared requirements";
                 for (const auto &requirement : row.requirements) {
                     const auto &capability = requirement.capability;
                     out << "\n  " << capability.id << '@' << capability.major_version << '.'
                         << capability.minor_version << ": " << requirement.resolution;
+                    if (requirement.candidate_provider)
+                        out << " (provider graph: " << requirement.provider_status << ')';
                     for (const auto &[provider, path] : requirement.providers)
                         out << " " << provider << " (" << path << ')';
                 }
                 out << '\n';
             }
-            if (strict) out << "Strict failures: " << failure_count << '\n';
-            return strict && failure_count ? 3 : 0;
+            write_duplicate_identities_text();
+            if (strict) out << "Strict failures (candidate dependency graphs): " << failure_count << '\n';
+            if (strict && !duplicate_identity_paths.empty())
+                out << "Duplicate plugin identities: " << duplicate_identity_paths.size() << '\n';
+            return strict && (failure_count || !duplicate_identity_paths.empty()) ? 3 : 0;
         }
         const auto invalid_manifest_count = static_cast<std::size_t>(std::count_if(
             scanned.value().begin(), scanned.value().end(), [](const auto &candidate) {
                 return !candidate.manifest && !candidate.manifest_error.empty();
             }));
+        const auto integrity_failure_count = static_cast<std::size_t>(std::count_if(
+            scanned.value().begin(), scanned.value().end(), [](const auto &candidate) {
+                return !candidate.integrity_error.empty();
+            }));
         if (json) {
             out << "{\"directory\":" << json_quote(path_text(directory))
                 << ",\"loaded\":false,\"strict\":" << (strict ? "true" : "false")
                 << ",\"invalid_manifest_count\":" << invalid_manifest_count
-                << ",\"count\":" << scanned.value().size() << ",\"candidates\":[";
+                << ",\"integrity_failure_count\":" << integrity_failure_count
+                << ",\"duplicate_identity_count\":" << duplicate_identity_paths.size() << ',';
+            write_duplicate_identities_json();
+            out << ",\"count\":" << scanned.value().size() << ",\"candidates\":[";
             for (std::size_t i = 0; i < scanned.value().size(); ++i) {
                 const auto &candidate = scanned.value()[i];
                 if (i) out << ',';
@@ -767,25 +1725,32 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
                     out << "{\"id\":" << json_quote(manifest.id)
                         << ",\"name\":" << json_quote(manifest.name)
                         << ",\"version\":" << json_quote(manifest.version)
+                        << ",\"sha256\":" << (manifest.sha256.empty() ? "null" : json_quote(manifest.sha256))
                         << ",\"capabilities\":";
                     capabilities(manifest.capabilities);
                     out << ",\"required_capabilities\":";
                     capabilities(manifest.required_capabilities);
                     out << '}';
                 }
-                out << ",\"manifest_error\":" << json_quote(candidate.manifest_error) << '}';
+                out << ",\"manifest_error\":" << json_quote(candidate.manifest_error)
+                    << ",\"module_sha256\":" << (candidate.module_sha256.empty() ? "null" : json_quote(candidate.module_sha256))
+                    << ",\"integrity_error\":" << json_quote(candidate.integrity_error) << '}';
             }
             out << "]}\n";
-            return strict && invalid_manifest_count ? 3 : 0;
+            return strict && (invalid_manifest_count || integrity_failure_count || !duplicate_identity_paths.empty()) ? 3 : 0;
         }
         out << "Scanned " << scanned.value().size() << " candidate(s) in " << path_text(directory)
             << ". No plugin modules were loaded.\n";
         if (strict) out << "Invalid manifests: " << invalid_manifest_count << '\n';
+        if (strict) out << "Integrity failures: " << integrity_failure_count << '\n';
         for (const auto &candidate : scanned.value()) {
             out << candidate.path;
             if (candidate.manifest) {
                 const auto &manifest = *candidate.manifest;
                 out << "\n  " << manifest.id << " | " << manifest.name << " | " << manifest.version;
+                if (!manifest.sha256.empty()) out << "\n  declared SHA-256: " << manifest.sha256;
+                if (!candidate.module_sha256.empty()) out << "\n  actual SHA-256:   " << candidate.module_sha256;
+                if (!candidate.integrity_error.empty()) out << "\n  integrity error: " << safe_text(candidate.integrity_error);
                 if (!manifest.capabilities.empty()) {
                     out << "\n  capabilities:";
                     for (const auto &capability : manifest.capabilities)
@@ -797,11 +1762,14 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
                         out << ' ' << capability.id << '@' << capability.major_version << '.' << capability.minor_version;
                 }
             } else if (!candidate.manifest_error.empty())
-                out << "\n  Invalid manifest: " << safe_text(candidate.manifest_error);
+                out << "\n  Rejected or invalid manifest: " << safe_text(candidate.manifest_error);
             else out << "\n  No manifest";
             out << '\n';
         }
-        return strict && invalid_manifest_count ? 3 : 0;
+        write_duplicate_identities_text();
+        if (strict && !duplicate_identity_paths.empty())
+            out << "Duplicate plugin identities: " << duplicate_identity_paths.size() << '\n';
+        return strict && (invalid_manifest_count || integrity_failure_count || !duplicate_identity_paths.empty()) ? 3 : 0;
     } catch (const std::exception &error) {
         err << "Plugin scan: " << error.what() << '\n';
         return 1;
@@ -810,9 +1778,19 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
 int firmware_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
     if (args.size() == 2 && args[1] == L"--help") {
         out << "Usage: hexlab_cli firmware inspect <path> --format ihex|srec|uefi|uefi-capsule\n"
-            << "       UEFI capsule lists: hexlab_cli firmware inspect <path> [<path> ...] --format uefi-capsule\n";
+            << "       Intel FIT: hexlab_cli firmware inspect <path> --fit-offset <file-offset> --format fit\n"
+            << "       Intel microcode: hexlab_cli firmware inspect <path> --microcode-offset <file-offset> --format intel-microcode\n"
+            << "       UEFI capsule lists: hexlab_cli firmware inspect <path> [<path> ...] --format uefi-capsule\n"
+            << "       Extract FMP image: hexlab_cli firmware inspect <path> --extract-item <index> --output <file> [--replace] --format uefi-capsule\n"
+            << "       FMP scatter/gather: hexlab_cli firmware inspect <capture> --capsule-sg-base <physical-base> --capsule-sg-head <physical-address> --format uefi-capsule\n";
         return 0;
     }
+    if (args.size() == 6 && args[0] == L"inspect" && args[2] == L"--fit-offset" &&
+        args[4] == L"--format" && args[5] == L"fit")
+        return run_intel_fit_cli(args, out, err);
+    if (args.size() == 6 && args[0] == L"inspect" && args[2] == L"--microcode-offset" &&
+        args[4] == L"--format" && args[5] == L"intel-microcode")
+        return run_intel_microcode_cli(args, out, err);
     if (args.size() == 4 && args[0] == L"inspect" && args[2] == L"--format" && args[3] == L"uefi")
         return run_uefi_firmware_cli(args, out, err);
     if (args.size() >= 4 && args[0] == L"inspect" && args[args.size() - 2] == L"--format" && args.back() == L"uefi-capsule")
@@ -867,22 +1845,39 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
     using project_detail::Failure;
     using project_detail::take;
     if (args.size() < 2 || (args.size() == 2 && args[1] == L"--help")) {
-        out << "Usage: hexlab_cli archive list <archive>\n"
-               "       hexlab_cli archive link-select <archive> --root-object <ET_REL>\n"
-               "       hexlab_cli archive link-audit <archive> --root-object <ET_REL>\n"
+        out << "Usage: hexlab_cli archive list <archive> [--thin-root <directory>]\n"
+               "       hexlab_cli archive link-select <archive> --root-object <ET_REL|XCOFF64>\n"
+               "       hexlab_cli archive link-audit <archive> --root-object <ET_REL|XCOFF64>\n"
                "       hexlab_cli archive link <archive> --root-object <ET_REL> --output <ET_REL>\n"
                "       hexlab_cli archive link-exec <archive> --root-object <ET_REL> --entry <symbol> --output <ET_EXEC>\n"
                "       hexlab_cli archive link-pe <archive> --root-object <COFF .obj> --entry <symbol> --output <PE .exe>\n"
                "       hexlab_cli archive link-macho <archive> --root-object <Mach-O .o> --entry <symbol> --output <Mach-O executable>\n"
                "       hexlab_cli archive extract <archive> --member <index> --output <path> [--replace]\n"
-               "       hexlab_cli archive open <archive> --member <index> --project <project.hxproj> [--replace]\n";
+               "       hexlab_cli archive open <archive> --member <index> --project <project.hxproj> [--replace]\n"
+               "Thin archive reads/link actions require --thin-root <directory>; member paths stay under that explicit root.\n";
         return 0;
     }
     try {
+        std::vector<std::wstring_view> archive_arguments{args[0],args[1]};
+        std::optional<std::filesystem::path> thin_root;
+        for(std::size_t i=2;i<args.size();++i){
+            if(args[i]!=L"--thin-root"){archive_arguments.push_back(args[i]);continue;}
+            if(thin_root||i+1==args.size())argument_error("archive --thin-root requires one explicit directory");
+            thin_root=std::filesystem::absolute(path_from_wide(args[++i]));
+            if(!std::filesystem::is_directory(*thin_root))argument_error("archive --thin-root is not a directory");
+        }
+        args=archive_arguments;
         const auto action = args[0];
         const auto archive_path = path_from_wide(args[1]);
         auto storage = take(FileStorage::open(archive_path));
         auto archive = take(read_ar_archive(*storage));
+        ArThinMemberResolver resolver;
+        if(thin_root){
+            resolver=take(make_ar_thin_member_resolver(*thin_root));
+        }
+        if(archive.thin&&action!=L"list"&&!resolver)
+            argument_error("Thin archive reads/link actions require --thin-root <directory>");
+        const auto open_member=[&](const ArMember& member){return open_ar_member(storage,member,resolver);};
         if (action == L"link-pe") {
             if (args.size() != 8 || args[2] != L"--root-object" || args[4] != L"--entry" || args[6] != L"--output")
                 argument_error("archive link-pe requires --root-object <COFF .obj> --entry <symbol> --output <PE .exe>");
@@ -905,8 +1900,8 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
             summaries.reserve(archive.members.size());
             for (std::size_t i = 0; i < archive.members.size(); ++i) {
                 const auto &member = archive.members[i];
-                if (member.kind != ArMemberKind::regular) continue;
-                auto member_storage = take(open_ar_member(storage, member));
+                if (member.kind != ArMemberKind::regular && member.kind != ArMemberKind::thin_external) continue;
+                auto member_storage = take(open_member(member));
                 if (member_storage->size() < 2) continue;
                 const auto prefix_size = static_cast<std::size_t>(std::min<std::uint64_t>(member_storage->size(), 8));
                 auto prefix = take(member_storage->read_at({0}, prefix_size));
@@ -921,7 +1916,7 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
                 throw std::runtime_error("Unresolved strong COFF symbol " + selected.unresolved_symbols.front());
             std::vector<std::shared_ptr<const ByteStorage>> objects{root_storage};
             for (const auto &item : selected.members)
-                objects.push_back(take(open_ar_member(storage, archive.members[item.member_index])));
+                objects.push_back(take(open_member(archive.members[item.member_index])));
             const auto linked = take(link_coff_executable(objects, wide_to_utf8(args[5])));
             write_archive_output(path_from_wide(args[7]), linked, false);
             out << "Linked PE32+ " << (root_machine == 0xaa64 ? "ARM64" : "AMD64") << ": objects=" << objects.size() << " bytes=" << linked.size()
@@ -937,8 +1932,8 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
             summaries.reserve(archive.members.size());
             for (std::size_t i = 0; i < archive.members.size(); ++i) {
                 const auto &member = archive.members[i];
-                if (member.kind != ArMemberKind::regular) continue;
-                auto member_storage = take(open_ar_member(storage, member));
+                if (member.kind != ArMemberKind::regular && member.kind != ArMemberKind::thin_external) continue;
+                auto member_storage = take(open_member(member));
                 if (take(detect_format(*member_storage)) != DetectedFormat::macho_candidate) continue;
                 summaries.push_back(take(summarize_macho_ar_member(*member_storage, i)));
             }
@@ -952,7 +1947,7 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
                 throw std::runtime_error("Unresolved strong Mach-O symbol " + selected.unresolved_symbols.front());
             std::vector<std::shared_ptr<const ByteStorage>> objects{root_storage};
             for (const auto &item : selected.members)
-                objects.push_back(take(open_ar_member(storage, archive.members[item.member_index])));
+                objects.push_back(take(open_member(archive.members[item.member_index])));
             const auto linked = take(link_macho64_executable(objects, entry_symbol));
             write_archive_output(path_from_wide(args[7]), linked, false);
             out << "Linked static Mach-O: objects=" << objects.size() << " bytes=" << linked.size()
@@ -969,13 +1964,154 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
                                args[6] != L"--output"))
                 argument_error("archive link-exec requires --root-object <ET_REL> --entry <symbol> --output <ET_EXEC>");
             auto root_storage = take(FileStorage::open(path_from_wide(args[3])));
+            const auto is_xcoff64 = [&](const ByteStorage &object) {
+                if (object.size() < 2) return false;
+                const auto prefix = take(object.read_at({0}, 2));
+                return prefix.bytes.size() == 2 && prefix.bytes[0] == std::byte{0x01} &&
+                    prefix.bytes[1] == std::byte{0xf7};
+            };
+            if ((action == L"link-select" || action == L"link-audit") && is_xcoff64(*root_storage)) {
+                const auto root = take(summarize_xcoff64_ar_member(*root_storage, 0));
+                std::vector<ArMemberSymbols> summaries;
+                summaries.reserve(archive.members.size());
+                for (std::size_t i = 0; i < archive.members.size(); ++i) {
+                    const auto &member = archive.members[i];
+                    if (member.kind != ArMemberKind::regular && member.kind != ArMemberKind::thin_external) continue;
+                    auto member_storage = take(open_member(member));
+                    if (!is_xcoff64(*member_storage)) continue;
+                    summaries.push_back(take(summarize_xcoff64_ar_member(*member_storage, i)));
+                }
+                std::vector<std::string_view> roots, definitions;
+                roots.reserve(root.undefined.size());
+                definitions.reserve(root.definitions.size());
+                for (const auto &name : root.undefined) roots.emplace_back(name);
+                for (const auto &name : root.definitions) definitions.emplace_back(name);
+                const auto selected = take(select_ar_members_fixed_point(archive, summaries, roots, definitions));
+                out << "Archive object format: XCOFF64 (selection and structural relocation audit)\n";
+                for (const auto &entry : selected.members) {
+                    out << "Selected: member=" << entry.member_index << " name="
+                        << safe_text(archive.members[entry.member_index].name) << " triggered-by=";
+                    for (std::size_t i = 0; i < entry.selected_for.size(); ++i) {
+                        if (i) out << ',';
+                        out << safe_text(entry.selected_for[i]);
+                    }
+                    out << '\n';
+                }
+                for (const auto &name : selected.unresolved_symbols)
+                    out << "Unresolved: " << safe_text(name) << '\n';
+                if (action == L"link-audit") {
+                    struct Object { std::string name; Xcoff64Object metadata; };
+                    std::vector<Object> objects;
+                    std::uint64_t total_bytes = 0, total_symbols = 0, total_relocations = 0, total_name_bytes = 0;
+                    const auto append = [&](std::string name, const ByteStorage &bytes) {
+                        constexpr std::uint64_t byte_limit = 256ULL * 1024 * 1024;
+                        if (objects.size() >= 4096 || bytes.size() > byte_limit - total_bytes)
+                            argument_error("XCOFF64 audit exceeds 4096 objects or 256 MiB aggregate input limit");
+                        total_bytes += bytes.size();
+                        auto metadata = take(inspect_xcoff64_object(bytes));
+                        for (const auto &symbol : metadata.symbols) {
+                            if (symbol.name.size() > byte_limit - total_name_bytes)
+                                argument_error("XCOFF64 audit exceeds 256 MiB aggregate decoded symbol name limit");
+                            total_name_bytes += symbol.name.size();
+                        }
+                        total_symbols += metadata.symbol_count;
+                        for (const auto &section : metadata.sections) total_relocations += section.relocation_count;
+                        if (total_symbols > 1'000'000 || total_relocations > 1'000'000)
+                            argument_error("XCOFF64 audit exceeds aggregate symbol or relocation limit");
+                        objects.push_back({std::move(name), std::move(metadata)});
+                    };
+                    append("<root>", *root_storage);
+                    for (const auto &entry : selected.members) {
+                        auto bytes = take(open_member(archive.members[entry.member_index]));
+                        append(archive.members[entry.member_index].name, *bytes);
+                    }
+                    // Only strong, concrete C_EXT definitions are unique providers.
+                    // Common and weak definitions require binder policy beyond this audit.
+                    std::map<std::string, std::vector<std::string>> providers;
+                    std::set<std::string> deferred_providers;
+                    for (const auto &object : objects)
+                        for (const auto &symbol : object.metadata.symbols) {
+                            if (symbol.storage_class == 2 && symbol.csect_type != 3 &&
+                                (symbol.section_number > 0 || symbol.section_number == -1) &&
+                                !symbol.name.empty())
+                                providers[symbol.name].push_back(object.name);
+                            if (!symbol.name.empty() && ((symbol.storage_class == 111 &&
+                                (symbol.section_number > 0 || symbol.section_number == -1)) ||
+                                (symbol.storage_class == 2 && (symbol.csect_type == 3 ||
+                                 (symbol.section_number == 0 && symbol.value != 0)))))
+                                deferred_providers.insert(symbol.name);
+                        }
+                    for (const auto &[name, candidates] : providers)
+                        if (candidates.size() > 1)
+                            out << "Conflicting strong definitions: symbol=" << safe_text(name)
+                                << " providers=" << candidates.size() << '\n';
+                    std::size_t unknown = 0, unresolved = 0, ambiguous = 0, deferred = 0, loader_rows = 0;
+                    for (const auto &object : objects) {
+                        if (object.metadata.file_flags & 0x0001u)
+                            out << "Relocation information stripped: object=" << safe_text(object.name)
+                                << " flag=F_RELFLG completeness=unknown\n";
+                        for (const auto &section : object.metadata.sections) {
+                            if (section.loader_relocation_encoding) {
+                                loader_rows += section.relocation_count;
+                                out << "Unsupported loader section: object=" << safe_text(object.name)
+                                    << " section=" << section.index << " relocation-count=" << section.relocation_count
+                                    << " encoding=loader16 decoded=false\n";
+                            }
+                            for (const auto &relocation : section.relocations) {
+                                const auto symbol = std::lower_bound(object.metadata.symbols.begin(), object.metadata.symbols.end(),
+                                    relocation.symbol_index, [](const auto &row, auto index) { return row.index < index; });
+                                const auto type_name = xcoff64_relocation_type_name(relocation.type);
+                                const bool recognized = type_name != "unknown";
+                                if (!recognized) ++unknown;
+                                out << (recognized ? "Relocation: " : "Unsupported relocation: ")
+                                    << "object=" << safe_text(object.name) << " section=" << section.index
+                                    << " address=" << hex(relocation.virtual_address)
+                                    << " record-offset=" << hex(relocation.file_offset) << " type=" << unsigned(relocation.type)
+                                    << " name=" << type_name << " bits=" << ((relocation.size_info & 0x3fu) + 1)
+                                    << " signed=" << ((relocation.size_info & 0x80u) ? "true" : "false")
+                                    << " instruction-modified=" << ((relocation.size_info & 0x40u) ? "true" : "false")
+                                    << " symbol-index=" << relocation.symbol_index << " symbol=" << safe_text(symbol->name)
+                                    << " symbol-section=" << symbol->section_number << " symbol-value=" << hex(symbol->value)
+                                    << " symbol-class=" << unsigned(symbol->storage_class);
+                                if (symbol->csect_type != 0xff)
+                                    out << " csect-type=" << unsigned(symbol->csect_type)
+                                        << " storage-mapping-class=" << unsigned(symbol->storage_mapping_class);
+                                if ((symbol->storage_class == 2 || symbol->storage_class == 107 || symbol->storage_class == 111 ||
+                                     symbol->storage_class == 3) && symbol->csect_type != 3 &&
+                                    (symbol->section_number > 0 || symbol->section_number == -1)) {
+                                    out << " resolution=object-definition provider=" << safe_text(object.name);
+                                } else if (symbol->storage_class == 2 && symbol->section_number == 0 && symbol->value == 0 &&
+                                           !symbol->name.empty()) {
+                                    const auto found = providers.find(symbol->name);
+                                    if (found == providers.end() && deferred_providers.contains(symbol->name)) {
+                                        ++deferred; out << " resolution=deferred-common-or-weak-provider";
+                                    }
+                                    else if (found == providers.end()) { ++unresolved; out << " resolution=unresolved-strong"; }
+                                    else if (found->second.size() != 1) { ++ambiguous; out << " resolution=ambiguous-strong providers=" << found->second.size(); }
+                                    else out << " resolution=unique-strong-provider provider=" << safe_text(found->second.front());
+                                } else { ++deferred; out << " resolution=deferred-common-weak-or-special"; }
+                                out << " applied=false\n";
+                            }
+                        }
+                    }
+                    out << "Link audit: objects=" << objects.size() << " relocations=" << total_relocations
+                        << " unresolved-strong-relocations=" << unresolved << " ambiguous-strong-relocations=" << ambiguous
+                        << " deferred-symbol-relocations=" << deferred << " unsupported-relocations=" << unknown
+                        << " undecoded-loader-relocations=" << loader_rows
+                        << " applied=0 output=none link-readiness=not-established\n";
+                }
+                out << "XCOFF64 link output is unsupported; no output was written.\n";
+                return 0;
+            }
+            if (is_xcoff64(*root_storage))
+                argument_error("XCOFF64 archive link output is unsupported; use link-select or link-audit");
             const auto root = take(summarize_elf_ar_member(*root_storage, 0));
             std::vector<ArMemberSymbols> summaries;
             summaries.reserve(archive.members.size());
             for (std::size_t i = 0; i < archive.members.size(); ++i) {
                 const auto &member = archive.members[i];
-                if (member.kind != ArMemberKind::regular) continue;
-                auto member_storage = take(open_ar_member(storage, member));
+                if (member.kind != ArMemberKind::regular && member.kind != ArMemberKind::thin_external) continue;
+                auto member_storage = take(open_member(member));
                 auto detected = take(detect_format(*member_storage));
                 if (detected != DetectedFormat::elf_candidate) continue;
                 summaries.push_back(take(summarize_elf_ar_member(*member_storage, i)));
@@ -993,7 +2129,7 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
                 objects.reserve(selected.members.size() + 1);
                 objects.push_back(root_storage);
                 for (const auto &entry : selected.members)
-                    objects.push_back(take(open_ar_member(storage, archive.members[entry.member_index])));
+                    objects.push_back(take(open_member(archive.members[entry.member_index])));
                 const auto root_elf = take(read_elf_header(*root_storage, {}));
                 const bool aarch64 = root_elf.machine == 183;
                 const auto linked = !executable && !root_elf.is_64 && root_elf.machine == 3
@@ -1025,7 +2161,7 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
                 std::vector<Object> objects;
                 objects.push_back({"<root>", root_storage, take(load_elf(root_storage, {}))});
                 for (const auto &entry : selected.members) {
-                    auto bytes = take(open_ar_member(storage, archive.members[entry.member_index]));
+                    auto bytes = take(open_member(archive.members[entry.member_index]));
                     objects.push_back({archive.members[entry.member_index].name, bytes, take(load_elf(bytes, {}))});
                 }
                 std::map<std::string, std::string> providers;
@@ -1075,13 +2211,24 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
         }
         if (action == L"list") {
             if (args.size() != 2) argument_error("archive list takes one path");
+            out << "Archive format: " << (archive.thin ? (resolver ? "GNU thin ar (external members resolved on request)" : "GNU thin ar (external member contents not resolved)")
+                                                       : archive.aix_big ? "AIX big ar" : "ar") << '\n';
             for (std::size_t i = 0; i < archive.members.size(); ++i) {
                 const auto &member = archive.members[i];
                 out << "Member: " << i << " name=" << safe_text(member.name) << " size=" << member.size
                     << " timestamp=" << member.timestamp << " uid=" << member.uid << " gid=" << member.gid
                     << " mode=0" << std::oct << member.mode << std::dec
                     << " kind=" << (member.kind == ArMemberKind::regular ? "regular"
-                                    : member.kind == ArMemberKind::symbol_index ? "symbol-index" : "long-name-table") << '\n';
+                                    : member.kind == ArMemberKind::thin_external ? "thin-external"
+                                    : member.kind == ArMemberKind::symbol_index ? "symbol-index"
+                                    : member.kind == ArMemberKind::member_table ? "member-table" : "long-name-table") << '\n';
+                if (member.kind == ArMemberKind::thin_external && resolver) {
+                    auto member_storage = take(open_member(member));
+                    const auto digest = take(hash_source(*member_storage, {}));
+                    out << "Thin provenance: member=" << i << " declared-path=" << safe_text(member.name)
+                        << " resolved-by=--thin-root bytes=" << member_storage->size()
+                        << " sha256=" << digest_hex(digest) << '\n';
+                }
             }
             for (const auto &symbol : archive.symbols) {
                 const auto &member = archive.members[symbol.member_index];
@@ -1114,21 +2261,16 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
             argument_error("archive extract requires --output and does not accept --project");
         if (*selected >= archive.members.size()) argument_error("Archive member index is out of range");
         const auto &member = archive.members[static_cast<std::size_t>(*selected)];
-        if (member.kind != ArMemberKind::regular) argument_error("Selected archive member is not a regular file");
-        auto bytes = take(extract_ar_member(*storage, member));
+        if (member.kind != ArMemberKind::regular && member.kind != ArMemberKind::thin_external)
+            argument_error("Selected archive member is not a regular file");
         if (action == L"extract") {
+            auto bytes = take(extract_ar_member(storage, member, resolver));
             write_archive_output(output_path, bytes, replace);
             out << "Extracted archive member " << *selected << " (" << safe_text(member.name) << ")\nOutput: "
                 << path_text(output_path) << '\n';
             return 0;
         }
-        const auto temporary = reserve_temporary_file();
-        struct TempFile { std::filesystem::path path; ~TempFile() { std::error_code ec; std::filesystem::remove(path, ec); } } cleanup{temporary};
-        {
-            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-            if (!file || (!bytes.empty() && !file.write(reinterpret_cast<const char *>(bytes.data()), std::streamsize(bytes.size()))))
-                throw std::runtime_error("Cannot stage selected archive member");
-        }
+        auto member_storage=take(open_member(member));
         auto pool = std::make_shared<AnalysisPool>();
         auto actor = take(ProjectActor::create({{1}, 1}, pool));
         auto reply = [&](Result<ProjectSubmission> submitted) {
@@ -1136,7 +2278,9 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
             return take(operation.result.get());
         };
         struct Close { std::shared_ptr<ProjectActor> actor; ~Close() { auto closing=actor->close(); if(closing) closing.value().result.wait(); } } close{actor};
-        OpenRequest request; request.path = temporary; request.run_analysis = false;
+        OpenRequest request; request.path = archive_path; request.input_storage=std::move(member_storage);
+        request.source_path=path_from_wide(utf8_to_wide(path_text(archive_path)+"!"+member.name));
+        request.run_analysis = false;
         reply(actor->import_binary(std::move(request)));
         auto saved = reply(actor->save_as(project_path, replace ? database::ReplacePolicy::replace_existing
                                                                : database::ReplacePolicy::fail_if_exists));
@@ -1150,20 +2294,84 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
     } catch (const ArgumentError &error) { err << error.message << '\n'; return 2; }
       catch (const std::exception &error) { err << "Archive: " << error.what() << '\n'; return 1; }
 }
+namespace {
+std::vector<std::filesystem::path> discover_jar_volumes(const std::filesystem::path &input) {
+    auto extension = input.extension().wstring();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](wchar_t ch) { return std::towlower(ch); });
+    std::wstring base;
+    if (extension == L".zip") base = input.stem().wstring();
+    else if (extension.size() >= 3 && extension[0] == L'.' && extension[1] == L'z' &&
+             std::all_of(extension.begin() + 2, extension.end(), [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; }))
+        base = input.stem().wstring();
+    else return {input};
+
+    auto parent = input.parent_path();
+    std::vector<std::filesystem::path> volumes;
+    std::uint32_t missing_at = 0;
+    for (std::uint32_t index = 1; index <= 65536; ++index) {
+        std::wstring suffix = std::to_wstring(index);
+        if (suffix.size() < 2) suffix.insert(suffix.begin(), 2 - suffix.size(), L'0');
+        auto candidate = parent / (base + L".z" + suffix);
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(candidate, error)) { missing_at = index; break; }
+        volumes.push_back(std::move(candidate));
+    }
+    if (missing_at != 0) {
+        for (std::uint32_t index = missing_at + 1; index <= 65536; ++index) {
+            std::wstring suffix = std::to_wstring(index);
+            if (suffix.size() < 2) suffix.insert(suffix.begin(), 2 - suffix.size(), L'0');
+            std::error_code error;
+            if (std::filesystem::exists(parent / (base + L".z" + suffix), error))
+                argument_error("Split JAR volumes must be contiguous starting at .z01");
+        }
+    }
+    auto terminal = parent / (base + L".zip");
+    std::error_code error;
+    if (std::filesystem::is_regular_file(terminal, error)) volumes.push_back(std::move(terminal));
+    if (volumes.empty()) return {input};
+    return volumes;
+}
+}
 int jar_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
     using project_detail::Failure;
     using project_detail::take;
     if (args.size() < 2 || (args.size() == 2 && args[1] == L"--help")) {
         out << "Usage: hexlab_cli jar list <package.jar>\n"
-               "       hexlab_cli jar inspect <package.jar> --member <index>\n";
+               "       hexlab_cli jar inspect <package.jar> --member <index>\n"
+               "       hexlab_cli jar list --volume <path> --volume <path> ...\n"
+               "       hexlab_cli jar inspect --volume <path> --volume <path> ... --member <index>\n";
         return 0;
     }
     try {
         const auto action = args[0];
-        auto storage = take(FileStorage::open(path_from_wide(args[1])));
-        auto archive = take(read_jar_archive(*storage));
+        std::optional<std::filesystem::path> input_path;
+        std::vector<std::filesystem::path> explicit_volumes;
+        std::optional<std::wstring_view> member_argument;
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            if (args[i] == L"--volume") {
+                if (++i >= args.size()) argument_error("--volume requires a path");
+                explicit_volumes.push_back(path_from_wide(args[i]));
+            } else if (args[i] == L"--member") {
+                if (++i >= args.size()) argument_error("--member requires an index");
+                member_argument = args[i];
+            } else if (!input_path) input_path = path_from_wide(args[i]);
+            else argument_error("Unexpected JAR argument");
+        }
+        const bool explicit_volume_mode = !explicit_volumes.empty();
+        auto volume_paths = !explicit_volume_mode
+            ? (input_path ? discover_jar_volumes(*input_path) : std::vector<std::filesystem::path>{})
+            : std::move(explicit_volumes);
+        if (explicit_volume_mode && input_path)
+            argument_error("Use either a package path or ordered --volume paths, not both");
+        if (volume_paths.empty()) argument_error("JAR command requires a package path or one or more --volume paths");
+        if (volume_paths.size() > 65536) argument_error("JAR volume count exceeds 65,536");
+        std::vector<std::shared_ptr<const ByteStorage>> storages;
+        storages.reserve(volume_paths.size());
+        for (const auto &path : volume_paths) storages.push_back(take(FileStorage::open(path)));
+        auto archive = take(read_jar_archive(storages));
         if (action == L"list") {
-            if (args.size() != 2) argument_error("jar list accepts one package path");
+            if (member_argument || (!explicit_volume_mode && (!input_path || args.size() != 2)))
+                argument_error("jar list accepts a package path or ordered --volume paths");
             out << "JAR members: " << archive.members.size() << '\n';
             for (std::size_t i = 0; i < archive.members.size(); ++i) {
                 const auto &member = archive.members[i];
@@ -1179,9 +2387,9 @@ int jar_command(std::span<const std::wstring_view> args, std::ostream &out, std:
             }
             return 0;
         }
-        if (action != L"inspect" || args.size() != 4 || args[2] != L"--member")
+        if (action != L"inspect" || !member_argument)
             argument_error("jar inspect requires --member <index>");
-        auto parsed = parse_address(args[3]);
+        auto parsed = parse_address(*member_argument);
         if (!parsed) argument_error(parsed.error().message);
         if (parsed.value() > (std::numeric_limits<std::size_t>::max)())
             argument_error("JAR member index is too large");
@@ -1197,6 +2405,299 @@ int jar_command(std::span<const std::wstring_view> args, std::ostream &out, std:
     } catch (const ArgumentError &error) { err << error.message << '\n'; return 2; }
       catch (const std::exception &error) { err << "JAR: " << error.what() << '\n'; return 1; }
 }
+
+int jvm_module_path_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
+    using project_detail::Failure;
+    using project_detail::take;
+    if (args.empty() || (args.size() == 1 && args[0] == L"--help")) {
+        out << "Usage: hexlab_cli jvm module-path [--release <feature>] [--module-path <dir-or-jar>]... [--class-path <dir-or-jar>]...\n"
+               "       hexlab_cli jvm module-path [roots...] [--root-module <name>]... [--lookup-class <binary-name>]\n"
+               "Roots are processed in option order; manifest Class-Path references use only supplied roots.\n";
+        return 0;
+    }
+    try {
+        if (args[0] != L"module-path") argument_error("Expected jvm module-path");
+        std::vector<JvmPathRoot> roots;
+        std::vector<std::string> lookup_classes;
+        std::vector<std::string> configuration_roots;
+        std::optional<std::uint16_t> target_release;
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            if (args[i] == L"--release") {
+                if (target_release || ++i >= args.size()) argument_error("--release requires one Java feature version");
+                std::string digits;
+                for (const wchar_t c : args[i]) {
+                    if (c < L'0' || c > L'9') argument_error("--release requires a decimal Java feature version");
+                    digits.push_back(static_cast<char>(c));
+                }
+                unsigned value = 0;
+                const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), value);
+                if (error != std::errc{} || end != digits.data() + digits.size() || value < 9 || value > UINT16_MAX)
+                    argument_error("--release must be a decimal Java feature version from 9 through 65535");
+                target_release = static_cast<std::uint16_t>(value);
+                continue;
+            }
+            if (args[i] == L"--lookup-class") {
+                if (++i >= args.size()) argument_error("--lookup-class requires a binary class name");
+                if (lookup_classes.size() >= 64) argument_error("At most 64 --lookup-class queries are accepted");
+                lookup_classes.push_back(wide_to_utf8(args[i]));
+                continue;
+            }
+            if (args[i] == L"--root-module") {
+                if (++i >= args.size()) argument_error("--root-module requires a module name");
+                if (configuration_roots.size() >= 256) argument_error("At most 256 --root-module names are accepted");
+                configuration_roots.push_back(wide_to_utf8(args[i]));
+                continue;
+            }
+            JvmPathRootKind kind;
+            if (args[i] == L"--module-path") kind = JvmPathRootKind::module_path;
+            else if (args[i] == L"--class-path") kind = JvmPathRootKind::class_path;
+            else argument_error("Expected --module-path or --class-path followed by a directory or JAR");
+            if (++i >= args.size()) argument_error("JVM path option requires a directory or archive path");
+            roots.push_back({path_from_wide(args[i]), kind});
+        }
+        if (roots.empty()) argument_error("jvm module-path requires at least one ordered root");
+        JvmModulePathLimits limits;
+        limits.target_release = target_release;
+        auto workspace = take(link_jvm_path_workspace(roots, {}, limits));
+        std::optional<JvmModuleConfiguration> configuration;
+        if (!configuration_roots.empty()) {
+            std::vector<std::string_view> names;
+            names.reserve(configuration_roots.size());
+            for (const auto &name : configuration_roots) names.push_back(name);
+            configuration = take(resolve_jvm_module_configuration(workspace, names));
+        }
+        const auto status = [](JvmModuleLinkStatus value) -> std::string_view {
+            switch (value) {
+            case JvmModuleLinkStatus::resolved: return "resolved";
+            case JvmModuleLinkStatus::missing: return "missing";
+            case JvmModuleLinkStatus::missing_optional: return "missing-optional";
+            case JvmModuleLinkStatus::duplicate_definition: return "duplicate-definition";
+            case JvmModuleLinkStatus::unresolved_ownership: return "unresolved-ownership";
+            case JvmModuleLinkStatus::ambiguous_ownership: return "ambiguous-ownership";
+            }
+            return "unknown";
+        };
+        const auto bounded_rows = [&](std::string_view label, const auto &rows, std::size_t cap, const auto &print) {
+            const auto count = std::min<std::size_t>(rows.size(), cap);
+            for (std::size_t i = 0; i < count; ++i) print(i, rows[i]);
+            if (rows.size() > count) out << "  ... " << rows.size() - count << " more " << label << " rows omitted\n";
+        };
+        const auto &graph = workspace.graph;
+        out << "JVM module-path workspace: roots=" << workspace.roots.size()
+            << " modules=" << graph.module_graph.modules.size() << " edges=" << graph.module_graph.edges.size()
+            << " classes=" << graph.class_ownership.size() << " packages=" << graph.packages.size()
+            << " services=" << graph.services.size() << " readability=" << graph.module_graph.readability.size()
+            << " requires-cycles=" << graph.module_graph.requires_cycles.size()
+            << " class-path-definitions=" << workspace.class_path_classes.size();
+        if (target_release) out << " target-release=" << *target_release;
+        out << " versioned-classes=" << workspace.versioned_classes.size() << '\n';
+        const auto nest_kind = [](JvmNestRelationKind value) -> std::string_view {
+            return value == JvmNestRelationKind::member_declares_host ? "member-host" : "host-member";
+        };
+        const auto nest_status = [](JvmNestRelationStatus value) -> std::string_view {
+            switch (value) {
+            case JvmNestRelationStatus::resolved: return "resolved";
+            case JvmNestRelationStatus::missing: return "missing";
+            case JvmNestRelationStatus::ambiguous: return "ambiguous";
+            case JvmNestRelationStatus::not_reciprocal: return "not-reciprocal";
+            case JvmNestRelationStatus::cross_package: return "cross-package";
+            }
+            return "unknown";
+        };
+        out << "Nest metadata relations: " << workspace.nest_relations.size() << '\n';
+        bounded_rows("nest relation", workspace.nest_relations, 256,
+            [&](std::size_t, const JvmNestRelation &row) {
+                out << "  " << nest_kind(row.kind) << " " << safe_text(row.source_class)
+                    << " -> " << safe_text(row.target_class) << " status=" << nest_status(row.status)
+                    << " source=class[" << row.source_metadata_index << "]+0x"
+                    << std::hex << row.source_file_offset.value << std::dec;
+                if (row.target_metadata_index) out << " target=class[" << *row.target_metadata_index << "]";
+                out << '\n';
+            });
+        const auto permitted_status = [](JvmPermittedClassStatus value) -> std::string_view {
+            switch (value) {
+            case JvmPermittedClassStatus::resolved: return "resolved";
+            case JvmPermittedClassStatus::missing: return "missing";
+            case JvmPermittedClassStatus::ambiguous: return "ambiguous";
+            case JvmPermittedClassStatus::not_direct_subtype: return "not-direct-subtype";
+            }
+            return "unknown";
+        };
+        out << "Permitted subclass links: " << graph.permitted_classes.size() << '\n';
+        bounded_rows("permitted subclass", graph.permitted_classes, 256,
+            [&](std::size_t, const JvmPermittedClassLink &row) {
+                out << "  " << safe_text(row.source_class) << " permits " << safe_text(row.target_class)
+                    << " status=" << permitted_status(row.status)
+                    << " source=class[" << row.source_metadata_index << "]+0x"
+                    << std::hex << row.source_file_offset.value << std::dec;
+                if (row.target_metadata_index) out << " target=class[" << *row.target_metadata_index << "]";
+                out << '\n';
+            });
+        if (configuration) {
+            out << "Module configuration: complete=" << (configuration->complete ? "true" : "false")
+                << " roots=" << configuration->roots.size() << " resolved-modules="
+                << configuration->resolved_modules.size() << " unresolved-required="
+                << configuration->unresolved_required_edges.size() << " omitted-optional="
+                << configuration->omitted_optional_edges.size() << '\n';
+            for (std::size_t i = 0; i < configuration->roots.size(); ++i) {
+                const auto &root = configuration->roots[i];
+                out << "  Module root: name=" << safe_text(root.name) << " status=" << status(root.status);
+                if (root.module_definition) out << " definition=" << *root.module_definition;
+                out << '\n';
+            }
+            for (std::size_t i = 0; i < configuration->resolved_modules.size(); ++i) {
+                const auto index = configuration->resolved_modules[i];
+                out << "  Resolved module[" << i << "]: definition=" << index
+                    << " name=" << safe_text(graph.module_graph.modules[index].name) << '\n';
+            }
+            for (const auto edge_index : configuration->unresolved_required_edges)
+                out << "  Unresolved required edge: " << edge_index << '\n';
+            for (const auto edge_index : configuration->omitted_optional_edges)
+                out << "  Omitted requires-static edge: " << edge_index << '\n';
+        }
+        out << "Roots:\n";
+        bounded_rows("root", workspace.roots, 256, [&](std::size_t i, const JvmPathRootResult &row) {
+            out << "  [" << i << "] " << (row.kind == JvmPathRootKind::module_path ? "module-path" : "class-path")
+                << " status=" << (row.status == JvmPathRootStatus::linked ? "linked" : "missing-module-descriptor")
+                << " files=" << row.files << " classes=" << row.classes;
+            if (target_release) out << " multi-release=" << (row.multi_release_active ? "enabled" : "inactive")
+                                    << " selected-overlays=" << row.selected_versioned_classes;
+            if (row.module_name) out << " module=" << safe_text(*row.module_name);
+            out << " path=" << safe_text(path_text(row.path)) << '\n';
+        });
+        out << "Effective class-path search order (manifest entries follow their declaring JAR):\n";
+        bounded_rows("class-path order", workspace.class_path_search_order, 256,
+            [&](std::size_t position, std::size_t root_index) {
+                out << "  [" << position << "] root=" << root_index;
+                if (root_index < workspace.roots.size()) out << " path=" << safe_text(path_text(workspace.roots[root_index].path));
+                out << '\n';
+            });
+        const auto class_path_status = [](JvmClassPathReferenceStatus value) -> std::string_view {
+            switch (value) {
+            case JvmClassPathReferenceStatus::resolved: return "resolved";
+            case JvmClassPathReferenceStatus::not_supplied: return "not-supplied";
+            case JvmClassPathReferenceStatus::ambiguous: return "ambiguous";
+            case JvmClassPathReferenceStatus::malformed_uri: return "malformed-uri";
+            case JvmClassPathReferenceStatus::unsupported_uri: return "unsupported-uri";
+            case JvmClassPathReferenceStatus::cycle: return "cycle";
+            }
+            return "unknown";
+        };
+        out << "Manifest Class-Path references (only caller-supplied roots are resolved):\n";
+        bounded_rows("manifest Class-Path", workspace.class_path_references, 256,
+            [&](std::size_t, const JvmClassPathReference &row) {
+                out << "  source-root=" << row.declaring_root_index << " uri=" << safe_text(row.uri)
+                    << " status=" << class_path_status(row.status);
+                if (row.target_root_index) out << " target-root=" << *row.target_root_index;
+                out << '\n';
+            });
+        out << "Selected versioned classes:\n";
+        bounded_rows("versioned class", workspace.versioned_classes, 128,
+            [&](std::size_t, const JvmPathVersionedClassSelection &row) {
+                out << "  root=" << row.root_index << " release=" << row.release
+                    << " logical=" << safe_text(row.logical_path) << " archive-entry=" << safe_text(row.archive_path)
+                    << " data-file=0x" << std::hex << row.data_file_offset << std::dec
+                    << " bytes=" << row.uncompressed_size << '\n';
+            });
+        out << "Modules:\n";
+        bounded_rows("module", graph.module_graph.modules, 256, [&](std::size_t i, const JvmModuleLinkNode &row) {
+            out << "  [" << i << "] " << safe_text(row.name) << (row.duplicate_definition ? " duplicate-definition" : "") << '\n';
+        });
+        out << "Module edges:\n";
+        bounded_rows("edge", graph.module_graph.edges, 256, [&](std::size_t, const JvmModuleLinkEdge &row) {
+            out << "  source=" << row.source_definition << " target=" << safe_text(row.target_name)
+                << " kind=" << (row.kind == JvmModuleLinkEdgeKind::requires_module ? "requires" :
+                    row.kind == JvmModuleLinkEdgeKind::qualified_export ? "qualified-export" : "qualified-open")
+                << " status=" << status(row.status);
+            if (row.kind == JvmModuleLinkEdgeKind::requires_module && row.transitive) out << " transitive=true";
+            out << '\n';
+        });
+        out << "Module readability (descriptor-derived; self edges omitted):\n";
+        bounded_rows("readability", graph.module_graph.readability, 512,
+            [&](std::size_t, const JvmModuleReadability &row) {
+                const std::string_view source = row.source_definition < graph.module_graph.modules.size()
+                    ? std::string_view(graph.module_graph.modules[row.source_definition].name) : "<invalid-index>";
+                const std::string_view target = row.target_definition < graph.module_graph.modules.size()
+                    ? std::string_view(graph.module_graph.modules[row.target_definition].name) : "<invalid-index>";
+                out << "  " << safe_text(source) << " reads " << safe_text(target)
+                    << (row.direct ? " direct" : " via-transitive-requires") << '\n';
+            });
+        out << "Class ownership:\n";
+        bounded_rows("class", graph.class_ownership, 128, [&](std::size_t, const JvmModuleClassOwnership &row) {
+            out << "  " << safe_text(row.class_name) << " module=" << safe_text(row.module_name)
+                << " status=" << status(row.status) << '\n';
+        });
+        out << "Packages:\n";
+        bounded_rows("package", graph.packages, 128, [&](std::size_t, const JvmPackageOwnership &row) {
+            out << "  " << (row.package_name.empty() ? "<default>" : safe_text(row.package_name))
+                << " owners=";
+            const auto owner_count = std::min<std::size_t>(row.module_definitions.size(), 8);
+            for (std::size_t i = 0; i < owner_count; ++i) {
+                if (i) out << ',';
+                const auto definition = row.module_definitions[i];
+                if (definition < graph.module_graph.modules.size()) out << safe_text(graph.module_graph.modules[definition].name);
+                else out << "<invalid-index>";
+            }
+            if (row.module_definitions.size() > owner_count) out << ",...+" << row.module_definitions.size() - owner_count;
+            out << (row.split_package ? " split" : "") << '\n';
+        });
+        out << "Services:\n";
+        bounded_rows("service", graph.services, 256, [&](std::size_t, const JvmServiceLink &row) {
+            const auto kind = row.kind == JvmServiceLinkKind::uses_service ? "uses" :
+                row.kind == JvmServiceLinkKind::provides_service ? "provides" : "provider";
+            out << "  source=" << row.source_definition << " kind=" << kind << " class=" << safe_text(row.class_name)
+                << " status=" << status(row.status) << '\n';
+        });
+        out << "Requires cycles:\n";
+        bounded_rows("cycle", graph.module_graph.requires_cycles, 64, [&](std::size_t, const std::vector<std::string> &cycle) {
+            out << "  ";
+            for (std::size_t i = 0; i < cycle.size(); ++i) out << (i ? " -> " : "") << safe_text(cycle[i]);
+            out << '\n';
+        });
+        if (workspace.unnamed_classpath_module) out << "Unnamed classpath module index: " << *workspace.unnamed_classpath_module << '\n';
+        for (const auto &requested : lookup_classes) {
+            const auto lookup = take(resolve_jvm_class_path_class(workspace, requested));
+            const auto lookup_status = lookup.status == JvmClassPathLookupStatus::resolved ? "resolved" :
+                lookup.status == JvmClassPathLookupStatus::class_name_mismatch ? "class-name-mismatch" : "not-found";
+            out << "Class-path lookup " << safe_text(lookup.requested_binary_name) << ": " << lookup_status;
+            if (lookup.selected_definition) {
+                const auto index = *lookup.selected_definition;
+                if (index >= workspace.class_path_classes.size())
+                    throw Failure{{ErrorCode::invalid_argument, "JVM class-path lookup returned an invalid definition index"}};
+                const auto &definition = workspace.class_path_classes[index];
+                out << " definition=" << index << " root=" << definition.root_index
+                    << " class=" << safe_text(definition.class_name)
+                    << " resource=" << safe_text(definition.resource_path);
+                if (definition.root_index < workspace.roots.size())
+                    out << " root-path=" << safe_text(path_text(workspace.roots[definition.root_index].path));
+                if (definition.archive_path)
+                    out << " archive-entry=" << safe_text(*definition.archive_path)
+                        << " data-file=0x" << std::hex << definition.data_file_offset << std::dec
+                        << " bytes=" << definition.uncompressed_size;
+                if (lookup.module_definition && *lookup.module_definition < graph.module_graph.modules.size())
+                    out << " module=" << safe_text(graph.module_graph.modules[*lookup.module_definition].name);
+                out << " shadowed=" << lookup.shadowed_definitions.size();
+                const auto shadow_preview = std::min<std::size_t>(lookup.shadowed_definitions.size(), 16);
+                for (std::size_t i = 0; i < shadow_preview; ++i) {
+                    const auto shadow = lookup.shadowed_definitions[i];
+                    if (shadow < workspace.class_path_classes.size())
+                        out << (i ? "," : " shadowed-definitions=") << shadow
+                            << "@root" << workspace.class_path_classes[shadow].root_index;
+                }
+                if (lookup.shadowed_definitions.size() > shadow_preview)
+                    out << " shadowed-omitted=" << lookup.shadowed_definitions.size() - shadow_preview;
+            }
+            out << '\n';
+        }
+        out << "Note: Class-Path order resolves only explicitly supplied local roots; runtime JPMS resolution and access enforcement are not performed.\n";
+        return 0;
+    } catch (const Failure &failure) {
+        err << "JVM module path: " << failure.error.message << '\n';
+        return failure.error.code == ErrorCode::invalid_argument ? 2 : 1;
+    } catch (const ArgumentError &error) { err << error.message << '\n'; return 2; }
+      catch (const std::exception &error) { err << "JVM module path: " << error.what() << '\n'; return 1; }
+}
+
 template <class T> void option(std::optional<T> &destination, T value) {
     if (destination && *destination != value)
         argument_error("Option has conflicting duplicate values");
@@ -1231,11 +2732,33 @@ std::string_view string_encoding_label(StringEncoding encoding) {
     case StringEncoding::dos850: return "DOS-850";
     case StringEncoding::iso8859_15: return "ISO-8859-15";
     case StringEncoding::iso8859_9: return "ISO-8859-9";
+    case StringEncoding::dos866: return "DOS-866";
+    case StringEncoding::dos852: return "DOS-852";
+    case StringEncoding::koi8_r: return "KOI8-R";
+    case StringEncoding::koi8_u: return "KOI8-U";
+    case StringEncoding::mac_roman: return "Mac Roman";
+    case StringEncoding::iso8859_1: return "ISO-8859-1";
+    case StringEncoding::iso8859_3: return "ISO-8859-3";
+    case StringEncoding::iso8859_4: return "ISO-8859-4";
+    case StringEncoding::iso8859_6: return "ISO-8859-6";
+    case StringEncoding::iso8859_7: return "ISO-8859-7";
+    case StringEncoding::iso8859_10: return "ISO-8859-10";
+    case StringEncoding::iso8859_13: return "ISO-8859-13";
+    case StringEncoding::iso8859_14: return "ISO-8859-14";
+    case StringEncoding::iso8859_16: return "ISO-8859-16";
+    case StringEncoding::iso8859_8: return "ISO-8859-8";
+    case StringEncoding::iso8859_11: return "ISO-8859-11";
+    case StringEncoding::windows874: return "Windows-874";
+    case StringEncoding::mac_cyrillic: return "Mac Cyrillic";
+    case StringEncoding::ebcdic_cp037: return "EBCDIC CP037";
+    case StringEncoding::ebcdic_cp500: return "EBCDIC CP500";
+    case StringEncoding::ebcdic_cp1047: return "EBCDIC CP1047";
+    case StringEncoding::windows932: return "Windows-932";
     }
     return "unknown";
 }
 OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
-                  std::vector<std::filesystem::path>& plugin_paths, bool &show_strings) {
+                  std::vector<std::filesystem::path>& plugin_paths, bool &show_strings, bool &json_output) {
     OpenRequest request;
     request.run_analysis = disassemble;
     std::optional<Format> format;
@@ -1256,6 +2779,10 @@ OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
         }
         if (!end_options && item == L"--show-strings") {
             show_strings = true;
+            continue;
+        }
+        if (!end_options && item == L"--json") {
+            json_output = true;
             continue;
         }
         if (!end_options && item.starts_with(L"--")) {
@@ -1383,7 +2910,7 @@ OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
         argument_error("Raw profile/architecture/base/entry options require --format raw");
     if (pe_runtime_architecture && request.format != Format::pe && request.format != Format::automatic)
         argument_error("--pe-runtime requires --format pe or auto");
-    if (!disassemble && (instructions || strings || minimum || show_strings))
+    if (!disassemble && (instructions || strings || minimum || show_strings || json_output))
         argument_error("Analysis options require disassemble");
     if (minimum && *minimum == 0)
         argument_error("Minimum string length must be positive");
@@ -1459,11 +2986,266 @@ void metadata(std::ostream &out, const DocumentSnapshot &document) {
     out << "Metadata: " << (document.metadata_complete ? "complete" : "partial") << '\n';
     elf_description(out, m, document.image.get());
     macho_description(out, m, document.image.get());
-    pe_description(out, m);
+    pe_description(out, m, document.image.get());
     jvm_description(out, m);
     wasm_description(out, m);
     dex_description(out, m);
     minidump_description(out, m);
+}
+
+int dex_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
+    if (!args.empty() && args[0] == L"vdex") {
+        if (args.size() < 2 || args.size() > 3 || (args.size() == 3 && args[2] != L"--json")) {
+            err << "Usage: hexlab_cli dex vdex <path> [--json]\n";
+            return 2;
+        }
+        auto storage = FileStorage::open(path_from_wide(args[1]));
+        if (!storage) { err << storage.error().message << '\n'; return 2; }
+        auto inventory = inspect_android_vdex_027(*storage.value());
+        if (!inventory) { err << inventory.error().message << '\n'; return 2; }
+        const auto &vdex = inventory.value();
+        if (args.size() == 3) {
+            out << "{\"format\":\"Android VDEX 027\",\"file_size\":" << vdex.file_size.value
+                << ",\"checksum_count\":" << vdex.dex_checksum_count << ",\"dex_section_present\":"
+                << (vdex.dex_section_present ? "true" : "false") << ",\"sections\":[";
+            for (std::size_t i = 0; i < vdex.sections.size(); ++i) {
+                if (i) out << ',';
+                const auto &section = vdex.sections[i];
+                out << "{\"kind\":" << section.kind << ",\"offset\":" << section.file_offset.value
+                    << ",\"size\":" << section.size << '}';
+            }
+            out << "],\"dex_members\":[";
+            for (std::size_t i = 0; i < vdex.dex_members.size(); ++i) {
+                if (i) out << ',';
+                const auto &member = vdex.dex_members[i];
+                out << "{\"index\":" << member.index << ",\"offset\":" << member.header_file_offset.value
+                    << ",\"size\":" << member.file_size << ",\"version\":" << member.version
+                    << ",\"header_checksum\":" << member.header_checksum
+                    << ",\"vdex_checksum\":" << member.vdex_checksum
+                    << ",\"checksum_fields_match\":" << (member.checksum_fields_match ? "true" : "false") << '}';
+            }
+            out << "]}\n";
+        } else {
+            out << "Android VDEX 027: " << vdex.file_size.value << " bytes sections=" << vdex.sections.size()
+                << " checksums=" << vdex.dex_checksum_count << " dex-members=" << vdex.dex_members.size()
+                << " dex-section=" << (vdex.dex_section_present ? "present" : "absent") << '\n';
+            for (const auto &section : vdex.sections)
+                out << "  section-kind=" << section.kind << " offset=0x" << std::hex << section.file_offset.value
+                    << " size=0x" << section.size << std::dec << '\n';
+            for (const auto &member : vdex.dex_members)
+                out << "  dex[" << member.index << "] offset=0x" << std::hex << member.header_file_offset.value
+                    << " size=0x" << member.file_size << std::dec << " version=" << member.version
+                    << " header-checksum=0x" << std::hex << member.header_checksum
+                    << " vdex-checksum=0x" << member.vdex_checksum << std::dec
+                    << " fields-match=" << (member.checksum_fields_match ? "yes" : "no") << '\n';
+            out << "Verifier dependencies and type-lookup data remain opaque.\n";
+        }
+        return 0;
+    }
+    if (!args.empty() && args[0] == L"apk") {
+        if (args.size() < 2 || args.size() > 3 || (args.size() == 3 && args[2] != L"--json")) {
+            err << "Usage: hexlab_cli dex apk <path> [--json]\n";
+            return 2;
+        }
+        auto storage = FileStorage::open(path_from_wide(args[1]));
+        if (!storage) { err << storage.error().message << '\n'; return 2; }
+        auto members = load_android_dex_archive(*storage.value());
+        if (!members) { err << members.error().message << '\n'; return 2; }
+        if (args.size() == 3) {
+            out << "{\"format\":\"APK DEX\",\"member_count\":" << members.value().size() << ",\"members\":[";
+            for (std::size_t i = 0; i < members.value().size(); ++i) {
+                if (i) out << ',';
+                const auto &member = members.value()[i];
+                const auto &dex = *member.loaded.metadata.dex;
+                out << "{\"entry\":" << json_quote(member.entry_name)
+                    << ",\"entry_index\":" << member.archive_entry_index
+                    << ",\"logical_index\":" << member.logical_member_index
+                    << ",\"data_offset\":" << member.data_offset
+                    << ",\"compressed_size\":" << member.compressed_size
+                    << ",\"uncompressed_size\":" << member.uncompressed_size
+                    << ",\"crc32\":" << member.crc32
+                    << ",\"class_count\":" << dex.classes.size()
+                    << ",\"method_count\":" << dex.method_identifiers.size()
+                    << ",\"code_count\":" << dex.code.size() << '}';
+            }
+            out << "]}\n";
+        } else {
+            out << "Android APK DEX: " << members.value().size() << " logical member(s)\n";
+            for (const auto &member : members.value()) {
+                const auto &dex = *member.loaded.metadata.dex;
+                out << "  " << member.entry_name << " logical=" << member.logical_member_index
+                    << " data=0x" << std::hex << member.data_offset << std::dec
+                    << " compressed=" << member.compressed_size << " uncompressed=" << member.uncompressed_size
+                    << " classes=" << dex.classes.size() << " methods=" << dex.method_identifiers.size()
+                    << " code_items=" << dex.code.size() << '\n';
+            }
+        }
+        return 0;
+    }
+    if (!args.empty() && args[0] == L"load-container") {
+        if (args.size() < 2 || args.size() > 3 || (args.size() == 3 && args[2] != L"--json")) {
+            err << "Usage: hexlab_cli dex load-container <path> [--json]\n";
+            return 2;
+        }
+        auto storage = FileStorage::open(path_from_wide(args[1]));
+        if (!storage) { err << storage.error().message << '\n'; return 2; }
+        auto members = load_dex041_container(storage.value(), {});
+        if (!members) { err << members.error().message << '\n'; return 2; }
+        if (args.size() == 3) {
+            out << "{\"format\":\"DEX 041\",\"container_size\":" << storage.value()->size()
+                << ",\"member_count\":" << members.value().size() << ",\"members\":[";
+            for (std::size_t i = 0; i < members.value().size(); ++i) {
+                if (i) out << ',';
+                const auto &loaded = members.value()[i];
+                const auto &dex = *loaded.metadata.dex;
+                out << "{\"index\":" << i << ",\"class_count\":" << dex.classes.size()
+                    << ",\"method_count\":" << dex.method_identifiers.size()
+                    << ",\"code_count\":" << dex.code.size() << '}';
+            }
+            out << "]}\n";
+        } else {
+            out << "DEX 041 parsed container: " << storage.value()->size() << " bytes, "
+                << members.value().size() << " logical member(s)\n";
+            for (std::size_t i = 0; i < members.value().size(); ++i) {
+                const auto &dex = *members.value()[i].metadata.dex;
+                out << "  [" << i << "] classes=" << dex.classes.size()
+                    << " methods=" << dex.method_identifiers.size()
+                    << " code_items=" << dex.code.size() << '\n';
+            }
+        }
+        return 0;
+    }
+    if (args.size() < 2 || args.size() > 3 || args[0] != L"container" ||
+        (args.size() == 3 && args[2] != L"--json")) {
+        err << "Usage: hexlab_cli dex container <path> [--json]\n"
+               "       hexlab_cli dex load-container <path> [--json]\n"
+               "       hexlab_cli dex apk <path> [--json]\n"
+               "       hexlab_cli dex vdex <path> [--json]\n";
+        return 2;
+    }
+    const bool json = args.size() == 3;
+    auto storage = FileStorage::open(path_from_wide(args[1]));
+    if (!storage) { err << storage.error().message << '\n'; return 2; }
+    auto members = inspect_dex041_container(*storage.value());
+    if (!members) { err << members.error().message << '\n'; return 2; }
+    if (json) {
+        out << "{\"format\":\"DEX 041\",\"container_size\":" << storage.value()->size()
+            << ",\"member_count\":" << members.value().size() << ",\"members\":[";
+        for (std::size_t index = 0; index < members.value().size(); ++index) {
+            if (index) out << ',';
+            const auto &member = members.value()[index];
+            out << "{\"index\":" << index << ",\"header_offset\":" << member.header_offset
+                << ",\"logical_file_size\":" << member.logical_file_size
+                << ",\"checksum\":" << member.checksum << ",\"signature\":\"";
+            for (const auto byte : member.signature)
+                out << std::hex << std::setw(2) << std::setfill('0')
+                    << std::to_integer<unsigned>(byte);
+            out << std::dec << "\"}";
+        }
+        out << "]}\n";
+    } else {
+        out << "DEX 041 container: " << storage.value()->size() << " bytes, "
+            << members.value().size() << " logical member(s)\n";
+        for (std::size_t index = 0; index < members.value().size(); ++index) {
+            const auto &member = members.value()[index];
+            out << "  [" << index << "] header=0x" << std::hex << member.header_offset
+                << " size=0x" << member.logical_file_size << " checksum=0x" << member.checksum
+                << " signature=";
+            for (const auto byte : member.signature)
+                out << std::setw(2) << std::setfill('0') << std::to_integer<unsigned>(byte);
+            out << std::dec << '\n';
+        }
+    }
+    return 0;
+}
+int macho_chained_targets_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
+    const auto usage = [&] {
+        out << "Usage: hexlab_cli macho chained-targets <image> [--shared-cache-base <address>] "
+               "[--cache-level-base <0..3> <address>]...\n";
+        return 0;
+    };
+    if (args.empty() || (args.size() == 1 && args[0] == L"--help")) return usage();
+    if (args.size() < 2 || args[0] != L"chained-targets") {
+        err << "Expected macho chained-targets <image>\n";
+        return 2;
+    }
+    const auto parse_address = [](std::wstring_view text) -> std::optional<std::uint64_t> {
+        if (text.empty()) return {};
+        std::string digits;
+        digits.reserve(text.size());
+        for (const auto ch : text) {
+            if (ch > 0x7f) return {};
+            digits.push_back(static_cast<char>(ch));
+        }
+        int base = 10;
+        if (digits.starts_with("0x") || digits.starts_with("0X")) {
+            digits.erase(0, 2);
+            base = 16;
+        }
+        if (digits.empty()) return {};
+        std::uint64_t value = 0;
+        const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), value, base);
+        if (error != std::errc{} || end != digits.data() + digits.size()) return {};
+        return value;
+    };
+    MachOChainedTargetBases bases;
+    for (std::size_t index = 2; index < args.size();) {
+        if (args[index] == L"--shared-cache-base") {
+            if (index + 1 >= args.size() || bases.shared_cache_base) {
+                err << "--shared-cache-base requires one address and may appear once\n";
+                return 2;
+            }
+            bases.shared_cache_base = parse_address(args[index + 1]);
+            if (!bases.shared_cache_base) { err << "Invalid shared-cache base address\n"; return 2; }
+            index += 2;
+        } else if (args[index] == L"--cache-level-base") {
+            if (index + 2 >= args.size()) { err << "--cache-level-base requires a level and address\n"; return 2; }
+            const auto level = parse_address(args[index + 1]);
+            const auto address = parse_address(args[index + 2]);
+            if (!level || *level >= bases.cache_level_bases.size() || !address) {
+                err << "Invalid cache-level base; expected a level 0..3 and an address\n";
+                return 2;
+            }
+            if (bases.cache_level_bases[*level]) { err << "Duplicate cache-level base\n"; return 2; }
+            bases.cache_level_bases[*level] = *address;
+            index += 3;
+        } else {
+            err << "Unexpected Mach-O chained-targets option\n";
+            return 2;
+        }
+    }
+    auto storage = FileStorage::open(path_from_wide(args[1]));
+    if (!storage) { err << storage.error().message << '\n'; return 2; }
+    auto loaded = load_macho(storage.value(), MachOOptions{}, {});
+    if (!loaded) { err << loaded.error().message << '\n'; return 2; }
+    if (!loaded.value().metadata.macho) { err << "Selected input is not a Mach-O image\n"; return 2; }
+    auto targets = resolve_macho_chained_external_targets(*loaded.value().metadata.macho, bases);
+    if (!targets) { err << targets.error().message << '\n'; return 2; }
+    const auto status_name = [](MachOChainedExternalTargetStatus status) {
+        switch (status) {
+        case MachOChainedExternalTargetStatus::resolved: return "resolved";
+        case MachOChainedExternalTargetStatus::missing_base: return "missing-base";
+        case MachOChainedExternalTargetStatus::invalid_encoding: return "invalid-encoding";
+        case MachOChainedExternalTargetStatus::overflow: return "overflow";
+        }
+        return "unknown";
+    };
+    out << "Mach-O external chained rebases: " << targets.value().size() << " row(s)\n";
+    constexpr std::size_t output_limit = 1024;
+    const auto count = (std::min)(targets.value().size(), output_limit);
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto &row = targets.value()[index];
+        out << "  pointer=" << row.pointer_index << " status=" << status_name(row.status);
+        if (row.base_kind == MachOChainedTargetBaseKind::cache_level && row.cache_level)
+            out << " cache-level=" << unsigned(*row.cache_level);
+        else out << " target-base=shared-cache";
+        if (row.base_address) out << " base=" << hex(*row.base_address);
+        if (row.target_address) out << " pre-pac-target=" << hex(*row.target_address);
+        if (row.authentication_required) out << " authentication-required=true";
+        out << '\n';
+    }
+    if (targets.value().size() > count) out << "  ... " << targets.value().size() - count << " rows omitted\n";
+    return 0;
 }
 } // namespace
 int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std::ostream &err) {
@@ -1485,27 +3267,67 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
         return archive_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"jar")
         return jar_command(arguments.subspan(1), out, err);
+    if (arguments[0] == L"jvm")
+        return jvm_module_path_command(arguments.subspan(1), out, err);
+    if (arguments[0] == L"dex")
+        return dex_command(arguments.subspan(1), out, err);
+    if (arguments[0] == L"macho")
+        return macho_chained_targets_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"firmware")
         return firmware_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"compare")
         return run_compare_cli(arguments.subspan(1), out, err);
     if (arguments[0] == L"modules")
         return modules_command(arguments.subspan(1), out, err);
-    if (arguments[0] != L"inspect" && arguments[0] != L"disassemble" && arguments[0] != L"decompile") {
+    if (arguments[0] == L"pe-deps")
+        return pe_dependency_files_command(arguments.subspan(1), out, err);
+    const bool functions_only = arguments[0] == L"functions";
+    if (arguments[0] != L"inspect" && arguments[0] != L"disassemble" && arguments[0] != L"decompile" &&
+        !functions_only) {
         err << "Invalid arguments. Use --help for usage.\n";
         return 2;
     }
     if (arguments.size() == 2 && arguments[1] == L"--help") {
-        usage(out);
+        if (functions_only)
+            out << "Usage: hexlab_cli functions <path> [input/analysis options] [--limit <count>] [--json]\n"
+                   "       Input options match `disassemble`; --show-strings is not supported here.\n"
+                   "       --limit caps returned rows (default 10000, maximum 100000).\n";
+        else usage(out);
         return 0;
     }
     try {
         const bool decompile = arguments[0] == L"decompile";
-        const bool disassemble = arguments[0] == L"disassemble" || decompile;
+        const bool disassemble = arguments[0] == L"disassemble" || decompile || functions_only;
         std::vector<std::filesystem::path> plugin_paths;
         bool show_strings = false;
-        auto request = parse(arguments.subspan(1), disassemble, plugin_paths, show_strings);
-        plugins::PluginManager plugin_manager(plugins::make_native_module_provider());
+        bool json_output = false;
+        std::size_t function_limit = 10000;
+        std::vector<std::wstring_view> parse_arguments;
+        bool end_options = false, limit_seen = false;
+        for (std::size_t index = 1; index < arguments.size(); ++index) {
+            const auto argument = arguments[index];
+            if (!functions_only || end_options || argument != L"--limit") {
+                parse_arguments.push_back(argument);
+                if (functions_only && argument == L"--") end_options = true;
+                continue;
+            }
+            if (limit_seen || index + 1 >= arguments.size() || arguments[index + 1].starts_with(L"--"))
+                argument_error("--limit requires one positive count and may appear once");
+            const auto parsed_limit = number(arguments[++index]);
+            if (parsed_limit == 0 || parsed_limit > 100000)
+                argument_error("--limit must be between 1 and 100000");
+            function_limit = static_cast<std::size_t>(parsed_limit);
+            limit_seen = true;
+        }
+        auto request = parse(parse_arguments, disassemble, plugin_paths, show_strings, json_output);
+        if (functions_only && show_strings)
+            argument_error("--show-strings is not supported by the functions command");
+        if (functions_only)
+            request.run_analysis = false;
+        if (json_output && (!disassemble || decompile))
+            argument_error("--json is currently supported only by disassemble or functions");
+        plugins::PluginManager plugin_manager(plugins::make_native_module_provider(),
+                                               plugins::default_plugin_state_path());
         for (const auto& plugin_path : plugin_paths) {
             auto loaded = plugin_manager.load(path_text(plugin_path));
             if (!loaded) {
@@ -1568,23 +3390,29 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
         for (const auto& failure : plugin_manager.extension_failures())
             err << "Plugin extension disabled: " << failure.plugin_id << "/" << failure.extension_id
                 << " (" << failure.kind << "): " << failure.reason << '\n';
-        if (disassemble && !analysis) {
+        if (disassemble && !functions_only && !analysis) {
             err << "Unsupported analysis: this CPU/mode has no enabled decoder\n";
             return 1;
         }
-        metadata(out, document);
+        if (!json_output) metadata(out, document);
         diagnostics(err, document.diagnostics, document.image.get());
+        if (functions_only)
+            return functions_report(document, request.path, request.analysis_options,
+                                    function_limit, json_output, out, err);
         if (!disassemble)
             return 0;
         if (show_strings) {
-            out << "Strings:\n";
-            for (const auto &candidate : analysis->strings.records) {
-                out << "  " << string_encoding_label(candidate.encoding)
-                    << " file=" << hex(candidate.file_offset.value)
-                    << " bytes=" << candidate.byte_length
-                    << " characters=" << candidate.characters
-                    << (candidate.terminated ? " terminated" : "")
-                    << " preview=" << candidate.preview << '\n';
+            if (!json_output) {
+                out << "Strings:\n";
+                for (const auto &candidate : analysis->strings.records) {
+                    out << "  " << string_encoding_label(candidate.encoding)
+                        << " script=" << string_script_name(classify_string_script(candidate.preview))
+                        << " file=" << hex(candidate.file_offset.value)
+                        << " bytes=" << candidate.byte_length
+                        << " characters=" << candidate.characters
+                        << (candidate.terminated ? " terminated" : "")
+                        << " preview=" << candidate.preview << '\n';
+                }
             }
         }
         if (decompile) {
@@ -1791,6 +3619,77 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
             }
             diagnostics(err, analysis->diagnostics, document.image.get());
             return complete ? 0 : 3;
+        }
+        if (json_output) {
+            const auto flow_name = [](FlowKind flow) -> const char * {
+                switch (flow) {
+                case FlowKind::fallthrough: return "fallthrough";
+                case FlowKind::call: return "call";
+                case FlowKind::conditional_branch: return "conditional_branch";
+                case FlowKind::jump: return "jump";
+                case FlowKind::ret: return "return";
+                case FlowKind::trap: return "trap";
+                case FlowKind::switch_dispatch: return "switch_dispatch";
+                case FlowKind::data: return "data";
+                }
+                return "unknown";
+            };
+            const auto access_name = [](OperandAccess access) -> const char * {
+                switch (access) {
+                case OperandAccess::read: return "read";
+                case OperandAccess::write: return "write";
+                case OperandAccess::read_write: return "read_write";
+                case OperandAccess::address: return "address";
+                }
+                return "unknown";
+            };
+            out << "{\"schema\":\"hexlab.disassembly.v1\",\"path\":"
+                << processor_inventory_json_string(path_text(request.path))
+                << ",\"analysis_status\":"
+                << processor_inventory_json_string(analysis->complete ? "complete" : "partial")
+                << ",\"partial\":" << (analysis->complete ? "false" : "true")
+                << ",\"instructions\":[";
+            bool first = true;
+            for (const auto &instruction : analysis->instructions) {
+                if (!first) out << ',';
+                first = false;
+                std::ostringstream encoded;
+                for (const auto byte : instruction.encoded_bytes())
+                    encoded << std::hex << std::uppercase << std::setw(2) << std::setfill('0')
+                            << std::to_integer<unsigned>(byte);
+                out << "{\"address\":" << processor_inventory_json_string(
+                           format_location(instruction.address, document.image.get()))
+                    << ",\"bytes\":" << processor_inventory_json_string(encoded.str())
+                    << ",\"text\":" << processor_inventory_json_string(format_instruction(instruction))
+                    << ",\"flow\":" << processor_inventory_json_string(flow_name(instruction.flow))
+                    << ",\"memory_read\":" << (instruction.memory_read ? "true" : "false")
+                    << ",\"memory_write\":" << (instruction.memory_write ? "true" : "false")
+                    << ",\"operand_access\":[";
+                for (std::size_t i = 0; i < instruction.access.size(); ++i) {
+                    if (i) out << ',';
+                    out << processor_inventory_json_string(access_name(instruction.access[i]));
+                }
+                out << "]}";
+            }
+            out << ']';
+            if (show_strings) {
+                out << ",\"strings\":[";
+                for (std::size_t i = 0; i < analysis->strings.records.size(); ++i) {
+                    if (i) out << ',';
+                    const auto &candidate = analysis->strings.records[i];
+                    out << "{\"encoding\":" << processor_inventory_json_string(string_encoding_label(candidate.encoding))
+                        << ",\"script_hint\":" << processor_inventory_json_string(
+                            string_script_name(classify_string_script(candidate.preview)))
+                        << ",\"file_offset\":" << processor_inventory_json_string(hex(candidate.file_offset.value))
+                        << ",\"byte_length\":" << candidate.byte_length
+                        << ",\"characters\":" << candidate.characters
+                        << ",\"terminated\":" << (candidate.terminated ? "true" : "false")
+                        << ",\"preview\":" << processor_inventory_json_string(candidate.preview) << '}';
+                }
+                out << ']';
+            }
+            out << "}\n";
+            return analysis->complete ? 0 : 3;
         }
         out << "Disassembly:\n";
         auto resolutions = RelocationResolver::create(*document.image, document.metadata, {});

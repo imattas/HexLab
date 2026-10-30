@@ -158,8 +158,40 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
     else if (opcode_index >= 360 && opcode_index <= 363)
         opcode = std::array{Opcode::rv_fleq_s, Opcode::rv_fltq_s,
                             Opcode::rv_fleq_d, Opcode::rv_fltq_d}[opcode_index - 360];
+    else if (opcode_index >= 364 && opcode_index <= 367)
+        opcode = std::array{Opcode::rv_vfredusum, Opcode::rv_vfredosum,
+                            Opcode::rv_vfredmin, Opcode::rv_vfredmax}[opcode_index - 364];
     else if (source.opcode == RiscvOpcode::fence_i)
         opcode = Opcode::rv_fence_i;
+    else if (source.opcode == RiscvOpcode::fence_tso)
+        opcode = Opcode::rv_fence_tso;
+    else if (source.opcode >= RiscvOpcode::andn && source.opcode <= RiscvOpcode::roriw)
+        opcode = std::array{Opcode::rv_andn, Opcode::rv_orn, Opcode::rv_xnor, Opcode::rv_min,
+            Opcode::rv_minu, Opcode::rv_max, Opcode::rv_maxu, Opcode::rv_rol, Opcode::rv_ror,
+            Opcode::rv_rori, Opcode::rv_sext_b, Opcode::rv_sext_h, Opcode::rv_zext_h,
+            Opcode::rv_orc_b, Opcode::rv_rev8, Opcode::rv_rolw, Opcode::rv_rorw,
+            Opcode::rv_roriw}[opcode_index - static_cast<std::size_t>(RiscvOpcode::andn)];
+    else if (source.opcode >= RiscvOpcode::bclr && source.opcode <= RiscvOpcode::bseti)
+        opcode = std::array{Opcode::rv_bclr, Opcode::rv_bext, Opcode::rv_binv, Opcode::rv_bset,
+                            Opcode::rv_bclri, Opcode::rv_bexti, Opcode::rv_binvi, Opcode::rv_bseti}
+            [opcode_index - static_cast<std::size_t>(RiscvOpcode::bclr)];
+    else if (source.opcode >= RiscvOpcode::clmul && source.opcode <= RiscvOpcode::clmulr)
+        opcode = std::array{Opcode::rv_clmul, Opcode::rv_clmulh, Opcode::rv_clmulr}
+            [opcode_index - static_cast<std::size_t>(RiscvOpcode::clmul)];
+    else if (source.opcode == RiscvOpcode::czero_eqz || source.opcode == RiscvOpcode::czero_nez)
+        opcode = source.opcode == RiscvOpcode::czero_eqz ? Opcode::rv_czero_eqz : Opcode::rv_czero_nez;
+    else if (source.opcode >= RiscvOpcode::pack && source.opcode <= RiscvOpcode::packw)
+        opcode = std::array{Opcode::rv_pack, Opcode::rv_packh, Opcode::rv_packw}
+            [opcode_index - static_cast<std::size_t>(RiscvOpcode::pack)];
+    else if (source.opcode >= RiscvOpcode::vmand_mm && source.opcode <= RiscvOpcode::vmxnor_mm)
+        opcode = std::array{Opcode::rv_vmand_mm, Opcode::rv_vmnand_mm, Opcode::rv_vmandn_mm,
+            Opcode::rv_vmxor_mm, Opcode::rv_vmor_mm, Opcode::rv_vmnor_mm,
+            Opcode::rv_vmorn_mm, Opcode::rv_vmxnor_mm}
+            [opcode_index - static_cast<std::size_t>(RiscvOpcode::vmand_mm)];
+    else if (source.opcode >= RiscvOpcode::vcpop_m && source.opcode <= RiscvOpcode::vid_v)
+        opcode = std::array{Opcode::rv_vcpop_m, Opcode::rv_vfirst_m, Opcode::rv_vmsbf_m,
+            Opcode::rv_vmsof_m, Opcode::rv_vmsif_m, Opcode::rv_viota_m, Opcode::rv_vid_v}
+            [opcode_index - static_cast<std::size_t>(RiscvOpcode::vcpop_m)];
     else
         return {DecodeStatus::invalid, {}, "RV64 opcode has no generic representation"};
 
@@ -181,6 +213,7 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
     instruction.rounding_mode = source.rounding_mode;
     instruction.writes_fflags = source.writes_fflags;
     instruction.riscv_vector_masked = source.vector_masked;
+    instruction.riscv_vector_segment_fields = source.vector_segment_fields;
     instruction.reads_frm = source.reads_frm;
     instruction.reads_fflags = source.reads_fflags;
     for (const auto &operand : source.operands) {
@@ -291,7 +324,7 @@ ProcessorCapabilities processor_capabilities(DecodeContext context) noexcept {
     if (context.architecture == Architecture::jvm && context.mode == ExecutionMode::jvm) {
         if (context.order != ByteOrder::big || context.segmented_memory || context.stack_address_width)
             return {false, 0, {}, "JVM classfile bytecode uses big-endian operands without x86 address overrides"};
-        return {true, 255, "JVM classfile bytecodes with bounded switch decoding", {}};
+        return {true, 65535, "JVM classfile bytecodes with Code-bounded switch decoding", {}};
     }
     if (context.architecture == Architecture::mos6502 && context.mode == ExecutionMode::m6502) {
         if (context.segmented_memory || context.stack_address_width)
@@ -316,28 +349,78 @@ ProcessorCapabilities processor_capabilities(DecodeContext context) noexcept {
     return {false, 0, {}, "This architecture and execution mode have no enabled decoder"};
 }
 std::span<const ProcessorVariantInfo> processor_variant_inventory() noexcept {
+    static constexpr std::string_view x86_16_families[]{"scalar-integer", "data-movement", "control-flow",
+        "bit-operations", "x87-d8-df"};
+    static constexpr std::string_view x86_families[]{"scalar-integer", "data-movement", "control-flow",
+        "bit-operations", "x87-d8-df", "sse2-and-selected-avx-avx2"};
+    static constexpr std::string_view arm_families[]{"integer-data-processing", "load-store", "register-lists",
+        "conditional-control-flow"};
+    static constexpr std::string_view thumb_families[]{"integer-data-processing", "load-store", "register-lists",
+        "conditional-control-flow", "it-state-and-wide-branches"};
+    static constexpr std::string_view a64_families[]{"integer-immediate-and-register", "conditional-control-flow",
+        "scalar-and-pair-memory", "selected-simd-integer-and-floating"};
+    static constexpr std::string_view rv32_families[]{"rv32i", "rv32m", "rv32a", "zicsr", "scalar-f-and-d",
+        "selected-rvv"};
+    static constexpr std::string_view rv64_families[]{"rv64i", "rv64m", "rv64a", "zicsr", "scalar-f-and-d",
+        "selected-zfa-and-rvv"};
+    static constexpr std::string_view rv64c_families[]{"rv64i", "rv64m", "rv64a", "rv64c", "zicsr",
+        "scalar-f-and-d", "selected-zfa-and-rvv"};
+    static constexpr std::string_view mips32_families[]{"integer", "loads-and-stores", "control-flow-delay-slots",
+        "hilo", "cop1-s-d-w"};
+    static constexpr std::string_view mips64_families[]{"integer-and-selected-doubleword", "loads-and-stores",
+        "control-flow-delay-slots", "hilo-and-special-registers", "selected-cop1"};
+    static constexpr std::string_view ppc_families[]{"integer", "loads-and-stores", "control-flow",
+        "condition-register", "selected-vmx-integer-and-scalar-floating"};
+    static constexpr std::string_view m6502_families[]{"documented-nmos-151-opcodes", "selected-undocumented-nmos"};
+    static constexpr std::string_view wasm_families[]{"wasm-1-structured-control", "calls-and-locals", "memory",
+        "scalar-numeric"};
+    static constexpr std::string_view dex_families[]{"core-dalvik-scalar", "branches-and-switch-payloads",
+        "field-and-array-access", "invoke-forms"};
+    static constexpr std::string_view jvm_families[]{"standard-opcodes-through-jsr-w", "branches-and-switches",
+        "locals-and-stack", "calls-and-fields"};
+    static constexpr std::string_view native_analysis[]{"function-recovery", "reference-recovery", "stack-slot-recovery"};
+    static constexpr std::string_view ppc_analysis[]{"reference-recovery", "stack-slot-recovery"};
+    static constexpr std::string_view native_decompiler[]{"selected-typed-instruction-lifting", "pseudocode"};
+    static constexpr std::string_view managed_decompiler[]{"method-level-typed-lifting", "pseudocode"};
+    static constexpr std::string_view remote_debugger[]{"remote-register-context"};
+    static constexpr std::span<const std::string_view> no_coverage{};
+    static constexpr ProcessorVariantCoverage x86_16_coverage{x86_16_families, native_analysis, native_decompiler, no_coverage};
+    static constexpr ProcessorVariantCoverage x86_coverage{x86_families, native_analysis, native_decompiler, remote_debugger};
+    static constexpr ProcessorVariantCoverage arm32_coverage{arm_families, native_analysis, native_decompiler, remote_debugger};
+    static constexpr ProcessorVariantCoverage thumb_coverage{thumb_families, native_analysis, native_decompiler, remote_debugger};
+    static constexpr ProcessorVariantCoverage a64_coverage{a64_families, native_analysis, native_decompiler, remote_debugger};
+    static constexpr ProcessorVariantCoverage rv32_coverage{rv32_families, native_analysis, native_decompiler, remote_debugger};
+    static constexpr ProcessorVariantCoverage rv64_coverage{rv64_families, native_analysis, native_decompiler, remote_debugger};
+    static constexpr ProcessorVariantCoverage rv64c_coverage{rv64c_families, native_analysis, native_decompiler, remote_debugger};
+    static constexpr ProcessorVariantCoverage mips32_coverage{mips32_families, native_analysis, native_decompiler, remote_debugger};
+    static constexpr ProcessorVariantCoverage mips64_coverage{mips64_families, native_analysis, native_decompiler, remote_debugger};
+    static constexpr ProcessorVariantCoverage ppc_coverage_partial{ppc_families, ppc_analysis, native_decompiler, remote_debugger};
+    static constexpr ProcessorVariantCoverage m6502_coverage{m6502_families, native_analysis, native_decompiler, no_coverage};
+    static constexpr ProcessorVariantCoverage wasm_coverage{wasm_families, no_coverage, managed_decompiler, no_coverage};
+    static constexpr ProcessorVariantCoverage dex_coverage{dex_families, no_coverage, managed_decompiler, no_coverage};
+    static constexpr ProcessorVariantCoverage jvm_coverage{jvm_families, no_coverage, managed_decompiler, no_coverage};
     static constexpr std::array variants{
-        ProcessorVariantInfo{"x86-16", {Architecture::x86, ExecutionMode::x86_16, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"x86-32", {Architecture::x86, ExecutionMode::x86_32, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"x86-64", {Architecture::x86_64, ExecutionMode::x86_64, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"a32", {Architecture::arm, ExecutionMode::a32, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"thumb", {Architecture::arm, ExecutionMode::thumb, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"a64", {Architecture::arm64, ExecutionMode::a64, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"rv32", {Architecture::riscv32, ExecutionMode::rv32, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"rv64", {Architecture::riscv64, ExecutionMode::rv64, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"rv64c", {Architecture::riscv64, ExecutionMode::rv64c, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"mips32le", {Architecture::mips32, ExecutionMode::mips32, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"mips32be", {Architecture::mips32, ExecutionMode::mips32, ByteOrder::big}, {}},
-        ProcessorVariantInfo{"mips64le", {Architecture::mips64, ExecutionMode::mips64, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"mips64be", {Architecture::mips64, ExecutionMode::mips64, ByteOrder::big}, {}},
-        ProcessorVariantInfo{"ppc32le", {Architecture::powerpc, ExecutionMode::ppc32, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"ppc32be", {Architecture::powerpc, ExecutionMode::ppc32, ByteOrder::big}, {}},
-        ProcessorVariantInfo{"ppc64le", {Architecture::powerpc, ExecutionMode::ppc64, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"ppc64be", {Architecture::powerpc, ExecutionMode::ppc64, ByteOrder::big}, {}},
-        ProcessorVariantInfo{"6502", {Architecture::mos6502, ExecutionMode::m6502, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"wasm32", {Architecture::wasm, ExecutionMode::wasm32, ByteOrder::little}, {}, false},
-        ProcessorVariantInfo{"dex", {Architecture::dex, ExecutionMode::dex, ByteOrder::little}, {}},
-        ProcessorVariantInfo{"jvm", {Architecture::jvm, ExecutionMode::jvm, ByteOrder::big}, {}}
+        ProcessorVariantInfo{"x86-16", {Architecture::x86, ExecutionMode::x86_16, ByteOrder::little}, {}, true, x86_16_coverage},
+        ProcessorVariantInfo{"x86-32", {Architecture::x86, ExecutionMode::x86_32, ByteOrder::little}, {}, true, x86_coverage},
+        ProcessorVariantInfo{"x86-64", {Architecture::x86_64, ExecutionMode::x86_64, ByteOrder::little}, {}, true, x86_coverage},
+        ProcessorVariantInfo{"a32", {Architecture::arm, ExecutionMode::a32, ByteOrder::little}, {}, true, arm32_coverage},
+        ProcessorVariantInfo{"thumb", {Architecture::arm, ExecutionMode::thumb, ByteOrder::little}, {}, true, thumb_coverage},
+        ProcessorVariantInfo{"a64", {Architecture::arm64, ExecutionMode::a64, ByteOrder::little}, {}, true, a64_coverage},
+        ProcessorVariantInfo{"rv32", {Architecture::riscv32, ExecutionMode::rv32, ByteOrder::little}, {}, true, rv32_coverage},
+        ProcessorVariantInfo{"rv64", {Architecture::riscv64, ExecutionMode::rv64, ByteOrder::little}, {}, true, rv64_coverage},
+        ProcessorVariantInfo{"rv64c", {Architecture::riscv64, ExecutionMode::rv64c, ByteOrder::little}, {}, true, rv64c_coverage},
+        ProcessorVariantInfo{"mips32le", {Architecture::mips32, ExecutionMode::mips32, ByteOrder::little}, {}, true, mips32_coverage},
+        ProcessorVariantInfo{"mips32be", {Architecture::mips32, ExecutionMode::mips32, ByteOrder::big}, {}, true, mips32_coverage},
+        ProcessorVariantInfo{"mips64le", {Architecture::mips64, ExecutionMode::mips64, ByteOrder::little}, {}, true, mips64_coverage},
+        ProcessorVariantInfo{"mips64be", {Architecture::mips64, ExecutionMode::mips64, ByteOrder::big}, {}, true, mips64_coverage},
+        ProcessorVariantInfo{"ppc32le", {Architecture::powerpc, ExecutionMode::ppc32, ByteOrder::little}, {}, true, ppc_coverage_partial},
+        ProcessorVariantInfo{"ppc32be", {Architecture::powerpc, ExecutionMode::ppc32, ByteOrder::big}, {}, true, ppc_coverage_partial},
+        ProcessorVariantInfo{"ppc64le", {Architecture::powerpc, ExecutionMode::ppc64, ByteOrder::little}, {}, true, ppc_coverage_partial},
+        ProcessorVariantInfo{"ppc64be", {Architecture::powerpc, ExecutionMode::ppc64, ByteOrder::big}, {}, true, ppc_coverage_partial},
+        ProcessorVariantInfo{"6502", {Architecture::mos6502, ExecutionMode::m6502, ByteOrder::little}, {}, true, m6502_coverage},
+        ProcessorVariantInfo{"wasm32", {Architecture::wasm, ExecutionMode::wasm32, ByteOrder::little}, {}, false, wasm_coverage},
+        ProcessorVariantInfo{"dex", {Architecture::dex, ExecutionMode::dex, ByteOrder::little}, {}, true, dex_coverage},
+        ProcessorVariantInfo{"jvm", {Architecture::jvm, ExecutionMode::jvm, ByteOrder::big}, {}, true, jvm_coverage}
     };
     static const auto inventory = [] {
         auto result = variants;

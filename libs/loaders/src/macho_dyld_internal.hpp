@@ -55,4 +55,5 @@ void read_exports(const Reader &, const Image &, MachOMetadata &, std::uint32_t,
                   Budget &, std::stop_token);
 void read_chained(const Reader &, const Image &, MachOMetadata &, std::uint32_t, std::uint32_t, std::optional<Address>,
                   Budget &, std::stop_token);
+void read_chain_starts_section(const Reader &, const Image &, MachOMetadata &, Budget &, std::stop_token);
 } // namespace hexlab::macho_detail

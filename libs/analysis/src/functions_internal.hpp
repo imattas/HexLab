@@ -61,6 +61,7 @@ struct Node {
     std::optional<FunctionStop> stop;
     bool call = false;
     std::optional<Address> call_target;
+    std::optional<ExternalIdentity> external_call_target;
     std::optional<FunctionStop> call_issue;
     std::uint16_t call_guard = 0xffff;
     std::uint16_t stop_guard = 0xffff;
@@ -88,6 +89,9 @@ class Recovery {
     AddressMap<std::uint16_t> reachable_flags;
     // Each possible input A64 NZCV nibble maps to a set of output nibbles.
     AddressMap<std::array<std::uint16_t, 16>> a64_flag_transfers;
+    AddressSet discovered_functions, discovered_switches;
+    std::size_t discovery_memberships = 0, a64_indirect_passes = 0;
+    bool a64_indirect_seeds_added = false;
     AddressMap<std::vector<FunctionSeed>> roots, all_seeds, valid_seeds;
     // Validated object-format function ranges constrain control-flow recovery
     // when no explicit user chunk definition overrides them.
@@ -104,6 +108,9 @@ class Recovery {
     AddressMap<BlockId> node_blocks;
     std::vector<std::shared_ptr<BasicBlock>> blocks;
     AddressMap<std::shared_ptr<const InstructionFact>> reusable_instructions;
+    // Exact loader-reported import address slots to their symbolic identities.
+    // A null value records a collision/invalid row so ambiguous slots fail closed.
+    AddressMap<std::optional<ExternalIdentity>> imported_call_slots;
     std::size_t decoded_instructions = 0, reused_instructions = 0;
     std::size_t attempts = 0, owner_steps = 0;
     std::size_t last_progress_attempts = 0;
@@ -111,7 +118,22 @@ class Recovery {
     Recovery(const Image &i, const ImageMetadata &m, const AnalysisDecisions &d, const AnalysisOptions &o,
              std::stop_token s)
         : image(i), metadata(m), decisions(d), options(o), stop(s),
-          relocations(take(RelocationResolver::create(i, m, s))) {}
+          relocations(take(RelocationResolver::create(i, m, s))) {
+        for (const auto &symbol : metadata.imports) {
+            if (stop.stop_requested())
+                throw Failure{{ErrorCode::canceled, "Function recovery canceled while indexing import slots"}};
+            std::optional<ExternalIdentity> identity;
+            const bool has_symbol = symbol.name && !symbol.name->empty() && !symbol.ordinal;
+            const bool has_ordinal = symbol.ordinal && !symbol.name;
+            if (!symbol.library.empty() && symbol.library.size() <= 65536 &&
+                symbol.library.find('\0') == std::string::npos && (has_symbol || has_ordinal) &&
+                (!symbol.name || (symbol.name->size() <= 65536 && symbol.name->find('\0') == std::string::npos)))
+                identity = ExternalIdentity{symbol.library, symbol.name, symbol.ordinal};
+            const auto [found, inserted] = imported_call_slots.emplace(symbol.iat, identity);
+            if (!inserted && found->second != identity)
+                found->second.reset();
+        }
+    }
     void canceled() const {
         if (stop.stop_requested())
             throw Failure{{ErrorCode::canceled, "Function recovery canceled"}};
@@ -149,6 +171,7 @@ class Recovery {
     void trusted_seeds();
     void assign_owners();
     void prune_unowned_seeds();
+    void resolve_wasm_indirect_calls();
 };
 void build_blocks(Recovery &);
 void finish_functions(Recovery &);

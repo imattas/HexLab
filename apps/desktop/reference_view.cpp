@@ -2,9 +2,16 @@
 #include "project_view.hpp"
 #include "hexlab/analysis/functions.hpp"
 #include "hexlab/image/image.hpp"
+#include <wx/choicdlg.h>
+#include <wx/clipbrd.h>
+#include <wx/dataobj.h>
+#include <wx/msgdlg.h>
 #include <wx/sizer.h>
 #include <wx/textctrl.h>
 #include <algorithm>
+#include <limits>
+#include <map>
+#include <tuple>
 namespace hexlab::desktop {
 namespace {
 const char *kind_text(ReferenceKind kind) {
@@ -46,10 +53,20 @@ wxString target_text(const Reference &reference, const Image *image) {
             text += *reference.provenance.target_mode == ExecutionMode::thumb ? " [Thumb]" : " [A32]";
         return text;
     }
-    if (auto external = std::get_if<ExternalIdentity>(&target))
+    if (auto external = std::get_if<ExternalIdentity>(&target)) {
+        if (external->wasm_function_index) {
+            auto text = wxString::Format("wasm:%s!%s [function index %u]",
+                preview_text(external->library, 160),
+                preview_text(external->name.value_or(std::string{}), 160),
+                *external->wasm_function_index);
+            if (external->host_binding)
+                text += " [host-binding " + preview_text(*external->host_binding, 160) + "]";
+            return text;
+        }
         return preview_text(external->library, 160) + "!" +
                (external->name ? preview_text(*external->name, 160)
                                : wxString::Format("#%u", external->ordinal.value_or(0)));
+    }
     auto &unresolved = std::get<UnresolvedTarget>(target);
     wxString reason;
     switch (unresolved.reason) {
@@ -104,6 +121,108 @@ wxString target_text(const Reference &reference, const Image *image) {
     }
     return "unresolved: " + reason;
 }
+struct FunctionCallRelation { Address entry; Address call_site; };
+struct FunctionCallNeighborhood {
+    std::vector<FunctionCallRelation> callees, callers;
+    bool omitted = false;
+};
+using CallAddressKey = std::pair<std::uint32_t, std::uint64_t>;
+CallAddressKey call_address_key(Address value) { return {value.space.value, value.offset}; }
+FunctionCallNeighborhood function_call_neighborhood(const ProjectSnapshot &project, Address address,
+                                                     const Image *image) {
+    FunctionCallNeighborhood result;
+    if (!image || !project.loaded || !project.functions || !project.references || !project.derived_key ||
+        project.references->key() != project.derived_key || project.functions->key != project.derived_key ||
+        (project.status != DerivedStatus::fresh && project.status != DerivedStatus::incomplete))
+        return result;
+    constexpr std::size_t max_indexed_functions = 4096, max_indexed_ranges = 8192;
+    constexpr std::size_t max_chunks = 8, max_page = 128;
+    const auto executable = [image](Address value) {
+        const auto *segment = image->segment_at(value);
+        return segment && segment->executable;
+    };
+    struct FunctionRange { Address begin; std::uint64_t end; const FunctionRecord *function; };
+    std::map<CallAddressKey, const FunctionRecord *> entries;
+    std::vector<FunctionRange> ranges;
+    std::size_t indexed_functions = 0;
+    for (const auto &candidate : project.functions->functions) {
+        if (!candidate) continue;
+        if (indexed_functions++ == max_indexed_functions) { result.omitted = true; break; }
+        entries.try_emplace(call_address_key(candidate->entry), candidate.get());
+        for (const auto &range : candidate->chunks) {
+            if (ranges.size() == max_indexed_ranges) { result.omitted = true; break; }
+            if (range.size && range.size <= std::numeric_limits<std::uint64_t>::max() - range.begin.offset)
+                ranges.push_back({range.begin, range.begin.offset + range.size, candidate.get()});
+        }
+        if (ranges.size() == max_indexed_ranges) { result.omitted = true; break; }
+    }
+    std::sort(ranges.begin(), ranges.end(), [](const auto &left, const auto &right) {
+        return std::tie(left.begin.space.value, left.begin.offset, left.end) <
+               std::tie(right.begin.space.value, right.begin.offset, right.end);
+    });
+    const auto function_for = [&](Address value) -> const FunctionRecord * {
+        if (const auto exact = entries.find(call_address_key(value)); exact != entries.end()) return exact->second;
+        const auto after = std::upper_bound(ranges.begin(), ranges.end(), value,
+            [](Address needle, const FunctionRange &range) {
+                return std::tie(needle.space.value, needle.offset) <
+                       std::tie(range.begin.space.value, range.begin.offset);
+            });
+        auto it = after;
+        for (std::size_t checked = 0; it != ranges.begin() && checked < 32;) {
+            --it;
+            ++checked;
+            if (it->begin.space.value != value.space.value) break;
+            if (value.offset >= it->begin.offset && value.offset < it->end) return it->function;
+        }
+        return nullptr;
+    };
+    const auto *containing = function_for(address);
+    if (!containing) return result;
+    std::map<CallAddressKey, FunctionCallRelation> callees, callers;
+    const auto chunk_count = std::min(max_chunks, containing->chunks.size());
+    if (containing->chunks.size() > chunk_count) result.omitted = true;
+    for (std::size_t i = 0; i < chunk_count; ++i) {
+        const auto &chunk = containing->chunks[i];
+        if (chunk.size == 0 || chunk.size > std::numeric_limits<std::uint64_t>::max() - chunk.begin.offset ||
+            !executable(chunk.begin)) continue;
+        auto outgoing = project.references->outgoing_range(chunk.begin, chunk.size, {0, max_page});
+        if (outgoing) {
+            for (const auto &reference : outgoing.value().rows) {
+                if (reference.kind != ReferenceKind::call) continue;
+                const auto *source = std::get_if<Address>(&reference.source);
+                const auto *target_location = std::get_if<Location>(&reference.target);
+                const auto *target = target_location ? std::get_if<Address>(target_location) : nullptr;
+                if (!source || !target || !executable(*target)) continue;
+                if (const auto *callee = function_for(*target))
+                    callees.try_emplace(call_address_key(callee->entry), FunctionCallRelation{callee->entry, *source});
+            }
+            if (outgoing.value().next_offset) result.omitted = true;
+        }
+        auto incoming = project.references->incoming_range(chunk.begin, chunk.size, {0, max_page});
+        if (incoming) {
+            for (const auto &reference : incoming.value().rows) {
+                if (reference.kind != ReferenceKind::call) continue;
+                const auto *target_location = std::get_if<Location>(&reference.target);
+                const auto *target = target_location ? std::get_if<Address>(target_location) : nullptr;
+                if (!target || target->space != chunk.begin.space || target->offset < chunk.begin.offset ||
+                    target->offset - chunk.begin.offset >= chunk.size) continue;
+                const auto *source = std::get_if<Address>(&reference.source);
+                if (source && executable(*source))
+                    if (const auto *caller = function_for(*source))
+                        callers.try_emplace(call_address_key(caller->entry), FunctionCallRelation{caller->entry, *source});
+            }
+            if (incoming.value().next_offset) result.omitted = true;
+        }
+    }
+    for (const auto &[key, relation] : callees) result.callees.push_back(relation);
+    for (const auto &[key, relation] : callers) result.callers.push_back(relation);
+    return result;
+}
+wxString function_relation_label(const ProjectSnapshot &project, const FunctionCallRelation &relation,
+                                 const Image *image) {
+    return preview_text(presentation_name(project, Location{relation.entry}), 96) +
+           " | callsite " + location_text(Location{relation.call_site}, image);
+}
 wxString endpoint_context(const ProjectSnapshot &project, Location location, const Image *image) {
     wxString result;
     const auto append = [&result](wxString value) {
@@ -118,6 +237,7 @@ wxString endpoint_context(const ProjectSnapshot &project, Location location, con
         append("comment: " + preview_text(annotation->comment, 160));
 
     const auto address = std::get_if<Address>(&location);
+    const FunctionRecord *containing_function = nullptr;
     if (address && project.functions) {
         for (const auto &function : project.functions->functions) {
             if (!function) continue;
@@ -130,6 +250,7 @@ wxString endpoint_context(const ProjectSnapshot &project, Location location, con
                 }
             }
             if (!contains) continue;
+            containing_function = function.get();
             auto label = preview_text(presentation_name(project, Location{function->entry}), 128);
             if (address->space == function->entry.space && address->offset >= function->entry.offset &&
                 address->offset != function->entry.offset)
@@ -138,6 +259,26 @@ wxString endpoint_context(const ProjectSnapshot &project, Location location, con
             append("function " + label);
             break;
         }
+    }
+
+    // The text summary uses the same bounded resolved-call neighborhood as the
+    // explicit caller/callee navigation controls below.
+    if (address && containing_function && image) {
+        const auto relationships = function_call_neighborhood(project, *address, image);
+        const auto append_relations = [&](const char *prefix, const std::vector<FunctionCallRelation> &relations) {
+            if (relations.empty()) return;
+            wxString value = wxString::Format("%s ", prefix);
+            const auto shown = std::min<std::size_t>(6, relations.size());
+            for (std::size_t i = 0; i < shown; ++i) {
+                if (i) value += ", ";
+                value += preview_text(presentation_name(project, Location{relations[i].entry}), 96);
+            }
+            if (relations.size() > shown) value += wxString::Format(" (+%zu)", relations.size() - shown);
+            append(value);
+        };
+        append_relations("calls", relationships.callees);
+        append_relations("called by", relationships.callers);
+        if (relationships.omitted) append("call relationship results bounded");
     }
 
     if (image) {
@@ -198,6 +339,14 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
     origin_->SetToolTip("Return to the current reference origin (Ctrl+Home).");
     context_bar->Add(pin_, 0, wxALL | wxALIGN_CENTER_VERTICAL, pad);
     context_bar->Add(origin_, 0, wxALL, pad);
+    call_callees_ = new wxButton(this, wxID_ANY, "Go to callee");
+    call_callees_->SetName("reference-call-callee");
+    call_callees_->SetToolTip("Choose a resolved executable callee of the containing function.");
+    call_callers_ = new wxButton(this, wxID_ANY, "Go to caller");
+    call_callers_->SetName("reference-call-caller");
+    call_callers_->SetToolTip("Choose a resolved executable caller of the containing function.");
+    context_bar->Add(call_callees_, 0, wxALL, pad);
+    context_bar->Add(call_callers_, 0, wxALL, pad);
     stack->Add(context_bar, 0, wxEXPAND);
     context_ = new wxStaticText(this, wxID_ANY, "Select a location", wxDefaultPosition, wxDefaultSize,
                                 wxST_ELLIPSIZE_END);
@@ -210,8 +359,12 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
     target_ = new wxButton(this, wxID_ANY, "Go to target");
     target_->SetName("reference-target");
     target_->SetToolTip("Available only for a resolved address or file-offset target.");
+    copy_selected_ = new wxButton(this, wxID_ANY, "Copy selected TSV");
+    copy_selected_->SetName("reference-copy-selected");
+    copy_selected_->SetToolTip("Copy the selected reference and bounded relation details as escaped TSV.");
     endpoint_bar->Add(source_, 0, wxALL, pad);
     endpoint_bar->Add(target_, 0, wxALL, pad);
+    endpoint_bar->Add(copy_selected_, 0, wxALL, pad);
     stack->Add(endpoint_bar, 0, wxEXPAND);
     auto *filter_bar = new wxBoxSizer(wxHORIZONTAL);
     filter_ = new wxTextCtrl(this, wxID_ANY);
@@ -308,6 +461,7 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
     });
     source_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { follow_selected(false); });
     target_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { follow_selected(true); });
+    copy_selected_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_selected_reference(); });
     filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { reload(); });
     origin_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         if (document_ && location_ && navigate) {
@@ -316,6 +470,8 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
             navigate(id, project_, location);
         }
     });
+    call_callees_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { navigate_call_relations(false); });
+    call_callers_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { navigate_call_relations(true); });
     table_->SetToolTip("References for the selected location. Use Up/Down to select an item; Enter or double-click follows its current endpoint.");
     direction_->SetToolTip("Choose outgoing references from the current location or incoming references to it.");
     previous_->SetToolTip("Show the previous page of references (Alt+Left).");
@@ -375,8 +531,16 @@ void ReferenceView::update_actions() {
     const auto *reference = selected_reference();
     source_->Enable(reference != nullptr);
     target_->Enable(reference && std::holds_alternative<Location>(reference->target));
+    copy_selected_->Enable(reference != nullptr);
     origin_->Enable(document_.has_value() && location_.has_value());
     pin_->Enable(document_.has_value() && location_.has_value());
+    const bool call_neighborhood_available = document_.has_value() && project_ && project_->loaded &&
+        project_->loaded->image && project_->functions && project_->references && project_->derived_key &&
+        project_->references->key() == project_->derived_key && project_->functions->key == project_->derived_key &&
+        (project_->status == DerivedStatus::fresh || project_->status == DerivedStatus::incomplete) &&
+        location_ && std::holds_alternative<Address>(*location_) && bool(navigate);
+    call_callees_->Enable(call_neighborhood_available);
+    call_callers_->Enable(call_neighborhood_available);
     const auto preference = document_ ? preferences_.find(document_->value) : preferences_.end();
     const bool pinned = preference != preferences_.end() && preference->second.pinned.has_value();
     pin_->SetValue(pinned);
@@ -476,6 +640,58 @@ void ReferenceView::update_detail() {
         text_value += wxString::Format("Mach-O dyld origins: %zu\n", reference->provenance.dyld->origins.size());
     detail_->ChangeValue(text_value);
 }
+void ReferenceView::copy_selected_reference() {
+    const auto *reference = selected_reference();
+    if (!reference || !project_) {
+        status_->SetLabel("Select a reference before copying its details");
+        return;
+    }
+    constexpr std::size_t byte_limit = 64u * 1024u;
+    const auto escape = [](std::string_view value) {
+        static constexpr char digits[] = "0123456789ABCDEF";
+        std::string output;
+        output.reserve(value.size());
+        for (const unsigned char byte : value) {
+            if (byte == '\\') output += "\\\\";
+            else if (byte == '\t') output += "\\t";
+            else if (byte == '\r') output += "\\r";
+            else if (byte == '\n') output += "\\n";
+            else if (byte < 0x20 || byte == 0x7f) {
+                output += "\\x";
+                output.push_back(digits[byte >> 4]);
+                output.push_back(digits[byte & 0x0f]);
+            } else output.push_back(static_cast<char>(byte));
+        }
+        return output;
+    };
+    std::string output = "Field\tValue\r\n";
+    const auto append = [&](std::string_view field, const wxString &value) {
+        const auto encoded = value.ToUTF8();
+        if (!encoded) return false;
+        std::string row = escape(field) + "\t" + escape(std::string_view(encoded.data(), encoded.length())) + "\r\n";
+        if (row.size() > byte_limit - output.size()) return false;
+        output += row;
+        return true;
+    };
+    const auto *image = project_->loaded ? project_->loaded->image.get() : nullptr;
+    if (!append("Document", wxString::Format("%llu", static_cast<unsigned long long>(document_ ? document_->value : 0))) ||
+        !append("Reference ID", wxString::Format("%llu", static_cast<unsigned long long>(reference->id.value))) ||
+        !append("Source", location_text(reference->source, image)) ||
+        !append("Target", target_text(*reference, image)) ||
+        !append("Kind", wxString(kind_text(reference->kind))) ||
+        !append("Relation details", detail_->GetValue())) {
+        status_->SetLabel("Selected reference details exceed the 64 KiB TSV clipboard limit or contain invalid UTF-8");
+        return;
+    }
+    if (!wxTheClipboard || !wxTheClipboard->Open()) {
+        status_->SetLabel("Could not open the system clipboard");
+        return;
+    }
+    const bool copied = wxTheClipboard->SetData(new wxTextDataObject(wxString::FromUTF8(output.data(), output.size())));
+    wxTheClipboard->Close();
+    status_->SetLabel(copied ? "Copied selected reference details as TSV" :
+                               "Could not copy selected reference details");
+}
 void ReferenceView::follow_selected(bool target) {
     const auto *reference = selected_reference();
     if (!reference || !document_ || !navigate) return;
@@ -489,6 +705,41 @@ void ReferenceView::follow_selected(bool target) {
         const auto location = reference->source;
         navigate(id, project_, location);
     }
+}
+void ReferenceView::navigate_call_relations(bool callers) {
+    if (!document_ || !project_ || !project_->loaded || !project_->loaded->image || !location_ ||
+        !std::holds_alternative<Address>(*location_) || !navigate)
+        return;
+    const auto document = *document_;
+    const auto snapshot = project_;
+    const auto *image = snapshot->loaded->image.get();
+    auto relationships = function_call_neighborhood(*snapshot, std::get<Address>(*location_), image);
+    const auto &links = callers ? relationships.callers : relationships.callees;
+    const auto title = callers ? wxString("Resolved callers") : wxString("Resolved callees");
+    if (links.empty()) {
+        wxMessageBox(callers ? "No resolved executable callers were found for this function."
+                             : "No resolved executable callees were found for this function.",
+                     title, wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    constexpr std::size_t choice_limit = 128;
+    const auto shown = std::min(choice_limit, links.size());
+    wxArrayString choices;
+    choices.Alloc(shown);
+    for (std::size_t i = 0; i < shown; ++i)
+        choices.Add(function_relation_label(*snapshot, links[i], image));
+    auto prompt = callers
+        ? wxString("Choose a caller. Each row includes one resolved call-site source address.")
+        : wxString("Choose a callee. Each row includes one resolved call-site source address.");
+    if (relationships.omitted || links.size() > shown)
+        prompt += "\nResults are bounded; some relationships are not shown.";
+    wxSingleChoiceDialog dialog(this, prompt, title, choices);
+    if (dialog.ShowModal() != wxID_OK) return;
+    const auto selection = dialog.GetSelection();
+    if (selection == wxNOT_FOUND || static_cast<std::size_t>(selection) >= shown ||
+        !document_ || document_->value != document.value || project_ != snapshot || !navigate)
+        return;
+    navigate(document, snapshot, Location{links[static_cast<std::size_t>(selection)].entry});
 }
 void ReferenceView::retain_documents(std::span<const DocumentInfo> docs) {
     for (auto it = preferences_.begin(); it != preferences_.end();)

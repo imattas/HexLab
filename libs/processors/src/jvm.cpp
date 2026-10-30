@@ -140,7 +140,14 @@ DecodeResult decode_jvm(std::span<const std::byte> b, Address at) {
         const auto nested=std::to_integer<std::uint8_t>(b[n++]);
         if(!((nested>=0x15&&nested<=0x19)||(nested>=0x36&&nested<=0x3a)||nested==0x84||nested==0xa9)) return fail(DecodeStatus::invalid,"wide prefix applied to an illegal opcode");
         if(!need(nested==0x84?4:2)) return fail(DecodeStatus::truncated,"truncated wide operands");
-        mnemonic=std::string("wide ")+std::string(names[nested]); imm(nested,8); imm(u16(b,n),16); n+=2;
+        const auto index = u16(b, n);
+        const bool category2_local = nested == 0x16 || nested == 0x18 || nested == 0x37 || nested == 0x39;
+        // Code.max_locals is u2, so even its largest legal value (65535)
+        // cannot contain local index 65535 or a category-2 pair starting at
+        // 65534. Reject forms that no classfile method can make valid.
+        if (index == UINT16_MAX || (category2_local && index >= UINT16_MAX - 1))
+            return fail(DecodeStatus::invalid, "wide local index cannot fit in the JVM Code.max_locals limit");
+        mnemonic=std::string("wide ")+std::string(names[nested]); imm(nested,8); imm(index,16); n+=2;
         if(nested==0x84){imm(static_cast<std::uint16_t>(s16(b,n)),16,true);n+=2;}
         if(nested==0xa9)flow=FlowKind::jump;
     }

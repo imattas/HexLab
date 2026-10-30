@@ -20,5 +20,7 @@ inline std::int64_t signed_bits(std::uint32_t value, unsigned bits) {
 inline bool active(const Instruction &i) { return i.arm->it_before.known && i.arm->it_before.bits; }
 bool flow(Instruction &, std::uint16_t, std::optional<std::uint16_t>);
 bool data(Instruction &, std::uint16_t);
+bool data_wide(Instruction &, std::uint16_t, std::uint16_t);
 bool memory(Instruction &, std::uint16_t);
+bool memory_wide(Instruction &, std::uint16_t, std::uint16_t);
 } // namespace hexlab::thumb_detail

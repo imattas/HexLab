@@ -4,12 +4,38 @@
 
 namespace hexlab::decompiler {
 namespace {
+bool same_type(const types::TypePtr &left, const types::TypePtr &right, unsigned depth = 0) {
+    if (!left || !right || depth > 64 || left->kind() != right->kind()) return false;
+    switch (left->kind()) {
+    case types::Kind::function:
+        if (left->function_convention() != right->function_convention() ||
+            left->variadic() != right->variadic() ||
+            left->parameters().size() != right->parameters().size() ||
+            !same_type(left->result_type(), right->result_type(), depth + 1)) return false;
+        for (std::size_t i = 0; i < left->parameters().size(); ++i)
+            if (!same_type(left->parameters()[i].type, right->parameters()[i].type, depth + 1))
+                return false;
+        return true;
+    case types::Kind::pointer:
+        return left->size() == right->size() && left->alignment() == right->alignment() &&
+               same_type(left->element(), right->element(), depth + 1);
+    case types::Kind::array:
+    case types::Kind::vector:
+        return left->count() == right->count() && left->size() == right->size() &&
+               left->alignment() == right->alignment() &&
+               same_type(left->element(), right->element(), depth + 1);
+    case types::Kind::qualified:
+        return left->qualifiers() == right->qualifiers() && left->size() == right->size() &&
+               left->alignment() == right->alignment() &&
+               same_type(left->element(), right->element(), depth + 1);
+    default:
+        return left->id() == right->id();
+    }
+}
+
 bool exact_type(const types::TypePtr &left, const types::TypePtr &right) {
-    if (!left || !right || left->kind() != types::Kind::function ||
-        right->kind() != types::Kind::function) return false;
-    const auto a = types::encode(*left);
-    const auto b = types::encode(*right);
-    return a && b && a.value() == b.value();
+    return left && right && left->kind() == types::Kind::function &&
+           right->kind() == types::Kind::function && same_type(left, right);
 }
 }
 

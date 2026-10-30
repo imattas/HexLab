@@ -15,6 +15,8 @@ struct DexDebugLine {
     std::uint32_t address = 0; // Byte offset in the method-relative address space.
     std::uint32_t line = 0;
     std::string source_file;
+    bool prologue_end = false;
+    bool epilogue_begin = false;
     bool operator==(const DexDebugLine &) const = default;
 };
 struct DexDebugLocal {
@@ -52,12 +54,14 @@ struct DexMethodCode {
 struct DexDeclaredField {
     std::uint32_t field_index = 0;
     std::uint32_t access_flags = 0;
+    std::string name; // Resolved from the validated DEX string_id table.
     bool operator==(const DexDeclaredField &) const = default;
 };
 struct DexDeclaredMethod {
     std::uint32_t method_index = 0;
     std::uint32_t access_flags = 0;
     std::uint32_t code_offset = 0; // Zero for abstract, native, or otherwise code-less methods.
+    std::string name; // Resolved from the validated DEX string_id table.
     bool operator==(const DexDeclaredMethod &) const = default;
 };
 struct DexClassDefinition {
@@ -66,6 +70,7 @@ struct DexClassDefinition {
     std::optional<std::uint32_t> superclass_index;
     std::optional<std::uint32_t> source_file_index;
     std::uint32_t class_data_offset = 0;
+    std::uint32_t annotations_offset = 0; // Zero means no directory, not an empty directory.
     std::vector<std::uint32_t> interface_indices;
     std::vector<DexDeclaredField> static_fields, instance_fields;
     std::vector<DexDeclaredMethod> direct_methods, virtual_methods;
@@ -81,6 +86,7 @@ struct DexEncodedValue {
     std::uint64_t payload = 0;
     std::uint32_t name_index = UINT32_MAX; // Set only for annotation elements.
     std::uint64_t file_offset = 0;
+    std::uint64_t byte_size = 0; // Exact encoded_value extent, including nested children for containers.
     std::vector<DexEncodedValue> children; // Array elements or annotation elements.
     bool operator==(const DexEncodedValue &) const = default;
 };
@@ -109,6 +115,7 @@ struct DexAnnotationItem {
     std::uint8_t visibility = 0; // DEX build, runtime, or system visibility.
     std::uint32_t type_index = 0;
     std::uint64_t file_offset = 0; // annotation_item start in the DEX file.
+    std::uint64_t byte_size = 0; // Complete visibility + encoded_annotation extent.
     std::vector<DexEncodedValue> elements; // name_index is set on each element value.
     bool operator==(const DexAnnotationItem &) const = default;
 };
@@ -122,6 +129,31 @@ struct DexAnnotationLink {
     std::uint64_t file_offset = 0; // Exact file location of the annotation-set offset reference.
     bool operator==(const DexAnnotationLink &) const = default;
 };
+struct DexAnnotationSet {
+    std::uint64_t file_offset=0, byte_size=0;
+    // Indexes into DexMetadata::annotations in the original set-entry order.
+    // Empty vectors preserve an explicitly present empty annotation_set_item.
+    std::vector<std::uint32_t> annotation_indices;
+    bool operator==(const DexAnnotationSet &) const = default;
+};
+struct DexAnnotationSetRefList {
+    std::uint64_t file_offset=0, byte_size=0;
+    // Prototype parameter positions, excluding the implicit receiver. Zero
+    // means absent annotations; a nonzero offset can name a present empty set.
+    std::vector<std::uint32_t> set_offsets;
+    bool operator==(const DexAnnotationSetRefList &) const = default;
+};
+struct DexAnnotationDirectoryEntry {
+    std::uint32_t member_index=0, annotations_offset=0;
+    std::uint64_t file_offset=0;
+    bool operator==(const DexAnnotationDirectoryEntry &) const = default;
+};
+struct DexAnnotationDirectory {
+    std::uint32_t class_def_index=0, class_annotations_offset=0;
+    std::uint64_t file_offset=0, byte_size=0;
+    std::vector<DexAnnotationDirectoryEntry> fields, methods, parameters;
+    bool operator==(const DexAnnotationDirectory &) const = default;
+};
 enum class DexHiddenApiMemberKind : std::uint8_t { field, method };
 struct DexHiddenApiFlag {
     std::uint32_t class_def_index = 0;
@@ -131,10 +163,59 @@ struct DexHiddenApiFlag {
     std::uint64_t file_offset = 0; // Exact source offset of the encoded flag.
     bool operator==(const DexHiddenApiFlag &) const = default;
 };
+struct DexMethodParameterMetadata {
+    std::uint32_t method_index = 0, parameter_index = 0;
+    std::optional<std::uint32_t> name_index;
+    std::uint32_t access_flags = 0;
+    std::uint64_t name_file_offset = 0, access_flags_file_offset = 0;
+    bool operator==(const DexMethodParameterMetadata &) const = default;
+};
+struct DexMethodThrows {
+    std::uint32_t method_index = 0;
+    std::vector<std::uint32_t> type_indices;
+    std::uint64_t value_file_offset = 0;
+    std::uint64_t annotation_link_file_offset = 0;
+    bool operator==(const DexMethodThrows &) const = default;
+};
+struct DexStringSource {
+    std::uint32_t id_file_offset = 0, data_file_offset = 0;
+    // Complete string_data_item, including ULEB128 length and NUL terminator.
+    std::uint32_t data_size = 0, utf16_size = 0;
+    bool operator==(const DexStringSource &) const = default;
+};
+struct DexFieldIdentifier {
+    std::uint32_t declaring_type_index = 0, type_index = 0, name_index = 0;
+    std::uint64_t file_offset = 0;
+    bool operator==(const DexFieldIdentifier &) const = default;
+};
+struct DexMethodIdentifier {
+    std::uint32_t declaring_type_index = 0, prototype_index = 0, name_index = 0;
+    std::uint64_t file_offset = 0;
+    bool operator==(const DexMethodIdentifier &) const = default;
+};
 struct DexMetadata {
     std::vector<DexMapItem> map_items;
+    // Opaque header-declared link_data section. The format leaves its payload
+    // unspecified; retain only its validated physical source extent.
+    std::uint32_t link_data_offset = 0;
+    std::uint32_t link_data_size = 0;
+    // Complete identifier catalogs, in original table-index order. References
+    // include members defined elsewhere; no external resolution is implied.
+    std::vector<std::string> strings;
+    std::vector<DexStringSource> string_sources;
+    std::vector<DexFieldIdentifier> field_identifiers;
+    std::vector<DexMethodIdentifier> method_identifiers;
+    // Type IDs are retained once; prototype rows refer to this shared table.
+    // This preserves complete descriptors without copying long class/array
+    // descriptors into every prototype that uses them.
+    std::vector<std::string> type_descriptors;
     // proto_id and method_id order is the DEX table index order.
     std::vector<DexReturnKind> prototype_return_kinds;
+    std::vector<std::uint32_t> prototype_return_type_indices;
+    // Half-open ranges into prototype_parameter_type_indices, one per proto
+    // plus a terminal offset. Parameter entries remain in encoded order.
+    std::vector<std::uint32_t> prototype_parameter_offsets;
+    std::vector<std::uint32_t> prototype_parameter_type_indices;
     // Number of Dalvik register words occupied by each prototype's parameters.
     // Wide primitive parameters count as two; the implicit receiver is excluded.
     std::vector<std::uint32_t> prototype_parameter_word_counts;
@@ -147,7 +228,17 @@ struct DexMetadata {
     std::vector<DexCallSite> call_sites;
     std::vector<DexAnnotationItem> annotations;
     std::vector<DexAnnotationLink> annotation_links;
+    // Reachable containers retain the directory graph, including empty sets
+    // and null parameter positions that produce no flattened annotation link.
+    std::vector<DexAnnotationSet> annotation_sets;
+    std::vector<DexAnnotationSetRefList> annotation_set_ref_lists;
+    std::vector<DexAnnotationDirectory> annotation_directories;
     std::vector<DexHiddenApiFlag> hidden_api_flags;
+    // Decoded dalvik.annotation.MethodParameters rows, linked by method ID.
+    std::vector<DexMethodParameterMetadata> method_parameters;
+    // Decoded dalvik.annotation.Throws value arrays, linked by method ID.
+    // Type assignability and duplicate type entries are retained, not resolved.
+    std::vector<DexMethodThrows> method_throws;
     bool operator==(const DexMetadata &) const = default;
 };
 }

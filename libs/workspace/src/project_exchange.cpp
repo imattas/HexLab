@@ -44,8 +44,10 @@ struct ProjectBreakpointRow {
     bool logpoint=false;
     std::string log_message;
     std::uint64_t ignore_count=0;
+    bool one_shot=false;
 };
-struct Bundle { database::InputIdentity input; std::uint64_t version=0; std::vector<AnnotationRow> annotations; std::vector<BookmarkRow> bookmarks; std::vector<ReferenceRow> references; std::vector<RegionRow> regions; std::vector<FunctionRow> functions; std::vector<TypeRow> types; std::vector<TypeAssignmentRow> type_assignments; std::vector<DebugVariableRow> debug_variables; std::vector<ProjectBreakpointRow> project_breakpoints; };
+struct PatchRow { std::uint64_t offset=0; std::vector<std::byte> original, replacement; };
+struct Bundle { database::InputIdentity input; std::uint64_t version=0; std::vector<AnnotationRow> annotations; std::vector<BookmarkRow> bookmarks; std::vector<ReferenceRow> references; std::vector<RegionRow> regions; std::vector<FunctionRow> functions; std::vector<TypeRow> types; std::vector<TypeAssignmentRow> type_assignments; std::vector<DebugVariableRow> debug_variables; std::vector<ProjectBreakpointRow> project_breakpoints; std::vector<PatchRow> patches; };
 Error invalid(std::string message, ErrorCode code = ErrorCode::invalid_argument) { return {code, std::move(message)}; }
 bool valid_utf8(std::string_view text) {
     for (std::size_t i = 0; i < text.size();) {
@@ -77,7 +79,7 @@ bool write_text(std::vector<std::byte> &out, std::string_view value, std::size_t
     return true;
 }
 bool write_blob(std::vector<std::byte> &out, std::span<const std::byte> value, std::size_t maximum) {
-    if (value.size() > maximum || value.size() > UINT32_MAX || out.size() > maximum || 4 > maximum - out.size() || value.size() > maximum - out.size() - 4) return false;
+    if (value.size() > max_text || value.size() > UINT32_MAX || out.size() > maximum || 4 > maximum - out.size() || value.size() > maximum - out.size() - 4) return false;
     if (!write_number(out, value.size(), 4, maximum)) return false;
     out.insert(out.end(), value.begin(), value.end());
     return true;
@@ -93,7 +95,7 @@ public:
     }
     bool text(std::string &value) {
         std::uint64_t size = 0;
-        if (!number(4, size) || size > max_exchange_bytes || size > bytes_.size() - position_) return false;
+        if (!number(4, size) || size > max_text || size > bytes_.size() - position_) return false;
         value.assign(reinterpret_cast<const char *>(bytes_.data() + position_), static_cast<std::size_t>(size));
         position_ += static_cast<std::size_t>(size);
         return true;
@@ -173,7 +175,8 @@ bool operations_write(std::vector<std::byte> &out,
                       std::size_t maximum) {
     if (operations.size() > 4096 || !write_number(out, operations.size(), 4, maximum)) return false;
     for (const auto &operation : operations) {
-        if (operation.kind > 15 || !write_number(out, operation.kind, 1, maximum) ||
+        if (operation.kind > 20 || (operation.kind == 16 && operation.second_unsigned_operand > 9) ||
+            !write_number(out, operation.kind, 1, maximum) ||
             !write_number(out, operation.unsigned_operand, 8, maximum) ||
             !write_number(out, static_cast<std::uint64_t>(operation.signed_operand), 8, maximum) ||
             !write_number(out, operation.expression_offset, 4, maximum) ||
@@ -188,10 +191,10 @@ bool operations_read(Reader &reader, std::vector<database::DebugLocationOperatio
     operations.reserve(static_cast<std::size_t>(count));
     for (std::uint64_t n=0; n<count; ++n) {
         std::uint64_t kind=0, unsigned_operand=0, signed_operand=0, expression_offset=0, second_unsigned_operand=0;
-        if (!reader.number(1,kind) || kind>15 || !reader.number(8,unsigned_operand) ||
+        if (!reader.number(1,kind) || kind>20 || !reader.number(8,unsigned_operand) ||
             !reader.number(8,signed_operand) || !reader.number(4,expression_offset) ||
             expression_offset>UINT32_MAX || !reader.number(8,second_unsigned_operand) ||
-            expression_size==0 || expression_offset>=expression_size) return false;
+            expression_size==0 || expression_offset>=expression_size || (kind==16 && second_unsigned_operand>9)) return false;
         operations.push_back({static_cast<std::uint8_t>(kind),unsigned_operand,
                               std::bit_cast<std::int64_t>(signed_operand),
                               static_cast<std::uint32_t>(expression_offset),second_unsigned_operand});
@@ -301,7 +304,7 @@ Result<Bundle> parse(const ProjectSnapshot &project, std::span<const std::byte> 
     Reader reader(bytes);
     std::array<std::byte, 4> magic{};
     if (!reader.raw(magic) || magic != std::array{std::byte{'H'}, std::byte{'X'}, std::byte{'E'}, std::byte{'X'}}) return invalid("Unknown exchange magic");
-    std::uint64_t version = 0, reserved = 0, input_size = 0, annotation_count = 0, bookmark_count = 0, reference_count = 0, region_count = 0, function_count = 0, type_count = 0, assignment_count = 0, debug_variable_count = 0, project_breakpoint_count = 0;
+    std::uint64_t version = 0, reserved = 0, input_size = 0, annotation_count = 0, bookmark_count = 0, reference_count = 0, region_count = 0, function_count = 0, type_count = 0, assignment_count = 0, debug_variable_count = 0, project_breakpoint_count = 0, patch_count = 0;
     if (!reader.number(2, version) || !reader.number(2, reserved) || !reader.number(8, input_size)) return invalid("Truncated exchange header");
     Bundle bundle; bundle.version=version;
     if (!reader.raw(bundle.input.sha256)) return invalid("Truncated exchange identity");
@@ -314,11 +317,15 @@ Result<Bundle> parse(const ProjectSnapshot &project, std::span<const std::byte> 
     if (version == 7 && (!reader.number(4, region_count) || !reader.number(4, function_count) ||
                          !reader.number(4, type_count) || !reader.number(4, assignment_count) ||
                          !reader.number(4, debug_variable_count) || !reader.number(4, project_breakpoint_count))) return invalid("Truncated exchange counts");
-    if (version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7) return invalid("Unsupported project exchange version");
+    if ((version == 8 || version == 9) && (!reader.number(4, region_count) || !reader.number(4, function_count) ||
+                         !reader.number(4, type_count) || !reader.number(4, assignment_count) ||
+                         !reader.number(4, debug_variable_count) || !reader.number(4, project_breakpoint_count) ||
+                         !reader.number(4, patch_count))) return invalid("Truncated exchange counts");
+    if (version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7 && version != 8 && version != 9) return invalid("Unsupported project exchange version");
     if (reserved != 0) return invalid("Nonzero reserved exchange header bits");
     bundle.input.size = input_size;
     if (bundle.input != project.state->input) return invalid("Exchange belongs to different original input bytes", ErrorCode::conflict);
-    if (annotation_count + bookmark_count + reference_count + region_count + function_count + type_count + assignment_count + debug_variable_count + project_breakpoint_count > max_records) return invalid("Exchange row count exceeds limit", ErrorCode::resource_limit);
+    if (annotation_count + bookmark_count + reference_count + region_count + function_count + type_count + assignment_count + debug_variable_count + project_breakpoint_count + patch_count > max_records) return invalid("Exchange row count exceeds limit", ErrorCode::resource_limit);
     bundle.annotations.reserve(static_cast<std::size_t>(annotation_count));
     bundle.bookmarks.reserve(static_cast<std::size_t>(bookmark_count));
     bundle.references.reserve(static_cast<std::size_t>(reference_count));
@@ -326,6 +333,7 @@ Result<Bundle> parse(const ProjectSnapshot &project, std::span<const std::byte> 
     bundle.types.reserve(static_cast<std::size_t>(type_count)); bundle.type_assignments.reserve(static_cast<std::size_t>(assignment_count));
     bundle.debug_variables.reserve(static_cast<std::size_t>(debug_variable_count));
     bundle.project_breakpoints.reserve(static_cast<std::size_t>(project_breakpoint_count));
+    bundle.patches.reserve(static_cast<std::size_t>(patch_count));
     for (std::uint64_t n = 0; n < annotation_count; ++n) {
         AnnotationRow row{};
         if (!location_read(reader, row.location) || !reader.text(row.name) || !reader.text(row.comment)) return invalid("Malformed annotation exchange row");
@@ -381,16 +389,16 @@ Result<Bundle> parse(const ProjectSnapshot &project, std::span<const std::byte> 
     }
     for (std::uint64_t n = 0; n < project_breakpoint_count; ++n) {
         ProjectBreakpointRow row{};
-        std::uint64_t kind=0, size=0, enabled=0, logpoint=0;
+        std::uint64_t kind=0, size=0, enabled=0, logpoint=0, one_shot=0;
         if (!location_read(reader,row.location) || row.location.kind!=1 ||
             !reader.number(1,kind) || kind>static_cast<unsigned>(database::ProjectBreakpointKind::access) ||
             !reader.number(1,size) || !reader.number(1,enabled) || enabled>1 ||
             !reader.text(row.condition) || row.condition.size()>256 || !valid_utf8(row.condition) || row.condition.find('\0')!=std::string::npos ||
             !reader.number(1,logpoint) || logpoint>1 || !reader.text(row.log_message) ||
             row.log_message.size()>1024 || !valid_utf8(row.log_message) || row.log_message.find('\0')!=std::string::npos ||
-            !reader.number(8,row.ignore_count)) return invalid("Malformed project-breakpoint exchange row");
+            !reader.number(8,row.ignore_count) || (version >= 9 && (!reader.number(1,one_shot) || one_shot>1))) return invalid("Malformed project-breakpoint exchange row");
         row.kind=static_cast<std::uint8_t>(kind); row.size=static_cast<std::uint8_t>(size);
-        row.enabled=enabled!=0; row.logpoint=logpoint!=0;
+        row.enabled=enabled!=0; row.logpoint=logpoint!=0; row.one_shot=one_shot!=0;
         const auto breakpoint_kind=static_cast<database::ProjectBreakpointKind>(kind);
         if ((row.size!=1 && row.size!=2 && row.size!=4 && row.size!=8) ||
             ((breakpoint_kind==database::ProjectBreakpointKind::software ||
@@ -399,10 +407,29 @@ Result<Bundle> parse(const ProjectSnapshot &project, std::span<const std::byte> 
             return invalid("Invalid project-breakpoint size");
         bundle.project_breakpoints.push_back(std::move(row));
     }
+    for (std::uint64_t n = 0; n < patch_count; ++n) {
+        PatchRow row{};
+        if (!reader.number(8, row.offset) || !reader.blob(row.original) || !reader.blob(row.replacement) ||
+            row.original.empty() || row.original.size() != row.replacement.size() ||
+            std::equal(row.original.begin(), row.original.end(), row.replacement.begin()))
+            return invalid("Malformed byte-patch exchange row");
+        for (std::size_t i = 0; i < row.original.size(); ++i)
+            if (row.original[i] == row.replacement[i]) return invalid("Byte-patch row contains a no-op byte");
+        bundle.patches.push_back(std::move(row));
+    }
     if (reader.position() != bytes.size()) return invalid("Trailing bytes after project exchange records");
     for (auto &row : bundle.annotations) if (row.location.offset >= input_size) return invalid("Annotation exchange offset exceeds input");
     for (auto &row : bundle.bookmarks) if (row.location.offset >= input_size) return invalid("Bookmark exchange offset exceeds input");
     for (auto &row : bundle.project_breakpoints) if (row.location.offset >= input_size) return invalid("Project-breakpoint exchange offset exceeds input");
+    for (const auto &row : bundle.patches) {
+        if (row.offset >= input_size || row.original.size() > input_size - row.offset)
+            return invalid("Byte-patch exchange range exceeds input");
+        if (!project.original) return invalid("Original input is unavailable for patch validation");
+        auto original = project.original->read_at({row.offset}, row.original.size());
+        if (!original || original.value().bytes.size() != row.original.size() ||
+            !std::equal(row.original.begin(), row.original.end(), original.value().bytes.begin()))
+            return invalid("Byte-patch original bytes do not match the input identity");
+    }
     for (auto &row : bundle.references) if (row.source.offset >= input_size || row.target.offset >= input_size) return invalid("Reference exchange offset exceeds input");
     for (auto &row : bundle.regions) if (row.begin.kind != 1 || row.begin.offset >= input_size || row.size > input_size - row.begin.offset) return invalid("Region exchange range exceeds input");
     for (auto &row : bundle.functions) {
@@ -438,7 +465,8 @@ Result<Bundle> parse(const ProjectSnapshot &project, std::span<const std::byte> 
         !std::is_sorted(bundle.debug_variables.begin(), bundle.debug_variables.end(), [](const auto &a,const auto &b) {
             return std::tie(a.origin.source_id,a.origin.section,a.origin.unit_offset,a.origin.record_offset) <
                    std::tie(b.origin.source_id,b.origin.section,b.origin.unit_offset,b.origin.record_offset);
-        }) || !std::is_sorted(bundle.project_breakpoints.begin(),bundle.project_breakpoints.end(),[](const auto &a,const auto &b){return a.location<b.location;})) return invalid("Exchange records are not in canonical order");
+        }) || !std::is_sorted(bundle.project_breakpoints.begin(),bundle.project_breakpoints.end(),[](const auto &a,const auto &b){return a.location<b.location;}) ||
+        !std::is_sorted(bundle.patches.begin(), bundle.patches.end(), [](const auto &a, const auto &b) { return a.offset < b.offset; })) return invalid("Exchange records are not in canonical order");
     if (std::adjacent_find(bundle.annotations.begin(), bundle.annotations.end(), [](const auto &a, const auto &b) { return a.location == b.location; }) != bundle.annotations.end() ||
         std::adjacent_find(bundle.bookmarks.begin(), bundle.bookmarks.end(), [](const auto &a, const auto &b) { return a.location == b.location; }) != bundle.bookmarks.end() ||
         std::adjacent_find(bundle.references.begin(), bundle.references.end()) != bundle.references.end() || std::adjacent_find(bundle.regions.begin(), bundle.regions.end(), [](const auto&a,const auto&b){return a.begin==b.begin;}) != bundle.regions.end() || std::adjacent_find(bundle.functions.begin(), bundle.functions.end(), [](const auto&a,const auto&b){return a.entry==b.entry;}) != bundle.functions.end() ||
@@ -448,6 +476,12 @@ Result<Bundle> parse(const ProjectSnapshot &project, std::span<const std::byte> 
                    a.origin.unit_offset==b.origin.unit_offset && a.origin.record_offset==b.origin.record_offset;
         }) != bundle.debug_variables.end() ||
         std::adjacent_find(bundle.project_breakpoints.begin(),bundle.project_breakpoints.end(),[](const auto &a,const auto &b){return a.location==b.location;}) != bundle.project_breakpoints.end()) return invalid("Duplicate exchange records");
+    for (std::size_t n = 1; n < bundle.patches.size(); ++n) {
+        const auto &previous = bundle.patches[n - 1];
+        if (previous.offset > UINT64_MAX - previous.original.size() ||
+            previous.offset + previous.original.size() >= bundle.patches[n].offset)
+            return invalid("Byte-patch exchange rows overlap or are not canonical");
+    }
     return bundle;
 }
 } // namespace
@@ -456,15 +490,50 @@ Result<std::vector<std::byte>> export_project_exchange(const ProjectSnapshot &pr
     max_bytes = std::min(max_bytes, max_exchange_bytes);
     if (!project.state || !project.state->user || !project.state->input.size) return invalid("No project input is available");
     const auto &user = *project.state->user;
-    const auto rows = user.annotations.size() + user.bookmarks.size() + user.decisions.references.size() + user.decisions.regions.size() + user.decisions.functions.size() + user.types.size() + user.type_assignments.size() + user.debug_variables.size() + user.breakpoints.size();
+    const auto rows = user.annotations.size() + user.bookmarks.size() + user.decisions.references.size() + user.decisions.regions.size() + user.decisions.functions.size() + user.types.size() + user.type_assignments.size() + user.debug_variables.size() + user.breakpoints.size() + user.patches.size();
     if (rows > max_records) return invalid("Project user rows exceed exchange limit", ErrorCode::resource_limit);
     std::vector<AnnotationRow> annotations; std::vector<BookmarkRow> bookmarks; std::vector<ReferenceRow> references; std::vector<RegionRow> regions; std::vector<FunctionRow> functions;
-    std::vector<TypeRow> type_rows; std::vector<TypeAssignmentRow> assignments; std::vector<DebugVariableRow> debug_variables; std::vector<ProjectBreakpointRow> project_breakpoints;
-    for (const auto &row : user.annotations) { auto at = portable(project, row.location); if (!at) return at.error(); annotations.push_back({at.value(), row.name, row.comment}); }
-    for (const auto &row : user.bookmarks) { auto at = portable(project, row.location); if (!at) return at.error(); bookmarks.push_back({at.value(), row.label}); }
-    for (const auto &row : user.decisions.references) { auto from = portable(project, row.source); if (!from) return from.error(); auto to = portable(project, row.target); if (!to) return to.error(); references.push_back({from.value(), to.value(), static_cast<std::uint8_t>(row.kind)}); }
-    for (const auto &row : user.decisions.regions) { auto begin = portable_range(project, row.begin, row.size); if (!begin) return begin.error(); regions.push_back({begin.value(), row.size, static_cast<std::uint8_t>(row.kind)}); }
-    for (const auto &row : user.decisions.functions) { auto entry = portable(project, Location{row.entry}); if (!entry) return entry.error(); FunctionRow value{entry.value(), row.suppressed, {}}; for (const auto &chunk : row.chunks) { auto begin = portable_range(project, chunk.begin, chunk.size); if (!begin) return begin.error(); value.chunks.emplace_back(begin.value(), chunk.size); } std::sort(value.chunks.begin(), value.chunks.end()); if (std::adjacent_find(value.chunks.begin(), value.chunks.end()) != value.chunks.end()) return invalid("Duplicate function chunks map to one portable range"); functions.push_back(std::move(value)); }
+    std::vector<TypeRow> type_rows; std::vector<TypeAssignmentRow> assignments; std::vector<DebugVariableRow> debug_variables; std::vector<ProjectBreakpointRow> project_breakpoints; std::vector<PatchRow> patches;
+    for (const auto &row : user.annotations) {
+        auto at = portable(project, row.location); if (!at) return at.error();
+        if ((row.name.empty() && row.comment.empty()) || (at.value().kind == 0 && !row.name.empty()) ||
+            !valid_utf8(row.name) || !valid_utf8(row.comment))
+            return invalid("Project contains an invalid annotation for portable exchange");
+        annotations.push_back({at.value(), row.name, row.comment});
+    }
+    for (const auto &row : user.bookmarks) {
+        auto at = portable(project, row.location); if (!at) return at.error();
+        if (row.label.empty() || !valid_utf8(row.label))
+            return invalid("Project contains an invalid bookmark for portable exchange");
+        bookmarks.push_back({at.value(), row.label});
+    }
+    for (const auto &row : user.decisions.references) {
+        if (row.kind > UserReferenceKind::address) return invalid("Project contains an invalid reference kind");
+        auto from = portable(project, row.source); if (!from) return from.error();
+        auto to = portable(project, row.target); if (!to) return to.error();
+        references.push_back({from.value(), to.value(), static_cast<std::uint8_t>(row.kind)});
+    }
+    for (const auto &row : user.decisions.regions) {
+        if (row.kind > RegionKind::data) return invalid("Project contains an invalid region kind");
+        auto begin = portable_range(project, row.begin, row.size); if (!begin) return begin.error();
+        regions.push_back({begin.value(), row.size, static_cast<std::uint8_t>(row.kind)});
+    }
+    std::size_t total_function_chunks = 0;
+    for (const auto &row : user.decisions.functions) {
+        if (row.chunks.size() > max_records - total_function_chunks)
+            return invalid("Project function chunks exceed exchange limit", ErrorCode::resource_limit);
+        total_function_chunks += row.chunks.size();
+        auto entry = portable(project, Location{row.entry}); if (!entry) return entry.error();
+        FunctionRow value{entry.value(), row.suppressed, {}};
+        for (const auto &chunk : row.chunks) { auto begin = portable_range(project, chunk.begin, chunk.size); if (!begin) return begin.error(); value.chunks.emplace_back(begin.value(), chunk.size); }
+        std::sort(value.chunks.begin(), value.chunks.end());
+        if (std::adjacent_find(value.chunks.begin(), value.chunks.end()) != value.chunks.end())
+            return invalid("Duplicate function chunks map to one portable range");
+        if (!value.chunks.empty() && std::none_of(value.chunks.begin(), value.chunks.end(), [&](const auto &chunk) {
+                return value.entry.offset >= chunk.first.offset && value.entry.offset - chunk.first.offset < chunk.second;
+            })) return invalid("Project function chunks do not contain their entry");
+        functions.push_back(std::move(value));
+    }
     for (const auto &row : user.types) {
         if (!database::declaration_type_matches(row.declaration_kind,row.type.get())) return invalid("Project contains an invalid declaration type");
         if (row.name.empty() || row.name.size() > 512 || !valid_utf8(row.name)) return invalid("Project contains a type name outside the portable limit");
@@ -496,7 +565,8 @@ Result<std::vector<std::byte>> export_project_exchange(const ProjectSnapshot &pr
         if(row.address&&!row.location_expression.empty())return invalid("Debug variable has both direct-address and expression locations");
         if(row.cfa_offset&&(!row.location_expression.size()||row.address))return invalid("Debug variable has an invalid CFA location");
         for(const auto &operation:row.location_operations)
-            if(operation.kind>15 || row.location_expression.empty() || operation.expression_offset>=row.location_expression.size())
+            if(operation.kind>20 || (operation.kind==16 && operation.second_unsigned_operand>9) ||
+                row.location_expression.empty() || operation.expression_offset>=row.location_expression.size())
                 return invalid("Debug variable contains an invalid decoded location operation");
         std::size_t expression_total=0,operation_total=0,payload=4;bool default_seen=false;
         for(const auto &range:row.location_ranges){
@@ -516,11 +586,16 @@ Result<std::vector<std::byte>> export_project_exchange(const ProjectSnapshot &pr
             if(encoded>1048576-payload)return invalid("Debug-variable location lists exceed their encoded budget",ErrorCode::resource_limit);
             payload+=encoded;
             for(const auto &operation:range.operations)
-                if(operation.kind>15||range.expression.empty()||operation.expression_offset>=range.expression.size())
+                if(operation.kind>20||(operation.kind==16&&operation.second_unsigned_operand>9)||
+                    range.expression.empty()||operation.expression_offset>=range.expression.size())
                     return invalid("Debug variable contains an invalid ranged location operation");
         }
         debug_variables.push_back(std::move(value));
     }
+    for (const auto &row : debug_variables)
+        if (std::none_of(functions.begin(), functions.end(), [&](const auto &function) {
+                return function.entry.offset == row.function_entry.offset;
+            })) return invalid("Debug variable references a function missing from portable metadata");
     for (const auto &row : user.breakpoints) {
         if (row.kind>database::ProjectBreakpointKind::access || row.condition.size()>256 ||
             row.condition.find('\0')!=std::string::npos || !valid_utf8(row.condition) ||
@@ -532,7 +607,29 @@ Result<std::vector<std::byte>> export_project_exchange(const ProjectSnapshot &pr
         auto at=portable(project,Location{row.address}); if(!at)return at.error();
         if(at.value().kind!=1)return invalid("Project breakpoint is not a virtual address");
         project_breakpoints.push_back({at.value(),static_cast<std::uint8_t>(row.kind),row.size,row.enabled,
-                                       row.condition,row.logpoint,row.log_message,row.ignore_count});
+                                       row.condition,row.logpoint,row.log_message,row.ignore_count,row.one_shot});
+    }
+    std::size_t patch_payload_bytes = 0;
+    if (!user.patches.empty() && !project.original)
+        return invalid("Original input is unavailable for patch export validation");
+    for (const auto &row : user.patches) {
+        if (row.original.empty() || row.original.size() > max_text ||
+            row.original.size() != row.replacement.size() ||
+            row.begin.value >= project.state->input.size ||
+            row.original.size() > project.state->input.size - row.begin.value ||
+            std::equal(row.original.begin(), row.original.end(), row.replacement.begin()))
+            return invalid("Project contains an invalid patch span");
+        auto original = project.original->read_at(row.begin, row.original.size());
+        if (!original || original.value().bytes.size() != row.original.size())
+            return invalid("Cannot read original input bytes for patch export validation", ErrorCode::io);
+        if (!std::equal(row.original.begin(), row.original.end(), original.value().bytes.begin()))
+            return invalid("Project patch original bytes do not match the source input");
+        if (row.original.size() > (max_bytes > patch_payload_bytes + 16 ? (max_bytes - patch_payload_bytes - 16) / 2 : 0))
+            return invalid("Project patches exceed the exchange byte limit", ErrorCode::resource_limit);
+        patch_payload_bytes += 16 + row.original.size() * 2;
+        for (std::size_t i = 0; i < row.original.size(); ++i)
+            if (row.original[i] == row.replacement[i]) return invalid("Project patch span contains a no-op byte");
+        patches.push_back({row.begin.value, row.original, row.replacement});
     }
     auto by_location = [](const auto &a, const auto &b) { return a.location < b.location; };
     std::sort(annotations.begin(), annotations.end(), by_location); std::sort(bookmarks.begin(), bookmarks.end(), by_location); std::sort(references.begin(), references.end());
@@ -540,6 +637,7 @@ Result<std::vector<std::byte>> export_project_exchange(const ProjectSnapshot &pr
     std::sort(type_rows.begin(), type_rows.end(), [](const auto &a, const auto &b) { return a.name < b.name; }); std::sort(assignments.begin(), assignments.end());
     std::sort(debug_variables.begin(),debug_variables.end(),[](const auto &a,const auto &b){return std::tie(a.origin.source_id,a.origin.section,a.origin.unit_offset,a.origin.record_offset)<std::tie(b.origin.source_id,b.origin.section,b.origin.unit_offset,b.origin.record_offset);});
     std::sort(project_breakpoints.begin(),project_breakpoints.end(),by_location);
+    std::sort(patches.begin(), patches.end(), [](const auto &a, const auto &b) { return a.offset < b.offset; });
     for (std::size_t n = 1; n < annotations.size(); ++n) if (annotations[n-1].location == annotations[n].location) return invalid("Multiple annotations map to one portable location");
     for (std::size_t n = 1; n < bookmarks.size(); ++n) if (bookmarks[n-1].location == bookmarks[n].location) return invalid("Multiple bookmarks map to one portable location");
     for (std::size_t n = 1; n < references.size(); ++n) if (references[n-1] == references[n]) return invalid("Multiple references map to one portable row");
@@ -549,12 +647,15 @@ Result<std::vector<std::byte>> export_project_exchange(const ProjectSnapshot &pr
     for (std::size_t n = 1; n < assignments.size(); ++n) if (assignments[n-1].location == assignments[n].location) return invalid("Multiple type assignments map to one portable location");
     for (std::size_t n = 1; n < debug_variables.size(); ++n) if (std::tie(debug_variables[n-1].origin.source_id,debug_variables[n-1].origin.section,debug_variables[n-1].origin.unit_offset,debug_variables[n-1].origin.record_offset)==std::tie(debug_variables[n].origin.source_id,debug_variables[n].origin.section,debug_variables[n].origin.unit_offset,debug_variables[n].origin.record_offset)) return invalid("Multiple debug variables share one portable source origin");
     for (std::size_t n = 1; n < project_breakpoints.size(); ++n) if (project_breakpoints[n-1].location==project_breakpoints[n].location) return invalid("Multiple project breakpoints map to one portable location");
+    for (std::size_t n = 1; n < patches.size(); ++n)
+        if (patches[n-1].offset + patches[n-1].original.size() >= patches[n].offset)
+            return invalid("Project patch spans overlap or are not canonical");
     std::vector<std::byte> out; out.reserve(56);
     for (auto b : {std::byte{'H'}, std::byte{'X'}, std::byte{'E'}, std::byte{'X'}}) out.push_back(b);
     auto num = [&](std::uint64_t v, unsigned size) { return write_number(out, v, size, max_bytes); };
-    if (!num(7, 2) || !num(0, 2) || !num(project.state->input.size, 8)) return invalid("Exchange output exceeds configured limit", ErrorCode::resource_limit);
+    if (!num(9, 2) || !num(0, 2) || !num(project.state->input.size, 8)) return invalid("Exchange output exceeds configured limit", ErrorCode::resource_limit);
     out.insert(out.end(), project.state->input.sha256.begin(), project.state->input.sha256.end());
-    if (!num(annotations.size(), 4) || !num(bookmarks.size(), 4) || !num(references.size(), 4) || !num(regions.size(), 4) || !num(functions.size(), 4) || !num(type_rows.size(), 4) || !num(assignments.size(), 4) || !num(debug_variables.size(),4) || !num(project_breakpoints.size(),4)) return invalid("Exchange output exceeds configured limit", ErrorCode::resource_limit);
+    if (!num(annotations.size(), 4) || !num(bookmarks.size(), 4) || !num(references.size(), 4) || !num(regions.size(), 4) || !num(functions.size(), 4) || !num(type_rows.size(), 4) || !num(assignments.size(), 4) || !num(debug_variables.size(),4) || !num(project_breakpoints.size(),4) || !num(patches.size(),4)) return invalid("Exchange output exceeds configured limit", ErrorCode::resource_limit);
     for (const auto &row : annotations) if (!location_write(out, row.location, max_bytes) || !write_text(out, row.name, max_bytes) || !write_text(out, row.comment, max_bytes)) return invalid("Exchange output exceeds configured limit", ErrorCode::resource_limit);
     for (const auto &row : bookmarks) if (!location_write(out, row.location, max_bytes) || !write_text(out, row.label, max_bytes)) return invalid("Exchange output exceeds configured limit", ErrorCode::resource_limit);
     for (const auto &row : references) if (!location_write(out, row.source, max_bytes) || !location_write(out, row.target, max_bytes) || !num(row.kind, 1)) return invalid("Exchange output exceeds configured limit", ErrorCode::resource_limit);
@@ -566,8 +667,12 @@ Result<std::vector<std::byte>> export_project_exchange(const ProjectSnapshot &pr
     for (const auto &row : project_breakpoints)
         if (!location_write(out,row.location,max_bytes) || !num(row.kind,1) || !num(row.size,1) ||
             !num(row.enabled,1) || !write_text(out,row.condition,max_bytes) || !num(row.logpoint,1) ||
-            !write_text(out,row.log_message,max_bytes) || !num(row.ignore_count,8))
+            !write_text(out,row.log_message,max_bytes) || !num(row.ignore_count,8) || !num(row.one_shot,1))
             return invalid("Exchange output exceeds configured limit",ErrorCode::resource_limit);
+    for (const auto &row : patches)
+        if (!num(row.offset, 8) || !write_blob(out, row.original, max_bytes) ||
+            !write_blob(out, row.replacement, max_bytes))
+            return invalid("Exchange output exceeds configured limit", ErrorCode::resource_limit);
     return out;
 }
 Result<ExchangeImport> import_project_exchange(const ProjectSnapshot &project, std::span<const std::byte> bytes,
@@ -775,7 +880,7 @@ Result<ExchangeImport> import_project_exchange(const ProjectSnapshot &project, s
         const bool same=existing!=user.breakpoints.end() && existing->kind==kind && existing->size==row.size &&
             existing->enabled==row.enabled && existing->condition==row.condition &&
             existing->logpoint==row.logpoint && existing->log_message==row.log_message &&
-            existing->ignore_count==row.ignore_count;
+            existing->ignore_count==row.ignore_count && existing->one_shot==row.one_shot;
         if(same){++result.skipped;continue;}
         if(existing!=user.breakpoints.end()){
             result.conflicts.push_back({ExchangeRecordKind::project_breakpoint,Location{*address}, {},
@@ -784,8 +889,37 @@ Result<ExchangeImport> import_project_exchange(const ProjectSnapshot &project, s
         }
         result.commands.emplace_back(SetProjectBreakpoint{*address,kind,row.size,row.enabled,false,
                                                           row.condition,row.logpoint,row.log_message,
-                                                          row.ignore_count});
+                                                          row.ignore_count,row.one_shot});
         ++result.project_breakpoints;
+    }
+    for (const auto &row : parsed.value().patches) {
+        const auto effective = project.effective;
+        if (!effective) return invalid("Effective input is unavailable for patch conflict analysis");
+        auto current = effective->read_at({row.offset}, row.replacement.size());
+        if (!current || current.value().bytes.size() != row.replacement.size())
+            return invalid("Cannot read current bytes for patch conflict analysis", ErrorCode::io);
+        if (std::equal(current.value().bytes.begin(), current.value().bytes.end(), row.replacement.begin())) {
+            ++result.skipped;
+            continue;
+        }
+        std::optional<std::uint64_t> first_conflict;
+        for (std::size_t i = 0; i < row.original.size(); ++i) {
+            if (current.value().bytes[i] != row.original[i] &&
+                current.value().bytes[i] != row.replacement[i]) {
+                first_conflict = row.offset + i;
+                break;
+            }
+        }
+        if (first_conflict) {
+            const auto resolution = policy == ExchangeConflictPolicy::replace
+                ? ExchangeConflictResolution::imported : ExchangeConflictResolution::kept_existing;
+            result.conflicts.push_back({ExchangeRecordKind::patch, Location{FileOffset{*first_conflict}}, {}, resolution});
+            auto replace = conflict(false);
+            if (!replace) return replace.error();
+            if (!replace.value()) continue;
+        }
+        result.commands.emplace_back(PatchBytes{Location{FileOffset{row.offset}}, row.replacement});
+        ++result.patches;
     }
     return result;
 }

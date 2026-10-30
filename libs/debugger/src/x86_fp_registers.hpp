@@ -256,6 +256,48 @@ inline std::optional<X86FxsaveField> x86_fxsave_field(std::string_view name) {
     return indexed("xmm", 16, 160, 16, 16);
 }
 
+inline Status validate_x86_avx512_alias_writes(std::span<const RegisterValue> registers) {
+    std::array<const RegisterValue*, 16> zmm{}, xmm{}, ymm_upper{};
+    const auto ymm_upper_index = [](std::string_view name) -> std::optional<std::size_t> {
+        if (!name.starts_with("ymm") || !name.ends_with('h') || name.size() < 5 || name.size() > 6) return {};
+        const auto digits = name.substr(3, name.size() - 4);
+        std::size_t index = 0;
+        for (const auto digit : digits) {
+            if (digit < '0' || digit > '9') return {};
+            index = index * 10 + static_cast<std::size_t>(digit - '0');
+        }
+        return index < 16 ? std::optional<std::size_t>{index} : std::nullopt;
+    };
+    for (const auto& reg : registers) {
+        if (const auto parsed = parse_x86_avx512_register(reg.name); parsed && parsed->vector && parsed->index < 16)
+            zmm[parsed->index] = &reg;
+        else if (const auto field = x86_fxsave_field(reg.name); field && field->offset >= x86_xmm_offset(0) &&
+                 field->offset < x86_xmm_offset(16) && field->width == 16)
+            xmm[(field->offset - x86_xmm_offset(0)) / 16] = &reg;
+        else if (const auto index = ymm_upper_index(reg.name))
+            ymm_upper[*index] = &reg;
+    }
+    for (std::size_t index = 0; index < zmm.size(); ++index) {
+        const auto* full = zmm[index];
+        if (!full) continue;
+        if (full->bytes.size() != 64)
+            return Error{ErrorCode::invalid_argument, "Linux x86-64 ZMM register has incorrect width"};
+        if (xmm[index]) {
+            if (xmm[index]->bytes.size() != 16)
+                return Error{ErrorCode::invalid_argument, "Linux x86-64 XMM register has incorrect width"};
+            if (!std::equal(xmm[index]->bytes.begin(), xmm[index]->bytes.end(), full->bytes.begin()))
+                return Error{ErrorCode::conflict, "Linux x86-64 XMM/ZMM writes disagree on the low 128-bit lane"};
+        }
+        if (ymm_upper[index]) {
+            if (ymm_upper[index]->bytes.size() != 16)
+                return Error{ErrorCode::invalid_argument, "Linux x86-64 YMM upper register has incorrect width"};
+            if (!std::equal(ymm_upper[index]->bytes.begin(), ymm_upper[index]->bytes.end(), full->bytes.begin() + 16))
+                return Error{ErrorCode::conflict, "Linux x86-64 YMM/ZMM writes disagree on the upper 128-bit lane"};
+        }
+    }
+    return std::monostate{};
+}
+
 // Compat i386 exposes the same 512-byte FXSAVE legacy area through
 // NT_X86_XSTATE, but its instruction/data pointers and visible XMM bank use
 // the 32-bit ABI. Keep this map separate from the native x86-64 names and
@@ -338,6 +380,62 @@ inline Status write_x86_i386_fxsave_registers(std::span<std::byte> image,
         std::copy(registers[index].bytes.begin(), registers[index].bytes.end(),
                   image.begin() + static_cast<std::ptrdiff_t>(field.offset));
     }
+    return std::monostate{};
+}
+
+inline std::optional<std::size_t> x86_i386_ymm_upper_index(std::string_view name) {
+    if (!name.starts_with("ymm") || !name.ends_with('h') || name.size() != 5 ||
+        name[3] < '0' || name[3] > '7') return {};
+    return static_cast<std::size_t>(name[3] - '0');
+}
+
+inline Result<std::vector<RegisterValue>> x86_i386_xstate_ymm_upper_register_values(
+    std::span<const std::byte> image, const X86XstateLayout& layout) {
+    constexpr std::size_t compat_ymm_bytes = 8 * 16;
+    if (!(layout.supported_features & x86_avx_xstate_bit) || layout.component_size < compat_ymm_bytes ||
+        image.size() < 576 || layout.ymm_upper_offset > image.size() ||
+        compat_ymm_bytes > image.size() - layout.ymm_upper_offset)
+        return Error{ErrorCode::unsupported, "i386 target does not expose a complete AVX YMM component"};
+    std::uint64_t compacted{};
+    std::memcpy(&compacted, image.data() + 520, sizeof(compacted));
+    if (compacted & (1ull << 63))
+        return Error{ErrorCode::unsupported, "compacted i386 XSAVE layout cannot be mapped to AVX register offsets"};
+    const bool in_use = (x86_xstate_bv(image) & x86_avx_xstate_bit) != 0;
+    std::vector<RegisterValue> result;
+    result.reserve(8);
+    for (std::size_t index = 0; index < 8; ++index) {
+        RegisterValue value;
+        value.name = "ymm" + std::to_string(index) + "h";
+        value.bytes.resize(16);
+        if (in_use)
+            std::copy_n(image.begin() + static_cast<std::ptrdiff_t>(layout.ymm_upper_offset + index * 16),
+                        16, value.bytes.begin());
+        result.push_back(std::move(value));
+    }
+    return result;
+}
+
+inline Status write_x86_i386_xstate_ymm_upper_registers(std::span<std::byte> image,
+    const X86XstateLayout& layout, std::span<const RegisterValue> registers) {
+    auto available = x86_i386_xstate_ymm_upper_register_values(image, layout);
+    if (!available) return available.error();
+    std::array<bool, 8> seen{};
+    for (const auto& reg : registers) {
+        const auto index = x86_i386_ymm_upper_index(reg.name);
+        if (!index) return Error{ErrorCode::invalid_argument, "unknown i386 YMM upper register"};
+        if (reg.bytes.size() != 16)
+            return Error{ErrorCode::invalid_argument, "i386 YMM upper register has incorrect width"};
+        if (reg.byte_order && *reg.byte_order != ByteOrder::little)
+            return Error{ErrorCode::invalid_argument, "i386 YMM upper register byte order is not little-endian"};
+        if (seen[*index]) return Error{ErrorCode::invalid_argument, "duplicate i386 YMM upper register write"};
+        seen[*index] = true;
+    }
+    for (const auto& reg : registers) {
+        const auto index = *x86_i386_ymm_upper_index(reg.name);
+        std::copy(reg.bytes.begin(), reg.bytes.end(),
+            image.begin() + static_cast<std::ptrdiff_t>(layout.ymm_upper_offset + index * 16));
+    }
+    if (!registers.empty()) x86_set_xstate_bv(image, x86_xstate_bv(image) | x86_avx_xstate_bit);
     return std::monostate{};
 }
 

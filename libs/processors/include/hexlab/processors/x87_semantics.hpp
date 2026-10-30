@@ -26,6 +26,75 @@ HEXLAB_PROCESSORS_EXPORT X87StackState transfer_x87_stack_state(const X87StackSt
 HEXLAB_PROCESSORS_EXPORT std::optional<std::uint8_t> x87_physical_register(const X87StackState &state,
                                                                           std::uint8_t logical_st) noexcept;
 
+enum class X87ExceptionDelivery { none, math_fault, external_irq13 };
+struct X87PendingExceptionRequest {
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+    // CR0.NE selects native #MF instead of legacy FERR#/IRQ13 reporting.
+    bool native_mode = true;
+};
+struct X87PendingExceptionResult {
+    std::uint8_t unmasked_exception_flags = 0; // IE/DE/ZE/OE/UE/PE bits 0..5.
+    std::uint16_t status_word = 0;
+    X87ExceptionDelivery delivery = X87ExceptionDelivery::none;
+    bool pending() const noexcept { return delivery != X87ExceptionDelivery::none; }
+    bool operator==(const X87PendingExceptionResult &) const = default;
+};
+
+// Resolve pending delivery from caller-owned FCW/FSW state. Sticky exception
+// flags only cause delivery when their corresponding control-word masks are
+// clear. When pending, the returned FSW includes ES and B. This identifies
+// #MF versus the legacy IRQ13 path; it does not deliver a host exception or
+// emulate task-switch/interrupt-controller state.
+HEXLAB_PROCESSORS_EXPORT X87PendingExceptionResult evaluate_x87_pending_exception(
+    const X87PendingExceptionRequest &) noexcept;
+
+struct X87StackFaultRequest {
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+    bool overflow = false;
+    bool native_mode = true;
+};
+struct X87StackFaultResult {
+    std::uint16_t status_word = 0;
+    bool instruction_completed = true; // Masked faults complete with operation-specific indefinite behavior.
+    X87PendingExceptionResult pending;
+    bool operator==(const X87StackFaultResult &) const = default;
+};
+// Record the x87 invalid-operation/stack-fault flags and C1 direction for a
+// detected stack overflow or underflow. This does not detect tag faults or
+// generate an operation-specific indefinite value; the caller supplies the
+// fault direction and commits stack state only when instruction_completed.
+HEXLAB_PROCESSORS_EXPORT X87StackFaultResult evaluate_x87_stack_fault(
+    const X87StackFaultRequest &) noexcept;
+
+struct X87ClearExceptionsResult {
+    std::uint16_t status_word = 0;
+    bool operator==(const X87ClearExceptionsResult &) const = default;
+};
+struct X87InitializeResult {
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+    X87StackState stack;
+    bool operator==(const X87InitializeResult &) const = default;
+};
+
+// Model FNCLEX's exact status-word mask and FNINIT's architectural control,
+// status, TOP, and tag defaults. FIP/FDP/FOP and register payload bits are
+// deliberately outside this abstract result.
+HEXLAB_PROCESSORS_EXPORT X87ClearExceptionsResult evaluate_x87_clear_exceptions(
+    std::uint16_t status_word) noexcept;
+HEXLAB_PROCESSORS_EXPORT X87InitializeResult evaluate_x87_initialize() noexcept;
+
+// Apply the stack/TOP/tag portion of a decoded instruction only when it was
+// allowed to execute past any prior pending exception and its own semantics
+// completed. This preserves input stack state for an unmasked exception or a
+// pending delivery before a waiting instruction. The simpler transfer helper
+// above remains the normal-completion transfer.
+HEXLAB_PROCESSORS_EXPORT X87StackState retire_x87_stack_state(
+    const X87StackState &, const Instruction &, const X87PendingExceptionResult &,
+    bool instruction_completed) noexcept;
+
 // Canonical x87 80-bit extended value fields. The explicit integer bit is
 // bit 63 of significand; exponent is the raw 15-bit biased field.
 struct X87Binary80 {
@@ -33,6 +102,26 @@ struct X87Binary80 {
     std::uint16_t sign_exponent = 0;
     bool operator==(const X87Binary80 &) const = default;
 };
+
+enum class X87SignOperation : std::uint8_t { change, clear };
+struct X87SignOperationRequest {
+    X87Binary80 value;
+    std::uint16_t status_word = 0;
+    X87SignOperation operation = X87SignOperation::change;
+};
+struct X87SignOperationResult {
+    X87Binary80 value;
+    std::uint16_t status_word = 0;
+    // C0/C2/C3 are undefined for FCHS and FABS; all other FSW bits are defined.
+    std::uint16_t status_word_defined_mask = 0xbaff;
+    bool operator==(const X87SignOperationResult &) const = default;
+};
+// Apply FCHS (change) or FABS (clear) to the binary80 sign bit without
+// decoding or canonicalizing the significand/exponent. This models the
+// normal nonempty-ST(0) path, sets C1 to zero, and preserves other defined FSW
+// bits. Stack-underflow exception handling is separate.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87SignOperationResult> evaluate_x87_sign_operation(
+    const X87SignOperationRequest &) noexcept;
 
 enum class X87Relation : std::uint8_t { less, equal, greater, unordered };
 enum class X87CompareKind : std::uint8_t { fcom, fucom, fcomi, fucomi };
@@ -53,6 +142,7 @@ struct X87CompareResult {
     // comparison condition outputs and any instruction stack pop from retiring.
     bool completed = true;
     bool invalid_operation = false;
+    bool denormal_operand = false;
     bool operator==(const X87CompareResult &) const = default;
 };
 
@@ -61,11 +151,65 @@ struct X87CompareResult {
 HEXLAB_PROCESSORS_EXPORT std::optional<X87Relation> compare_x87_binary80(X87Binary80 left,
                                                                        X87Binary80 right) noexcept;
 
-// Evaluate FCOM/FUCOM and FCOMI/FUCOMI condition effects. FCOM variants are
-// ordered; FUCOM variants raise invalid only for signaling NaNs. The caller
-// remains responsible for x87 stack tags/TOP and instruction-specific pops.
+// Evaluate FCOM/FUCOM and FCOMI/FUCOMI condition effects, including denormal
+// operand status. FCOM variants are ordered; FUCOM variants raise invalid only
+// for signaling NaNs. The caller remains responsible for x87 stack tags/TOP
+// and instruction-specific pops.
 HEXLAB_PROCESSORS_EXPORT std::optional<X87CompareResult>
 evaluate_x87_compare(const X87CompareRequest &request) noexcept;
+
+struct X87TestRequest {
+    X87Binary80 value;
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+};
+// Evaluate FTST as an ordered comparison of ST(0) with positive zero. The
+// caller supplies a nonempty ST(0) and owns any stack-underflow handling.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87CompareResult>
+evaluate_x87_test(const X87TestRequest &request) noexcept;
+
+enum class X87ConditionalMoveCondition : std::uint8_t {
+    below, equal, below_or_equal, unordered,
+    not_below, not_equal, not_below_or_equal, ordered
+};
+struct X87ConditionalMoveRequest {
+    X87Binary80 destination;
+    X87Binary80 source;
+    std::uint32_t eflags = 0;
+    X87ConditionalMoveCondition condition = X87ConditionalMoveCondition::below;
+};
+struct X87ConditionalMoveResult {
+    X87Binary80 destination;
+    std::uint32_t eflags = 0;
+    bool condition_met = false;
+    bool operator==(const X87ConditionalMoveResult &) const = default;
+};
+
+// Evaluate the value and condition-code portion of FCMOVcc. Both x87 stack
+// operands must be non-empty; stack-underflow exception/tag handling remains
+// caller-owned. For valid operands FCMOV copies the source bits conditionally
+// and leaves EFLAGS and FSW unchanged.
+HEXLAB_PROCESSORS_EXPORT X87ConditionalMoveResult evaluate_x87_conditional_move(
+    const X87ConditionalMoveRequest &request) noexcept;
+
+enum class X87ExamineClass : std::uint8_t { unsupported, nan, normal, infinity, zero, empty, denormal };
+struct X87ExamineRequest {
+    X87Binary80 value;
+    std::uint16_t status_word = 0;
+    bool empty = false; // Supplied from the caller's x87 tag state.
+};
+struct X87ExamineResult {
+    X87ExamineClass classification = X87ExamineClass::unsupported;
+    std::uint16_t status_word = 0;
+    bool negative = false;
+    bool operator==(const X87ExamineResult &) const = default;
+};
+
+// Evaluate FXAM's binary80 class and FSW C0/C1/C2/C3 outputs. The caller
+// supplies the physical ST(0) value and its empty-tag state; no exceptions are
+// raised and all unrelated status-word bits are preserved.
+HEXLAB_PROCESSORS_EXPORT X87ExamineResult evaluate_x87_examine(
+    const X87ExamineRequest &request) noexcept;
 
 struct X87IntegerConvertRequest {
     X87Binary80 value;
@@ -174,6 +318,24 @@ struct X87SquareRootRequest {
 HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
 evaluate_x87_square_root(const X87SquareRootRequest &request) noexcept;
 
+struct X87ScaleRequest {
+    X87Binary80 value;
+    X87Binary80 scale;
+    std::uint16_t status_word = 0;
+};
+struct X87ScaleResult {
+    X87Binary80 value;
+    std::uint16_t status_word = 0;
+    // C0/C2/C3 are undefined for FSCALE; C1 is zero on the normal path.
+    std::uint16_t status_word_defined_mask = 0xbaff;
+    bool operator==(const X87ScaleResult &) const = default;
+};
+// Evaluate the exact normal-result FSCALE subset. ST(1) must be a finite
+// normal value or zero; its value is truncated toward zero. ST(0) must be
+// zero or normal and the adjusted exponent must remain normal.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87ScaleResult>
+evaluate_x87_scale(const X87ScaleRequest &request) noexcept;
+
 enum class X87UnaryArithmetic : std::uint8_t { change_sign, absolute };
 struct X87UnaryResult {
     X87Binary80 value;
@@ -186,6 +348,29 @@ struct X87UnaryResult {
 HEXLAB_PROCESSORS_EXPORT X87UnaryResult
 evaluate_x87_unary(X87Binary80 value, std::uint16_t status_word,
                    X87UnaryArithmetic operation) noexcept;
+
+struct X87ExtractRequest {
+    X87Binary80 value;
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+};
+struct X87ExtractResult {
+    // Values after FXTRACT pushes the significand: new ST(0), then ST(1).
+    std::optional<X87Binary80> significand;
+    std::optional<X87Binary80> exponent;
+    std::uint16_t status_word = 0;
+    bool completed = true;
+    bool denormal_operand = false;
+    bool zero_divide = false;
+    bool invalid_operation = false;
+    bool operator==(const X87ExtractResult &) const = default;
+};
+// Evaluate FXTRACT's numeric outputs for finite values, signed zero,
+// infinities and NaNs, with DE/ZE/IE mask handling and masked SNaN quieting.
+// Stack push/TOP/tag handling and stack-fault condition codes remain caller-
+// owned; unsupported binary80 encodings fail closed.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87ExtractResult>
+evaluate_x87_extract(const X87ExtractRequest &request) noexcept;
 
 struct X87RealLoadRequest {
     std::uint64_t source_bits = 0;
@@ -231,5 +416,33 @@ struct X87RealStoreResult {
 // are the caller's responsibility.
 HEXLAB_PROCESSORS_EXPORT std::optional<X87RealStoreResult>
 evaluate_x87_store_real(const X87RealStoreRequest &request) noexcept;
+
+struct X87PackedBcdLoadRequest {
+    std::array<std::uint8_t, 10> source{};
+};
+// An invalid packed-BCD digit has an undefined FBLD result and returns no
+// value. Reserved bits in the high byte are ignored as on the processor.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87Binary80>
+evaluate_x87_load_packed_bcd(const X87PackedBcdLoadRequest &request) noexcept;
+
+struct X87PackedBcdStoreRequest {
+    X87Binary80 value;
+    std::uint16_t control_word = 0x037f;
+    std::uint16_t status_word = 0;
+};
+struct X87PackedBcdStoreResult {
+    std::optional<std::array<std::uint8_t, 10>> destination;
+    std::uint16_t status_word = 0;
+    bool completed = true;
+    bool invalid_operation = false;
+    bool precision = false;
+    bool rounded_up = false;
+    bool operator==(const X87PackedBcdStoreResult &) const = default;
+};
+// Evaluate FBSTP's 18-digit packed-BCD conversion using FCW.RC. Masked invalid
+// operations store the architectural BCD indefinite; unmasked exceptions and
+// precision exceptions suppress the memory output. The caller owns the pop.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87PackedBcdStoreResult>
+evaluate_x87_store_packed_bcd(const X87PackedBcdStoreRequest &request) noexcept;
 
 } // namespace hexlab

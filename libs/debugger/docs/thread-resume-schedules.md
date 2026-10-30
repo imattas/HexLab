@@ -9,6 +9,18 @@ including a stop action when another thread runs. The session becomes running
 only after backend acceptance; notification-only acknowledgements preserve the
 stopped state and continue draining queued events.
 
+Callers that need per-thread acknowledgment detail can use
+`DebugSession::resume_threads_with_outcomes(sequence, actions)`. On success it
+returns one ordered row for each submitted action: `continue_accepted`,
+`single_step_accepted`, or `stop_preserved`, each paired with that thread ID.
+These outcomes describe the accepted schedule; they do not claim that an OS
+thread is still executing when the call returns, since a thread may immediately
+block, exit, or stop for another event. On validation or backend failure the
+method returns the same error as `resume_threads`; it does not synthesize
+per-thread success rows for a rejected or rolled-back schedule. Existing stop
+ownership, pending-event retention, and backend rollback behavior are shared
+with `resume_threads` unchanged.
+
 The [RSP server](../../../docs/debug-server.md) resolves `vCont` left to right
 against a bounded live-thread census. Every unmatched live thread receives a
 stop action. Explicit `t` actions also reach the shared API as stop actions,
@@ -50,10 +62,10 @@ retain the owned event, with no retry as an unfiltered continuation.
 
 | Backend | Supported filtered schedule | Explicit restrictions |
 | --- | --- | --- |
-| Linux x86/x64 | One selected thread continues or steps; multiple selected threads may continue while others stay stopped. One schedule may single-step the pending event owner while other selected threads continue, or step one non-owner while the event owner remains stopped and other peers continue. | Every traced thread must be stopped. Deferred-event owners cannot be rescheduled. A pending software-breakpoint step-over limits runnable selection; multi-thread schedules through that breakpoint are rejected. Mixed schedules support at most one step; multiple steps remain unsupported. |
-| Linux AArch64 | One selected thread continues or steps; a multi-thread schedule may combine one single-step action with any number of continue actions. The event owner can remain stopped when another thread runs. A scheduled action may preserve/redeliver its queued signal by default or suppress it with `signal_disposition = handled`; `not_handled` explicitly requests redelivery. | Every traced thread must be stopped. At most one single-step may be outstanding; a later schedule cannot resume that step thread or issue another step until its event is collected. Pending software/hardware execute-breakpoint step-over still limits the schedule to one runnable thread. |
-| Windows | The event thread steps alone, or a continue-only subset runs while all other threads stay suspended. The event owner may be explicitly stopped while selected peers continue; unselected threads retain one debugger-owned suspend count. The event owner's `signal_disposition` selects `DBG_CONTINUE` (default/`handled`) or `DBG_EXCEPTION_NOT_HANDLED` (`not_handled`) for a pending exception. | Foreign-thread steps, mixed step/continue, multiple steps and an active displaced software-breakpoint step reject. `not_handled` is valid only for an exception event and cannot be combined with a single-step. Non-owner actions cannot set an event disposition. ARM32 stepping remains unsupported. A Windows ARM64 execute-breakpoint step-over cannot run a multi-thread subset. |
-| Darwin | One exact continue or step action for a target proven to contain one thread. | Process-wide ptrace cannot implement multithread schedules; the existing Mach-thread census and stop-identity restrictions remain conservative. |
+| Linux x86/x64 | One selected thread continues or steps; multiple selected threads may continue while others stay stopped. One schedule may single-step the pending event owner while other selected threads continue, or step one non-owner while the event owner remains stopped and other peers continue. Continuing past an owned software breakpoint with selected peers first steps the owner alone, rearms the breakpoint, then resumes the selected set before waiting for the next real stop. | Every traced thread must be stopped. Deferred-event owners cannot be rescheduled. A breakpoint step-over schedule must continue the event owner and cannot combine an explicit step action with peer continuations. Mixed schedules otherwise support at most one step; multiple steps remain unsupported. |
+| Linux AArch64 | One selected thread continues or steps; a multi-thread schedule may combine one single-step action with any number of continue actions. The event owner can remain stopped when another thread runs. A scheduled action may preserve/redeliver its queued signal by default or suppress it with `signal_disposition = handled`; `not_handled` explicitly requests redelivery. Continuing past an owned software breakpoint with selected peers first steps the owner alone, rearms the breakpoint, then resumes the selected set before waiting for the next real stop. | Every traced thread must be stopped. At most one single-step may be outstanding; a later schedule cannot resume that step thread or issue another step until its event is collected. A breakpoint step-over schedule must continue the event owner and cannot combine an explicit step action with peer continuations. Hardware execute-breakpoint step-over remains single-thread only. |
+| Windows | The event owner may step with selected peers continuing on x86/x64. For a handled ARM64 hardware execute-breakpoint event, the owner may also single-step while selected peers continue. Omitted threads stay suspended until the next debug event. For a displaced x86/x64 software-breakpoint instruction, all peers are held for that one instruction and their requested continuation is deferred until the resulting event is collected. The event owner may be explicitly stopped while a continue-only peer subset runs; unselected threads retain one debugger-owned suspend count. The event owner's `signal_disposition` selects `DBG_CONTINUE` (default/`handled`) or `DBG_EXCEPTION_NOT_HANDLED` (`not_handled`) for a pending exception. | Foreign-thread steps, multiple steps, and an active displaced software-breakpoint step reject. Other mixed ARM64 step/continue shapes remain unsupported. `not_handled` is valid only for an exception event and cannot be combined with a single-step. Non-owner actions cannot set an event disposition. |
+| Darwin | One exact continue or step action for a target proven to contain one thread. The action's `signal_disposition` selects whether a pending ptrace signal is redelivered (`not_handled`, also the default) or suppressed (`handled`). | Process-wide ptrace cannot implement multithread schedules; the existing Mach-thread census and stop-identity restrictions remain conservative. |
 
 The Linux x86-64 mixed schedule issues peer continuations first, the pending
 event owner last among continuations, and the single-step last. A non-owner
@@ -63,7 +75,9 @@ continuation or final step request fails, already continued peers are
 interrupted and collected before the owned event is returned for retry. A
 failed rollback blocks further resume until recovery. Continuing the event
 owner before a non-owner step is rejected because that would consume the owned
-event before the step can be accepted.
+event before the step can be accepted. Only one ptrace step may be outstanding;
+while its result is pending, schedules may continue other stopped threads but
+cannot request another step until the outstanding step reports an event.
 
 The Linux resume mechanisms predate this server integration. Explicit stop
 actions now preserve deferred-event owners instead of rejecting an otherwise
@@ -76,8 +90,17 @@ event owner last among continuations, and the single-step request runs last.
 This ordering means a later ptrace failure rolls back only continued threads;
 the backend never has to roll back a step already issued. Multiple concurrent
 single-step actions remain unsupported because the backend tracks one pending
-step result at a time. A pending breakpoint displaced-instruction step-over
-also remains restricted to a single runnable thread.
+step result at a time. A pending hardware execute-breakpoint step-over remains
+restricted to a single runnable thread; software breakpoint step-over follows
+the deferred continuation behavior described below.
+
+On both Linux backends, a continue-only schedule can pass an owned software
+breakpoint with selected peers. The owner executes the displaced instruction
+while peers remain stopped; once the trap is rearmed, the backend resumes the
+selected set and waits for the next real stop. An explicit single-step at the
+breakpoint remains single-thread only so the caller receives the step result
+without resuming peers. AArch64 hardware execute-breakpoint step-over remains
+single-thread only.
 
 On Linux AArch64, a stopped action retains its pending signal for a later
 resume; `handled` explicitly suppresses it. Continue and single-step actions
@@ -92,6 +115,28 @@ The RSP server advertises `C`/`S` when this scheduled disposition is supported;
 it accepts suppression or redelivery of the pending event owner's signal.
 
 ## Windows suspension ownership
+
+On x86/x64, a mixed schedule can request one event-owner instruction step and
+continue selected peers. The normal complete thread census and suspension
+rollback apply before `ContinueDebugEvent`. For an owned software-breakpoint
+hit, the displaced instruction requires exclusive execution while its
+process-wide trap byte is absent. The backend therefore acquires its own suspend
+count for every peer during that instruction, including peers selected to
+continue. Once the next debug event freezes the process, those temporary counts
+are released and the resulting event is returned; the selected peers can then
+run under the caller's next schedule. This preserves breakpoint safety while
+retaining the user's peer selection across the step boundary.
+
+The mixed x86/x64 path records the owner's original trap-flag bit. At the next
+debug event it restores only that bit, preserving other flags changed by the
+instruction. A peer can report an event before the owner's step completes;
+that real event is surfaced with an interruption diagnostic and the pending
+step is cancelled, so a later continuation cannot inherit the debugger's trap
+flag. A failed flag restoration retains its recovery record and must succeed
+before resume or detach. Exiting owners and processes discard the record.
+This does not guarantee that the owner executed an instruction before a peer
+stopped the process. Live mixed-thread execution and WOW64 runtime validation
+remain pending.
 
 Windows freezes the affected process while a debug event is pending. The backend
 enumerates all target threads with a 4,096-thread cap and requires a complete

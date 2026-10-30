@@ -29,15 +29,16 @@ constexpr std::uint64_t tag_array=0x01,tag_enumeration=0x04,tag_formal_parameter
     tag_member=0x0d,tag_pointer_type=0x0f,tag_compile_unit=0x11,tag_structure_type=0x13,
     tag_subroutine_type=0x15,tag_typedef=0x16,tag_union_type=0x17,tag_unspecified_parameters=0x18,
     tag_subrange_type=0x21,tag_base_type=0x24,tag_const_type=0x26,tag_enumerator=0x28,
-    tag_subprogram=0x2e,tag_volatile_type=0x35,tag_variable=0x34,tag_type_unit=0x41,
-    tag_inheritance=0x1c;
+    tag_entry_point=0x03,tag_subprogram=0x2e,tag_volatile_type=0x35,tag_restrict_type=0x37,tag_variable=0x34,tag_type_unit=0x41,
+    tag_inheritance=0x1c,tag_atomic_type=0x47;
 constexpr std::uint64_t attr_sibling=0x01,attr_location=0x02,attr_name=0x03,attr_byte_size=0x0b,
     attr_bit_offset=0x0c,attr_bit_size=0x0d,attr_const_value=0x1c,attr_low_pc=0x11,attr_high_pc=0x12,
     attr_data_member_location=0x38,attr_encoding=0x3e,attr_type=0x49,attr_declaration=0x3c,attr_alignment=0x88,
-    attr_virtuality=0x4c,
+    attr_virtuality=0x4c,attr_calling_convention=0x36,
     attr_data_bit_offset=0x6b,
     attr_count=0x37,attr_lower_bound=0x22,attr_upper_bound=0x2f,
     attr_abstract_origin=0x31,attr_specification=0x47,attr_linkage_name=0x6e,
+    attr_decl_column=0x39,attr_decl_file=0x3a,attr_decl_line=0x3b,
     attr_frame_base=0x40,attr_comp_dir=0x1b,attr_dwo_name=0x76,
     attr_gnu_dwo_name=0x2130,attr_gnu_dwo_id=0x2131,
     attr_str_offsets_base=0x72,attr_addr_base=0x73,attr_rnglists_base=0x74,attr_loclists_base=0x8c,
@@ -123,9 +124,24 @@ const Value* attr(const Die&d,std::uint64_t n){auto i=d.attributes.find(n);retur
 const std::string* str(const Die&d,std::uint64_t n){auto*v=attr(d,n);return v?std::get_if<std::string>(v):nullptr;}
 const std::uint64_t* num(const Die&d,std::uint64_t n){auto*v=attr(d,n);return v?std::get_if<std::uint64_t>(v):nullptr;}
 std::optional<std::int64_t> signed_num(const Die&d,std::uint64_t n){auto*v=attr(d,n);if(!v)return{};if(auto*s=std::get_if<std::int64_t>(v))return *s;if(auto*u=std::get_if<std::uint64_t>(v);u&&*u<=std::uint64_t(INT64_MAX))return static_cast<std::int64_t>(*u);return{};}
+hexlab::Result<DwarfDeclarationLocation> declaration_location(const Die&die){
+    DwarfDeclarationLocation result;
+    const auto coordinate=[&](std::uint64_t attribute,std::string_view name)->hexlab::Result<std::optional<std::uint64_t>>{
+        const auto*value=attr(die,attribute);
+        if(!value)return std::optional<std::uint64_t>{};
+        if(const auto*number=std::get_if<std::uint64_t>(value))return std::optional<std::uint64_t>{*number};
+        if(const auto*number=std::get_if<std::int64_t>(value);number&&*number>=0)
+            return std::optional<std::uint64_t>{static_cast<std::uint64_t>(*number)};
+        return malformed(std::string(name)+" is not a nonnegative integer");
+    };
+    auto file=coordinate(attr_decl_file,"DW_AT_decl_file");if(!file)return file.error();result.file_index=file.value();
+    auto line=coordinate(attr_decl_line,"DW_AT_decl_line");if(!line)return line.error();result.line=line.value();
+    auto column=coordinate(attr_decl_column,"DW_AT_decl_column");if(!column)return column.error();result.column=column.value();
+    return result;
+}
 const Reference* ref(const Die&d,std::uint64_t n){auto*v=attr(d,n);return v?std::get_if<Reference>(v):nullptr;}
 SourceOrigin origin(const DwarfSections&s,std::uint64_t unit,const Die&d){return{s.source_id,".debug_info",s.info_section_offset+unit,s.info_section_offset+d.offset,d.end-d.offset};}
-bool is_type_tag(std::uint64_t t){return t==tag_base_type||t==tag_pointer_type||t==tag_typedef||t==tag_const_type||t==tag_volatile_type||t==tag_array||t==tag_structure_type||t==tag_union_type||t==tag_enumeration||t==tag_subroutine_type;}
+bool is_type_tag(std::uint64_t t){return t==tag_base_type||t==tag_pointer_type||t==tag_typedef||t==tag_const_type||t==tag_volatile_type||t==tag_restrict_type||t==tag_atomic_type||t==tag_array||t==tag_structure_type||t==tag_union_type||t==tag_enumeration||t==tag_subroutine_type;}
 
 hexlab::Result<std::vector<LocationOperation>> decode_location_expression_impl(
     std::span<const std::uint8_t> bytes,std::uint8_t address_size,std::size_t depth,std::size_t& total_operations){
@@ -166,7 +182,16 @@ hexlab::Result<std::vector<LocationOperation>> decode_location_expression_impl(
         case 0x93:{item.kind=LocationOperationKind::piece;auto v=uleb();if(!v)return v.error();item.unsigned_operand=v.value();break;}
         case 0x94:{item.kind=LocationOperationKind::dereference_sized;auto v=r.fixed(1);if(!v)return v.error();if(!v.value())return malformed("DW_OP_deref_size has zero size");item.unsigned_operand=v.value();break;}
         case 0x9c:item.kind=LocationOperationKind::call_frame_cfa;break;
+        case 0x9b:item.kind=LocationOperationKind::tls_address;break;
         case 0x9d:{item.kind=LocationOperationKind::bit_piece;auto size=uleb();if(!size)return size.error();auto off=uleb();if(!off)return off.error();item.unsigned_operand=size.value();item.second_unsigned_operand=off.value();break;}
+        case 0x9e:{
+            item.kind=LocationOperationKind::implicit_value;
+            auto length=uleb();if(!length)return length.error();
+            if(length.value()>64*1024)return hexlab::Error{hexlab::ErrorCode::resource_limit,"DW_OP_implicit_value block exceeds 64 KiB"};
+            auto block=r.bytes(static_cast<std::size_t>(length.value()));if(!block)return block.error();
+            item.block_operand.assign(block.value().begin(),block.value().end());
+            break;
+        }
         case 0x9f:item.kind=LocationOperationKind::stack_value;break;
         case 0xa3:{
             item.kind=LocationOperationKind::entry_value;
@@ -861,6 +886,13 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
             return static_cast<const Value*>(nullptr);
         };
         auto function_attribute=[&](std::size_t index,std::uint64_t attribute)->hexlab::Result<const Value*>{std::set<std::size_t> visited;return inherited_attribute(index,attribute,visited);};
+        auto validate_calling_convention=[&](const Value*value)->hexlab::Result<bool>{
+            if(!value)return true;
+            const auto*code=std::get_if<std::uint64_t>(value);
+            if(!code)return malformed("DW_AT_calling_convention is not an unsigned constant");
+            if(*code!=1)return unsupported("DW_AT_calling_convention is explicit but not represented by the type model");
+            return true;
+        };
         std::function<hexlab::Result<std::size_t>(std::size_t,std::set<std::size_t>&)> parameter_source;
         parameter_source=[&](std::size_t index,std::set<std::size_t>&visited)->hexlab::Result<std::size_t>{
             if(!visited.insert(index).second)return malformed("cycle in DWARF function declaration references");
@@ -875,7 +907,7 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
             return index;
         };
         std::unordered_map<std::uint64_t,types::TypePtr> cache;std::unordered_map<std::uint64_t,unsigned> state;unsigned resolve_depth=0;
-        auto enum_value=[&](const Die&e,const types::TypePtr&base)->hexlab::Result<std::int64_t>{const auto*v=attr(e,attr_const_value);if(!v)return malformed("enumerator DIE lacks DW_AT_const_value");std::optional<std::int64_t> value;if(auto*s=std::get_if<std::int64_t>(v))value=*s;else if(auto*u=std::get_if<std::uint64_t>(v)){std::uint64_t raw=*u;auto ab=abbrevs.value().find(e.code);auto spec=std::find_if(ab->second.attributes.begin(),ab->second.attributes.end(),[](const auto&a){return a.name==attr_const_value;});if(spec!=ab->second.attributes.end()&&base->is_signed()){unsigned bytes=spec->form==form_data1?1:spec->form==form_data2?2:spec->form==form_data4?4:spec->form==form_data8?8:0;if(bytes&&bytes<8&&(raw&(std::uint64_t{1}<<(bytes*8-1))))raw|=(~std::uint64_t{0})<<(bytes*8);}if(raw<=std::uint64_t(INT64_MAX))value=static_cast<std::int64_t>(raw);else if(base->is_signed()&&raw>=std::uint64_t(INT64_MIN))value=static_cast<std::int64_t>(raw);}if(!value)return malformed("enumerator constant is outside the supported signed 64-bit range");if(base->size()){const unsigned bits=static_cast<unsigned>(*base->size()*8);if(base->is_signed()&&bits<64){const auto lo=-(std::int64_t{1}<<(bits-1)),hi=(std::int64_t{1}<<(bits-1))-1;if(*value<lo||*value>hi)return malformed("enumerator value does not fit its underlying type");}else if(!base->is_signed()&&*value<0)return malformed("negative enumerator value has an unsigned underlying type");}return *value;};
+        auto enum_value=[&](const Die&e,const types::TypePtr&base)->hexlab::Result<std::uint64_t>{const auto*v=attr(e,attr_const_value);if(!v)return malformed("enumerator DIE lacks DW_AT_const_value");std::optional<std::uint64_t> value;if(auto*s=std::get_if<std::int64_t>(v)){if(!base->is_signed()&&*s<0)return malformed("negative enumerator value has an unsigned underlying type");value=static_cast<std::uint64_t>(*s);}else if(auto*u=std::get_if<std::uint64_t>(v)){std::uint64_t raw=*u;auto ab=abbrevs.value().find(e.code);auto spec=std::find_if(ab->second.attributes.begin(),ab->second.attributes.end(),[](const auto&a){return a.name==attr_const_value;});if(spec!=ab->second.attributes.end()&&base->is_signed()){unsigned bytes=spec->form==form_data1?1:spec->form==form_data2?2:spec->form==form_data4?4:spec->form==form_data8?8:0;if(bytes&&bytes<8&&(raw&(std::uint64_t{1}<<(bytes*8-1))))raw|=(~std::uint64_t{0})<<(bytes*8);}value=raw;}if(!value)return malformed("enumerator constant is outside the supported 64-bit range");if(base->size()){const auto bits=static_cast<unsigned>(*base->size()*8);if(bits<64){const auto mask=(std::uint64_t{1}<<bits)-1;const auto upper=*value&~mask;if(base->is_signed()){const auto sign=std::uint64_t{1}<<(bits-1);const auto expected=(*value&sign)?~mask:std::uint64_t{0};if(upper!=expected)return malformed("enumerator value does not fit its underlying type");}else if(upper)return malformed("enumerator value does not fit its underlying type");}}return *value;};
         std::function<hexlab::Result<types::TypePtr>(std::size_t)> resolve_type;
         std::function<hexlab::Result<types::TypePtr>(const Reference&)> resolve_type_reference;
         std::function<hexlab::Result<std::vector<types::Parameter>>(const Die&)> parameters;
@@ -886,8 +918,8 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
             types::TypePtr result;const auto*name=str(d,attr_name);const auto*size=num(d,attr_byte_size);
             std::uint64_t declared_alignment=0;
             if(attr(d,attr_alignment)){
-                if(d.tag!=tag_base_type&&d.tag!=tag_pointer_type&&d.tag!=tag_structure_type&&d.tag!=tag_union_type)
-                    return unsupported("DW_AT_alignment is currently supported only on base, pointer, structure, and union types");
+                if(d.tag!=tag_base_type&&d.tag!=tag_pointer_type&&d.tag!=tag_structure_type&&d.tag!=tag_union_type&&d.tag!=tag_atomic_type)
+                    return unsupported("DW_AT_alignment is currently supported only on base, pointer, atomic, structure, and union types");
                 const auto*alignment=num(d,attr_alignment);
                 if(!alignment||!*alignment||(*alignment&(*alignment-1)))return malformed("DW_AT_alignment must be a positive power-of-two constant");
                 if(*alignment>(1u<<20))return hexlab::Error{hexlab::ErrorCode::resource_limit,"DW_AT_alignment exceeds the 1 MiB type-alignment limit"};
@@ -896,7 +928,23 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
             switch(d.tag){
             case tag_base_type:{if(!name||name->empty()||!size||!*size||*size>32)return malformed("base_type DIE lacks a valid name/byte_size");const auto*enc=num(d,attr_encoding);if(!enc)return malformed("base_type DIE lacks DW_AT_encoding");const auto alignment=declared_alignment?declared_alignment:1;hexlab::Result<types::TypePtr> t=unsupported("unsupported DWARF base-type encoding "+std::to_string(*enc));if(*enc==0x04)t=types::Type::floating(*name,*size,alignment);else if(*enc==0x02)t=types::Type::boolean(*size,alignment);else if(*enc==0x05||*enc==0x06)t=types::Type::integer(*name,*size,alignment,true);else if(*enc==0x07||*enc==0x08)t=types::Type::integer(*name,*size,alignment,false);else if(*enc==0x01)t=types::Type::pointer(types::Type::void_type(),*size,alignment);if(!t)return t.error();result=t.value();break;}
             case tag_pointer_type:{auto pointee=resolve_attr_type(false);if(!pointee)return pointee.error();const auto bytes=size?*size:as_value;const auto alignment=declared_alignment?declared_alignment:std::min<std::uint64_t>(bytes,8);auto t=types::Type::pointer(pointee.value()?pointee.value():types::Type::void_type(),bytes,alignment);if(!t)return t.error();result=t.value();break;}
-            case tag_typedef:case tag_const_type:case tag_volatile_type:{if(d.tag==tag_typedef&&(!name||name->empty()))return malformed("typedef DIE lacks DW_AT_name");auto target=resolve_attr_type(true);if(!target)return target.error();result=target.value();break;}
+            case tag_typedef:{if(!name||name->empty())return malformed("typedef DIE lacks DW_AT_name");auto target=resolve_attr_type(true);if(!target)return target.error();result=target.value();break;}
+            case tag_const_type:case tag_volatile_type:case tag_restrict_type:{
+                auto target=resolve_attr_type(true);if(!target)return target.error();
+                const auto qualifier=d.tag==tag_const_type?types::Qualifier::const_:
+                    d.tag==tag_volatile_type?types::Qualifier::volatile_:types::Qualifier::restrict_;
+                auto qualified=types::Type::qualified(target.value(),static_cast<std::uint8_t>(qualifier));
+                if(!qualified)return qualified.error();result=qualified.value();break;
+            }
+            case tag_atomic_type:{
+                auto target=resolve_attr_type(true);if(!target)return target.error();
+                if(size&&(!target.value()->size()||*size!=*target.value()->size()))
+                    return unsupported("atomic DW_AT_byte_size differs from the underlying type and is not represented");
+                auto qualified=types::Type::qualified(target.value(),static_cast<std::uint8_t>(types::Qualifier::atomic_));
+                if(!qualified)return qualified.error();result=qualified.value();
+                if(declared_alignment){auto aligned=types::Type::with_alignment(result,declared_alignment);if(!aligned)return aligned.error();result=aligned.value();}
+                break;
+            }
             case tag_array:{auto element=resolve_attr_type(true);if(!element)return element.error();if(!element.value())return malformed("array element type resolved to void");std::vector<std::uint64_t> dimensions;for(auto ci:d.children)if(dies[ci].tag==tag_subrange_type){const auto&sub=dies[ci];std::optional<std::uint64_t> count;if(auto*c=num(sub,attr_count))count=*c;else {auto lo=signed_num(sub,attr_lower_bound).value_or(0);auto hi=signed_num(sub,attr_upper_bound);if(hi){if(*hi<lo)return malformed("array subrange upper bound precedes lower bound");const auto difference=static_cast<std::uint64_t>(*hi)-static_cast<std::uint64_t>(lo);if(difference==UINT64_MAX)return hexlab::Error{hexlab::ErrorCode::overflow,"array subrange element count overflows"};count=difference+1;}}if(!count||!*count)return unsupported("array subrange has no finite positive element count");dimensions.push_back(*count);}if(dimensions.empty()){if(auto*c=num(d,attr_count);c&&*c)dimensions.push_back(*c);else return unsupported("array type has no supported fixed subrange");}for(auto it=dimensions.rbegin();it!=dimensions.rend();++it){auto a=types::Type::array(element.value(),*it);if(!a)return a.error();element=a.value();}result=element.value();break;}
             case tag_structure_type:case tag_union_type:{
                 if(!name||name->empty())return unsupported("anonymous aggregate DIE is unsupported");
@@ -983,8 +1031,8 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
                 align=std::max(align,declared_alignment);auto t=d.tag==tag_structure_type?types::Type::structure(*name,std::move(members),*size,align):types::Type::union_type(*name,std::move(members),*size,align);
                 if(!t)return t.error();result=t.value();break;
             }
-            case tag_enumeration:{if(!name||name->empty())return unsupported("anonymous enumeration DIE is unsupported");types::TypePtr base;if(ref(d,attr_type)){auto b=resolve_attr_type(true);if(!b)return b.error();base=b.value();}else {const auto bytes=size?*size:4;auto b=types::Type::integer("enum-underlying",bytes,1,true);if(!b)return b.error();base=b.value();}if(base->kind()!=types::Kind::integer)return malformed("enum underlying type is not an integer");std::vector<std::string> enumerators;for(auto ci:d.children)if(dies[ci].tag==tag_enumerator){const auto&e=dies[ci];const auto*en=str(e,attr_name);auto val=enum_value(e,base);if(!en||!val)return !en?hexlab::Result<types::TypePtr>(malformed("enumerator DIE lacks DW_AT_name")):hexlab::Result<types::TypePtr>(val.error());enumerators.push_back(*en);output.enumerators.push_back({*en,*name,val.value(),origin(sections,unit_offset,e)});}if(enumerators.empty())return unsupported("enumeration DIE contains no supported enumerators");auto t=types::Type::enumeration(*name,base,std::move(enumerators));if(!t)return t.error();result=t.value();break;}
-            case tag_subroutine_type:{types::TypePtr ret=types::Type::void_type();if(ref(d,attr_type)){auto r=resolve_attr_type(true);if(!r)return r.error();ret=r.value();}auto ps=parameters(d);if(!ps)return ps.error();bool variadic=std::any_of(d.children.begin(),d.children.end(),[&](auto ci){return dies[ci].tag==tag_unspecified_parameters;});auto t=types::Type::function(ret,std::move(ps.value()),variadic);if(!t)return t.error();result=t.value();break;}
+            case tag_enumeration:{if(!name||name->empty())return unsupported("anonymous enumeration DIE is unsupported");types::TypePtr base;if(ref(d,attr_type)){auto b=resolve_attr_type(true);if(!b)return b.error();base=b.value();}else {const auto bytes=size?*size:4;auto b=types::Type::integer("enum-underlying",bytes,1,true);if(!b)return b.error();base=b.value();}if(base->kind()!=types::Kind::integer)return malformed("enum underlying type is not an integer");std::vector<types::Enumerator> enumerators;for(auto ci:d.children)if(dies[ci].tag==tag_enumerator){const auto&e=dies[ci];const auto*en=str(e,attr_name);auto val=enum_value(e,base);if(!en||!val)return !en?hexlab::Result<types::TypePtr>(malformed("enumerator DIE lacks DW_AT_name")):hexlab::Result<types::TypePtr>(val.error());enumerators.push_back({*en,val.value()});const auto legacy_value=val.value()<=static_cast<std::uint64_t>(INT64_MAX)?static_cast<std::int64_t>(val.value()):-1-static_cast<std::int64_t>(~val.value());output.enumerators.push_back({*en,*name,legacy_value,origin(sections,unit_offset,e),ImportedEnumerator::ExactValue{val.value(),base->is_signed()}});}if(enumerators.empty())return unsupported("enumeration DIE contains no supported enumerators");auto t=types::Type::enumeration_with_values(*name,base,std::move(enumerators));if(!t)return t.error();result=t.value();break;}
+            case tag_subroutine_type:{auto convention=validate_calling_convention(attr(d,attr_calling_convention));if(!convention)return convention.error();types::TypePtr ret=types::Type::void_type();if(ref(d,attr_type)){auto r=resolve_attr_type(true);if(!r)return r.error();ret=r.value();}auto ps=parameters(d);if(!ps)return ps.error();bool variadic=std::any_of(d.children.begin(),d.children.end(),[&](auto ci){return dies[ci].tag==tag_unspecified_parameters;});auto t=types::Type::function(ret,std::move(ps.value()),variadic);if(!t)return t.error();result=t.value();break;}
             default:return unsupported("referenced DIE is not a supported type");
             }
             state[d.offset]=2;cache.emplace(d.offset,result);return result;
@@ -993,7 +1041,7 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
         // remain intentionally opaque unless another DIE requires its layout.
         for(std::size_t i=0;i<dies.size();++i){if(canceled())return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF import canceled"};if(is_type_tag(dies[i].tag)){
             if((dies[i].tag==tag_structure_type||dies[i].tag==tag_union_type)&&num(dies[i],attr_declaration)&&*num(dies[i],attr_declaration))continue;
-            auto t=resolve_type(i);if(!t)return t.error();const auto&d=dies[i];const auto*n=str(d,attr_name);ImportedType it;it.type=t.value();it.origin=origin(sections,unit_offset,d);it.alignment_is_inferred=attr(d,attr_alignment)==nullptr;it.source_name=n?*n:t.value()->name();it.is_typedef=d.tag==tag_typedef;it.is_const=d.tag==tag_const_type;it.is_volatile=d.tag==tag_volatile_type;output.types.push_back(std::move(it));
+            auto t=resolve_type(i);if(!t)return t.error();const auto&d=dies[i];const auto*n=str(d,attr_name);ImportedType it;it.type=t.value();it.origin=origin(sections,unit_offset,d);it.alignment_is_inferred=attr(d,attr_alignment)==nullptr;it.source_name=n?*n:t.value()->name();it.is_typedef=d.tag==tag_typedef;it.is_const=d.tag==tag_const_type;it.is_volatile=d.tag==tag_volatile_type;it.is_restrict=d.tag==tag_restrict_type;it.is_atomic=d.tag==tag_atomic_type;output.types.push_back(std::move(it));
         }}
         // Preserve complete declaration signatures from earlier compilation
         // units so later DW_FORM_ref_addr specification/origin edges can reuse
@@ -1005,6 +1053,10 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
         for(std::size_t i=0;i<dies.size();++i){
             const auto&die=dies[i];
             if(die.tag!=tag_subprogram)continue;
+            auto convention_value=function_attribute(i,attr_calling_convention);
+            if(!convention_value)return convention_value.error();
+            auto convention_valid=validate_calling_convention(convention_value.value());
+            if(!convention_valid)return convention_valid.error();
             const PriorFunctionSignature*prior=nullptr;
             for(const auto reference_attribute:{attr_abstract_origin,attr_specification}){
                 const auto*reference=ref(die,reference_attribute);
@@ -1104,6 +1156,9 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
                 else resolved_type=inherited_type;
                 if(!resolved_type)continue;
                 ImportedVariable v;v.name=*resolved_name;v.type=resolved_type;v.is_parameter=d.tag==tag_formal_parameter;v.scope_offset=scope;v.origin=origin(sections,unit_offset,d);
+                auto declaration=declaration_location(d);if(!declaration)return declaration.error();
+                if(declaration.value().file_index||declaration.value().line||declaration.value().column)
+                    v.declaration_location=declaration.value();
                 if(const auto*loc=attr(d,attr_location)){
                     auto ab=abbrevs.value().find(d.code);
                     auto spec=std::find_if(ab->second.attributes.begin(),ab->second.attributes.end(),[](const auto&a){return a.name==attr_location;});
@@ -1146,7 +1201,26 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
                 }
                 output.variables.push_back(std::move(v));
             }
-            if(d.tag==tag_subprogram){
+            if (d.tag == tag_entry_point) {
+                // An alternate entry point has a code PC but does not claim
+                // the complete extent or callable signature of a subprogram.
+                // Retain only a direct DW_AT_low_pc and name; the image-aware
+                // function pass validates mapping, execution mode, and code.
+                const auto *low = num(d, attr_low_pc);
+                const auto *name = str(d, attr_name);
+                if (low && name && !name->empty()) {
+                    ImportedSymbol entry_point;
+                    entry_point.name = *name;
+                    entry_point.kind = SymbolKind::entry_point;
+                    entry_point.address = *low;
+                    entry_point.origin = origin(sections, unit_offset, d);
+                    output.symbols.push_back(std::move(entry_point));
+                }
+            } else if(d.tag==tag_subprogram){
+                auto convention_value=function_attribute(i,attr_calling_convention);
+                if(!convention_value)return convention_value.error();
+                auto convention_valid=validate_calling_convention(convention_value.value());
+                if(!convention_valid)return convention_valid.error();
                 const auto*low=num(d,attr_low_pc);const auto*high=num(d,attr_high_pc);
                 auto function_ranges=std::vector<ImportedSymbol::Range>{};
                 if(const auto*ranges_value=attr(d,attr_ranges)){
@@ -1228,6 +1302,14 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
                 ImportedSymbol imported{*n,SymbolKind::function,function_ranges.front().begin,
                     function_ranges.front().end-function_ranges.front().begin,origin(sections,unit_offset,d),fn.value()};
                 imported.ranges=std::move(function_ranges);
+                if(const auto*linkage_value=attr(d,attr_linkage_name)){
+                    const auto*linkage_name=std::get_if<std::string>(linkage_value);
+                    if(!linkage_name)return malformed("DW_AT_linkage_name is not a string");
+                    imported.linkage_name=*linkage_name;
+                }
+                auto declaration=declaration_location(d);if(!declaration)return declaration.error();
+                if(declaration.value().file_index||declaration.value().line||declaration.value().column)
+                    imported.declaration_location=declaration.value();
                 output.symbols.push_back(std::move(imported));
             }
         }

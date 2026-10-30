@@ -3,6 +3,7 @@
 #include "hexlab/processors/instruction.hpp"
 #include "hexlab/processors/x64_semantics.hpp"
 #include <algorithm>
+#include <functional>
 #include <optional>
 #include <bit>
 #include <type_traits>
@@ -28,6 +29,220 @@ inline bool x86_context(const Instruction &instruction) noexcept {
 }
 } // namespace x64_instruction_semantics_detail
 
+// Validate the typed hardware-random instruction before evaluating a caller-
+// supplied sample/availability pair. The value is the printed destination slice;
+// callers merge 16-bit partial writes and zero-extend 32-bit long-mode writes.
+inline std::optional<X86RandomResult> evaluate_x86_random_instruction(
+    const Instruction &instruction, std::uint64_t sample, bool available,
+    std::uint64_t incoming_flags) noexcept {
+    const bool long_mode = instruction.context.architecture == Architecture::x86_64 &&
+        instruction.context.mode == ExecutionMode::x86_64;
+    const bool legacy = instruction.context.architecture == Architecture::x86 &&
+        (instruction.context.mode == ExecutionMode::x86_16 || instruction.context.mode == ExecutionMode::x86_32);
+    if ((!long_mode && !legacy) || (instruction.opcode != Opcode::rdrand && instruction.opcode != Opcode::rdseed) ||
+        instruction.flow != FlowKind::fallthrough || instruction.lock_prefix || instruction.memory_read ||
+        instruction.memory_write || instruction.operands.size() != 1 || instruction.access.size() != 1 ||
+        instruction.access[0] != OperandAccess::write || instruction.x86_repeat != X86RepeatPrefix::none)
+        return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    if (!destination || destination->bank != RegisterBank::gpr || destination->high_byte ||
+        destination->index >= (long_mode ? 16 : 8) ||
+        (destination->width != 16 && destination->width != 32 && !(long_mode && destination->width == 64)))
+        return std::nullopt;
+    const auto full_width = static_cast<std::uint16_t>(long_mode ? 64 :
+        instruction.context.mode == ExecutionMode::x86_16 ? 16 : 32);
+    const RegisterOperand flags{RegisterBank::flags, 0, full_width, false};
+    const RegisterOperand full{RegisterBank::gpr, destination->index, full_width, false};
+    std::vector<RegisterOperand> reads, writes;
+    if (destination->width < full_width) {
+        if (destination->width == 16) reads.push_back(full);
+        writes.push_back(full);
+    }
+    reads.push_back(flags);
+    writes.push_back(*destination);
+    writes.push_back(flags);
+    if (instruction.register_reads != reads || instruction.register_writes != writes) return std::nullopt;
+    auto result = evaluate_x86_random(sample, available, destination->width, incoming_flags);
+    if (result && full_width != 64) result->flags &= (UINT64_C(1) << full_width) - 1;
+    return result;
+}
+
+struct X86ExchangeResult {
+    std::uint64_t first_value = 0;
+    std::uint64_t second_value = 0;
+    std::uint8_t width = 0;
+    bool operator==(const X86ExchangeResult &) const = default;
+};
+
+// Evaluate register-register XCHG. Memory forms are rejected because their
+// atomic memory effects are outside this pure register evaluator.
+inline std::optional<X86ExchangeResult> evaluate_x86_exchange_instruction(
+    const Instruction &instruction, std::uint64_t first_value,
+    std::uint64_t second_value) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (!x86_context(instruction) || instruction.opcode != Opcode::xchg ||
+        instruction.flow != FlowKind::fallthrough || instruction.memory_read || instruction.memory_write ||
+        instruction.operands.size() != 2 || instruction.access.size() != 2 ||
+        instruction.access[0] != OperandAccess::read_write || instruction.access[1] != OperandAccess::read_write)
+        return std::nullopt;
+    const auto *first = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *second = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    if (!first || !second || first->bank != RegisterBank::gpr || second->bank != RegisterBank::gpr ||
+        first->width != second->width || (first->width != 8 && first->width != 16 &&
+        first->width != 32 && first->width != 64) || (first->width == 64 &&
+        instruction.context.architecture != Architecture::x86_64))
+        return std::nullopt;
+    const auto has = [](const auto &registers, RegisterOperand reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    if (!has(instruction.register_reads, *first) || !has(instruction.register_reads, *second) ||
+        !has(instruction.register_writes, *first) || !has(instruction.register_writes, *second))
+        return std::nullopt;
+    const auto mask = x86_semantics_detail::mask_for(first->width);
+    if (*first == *second && ((first_value ^ second_value) & mask) != 0)
+        return std::nullopt;
+    return X86ExchangeResult{second_value & mask, first_value & mask,
+                             static_cast<std::uint8_t>(first->width)};
+}
+
+struct X86XaddResult {
+    std::uint64_t destination_value = 0;
+    std::uint64_t source_value = 0;
+    X86Flags flags{};
+    std::uint8_t width = 0;
+    bool writes_source = true;
+    bool operator==(const X86XaddResult &) const = default;
+};
+
+// Evaluate register-register XADD. Memory-destination and locked atomic forms
+// are caller-owned and rejected; a source/destination alias writes only the sum.
+inline std::optional<X86XaddResult> evaluate_x86_xadd_instruction(
+    const Instruction &instruction, std::uint64_t old_destination,
+    std::uint64_t old_source) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (!x86_context(instruction) || instruction.opcode != Opcode::xadd ||
+        instruction.flow != FlowKind::fallthrough || instruction.memory_read || instruction.memory_write ||
+        instruction.operands.size() != 2 || instruction.access.size() != 2 ||
+        instruction.access[0] != OperandAccess::read_write || instruction.access[1] != OperandAccess::read_write)
+        return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *source = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    if (!destination || !source || destination->bank != RegisterBank::gpr || source->bank != RegisterBank::gpr ||
+        destination->width != source->width || (destination->width != 8 && destination->width != 16 &&
+        destination->width != 32 && destination->width != 64) ||
+        (destination->width == 64 && instruction.context.architecture != Architecture::x86_64))
+        return std::nullopt;
+    const auto has = [](const auto &registers, RegisterOperand reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    const bool writes_flags = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+        [](const RegisterOperand &reg) { return reg.bank == RegisterBank::flags && reg.index == 0; });
+    if (!has(instruction.register_reads, *destination) || !has(instruction.register_reads, *source) ||
+        !has(instruction.register_writes, *destination) || !has(instruction.register_writes, *source) ||
+        !writes_flags)
+        return std::nullopt;
+    const auto mask = x86_semantics_detail::mask_for(destination->width);
+    old_destination &= mask;
+    old_source &= mask;
+    const auto arithmetic = evaluate_x86_arithmetic(X86Arithmetic::add, old_destination, old_source,
+                                                    false, destination->width);
+    return X86XaddResult{arithmetic.value, old_destination, arithmetic.flags,
+                         static_cast<std::uint8_t>(destination->width), *destination != *source};
+}
+
+struct X86CmpxchgResult {
+    std::uint64_t destination_value = 0;
+    std::uint64_t accumulator_value = 0;
+    X86Flags flags{};
+    std::uint8_t width = 0;
+    bool matched = false;
+    bool writes_destination = false;
+    bool writes_accumulator = false;
+    bool operator==(const X86CmpxchgResult &) const = default;
+};
+
+// Evaluate register-destination CMPXCHG. Memory/LOCK forms and aliases where
+// the destination is the implicit accumulator are rejected.
+inline std::optional<X86CmpxchgResult> evaluate_x86_cmpxchg_instruction(
+    const Instruction &instruction, std::uint64_t old_accumulator,
+    std::uint64_t old_destination, std::uint64_t source_value) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (!x86_context(instruction) || instruction.opcode != Opcode::cmpxchg ||
+        instruction.flow != FlowKind::fallthrough || instruction.memory_read || instruction.memory_write ||
+        instruction.operands.size() != 2 || instruction.access.size() != 2 ||
+        instruction.access[0] != OperandAccess::read_write ||
+        instruction.access[1] != OperandAccess::read)
+        return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *source = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    if (!destination || !source || destination->bank != RegisterBank::gpr ||
+        source->bank != RegisterBank::gpr || destination->width != source->width ||
+        (destination->width != 8 && destination->width != 16 &&
+         destination->width != 32 && destination->width != 64) ||
+        (destination->width == 64 && instruction.context.architecture != Architecture::x86_64))
+        return std::nullopt;
+    const RegisterOperand accumulator{RegisterBank::gpr, 0, destination->width, false};
+    if (*destination == accumulator) return std::nullopt;
+    const auto has = [](const auto &registers, RegisterOperand reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    const bool writes_flags = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+    if (!has(instruction.register_reads, *destination) ||
+        !has(instruction.register_reads, *source) ||
+        !has(instruction.register_reads, accumulator) ||
+        !has(instruction.register_writes, *destination) ||
+        !has(instruction.register_writes, accumulator) || !writes_flags)
+        return std::nullopt;
+
+    const auto mask = x86_semantics_detail::mask_for(destination->width);
+    old_accumulator &= mask;
+    old_destination &= mask;
+    source_value &= mask;
+    const auto comparison = evaluate_x86_arithmetic(X86Arithmetic::compare, old_accumulator,
+                                                   old_destination, false, destination->width);
+    const bool matched = old_accumulator == old_destination;
+    return X86CmpxchgResult{matched ? source_value : old_destination,
+                            matched ? old_accumulator : old_destination,
+                            comparison.flags, static_cast<std::uint8_t>(destination->width),
+                            matched, matched, !matched};
+}
+
+// Caller supplies the runtime destination/source values (memory reads are
+// intentionally outside this pure evaluator). Validate the decoded operand
+// effects before applying either independent ADX carry chain.
+inline std::optional<X86AdxResult> evaluate_x86_adx_instruction(
+    const Instruction &instruction, std::uint64_t destination, std::uint64_t source,
+    X86Flags incoming) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (!x86_context(instruction) ||
+        (instruction.opcode != Opcode::adcx && instruction.opcode != Opcode::adox) ||
+        instruction.operands.size() != 2 || instruction.access.size() != 2 ||
+        instruction.access[0] != OperandAccess::read_write ||
+        instruction.access[1] != OperandAccess::read)
+        return std::nullopt;
+    const auto *destination_operand = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    if (!destination_operand || destination_operand->bank != RegisterBank::gpr ||
+        destination_operand->high_byte ||
+        (destination_operand->width != 32 && destination_operand->width != 64) ||
+        (destination_operand->width == 64 && instruction.context.mode != ExecutionMode::x86_64) ||
+        operand_width(instruction.operands[1]) != destination_operand->width)
+        return std::nullopt;
+    if (const auto *source_register = std::get_if<RegisterOperand>(&instruction.operands[1])) {
+        if (source_register->bank != RegisterBank::gpr || source_register->high_byte)
+            return std::nullopt;
+    } else if (!std::holds_alternative<MemoryOperand>(instruction.operands[1])) {
+        return std::nullopt;
+    }
+    const bool reads_flags = std::any_of(instruction.register_reads.begin(), instruction.register_reads.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+    const bool writes_flags = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+    if (!reads_flags || !writes_flags) return std::nullopt;
+    return evaluate_x86_adx(instruction.opcode == Opcode::adcx ? X86Adx::carry : X86Adx::overflow,
+                            destination, source, incoming, destination_operand->width);
+}
+
 // LAHF copies the defined arithmetic-status subset into AH, forces bit 1,
 // and clears bits 3 and 5. Other FLAGS bits are not represented in AH.
 inline std::uint8_t evaluate_x86_lahf(std::uint64_t flags) noexcept {
@@ -47,6 +262,58 @@ inline std::optional<std::uint8_t> evaluate_x86_lahf_instruction(const Instructi
     return evaluate_x86_lahf(flags);
 }
 
+// SAHF replaces only CF/PF/AF/ZF/SF from AH and preserves every other FLAGS
+// bit. The decoder represents SAHF in the x87 opcode family so its existing
+// bounded FNSTSW/SAHF comparison-chain recognition can consume the instruction.
+inline std::uint64_t evaluate_x86_sahf(std::uint64_t flags, std::uint8_t ah) noexcept {
+    constexpr std::uint64_t status_mask = 0xd5u;
+    return (flags & ~status_mask) | (static_cast<std::uint64_t>(ah) & status_mask);
+}
+
+inline std::optional<std::uint64_t> evaluate_x86_sahf_instruction(const Instruction &instruction,
+                                                                  std::uint64_t flags,
+                                                                  std::uint8_t ah) noexcept {
+    if (!x64_instruction_semantics_detail::x86_context(instruction) || instruction.opcode != Opcode::x87 ||
+        instruction.mnemonic_override != "sahf")
+        return std::nullopt;
+    const bool reads_ah = std::any_of(instruction.register_reads.begin(), instruction.register_reads.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::gpr && reg.index == 0 &&
+                                         reg.width == 8 && reg.high_byte; });
+    const auto written_flags = std::find_if(instruction.register_writes.begin(), instruction.register_writes.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+    if (!reads_ah || written_flags == instruction.register_writes.end() ||
+        (written_flags->width != 16 && written_flags->width != 32 && written_flags->width != 64))
+        return std::nullopt;
+    return evaluate_x86_sahf(flags, ah) & x86_semantics_detail::mask_for(written_flags->width);
+}
+
+// Evaluate CLC/STC/CMC and CLD/STD against the prior whole FLAGS value.
+// The decoder retains the specific mnemonic as an override on the shared
+// x86 semantic opcode so the operation remains visible to formatters.
+inline std::optional<std::uint64_t> evaluate_x86_flag_control_instruction(
+    const Instruction &instruction, std::uint64_t flags) noexcept {
+    if (!x64_instruction_semantics_detail::x86_context(instruction) ||
+        instruction.opcode != Opcode::x86_flag_control)
+        return std::nullopt;
+    const bool reads_flags = std::any_of(instruction.register_reads.begin(), instruction.register_reads.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+    const auto written_flags = std::find_if(instruction.register_writes.begin(), instruction.register_writes.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+    if (!reads_flags || written_flags == instruction.register_writes.end() ||
+        (written_flags->width != 16 && written_flags->width != 32 && written_flags->width != 64))
+        return std::nullopt;
+
+    constexpr std::uint64_t carry = 1u;
+    constexpr std::uint64_t direction = 1u << 10;
+    if (instruction.mnemonic_override == "clc") flags &= ~carry;
+    else if (instruction.mnemonic_override == "stc") flags |= carry;
+    else if (instruction.mnemonic_override == "cmc") flags ^= carry;
+    else if (instruction.mnemonic_override == "cld") flags &= ~direction;
+    else if (instruction.mnemonic_override == "std") flags |= direction;
+    else return std::nullopt;
+    return flags & x86_semantics_detail::mask_for(written_flags->width);
+}
+
 // Evaluate LOOP/LOOPE/LOOPNE/JCXZ-family control flow using a decoded
 // instruction. `counter` is the pre-instruction CX/ECX/RCX value.
 inline std::optional<X86LoopResult> evaluate_x86_loop_instruction(const Instruction &instruction,
@@ -60,6 +327,380 @@ inline std::optional<X86LoopResult> evaluate_x86_loop_instruction(const Instruct
         return std::nullopt;
     return evaluate_x86_loop(*instruction.x86_loop_condition, counter,
                              instruction.x86_loop_counter_width, zero_flag);
+}
+
+// Evaluate the register value produced by BSWAP. The decoder already resolves
+// the architectural width (including REX.W in long mode); 32-bit results are
+// zero-extended as required by x86-64 GPR writes.
+inline std::optional<std::uint64_t> evaluate_x86_bswap_instruction(
+    const Instruction &instruction, std::uint64_t source) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (!x86_context(instruction) || instruction.opcode != Opcode::bswap ||
+        instruction.operands.size() != 1 || instruction.access.size() != 1 ||
+        instruction.access[0] != OperandAccess::read_write)
+        return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    if (!destination || destination->bank != RegisterBank::gpr || destination->high_byte ||
+        (destination->width != 32 && destination->width != 64) ||
+        (destination->width == 64 && instruction.context.mode != ExecutionMode::x86_64))
+        return std::nullopt;
+    const unsigned bytes = destination->width / 8;
+    std::uint64_t result = 0;
+    for (unsigned index = 0; index < bytes; ++index)
+        result |= ((source >> (index * 8)) & 0xffu) << ((bytes - index - 1) * 8);
+    return result;
+}
+
+struct X86SignExtendAccumulatorResult {
+    std::uint64_t accumulator_value = 0;
+    std::uint64_t high_value = 0;
+    std::uint8_t width = 0;
+    bool writes_accumulator = false;
+    bool writes_high = false;
+    bool operator==(const X86SignExtendAccumulatorResult &) const = default;
+};
+
+// Evaluate implicit accumulator sign-extension forms used to prepare a
+// signed dividend. The caller commits whichever implicit registers are written.
+inline std::optional<X86SignExtendAccumulatorResult>
+evaluate_x86_sign_extend_accumulator_instruction(const Instruction &instruction,
+                                                  std::uint64_t accumulator) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (!x86_context(instruction) || instruction.flow != FlowKind::fallthrough ||
+        !instruction.operands.empty() || !instruction.access.empty() ||
+        instruction.memory_read || instruction.memory_write)
+        return std::nullopt;
+    unsigned input_width = 0, output_width = 0;
+    bool writes_accumulator = false;
+    bool writes_high = false;
+    switch (instruction.opcode) {
+    case Opcode::cbw: input_width = 8; output_width = 16; writes_accumulator = true; break;
+    case Opcode::cwde: input_width = 16; output_width = 32; writes_accumulator = true; break;
+    case Opcode::cdqe: input_width = 32; output_width = 64; writes_accumulator = true; break;
+    case Opcode::cwd: input_width = output_width = 16; writes_high = true; break;
+    case Opcode::cdq: input_width = output_width = 32; writes_high = true; break;
+    case Opcode::cqo: input_width = output_width = 64; writes_high = true; break;
+    default: return std::nullopt;
+    }
+    if (output_width == 64 && instruction.context.mode != ExecutionMode::x86_64)
+        return std::nullopt;
+    const RegisterOperand input{RegisterBank::gpr, 0, static_cast<std::uint16_t>(input_width), false};
+    const RegisterOperand destination{RegisterBank::gpr, 0, static_cast<std::uint16_t>(output_width), false};
+    const RegisterOperand high{RegisterBank::gpr, 2, static_cast<std::uint16_t>(output_width), false};
+    const auto has = [](const auto &registers, RegisterOperand reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    if (!has(instruction.register_reads, input) ||
+        (writes_accumulator && !has(instruction.register_writes, destination)) ||
+        (writes_high && !has(instruction.register_writes, high)))
+        return std::nullopt;
+    const auto input_mask = input_width == 64 ? UINT64_MAX : (UINT64_C(1) << input_width) - 1;
+    const auto output_mask = output_width == 64 ? UINT64_MAX : (UINT64_C(1) << output_width) - 1;
+    const auto source = accumulator & input_mask;
+    const bool negative = (source & (UINT64_C(1) << (input_width - 1))) != 0;
+    std::uint64_t accumulator_value = source;
+    std::uint64_t high_value = 0;
+    if (writes_accumulator && negative) accumulator_value |= ~input_mask;
+    if (writes_accumulator) accumulator_value &= output_mask;
+    if (writes_high && negative) high_value = output_mask;
+    return X86SignExtendAccumulatorResult{accumulator_value, high_value,
+        static_cast<std::uint8_t>(output_width), writes_accumulator, writes_high};
+}
+
+// Evaluate the byte written by SETcc from caller-supplied flags. Memory writes
+// are validated as decoded facts but remain caller-owned.
+inline std::optional<std::uint8_t> evaluate_x86_setcc_instruction(
+    const Instruction &instruction, X86Flags flags) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (!x86_context(instruction) || instruction.opcode != Opcode::setcc ||
+        !instruction.x86_condition || instruction.flow != FlowKind::fallthrough ||
+        instruction.operands.size() != 1 || instruction.access.size() != 1 ||
+        instruction.access[0] != OperandAccess::write || instruction.memory_read)
+        return std::nullopt;
+    if (const auto *reg = std::get_if<RegisterOperand>(&instruction.operands[0])) {
+        if (reg->bank != RegisterBank::gpr || reg->width != 8 || instruction.memory_write ||
+            std::find(instruction.register_writes.begin(), instruction.register_writes.end(), *reg) ==
+                instruction.register_writes.end()) return std::nullopt;
+    } else if (const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[0])) {
+        if (memory->data_width != 8 || !instruction.memory_write || !instruction.register_writes.empty())
+            return std::nullopt;
+    } else {
+        return std::nullopt;
+    }
+    return static_cast<std::uint8_t>(evaluate_x86_condition(*instruction.x86_condition, flags));
+}
+
+// Evaluate decoded CMOVcc. The source value is supplied even when the
+// condition is false because memory sources are architecturally read either way.
+inline std::optional<std::uint64_t> evaluate_x86_cmovcc_instruction(
+    const Instruction &instruction, std::uint64_t old_destination,
+    std::uint64_t source, X86Flags flags) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (!x86_context(instruction) || instruction.opcode != Opcode::cmovcc ||
+        !instruction.x86_condition || instruction.flow != FlowKind::fallthrough ||
+        instruction.operands.size() != 2 || instruction.access.size() != 2 ||
+        instruction.access[0] != OperandAccess::read_write ||
+        instruction.access[1] != OperandAccess::read || instruction.memory_write)
+        return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    if (!destination || destination->bank != RegisterBank::gpr || destination->high_byte ||
+        (destination->width != 16 && destination->width != 32 && destination->width != 64) ||
+        (destination->width == 64 && instruction.context.mode != ExecutionMode::x86_64) ||
+        std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *destination) ==
+            instruction.register_reads.end() ||
+        std::find(instruction.register_writes.begin(), instruction.register_writes.end(), *destination) ==
+            instruction.register_writes.end())
+        return std::nullopt;
+    unsigned source_width = 0;
+    if (const auto *reg = std::get_if<RegisterOperand>(&instruction.operands[1])) {
+        if (reg->bank != RegisterBank::gpr || reg->width != destination->width || reg->high_byte ||
+            instruction.memory_read ||
+            std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *reg) ==
+                instruction.register_reads.end())
+            return std::nullopt;
+        source_width = reg->width;
+    } else if (const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1])) {
+        if (memory->data_width != destination->width || !instruction.memory_read) return std::nullopt;
+        source_width = memory->data_width;
+    } else {
+        return std::nullopt;
+    }
+    const unsigned architectural_width = instruction.context.mode == ExecutionMode::x86_64 ? 64u : 32u;
+    const auto architectural_mask = architectural_width == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    old_destination &= architectural_mask;
+    if (!evaluate_x86_condition(*instruction.x86_condition, flags)) return old_destination;
+    const auto source_mask = source_width == 64 ? UINT64_MAX : (UINT64_C(1) << source_width) - 1;
+    if (source_width == 64) return source & source_mask;
+    if (source_width == 32 && instruction.context.mode == ExecutionMode::x86_64)
+        return source & source_mask; // A taken W-style GPR write clears the upper half.
+    const auto destination_mask = source_mask;
+    return (old_destination & ~destination_mask) | (source & destination_mask);
+}
+
+// Compute LEA's effective offset for base/index forms with 32/64-bit address
+// sizes. This does not read the addressed memory or apply segment bases.
+inline std::optional<std::uint64_t> evaluate_x86_lea_instruction(
+    const Instruction &instruction,
+    const std::function<std::optional<std::uint64_t>(const RegisterOperand &)> &read_register) {
+    using namespace x64_instruction_semantics_detail;
+    if (!x86_context(instruction) || instruction.opcode != Opcode::lea ||
+        instruction.flow != FlowKind::fallthrough || instruction.operands.size() != 2 ||
+        instruction.access.size() != 2 || instruction.access[0] != OperandAccess::write ||
+        instruction.access[1] != OperandAccess::address || instruction.memory_read ||
+        instruction.memory_write || !read_register)
+        return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+    if (!destination || !memory || destination->bank != RegisterBank::gpr || destination->high_byte ||
+        (destination->width != 16 && destination->width != 32 && destination->width != 64) ||
+        memory->data_width != destination->width ||
+        (destination->width == 64 && instruction.context.mode != ExecutionMode::x86_64) ||
+        (memory->address_width != 32 && memory->address_width != 64) || memory->ip_relative ||
+        (memory->scale != 1 && memory->scale != 2 && memory->scale != 4 && memory->scale != 8))
+        return std::nullopt;
+    const auto valid_address_register = [memory](const std::optional<RegisterOperand> &reg) {
+        return !reg || (reg->bank == RegisterBank::gpr && reg->width == memory->address_width &&
+                        !reg->high_byte);
+    };
+    if (!valid_address_register(memory->base) || !valid_address_register(memory->index))
+        return std::nullopt;
+    const auto address_mask = memory->address_width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
+    std::uint64_t effective = static_cast<std::uint64_t>(memory->displacement);
+    if (memory->base) {
+        const auto value = read_register(*memory->base);
+        if (!value) return std::nullopt;
+        effective += *value & address_mask;
+    }
+    if (memory->index) {
+        const auto value = read_register(*memory->index);
+        if (!value) return std::nullopt;
+        effective += (*value & address_mask) * memory->scale;
+    }
+    effective &= address_mask;
+    const auto destination_mask = destination->width == 64 ? UINT64_MAX :
+        (UINT64_C(1) << destination->width) - 1;
+    return effective & destination_mask;
+}
+
+struct X86AamAadResult {
+    std::uint8_t al = 0;
+    std::uint8_t ah = 0;
+    std::uint64_t flags_value = 0;
+    std::uint64_t flags_defined_mask = 0; // PF/ZF/SF; AF/CF/OF are undefined.
+    bool divide_error = false; // AAM with radix zero does not retire.
+    bool operator==(const X86AamAadResult &) const = default;
+};
+
+// Evaluate the byte results and defined SF/ZF/PF bits of decoded legacy AAM
+// or AAD. AAM's zero radix reports a divide error with no committed byte or
+// flag results. Radix and byte inputs are caller-supplied decoded/runtime data.
+inline std::optional<X86AamAadResult> evaluate_x86_aam_aad_instruction(
+    const Instruction &instruction, std::uint8_t al, std::uint8_t ah) noexcept {
+    if ((instruction.context.architecture != Architecture::x86 &&
+         instruction.context.architecture != Architecture::x86_64) ||
+        (instruction.context.mode != ExecutionMode::x86_16 &&
+         instruction.context.mode != ExecutionMode::x86_32) ||
+        (instruction.opcode != Opcode::aam && instruction.opcode != Opcode::aad) ||
+        instruction.operands.size() != 1 || instruction.access.size() != 1 ||
+        instruction.access[0] != OperandAccess::read)
+        return std::nullopt;
+    const auto *radix = std::get_if<ImmediateOperand>(&instruction.operands[0]);
+    if (!radix || radix->encoded_width != 8 || radix->effective_width != 8 ||
+        radix->is_signed || radix->value > 0xff)
+        return std::nullopt;
+    const RegisterOperand al_register{RegisterBank::gpr, 0, 8, false};
+    const RegisterOperand ah_register{RegisterBank::gpr, 0, 8, true};
+    const auto contains = [](const auto &registers, RegisterOperand value) {
+        return std::find(registers.begin(), registers.end(), value) != registers.end();
+    };
+    const auto flags_width = instruction.context.mode == ExecutionMode::x86_16 ? 16u : 32u;
+    const bool writes_flags = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+        [&](RegisterOperand reg) { return reg.bank == RegisterBank::flags && reg.width == flags_width; });
+    if (!contains(instruction.register_reads, al_register) ||
+        !contains(instruction.register_writes, al_register) ||
+        !contains(instruction.register_writes, ah_register) ||
+        !writes_flags ||
+        (instruction.opcode == Opcode::aad && !contains(instruction.register_reads, ah_register)) ||
+        (instruction.opcode == Opcode::aam && contains(instruction.register_reads, ah_register)))
+        return std::nullopt;
+
+    const auto base = static_cast<std::uint8_t>(radix->value);
+    X86AamAadResult result;
+    if (instruction.opcode == Opcode::aam) {
+        if (!base) {
+            result.divide_error = true;
+            return result;
+        }
+        result.al = static_cast<std::uint8_t>(al % base);
+        result.ah = static_cast<std::uint8_t>(al / base);
+    } else {
+        result.al = static_cast<std::uint8_t>(static_cast<unsigned>(al) +
+                                               static_cast<unsigned>(ah) * base);
+        result.ah = 0;
+    }
+    constexpr std::uint64_t pf = UINT64_C(1) << 2;
+    constexpr std::uint64_t zf = UINT64_C(1) << 6;
+    constexpr std::uint64_t sf = UINT64_C(1) << 7;
+    result.flags_defined_mask = pf | zf | sf;
+    if ((std::popcount(result.al) & 1) == 0) result.flags_value |= pf;
+    if (!result.al) result.flags_value |= zf;
+    if (result.al & 0x80u) result.flags_value |= sf;
+    return result;
+}
+
+struct X86DaaDasResult {
+    std::uint8_t al = 0;
+    std::uint64_t flags_value = 0;
+    std::uint64_t flags_defined_mask = 0; // CF/AF/PF/ZF/SF; OF is undefined.
+    bool operator==(const X86DaaDasResult &) const = default;
+};
+
+// Evaluate decoded legacy DAA/DAS using AL and the incoming AF/CF bits. The
+// returned flags contain only defined outputs; callers must keep OF unknown.
+inline std::optional<X86DaaDasResult> evaluate_x86_daa_das_instruction(
+    const Instruction &instruction, std::uint8_t al, std::uint64_t incoming_flags) noexcept {
+    if ((instruction.context.architecture != Architecture::x86 &&
+         instruction.context.architecture != Architecture::x86_64) ||
+        (instruction.context.mode != ExecutionMode::x86_16 &&
+         instruction.context.mode != ExecutionMode::x86_32) ||
+        (instruction.opcode != Opcode::daa && instruction.opcode != Opcode::das) ||
+        instruction.length != 1 || instruction.bytes[0] !=
+            std::byte{static_cast<std::uint8_t>(instruction.opcode == Opcode::daa ? 0x27 : 0x2f)} ||
+        !instruction.operands.empty() || !instruction.access.empty())
+        return std::nullopt;
+    const RegisterOperand al_register{RegisterBank::gpr, 0, 8, false};
+    const auto contains = [](const auto &registers, RegisterOperand value) {
+        return std::find(registers.begin(), registers.end(), value) != registers.end();
+    };
+    const auto flags_width = instruction.context.mode == ExecutionMode::x86_16 ? 16u : 32u;
+    const RegisterOperand flags_register{RegisterBank::flags, 0, static_cast<std::uint16_t>(flags_width), false};
+    if (!contains(instruction.register_reads, al_register) ||
+        !contains(instruction.register_writes, al_register) ||
+        !contains(instruction.register_reads, flags_register) ||
+        !contains(instruction.register_writes, flags_register))
+        return std::nullopt;
+
+    constexpr std::uint64_t cf = UINT64_C(1) << 0;
+    constexpr std::uint64_t pf = UINT64_C(1) << 2;
+    constexpr std::uint64_t af = UINT64_C(1) << 4;
+    constexpr std::uint64_t zf = UINT64_C(1) << 6;
+    constexpr std::uint64_t sf = UINT64_C(1) << 7;
+    const bool subtract = instruction.opcode == Opcode::das;
+    const bool adjust_low = (al & 0x0f) > 9 || (incoming_flags & af) != 0;
+    const bool adjust_high = al > 0x99 || (incoming_flags & cf) != 0;
+    unsigned adjusted = al;
+    if (adjust_low) adjusted = subtract ? adjusted - 6u : adjusted + 6u;
+    if (adjust_high) adjusted = subtract ? adjusted - 0x60u : adjusted + 0x60u;
+    X86DaaDasResult result;
+    result.al = static_cast<std::uint8_t>(adjusted);
+    result.flags_defined_mask = cf | af | pf | zf | sf;
+    if (adjust_high) result.flags_value |= cf;
+    if (adjust_low) result.flags_value |= af;
+    if ((std::popcount(result.al) & 1) == 0) result.flags_value |= pf;
+    if (result.al == 0) result.flags_value |= zf;
+    if (result.al & 0x80u) result.flags_value |= sf;
+    return result;
+}
+
+struct X86PopcntResult {
+    std::uint64_t value = 0;
+    std::uint64_t flags = 0;
+    bool operator==(const X86PopcntResult &) const = default;
+};
+
+// Evaluate a decoded POPCNT after its register or memory source has been read.
+// POPCNT defines CF/PF/AF/ZF/SF/OF and preserves every other FLAGS bit.
+inline std::optional<X86PopcntResult> evaluate_x86_popcnt_instruction(
+    const Instruction &instruction, std::uint64_t source, std::uint64_t incoming_flags) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (!x86_context(instruction) || instruction.opcode != Opcode::popcnt ||
+        instruction.operands.size() != 2 || instruction.access.size() != 2 ||
+        instruction.access[0] != OperandAccess::write || instruction.access[1] != OperandAccess::read)
+        return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const unsigned width = destination && destination->bank == RegisterBank::gpr ? destination->width : 0;
+    if (!destination || destination->high_byte || (width != 16 && width != 32 && width != 64) ||
+        (instruction.context.mode != ExecutionMode::x86_16 &&
+         instruction.context.mode != ExecutionMode::x86_32 && instruction.context.mode != ExecutionMode::x86_64) ||
+        (width == 64 && instruction.context.mode != ExecutionMode::x86_64) ||
+        operand_width(instruction.operands[1]) != width)
+        return std::nullopt;
+    const auto destination_write = std::find(instruction.register_writes.begin(), instruction.register_writes.end(),
+                                             *destination);
+    if (destination_write == instruction.register_writes.end()) return std::nullopt;
+    if (const auto *source_register = std::get_if<RegisterOperand>(&instruction.operands[1])) {
+        if (source_register->bank != RegisterBank::gpr || source_register->high_byte ||
+            std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *source_register) ==
+                instruction.register_reads.end()) return std::nullopt;
+    } else if (!std::holds_alternative<MemoryOperand>(instruction.operands[1])) {
+        return std::nullopt;
+    } else if (!instruction.memory_read) {
+        return std::nullopt;
+    }
+    const auto flag_register = [](RegisterOperand reg) {
+        return reg.bank == RegisterBank::flags &&
+            (reg.width == 16 || reg.width == 32 || reg.width == 64);
+    };
+    const auto incoming = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(), flag_register);
+    const auto outgoing = std::find_if(instruction.register_writes.begin(), instruction.register_writes.end(), flag_register);
+    const auto expected_flags_width = instruction.context.mode == ExecutionMode::x86_16 ? 16u :
+        instruction.context.mode == ExecutionMode::x86_64 ? 64u : 32u;
+    if (incoming == instruction.register_reads.end() || outgoing == instruction.register_writes.end() ||
+        incoming->width != outgoing->width || outgoing->width != expected_flags_width)
+        return std::nullopt;
+
+    const std::uint64_t operand_mask = width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1;
+    constexpr std::uint64_t affected = (UINT64_C(1) << 0) | (UINT64_C(1) << 2) |
+        (UINT64_C(1) << 4) | (UINT64_C(1) << 6) | (UINT64_C(1) << 7) | (UINT64_C(1) << 11);
+    const std::uint64_t flags_mask = outgoing->width == 64 ? UINT64_MAX :
+        (UINT64_C(1) << outgoing->width) - 1;
+    const auto masked_source = source & operand_mask;
+    X86PopcntResult result;
+    result.value = static_cast<std::uint64_t>(std::popcount(masked_source));
+    result.flags = (incoming_flags & ~affected) |
+        (masked_source == 0 ? (UINT64_C(1) << 6) : 0);
+    result.flags &= flags_mask;
+    return result;
 }
 
 // Architectural state touched by one x86 string-instruction iteration.
@@ -534,6 +1175,190 @@ evaluate_x86_double_shift_instruction(const Instruction &instruction,
         return std::nullopt;
     }
     return evaluate_x86_double_shift(instruction.opcode == Opcode::shld, destination, source, count, width);
+}
+
+// BMI1 sources are caller-owned values in printed operand order (excluding
+// the destination). Memory is neither read nor written by this evaluator.
+inline std::optional<X86Bmi1Result>
+evaluate_x86_bmi1_instruction(const Instruction &instruction, std::uint64_t source1,
+                              std::optional<std::uint64_t> source2 = std::nullopt) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (!x86_context(instruction) || instruction.context.mode != ExecutionMode::x86_64)
+        return std::nullopt;
+    X86Bmi1 operation;
+    bool unary = false;
+    switch (instruction.opcode) {
+    case Opcode::andn: operation = X86Bmi1::andn; break;
+    case Opcode::bextr: operation = X86Bmi1::bextr; break;
+    case Opcode::blsi: operation = X86Bmi1::blsi; unary = true; break;
+    case Opcode::blsmsk: operation = X86Bmi1::blsmsk; unary = true; break;
+    case Opcode::blsr: operation = X86Bmi1::blsr; unary = true; break;
+    default: return std::nullopt;
+    }
+    const unsigned count = unary ? 2 : 3;
+    if ((!unary && !source2) || instruction.operands.size() != count || instruction.access.size() != count ||
+        instruction.access[0] != OperandAccess::write)
+        return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    if (!destination || destination->bank != RegisterBank::gpr || destination->index > 15 ||
+        destination->high_byte || (destination->width != 32 && destination->width != 64))
+        return std::nullopt;
+    const unsigned width = destination->width;
+    for (unsigned index = 1; index < count; ++index) {
+        if (instruction.access[index] != OperandAccess::read ||
+            operand_width(instruction.operands[index]) != width)
+            return std::nullopt;
+        if (const auto *reg = std::get_if<RegisterOperand>(&instruction.operands[index])) {
+            if (reg->bank != RegisterBank::gpr || reg->index > 15 || reg->high_byte)
+                return std::nullopt;
+        } else if (!std::holds_alternative<MemoryOperand>(instruction.operands[index])) {
+            return std::nullopt;
+        }
+        // Only ModRM.r/m may address memory: ANDN source2, all other source1.
+        const bool register_only = !unary && index == (operation == X86Bmi1::andn ? 1u : 2u);
+        if (register_only && !std::holds_alternative<RegisterOperand>(instruction.operands[index]))
+            return std::nullopt;
+    }
+    return evaluate_x86_bmi1(operation, source1, source2.value_or(0), width);
+}
+
+// The caller supplies runtime values for the printed source and mask operands;
+// memory reads and architectural dispatch/CPUID checks remain outside this pure adapter.
+inline std::optional<X86Bmi2Result> evaluate_x86_bmi2_instruction(
+    const Instruction &instruction, std::uint64_t source, std::uint64_t bit_mask) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (!x86_context(instruction) ||
+        (instruction.context.mode != ExecutionMode::x86_32 && instruction.context.mode != ExecutionMode::x86_64) ||
+        (instruction.context.architecture == Architecture::x86 &&
+         instruction.context.mode != ExecutionMode::x86_32) ||
+        (instruction.context.architecture == Architecture::x86_64 &&
+         instruction.context.mode != ExecutionMode::x86_64) ||
+        instruction.operands.size() != 3 || instruction.access.size() != 3 ||
+        instruction.access[0] != OperandAccess::write ||
+        instruction.access[1] != OperandAccess::read || instruction.access[2] != OperandAccess::read)
+        return std::nullopt;
+    X86Bmi2 operation;
+    if (instruction.opcode == Opcode::pdep) operation = X86Bmi2::pdep;
+    else if (instruction.opcode == Opcode::pext) operation = X86Bmi2::pext;
+    else return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *source_reg = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    if (!destination || !source_reg || destination->bank != RegisterBank::gpr ||
+        source_reg->bank != RegisterBank::gpr || destination->high_byte || source_reg->high_byte ||
+        destination->index > 15 || source_reg->index > 15 ||
+        (instruction.context.architecture == Architecture::x86 &&
+         (destination->index > 7 || source_reg->index > 7)) ||
+        (destination->width != 32 && destination->width != 64) ||
+        destination->width != source_reg->width || operand_width(instruction.operands[2]) != destination->width ||
+        (destination->width == 64 && instruction.context.mode != ExecutionMode::x86_64))
+        return std::nullopt;
+    if (const auto *mask_reg = std::get_if<RegisterOperand>(&instruction.operands[2])) {
+        if (mask_reg->bank != RegisterBank::gpr || mask_reg->high_byte || mask_reg->index > 15 ||
+            (instruction.context.architecture == Architecture::x86 && mask_reg->index > 7))
+            return std::nullopt;
+    } else if (!std::holds_alternative<MemoryOperand>(instruction.operands[2])) {
+        return std::nullopt;
+    }
+    return evaluate_x86_bmi2(operation, source, bit_mask, destination->width);
+}
+
+// Evaluate BMI2 SHLX/SHRX/SARX/RORX. The caller supplies the source value and,
+// except for RORX, the count-register value; memory reads remain caller-owned.
+inline std::optional<std::uint64_t> evaluate_x86_bmi2_shift_instruction(
+    const Instruction &instruction, std::uint64_t source,
+    std::uint64_t runtime_count = 0) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 ||
+        instruction.flow != FlowKind::fallthrough || instruction.memory_write ||
+        (instruction.opcode != Opcode::shlx && instruction.opcode != Opcode::shrx &&
+         instruction.opcode != Opcode::sarx && instruction.opcode != Opcode::rorx) ||
+        instruction.operands.size() != 3 || instruction.access.size() != 3 ||
+        instruction.access[0] != OperandAccess::write || instruction.access[1] != OperandAccess::read ||
+        instruction.access[2] != OperandAccess::read)
+        return std::nullopt;
+    const bool immediate_count = instruction.opcode == Opcode::rorx;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const unsigned width = destination ? destination->width : 0;
+    if (!destination || destination->bank != RegisterBank::gpr || destination->index > 15 || destination->high_byte ||
+        (width != 32 && width != 64) || operand_width(instruction.operands[1]) != width ||
+        (std::holds_alternative<MemoryOperand>(instruction.operands[1]) && !instruction.memory_read) ||
+        (std::holds_alternative<RegisterOperand>(instruction.operands[1]) && instruction.memory_read))
+        return std::nullopt;
+    const auto *source_register = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    if (source_register && (source_register->bank != RegisterBank::gpr || source_register->index > 15 ||
+                            source_register->high_byte))
+        return std::nullopt;
+    const auto has = [](const auto &registers, RegisterOperand reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    if (!has(instruction.register_writes, *destination) ||
+        (source_register && !has(instruction.register_reads, *source_register)))
+        return std::nullopt;
+    std::uint64_t count = runtime_count;
+    if (immediate_count) {
+        const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        if (!immediate || immediate->encoded_width != 8 || immediate->effective_width != 8 || immediate->is_signed)
+            return std::nullopt;
+        count = immediate->value;
+    } else {
+        const auto *count_register = std::get_if<RegisterOperand>(&instruction.operands[2]);
+        if (!count_register || count_register->bank != RegisterBank::gpr || count_register->index > 15 ||
+            count_register->width != width ||
+            count_register->high_byte || !has(instruction.register_reads, *count_register))
+            return std::nullopt;
+    }
+    const auto mask = x86_semantics_detail::mask_for(width);
+    source &= mask;
+    const unsigned shift = static_cast<unsigned>(count) & (width - 1);
+    if (instruction.opcode == Opcode::shlx) return (source << shift) & mask;
+    if (instruction.opcode == Opcode::shrx) return source >> shift;
+    if (instruction.opcode == Opcode::rorx) {
+        if (width == 32) return std::rotr(static_cast<std::uint32_t>(source), static_cast<int>(shift));
+        return std::rotr(source, static_cast<int>(shift));
+    }
+    if (shift == 0) return source;
+    auto result = source >> shift;
+    if (source & (UINT64_C(1) << (width - 1)))
+        result |= mask & ~((UINT64_C(1) << (width - shift)) - 1);
+    return result & mask;
+}
+
+// Evaluate the scalar result and defined status flags for a decoded BZHI.
+// Register and memory source values are supplied by the caller.
+inline std::optional<X86BzhiResult> evaluate_x86_bzhi_instruction(
+    const Instruction &instruction, std::uint64_t source, std::uint64_t index) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 ||
+        instruction.flow != FlowKind::fallthrough || instruction.opcode != Opcode::bzhi ||
+        instruction.memory_write || instruction.operands.size() != 3 || instruction.access.size() != 3 ||
+        instruction.access[0] != OperandAccess::write || instruction.access[1] != OperandAccess::read ||
+        instruction.access[2] != OperandAccess::read)
+        return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *index_register = std::get_if<RegisterOperand>(&instruction.operands[2]);
+    if (!destination || !index_register || destination->bank != RegisterBank::gpr ||
+        destination->index > 15 || destination->high_byte ||
+        (destination->width != 32 && destination->width != 64) ||
+        index_register->bank != RegisterBank::gpr || index_register->index > 15 ||
+        index_register->width != destination->width || index_register->high_byte ||
+        operand_width(instruction.operands[1]) != destination->width)
+        return std::nullopt;
+    const auto has = [](const auto &registers, RegisterOperand reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    const auto *source_register = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    if (source_register && (source_register->bank != RegisterBank::gpr || source_register->index > 15 ||
+                            source_register->high_byte))
+        return std::nullopt;
+    if ((std::holds_alternative<MemoryOperand>(instruction.operands[1]) && !instruction.memory_read) ||
+        (source_register && instruction.memory_read) || !has(instruction.register_writes, *destination) ||
+        !has(instruction.register_reads, *index_register) ||
+        (source_register && !has(instruction.register_reads, *source_register)) ||
+        !has(instruction.register_writes, {RegisterBank::flags, 0, 64, false}))
+        return std::nullopt;
+    return evaluate_x86_bzhi(source, index, destination->width);
 }
 
 // Evaluate the value written by a decoded MOV-family instruction. The caller

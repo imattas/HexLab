@@ -86,12 +86,13 @@ ExpressionPtr managed_string_expression(std::u16string_view value) {
 }
 ValueType managed_signature_type(const ManagedTypeSignature &signature,
                                  const ManagedMethodSignature &context,
+                                 std::uint16_t native_bits,
                                  unsigned depth = 0) {
     if (depth > 16) return {};
     if (!context.declaring_type_generic_arguments_valid) return {};
     if (signature.element_type == 0x15 && !signature.generic_instance_arity_valid) return {};
     if (signature.type_spec_signature)
-        return managed_signature_type(*signature.type_spec_signature, context, depth + 1);
+        return managed_signature_type(*signature.type_spec_signature, context, native_bits, depth + 1);
     const auto integer = [](std::uint16_t bits, bool is_signed) {
         return ValueType{TypeKind::integer, bits, is_signed};
     };
@@ -108,19 +109,21 @@ ValueType managed_signature_type(const ManagedTypeSignature &signature,
     case 0x0b: return integer(64, false);
     case 0x0c: return {TypeKind::floating, 32, false};
     case 0x0d: return {TypeKind::floating, 64, false};
-    case 0x0e: case 0x0f: case 0x10: case 0x14: case 0x18: case 0x19: case 0x1c: case 0x1d:
+    case 0x18: return integer(native_bits, true);
+    case 0x19: return integer(native_bits, false);
+    case 0x0e: case 0x0f: case 0x10: case 0x14: case 0x1c: case 0x1d:
         return managed_reference_type();
     case 0x11: return {};
     case 0x12: return managed_reference_type();
     case 0x13:
         return signature.generic_index < context.declaring_type_arguments.size()
-            ? managed_signature_type(context.declaring_type_arguments[signature.generic_index], context, depth + 1)
+            ? managed_signature_type(context.declaring_type_arguments[signature.generic_index], context, native_bits, depth + 1)
             : ValueType{};
     case 0x15: return signature.generic_instance_is_value_type ? ValueType{} : managed_reference_type();
     case 0x16: return {};
     case 0x1e:
         return signature.generic_index < context.method_spec_arguments.size()
-            ? managed_signature_type(context.method_spec_arguments[signature.generic_index], context, depth + 1)
+            ? managed_signature_type(context.method_spec_arguments[signature.generic_index], context, native_bits, depth + 1)
             : ValueType{};
     default: return {};
     }
@@ -132,21 +135,21 @@ ExpressionPtr retag_managed_expression(ExpressionPtr expression, ValueType type)
 ExpressionPtr typed_variable(std::string name, ValueType type) {
     return std::make_shared<Expression>(Expression{type, VariableValue{std::move(name)}});
 }
-ValueType managed_call_result_type(const ManagedMethodSignature &signature, bool construct) {
+ValueType managed_call_result_type(const ManagedMethodSignature &signature, bool construct, std::uint16_t native_bits) {
     if (construct)
         return signature.declaring_type_generic_arguments_valid &&
                signature.declaring_type_is_value_type == std::optional<bool>{false}
             ? managed_reference_type() : ValueType{};
-    return signature.returns_value ? managed_signature_type(signature.return_type, signature) : ValueType{};
+    return signature.returns_value ? managed_signature_type(signature.return_type, signature, native_bits) : ValueType{};
 }
-std::optional<ValueType> managed_array_element_type(std::string_view op) {
+std::optional<ValueType> managed_array_element_type(std::string_view op, std::uint16_t native_bits) {
     if (op == "ldelem.i1") return ValueType{TypeKind::integer, 32, true};
     if (op == "ldelem.u1") return ValueType{TypeKind::integer, 32, false};
     if (op == "ldelem.i2") return ValueType{TypeKind::integer, 32, true};
     if (op == "ldelem.u2") return ValueType{TypeKind::integer, 32, false};
     if (op == "ldelem.i4" || op == "ldelem.u4") return ValueType{TypeKind::integer, 32, op == "ldelem.i4"};
     if (op == "ldelem.i8") return ValueType{TypeKind::integer, 64, true};
-    if (op == "ldelem.i") return ValueType{TypeKind::integer, 0, true};
+    if (op == "ldelem.i") return ValueType{TypeKind::integer, native_bits, true};
     if (op == "ldelem.r4") return ValueType{TypeKind::floating, 32, false};
     if (op == "ldelem.r8") return ValueType{TypeKind::floating, 64, false};
     if (op == "ldelem.ref") return managed_reference_type();
@@ -154,13 +157,13 @@ std::optional<ValueType> managed_array_element_type(std::string_view op) {
 }
 bool managed_array_load(std::string_view op) { return op.starts_with("ldelem."); }
 bool managed_array_store(std::string_view op) { return op.starts_with("stelem."); }
-std::optional<ValueType> managed_indirect_load_type(std::string_view op) {
+std::optional<ValueType> managed_indirect_load_type(std::string_view op, std::uint16_t native_bits) {
     if (op == "ldind.i1" || op == "ldind.i2" || op == "ldind.i4")
         return ValueType{TypeKind::integer, 32, true};
     if (op == "ldind.u1" || op == "ldind.u2" || op == "ldind.u4")
         return ValueType{TypeKind::integer, 32, false};
     if (op == "ldind.i8") return ValueType{TypeKind::integer, 64, true};
-    if (op == "ldind.i") return ValueType{TypeKind::integer, 0, true};
+    if (op == "ldind.i") return ValueType{TypeKind::integer, native_bits, true};
     if (op == "ldind.r4") return ValueType{TypeKind::floating, 32, false};
     if (op == "ldind.r8") return ValueType{TypeKind::floating, 64, false};
     if (op == "ldind.ref") return managed_reference_type();
@@ -171,7 +174,18 @@ bool managed_indirect_store(std::string_view op) {
            op == "stind.i" || op == "stind.r4" || op == "stind.r8" || op == "stind.ref";
 }
 ValueType int_type(std::uint16_t bits = 32) { return {TypeKind::integer, bits, true}; }
+struct NativeIntegerConversion { bool target_signed, checked, unsigned_source; };
+std::optional<NativeIntegerConversion> native_integer_conversion(std::string_view op) {
+    if(op=="conv.i")return NativeIntegerConversion{true,false,false};
+    if(op=="conv.u")return NativeIntegerConversion{false,false,true};
+    if(op=="conv.ovf.i")return NativeIntegerConversion{true,true,false};
+    if(op=="conv.ovf.u")return NativeIntegerConversion{false,true,false};
+    if(op=="conv.ovf.i.un")return NativeIntegerConversion{true,true,true};
+    if(op=="conv.ovf.u.un")return NativeIntegerConversion{false,true,true};
+    return {};
+}
 ExpressionPtr typed_unary(std::string operation, ExpressionPtr value, ValueType type);
+ExpressionPtr binary(std::string op, ExpressionPtr left, ExpressionPtr right, bool boolean = false);
 struct IntegerConversion { std::uint16_t target_bits; bool is_signed; };
 std::optional<IntegerConversion> integer_conversion(std::string_view op) {
     if (op == "conv.i1") return IntegerConversion{8, true};
@@ -182,6 +196,20 @@ std::optional<IntegerConversion> integer_conversion(std::string_view op) {
     if (op == "conv.u4") return IntegerConversion{32, false};
     if (op == "conv.i8") return IntegerConversion{64, true};
     if (op == "conv.u8") return IntegerConversion{64, false};
+    return {};
+}
+struct CheckedIntegerConversion { std::uint16_t target_bits; bool target_signed, unsigned_source; };
+std::optional<CheckedIntegerConversion> checked_integer_conversion(std::string_view op) {
+    const bool unsigned_source = op.ends_with(".un");
+    if (unsigned_source) op.remove_suffix(3);
+    if (op == "conv.ovf.i1") return CheckedIntegerConversion{8, true, unsigned_source};
+    if (op == "conv.ovf.u1") return CheckedIntegerConversion{8, false, unsigned_source};
+    if (op == "conv.ovf.i2") return CheckedIntegerConversion{16, true, unsigned_source};
+    if (op == "conv.ovf.u2") return CheckedIntegerConversion{16, false, unsigned_source};
+    if (op == "conv.ovf.i4") return CheckedIntegerConversion{32, true, unsigned_source};
+    if (op == "conv.ovf.u4") return CheckedIntegerConversion{32, false, unsigned_source};
+    if (op == "conv.ovf.i8") return CheckedIntegerConversion{64, true, unsigned_source};
+    if (op == "conv.ovf.u8") return CheckedIntegerConversion{64, false, unsigned_source};
     return {};
 }
 std::optional<std::uint16_t> floating_conversion(std::string_view op) {
@@ -239,6 +267,52 @@ ExpressionPtr convert_integer(std::string_view opcode, IntegerConversion convers
     }
     return converted;
 }
+struct CheckedIntegerConversionModel { ValueType result_type; ExpressionPtr overflow_condition; };
+CheckedIntegerConversionModel evaluate_checked_integer_conversion(CheckedIntegerConversion conversion,
+        ExpressionPtr input) {
+    CheckedIntegerConversionModel result;
+    result.result_type = conversion_stack_type({conversion.target_bits, conversion.target_signed});
+    const auto source_bits = input->type.bits;
+    const auto source_signed = !conversion.unsigned_source;
+    const ValueType source_type{TypeKind::integer, source_bits, source_signed};
+    const auto retag = [](ExpressionPtr expression, ValueType type) -> ExpressionPtr {
+        if (const auto *literal = std::get_if<ConstantValue>(&expression->value))
+            return std::make_shared<Expression>(Expression{type, ConstantValue{literal->value, type}});
+        return retag_managed_expression(std::move(expression), type);
+    };
+    auto source = retag(input, source_type);
+    const auto predicate_type = ValueType{TypeKind::boolean, 1, false};
+    const auto literal = [&](std::uint64_t bits) {
+        if (source_bits < 64) bits &= (std::uint64_t{1} << source_bits) - 1;
+        return std::make_shared<Expression>(Expression{source_type, ConstantValue{bits, source_type}});
+    };
+    const auto bool_constant = std::make_shared<Expression>(Expression{predicate_type,
+        ConstantValue{0, predicate_type}});
+    auto overflow = ExpressionPtr{bool_constant};
+    const auto target_bits = static_cast<unsigned>(conversion.target_bits);
+    if (!source_signed) {
+        const auto range_bits = target_bits - (conversion.target_signed ? 1u : 0u);
+        if (source_bits > range_bits) {
+            const auto maximum = (std::uint64_t{1} << range_bits) - 1;
+            overflow = binary("ugt", source, literal(maximum), true);
+        }
+    } else if (conversion.target_signed) {
+        if (source_bits > target_bits) {
+            const auto maximum = (std::uint64_t{1} << (target_bits - 1)) - 1;
+            const auto minimum = std::uint64_t{0} - (std::uint64_t{1} << (target_bits - 1));
+            overflow = binary("or", binary("slt", source, literal(minimum), true),
+                                     binary("sgt", source, literal(maximum), true), true);
+        }
+    } else {
+        overflow = binary("slt", source, literal(0), true);
+        if (source_bits - 1 > target_bits) {
+            const auto maximum = (std::uint64_t{1} << target_bits) - 1;
+            overflow = binary("or", overflow, binary("sgt", source, literal(maximum), true), true);
+        }
+    }
+    result.overflow_condition = std::move(overflow);
+    return result;
+}
 ExpressionPtr variable(std::string name) {
     return std::make_shared<Expression>(Expression{{TypeKind::unknown, 0, false}, VariableValue{std::move(name)}});
 }
@@ -250,9 +324,90 @@ ExpressionPtr unary(std::string op, ExpressionPtr value) {
     auto type = value ? value->type : int_type();
     return std::make_shared<Expression>(Expression{type, UnaryValue{std::move(op), std::move(value)}});
 }
-ExpressionPtr binary(std::string op, ExpressionPtr left, ExpressionPtr right, bool boolean = false) {
+ExpressionPtr binary(std::string op, ExpressionPtr left, ExpressionPtr right, bool boolean) {
     const auto type = boolean ? ValueType{TypeKind::boolean, 1, false} : (left ? left->type : int_type());
     return std::make_shared<Expression>(Expression{type, BinaryValue{std::move(op), std::move(left), std::move(right)}});
+}
+std::string native_conversion_name(std::string_view opcode,std::uint16_t bits) {
+    std::string name="cil_"+std::string(opcode);
+    std::replace(name.begin(),name.end(),'.','_');
+    return name+"_native_"+(bits?std::to_string(bits):std::string("runtime"));
+}
+bool native_conversion_input_supported(ValueType type,NativeIntegerConversion conversion) {
+    // A common managed pointer can denote an object reference, byref or an
+    // unmanaged pointer. Do not assert numeric checked-conversion semantics
+    // for that unresolved address category.
+    return type.kind==TypeKind::unknown||type.kind==TypeKind::integer||type.kind==TypeKind::boolean||
+           type.kind==TypeKind::floating||(!conversion.checked&&type.kind==TypeKind::pointer);
+}
+ManagedCilNativeConversion evaluate_native_conversion(std::uint32_t offset,std::string_view opcode,
+        NativeIntegerConversion conversion,std::uint16_t target_bits,ExpressionPtr input) {
+    ManagedCilNativeConversion result;
+    result.offset=offset;result.opcode=opcode;result.source_type=input->type;
+    result.result_type={TypeKind::integer,target_bits,conversion.target_signed};
+    result.overflow_checked=conversion.checked;result.unsigned_source=conversion.unsigned_source;
+    const ValueType predicate_type{TypeKind::boolean,1,false};
+    const auto bool_constant=[&](bool value){
+        return std::make_shared<Expression>(Expression{predicate_type,ConstantValue{value?1u:0u,predicate_type}});
+    };
+    auto source=input;
+    if(source->type.kind==TypeKind::boolean)
+        source=typed_unary("zext",source,int_type(32));
+    else if(source->type.kind==TypeKind::integer&&source->type.bits&&source->type.bits<32)
+        source=typed_unary(source->type.is_signed?"sext":"zext",source,int_type(32));
+    result.exact_integer_semantics=(target_bits==32||target_bits==64)&&source->type.kind==TypeKind::integer&&
+                                  (source->type.bits==32||source->type.bits==64);
+    const auto operation=native_conversion_name(opcode,target_bits);
+    if(!result.exact_integer_semantics){
+        // In particular, unchecked floating overflow is unspecified rather
+        // than saturating or throwing. Keep the CLI conversion itself opaque.
+        result.normal_value=typed_unary(operation,input,result.result_type);
+        if(conversion.checked)
+            result.overflow_condition=typed_unary(operation+"_OverflowException",input,predicate_type);
+        return result;
+    }
+    const auto source_bits=source->type.bits;
+    const auto source_unsigned=conversion.unsigned_source;
+    const auto retag=[](ExpressionPtr expression,ValueType type)->ExpressionPtr{
+        if(const auto *literal=std::get_if<ConstantValue>(&expression->value))
+            return std::make_shared<Expression>(Expression{type,ConstantValue{literal->value,type}});
+        return retag_managed_expression(std::move(expression),type);
+    };
+    source=retag(source,{TypeKind::integer,source_bits,!source_unsigned});
+    if(source_bits>target_bits)
+        result.normal_value=typed_unary("trunc"+std::to_string(target_bits),source,result.result_type);
+    else if(source_bits<target_bits)
+        result.normal_value=typed_unary(source_unsigned?"zext":"sext",source,result.result_type);
+    else result.normal_value=retag(source,result.result_type);
+    if(!conversion.checked)return result;
+    const auto literal=[&](std::uint64_t bits){
+        const ValueType type{TypeKind::integer,source_bits,!source_unsigned};
+        if(source_bits<64)bits&=(std::uint64_t{1}<<source_bits)-1;
+        return std::make_shared<Expression>(Expression{type,ConstantValue{bits,type}});
+    };
+    auto overflow=ExpressionPtr{bool_constant(false)};
+    if(source_unsigned){
+        const auto range_bits=static_cast<unsigned>(target_bits-(conversion.target_signed?1:0));
+        if(source_bits>range_bits){
+            const auto maximum=range_bits==64?UINT64_MAX:(std::uint64_t{1}<<range_bits)-1;
+            overflow=binary("ugt",source,literal(maximum),true);
+        }
+    }else if(conversion.target_signed){
+        if(source_bits>target_bits){
+            const auto maximum=(std::uint64_t{1}<<(target_bits-1))-1;
+            const auto minimum=std::uint64_t{0}-(std::uint64_t{1}<<(target_bits-1));
+            overflow=binary("or",binary("slt",source,literal(minimum),true),
+                                  binary("sgt",source,literal(maximum),true),true);
+        }
+    }else{
+        overflow=binary("slt",source,literal(0),true);
+        if(source_bits-1>target_bits){
+            const auto maximum=target_bits==64?UINT64_MAX:(std::uint64_t{1}<<target_bits)-1;
+            overflow=binary("or",overflow,binary("sgt",source,literal(maximum),true),true);
+        }
+    }
+    result.overflow_condition=std::move(overflow);
+    return result;
 }
 Error failure(ErrorCode code, const char *message) { return {code, message}; }
 std::uint32_t index_operand(const CilInstruction &instruction, std::size_t short_base = 0) {
@@ -270,6 +425,11 @@ bool valid_type_token(const std::optional<std::uint32_t> &token) {
     if (!token || (*token & 0x00ffffffu) == 0) return false;
     const auto table = *token >> 24;
     return table == 0x01 || table == 0x02 || table == 0x1b;
+}
+std::optional<ValueType> managed_token_array_element_type(const ManagedMethodAnalysis &method,
+                                                          std::uint32_t token) {
+    return method.resolved_array_reference_type_tokens.contains(token)
+        ? std::optional<ValueType>{managed_reference_type()} : std::nullopt;
 }
 std::optional<std::uint32_t> directly_constructed_throw_type(
     const ManagedMethodAnalysis &method, std::size_t instruction_index,
@@ -473,6 +633,8 @@ Result<ManagedCilDecompilation> decompile_managed_method(
         return failure(ErrorCode::malformed, "Cannot decompile malformed managed method body");
     if (method.status != ManagedMethodStatus::decoded || !method.body)
         return failure(ErrorCode::unsupported, "Managed method has no decoded IL body");
+    if(method.native_integer_bits!=0&&method.native_integer_bits!=32&&method.native_integer_bits!=64)
+        return failure(ErrorCode::invalid_argument,"CIL native integer width must be unknown, 32 or 64 bits");
     if (method.body->has_more_sections && method.body->exception_clauses.empty())
         return failure(ErrorCode::unsupported, "Managed method has extra data sections that are not supported");
     if (std::any_of(method.body->data_sections.begin(), method.body->data_sections.end(),
@@ -568,6 +730,13 @@ Result<ManagedCilDecompilation> decompile_managed_method(
         if (instruction.offset > UINT32_MAX - instruction.size)
             return failure(ErrorCode::malformed, "Managed IL instruction extent overflows");
         const auto mnemonic = std::string_view(instruction.mnemonic);
+        if(const auto conversion=native_integer_conversion(mnemonic);conversion&&conversion->checked){
+            // Preserve an instruction-specific exception point even outside a
+            // protected region; later memory effects belong only to success.
+            leaders.insert(instruction.offset);
+            if(instruction.offset+instruction.size<method.body->code_size)
+                leaders.insert(instruction.offset+instruction.size);
+        }
         if (!method.body->exception_clauses.empty()) {
             const auto covered = [&](const CilExceptionClause &clause) {
                 return in_region(instruction.offset, clause.try_offset, clause.try_length) ||
@@ -758,6 +927,8 @@ Result<ManagedCilDecompilation> decompile_managed_method(
     std::vector<std::uint32_t> starts(leaders.begin(), leaders.end());
     std::unordered_map<std::uint32_t, std::size_t> block_for_offset;
     ManagedCilDecompilation result;
+    result.native_integer_bits=method.native_integer_bits;
+    bool native_opaque_diagnostic=false,native_checked_diagnostic=false,fixed_checked_diagnostic=false;
     result.exception_clauses = method.body->exception_clauses;
     result.exception_regions = std::move(regions.value());
     result.declaring_type_generic_parameters = method.method.declaring_type_generic_parameters;
@@ -1019,7 +1190,9 @@ Result<ManagedCilDecompilation> decompile_managed_method(
     std::size_t next_clause_event = 0;
     for (std::size_t ii = 0; ii < method.instructions.size(); ++ii) {
         const auto &instruction = method.instructions[ii];
-        const bool explicit_throw = std::string_view(instruction.mnemonic) == "throw" || std::string_view(instruction.mnemonic) == "rethrow";
+        const auto native_conversion=native_integer_conversion(instruction.mnemonic);
+        const bool explicit_throw = std::string_view(instruction.mnemonic) == "throw" ||
+            std::string_view(instruction.mnemonic) == "rethrow" || (native_conversion&&native_conversion->checked);
         bool active_changed = false;
         while (next_clause_event < clause_events.size() && clause_events[next_clause_event].offset <= instruction.offset) {
             const auto &event = clause_events[next_clause_event++];
@@ -1446,26 +1619,30 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                 if (!shape_push(result_type)) return failure(ErrorCode::malformed, "CIL max_stack exceeded");
                 continue;
             }
-            if (op == "ldfld" || op == "stfld" || op == "ldsfld" || op == "stsfld") {
+            if (op == "ldfld" || op == "stfld" || op == "ldsfld" || op == "stsfld" ||
+                op == "ldflda" || op == "ldsflda") {
                 const auto token = call_token(ins);
                 if (!token || ((*token >> 24) != 0x04 && (*token >> 24) != 0x0a))
                     return failure(ErrorCode::malformed, "CIL field access has neither a FieldDef nor MemberRef token");
                 const auto field = method.resolved_fields.find(*token);
                 if (field == method.resolved_fields.end())
                     return failure(ErrorCode::unsupported, "CIL field token is unresolved");
-                const bool opcode_static = op == "ldsfld" || op == "stsfld";
+                const bool opcode_static = op == "ldsfld" || op == "stsfld" || op == "ldsflda";
                 const bool is_field_definition=(*token>>24)==0x04;
                 const bool is_static = (field->second.flags & 0x0010) != 0;
                 if (is_field_definition && is_static != opcode_static)
                     return failure(ErrorCode::malformed, "CIL field opcode staticness disagrees with FieldDef flags");
                 const auto count = opcode_static ? (op.starts_with("ld") ? 0u : 1u) : (op.starts_with("ld") ? 1u : 2u);
                 if (!shape_pop(count)) return failure(ErrorCode::malformed, "CIL field access underflows evaluation stack");
-                if (op.starts_with("ld")) {
+                const bool address = op == "ldflda" || op == "ldsflda";
+                if (address) {
+                    if (!shape_push(managed_reference_type())) return failure(ErrorCode::malformed, "CIL max_stack exceeded");
+                } else if (op.starts_with("ld")) {
                 ManagedMethodSignature field_context;
                 field_context.declaring_type_arguments=field->second.declaring_type_arguments;
                 field_context.declaring_type_generic_arguments_valid=field->second.declaring_type_generic_arguments_valid;
                 const auto type = field->second.type_signature
-                    ? managed_signature_type(*field->second.type_signature, field_context) : ValueType{};
+                    ? managed_signature_type(*field->second.type_signature, field_context,method.native_integer_bits) : ValueType{};
                     if (!shape_push(type)) return failure(ErrorCode::malformed, "CIL max_stack exceeded");
                 }
                 continue;
@@ -1480,7 +1657,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
             }
             if (op == "ldlen") {
                 if (!shape_pop(1)) return failure(ErrorCode::malformed, "CIL ldlen underflows evaluation stack");
-                if (!shape_push({TypeKind::integer, 0, false})) return failure(ErrorCode::malformed, "CIL max_stack exceeded");
+                if (!shape_push({TypeKind::integer, method.native_integer_bits, false})) return failure(ErrorCode::malformed, "CIL max_stack exceeded");
                 continue;
             }
             if (op == "ldelema") {
@@ -1505,7 +1682,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                 continue;
             }
             if (op.starts_with("ldind.")) {
-                const auto type = managed_indirect_load_type(op);
+                const auto type = managed_indirect_load_type(op,method.native_integer_bits);
                 if (!type) return failure(ErrorCode::unsupported, "CIL indirect load type is unsupported");
                 if (!shape_pop(1)) return failure(ErrorCode::malformed, "CIL indirect load underflows evaluation stack");
                 if (!shape_push(*type)) return failure(ErrorCode::malformed, "CIL max_stack exceeded");
@@ -1516,7 +1693,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                 continue;
             }
             if (managed_array_load(op)) {
-                const auto type = managed_array_element_type(op);
+                const auto type = managed_array_element_type(op,method.native_integer_bits);
                 if (!type) return failure(ErrorCode::unsupported, "CIL array element type is unsupported");
                 if (!shape_pop(2)) return failure(ErrorCode::malformed, "CIL array load underflows evaluation stack");
                 if (!shape_push(*type)) return failure(ErrorCode::malformed, "CIL max_stack exceeded");
@@ -1524,6 +1701,20 @@ Result<ManagedCilDecompilation> decompile_managed_method(
             }
             if (managed_array_store(op)) {
                 if (!shape_pop(3)) return failure(ErrorCode::malformed, "CIL array store underflows evaluation stack");
+                continue;
+            }
+            if (op == "ldelem") {
+                const auto token = call_token(ins);
+                if (!valid_type_token(token)) return failure(ErrorCode::malformed, "CIL ldelem has an invalid element type token");
+                if (!shape_pop(2)) return failure(ErrorCode::malformed, "CIL ldelem underflows evaluation stack");
+                if (!shape_push(managed_token_array_element_type(method, *token).value_or(ValueType{})))
+                    return failure(ErrorCode::malformed, "CIL max_stack exceeded");
+                continue;
+            }
+            if (op == "stelem") {
+                const auto token = call_token(ins);
+                if (!valid_type_token(token)) return failure(ErrorCode::malformed, "CIL stelem has an invalid element type token");
+                if (!shape_pop(3)) return failure(ErrorCode::malformed, "CIL stelem underflows evaluation stack");
                 continue;
             }
             if (op == "dup") {
@@ -1534,6 +1725,15 @@ Result<ManagedCilDecompilation> decompile_managed_method(
             if (op == "pop") { if (!shape_pop(1)) return failure(ErrorCode::malformed, "CIL pop underflows evaluation stack"); continue; }
             if (op == "neg" || op == "not") {
                 if (shape.empty()) return failure(ErrorCode::malformed, "CIL unary operation underflows evaluation stack");
+                continue;
+            }
+            if(const auto conversion=native_integer_conversion(op)){
+                if(shape.empty())return failure(ErrorCode::malformed,"CIL native conversion underflows evaluation stack");
+                if(!native_conversion_input_supported(shape.back(),*conversion))
+                    return failure(ErrorCode::unsupported,"CIL checked native conversion requires a numeric value, not an unresolved reference/address category");
+                shape.pop_back();
+                if(!shape_push({TypeKind::integer,method.native_integer_bits,conversion->target_signed}))
+                    return failure(ErrorCode::malformed,"CIL max_stack exceeded");
                 continue;
             }
             if (const auto conversion = integer_conversion(op)) {
@@ -1548,7 +1748,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                     return failure(ErrorCode::malformed, "CIL max_stack exceeded");
                 continue;
             }
-            const bool binary_value = op == "add" || op == "sub" || op == "mul" || op == "div" || op == "div.un" ||
+            const bool binary_value = op == "add" || op == "sub" || op == "mul" || op == "mul.ovf" || op == "mul.ovf.un" || op == "div" || op == "div.un" ||
                 op == "rem" || op == "rem.un" || op == "and" || op == "or" || op == "xor" || op == "shl" ||
                 op == "shr" || op == "shr.un";
             const bool comparison = op == "ceq" || op == "cgt" || op == "cgt.un" || op == "clt" || op == "clt.un";
@@ -1614,7 +1814,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                 const auto count = signature->second.parameter_count + (signature->second.has_this && !construct ? 1u : 0u) + (indirect ? 1u : 0u);
                 if (!shape_pop(count)) return failure(ErrorCode::malformed, "CIL call arguments underflow evaluation stack");
                 if (construct || signature->second.returns_value)
-                    if (!shape_push(managed_call_result_type(signature->second, construct)))
+                    if (!shape_push(managed_call_result_type(signature->second, construct,method.native_integer_bits)))
                         return failure(ErrorCode::malformed, "CIL max_stack exceeded");
                 continue;
             }
@@ -1848,18 +2048,20 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                 result.lifted.diagnostics.push_back("CIL type operation preserves its metadata token, but CLR type compatibility and exception behavior remain opaque");
                 continue;
             }
-            if (op == "ldfld" || op == "stfld" || op == "ldsfld" || op == "stsfld") {
+            if (op == "ldfld" || op == "stfld" || op == "ldsfld" || op == "stsfld" ||
+                op == "ldflda" || op == "ldsflda") {
                 const auto token = call_token(ins);
                 if (!token || ((*token >> 24) != 0x04 && (*token >> 24) != 0x0a))
                     return failure(ErrorCode::malformed, "CIL field access has neither a FieldDef nor MemberRef token");
                 const auto field = method.resolved_fields.find(*token);
                 if (field == method.resolved_fields.end())
                     return failure(ErrorCode::unsupported, "CIL field token is unresolved");
-                const bool opcode_static = op == "ldsfld" || op == "stsfld";
+                const bool opcode_static = op == "ldsfld" || op == "stsfld" || op == "ldsflda";
                 const bool is_field_definition=(*token>>24)==0x04;
                 const bool is_static = (field->second.flags & 0x0010) != 0;
                 if (is_field_definition && is_static != opcode_static)
                     return failure(ErrorCode::malformed, "CIL field opcode staticness disagrees with FieldDef flags");
+                const bool address = op == "ldflda" || op == "ldsflda";
                 const bool load = op.starts_with("ld");
                 ExpressionPtr object, value;
                 if (!opcode_static && load) object = pop(stack);
@@ -1871,9 +2073,21 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                 empty_context.declaring_type_arguments=field->second.declaring_type_arguments;
                 empty_context.declaring_type_generic_arguments_valid=field->second.declaring_type_generic_arguments_valid;
                 const auto type = field->second.type_signature
-                    ? managed_signature_type(*field->second.type_signature, empty_context) : ValueType{};
+                    ? managed_signature_type(*field->second.type_signature, empty_context,method.native_integer_bits) : ValueType{};
                 const auto field_name = field->second.declaring_type + "::" + field->second.name;
-                if (load) {
+                if (address) {
+                    const auto name = "cil_field_address_" + std::to_string(origin.instruction_id);
+                    std::vector<ExpressionPtr> operands;
+                    if (!opcode_static) operands.push_back(std::move(object));
+                    operands.push_back(typed_variable(field_name, {}));
+                    operands.push_back(constant(*token));
+                    Intrinsic access{name + " = ", std::move(operands), IntrinsicMemoryEffect::none};
+                    access.result_type = managed_reference_type();
+                    block.instructions.push_back({origin, std::move(access)});
+                    if (!push(typed_variable(name, managed_reference_type()))) return failure(ErrorCode::malformed, "CIL max_stack exceeded");
+                    result.complete = false;
+                    result.lifted.diagnostics.push_back("CIL field address preserves the field identity and by-reference stack value, but field layout and escaped alias behavior remain unresolved");
+                } else if (load) {
                     const auto name = "cil_field_load_" + std::to_string(origin.instruction_id);
                     Intrinsic access{name + " = ", {std::move(object), typed_variable(field_name, {})}, IntrinsicMemoryEffect::read};
                     access.result_type = type;
@@ -1902,7 +2116,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
             if (op == "ldlen") {
                 auto array = pop(stack);
                 if (!array) return failure(ErrorCode::malformed, "CIL ldlen underflows evaluation stack");
-                const ValueType length_type{TypeKind::integer, 0, false};
+                const ValueType length_type{TypeKind::integer, method.native_integer_bits, false};
                 const auto name = "cil_array_length_" + std::to_string(origin.instruction_id);
                 Intrinsic length{name + " = ", {std::move(array)}, IntrinsicMemoryEffect::read};
                 length.result_type = length_type;
@@ -1967,7 +2181,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                 continue;
             }
             if (op.starts_with("ldind.")) {
-                const auto type = managed_indirect_load_type(op);
+                const auto type = managed_indirect_load_type(op,method.native_integer_bits);
                 if (!type) return failure(ErrorCode::unsupported, "CIL indirect load type is unsupported");
                 auto address = pop(stack);
                 if (!address) return failure(ErrorCode::malformed, "CIL indirect load underflows evaluation stack");
@@ -1987,8 +2201,42 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                                                                  IntrinsicMemoryEffect::write}});
                 continue;
             }
+            if (op == "ldelem") {
+                const auto token = call_token(ins);
+                if (!valid_type_token(token)) return failure(ErrorCode::malformed, "CIL ldelem has an invalid element type token");
+                auto index = pop(stack), array = pop(stack);
+                if (!index || !array) return failure(ErrorCode::malformed, "CIL ldelem underflows evaluation stack");
+                const auto type = managed_token_array_element_type(method, *token).value_or(ValueType{});
+                const auto name = "cil_ldelem_any_" + std::to_string(origin.instruction_id);
+                Intrinsic load{name + " = ", {std::move(array), std::move(index), constant(*token)},
+                    IntrinsicMemoryEffect::read};
+                load.result_type = type;
+                block.instructions.push_back({origin, std::move(load)});
+                if (!push(typed_variable(name, type))) return failure(ErrorCode::malformed, "CIL max_stack exceeded");
+                result.referenced_tokens.push_back(*token);
+                if (type.kind == TypeKind::unknown) {
+                    result.complete = false;
+                    result.lifted.diagnostics.push_back("CIL token-typed array load preserves its type token, but the element stack type is unresolved");
+                }
+                continue;
+            }
+            if (op == "stelem") {
+                const auto token = call_token(ins);
+                if (!valid_type_token(token)) return failure(ErrorCode::malformed, "CIL stelem has an invalid element type token");
+                auto value = pop(stack), index = pop(stack), array = pop(stack);
+                if (!value || !index || !array) return failure(ErrorCode::malformed, "CIL stelem underflows evaluation stack");
+                block.instructions.push_back({origin, Intrinsic{"cil_stelem_any",
+                    {std::move(array), std::move(index), std::move(value), constant(*token)},
+                    IntrinsicMemoryEffect::write}});
+                result.referenced_tokens.push_back(*token);
+                if (!method.resolved_array_reference_type_tokens.contains(*token)) {
+                    result.complete = false;
+                    result.lifted.diagnostics.push_back("CIL token-typed array store preserves its type token, but element/value compatibility is unresolved");
+                }
+                continue;
+            }
             if (managed_array_load(op)) {
-                const auto type = managed_array_element_type(op);
+                const auto type = managed_array_element_type(op,method.native_integer_bits);
                 if (!type) return failure(ErrorCode::unsupported, "CIL array element type is unsupported");
                 auto index = pop(stack), array = pop(stack);
                 if (!index || !array) return failure(ErrorCode::malformed, "CIL array load underflows evaluation stack");
@@ -2009,6 +2257,67 @@ Result<ManagedCilDecompilation> decompile_managed_method(
             if (op == "dup") { if(stack.empty())return failure(ErrorCode::malformed,"CIL dup underflows evaluation stack"); if(!push(stack.back()))return failure(ErrorCode::malformed,"CIL max_stack exceeded"); continue; }
             if (op == "pop") { if(!pop(stack))return failure(ErrorCode::malformed,"CIL pop underflows evaluation stack"); continue; }
             if (op == "neg" || op == "not") { auto value=pop(stack); if(!value)return failure(ErrorCode::malformed,"CIL unary operation underflows evaluation stack"); if(!push(unary(op=="neg"?"-":"~",std::move(value))))return failure(ErrorCode::malformed,"CIL max_stack exceeded"); continue; }
+            if(const auto conversion=native_integer_conversion(op)){
+                auto value=pop(stack);
+                if(!value)return failure(ErrorCode::malformed,"CIL native conversion underflows evaluation stack");
+                if(!native_conversion_input_supported(value->type,*conversion))
+                    return failure(ErrorCode::unsupported,"CIL checked native conversion requires a numeric value, not an unresolved reference/address category");
+                auto modeled=evaluate_native_conversion(ins.offset,op,*conversion,method.native_integer_bits,value);
+                const auto name="cil_native_result_"+std::to_string(origin.instruction_id);
+                // Materialize the operation even when its result is popped.
+                // A checked conversion can still throw without a live value.
+                Intrinsic effect{name+" = "+native_conversion_name(op,method.native_integer_bits)+
+                    (conversion->checked?"_throw_OverflowException":""),{std::move(value)},IntrinsicMemoryEffect::none};
+                effect.result_type=modeled.result_type;
+                block.instructions.push_back({origin,std::move(effect)});
+                if(conversion->checked){
+                    block.trap_edges.push_back({origin.address,TrapEdgeKind::may_trap,
+                        "System.OverflowException from "+std::string(op),modeled.overflow_condition});
+                    result.complete=false;
+                    if(!native_checked_diagnostic){
+                        result.lifted.diagnostics.push_back(
+                            "CIL native checked conversions retain OverflowException guards and instruction-point dispatch, but exception CFG edges remain conservative runtime continuations");
+                        native_checked_diagnostic=true;
+                    }
+                }
+                if(!modeled.exact_integer_semantics){
+                    result.complete=false;
+                    if(!native_opaque_diagnostic){
+                        result.lifted.diagnostics.push_back(
+                            "CIL native conversion retains its exact opcode with opaque runtime-width, floating or address semantics; no host width, saturating float result or managed address is inferred");
+                        native_opaque_diagnostic=true;
+                    }
+                }
+                if(!push(typed_variable(name,modeled.result_type)))return failure(ErrorCode::malformed,"CIL max_stack exceeded");
+                result.native_integer_conversions.push_back(std::move(modeled));
+                continue;
+            }
+            if (const auto conversion = checked_integer_conversion(op)) {
+                auto value = pop(stack);
+                if (!value) return failure(ErrorCode::malformed, "CIL checked conversion underflows evaluation stack");
+                if (value->type.kind != TypeKind::integer || value->type.bits == 0 || value->type.bits > 64)
+                    return failure(ErrorCode::unsupported,
+                        "CIL fixed-width checked conversion requires a known integer input");
+                auto modeled = evaluate_checked_integer_conversion(*conversion, value);
+                std::string operation = "cil_" + std::string(op);
+                std::replace(operation.begin(), operation.end(), '.', '_');
+                Intrinsic effect{"cil_checked_result_" + std::to_string(origin.instruction_id) + " = " +
+                    operation + "_throw_OverflowException", {std::move(value)}, IntrinsicMemoryEffect::none};
+                effect.result_type = modeled.result_type;
+                block.instructions.push_back({origin, std::move(effect)});
+                block.trap_edges.push_back({origin.address, TrapEdgeKind::may_trap,
+                    "System.OverflowException from " + std::string(op), modeled.overflow_condition});
+                result.complete = false;
+                if (!fixed_checked_diagnostic) {
+                    result.lifted.diagnostics.push_back(
+                        "CIL fixed-width checked integer conversions retain exact overflow predicates and instruction-point dispatch, but exception CFG edges remain conservative runtime continuations");
+                    fixed_checked_diagnostic = true;
+                }
+                if (!push(typed_variable("cil_checked_result_" + std::to_string(origin.instruction_id),
+                                         modeled.result_type)))
+                    return failure(ErrorCode::malformed, "CIL max_stack exceeded");
+                continue;
+            }
             if (const auto conversion = integer_conversion(op)) {
                 auto value = pop(stack);
                 if (!value) return failure(ErrorCode::malformed, "CIL conversion underflows evaluation stack");
@@ -2021,6 +2330,40 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                 if (!value) return failure(ErrorCode::malformed, "CIL floating conversion underflows evaluation stack");
                 if (!push(convert_floating(op, *conversion_bits, std::move(value))))
                     return failure(ErrorCode::malformed, "CIL max_stack exceeded");
+                continue;
+            }
+            if (op == "add.ovf" || op == "add.ovf.un" || op == "sub.ovf" || op == "sub.ovf.un" ||
+                op == "mul.ovf" || op == "mul.ovf.un") {
+                auto right = pop(stack), left = pop(stack);
+                if (!left || !right) return failure(ErrorCode::malformed, "CIL checked arithmetic underflows evaluation stack");
+                if (left->type.kind != TypeKind::integer || right->type != left->type ||
+                    (left->type.bits != 32 && left->type.bits != 64))
+                    return failure(ErrorCode::unsupported, "CIL checked arithmetic requires matching I4 or I8 operands");
+                const bool multiply = op.starts_with("mul");
+                const bool add = op.starts_with("add");
+                const bool uns = op.ends_with(".un");
+                auto value = binary(multiply ? "*" : add ? "+" : "-", left, right, false);
+                ExpressionPtr overflow;
+                if (multiply) {
+                    overflow = binary(std::string(uns ? "cil_umul_overflow_i" : "cil_smul_overflow_i") +
+                                          std::to_string(left->type.bits), left, right, true);
+                } else if (uns) overflow = binary("ult", add ? value : left, add ? left : right, true);
+                else {
+                    auto zero = constant(0, left->type.bits);
+                    if (add) overflow = binary("and", binary("==", binary("slt", left, zero, true), binary("slt", right, zero, true), true),
+                        binary("!=", binary("slt", value, zero, true), binary("slt", left, zero, true), true), true);
+                    else overflow = binary("and", binary("!=", binary("slt", left, zero, true), binary("slt", right, zero, true), true),
+                        binary("!=", binary("slt", value, zero, true), binary("slt", left, zero, true), true), true);
+                }
+                const auto name = "cil_checked_arithmetic_" + std::to_string(origin.instruction_id);
+                const auto operation = multiply ? "multiply" : add ? "add" : "sub";
+                Intrinsic effect{name + " = " + operation + "_overflow_checked", {left, right}, IntrinsicMemoryEffect::none};
+                effect.result_type = left->type;
+                block.instructions.push_back({origin, std::move(effect)});
+                block.trap_edges.push_back({origin.address, TrapEdgeKind::may_trap,
+                    "System.OverflowException from " + std::string(op), std::move(overflow)});
+                result.complete = false;
+                if (!push(typed_variable(name, left->type))) return failure(ErrorCode::malformed, "CIL max_stack exceeded");
                 continue;
             }
             const std::map<std::string, std::string, std::less<>> binary_ops{
@@ -2242,11 +2585,11 @@ Result<ManagedCilDecompilation> decompile_managed_method(
                     for(std::size_t i=0;i<signature->second.parameter_types.size();++i){
                         const auto index=explicit_parameter_offset+i;
                         if(index>=arguments.size())return failure(ErrorCode::malformed,"CIL call signature parameter mapping exceeds argument list");
-                        const auto type=managed_signature_type(signature->second.parameter_types[i],signature->second);
+                        const auto type=managed_signature_type(signature->second.parameter_types[i],signature->second,method.native_integer_bits);
                         arguments[index]=retag_managed_expression(arguments[index],type);
                     }
                 }
-                const auto result_type=managed_call_result_type(signature->second,construct);
+                const auto result_type=managed_call_result_type(signature->second,construct,method.native_integer_bits);
                 Intrinsic call{name,std::move(arguments),IntrinsicMemoryEffect::unknown};
                 if(result_type.kind!=TypeKind::unknown)call.result_type=result_type;
                 block.instructions.push_back({origin,std::move(call)});
@@ -2322,6 +2665,7 @@ Result<ManagedCilDecompilation> decompile_managed_method(
             found_source = true;
             if (auto *intrinsic = std::get_if<Intrinsic>(&lifted.statement)) {
                 if (intrinsic->memory_effect == IntrinsicMemoryEffect::write ||
+                    intrinsic->memory_effect == IntrinsicMemoryEffect::read_write ||
                     intrinsic->memory_effect == IntrinsicMemoryEffect::unknown) {
                     // A managed store/call may partially complete before a
                     // runtime fault. Preserve an explicit unknown memory

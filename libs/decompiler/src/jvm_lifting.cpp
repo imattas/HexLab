@@ -82,7 +82,38 @@ struct StringConcatRecipe {
     std::size_t dynamic_markers = 0;
     std::size_t constant_markers = 0;
 };
+enum class StringConcatFactoryKind { none, make_concat, make_concat_with_constants };
+StringConcatFactoryKind string_concat_factory(const JvmMetadata &metadata, const DynamicCallSite &site) {
+    if (!metadata.bootstrap_methods || site.bootstrap_index >= metadata.bootstrap_methods->size()) return StringConcatFactoryKind::none;
+    const auto &bootstrap = (*metadata.bootstrap_methods)[site.bootstrap_index];
+    const auto handle_index = bootstrap.method_handle_index;
+    if (!handle_index || handle_index >= metadata.constant_pool.size()) return StringConcatFactoryKind::none;
+    const auto &handle = metadata.constant_pool[handle_index];
+    if (handle.tag != 15 || handle.first != 6 || !handle.second || handle.second >= metadata.constant_pool.size())
+        return StringConcatFactoryKind::none;
+    const auto &reference = metadata.constant_pool[handle.second];
+    if (reference.tag != 10 || !reference.first || reference.first >= metadata.constant_pool.size() ||
+        !reference.second || reference.second >= metadata.constant_pool.size()) return StringConcatFactoryKind::none;
+    const auto &owner = metadata.constant_pool[reference.first];
+    const auto &name_and_type = metadata.constant_pool[reference.second];
+    if (owner.tag != 7 || name_and_type.tag != 12) return StringConcatFactoryKind::none;
+    auto owner_name = cp_utf8(metadata, owner.first);
+    auto method_name = cp_utf8(metadata, name_and_type.first);
+    auto bootstrap_descriptor = cp_utf8(metadata, name_and_type.second);
+    if (!owner_name || !method_name || !bootstrap_descriptor ||
+        owner_name.value() != "java/lang/invoke/StringConcatFactory") return StringConcatFactoryKind::none;
+    if (site.descriptor.empty() || site.descriptor.front() != '(' || !site.descriptor.ends_with(")Ljava/lang/String;"))
+        return StringConcatFactoryKind::none;
+    if (method_name.value() == "makeConcat" &&
+        bootstrap_descriptor.value() == "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;" &&
+        bootstrap.argument_indices.empty()) return StringConcatFactoryKind::make_concat;
+    if (method_name.value() == "makeConcatWithConstants" &&
+        bootstrap_descriptor.value() == "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;" &&
+        !bootstrap.argument_indices.empty()) return StringConcatFactoryKind::make_concat_with_constants;
+    return StringConcatFactoryKind::none;
+}
 std::optional<StringConcatRecipe> string_concat_recipe(const JvmMetadata &metadata,const DynamicCallSite &site) {
+    if (string_concat_factory(metadata, site) != StringConcatFactoryKind::make_concat_with_constants) return {};
     if(!metadata.bootstrap_methods||site.bootstrap_index>=metadata.bootstrap_methods->size())return{};
     const auto &bootstrap=(*metadata.bootstrap_methods)[site.bootstrap_index];
     const auto handle_index=bootstrap.method_handle_index;
@@ -234,11 +265,47 @@ struct ReferenceIdentity {
     bool operator==(const ReferenceIdentity &) const = default;
 };
 using Reference = std::optional<ReferenceIdentity>;
+enum class LocalCategory : std::uint8_t { top, integer, float_value, long_value, double_value, reference, category2_tail };
+using LocalCategories = std::array<LocalCategory, 256>;
 struct ReferenceState {
-    std::array<Reference, 256> locals{};
+    std::map<std::size_t, Reference> locals;
+    LocalCategories local_categories{};
     std::vector<Reference> stack;
     bool operator==(const ReferenceState &) const = default;
 };
+LocalCategory local_category(ValueType type) {
+    if (type == int32()) return LocalCategory::integer;
+    if (type == fp32()) return LocalCategory::float_value;
+    if (type == int64()) return LocalCategory::long_value;
+    if (type == fp64()) return LocalCategory::double_value;
+    if (type == ref32()) return LocalCategory::reference;
+    return LocalCategory::top;
+}
+LocalCategory local_category(JvmVerificationKind kind) {
+    switch (kind) {
+    case JvmVerificationKind::integer: return LocalCategory::integer;
+    case JvmVerificationKind::float_value: return LocalCategory::float_value;
+    case JvmVerificationKind::long_value: return LocalCategory::long_value;
+    case JvmVerificationKind::double_value: return LocalCategory::double_value;
+    case JvmVerificationKind::null_value: case JvmVerificationKind::uninitialized_this:
+    case JvmVerificationKind::object: case JvmVerificationKind::uninitialized:
+        return LocalCategory::reference;
+    case JvmVerificationKind::top: return LocalCategory::top;
+    }
+    return LocalCategory::top;
+}
+bool category2(LocalCategory category) {
+    return category == LocalCategory::long_value || category == LocalCategory::double_value;
+}
+void store_local_category(LocalCategories &locals, std::size_t index, LocalCategory category) {
+    if (index >= locals.size()) return;
+    if (locals[index] == LocalCategory::category2_tail && index) locals[index - 1] = LocalCategory::top;
+    if (category2(locals[index]) && index + 1 < locals.size()) locals[index + 1] = LocalCategory::top;
+    if (index + 1 < locals.size() && category2(locals[index + 1]) && index + 2 < locals.size())
+        locals[index + 2] = LocalCategory::top;
+    locals[index] = category;
+    if (category2(category) && index + 1 < locals.size()) locals[index + 1] = LocalCategory::category2_tail;
+}
 Reference reference_descriptor(std::string_view descriptor) {
     if (descriptor.empty() || (descriptor.front() != 'L' && descriptor.front() != '[')) return {};
     std::size_t position = 0;
@@ -401,6 +468,177 @@ Result<MethodDescriptor> parse_method_descriptor(std::string_view descriptor) {
     if(parameter_slots>255)return no("method descriptor exceeds the JVM parameter-slot limit");
     return parsed;
 }
+Result<std::string> cp_method_handle_summary(const JvmMetadata &metadata, std::uint64_t index) {
+    if (!index || index >= metadata.constant_pool.size() || metadata.constant_pool[index].tag != 15)
+        return no("method-handle constant-pool entry is invalid");
+    const auto &handle = metadata.constant_pool[index];
+    const auto kind = static_cast<unsigned>(handle.first);
+    if (kind < 1 || kind > 9 || !handle.second || handle.second >= metadata.constant_pool.size())
+        return no("method-handle reference kind or target is invalid");
+    const auto target_tag = metadata.constant_pool[handle.second].tag;
+    const bool target_is_method = kind >= 5;
+    const bool target_matches = kind <= 4 ? target_tag == 9 :
+        kind == 5 || kind == 8 ? target_tag == 10 :
+        kind == 6 || kind == 7 ? target_tag == 10 || (metadata.major_version >= 52 && target_tag == 11) :
+        target_tag == 11;
+    if (!target_matches) return no("method-handle target kind does not match its reference kind");
+    auto member = cp_member(metadata, handle.second, target_is_method);
+    if (!member) return member.error();
+    if (target_is_method) {
+        auto signature = parse_method_descriptor(member.value().descriptor);
+        if (!signature) return signature.error();
+        if (kind == 8) {
+            if (member.value().name != "<init>" || signature.value().result)
+                return no("REF_newInvokeSpecial target is not a void constructor");
+        } else if (member.value().name == "<init>" || member.value().name == "<clinit>") {
+            return no("method-handle kind cannot target a constructor or class initializer");
+        }
+    } else {
+        std::size_t position = 0;
+        auto type = descriptor_type(member.value().descriptor, position);
+        if (!type || position != member.value().descriptor.size())
+            return no("method-handle field descriptor is malformed");
+    }
+    return "kind=" + std::to_string(kind) + " " + member.value().owner + "." +
+        member.value().name + ":" + member.value().descriptor;
+}
+std::optional<std::string> lambda_metafactory_summary(const JvmMetadata &metadata, const DynamicCallSite &site) {
+    if (!metadata.bootstrap_methods || site.bootstrap_index >= metadata.bootstrap_methods->size() ||
+        site.descriptor.empty() || site.descriptor.front() != '(') return {};
+    // The call-site result must be a reference type; the descriptor parser at
+    // the invocation site validates the complete descriptor and closing ';'.
+    const auto close = site.descriptor.find(')');
+    if (close == std::string::npos || close + 2 >= site.descriptor.size() || site.descriptor[close + 1] != 'L' ||
+        site.descriptor.back() != ';') return {};
+    const auto &bootstrap = (*metadata.bootstrap_methods)[site.bootstrap_index];
+    if (bootstrap.argument_indices.size() != 3) return {};
+    const auto handle_index = bootstrap.method_handle_index;
+    if (!handle_index || handle_index >= metadata.constant_pool.size()) return {};
+    const auto &bootstrap_handle = metadata.constant_pool[handle_index];
+    if (bootstrap_handle.tag != 15 || bootstrap_handle.first != 6 || !bootstrap_handle.second ||
+        bootstrap_handle.second >= metadata.constant_pool.size()) return {};
+    if (metadata.constant_pool[bootstrap_handle.second].tag != 10) return {};
+    auto bootstrap_member = cp_member(metadata, bootstrap_handle.second, true);
+    if (!bootstrap_member || bootstrap_member.value().owner != "java/lang/invoke/LambdaMetafactory" ||
+        bootstrap_member.value().name != "metafactory" ||
+        bootstrap_member.value().descriptor != "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;") return {};
+    const auto method_type_descriptor = [&](std::uint16_t index) -> std::optional<std::string> {
+        if (!index || index >= metadata.constant_pool.size()) return {};
+        const auto &entry = metadata.constant_pool[index];
+        if (entry.tag != 16) return {};
+        auto descriptor = cp_utf8(metadata, entry.first);
+        if (!descriptor || !parse_method_descriptor(descriptor.value())) return {};
+        return std::move(descriptor.value());
+    };
+    const auto sam_type = method_type_descriptor(bootstrap.argument_indices[0]);
+    if (!bootstrap.argument_indices[1] || bootstrap.argument_indices[1] >= metadata.constant_pool.size()) return {};
+    const auto &implementation = metadata.constant_pool[bootstrap.argument_indices[1]];
+    const auto instantiated_type = method_type_descriptor(bootstrap.argument_indices[2]);
+    if (!sam_type || !instantiated_type || implementation.tag != 15 || implementation.first < 5 || implementation.first > 9 ||
+        !implementation.second || implementation.second >= metadata.constant_pool.size()) return {};
+    const auto reference_kind = static_cast<unsigned>(implementation.first);
+    const auto &target_reference = metadata.constant_pool[implementation.second];
+    const bool target_kind_matches = (reference_kind == 5 && target_reference.tag == 10) ||
+        (reference_kind == 6 && (target_reference.tag == 10 || (metadata.major_version >= 52 && target_reference.tag == 11))) ||
+        (reference_kind == 7 && (target_reference.tag == 10 || (metadata.major_version >= 52 && target_reference.tag == 11))) ||
+        (reference_kind == 8 && target_reference.tag == 10) ||
+        (reference_kind == 9 && target_reference.tag == 11);
+    if (!target_kind_matches) return {};
+    auto implementation_member = cp_member(metadata, implementation.second, true);
+    if (!implementation_member) return {};
+    auto implementation_signature = parse_method_descriptor(implementation_member.value().descriptor);
+    if (!implementation_signature) return {};
+    if (reference_kind == 8 &&
+        (implementation_member.value().name != "<init>" || implementation_signature.value().result)) return {};
+    return "lambda_metafactory=validated sam_type=" + *sam_type + " instantiated_type=" + *instantiated_type +
+        " implementation=handle" + std::to_string(reference_kind) + ":" + implementation_member.value().owner + "." +
+        implementation_member.value().name + implementation_member.value().descriptor;
+}
+std::optional<std::string> lambda_alt_metafactory_summary(const JvmMetadata &metadata, const DynamicCallSite &site) {
+    if (!metadata.bootstrap_methods || site.bootstrap_index >= metadata.bootstrap_methods->size()) return {};
+    const auto close = site.descriptor.find(')');
+    if (close == std::string::npos || close + 2 >= site.descriptor.size() || site.descriptor[close + 1] != 'L' ||
+        site.descriptor.back() != ';') return {};
+    const auto &bootstrap = (*metadata.bootstrap_methods)[site.bootstrap_index];
+    if (!bootstrap.method_handle_index || bootstrap.method_handle_index >= metadata.constant_pool.size()) return {};
+    const auto &bootstrap_handle = metadata.constant_pool[bootstrap.method_handle_index];
+    if (bootstrap_handle.tag != 15 || bootstrap_handle.first != 6 || !bootstrap_handle.second ||
+        bootstrap_handle.second >= metadata.constant_pool.size()) return {};
+    const auto bootstrap_member = cp_member(metadata, bootstrap_handle.second, true);
+    constexpr std::string_view alt_descriptor =
+        "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;"
+        "[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;";
+    if (!bootstrap_member || bootstrap_member.value().owner != "java/lang/invoke/LambdaMetafactory" ||
+        bootstrap_member.value().name != "altMetafactory" || bootstrap_member.value().descriptor != alt_descriptor ||
+        bootstrap.method_handle_index >= metadata.constant_pool.size()) return {};
+    const auto &args = bootstrap.argument_indices;
+    if (args.size() < 4) return {};
+    const auto method_type = [&](std::uint16_t index) -> std::optional<std::string> {
+        if (!index || index >= metadata.constant_pool.size() || metadata.constant_pool[index].tag != 16) return {};
+        auto descriptor = cp_utf8(metadata, metadata.constant_pool[index].first);
+        if (!descriptor || !parse_method_descriptor(descriptor.value())) return {};
+        return std::move(descriptor.value());
+    };
+    const auto sam = method_type(args[0]);
+    const auto instantiated = method_type(args[2]);
+    if (!sam || !instantiated || !args[1] || args[1] >= metadata.constant_pool.size()) return {};
+    const auto &implementation = metadata.constant_pool[args[1]];
+    if (implementation.tag != 15 || implementation.first < 5 || implementation.first > 9 ||
+        !implementation.second || implementation.second >= metadata.constant_pool.size()) return {};
+    const auto kind = static_cast<unsigned>(implementation.first);
+    const auto &target = metadata.constant_pool[implementation.second];
+    const bool target_kind_matches = (kind == 5 && target.tag == 10) ||
+        ((kind == 6 || kind == 7) && (target.tag == 10 || (metadata.major_version >= 52 && target.tag == 11))) ||
+        (kind == 8 && target.tag == 10) || (kind == 9 && target.tag == 11);
+    if (!target_kind_matches) return {};
+    const auto member = cp_member(metadata, implementation.second, true);
+    if (!member || !parse_method_descriptor(member.value().descriptor) ||
+        (kind == 8 && (member.value().name != "<init>" || parse_method_descriptor(member.value().descriptor).value().result))) return {};
+    if (args[3] == 0 || args[3] >= metadata.constant_pool.size() || metadata.constant_pool[args[3]].tag != 3) return {};
+    const auto &flags_entry = metadata.constant_pool[args[3]];
+    constexpr std::uint32_t serializable = 1, markers_flag = 2, bridges_flag = 4;
+    const auto flags = static_cast<std::uint32_t>(flags_entry.first);
+    if ((flags & ~(serializable | markers_flag | bridges_flag)) != 0) return {};
+    std::size_t cursor = 4;
+    std::vector<std::string> markers, bridges;
+    const auto read_count = [&](std::size_t &at) -> std::optional<std::size_t> {
+        if (at >= args.size() || args[at] == 0 || args[at] >= metadata.constant_pool.size() || metadata.constant_pool[args[at]].tag != 3) return {};
+        const auto count_index = args[at++];
+        const auto value = static_cast<std::uint32_t>(metadata.constant_pool[count_index].first);
+        if (value > 64 || value > args.size() - at) return {};
+        return value;
+    };
+    if (flags & markers_flag) {
+        auto count = read_count(cursor); if (!count) return {};
+        for (std::size_t i = 0; i < *count; ++i) {
+            auto name = cp_class_name(metadata, args[cursor++]); if (!name || name.value().starts_with("[")) return {};
+            markers.push_back(std::move(name.value()));
+        }
+    }
+    if (flags & bridges_flag) {
+        auto count = read_count(cursor); if (!count) return {};
+        for (std::size_t i = 0; i < *count; ++i) {
+            auto bridge = method_type(args[cursor++]); if (!bridge) return {};
+            bridges.push_back(std::move(*bridge));
+        }
+    }
+    if (cursor != args.size()) return {};
+    std::string summary = "lambda_alt_metafactory=validated sam_type=" + *sam +
+        " instantiated_type=" + *instantiated + " implementation=handle" + std::to_string(kind) + ":" +
+        member.value().owner + "." + member.value().name + member.value().descriptor;
+    if (flags & serializable) summary += " serializable=true";
+    if (!markers.empty()) {
+        summary += " marker_interfaces=[";
+        for (std::size_t i = 0; i < markers.size(); ++i) { if (i) summary += ","; summary += markers[i]; }
+        summary += "]";
+    }
+    if (!bridges.empty()) {
+        summary += " bridge_methods=[";
+        for (std::size_t i = 0; i < bridges.size(); ++i) { if (i) summary += ","; summary += bridges[i]; }
+        summary += "]";
+    }
+    return summary;
+}
 }
 Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const FunctionSnapshot &snapshot,const JvmMetadata *metadata){
     std::map<std::uint64_t,std::shared_ptr<const BasicBlock>> blocks;
@@ -411,6 +649,7 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
     // dataflow worklist may revisit joins many times, so it must not rebuild it.
     const auto hierarchy = metadata ? index_hierarchy(*metadata) : std::optional<HierarchyIndex>{};
     HierarchyWork hierarchy_work;
+    HierarchyWork type_test_work;
     std::map<std::uint64_t, std::size_t> block_positions;
     std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> address_positions;
     std::vector<const BasicBlock *> sources(count);
@@ -473,6 +712,7 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             code = &*member.code;
             method = &member;
         }
+    const std::size_t local_count = code ? code->max_locals : 256;
     if (code) for (const auto *block : sources) {
         if (block->begin.space != code->begin.space || block->begin.offset < code->begin.offset ||
             block->begin.offset - code->begin.offset >= code->code_size)
@@ -494,7 +734,8 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
     std::array<std::uint32_t, 256> versions{};
     struct ExceptionalReference {
         std::size_t target;
-        std::shared_ptr<std::array<Reference, 256>> locals;
+        std::shared_ptr<std::map<std::size_t, Reference>> locals;
+        LocalCategories local_categories{};
     };
     struct Transfer {
         LiftedBlock block;
@@ -508,7 +749,7 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         const auto &src = *sources[block_index];
         LiftedBlock dst{src.id, src.begin, {}, src.successors};
         std::vector<ExceptionalReference> exceptional_references;
-        std::shared_ptr<std::array<Reference, 256>> exceptional_locals;
+        std::shared_ptr<std::map<std::size_t, Reference>> exceptional_locals;
         // Owning keys prevent allocator address reuse from attributing a popped
         // value's identity to an unrelated expression created later.
         std::map<ExpressionPtr, Reference, std::owner_less<ExpressionPtr>> identities;
@@ -612,8 +853,15 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                     if (std::none_of(exceptional_references.begin(), exceptional_references.end(),
                             [&](const auto &snapshot) { return snapshot.target == target->second; })) {
                         if (!exceptional_locals)
-                            exceptional_locals = std::make_shared<std::array<Reference, 256>>(references->locals);
-                        exceptional_references.push_back({target->second, exceptional_locals});
+                        exceptional_locals = std::make_shared<std::map<std::size_t, Reference>>(references->locals);
+                        exceptional_references.push_back({target->second, exceptional_locals,
+                                                          references->local_categories});
+                    } else {
+                        auto &categories = std::find_if(exceptional_references.begin(), exceptional_references.end(),
+                            [&](const auto &snapshot) { return snapshot.target == target->second; })->local_categories;
+                        for (std::size_t slot = 0; slot < categories.size(); ++slot)
+                            if (categories[slot] != references->local_categories[slot])
+                                categories[slot] = LocalCategory::top;
                     }
                 }
             if ((target(i) || (op >= 0xac && op <= 0xb1) || op == 0xbf) && ix+1 != src.instructions.size())
@@ -630,7 +878,17 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             if(op==0x09||op==0x0a){stack.push_back(con(op-0x09,int64()));continue;}
             if(op>=0x0b&&op<=0x0d){stack.push_back(con(op==0x0b?0:op==0x0c?0x3f800000:0x40000000,fp32()));continue;}
             if(op==0x0e||op==0x0f){stack.push_back(con(op-0x0e,fp64()));continue;}
-            if(op==0x10||op==0x11){auto v=imm(i);if(!v)return no("integer push immediate unavailable");std::int64_t s=op==0x10?static_cast<std::int8_t>(*v):static_cast<std::int16_t>(*v);stack.push_back(con(static_cast<std::uint32_t>(s),int32()));continue;}
+            if(op==0x10||op==0x11){
+                if(i.operands.size()!=1)return no("integer push immediate unavailable");
+                const auto *encoded=std::get_if<ImmediateOperand>(&i.operands.front());
+                const auto expected_width=op==0x10?8u:16u;
+                if(!encoded||!encoded->is_signed||encoded->encoded_width!=expected_width)
+                    return no("integer push immediate is not a signed byte or short");
+                const auto signed_value=encoded->encoded_width==8
+                    ?static_cast<std::int64_t>(static_cast<std::int8_t>(encoded->value))
+                    :static_cast<std::int64_t>(static_cast<std::int16_t>(encoded->value));
+                stack.push_back(con(static_cast<std::uint32_t>(signed_value),int32()));continue;
+            }
             if(op==0x12||op==0x13||op==0x14){
                 if(!metadata)return no("ldc requires JVM constant-pool metadata");
                 const auto index=imm(i);if(!index||!*index||*index>=metadata->constant_pool.size())return no("ldc constant-pool index is invalid");
@@ -654,6 +912,19 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                         Intrinsic load;load.name=description;load.memory_effect=IntrinsicMemoryEffect::unknown;load.result_type=ref32();
                         emit(*fact,std::move(load));stack.push_back(evidence(unknown(description,ref32()),reference_class("java/lang/Class")));continue;
                     }
+                    if(constant.tag==16){
+                        auto descriptor=cp_utf8(*metadata,constant.first);if(!descriptor)return descriptor.error();
+                        auto signature=parse_method_descriptor(descriptor.value());if(!signature)return signature.error();
+                        const auto description="jvm_method_type "+descriptor.value()+" cp#"+std::to_string(*index);
+                        Intrinsic load;load.name=description;load.memory_effect=IntrinsicMemoryEffect::unknown;load.result_type=ref32();
+                        emit(*fact,std::move(load));stack.push_back(evidence(unknown(description,ref32()),reference_class("java/lang/invoke/MethodType")));continue;
+                    }
+                    if(constant.tag==15){
+                        auto handle=cp_method_handle_summary(*metadata,*index);if(!handle)return handle.error();
+                        const auto description="jvm_method_handle "+handle.value()+" cp#"+std::to_string(*index);
+                        Intrinsic load;load.name=description;load.memory_effect=IntrinsicMemoryEffect::unknown;load.result_type=ref32();
+                        emit(*fact,std::move(load));stack.push_back(evidence(unknown(description,ref32()),reference_class("java/lang/invoke/MethodHandle")));continue;
+                    }
                     if(constant.tag!=17)return no("ldc constant kind is not modeled");
                 }
                 auto dynamic=cp_dynamic_constant(*metadata,*index);if(!dynamic)return dynamic.error();
@@ -672,19 +943,30 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 if((sem_op>=0x15&&sem_op<=0x19)||(sem_op>=0x36&&sem_op<=0x3a)){auto v=imm(i,wide?1:0);if(!v)return no("local index unavailable");index=static_cast<unsigned>(*v);kind=store?sem_op-0x36:sem_op-0x15;}
                 else if(!store){if(sem_op<=0x2d){kind=(sem_op-0x1a)/4;index=(sem_op-0x1a)%4;}}
                 else {kind=(sem_op-0x3b)/4;index=(sem_op-0x3b)%4;}
-                if(kind>4)return no("invalid local access kind");if(index>255)return no("local index exceeds common-IR register-key width");
-                const auto type=kind==0?int32():kind==1?int64():kind==2?fp32():kind==3?fp64():ref32();RegisterOperand local{RegisterBank::jvm_local,static_cast<std::uint8_t>(index),type.bits,false};
+                if(kind>4)return no("invalid local access kind");if(index>=local_count||index>=256)return no("local index exceeds bounded JVM verifier slots");
+                const auto type=kind==0?int32():kind==1?int64():kind==2?fp32():kind==3?fp64():ref32();RegisterOperand local{RegisterBank::jvm_local,static_cast<std::uint16_t>(index),type.bits,false};
                 if (code && static_cast<std::size_t>(index) + (type.bits == 64 ? 2u : 1u) > code->max_locals)
                     return no("local access exceeds Code.max_locals");
                 if (store) {
                     auto v=pop(type);if(!v)return v.error();emit(*fact,Assign{local,v.value()});
                     if (references) {
+                        store_local_category(references->local_categories, index, local_category(type));
                         // A category-2 store invalidates both physical local slots.
-                        references->locals[index] = type == ref32() ? identity(v.value()) : Reference{};
-                        if (type.bits == 64 && index + 1 < references->locals.size()) references->locals[index + 1].reset();
+                        const auto local_identity = type == ref32() ? identity(v.value()) : Reference{};
+                        if (local_identity) references->locals[index] = local_identity;
+                        else references->locals.erase(index);
+                        if (type.bits == 64) references->locals.erase(index + 1);
                     }
                 }
-                else if (shapes_only) stack.push_back(evidence(unknown("local_shape", type),references ? references->locals[index] : Reference{}));
+                else if (shapes_only) {
+                    if (references && references->local_categories[index] != local_category(type))
+                        return no("local load reads an uninitialized or incompatible JVM value");
+                    if (references && type.bits == 64 &&
+                        references->local_categories[index + 1] != LocalCategory::category2_tail)
+                        return no("category-2 local load has no matching second slot");
+                    const auto found = references ? references->locals.find(index) : std::map<std::size_t, Reference>::const_iterator{};
+                    stack.push_back(evidence(unknown("local_shape", type), references && found != references->locals.end() ? found->second : Reference{}));
+                }
                 else {
                     // Freeze the local at the load instruction. A later local
                     // store must not change a value still on the operand stack.
@@ -694,16 +976,29 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                     const auto version = ++versions[slot];
                     const RegisterOperand temporary{RegisterBank::jvm_stack, static_cast<std::uint8_t>(slot), type.bits, false};
                     emit(*fact, Assign{temporary, reg(local, type), version});
+                    const auto found = references ? references->locals.find(index) : std::map<std::size_t, Reference>::const_iterator{};
                     stack.push_back(evidence(std::make_shared<Expression>(Expression{type, RegisterValue{temporary, version}}),
-                                             references ? references->locals[index] : Reference{}));
+                                             references && found != references->locals.end() ? found->second : Reference{}));
                 }
                 continue;
             }
-            if(sem_op==0x84){auto index=imm(i,wide?1:0),delta=imm(i,wide?2:1);if(!index||!delta)return no("iinc operands unavailable");if(*index>255)return no("iinc local index exceeds common-IR register-key width");if(code&&*index>=code->max_locals)return no("iinc local index exceeds Code.max_locals");if(references)references->locals[*index].reset();const auto d=wide?static_cast<std::int16_t>(*delta):static_cast<std::int8_t>(*delta);RegisterOperand local{RegisterBank::jvm_local,static_cast<std::uint8_t>(*index),32,false};emit(*fact,Assign{local,bin("add",reg(local),con(static_cast<std::uint32_t>(d),int32()),int32())});continue;}
+            if(sem_op==0x84){auto index=imm(i,wide?1:0),delta=imm(i,wide?2:1);if(!index||!delta)return no("iinc operands unavailable");if(*index>=local_count||*index>=256)return no("iinc local index exceeds bounded JVM verifier slots");if(references){if(references->local_categories[*index]!=LocalCategory::integer)return no("iinc reads an uninitialized or non-integer JVM local");references->locals.erase(*index);}const auto d=wide?static_cast<std::int16_t>(*delta):static_cast<std::int8_t>(*delta);RegisterOperand local{RegisterBank::jvm_local,static_cast<std::uint16_t>(*index),32,false};emit(*fact,Assign{local,bin("add",reg(local),con(static_cast<std::uint32_t>(d),int32()),int32())});continue;}
             if(op>=0x2e&&op<=0x35){
                 static constexpr const char *names[]={"iaload","laload","faload","daload","aaload","baload","caload","saload"};
                 const ValueType types[]={int32(),int64(),fp32(),fp64(),ref32(),int32(),int32(),int32()};
                 auto index=pop(int32());if(!index)return index.error();auto array=pop(ref32());if(!array)return array.error();
+                const auto null_condition=bin("eq",array.value(),con(0,ref32()),int32());
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,"java.lang.NullPointerException from "+i.mnemonic_override,null_condition});
+                // Array loads can also throw for either side of the signed
+                // index interval. Keep the check as an expression over the
+                // original index and a symbolic length read so the exceptional
+                // edge remains visible to later IR consumers.
+                const auto length=un("jvm_arraylength",array.value(),int32());
+                const auto negative=bin("slt",index.value(),con(0,int32()),int32());
+                const auto past_end=bin("sge",index.value(),length,int32());
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                    "java.lang.ArrayIndexOutOfBoundsException from "+i.mnemonic_override,
+                    bin("or",negative,past_end,int32())});
                 Intrinsic load;load.name=std::string("jvm_")+names[op-0x2e];load.operands={array.value(),index.value()};
                 load.memory_effect=IntrinsicMemoryEffect::read;load.result_type=types[op-0x2e];
                 const auto result_name=load.name;const auto result_type=*load.result_type;emit(*fact,std::move(load));
@@ -721,11 +1016,27 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 const ValueType types[]={int32(),int64(),fp32(),fp64(),ref32(),int32(),int32(),int32()};
                 const auto slot=op-0x4f;auto value=pop(types[slot]);if(!value)return value.error();
                 auto index=pop(int32());if(!index)return index.error();auto array=pop(ref32());if(!array)return array.error();
+                const auto null_condition=bin("eq",array.value(),con(0,ref32()),int32());
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,"java.lang.NullPointerException from "+i.mnemonic_override,null_condition});
+                const auto length=un("jvm_arraylength",array.value(),int32());
+                const auto negative=bin("slt",index.value(),con(0,int32()),int32());
+                const auto past_end=bin("sge",index.value(),length,int32());
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                    "java.lang.ArrayIndexOutOfBoundsException from "+i.mnemonic_override,
+                    bin("or",negative,past_end,int32())});
+                if(op==0x53) {
+                    dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                        "java.lang.ArrayStoreException from aastore",
+                        bin("jvm_array_store_type_mismatch",array.value(),value.value(),int32())});
+                }
                 Intrinsic store;store.name=std::string("jvm_")+names[slot];store.operands={array.value(),index.value(),value.value()};
                 store.memory_effect=IntrinsicMemoryEffect::write;emit(*fact,std::move(store));continue;
             }
             if(op==0xbc||op==0xbd){
                 auto length=pop(int32());if(!length)return length.error();std::string element, array_descriptor;
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                    "java.lang.NegativeArraySizeException from "+i.mnemonic_override,
+                    bin("slt",length.value(),con(0,int32()),int32())});
                 if(op==0xbc){
                     static constexpr const char *types[]={"","","","","boolean","char","float","double","byte","short","int","long"};
                     const auto atype=imm(i);if(!atype||*atype<4||*atype>11)return no("newarray primitive type is invalid");element=types[*atype];
@@ -744,6 +1055,8 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             }
             if(op==0xbe){
                 auto array=pop(ref32());if(!array)return array.error();Intrinsic length;length.name="jvm_arraylength";
+                const auto null_condition=bin("eq",array.value(),con(0,ref32()),int32());
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,"java.lang.NullPointerException from arraylength",null_condition});
                 length.operands.push_back(array.value());length.memory_effect=IntrinsicMemoryEffect::read;length.result_type=int32();
                 emit(*fact,std::move(length));stack.push_back(unknown("jvm_arraylength",int32()));continue;
             }
@@ -752,6 +1065,46 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 const auto index=imm(i);if(!index)return no("type-check class index unavailable");
                 auto name=cp_class_name(*metadata,*index);if(!name)return name.error();
                 auto object=pop(ref32());if(!object)return object.error();
+                const auto *null_constant=std::get_if<ConstantValue>(&object.value()->value);
+                const auto reference=identity(object.value());
+                if (reference && (reference->kind == JvmVerificationKind::uninitialized ||
+                                  reference->kind == JvmVerificationKind::uninitialized_this))
+                    return no("type check uses an uninitialized verifier value");
+                const bool known_null=(null_constant && null_constant->type==ref32() && null_constant->value==0) ||
+                    (reference && reference->kind==JvmVerificationKind::null_value);
+                auto expected = reference_class(name.value());
+                if (expected) expected->defining_loader = metadata->defining_loader;
+                const bool definitely_assignable = references && reference && expected &&
+                    reference->kind == JvmVerificationKind::object &&
+                    (*reference == *expected || (hierarchy &&
+                        hierarchy_assignable(*hierarchy, type_test_work, *reference, *expected)));
+                if (known_null) {
+                    Intrinsic resolution;
+                    resolution.name=std::string("jvm_resolve_type ")+(op==0xc0?"checkcast ":"instanceof ")+name.value();
+                    resolution.memory_effect=IntrinsicMemoryEffect::unknown;
+                    emit(*fact,std::move(resolution));
+                    if (op==0xc0)
+                        stack.push_back(evidence(object.value(), reference.value_or(
+                            ReferenceIdentity{JvmVerificationKind::null_value,{},0})));
+                    else stack.push_back(con(0,int32()));
+                    continue;
+                }
+                if (definitely_assignable) {
+                    Intrinsic resolution;
+                    resolution.name=std::string("jvm_resolve_type ")+(op==0xc0?"checkcast ":"instanceof ")+name.value();
+                    resolution.memory_effect=IntrinsicMemoryEffect::unknown;
+                    emit(*fact,std::move(resolution));
+                    if (op==0xc0)
+                        stack.push_back(evidence(object.value(), reference));
+                    else
+                        stack.push_back(bin("ne",object.value(),con(0,ref32()),int32()));
+                    continue;
+                }
+                if(op==0xc0) {
+                    dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                        "java.lang.ClassCastException from checkcast",
+                        bin("jvm_checkcast_type_mismatch_"+name.value(),object.value(),con(0,ref32()),int32())});
+                }
                 Intrinsic check;check.name=(op==0xc0?"jvm_checkcast ":"jvm_instanceof ")+name.value();
                 check.operands.push_back(object.value());check.memory_effect=IntrinsicMemoryEffect::unknown;
                 check.result_type=op==0xc0?ref32():int32();
@@ -760,6 +1113,14 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             }
             if(op==0xc2||op==0xc3){
                 auto object=pop(ref32());if(!object)return object.error();
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                    "java.lang.NullPointerException from "+i.mnemonic_override,
+                    bin("eq",object.value(),con(0,ref32()),int32())});
+                if(op==0xc3) {
+                    dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                        "java.lang.IllegalMonitorStateException from monitorexit",
+                        bin("jvm_monitor_not_owned",object.value(),con(0,ref32()),int32())});
+                }
                 Intrinsic monitor;monitor.name=op==0xc2?"jvm_monitorenter":"jvm_monitorexit";
                 monitor.operands.push_back(object.value());monitor.memory_effect=IntrinsicMemoryEffect::unknown;
                 emit(*fact,std::move(monitor));continue;
@@ -776,6 +1137,13 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 if(*dimensions>array_dimensions)return no("multianewarray dimensions exceed the class descriptor rank");
                 std::vector<ExpressionPtr> sizes(static_cast<std::size_t>(*dimensions));
                 for(std::size_t n=sizes.size();n>0;--n){auto size=pop(int32());if(!size)return size.error();sizes[n-1]=size.value();}
+                ExpressionPtr negative_dimension;
+                for(const auto &size:sizes){
+                    const auto negative=bin("slt",size,con(0,int32()),int32());
+                    negative_dimension=negative_dimension?bin("or",negative_dimension,negative,int32()):negative;
+                }
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                    "java.lang.NegativeArraySizeException from multianewarray",negative_dimension});
                 Intrinsic allocation;allocation.name="jvm_multianewarray "+descriptor.value()+" dims="+std::to_string(*dimensions);
                 allocation.operands=std::move(sizes);allocation.memory_effect=IntrinsicMemoryEffect::unknown;allocation.result_type=ref32();
                 const auto description=allocation.name;emit(*fact,std::move(allocation));stack.push_back(evidence(unknown(description,ref32()),reference_descriptor(descriptor.value())));continue;
@@ -795,13 +1163,24 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 continue;
             }
             if(op==0x5f){auto v1=pop_any();if(!v1)return v1.error();auto v2=pop_any();if(!v2)return v2.error();if(v1.value()->type.bits>32||v2.value()->type.bits>32)return no("swap requires two category-1 values");stack.push_back(v1.value());stack.push_back(v2.value());continue;}
-            if(op>=0x60&&op<=0x83){static constexpr const char *ops[]={"add","add","add","add","sub","sub","sub","sub","mul","mul","mul","mul","div","div","div","div","rem","rem","rem","rem","neg","neg","neg","neg","shl","shl","shr","shr","ushr","ushr","and","and","or","or","xor","xor"};const auto slot=op-0x60;const auto kind=op>=0x78?static_cast<unsigned>((op-0x78)%2):slot%4;const auto type=kind==0?int32():kind==1?int64():kind==2?fp32():fp64();const bool unary_op=op>=0x74&&op<=0x77;if(unary_op){auto a=pop(type);if(!a)return a.error();stack.push_back(un(ops[slot],a.value(),type));continue;}const bool integer_division=op==0x6c||op==0x6d||op==0x70||op==0x71;const bool shift=op==0x78||op==0x79||op==0x7a||op==0x7b||op==0x7c||op==0x7d;if(shift){auto rhs=pop(int32());if(!rhs)return rhs.error();auto lhs=pop(type);if(!lhs)return lhs.error();stack.push_back(bin(ops[slot],lhs.value(),rhs.value(),type));}else{auto rhs=pop(type);if(!rhs)return rhs.error();auto lhs=pop(type);if(!lhs)return lhs.error();if(integer_division){const auto condition=bin("eq",rhs.value(),con(0,type),int32());dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,"java.lang.ArithmeticException from "+i.mnemonic_override,condition});}stack.push_back(bin(ops[slot],lhs.value(),rhs.value(),type));}continue;}
-            if(op>=0x94&&op<=0x98){const auto type=op==0x94?int64():op<=0x96?fp32():fp64();auto rhs=pop(type);if(!rhs)return rhs.error();auto lhs=pop(type);if(!lhs)return lhs.error();stack.push_back(bin(i.mnemonic_override,lhs.value(),rhs.value(),int32()));continue;}
-            if(op>=0x85&&op<=0x93){const ValueType types[]={int64(),fp32(),fp64(),int32(),fp32(),fp64(),int32(),int64(),fp64(),int32(),int64(),fp32(),int32(),int32(),int32()};const ValueType from[]={int32(),int32(),int32(),int64(),int64(),int64(),fp32(),fp32(),fp32(),fp64(),fp64(),fp64(),int32(),int32(),int32()};auto v=pop(from[op-0x85]);if(!v)return v.error();stack.push_back(un(i.mnemonic_override,v.value(),types[op-0x85]));continue;}
+            if(op>=0x60&&op<=0x83){static constexpr const char *ops[]={"add","add","add","add","sub","sub","sub","sub","mul","mul","mul","mul","div","div","div","div","rem","rem","rem","rem","neg","neg","neg","neg","shl","shl","shr","shr","ushr","ushr","and","and","or","or","xor","xor"};const auto slot=op-0x60;const auto kind=op>=0x78?static_cast<unsigned>((op-0x78)%2):slot%4;const auto type=kind==0?int32():kind==1?int64():kind==2?fp32():fp64();const bool unary_op=op>=0x74&&op<=0x77;if(unary_op){auto a=pop(type);if(!a)return a.error();stack.push_back(un(ops[slot],a.value(),type));continue;}const bool integer_division=op==0x6c||op==0x6d||op==0x70||op==0x71;const bool shift=op==0x78||op==0x79||op==0x7a||op==0x7b||op==0x7c||op==0x7d;if(shift){auto rhs=pop(int32());if(!rhs)return rhs.error();auto lhs=pop(type);if(!lhs)return lhs.error();const auto count_mask=con(type==int64()?63:31,int32());const auto masked_rhs=bin("and",rhs.value(),count_mask,int32());stack.push_back(bin(ops[slot],lhs.value(),masked_rhs,type));}else{auto rhs=pop(type);if(!rhs)return rhs.error();auto lhs=pop(type);if(!lhs)return lhs.error();if(integer_division){const auto condition=bin("eq",rhs.value(),con(0,type),int32());dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,"java.lang.ArithmeticException from "+i.mnemonic_override,condition});}stack.push_back(bin(ops[slot],lhs.value(),rhs.value(),type));}continue;}
+            if(op>=0x94&&op<=0x98){
+                const auto type=op==0x94?int64():op<=0x96?fp32():fp64();
+                auto rhs=pop(type);if(!rhs)return rhs.error();auto lhs=pop(type);if(!lhs)return lhs.error();
+                static constexpr const char *operations[]={"jvm_lcmp", "jvm_fcmpl_nan_minus_one",
+                    "jvm_fcmpg_nan_plus_one", "jvm_dcmpl_nan_minus_one", "jvm_dcmpg_nan_plus_one"};
+                stack.push_back(bin(operations[op-0x94],lhs.value(),rhs.value(),int32()));continue;
+            }
+            if(op>=0x91&&op<=0x93){
+                auto value=pop(int32());if(!value)return value.error();
+                const auto operation=op==0x91?"sext8":op==0x92?"zext16":"sext16";
+                stack.push_back(un(operation,value.value(),int32()));continue;
+            }
+            if(op>=0x85&&op<=0x90){const ValueType types[]={int64(),fp32(),fp64(),int32(),fp32(),fp64(),int32(),int64(),fp64(),int32(),int64(),fp32()};const ValueType from[]={int32(),int32(),int32(),int64(),int64(),int64(),fp32(),fp32(),fp32(),fp64(),fp64(),fp64()};auto v=pop(from[op-0x85]);if(!v)return v.error();stack.push_back(un(i.mnemonic_override,v.value(),types[op-0x85]));continue;}
             if(op>=0x99&&op<=0x9e){if(ix+1!=src.instructions.size())return no("conditional transfer is not block-terminating");if(!i.direct_target)return no("conditional target unavailable");auto v=pop(int32());if(!v)return v.error();static constexpr const char *cmp[]={"eq","ne","slt","sge","sgt","sle"};auto pred=bin(cmp[op-0x99],v.value(),con(0,int32()),{TypeKind::boolean,1,false});auto false_target=std::optional<Address>{};for(const auto &e:src.successors)if(e.kind==BlockEdgeKind::conditional_false&&e.target)false_target=e.target;emit(*fact,Branch{"predicate",i.direct_target,false_target,pred});continue;}
             if(op>=0x9f&&op<=0xa4){if(ix+1!=src.instructions.size())return no("conditional transfer is not block-terminating");if(!i.direct_target)return no("conditional target unavailable");auto rhs=pop(int32());if(!rhs)return rhs.error();auto lhs=pop(int32());if(!lhs)return lhs.error();static constexpr const char *cmp[]={"eq","ne","slt","sge","sgt","sle"};auto pred=bin(cmp[op-0x9f],lhs.value(),rhs.value(),{TypeKind::boolean,1,false});auto false_target=std::optional<Address>{};for(const auto &e:src.successors)if(e.kind==BlockEdgeKind::conditional_false&&e.target)false_target=e.target;emit(*fact,Branch{"predicate",i.direct_target,false_target,pred});continue;}
-            if(op==0xa5||op==0xa6){if(ix+1!=src.instructions.size())return no("reference comparison is not block-terminating");if(!i.direct_target)return no("reference comparison target unavailable");auto rhs=pop(ref32());if(!rhs)return rhs.error();auto lhs=pop(ref32());if(!lhs)return lhs.error();if(references){for(const auto &value:{lhs.value(),rhs.value()}){const auto ref=identity(value);if(ref&&(ref->kind==JvmVerificationKind::uninitialized||ref->kind==JvmVerificationKind::uninitialized_this))return no("reference comparison uses an uninitialized verifier value");}}const auto condition=bin(op==0xa5?"eq":"ne",lhs.value(),rhs.value(),{TypeKind::boolean,1,false});auto false_target=std::optional<Address>{};for(const auto &e:src.successors)if(e.kind==BlockEdgeKind::conditional_false&&e.target)false_target=e.target;emit(*fact,Branch{"predicate",i.direct_target,false_target,condition});continue;}
-            if(op==0xc6||op==0xc7){if(ix+1!=src.instructions.size())return no("null comparison is not block-terminating");if(!i.direct_target)return no("null comparison target unavailable");auto value=pop(ref32());if(!value)return value.error();if(references){const auto ref=identity(value.value());if(ref&&(ref->kind==JvmVerificationKind::uninitialized||ref->kind==JvmVerificationKind::uninitialized_this))return no("null comparison uses an uninitialized verifier value");}const auto condition=bin(op==0xc6?"eq":"ne",value.value(),con(0,ref32()),{TypeKind::boolean,1,false});auto false_target=std::optional<Address>{};for(const auto &e:src.successors)if(e.kind==BlockEdgeKind::conditional_false&&e.target)false_target=e.target;emit(*fact,Branch{"predicate",i.direct_target,false_target,condition});continue;}
+            if(op==0xa5||op==0xa6){if(ix+1!=src.instructions.size())return no("reference comparison is not block-terminating");if(!i.direct_target)return no("reference comparison target unavailable");auto rhs=pop(ref32());if(!rhs)return rhs.error();auto lhs=pop(ref32());if(!lhs)return lhs.error();Reference left_reference,right_reference;if(references){left_reference=identity(lhs.value());right_reference=identity(rhs.value());for(const auto &ref:{left_reference,right_reference})if(ref&&(ref->kind==JvmVerificationKind::uninitialized||ref->kind==JvmVerificationKind::uninitialized_this))return no("reference comparison uses an uninitialized verifier value");}const auto *left_register=std::get_if<RegisterValue>(&lhs.value()->value);const auto *right_register=std::get_if<RegisterValue>(&rhs.value()->value);const auto *left_constant=std::get_if<ConstantValue>(&lhs.value()->value);const auto *right_constant=std::get_if<ConstantValue>(&rhs.value()->value);const bool both_null=(left_constant&&left_constant->type==ref32()&&left_constant->value==0&&right_constant&&right_constant->type==ref32()&&right_constant->value==0)||(left_reference&&right_reference&&left_reference->kind==JvmVerificationKind::null_value&&right_reference->kind==JvmVerificationKind::null_value);const bool same_ssa_value=left_register&&right_register&&left_register->version&&right_register->version&&*left_register==*right_register;const bool known_equal=both_null||same_ssa_value;const ValueType boolean{TypeKind::boolean,1,false};const auto condition=known_equal?con(op==0xa5?1:0,boolean):bin(op==0xa5?"eq":"ne",lhs.value(),rhs.value(),boolean);auto false_target=std::optional<Address>{};for(const auto &e:src.successors)if(e.kind==BlockEdgeKind::conditional_false&&e.target)false_target=e.target;emit(*fact,Branch{"predicate",i.direct_target,false_target,condition});continue;}
+            if(op==0xc6||op==0xc7){if(ix+1!=src.instructions.size())return no("null comparison is not block-terminating");if(!i.direct_target)return no("null comparison target unavailable");auto value=pop(ref32());if(!value)return value.error();Reference ref;if(references)ref=identity(value.value());if(ref&&(ref->kind==JvmVerificationKind::uninitialized||ref->kind==JvmVerificationKind::uninitialized_this))return no("null comparison uses an uninitialized verifier value");const auto *constant_value=std::get_if<ConstantValue>(&value.value()->value);const bool known_null=(constant_value&&constant_value->type==ref32()&&constant_value->value==0)||(ref&&ref->kind==JvmVerificationKind::null_value);const ValueType boolean{TypeKind::boolean,1,false};const auto condition=known_null?con(op==0xc6?1:0,boolean):bin(op==0xc6?"eq":"ne",value.value(),con(0,ref32()),boolean);auto false_target=std::optional<Address>{};for(const auto &e:src.successors)if(e.kind==BlockEdgeKind::conditional_false&&e.target)false_target=e.target;emit(*fact,Branch{"predicate",i.direct_target,false_target,condition});continue;}
             if(op==0xa7||op==0xc8){if(!i.direct_target)return no("goto target unavailable");emit(*fact,Branch{"true",i.direct_target,{}});continue;}
             if(op>=0xac&&op<=0xb0){const auto type=op==0xac?int32():op==0xad?int64():op==0xae?fp32():op==0xaf?fp64():ref32();auto v=pop(type);if(!v)return v.error();if(!stack.empty())return no("return leaves extra operand-stack values");emit(*fact,Return{v.value()});continue;}
             if(op==0xb1){if(!stack.empty())return no("void return leaves operand-stack values");emit(*fact,Return{});continue;}
@@ -814,6 +1193,11 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                     if(ref&&(ref->kind==JvmVerificationKind::uninitialized||ref->kind==JvmVerificationKind::uninitialized_this))
                         return no("athrow uses an uninitialized verifier value");
                 }
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                    "java.lang.NullPointerException from athrow",
+                    bin("eq",exception.value(),con(0,ref32()),int32())});
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::unconditional,
+                    "athrow propagated exception",{}});
                 Intrinsic effect;effect.name="jvm_athrow";effect.operands.push_back(exception.value());effect.memory_effect=IntrinsicMemoryEffect::none;
                 emit(*fact,std::move(effect));continue;
             }
@@ -860,7 +1244,7 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                     if (receiver && (receiver->kind == JvmVerificationKind::uninitialized ||
                                      receiver->kind == JvmVerificationKind::uninitialized_this))
                         if (exceptional_locals)
-                            for (auto &value : *exceptional_locals)
+                            for (auto &[slot, value] : *exceptional_locals)
                                 if (value == receiver) value.reset();
                     const auto initialize_alias = [&](Reference &value) {
                         if (!value || (value->kind != JvmVerificationKind::uninitialized &&
@@ -873,7 +1257,7 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                         value = exact_new ? initialized : constructor_chain ? initialized_this : Reference{};
                     };
                     for (auto &entry : identities) initialize_alias(entry.second);
-                    for (auto &value : references->locals) initialize_alias(value);
+                    for (auto &entry : references->locals) initialize_alias(entry.second);
                 }
                 if(op==0xb9){
                     if(!imm(i,1)||!imm(i,2)||*imm(i,2)!=0)return no("invokeinterface trailing operands are malformed");
@@ -906,6 +1290,13 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                     const auto &bootstrap=(*metadata->bootstrap_methods)[site.value().bootstrap_index];
                     call.name+=" bsm_handle#"+std::to_string(bootstrap.method_handle_index)+" bsm_args=";
                     for(std::size_t n=0;n<bootstrap.argument_indices.size();++n){if(n)call.name+=",";call.name+="#"+std::to_string(bootstrap.argument_indices[n]);}
+                    const auto concat_factory = string_concat_factory(*metadata, site.value());
+                    if (concat_factory == StringConcatFactoryKind::make_concat)
+                        call.name += " concat_factory=makeConcat dynamic_arguments=" + std::to_string(signature.value().parameters.size());
+                    if (auto lambda = lambda_metafactory_summary(*metadata, site.value()))
+                        call.name += " linkage=unresolved " + *lambda;
+                    else if (auto lambda = lambda_alt_metafactory_summary(*metadata, site.value()))
+                        call.name += " linkage=unresolved " + *lambda;
                     if(auto recipe=string_concat_recipe(*metadata,site.value())){
                         const auto dynamic_markers=recipe->dynamic_markers;
                         const auto constant_markers=recipe->constant_markers;
@@ -1115,6 +1506,19 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         default: return {};
         }
     };
+    const auto verifier_assignable = [&](const ReferenceIdentity &actual,
+                                         const ReferenceIdentity &expected) {
+        if (actual == expected) return true;
+        // The verifier's null type is assignable to every initialized object
+        // type. Uninitialized allocation identities remain exact and cannot
+        // be widened through the ordinary class hierarchy.
+        if (actual.kind == JvmVerificationKind::null_value &&
+            expected.kind == JvmVerificationKind::object)
+            return true;
+        return hierarchy && actual.kind == JvmVerificationKind::object &&
+            expected.kind == JvmVerificationKind::object &&
+            hierarchy_assignable(*hierarchy, hierarchy_work, actual, expected);
+    };
     std::vector<const JvmStackMapFrame *> frames(count, nullptr);
     if (code && code->stack_map_table) {
         std::optional<std::uint32_t> previous;
@@ -1123,15 +1527,63 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 return no("StackMapTable has invalid or duplicate frame offsets");
             previous = frame.bytecode_offset;
             const auto position = address_positions.find({code->begin.space.value, code->begin.offset + frame.bytecode_offset});
-            if (position != address_positions.end()) frames[position->second] = &frame;
+            if (position == address_positions.end())
+                return no("StackMapTable frame is not a recovered basic-block entry");
+            frames[position->second] = &frame;
         }
     }
     std::vector<std::optional<ReferenceState>> reference_entries(count), reference_exits(count);
     ReferenceState initial;
+    if (method) {
+        auto descriptor = parse_method_descriptor(method->descriptor);
+        if (!descriptor) return no("method descriptor cannot initialize local verifier state");
+        std::size_t slot = 0;
+        if ((method->access_flags & 0x0008u) == 0) {
+            if (slot >= local_count || slot >= 256) return no("implicit this parameter exceeds bounded local verifier slots");
+            store_local_category(initial.local_categories, slot++, LocalCategory::reference);
+        }
+        for (const auto &parameter : descriptor.value().parameters) {
+            const auto category = local_category(parameter);
+            if (category == LocalCategory::top || slot + (category2(category) ? 2u : 1u) > local_count ||
+                slot + (category2(category) ? 2u : 1u) > 256)
+                return no("method parameters exceed Code.max_locals or have an unsupported verifier category");
+            store_local_category(initial.local_categories, slot, category);
+            slot += category2(category) ? 2u : 1u;
+        }
+    }
     if (code && code->stack_map_table) {
         std::size_t slot = 0;
         for (const auto &type : code->stack_map_table->initial_locals) {
-            if (slot < initial.locals.size()) initial.locals[slot] = verifier_reference(type);
+            const auto category = local_category(type.kind);
+            if (category == LocalCategory::top || slot + (category2(category) ? 2u : 1u) > local_count ||
+                slot + (category2(category) ? 2u : 1u) > 256)
+                return no("StackMapTable initial locals exceed Code.max_locals or have an invalid category");
+            store_local_category(initial.local_categories, slot, category);
+            slot += category2(category) ? 2u : 1u;
+        }
+        if (slot != code->stack_map_table->initial_local_slots)
+            return no("StackMapTable initial local slot count is inconsistent");
+        // The implicit frame must agree with the descriptor-derived entry
+        // categories. It may carry more precise reference identities, handled
+        // by the separate reference map below.
+        if (method) {
+            LocalCategories descriptor_categories{};
+            std::size_t descriptor_slot = 0;
+            if ((method->access_flags & 0x0008u) == 0)
+                store_local_category(descriptor_categories, descriptor_slot++, LocalCategory::reference);
+            auto descriptor = parse_method_descriptor(method->descriptor);
+            if (!descriptor) return no("method descriptor cannot validate StackMapTable initial locals");
+            for (const auto &parameter : descriptor.value().parameters) {
+                const auto category = local_category(parameter);
+                store_local_category(descriptor_categories, descriptor_slot, category);
+                descriptor_slot += category2(category) ? 2u : 1u;
+            }
+            if (descriptor_categories != initial.local_categories)
+                return no("StackMapTable implicit locals disagree with method descriptor categories");
+        }
+        slot = 0;
+        for (const auto &type : code->stack_map_table->initial_locals) {
+            if (auto reference = verifier_reference(type)) initial.locals[slot] = std::move(reference);
             slot += type.kind == JvmVerificationKind::long_value || type.kind == JvmVerificationKind::double_value ? 2u : 1u;
         }
         if (slot != code->stack_map_table->initial_local_slots || slot > code->max_locals)
@@ -1166,8 +1618,17 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             }
             a.reset();
         };
-        for (std::size_t slot = 0; slot < merged.locals.size(); ++slot) join(merged.locals[slot], incoming.locals[slot]);
+        for (auto local = merged.locals.begin(); local != merged.locals.end();) {
+            auto &[slot, reference] = *local;
+            const auto found = incoming.locals.find(slot);
+            join(reference, found == incoming.locals.end() ? Reference{} : found->second);
+            if (!reference) local = merged.locals.erase(local);
+            else ++local;
+        }
         for (std::size_t slot = 0; slot < merged.stack.size(); ++slot) join(merged.stack[slot], incoming.stack[slot]);
+        for (std::size_t slot = 0; slot < merged.local_categories.size(); ++slot)
+            if (merged.local_categories[slot] != incoming.local_categories[slot])
+                merged.local_categories[slot] = LocalCategory::top;
         if (merged == *reference_entries[target]) return false;
         reference_entries[target] = std::move(merged);
         work.push_back(target);
@@ -1181,18 +1642,40 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             // A frame is a constraint, never a source of newly invented
             // evidence. Top, dropped locals and assignability widening erase
             // facts, so a later aload cannot resurrect a discarded identity.
+            LocalCategories constrained_categories{};
+            std::size_t local_slot = 0;
+            for (const auto &local : frame->locals) {
+                const auto expected = local_category(local.kind);
+                if (local_slot >= local_count || local_slot >= 256 ||
+                    (expected == LocalCategory::top && local.kind != JvmVerificationKind::top))
+                    return no("StackMapTable local category is invalid or exceeds Code.max_locals");
+                const auto actual = state.local_categories[local_slot];
+                if (expected != LocalCategory::top && actual != expected)
+                    return no("StackMapTable local category disagrees with inferred control-flow state");
+                if (category2(expected) &&
+                    (local_slot + 1 >= local_count || local_slot + 1 >= 256 ||
+                     state.local_categories[local_slot + 1] != LocalCategory::category2_tail))
+                    return no("StackMapTable category-2 local has no matching second slot");
+                if (expected != LocalCategory::top)
+                    store_local_category(constrained_categories, local_slot, expected);
+                local_slot += category2(expected) ? 2u : 1u;
+            }
+            if (local_slot != frame->local_slots || local_slot > local_count)
+                return no("StackMapTable local category slot count is inconsistent");
+            state.local_categories = constrained_categories;
             for (std::size_t slot = 0; slot < state.stack.size(); ++slot) {
                 if (slot >= frame->stack.size() ||
                     (!hierarchy || !state.stack[slot] || !verifier_reference(frame->stack[slot]) ||
                      !hierarchy_assignable(*hierarchy, hierarchy_work, *state.stack[slot], *verifier_reference(frame->stack[slot])))) state.stack[slot].reset();
             }
-            std::array<Reference, 256> constrained{};
+            std::map<std::size_t, Reference> constrained;
             std::size_t slot = 0;
             for (const auto &local : frame->locals) {
                 const auto expected = verifier_reference(local);
-                if (slot < constrained.size() && expected && state.locals[slot] && hierarchy &&
-                    hierarchy_assignable(*hierarchy, hierarchy_work, *state.locals[slot], *expected))
-                    constrained[slot] = state.locals[slot];
+                const auto found = state.locals.find(slot);
+                if (expected && found != state.locals.end() && hierarchy &&
+                    found->second && hierarchy_assignable(*hierarchy, hierarchy_work, *found->second, *expected))
+                    constrained[slot] = *found->second;
                 slot += local.kind == JvmVerificationKind::long_value || local.kind == JvmVerificationKind::double_value ? 2u : 1u;
             }
             state.locals = std::move(constrained);
@@ -1205,6 +1688,7 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             if (!handler_entries[snapshot.target]) return no("exception evidence targets a non-handler block");
             ReferenceState incoming;
             incoming.locals = *snapshot.locals;
+            incoming.local_categories = snapshot.local_categories;
             incoming.stack.push_back(handler_stack_references[snapshot.target]);
             auto merged = merge_reference_entry(snapshot.target, incoming);
             if (!merged) return merged.error();
@@ -1244,11 +1728,17 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
     for (std::size_t bi = 0; bi < count; ++bi) {
         const bool references_on_stack = std::any_of(entries[bi]->begin(), entries[bi]->end(),
             [](const auto type) { return type == ref32(); });
-        if (!needs_frame[bi] || !references_on_stack) continue;
         const auto *frame = frames[bi];
-        if (!frame || !reference_entries[bi] || frame->stack.size() != entries[bi]->size())
+        const bool references_in_locals = reference_entries[bi] && std::any_of(
+            reference_entries[bi]->local_categories.begin(), reference_entries[bi]->local_categories.end(),
+            [](const auto category) { return category == LocalCategory::reference; });
+        const bool requires_reference_frame = needs_frame[bi] && (references_on_stack || references_in_locals);
+        if (!frame && requires_reference_frame)
             return no("reference stack join/backedge requires a complete exact StackMapTable frame");
-        const auto &state = *reference_entries[bi];
+        if (!frame) continue;
+        if (frame->stack.size() != entries[bi]->size())
+            return no("StackMapTable stack height disagrees with inferred control-flow state");
+        const ReferenceState *state = reference_entries[bi] ? &*reference_entries[bi] : nullptr;
         std::size_t stack_slots = 0;
         for (std::size_t slot = 0; slot < frame->stack.size(); ++slot) {
             const auto type = verifier_value_type(frame->stack[slot].kind);
@@ -1257,9 +1747,13 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             stack_slots += type->bits == 64 ? 2u : 1u;
             if (*type == ref32()) {
                 const auto expected = verifier_reference(frame->stack[slot]);
-                if (!expected || !state.stack[slot] || !hierarchy ||
-                    !hierarchy_assignable(*hierarchy, hierarchy_work, *state.stack[slot], *expected))
-                    return no("reference stack join/backedge has unknown or unequal verifier identities");
+                const Reference actual = state && slot < state->stack.size() ? state->stack[slot] : Reference{};
+                if (!expected)
+                    return no("StackMapTable contains a reference type that cannot be resolved");
+                if (actual && !verifier_assignable(*actual, *expected))
+                    return no("StackMapTable reference is incompatible with inferred stack value");
+                if (!actual && requires_reference_frame)
+                    return no("reference stack join/backedge has unknown verifier identity");
             }
         }
         if (stack_slots != frame->stack_slots || !code || stack_slots > code->max_stack)
@@ -1269,12 +1763,22 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             const auto type = verifier_value_type(local.kind);
             if (type && *type == ref32()) {
                 const auto expected = verifier_reference(local);
-                if (local_slot >= state.locals.size() || !expected || !state.locals[local_slot] || !hierarchy ||
-                    !hierarchy_assignable(*hierarchy, hierarchy_work, *state.locals[local_slot], *expected))
-                    return no("reference stack join/backedge has unproved verifier local identities");
-            } else if (local.kind != JvmVerificationKind::top && local_slot < state.locals.size() && state.locals[local_slot])
+                Reference actual;
+                if (state) {
+                    const auto found = state->locals.find(local_slot);
+                    if (found != state->locals.end()) actual = found->second;
+                }
+                if (!expected)
+                    return no("StackMapTable contains a local reference type that cannot be resolved");
+                if (actual && !verifier_assignable(*actual, *expected))
+                    return no("StackMapTable reference is incompatible with inferred local value");
+                if (!actual && requires_reference_frame)
+                    return no("reference stack join/backedge has unproved verifier local identity");
+            } else if (local.kind != JvmVerificationKind::top && state && state->locals.contains(local_slot))
                 return no("StackMapTable primitive local conflicts with reference evidence");
             if (!type && local.kind != JvmVerificationKind::top) return no("StackMapTable local kind is unknown");
+            if (type && type->bits == 64 && state && state->locals.contains(local_slot + 1))
+                return no("category-2 StackMapTable local overlaps inferred reference evidence");
             local_slot += type && type->bits == 64 ? 2u : 1u;
         }
         if (local_slot != frame->local_slots || local_slot > code->max_locals)
@@ -1309,7 +1813,10 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             }
             input.push_back(std::make_shared<Expression>(Expression{type, RegisterValue{stack_reg, version}}));
         }
-        auto lifted = transfer(bi, std::move(input), false);
+        std::optional<ReferenceState> reference_state;
+        if (reference_entries[bi]) reference_state = *reference_entries[bi];
+        auto lifted = transfer(bi, std::move(input), false,
+                               reference_state ? &*reference_state : nullptr);
         if (!lifted) return lifted.error();
         auto &block = lifted.value().block;
         const auto &stack = lifted.value().stack;

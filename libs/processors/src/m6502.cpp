@@ -12,6 +12,39 @@ enum class Mode : std::uint8_t { immediate, zero_page, zero_page_x, zero_page_y,
 R reg(unsigned n) { return {bank, static_cast<std::uint8_t>(n), 8, false}; }
 constexpr R a{bank, 0, 8, false}, x{bank, 1, 8, false}, y{bank, 2, 8, false}, p{bank, 3, 8, false}, s{bank, 4, 8, false};
 DecodeResult bad(DecodeStatus status, const char *reason) { return {status, {}, reason}; }
+constexpr std::array<std::uint8_t, 256> documented_cycles{
+    // 00-0f
+    7,6,0,0,0,3,5,0,3,2,2,0,0,4,6,0,
+    // 10-1f
+    2,5,0,0,0,4,6,0,2,4,2,0,0,4,7,0,
+    // 20-2f
+    6,6,0,0,3,3,5,0,4,2,2,0,4,4,6,0,
+    // 30-3f
+    2,5,0,0,0,4,6,0,2,4,2,0,0,4,7,0,
+    // 40-4f
+    6,6,0,0,0,3,5,0,3,2,2,0,3,4,6,0,
+    // 50-5f
+    2,5,0,0,0,4,6,0,2,4,2,0,0,4,7,0,
+    // 60-6f
+    6,6,0,0,0,3,5,0,4,2,2,0,5,4,6,0,
+    // 70-7f
+    2,5,0,0,0,4,6,0,2,4,2,0,0,4,7,0,
+    // 80-8f
+    0,6,0,0,3,3,3,0,2,0,2,0,4,4,4,0,
+    // 90-9f
+    2,6,0,0,4,4,4,0,2,5,2,0,0,5,0,5,
+    // a0-af
+    2,6,2,0,3,3,3,0,2,2,2,0,4,4,4,0,
+    // b0-bf
+    2,5,0,0,4,4,4,0,2,4,2,0,4,4,4,0,
+    // c0-cf
+    2,6,0,0,3,3,5,0,2,2,2,0,4,4,6,0,
+    // d0-df
+    2,5,0,0,0,4,6,0,2,4,0,0,0,4,7,0,
+    // e0-ef
+    2,6,0,0,3,3,5,0,2,2,2,0,4,4,6,0,
+    // f0-ff
+    2,5,0,0,0,4,6,0,2,4,2,0,0,4,7,0};
 }
 
 DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
@@ -26,6 +59,23 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     auto finish = [&](unsigned length) -> DecodeResult {
         i.length = static_cast<std::uint8_t>(length);
         std::copy_n(bytes.begin(), length, i.bytes.begin());
+        const auto base_cycles = documented_cycles[op];
+        if (base_cycles) {
+            M6502Timing timing;
+            timing.base_cycles = base_cycles;
+            if (i.flow == FlowKind::conditional_branch) {
+                timing.branch_taken_penalty = true;
+                timing.branch_page_cross_penalty = true;
+            } else if (i.memory_read && !i.memory_write) {
+                const auto *operand = i.operands.empty() ? nullptr : std::get_if<MemoryOperand>(&i.operands.front());
+                // The absolute indexed forms have a three-byte encoding. The
+                // (zp),Y family has its own low-nibble encoding and a two-byte
+                // instruction; both gain one read cycle only across a page.
+                timing.page_cross_penalty = (operand && operand->index && length == 3) ||
+                                            ((op & 0x1f) == 0x11);
+            }
+            i.m6502_timing = timing;
+        }
         return {DecodeStatus::decoded, std::move(i), {}};
     };
     auto need = [&](unsigned n) { return bytes.size() >= n; };
@@ -97,7 +147,9 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
             opcode == Opcode::m6502_lda || opcode == Opcode::m6502_ldx || opcode == Opcode::m6502_ldy;
         if (writes_value) i.register_writes.push_back(value);
         if (writes_flags) i.register_writes.push_back(p);
-        if (reads_carry) i.register_reads.push_back(p);
+        // A partial N/Z update preserves the incoming modeled P bits.
+        if (reads_carry || opcode == Opcode::m6502_lda || opcode == Opcode::m6502_ldx || opcode == Opcode::m6502_ldy)
+            i.register_reads.push_back(p);
         return finish(length);
     };
     auto implied = [&](Opcode opcode, unsigned length = 1) -> bool {
@@ -139,6 +191,59 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
         i.register_writes = {x, p};
         return finish(2);
     };
+    auto alr = [&]() -> DecodeResult {
+        if (!begin(Opcode::m6502_alr, 2))
+            return bad(DecodeStatus::truncated, "6502 operand bytes are truncated");
+        i.operands.emplace_back(ImmediateOperand{byte(1), 8, 8, false, EncodedField{1, 1}});
+        i.access = {OperandAccess::read};
+        i.register_reads = {a, p};
+        i.register_writes = {a, p};
+        return finish(2);
+    };
+    auto lax = [&](Mode mode) -> DecodeResult {
+        const auto length = sized_mode(mode);
+        if (!begin(Opcode::m6502_lax, length))
+            return bad(DecodeStatus::truncated, "6502 LAX operand bytes are truncated");
+        const auto operand = memory(mode);
+        i.operands.emplace_back(operand);
+        i.access = {OperandAccess::read};
+        if (operand.index) i.register_reads.push_back(*operand.index);
+        i.register_reads.push_back(p);
+        i.register_writes = {a, x, p};
+        i.memory_read = true;
+        return finish(length);
+    };
+    auto sax = [&](Mode mode) -> DecodeResult {
+        const auto length = sized_mode(mode);
+        if (!begin(Opcode::m6502_sax, length))
+            return bad(DecodeStatus::truncated, "6502 SAX operand bytes are truncated");
+        const auto operand = memory(mode);
+        i.operands.emplace_back(operand);
+        i.access = {OperandAccess::write};
+        if (operand.index) i.register_reads.push_back(*operand.index);
+        i.register_reads.push_back(a);
+        i.register_reads.push_back(x);
+        i.memory_write = true;
+        return finish(length);
+    };
+    auto undocumented_nop = [&](Mode mode) -> DecodeResult {
+        const auto length = sized_mode(mode);
+        if (!begin(Opcode::nop, length))
+            return bad(DecodeStatus::truncated, "6502 unofficial NOP operand bytes are truncated");
+        if (mode == Mode::implied) {
+            i.access = {};
+        } else if (mode == Mode::immediate) {
+            i.operands.emplace_back(ImmediateOperand{byte(1), 8, 8, false, EncodedField{1, 1}});
+            i.access = {OperandAccess::read};
+        } else {
+            const auto operand = memory(mode);
+            i.operands.emplace_back(operand);
+            i.access = {OperandAccess::read};
+            if (operand.index) i.register_reads.push_back(*operand.index);
+            i.memory_read = true;
+        }
+        return finish(length);
+    };
 
     // Regular ALU family: xx01 encodes the operation in bits 7..5 and the
     // addressing form in bits 4..2. This covers 55 legal NMOS opcodes.
@@ -158,9 +263,28 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     }
 
     switch (op) {
+    // NMOS KIL/JAM locks instruction execution until reset. Represent it as a
+    // terminal trap; reset-line and bus-lock behavior are outside this IR.
+    case 0x02: case 0x12: case 0x22: case 0x32: case 0x42: case 0x52:
+    case 0x62: case 0x72: case 0x92: case 0xb2: case 0xd2: case 0xf2:
+        if (!begin(Opcode::m6502_kil, 1))
+            return bad(DecodeStatus::truncated, "6502 KIL opcode is truncated");
+        i.flow = FlowKind::trap;
+        return finish(1);
+    case 0x4b: return alr();
     // AXS (also called SBX) is the stable NMOS $CB immediate form.
     case 0xcb: return axs();
     case 0x0b: case 0x2b: return data_op(Opcode::m6502_anc, Mode::immediate, a, false);
+    case 0xa3: return lax(Mode::indexed_indirect);
+    case 0xa7: return lax(Mode::zero_page);
+    case 0xaf: return lax(Mode::absolute);
+    case 0xb3: return lax(Mode::indirect_indexed);
+    case 0xb7: return lax(Mode::zero_page_y);
+    case 0xbf: return lax(Mode::absolute_y);
+    case 0x83: return sax(Mode::indexed_indirect);
+    case 0x87: return sax(Mode::zero_page);
+    case 0x8f: return sax(Mode::absolute);
+    case 0x97: return sax(Mode::zero_page_y);
     // Undocumented NMOS decrement-then-compare family. These byte forms are
     // stable on the NMOS 6502; the decoder records their combined effects.
     case 0xc7: return dcp(Mode::zero_page);
@@ -295,6 +419,21 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     case 0xd8: implied(Opcode::m6502_cld); i.register_reads = {p}; i.register_writes = {p}; return finish(1);
     case 0xf8: implied(Opcode::m6502_sed); i.register_reads = {p}; i.register_writes = {p}; return finish(1);
 
+    // Stable NMOS multi-byte and implied unofficial NOP encodings. The DOP
+    // and TOP forms perform the effective-address read but do not alter flags.
+    case 0x1a: case 0x3a: case 0x5a: case 0x7a: case 0xda: case 0xfa:
+        return undocumented_nop(Mode::implied);
+    case 0x80: case 0x82: case 0x89: case 0xc2: case 0xe2:
+        return undocumented_nop(Mode::immediate);
+    case 0x04: case 0x44: case 0x64:
+        return undocumented_nop(Mode::zero_page);
+    case 0x14: case 0x34: case 0x54: case 0x74: case 0xd4: case 0xf4:
+        return undocumented_nop(Mode::zero_page_x);
+    case 0x0c:
+        return undocumented_nop(Mode::absolute);
+    case 0x1c: case 0x3c: case 0x5c: case 0x7c: case 0xdc: case 0xfc:
+        return undocumented_nop(Mode::absolute_x);
+
     // Direct and indirect control flow.
     case 0x4c: case 0x20: {
         if (!begin(op == 0x4c ? Opcode::m6502_jmp : Opcode::m6502_jsr, 3))
@@ -398,10 +537,7 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     // 65C02-defined encodings are called out separately; other unassigned
     // encodings are undocumented NMOS instructions (including stable illegal
     // operations) and are deliberately not assigned fabricated semantics.
-    if (op == 0x80 || op == 0x64 || op == 0x74 || op == 0x89 || op == 0x9c || op == 0x9e ||
-        op == 0x12 || op == 0x32 || op == 0x52 || op == 0x72 || op == 0x92 || op == 0xb2 || op == 0xd2 || op == 0xf2 ||
-        op == 0x04 || op == 0x0c || op == 0x14 || op == 0x1a || op == 0x34 || op == 0x3a || op == 0x3c ||
-        op == 0x5a || op == 0x7a || op == 0x7c || op == 0x89 || op == 0x9c || op == 0xdb)
+    if (op == 0x9c || op == 0x9e)
         return bad(DecodeStatus::unsupported, "65C02-only opcode is not enabled in the NMOS 6502 mode");
     return bad(DecodeStatus::unsupported, "Undocumented NMOS 6502 opcode has no defined decoder semantics");
 }

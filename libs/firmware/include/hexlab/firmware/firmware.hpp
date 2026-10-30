@@ -39,6 +39,8 @@ struct ParseOptions {
     std::uint64_t max_data_bytes = 512ull * 1024 * 1024;
     std::uint64_t max_address = 0xffffffffull;
     std::size_t max_records = 4'000'000;
+    // Counts every physical input line, including ignored blank lines.
+    std::size_t max_lines = 4'000'000;
 };
 // Record lines are one-based in provenance and diagnostics. Blank lines are ignored.
 HEXLAB_FIRMWARE_EXPORT Result<FirmwareImage> parse_intel_hex(std::string_view text,

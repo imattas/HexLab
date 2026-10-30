@@ -1,5 +1,7 @@
 #include "main_frame.hpp"
 #include "jump_resolver.hpp"
+#include "jump_suggestions_dialog.hpp"
+#include "cross_document_jump.hpp"
 #include "marker_navigation.hpp"
 #include "session_controller.hpp"
 #include "document_tabs.hpp"
@@ -10,6 +12,8 @@
 #include "close_coordinator.hpp"
 #include "project_view.hpp"
 #include "data_views.hpp"
+#include "metadata_context.hpp"
+#include "metadata_filter.hpp"
 #include "string_view.hpp"
 #include "type_symbols_view.hpp"
 #include "pseudocode_view.hpp"
@@ -38,6 +42,7 @@
 #include "hexlab/analysis/functions.hpp"
 #include "hexlab/analysis/flirt.hpp"
 #include "hexlab/core/sha256.hpp"
+#include "hexlab/database/codec.hpp"
 #include "hexlab/loaders/ar.hpp"
 #include "hexlab/image/file_storage.hpp"
 #include "hexlab/loaders/recipe.hpp"
@@ -57,6 +62,7 @@
 #include <wx/log.h>
 #include <wx/dataobj.h>
 #include <wx/filedlg.h>
+#include <wx/textdlg.h>
 #include <wx/menu.h>
 #include <wx/gauge.h>
 #include <wx/menu.h>
@@ -72,8 +78,10 @@
 #include <wx/listctrl.h>
 #include <wx/valnum.h>
 #include <wx/window.h>
+#include <wx/weakref.h>
 #include <algorithm>
 #include <map>
+#include <tuple>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -96,11 +104,15 @@
 namespace hexlab::desktop {
 namespace {
 constexpr int move_pane_id_base = python_console_id + 1;
-// Keep persisted restore work bounded while avoiding the old small ceiling
-// that silently dropped most tabs in larger analysis sessions.
-constexpr long maximum_restored_documents = 256;
+// Keep persisted restore work bounded while supporting large multi-document
+// sessions. The same cap validates the serialized count and limits saves.
+constexpr long maximum_restored_documents = 1024;
+constexpr long maximum_restored_comparison_sessions = 32;
 constexpr std::size_t maximum_persisted_path_characters = 32768;
 constexpr std::size_t maximum_persisted_recipe_bytes = 65536;
+constexpr long maximum_persisted_navigation_entries = 512;
+constexpr std::size_t maximum_image_entry_scan = 100000;
+constexpr std::size_t maximum_image_entry_choices = 4096;
 constexpr char recipe_hex_digits[] = "0123456789abcdef";
 std::string encode_session_integer(std::uint64_t value) {
     char buffer[16];
@@ -116,6 +128,10 @@ std::optional<std::uint64_t> decode_session_integer(const wxString &value) {
     const auto parsed = std::from_chars(begin, end, decoded, 16);
     if (parsed.ec != std::errc{} || parsed.ptr != end) return std::nullopt;
     return decoded;
+}
+std::string wx_utf8_bytes(const wxString &value) {
+    const auto encoded = value.utf8_str();
+    return encoded ? std::string(encoded.data(), encoded.length()) : std::string{};
 }
 std::string encode_recipe_hex(std::span<const std::byte> bytes) {
     std::string encoded;
@@ -330,6 +346,25 @@ wxString string_encoding_name(StringEncoding encoding) {
     case StringEncoding::dos850: return "DOS-850";
     case StringEncoding::iso8859_15: return "ISO-8859-15";
     case StringEncoding::iso8859_9: return "ISO-8859-9";
+    case StringEncoding::dos866: return "DOS-866";
+    case StringEncoding::dos852: return "DOS-852";
+    case StringEncoding::koi8_r: return "KOI8-R";
+    case StringEncoding::koi8_u: return "KOI8-U";
+    case StringEncoding::mac_roman: return "Mac Roman";
+    case StringEncoding::iso8859_1: return "ISO-8859-1";
+    case StringEncoding::iso8859_3: return "ISO-8859-3";
+    case StringEncoding::iso8859_4: return "ISO-8859-4";
+    case StringEncoding::iso8859_6: return "ISO-8859-6";
+    case StringEncoding::iso8859_7: return "ISO-8859-7";
+    case StringEncoding::iso8859_10: return "ISO-8859-10";
+    case StringEncoding::iso8859_13: return "ISO-8859-13";
+    case StringEncoding::iso8859_14: return "ISO-8859-14";
+    case StringEncoding::iso8859_16: return "ISO-8859-16";
+    case StringEncoding::iso8859_8: return "ISO-8859-8";
+    case StringEncoding::iso8859_11: return "ISO-8859-11";
+    case StringEncoding::windows874: return "Windows-874";
+    case StringEncoding::ebcdic_cp1047: return "EBCDIC CP1047";
+    case StringEncoding::windows932: return "Windows-932";
     }
     return "Unknown";
 }
@@ -360,11 +395,14 @@ struct CompareInput {
     std::vector<std::string> keys;
     std::vector<std::uint64_t> addresses;
     std::vector<ByteView> views;
+    std::vector<std::vector<compare::RegionView::IgnoredRange>> ignored_ranges;
     compare::ImageView view;
 };
-Result<std::shared_ptr<CompareInput>> compare_input(const Image &image, std::stop_token stop) {
+Result<std::shared_ptr<CompareInput>> compare_input(const Image &image, const ImageMetadata &metadata,
+                                                    std::stop_token stop) {
     auto input = std::make_shared<CompareInput>();
     std::map<std::string, std::size_t> occurrences;
+    std::vector<const Segment *> selected_segments;
     for (const auto &segment : image.layout().segments) {
         if (stop.stop_requested())
             return Error{ErrorCode::canceled, "comparison canceled"};
@@ -382,10 +420,117 @@ Result<std::shared_ptr<CompareInput>> compare_input(const Image &image, std::sto
         input->keys.push_back(std::move(key));
         input->addresses.push_back(segment.begin.offset);
         input->views.push_back(std::move(data.value()));
+        selected_segments.push_back(&segment);
+    }
+    input->ignored_ranges.resize(input->views.size());
+    constexpr std::size_t relocation_item_budget = 1'000'000;
+    std::size_t relocation_items = 0;
+    const auto add_file_field = [&](FileOffset place, std::uint64_t size) -> Result<bool> {
+        if (!size || size > 64) return true;
+        for (std::size_t index = 0; index < selected_segments.size(); ++index) {
+            const auto &segment = *selected_segments[index];
+            const auto region_size = input->views[index].bytes.size();
+            if (place.value < segment.file_begin.value) continue;
+            const auto offset = place.value - segment.file_begin.value;
+            if (offset > region_size || size > region_size - offset) continue;
+            if (++relocation_items > relocation_item_budget)
+                return Error{ErrorCode::resource_limit, "comparison relocation mask exceeds one million fields"};
+            input->ignored_ranges[index].push_back({offset, size});
+        }
+        return true;
+    };
+    const auto add_address_field = [&](Address place, std::uint64_t size) -> Result<bool> {
+        const auto file_place = image.to_file_offset(place);
+        if (!file_place) return true;
+        return add_file_field(file_place.value(), size);
+    };
+    std::size_t visited_relocations = 0;
+    const auto check_cancel = [&]() {
+        return ((visited_relocations++ & 0xffu) == 0) && stop.stop_requested();
+    };
+    if (metadata.elf) {
+        for (const auto &relocation : metadata.elf->relocations) {
+            if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (!relocation.field_size || relocation.kind == ElfRelocationKind::unknown ||
+                relocation.kind == ElfRelocationKind::copy || relocation.kind == ElfRelocationKind::symbol_size ||
+                relocation.kind == ElfRelocationKind::tls || relocation.kind == ElfRelocationKind::ifunc)
+                continue;
+            const auto result = relocation.file_place
+                ? add_file_field(*relocation.file_place, *relocation.field_size)
+                : (relocation.place ? add_address_field(*relocation.place, *relocation.field_size) : Result<bool>(true));
+            if (!result) return result.error();
+        }
+    }
+    if (metadata.macho) {
+        for (const auto &relocation : metadata.macho->relocations) {
+            if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (!relocation.field_size || relocation.auxiliary || relocation.kind == MachORelocationKind::pair ||
+                relocation.kind == MachORelocationKind::addend || relocation.kind == MachORelocationKind::unknown)
+                continue;
+            const auto result = relocation.file_place
+                ? add_file_field(*relocation.file_place, relocation.field_size)
+                : (relocation.place ? add_address_field(*relocation.place, relocation.field_size) : Result<bool>(true));
+            if (!result) return result.error();
+        }
+        for (const auto &fixup : metadata.macho->dyld_fixups) {
+            if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (!fixup.field_size) continue;
+            const auto result = fixup.file_place
+                ? add_file_field(*fixup.file_place, fixup.field_size)
+                : (fixup.place ? add_address_field(*fixup.place, fixup.field_size) : Result<bool>(true));
+            if (!result) return result.error();
+        }
+        for (const auto &pointer : metadata.macho->chained_pointers) {
+            if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (!pointer.field_size) continue;
+            const auto result = pointer.file_place
+                ? add_file_field(*pointer.file_place, pointer.field_size)
+                : (pointer.place ? add_address_field(*pointer.place, pointer.field_size) : Result<bool>(true));
+            if (!result) return result.error();
+        }
+        for (const auto &pointer : metadata.macho->firmware_chained_pointers) {
+            if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            if (!pointer.field_size) continue;
+            const auto result = add_file_field(pointer.file_place, pointer.field_size);
+            if (!result) return result.error();
+        }
+    }
+    if (metadata.pe && (image.layout().architecture == Architecture::x86 ||
+                        image.layout().architecture == Architecture::x86_64)) {
+        for (const auto &relocation : metadata.relocations) {
+            if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            std::uint64_t width = 0;
+            switch (relocation.type) {
+            case 1: case 2: case 4: width = 2; break; // HIGH, LOW, HIGHADJ
+            case 3: width = 4; break;                 // HIGHLOW
+            case 10: width = 8; break;                // DIR64
+            default: break;
+            }
+            if (!width) continue;
+            auto result = add_address_field(relocation.address, width);
+            if (!result) return result.error();
+        }
+    }
+    for (auto &ranges : input->ignored_ranges) {
+        std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b) {
+            return std::tie(a.offset, a.size) < std::tie(b.offset, b.size);
+        });
+        std::vector<compare::RegionView::IgnoredRange> merged;
+        merged.reserve(ranges.size());
+        for (const auto &range : ranges) {
+            if (merged.empty() || range.offset > merged.back().offset + merged.back().size) {
+                merged.push_back(range);
+                continue;
+            }
+            const auto end = std::max(merged.back().offset + merged.back().size, range.offset + range.size);
+            merged.back().size = end - merged.back().offset;
+        }
+        ranges = std::move(merged);
     }
     input->view.regions.reserve(input->views.size());
     for (std::size_t i = 0; i < input->views.size(); ++i)
-        input->view.regions.push_back({input->keys[i], input->addresses[i], input->views[i].bytes});
+        input->view.regions.push_back({input->keys[i], input->addresses[i], input->views[i].bytes,
+                                       input->ignored_ranges[i]});
     return input;
 }
 std::string stable_function_name(const ImageMetadata &metadata, Address entry) {
@@ -415,6 +560,7 @@ std::vector<compare::FunctionFeature> compare_function_features(const FunctionSn
     result.reserve(snapshot.functions.size());
     std::uint64_t cfg_node_budget = 1'000'000, cfg_edge_budget = 4'000'000;
     std::uint64_t cfg_instruction_fingerprint_budget = 4'000'000;
+    std::uint64_t instruction_address_budget = 1'000'000;
     for (const auto &function : snapshot.functions) {
         if (stop.stop_requested()) return {};
         if (!function) continue;
@@ -547,24 +693,29 @@ std::vector<compare::FunctionFeature> compare_function_features(const FunctionSn
                 compare::CfgBlockFeature block_feature;
                 block_feature.fingerprint = node.block_fingerprint;
                 bool block_fingerprints_complete = true;
+                std::uint64_t instruction_position = 0;
                 for (const auto &fact : node.block->instructions) {
-                    if (!fact) continue;
-                    const auto fingerprint = compare_instruction_fingerprint(fact->instruction);
-                    if (!fingerprint || block_feature.instruction_fingerprints.size() >=
-                                            cfg_instruction_fingerprint_budget) {
+                    if (!fact) {
                         block_fingerprints_complete = false;
-                        break;
+                        ++instruction_position;
+                        continue;
                     }
-                    block_feature.instruction_fingerprints.push_back(*fingerprint);
-                    block_feature.instruction_semantics.push_back(::hexlab::app::compare_semantic_feature(fact->instruction, *fingerprint));
+                    const auto fingerprint = compare_instruction_fingerprint(fact->instruction);
+                    if (!fingerprint || cfg_instruction_fingerprint_budget <
+                                            (block_feature.instruction_fingerprints.size() + 1) * 2) {
+                        block_fingerprints_complete = false;
+                    } else {
+                        block_feature.instruction_fingerprints.push_back(*fingerprint);
+                        block_feature.instruction_fingerprint_positions.push_back(instruction_position);
+                        block_feature.instruction_semantics.push_back(::hexlab::app::compare_semantic_feature(fact->instruction, *fingerprint));
+                    }
+                    ++instruction_position;
                 }
-                if (block_fingerprints_complete) {
-                    block_feature.instruction_fingerprints_available = true;
-                    cfg_instruction_fingerprint_budget -= block_feature.instruction_fingerprints.size();
-                } else {
-                    block_feature.instruction_fingerprints.clear();
-                    block_feature.instruction_semantics.clear();
-                }
+                block_feature.instruction_count = instruction_position;
+                block_feature.instruction_fingerprints_available = !block_feature.instruction_fingerprints.empty();
+                block_feature.instruction_fingerprints_complete = block_fingerprints_complete &&
+                    block_feature.instruction_fingerprints.size() == instruction_position;
+                cfg_instruction_fingerprint_budget -= block_feature.instruction_fingerprints.size() * 2;
                 for (const auto &[kind, target] : node.outgoing)
                     if (target < cfg.size()) block_feature.successors.push_back({static_cast<std::uint32_t>(target), kind});
                 feature.cfg_blocks.push_back(std::move(block_feature));
@@ -572,6 +723,7 @@ std::vector<compare::FunctionFeature> compare_function_features(const FunctionSn
         }
         bool has_architecture = false;
         bool fingerprints_complete = true;
+        bool instruction_addresses_complete = true;
         for (const auto block_id : function->blocks) {
             if (stop.stop_requested()) return {};
             const auto found = blocks.find(block_id.value);
@@ -590,6 +742,13 @@ std::vector<compare::FunctionFeature> compare_function_features(const FunctionSn
                     const auto fingerprint = compare_instruction_fingerprint(fact->instruction);
                     if (fingerprint) {
                         feature.instruction_fingerprints.push_back(*fingerprint);
+                        if (instruction_addresses_complete && instruction_address_budget) {
+                            feature.instruction_addresses.push_back({fact->instruction.address.offset,
+                                                                     fact->instruction.address.space.value});
+                            --instruction_address_budget;
+                        } else {
+                            instruction_addresses_complete = false;
+                        }
                         feature.instruction_semantics.push_back(::hexlab::app::compare_semantic_feature(fact->instruction, *fingerprint));
                     }
                     else {
@@ -602,7 +761,11 @@ std::vector<compare::FunctionFeature> compare_function_features(const FunctionSn
         }
         feature.call_count = static_cast<std::uint64_t>(std::count_if(snapshot.calls.begin(), snapshot.calls.end(),
             [&](const auto &call) { return call.owner == function->id; }));
-        if (!fingerprints_complete) { feature.instruction_fingerprints.clear(); feature.instruction_semantics.clear(); }
+        if (!fingerprints_complete) {
+            feature.instruction_fingerprints.clear();
+            feature.instruction_addresses.clear();
+            feature.instruction_semantics.clear();
+        } else if (!instruction_addresses_complete) feature.instruction_addresses.clear();
         result.push_back(std::move(feature));
     }
     populate_direct_call_neighborhoods(snapshot, result);
@@ -645,7 +808,12 @@ std::vector<compare::FunctionBodyDiff> compare_function_bodies(
                         auto diff = compare::diff_function_instructions_detailed(before, after,
                             old_found->second->instruction_semantics, new_found->second->instruction_semantics, options);
                         if (!diff && diff.error().code == compare::ErrorCode::canceled) return {};
-                        if (diff) { instruction_diff = std::move(diff.value()); remaining_cells -= cells; }
+                        if (diff) {
+                            instruction_diff = std::move(diff.value());
+                            if (!::hexlab::app::attach_instruction_addresses(instruction_diff,
+                                *old_found->second, *new_found->second, stop)) return {};
+                            remaining_cells -= cells;
+                        }
                     }
                 }
             }
@@ -672,6 +840,11 @@ struct MainFrame::Impl {
     std::vector<DocumentId> session_restore_documents;
     std::optional<DocumentId> session_restore_active;
     std::map<std::uint64_t, Location> session_restore_locations;
+    struct PersistedComparisonSession {
+        wxWeakRef<CompareView> view;
+        std::filesystem::path path;
+    };
+    std::vector<PersistedComparisonSession> comparison_sessions;
     wxTimer compare_timer;
     struct CompareWork {
         std::mutex mutex;
@@ -742,7 +915,21 @@ struct MainFrame::Impl {
     wxTextCtrl *function_filter = nullptr;
     wxTextCtrl *symbol_filter = nullptr;
     wxStaticText *symbol_filter_status = nullptr;
+    std::map<std::uint64_t, wxString> document_symbol_filters;
+    std::vector<std::uint64_t> document_symbol_filter_order;
+    wxTextCtrl *import_filter = nullptr, *export_filter = nullptr;
+    std::map<std::uint64_t, std::pair<wxString, wxString>> document_import_export_filters;
+    std::vector<std::uint64_t> document_import_export_filter_order;
+    wxStaticText *import_filter_status = nullptr, *export_filter_status = nullptr;
+    wxTextCtrl *segment_filter = nullptr;
+    wxStaticText *segment_filter_status = nullptr;
+    wxTextCtrl *bookmark_filter = nullptr;
+    wxStaticText *bookmark_filter_status = nullptr;
+    MetadataContextBar *import_context = nullptr, *export_context = nullptr, *segment_context = nullptr;
+    MetadataContextIndex metadata_context_index;
     std::vector<std::size_t> visible_symbol_rows;
+    std::vector<std::size_t> visible_import_rows, visible_export_rows, visible_segment_rows;
+    std::vector<std::size_t> visible_bookmark_rows;
     std::function<wxString(std::size_t, int)> symbol_source_cell;
     std::function<void(std::size_t)> symbol_source_activate;
     std::size_t symbol_source_count = 0;
@@ -758,6 +945,9 @@ struct MainFrame::Impl {
     wxTimer macho_objc_filter_timer;
     wxButton *macho_objc_import_types = nullptr, *macho_objc_pseudocode = nullptr,
              *macho_objc_copy_row = nullptr;
+    int macho_objc_sort_column = -1;
+    bool macho_objc_sort_ascending = true;
+    std::optional<std::size_t> macho_objc_restore_selection;
     std::shared_ptr<const std::vector<MachOObjCViewRow>> macho_objc_rows;
     std::shared_ptr<const std::vector<std::size_t>> macho_objc_visible_rows;
     std::shared_ptr<const MachOObjCScan> macho_objc_scan;
@@ -782,9 +972,11 @@ struct MainFrame::Impl {
         DocumentId document;
         std::uint64_t document_revision = 0;
         std::optional<database::ProjectUuid> project_uuid;
+        std::optional<database::InputIdentity> project_input;
         database::ProjectRevisions project_revisions{};
         Location location;
         int binary_view = -1;
+        bool persistable = false;
     };
     std::vector<NavigationEntry> navigation_history;
     std::size_t navigation_position = 0;
@@ -876,9 +1068,20 @@ struct MainFrame::Impl {
         }
         wxFileDialog picker(&frame, "Scan FLAIR signature catalog", {}, {},
                             "FLAIR catalogs (*.pat;*.pat.gz;*.sig)|*.pat;*.pat.gz;*.sig|All files (*.*)|*.*",
-                            wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+                            wxFD_OPEN | wxFD_FILE_MUST_EXIST | wxFD_MULTIPLE);
         if (picker.ShowModal() != wxID_OK) return;
-        const std::filesystem::path catalog_path(picker.GetPath().ToStdWstring());
+        wxArrayString selected_paths;
+        picker.GetPaths(selected_paths);
+        if (selected_paths.empty()) return;
+        if (selected_paths.size() > 256) {
+            wxMessageBox("Select at most 256 FLAIR catalogs.", "FLAIR signatures",
+                         wxOK | wxICON_INFORMATION, &frame);
+            return;
+        }
+        std::vector<std::filesystem::path> catalog_paths;
+        catalog_paths.reserve(selected_paths.size());
+        for (const auto &path : selected_paths)
+            catalog_paths.emplace_back(path.ToStdWstring());
 
         {
             std::lock_guard lock(flirt_work->mutex);
@@ -892,53 +1095,75 @@ struct MainFrame::Impl {
             std::lock_guard lock(flirt_work->mutex);
             flirt_work->running = true;
         }
-        frame.SetStatusText("Reading FLAIR catalog and recognizing functions...", 0);
+        frame.SetStatusText("Reading FLAIR catalogs and recognizing functions...", 0);
         const auto work = flirt_work;
         const auto project_id = *id;
-        const auto u8name = catalog_path.filename().u8string();
-        const std::string provenance = "FLAIR " +
-            std::string(reinterpret_cast<const char *>(u8name.data()), u8name.size());
         try {
             flirt_work->thread = std::jthread(
-                [work, project_id, snapshot, actor, catalog_path, provenance](std::stop_token stop) {
+                [work, project_id, snapshot, actor, catalog_paths = std::move(catalog_paths)](std::stop_token stop) {
                     std::string message;
                     std::vector<FunctionFlirtMatch> match_rows;
                     try {
-                        std::error_code ec;
-                        const auto size = std::filesystem::file_size(catalog_path, ec);
                         FlirtCatalogLimits catalog_limits;
-                        if (ec || size > catalog_limits.max_bytes)
-                            throw std::runtime_error("Cannot read FLAIR catalog or file exceeds 64 MiB.");
-                        std::ifstream input(catalog_path, std::ios::binary);
-                        if (!input) throw std::runtime_error("Could not open FLAIR catalog.");
-                        std::vector<std::byte> bytes(static_cast<std::size_t>(size));
-                        if (size && !input.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(size)))
-                            throw std::runtime_error("Could not read FLAIR catalog.");
-                        const char *catalog_data = bytes.empty() ? "" : reinterpret_cast<const char *>(bytes.data());
-                        if (stop.stop_requested()) throw std::runtime_error("FLAIR recognition canceled.");
-
                         const auto &image = *snapshot->loaded->image;
-                        Result<FlirtCatalog> catalog = Error{ErrorCode::unsupported, "Unsupported FLAIR catalog format."};
-                        const bool binary_sig = bytes.size() >= 6 && std::memcmp(bytes.data(), "IDASGN", 6) == 0;
-                        const bool gzip_text = bytes.size() >= 2 && bytes[0] == std::byte{0x1f} &&
-                                               bytes[1] == std::byte{0x8b};
-                        if (binary_sig) {
-                            catalog = parse_flirt_sig(bytes, provenance, catalog_limits, stop);
-                        } else if (gzip_text) {
-                            catalog = parse_flirt_pat_gz(bytes, image.layout().architecture, image.layout().mode,
-                                                         provenance, catalog_limits, stop);
-                        } else {
-                            catalog = parse_flirt_pat(std::string_view(catalog_data, bytes.size()),
-                                                      image.layout().architecture, image.layout().mode,
-                                                      provenance, catalog_limits, stop);
+                        std::vector<FlirtCatalog> catalogs;
+                        catalogs.reserve(catalog_paths.size());
+                        std::vector<std::string> catalog_labels;
+                        catalog_labels.reserve(catalog_paths.size());
+                        std::string identity;
+                        std::uint64_t input_bytes = 0, inflated_bytes = 0, pattern_count = 0;
+                        FlirtRecognitionLimits recognition_limits;
+                        for (const auto &catalog_path : catalog_paths) {
+                            if (stop.stop_requested()) throw std::runtime_error("FLAIR recognition canceled.");
+                            std::error_code ec;
+                            const auto size = std::filesystem::file_size(catalog_path, ec);
+                            if (ec || size > catalog_limits.max_bytes - input_bytes)
+                                throw std::runtime_error("Cannot read FLAIR catalog set or aggregate input exceeds 64 MiB.");
+                            std::ifstream input(catalog_path, std::ios::binary);
+                            if (!input) throw std::runtime_error("Could not open FLAIR catalog.");
+                            std::string text(static_cast<std::size_t>(size), '\0');
+                            if (size && !input.read(text.data(), static_cast<std::streamsize>(size)))
+                                throw std::runtime_error("Could not read FLAIR catalog.");
+                            input_bytes += size;
+                            const auto u8name = catalog_path.filename().u8string();
+                            const std::string provenance = "FLAIR " +
+                                std::string(reinterpret_cast<const char *>(u8name.data()), u8name.size());
+                            if (provenance.size() > 256)
+                                throw std::runtime_error("FLAIR catalog provenance exceeds 256 bytes.");
+                            auto limits = catalog_limits;
+                            limits.max_bytes = static_cast<std::size_t>(catalog_limits.max_bytes - input_bytes + size);
+                            limits.max_inflated_bytes = static_cast<std::size_t>(std::max<std::uint64_t>(1,
+                                catalog_limits.max_inflated_bytes - inflated_bytes));
+                            limits.max_patterns = static_cast<std::size_t>(std::min<std::uint64_t>(limits.max_patterns,
+                                recognition_limits.max_patterns - pattern_count));
+                            const auto bytes = std::span<const std::byte>(
+                                reinterpret_cast<const std::byte *>(text.data()), text.size());
+                            Result<FlirtCatalog> parsed = text.size() >= 6 && text.compare(0, 6, "IDASGN") == 0
+                                ? parse_flirt_sig(bytes, provenance, limits, stop)
+                                : text.size() >= 2 && static_cast<unsigned char>(text[0]) == 0x1f &&
+                                    static_cast<unsigned char>(text[1]) == 0x8b
+                                ? parse_flirt_pat_gz(bytes, image.layout().architecture, image.layout().mode,
+                                                     provenance, limits, stop)
+                                : parse_flirt_pat(text, image.layout().architecture, image.layout().mode,
+                                                  provenance, limits, stop);
+                            if (!parsed) throw std::runtime_error(parsed.error().message);
+                            if (parsed.value().inflated_body_bytes > catalog_limits.max_inflated_bytes - inflated_bytes)
+                                throw std::runtime_error("FLAIR catalog set exceeds aggregate inflated-byte budget.");
+                            if (parsed.value().patterns.size() > recognition_limits.max_patterns - pattern_count)
+                                throw std::runtime_error("FLAIR catalog set exceeds aggregate pattern budget.");
+                            inflated_bytes += parsed.value().inflated_body_bytes;
+                            pattern_count += parsed.value().patterns.size();
+                            if (catalog_paths.size() == 1)
+                                identity = std::to_string(provenance.size()) + ":" + provenance + text;
+                            else
+                                identity += std::to_string(provenance.size()) + ":" + provenance +
+                                    std::to_string(text.size()) + ":" + text;
+                            catalog_labels.push_back(provenance + " (" + std::to_string(parsed.value().patterns.size()) + " patterns)");
+                            catalogs.push_back(std::move(parsed.value()));
                         }
-                        if (!catalog) throw std::runtime_error(catalog.error().message);
-                        auto recognition = recognize_flirt_catalog(image, *snapshot->effective, *snapshot->functions,
-                                                                    catalog.value(), {}, stop);
+                        auto recognition = recognize_flirt_catalogs(image, *snapshot->effective, *snapshot->functions,
+                                                                     catalogs, recognition_limits, stop);
                         if (!recognition) throw std::runtime_error(recognition.error().message);
-
-                        const std::string identity = std::to_string(provenance.size()) + ":" + provenance +
-                            std::string(catalog_data, bytes.size());
                         Sha256 hash;
                         const auto identity_bytes = std::as_bytes(std::span(identity.data(), identity.size()));
                         auto updated = hash.update(identity_bytes);
@@ -954,11 +1179,11 @@ struct MainFrame::Impl {
                         auto persisted = operation.result.get();
                         if (!persisted) throw std::runtime_error(persisted.error().message);
                         std::ostringstream report;
-                        report << "Catalog: " << provenance << "\nFormat: "
-                               << (binary_sig ? "binary IDASGN" : gzip_text ? "gzip FLAIR text" : "FLAIR text")
-                               << "\nPatterns: " << catalog.value().patterns.size()
-                               << "\nTarget: " << static_cast<unsigned>(catalog.value().target_architecture)
-                               << " / mode " << static_cast<unsigned>(catalog.value().target_mode)
+                        report << "Catalogs: " << catalogs.size() << "\n";
+                        for (const auto &label : catalog_labels) report << "  " << label << "\n";
+                        report << "Patterns: " << pattern_count
+                               << "\nTarget: " << static_cast<unsigned>(image.layout().architecture)
+                               << " / mode " << static_cast<unsigned>(image.layout().mode)
                                << "\nRecovered function matches: " << recognition.value().functions.size()
                                << "\nCandidate checks: " << recognition.value().pattern_candidates
                                << "\nComparisons: " << recognition.value().comparisons
@@ -973,7 +1198,8 @@ struct MainFrame::Impl {
                                    << (function.ambiguous ? " [AMBIGUOUS] " : " ");
                             for (std::size_t n = 0; n < function.candidates.size(); ++n) {
                                 if (n) report << " | ";
-                                report << function.candidates[n].name << " {" << function.candidates[n].provenance << "}";
+                                report << "[catalog " << function.candidates[n].catalog_index << "] "
+                                       << function.candidates[n].name << " {" << function.candidates[n].provenance << "}";
                                 if (function.candidates[n].kind == FlirtSymbolKind::local_name)
                                     report << " [local]";
                             }
@@ -984,7 +1210,8 @@ struct MainFrame::Impl {
                                    << " additional matches remain in persisted project evidence.\n";
                         const auto match_count = recognition.value().functions.size();
                         match_rows = std::move(recognition.value().functions);
-                        message = "Stored FLAIR evidence for " + std::to_string(match_count) +
+                        message = "Stored FLAIR evidence from " + std::to_string(catalogs.size()) + " catalogs for " +
+                            std::to_string(match_count) +
                             " functions" + (recognition.value().complete ? "." : " (partial; work budget reached).") +
                             "\n" + report.str();
                     } catch (const std::exception &error) {
@@ -1006,20 +1233,24 @@ struct MainFrame::Impl {
                         }
                         if (target && target->projects().active_document() == project_id) {
                             target->impl_->log_to(project_id, text(message));
-                            wxDialog dialog(target, wxID_ANY, "FLAIR catalog scan results", wxDefaultPosition, wxSize(920, 680),
+                            wxDialog dialog(target, wxID_ANY, "FLAIR catalog scan results", wxDefaultPosition, wxDefaultSize,
                                             wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+                            dialog.SetName("flair-scan-results-dialog");
                             auto *layout = new wxBoxSizer(wxVERTICAL);
                             auto summary_text = message;
                             if (const auto end = summary_text.find("\n\nMatches and candidate names"); end != std::string::npos)
                                 summary_text.resize(end);
                             auto *summary = new wxTextCtrl(&dialog, wxID_ANY, text(summary_text), wxDefaultPosition,
-                                                           wxSize(-1, 150), wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2);
-                            layout->Add(summary, 0, wxEXPAND | wxALL, 8);
+                                                           wxSize(-1, dialog.FromDIP(150)), wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2);
+                            summary->SetName("flair-scan-summary");
+                            layout->Add(summary, 0, wxEXPAND | wxALL, dialog.FromDIP(8));
                             auto *results = new wxListCtrl(&dialog, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                                            wxLC_REPORT | wxLC_SINGLE_SEL | wxLC_HRULES | wxLC_VRULES);
-                            results->InsertColumn(0, "Function entry", wxLIST_FORMAT_LEFT, 180);
-                            results->InsertColumn(1, "Candidate names and provenance", wxLIST_FORMAT_LEFT, 620);
-                            results->InsertColumn(2, "Status", wxLIST_FORMAT_LEFT, 90);
+                            results->SetName("flair-scan-results");
+                            results->SetToolTip("Function matches. Use Up/Down to select a row, then Enter or Go to Selected Function to navigate.");
+                            results->InsertColumn(0, "Function entry", wxLIST_FORMAT_LEFT, dialog.FromDIP(180));
+                            results->InsertColumn(1, "Candidate names and provenance", wxLIST_FORMAT_LEFT, dialog.FromDIP(620));
+                            results->InsertColumn(2, "Status", wxLIST_FORMAT_LEFT, dialog.FromDIP(90));
                             const auto row_count = std::min<std::size_t>(2000, matches->size());
                             for (std::size_t i = 0; i < row_count; ++i) {
                                 const auto &match = (*matches)[i];
@@ -1028,7 +1259,8 @@ struct MainFrame::Impl {
                                 std::string names;
                                 for (const auto &candidate : match.candidates) {
                                     if (!names.empty()) names += " | ";
-                                    names += candidate.name + " {" + candidate.provenance + "}";
+                                    names += "[catalog " + std::to_string(candidate.catalog_index) + "] " +
+                                             candidate.name + " {" + candidate.provenance + "}";
                                     if (candidate.kind == FlirtSymbolKind::local_name) names += " [local]";
                                     if (names.size() >= 2048) {
                                         names.resize(2048);
@@ -1039,21 +1271,25 @@ struct MainFrame::Impl {
                                 results->SetItem(row, 1, text(names));
                                 results->SetItem(row, 2, match.ambiguous ? "Ambiguous" : "Unambiguous");
                             }
-                            results->SetMinSize(wxSize(-1, 300));
-                            layout->Add(results, 1, wxEXPAND | wxLEFT | wxRIGHT, 8);
+                            results->SetMinSize(wxSize(-1, dialog.FromDIP(300)));
+                            layout->Add(results, 1, wxEXPAND | wxLEFT | wxRIGHT, dialog.FromDIP(8));
                             if (matches->size() > row_count)
                                 layout->Add(new wxStaticText(&dialog, wxID_ANY,
                                     text(std::to_string(matches->size() - row_count) +
                                          " additional matches remain in the stored project evidence.")),
-                                    0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+                                    0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, dialog.FromDIP(8));
                             auto *buttons = new wxBoxSizer(wxHORIZONTAL);
                             auto *go = new wxButton(&dialog, wxID_OK, "Go to Selected Function");
                             auto *close = new wxButton(&dialog, wxID_CANCEL, "Close");
-                            buttons->Add(go, 0, wxRIGHT, 8);
+                            go->SetName("flair-scan-go-to-function");
+                            go->SetToolTip("Navigate to the selected function match.");
+                            close->SetName("flair-scan-close");
+                            buttons->Add(go, 0, wxRIGHT, dialog.FromDIP(8));
                             buttons->Add(close, 0);
-                            layout->Add(buttons, 0, wxALIGN_RIGHT | wxALL, 8);
+                            layout->Add(buttons, 0, wxALIGN_RIGHT | wxALL, dialog.FromDIP(8));
                             dialog.SetSizerAndFit(layout);
-                            dialog.SetSize(920, 680);
+                            dialog.SetClientSize(dialog.FromDIP(wxSize(920, 680)));
+                            dialog.SetMinSize(dialog.FromDIP(wxSize(680, 440)));
                             dialog.CentreOnParent();
                             std::optional<Address> selected_entry;
                             auto navigate_selected = [&] {
@@ -1178,18 +1414,26 @@ struct MainFrame::Impl {
                     index_context_row(symbol_rows, context_key(*rows[row].address), view_row);
             }
         }
-        for (std::size_t row = 0; row < metadata.imports.size(); ++row)
-            index_context_row(import_rows, context_key(metadata.imports[row].iat), row);
-        for (std::size_t row = 0; row < metadata.exports.size(); ++row)
-            if (metadata.exports[row].address)
-                index_context_row(export_rows, context_key(*metadata.exports[row].address), row);
+        for (std::size_t view_row = 0; view_row < visible_import_rows.size(); ++view_row) {
+            const auto row = visible_import_rows[view_row];
+            if (row < metadata.imports.size())
+                index_context_row(import_rows, context_key(metadata.imports[row].iat), view_row);
+        }
+        for (std::size_t view_row = 0; view_row < visible_export_rows.size(); ++view_row) {
+            const auto row = visible_export_rows[view_row];
+            if (row < metadata.exports.size() && metadata.exports[row].address)
+                index_context_row(export_rows, context_key(*metadata.exports[row].address), view_row);
+        }
         if (doc->project && doc->project->state) {
             const auto &annotation_records = doc->project->state->user->annotations;
             for (std::size_t row = 0; row < annotation_records.size(); ++row)
                 index_context_row(annotation_rows, context_key(annotation_records[row].location), row);
             const auto &bookmark_records = doc->project->state->user->bookmarks;
-            for (std::size_t row = 0; row < bookmark_records.size(); ++row)
-                index_context_row(bookmark_rows, context_key(bookmark_records[row].location), row);
+            for (std::size_t view_row = 0; view_row < visible_bookmark_rows.size(); ++view_row) {
+                const auto row = visible_bookmark_rows[view_row];
+                if (row < bookmark_records.size())
+                    index_context_row(bookmark_rows, context_key(bookmark_records[row].location), view_row);
+            }
         }
     }
     void render_symbol_filter(const std::shared_ptr<const DocumentSnapshot> &doc) {
@@ -1216,6 +1460,182 @@ struct MainFrame::Impl {
             symbol_filter_status->SetLabel(wxString::Format("%llu of %llu symbols", static_cast<unsigned long long>(visible_symbol_rows.size()), static_cast<unsigned long long>(symbol_source_count)));
         index_context_tables(doc);
         select_context_rows(state().selection());
+    }
+    void render_bookmark_filter(const std::shared_ptr<const DocumentSnapshot> &doc) {
+        visible_bookmark_rows.clear();
+        const auto project = doc ? doc->project : nullptr;
+        const auto count = project && project->state ? project->state->user->bookmarks.size() : 0;
+        const auto query = bookmark_filter
+            ? bookmark_filter->GetValue().Lower().Trim(true).Trim(false) : wxString{};
+        for (std::size_t row = 0; row < count; ++row) {
+            const auto &bookmark = project->state->user->bookmarks[row];
+            const auto address = location_text(bookmark.location, project->loaded ? project->loaded->image.get() : nullptr);
+            const auto state = location_mapped(*project, bookmark.location) ? wxString("mapped") : wxString("orphaned");
+            if (query.empty() || address.Lower().Find(query) != wxNOT_FOUND ||
+                text(bookmark.label).Lower().Find(query) != wxNOT_FOUND || state.Find(query) != wxNOT_FOUND)
+                visible_bookmark_rows.push_back(row);
+        }
+        bookmarks->populate(visible_bookmark_rows.size(), [this, project](std::size_t view_row, int column) {
+            if (!project || !project->state || view_row >= visible_bookmark_rows.size()) return wxString{};
+            const auto row = visible_bookmark_rows[view_row];
+            if (row >= project->state->user->bookmarks.size()) return wxString{};
+            const auto &bookmark = project->state->user->bookmarks[row];
+            if (column == 0)
+                return location_text(bookmark.location, project->loaded ? project->loaded->image.get() : nullptr);
+            if (column == 1) return text(bookmark.label);
+            return location_mapped(*project, bookmark.location) ? wxString("mapped") : wxString("orphaned");
+        });
+        const auto rows = visible_bookmark_rows;
+        bookmarks->activate = [this, doc, project, rows](std::size_t view_row) {
+            if (!doc || !project || !project->state || view_row >= rows.size()) return;
+            const auto row = rows[view_row];
+            if (row >= project->state->user->bookmarks.size()) return;
+            const auto location = project->state->user->bookmarks[row].location;
+            if (location_mapped(*project, location))
+                navigate_from_document(doc, location);
+            else {
+                annotation_context = std::pair{doc->id, location};
+                log("Orphaned bookmark at " + location_text(location));
+                frame.UpdateWindowUI(wxUPDATE_UI_RECURSE);
+            }
+        };
+        if (bookmark_filter_status)
+            bookmark_filter_status->SetLabel(wxString::Format("%llu of %llu bookmarks",
+                static_cast<unsigned long long>(visible_bookmark_rows.size()),
+                static_cast<unsigned long long>(count)));
+        if (bookmark_rename) bookmark_rename->Enable(false);
+        if (bookmark_remove) bookmark_remove->Enable(false);
+    }
+    void render_import_filter(const std::shared_ptr<const DocumentSnapshot> &doc) {
+        visible_import_rows.clear();
+        const auto count = doc ? doc->metadata_view().imports.size() : 0;
+        auto query_text = import_filter ? import_filter->GetValue() : wxString{};
+        query_text.Trim(true).Trim(false);
+        const auto query = parse_metadata_query(std::move(query_text));
+        const auto cell = [doc](std::size_t row, int column) {
+            if (!doc || row >= doc->metadata_view().imports.size()) return wxString{};
+            const auto &item = doc->metadata_view().imports[row];
+            if (column == 0) return location_text(item.iat, doc->image.get());
+            if (column == 1) return text(item.library);
+            if (!item.name) return wxString::Format("ordinal %u", *item.ordinal);
+            const auto rendered = hexlab::symbols::demangle_symbol_name(*item.name);
+            return text(rendered.status == hexlab::symbols::DemangleStatus::demangled
+                ? std::string_view(rendered.text) : std::string_view(*item.name));
+        };
+        for (std::size_t row = 0; row < count; ++row) {
+            const auto &item = doc->metadata_view().imports[row];
+            const auto ordinal = item.ordinal ? wxString::Format("%u", *item.ordinal) : wxString{};
+            std::array<MetadataQueryValue, 5> values{{
+                {MetadataQueryField::address, cell(row, 0)},
+                {MetadataQueryField::library, cell(row, 1)},
+                {MetadataQueryField::name, cell(row, 2)},
+                {MetadataQueryField::name, item.name ? text(*item.name) : wxString{}},
+                {MetadataQueryField::ordinal, ordinal},
+            }};
+            const bool matches = metadata_query_matches(query, values);
+            if (matches) visible_import_rows.push_back(row);
+        }
+        imports->populate(visible_import_rows.size(), [this, cell](std::size_t row, int column) {
+            return row < visible_import_rows.size() ? cell(visible_import_rows[row], column) : wxString{};
+        });
+        imports->activate = [this, doc](std::size_t row) {
+            if (doc && row < visible_import_rows.size())
+                navigate_from_document(doc, Location{doc->metadata_view().imports[visible_import_rows[row]].iat});
+        };
+        if (import_filter_status) {
+            import_filter_status->SetLabel(!query.valid ? wxString("Invalid filter; use field:value terms such as lib:kernel32 name:CreateFile")
+                : wxString::Format("%llu of %llu imports",
+                    static_cast<unsigned long long>(visible_import_rows.size()),
+                    static_cast<unsigned long long>(count)));
+        }
+        index_context_tables(doc);
+        select_context_rows(state().selection());
+    }
+    void render_export_filter(const std::shared_ptr<const DocumentSnapshot> &doc) {
+        visible_export_rows.clear();
+        const auto count = doc ? doc->metadata_view().exports.size() : 0;
+        auto query_text = export_filter ? export_filter->GetValue() : wxString{};
+        query_text.Trim(true).Trim(false);
+        const auto query = parse_metadata_query(std::move(query_text));
+        const auto cell = [doc](std::size_t row, int column) {
+            if (!doc || row >= doc->metadata_view().exports.size()) return wxString{};
+            const auto &item = doc->metadata_view().exports[row];
+            if (column == 0) return item.address ? location_text(*item.address, doc->image.get()) : wxString("forwarded");
+            if (column == 1) return item.name ? text(*item.name) : wxString::Format("ordinal %u", item.ordinal);
+            return item.forwarder ? text(*item.forwarder) : wxString{};
+        };
+        for (std::size_t row = 0; row < count; ++row) {
+            const auto &item = doc->metadata_view().exports[row];
+            std::array<MetadataQueryValue, 4> values{{
+                {MetadataQueryField::address, cell(row, 0)},
+                {MetadataQueryField::name, cell(row, 1)},
+                {MetadataQueryField::ordinal, wxString::Format("%u", item.ordinal)},
+                {MetadataQueryField::forwarder, cell(row, 2)},
+            }};
+            const bool matches = metadata_query_matches(query, values);
+            if (matches) visible_export_rows.push_back(row);
+        }
+        exports->populate(visible_export_rows.size(), [this, cell](std::size_t row, int column) {
+            return row < visible_export_rows.size() ? cell(visible_export_rows[row], column) : wxString{};
+        });
+        exports->activate = [this, doc](std::size_t row) {
+            if (!doc || row >= visible_export_rows.size()) return;
+            const auto &item = doc->metadata_view().exports[visible_export_rows[row]];
+            if (item.address) navigate_from_document(doc, Location{*item.address});
+            else if (item.forwarder) log("Forwarder: " + text(*item.forwarder));
+        };
+        if (export_filter_status) {
+            export_filter_status->SetLabel(!query.valid ? wxString("Invalid filter; use field:value terms such as name:Start forwarder:KERNEL32")
+                : wxString::Format("%llu of %llu exports",
+                    static_cast<unsigned long long>(visible_export_rows.size()),
+                    static_cast<unsigned long long>(count)));
+        }
+        index_context_tables(doc);
+        select_context_rows(state().selection());
+    }
+    void render_segment_filter(const std::shared_ptr<const DocumentSnapshot> &doc) {
+        visible_segment_rows.clear();
+        if (!doc || !doc->image) {
+            if (segment_filter_status) segment_filter_status->SetLabel("0 of 0 segments");
+            segments->populate(0, {});
+            return;
+        }
+        constexpr std::size_t row_limit = 65536;
+        const auto &source = doc->image->layout().segments;
+        const auto count = std::min(source.size(), row_limit);
+        const auto query = segment_filter ? segment_filter->GetValue().Lower().Trim(true).Trim(false) : wxString{};
+        const auto cell = [doc](std::size_t row, int column) {
+            const auto &item = doc->image->layout().segments[row];
+            switch (column) {
+            case 0: return location_text(item.begin, doc->image.get());
+            case 1: return text(item.name);
+            case 2: return wxString::Format("%llu", static_cast<unsigned long long>(item.size));
+            case 3: return wxString(item.readable ? "R" : "-") + (item.writable ? "W" : "-") +
+                           (item.executable ? "X" : "-");
+            case 4: return item.file_size ? location_text(item.file_begin) +
+                (doc->image->storage().get() == &doc->file_storage() ? wxString{} : wxString(" (image backing)"))
+                : wxString("not file-backed");
+            default: return wxString::Format("%llu", static_cast<unsigned long long>(item.file_size));
+            }
+        };
+        for (std::size_t row = 0; row < count; ++row) {
+            bool matches = query.empty();
+            for (int column = 0; !matches && column < 6; ++column) {
+                auto value = cell(row, column);
+                value.MakeLower();
+                matches = value.Find(query) != wxNOT_FOUND;
+            }
+            if (matches) visible_segment_rows.push_back(row);
+        }
+        segments->populate(visible_segment_rows.size(), [this, cell](std::size_t row, int column) {
+            return row < visible_segment_rows.size() ? cell(visible_segment_rows[row], column) : wxString{};
+        });
+        if (segment_filter_status) {
+            const auto suffix = source.size() > row_limit ? wxString(" (first 65,536 indexed)") : wxString{};
+            segment_filter_status->SetLabel(wxString::Format("%llu of %llu segments",
+                static_cast<unsigned long long>(visible_segment_rows.size()),
+                static_cast<unsigned long long>(source.size())) + suffix);
+        }
     }
     void populate_candidate_model(const std::shared_ptr<const DocumentSnapshot> &doc) {
         candidate_items.clear();
@@ -1295,12 +1715,87 @@ struct MainFrame::Impl {
         for (std::size_t row = 0; row < visible_candidate_items.size(); ++row)
             index_context_row(candidate_rows, context_key(visible_candidate_items[row].entry), row);
     }
+    bool metadata_context_current(const std::shared_ptr<const DocumentSnapshot> &document, Location selection) {
+        return document && shown == document && !closer->closing_window() &&
+            controller->documents().active_document() == document->id &&
+            controller->state().current() == document &&
+            controller->documents().project(document->id) == document->project &&
+            state().selection() == std::optional<Location>{selection};
+    }
+    void update_metadata_context(std::optional<Location> selection) {
+        metadata_context_index.bind(shown);
+        if (!shown || !shown->image || !selection) {
+            for (auto *bar : {import_context, export_context, segment_context})
+                if (bar) bar->update(shown, selection, {}, false);
+            return;
+        }
+        std::optional<Address> address;
+        if (const auto *value = std::get_if<Address>(&*selection)) address = *value;
+        else if (shown->image->storage().get() == &shown->file_storage()) {
+            auto mapped = shown->image->to_address(std::get<FileOffset>(*selection));
+            if (mapped) address = mapped.value();
+        }
+        const auto update_page = [&](MetadataContextBar *bar, const ContextRowMap &visible,
+                                     bool known, bool complete, const wxString &kind) {
+            if (!bar) return;
+            const bool visible_match = address && visible.contains(context_key(*address));
+            const bool hidden = known && !visible_match;
+            wxString description = visible_match ? "Exact " + kind + " cursor row is visible"
+                : hidden ? "Exact " + kind + " cursor row is hidden by this page's filter"
+                : "No exact " + kind + " cursor row in the indexed metadata";
+            if (!complete) description += " | Partial context index (first 65,536 source rows)";
+            if (!shown->metadata_complete) description += " | Metadata is incomplete";
+            bar->update(shown, selection, description, hidden);
+        };
+        update_page(import_context, import_rows, address && metadata_context_index.has_import(*address),
+                    metadata_context_index.imports_complete, "import");
+        update_page(export_context, export_rows, address && metadata_context_index.has_export(*address),
+                    metadata_context_index.exports_complete, "export");
+        if (segment_context) {
+            wxString description = "No containing mapped segment";
+            std::optional<std::size_t> source_row;
+            const auto &source_segments = shown->image->layout().segments;
+            if (address) {
+                if (const auto *segment = shown->image->segment_at(*address))
+                    source_row = static_cast<std::size_t>(segment - source_segments.data());
+            } else if (shown->image->storage().get() == &shown->file_storage() &&
+                       std::holds_alternative<FileOffset>(*selection)) {
+                const auto offset = std::get<FileOffset>(*selection).value;
+                for (std::size_t row = 0; row < source_segments.size(); ++row) {
+                    const auto &candidate = source_segments[row];
+                    if (candidate.file_size && offset >= candidate.file_begin.value &&
+                        offset - candidate.file_begin.value < candidate.file_size) {
+                        source_row = row;
+                        break;
+                    }
+                }
+            }
+            const bool indexed_match = source_row && *source_row < 65536;
+            const bool visible_match = indexed_match && std::find(visible_segment_rows.begin(), visible_segment_rows.end(),
+                *source_row) != visible_segment_rows.end();
+            const bool hidden_match = indexed_match && !visible_match;
+            if (source_row) {
+                const auto &segment = source_segments[*source_row];
+                description = "Segment " + preview_text(segment.name, 128);
+                if (segment.file_size)
+                    description += (shown->image->storage().get() == &shown->file_storage() ? "; source " : "; decoded image backing ") +
+                        location_text(segment.file_begin) + wxString::Format("; %llu file-backed bytes",
+                            static_cast<unsigned long long>(segment.file_size));
+                else description += "; no file-backed bytes";
+                if (hidden_match) description += " | Hidden by this page's filter";
+                else if (!indexed_match) description += " | Outside the first 65,536 filtered rows";
+            }
+            segment_context->update(shown, selection, description, hidden_match);
+        }
+    }
     void select_context_rows(std::optional<Location> selection) {
         for (auto *table : {candidates, symbols, segments, imports, exports, annotations, bookmarks})
             table->clear_selection();
-        strings->clear_selection();
-        if (!shown || !selection || !shown->image)
+        strings->synchronize_selection(selection, session_restore_activation_pending);
+        if (!shown || !selection || !shown->image) {
+            update_metadata_context(selection);
             return;
+        }
 
         const auto &doc = *shown;
         std::optional<Address> address;
@@ -1309,9 +1804,10 @@ struct MainFrame::Impl {
             address = *value;
         else {
             file_offset = std::get<FileOffset>(*selection);
-            auto mapped = doc.image->to_address(*file_offset);
-            if (mapped)
-                address = mapped.value();
+            if (doc.image->storage().get() == &doc.file_storage()) {
+                auto mapped = doc.image->to_address(*file_offset);
+                if (mapped) address = mapped.value();
+            }
         }
         const auto select_indexed = [&](VirtualTable *table, const ContextRowMap &rows) {
             if (address) {
@@ -1329,24 +1825,31 @@ struct MainFrame::Impl {
         select_indexed(candidates, candidate_rows);
 
         const auto &segments_in_image = doc.image->layout().segments;
-        for (std::size_t row = 0; row < segments_in_image.size(); ++row) {
-            const auto &segment = segments_in_image[row];
-            const bool contains = address
-                ? segment.begin.space == address->space && address->offset >= segment.begin.offset &&
-                      address->offset - segment.begin.offset < segment.size
-                : file_offset && file_offset->value >= segment.file_begin.value &&
-                      file_offset->value - segment.file_begin.value < segment.file_size;
-            if (contains) {
-                segments->select_row(row);
-                break;
+        std::optional<std::size_t> segment_row;
+        if (address) {
+            if (const auto *segment = doc.image->segment_at(*address))
+                segment_row = static_cast<std::size_t>(segment - segments_in_image.data());
+        } else if (file_offset && doc.image->storage().get() == &doc.file_storage()) {
+            for (std::size_t row = 0; row < segments_in_image.size(); ++row) {
+                const auto &segment = segments_in_image[row];
+                if (segment.file_size && file_offset->value >= segment.file_begin.value &&
+                    file_offset->value - segment.file_begin.value < segment.file_size) {
+                    segment_row = row;
+                    break;
+                }
             }
         }
-        strings->select(*selection);
+        if (segment_row) {
+            const auto visible = std::find(visible_segment_rows.begin(), visible_segment_rows.end(), *segment_row);
+            if (visible != visible_segment_rows.end())
+                segments->select_row(static_cast<std::size_t>(visible - visible_segment_rows.begin()));
+        }
         select_indexed(imports, import_rows);
         select_indexed(exports, export_rows);
         select_indexed(annotations, annotation_rows);
         select_indexed(bookmarks, bookmark_rows);
         select_indexed(symbols, symbol_rows);
+        update_metadata_context(selection);
     }
     void poll_compare() {
         if (!compare_work.thread.joinable()) return;
@@ -1435,6 +1938,25 @@ struct MainFrame::Impl {
                 if (!activated || !activated.value()) return;
                 for (const auto &function : new_functions->functions)
                     if (function && function->entry.offset == *match.new_entry && function->entry.space.value == match.new_space) { frame.Navigate(function->entry); break; }
+            },
+            [this, source_id, source_project](const compare::FunctionAddress &location) {
+                if (!source_id || controller->documents().project(*source_id) != source_project) {
+                    frame.SetStatusText("Old-side project changed; instruction navigation is unavailable.");
+                    return;
+                }
+                frame.Navigate(Address{AddressSpaceId{location.address_space}, location.entry});
+            },
+            [this, target_id, target_project](const compare::FunctionAddress &location) {
+                if (!target_id || !target_project || controller->documents().project(*target_id) != target_project) {
+                    frame.SetStatusText("New-side project changed or is not open; instruction navigation is unavailable.");
+                    return;
+                }
+                const auto activated = controller->documents().activate(*target_id);
+                if (!activated || !activated.value()) {
+                    frame.SetStatusText("Could not activate the new-side project for instruction navigation.");
+                    return;
+                }
+                frame.Navigate(Address{AddressSpaceId{location.address_space}, location.entry});
             });
         view->Show();
         frame.SetStatusText("Binary comparison complete");
@@ -1472,13 +1994,13 @@ struct MainFrame::Impl {
             std::shared_ptr<const FunctionSnapshot> comparison_old_functions;
             std::string error;
             try {
-                auto old_input = compare_input(*current_image, stop);
+                auto old_input = compare_input(*current_image, source_project->loaded->metadata, stop);
                 if (!old_input) throw std::runtime_error(old_input.error().message);
                 OpenRequest request; request.path = path; request.format = Format::automatic; request.run_analysis = false;
                 auto loaded = load_document(request, {{0}, 0}, stop);
                 if (!loaded) throw std::runtime_error(loaded.error().message);
                 if (!loaded.value()->image) throw std::runtime_error("Selected file did not produce a mapped image");
-                auto new_input = compare_input(*loaded.value()->image, stop);
+                auto new_input = compare_input(*loaded.value()->image, loaded.value()->metadata, stop);
                 if (!new_input) throw std::runtime_error(new_input.error().message);
                 compare::CompareOptions options; options.stop_token = stop;
                 options.progress_interval = 1024 * 1024;
@@ -1593,9 +2115,9 @@ struct MainFrame::Impl {
             std::shared_ptr<const FunctionSnapshot> new_functions;
             std::string error;
             try {
-                auto old_input = compare_input(*old_image, stop);
+                auto old_input = compare_input(*old_image, old_project->loaded->metadata, stop);
                 if (!old_input) throw std::runtime_error(old_input.error().message);
-                auto new_input = compare_input(*new_image, stop);
+                auto new_input = compare_input(*new_image, new_project->loaded->metadata, stop);
                 if (!new_input) throw std::runtime_error(new_input.error().message);
                 compare::CompareOptions options; options.stop_token = stop; options.progress_interval = 1024 * 1024;
                 options.progress = [this](std::uint64_t done, std::uint64_t total) { compare_work.done = done; compare_work.total = total; return true; };
@@ -1673,6 +2195,74 @@ struct MainFrame::Impl {
             frame.SetStatusText(message);
         }
     }
+    static wxString project_filter_config_path(const DocumentSnapshot &document) {
+        if (!document.project || !document.project->state) return {};
+        wxString identity;
+        for (const auto byte : document.project->state->uuid)
+            identity += wxString::Format("%02x", static_cast<unsigned>(std::to_integer<unsigned char>(byte)));
+        return wxString("/Desktop/ProjectImportExportFilters/") + identity;
+    }
+    static wxString project_symbol_filter_config_path(const DocumentSnapshot &document) {
+        if (!document.project || !document.project->state) return {};
+        wxString identity;
+        for (const auto byte : document.project->state->uuid)
+            identity += wxString::Format("%02x", static_cast<unsigned>(std::to_integer<unsigned char>(byte)));
+        return wxString("/Desktop/ProjectSymbolFilters/") + identity;
+    }
+    std::optional<wxString> read_project_symbol_filter(
+        const std::shared_ptr<const DocumentSnapshot> &document) const {
+        if (!document) return std::nullopt;
+        const auto path = project_symbol_filter_config_path(*document);
+        if (path.empty()) return std::nullopt;
+        auto *config = wxConfigBase::Get(false);
+        if (!config) return std::nullopt;
+        const auto previous_path = config->GetPath();
+        config->SetPath(path);
+        wxString filter;
+        const bool present = config->Read("Filter", &filter) && filter.length() <= 2048;
+        config->SetPath(previous_path);
+        if (!present) return std::nullopt;
+        return filter;
+    }
+    void save_project_symbol_filter(const std::shared_ptr<const DocumentSnapshot> &document) const {
+        if (!document || !symbol_filter) return;
+        const auto path = project_symbol_filter_config_path(*document);
+        if (path.empty()) return;
+        auto *config = wxConfigBase::Get(false);
+        if (!config) return;
+        const auto previous_path = config->GetPath();
+        config->SetPath(path);
+        config->Write("Filter", symbol_filter->GetValue().Left(2048));
+        config->SetPath(previous_path);
+    }
+    std::optional<std::pair<wxString, wxString>> read_project_import_export_filters(
+        const std::shared_ptr<const DocumentSnapshot> &document) const {
+        if (!document) return std::nullopt;
+        const auto path = project_filter_config_path(*document);
+        if (path.empty()) return std::nullopt;
+        auto *config = wxConfigBase::Get(false);
+        if (!config) return std::nullopt;
+        const auto previous_path = config->GetPath();
+        config->SetPath(path);
+        wxString imports, exports;
+        const bool have_imports = config->Read("Imports", &imports) && imports.length() <= 2048;
+        const bool have_exports = config->Read("Exports", &exports) && exports.length() <= 2048;
+        config->SetPath(previous_path);
+        if (!have_imports || !have_exports) return std::nullopt;
+        return std::pair<wxString, wxString>{imports, exports};
+    }
+    void save_project_import_export_filters(const std::shared_ptr<const DocumentSnapshot> &document) const {
+        if (!document || !import_filter || !export_filter) return;
+        const auto path = project_filter_config_path(*document);
+        if (path.empty()) return;
+        auto *config = wxConfigBase::Get(false);
+        if (!config) return;
+        const auto previous_path = config->GetPath();
+        config->SetPath(path);
+        config->Write("Imports", import_filter->GetValue().Left(2048));
+        config->Write("Exports", export_filter->GetValue().Left(2048));
+        config->SetPath(previous_path);
+    }
     void changed() {
         if (debugger) debugger->document_changed();
         if (closer)
@@ -1713,6 +2303,7 @@ struct MainFrame::Impl {
         auto active_snapshot = manager.active_workspace().current();
         auto open_documents = manager.documents();
         references->retain_documents(open_documents);
+        strings->retain_documents(open_documents);
         if (analysis_issues) analysis_issues->retain_documents(open_documents);
         pseudocode->retain_documents(open_documents);
         if (controller->all_search_scope()) {
@@ -1790,7 +2381,58 @@ struct MainFrame::Impl {
             active_document_bridge->active_id = active_id;
         }
         if (document != shown) {
+            // Import/export searches describe a particular image. Keep a small
+            // per-document cache so changing tabs does not silently replace
+            // the user's query with another image's filter.
+            if (shown && import_filter && export_filter) {
+                const auto id = shown->id.value;
+                std::erase(document_import_export_filter_order, id);
+                document_import_export_filter_order.push_back(id);
+                document_import_export_filters[id] = {
+                    import_filter->GetValue().Left(2048), export_filter->GetValue().Left(2048)};
+                save_project_import_export_filters(shown);
+                while (document_import_export_filter_order.size() > 32) {
+                    document_import_export_filters.erase(document_import_export_filter_order.front());
+                    document_import_export_filter_order.erase(document_import_export_filter_order.begin());
+                }
+            }
+            if (shown && symbol_filter) {
+                const auto id = shown->id.value;
+                std::erase(document_symbol_filter_order, id);
+                document_symbol_filter_order.push_back(id);
+                document_symbol_filters[id] = symbol_filter->GetValue().Left(2048);
+                save_project_symbol_filter(shown);
+                while (document_symbol_filter_order.size() > 32) {
+                    document_symbol_filters.erase(document_symbol_filter_order.front());
+                    document_symbol_filter_order.erase(document_symbol_filter_order.begin());
+                }
+            }
             shown = document;
+            if (shown && import_filter && export_filter) {
+                const auto project_saved = read_project_import_export_filters(shown);
+                const auto saved = document_import_export_filters.find(shown->id.value);
+                if (project_saved) {
+                    import_filter->ChangeValue(project_saved->first);
+                    export_filter->ChangeValue(project_saved->second);
+                } else if (saved != document_import_export_filters.end()) {
+                    import_filter->ChangeValue(saved->second.first);
+                    export_filter->ChangeValue(saved->second.second);
+                } else if (document_import_export_filter_order.size() > 0) {
+                    import_filter->ChangeValue({});
+                    export_filter->ChangeValue({});
+                }
+            }
+            if (shown && symbol_filter) {
+                const auto project_saved = read_project_symbol_filter(shown);
+                const auto saved = document_symbol_filters.find(shown->id.value);
+                if (project_saved) {
+                    symbol_filter->ChangeValue(*project_saved);
+                } else if (saved != document_symbol_filters.end()) {
+                    symbol_filter->ChangeValue(saved->second);
+                } else if (!document_symbol_filter_order.empty()) {
+                    symbol_filter->ChangeValue({});
+                }
+            }
             listing->set_document(document);
             bytes->set_document(document);
             source->set_document(document);
@@ -1868,18 +2510,141 @@ struct MainFrame::Impl {
         const auto document = controller->documents().active_workspace().current();
         if (!id || !document || document->id != *id)
             return {};
-        NavigationEntry entry{*id, document->revision, {}, {}, std::move(location),
-                              pages ? pages->GetSelection() : wxNOT_FOUND};
+        NavigationEntry entry;
+        entry.document = *id;
+        entry.document_revision = document->revision;
+        entry.location = std::move(location);
+        entry.binary_view = pages ? pages->GetSelection() : wxNOT_FOUND;
         if (document->project && document->project->state) {
             entry.project_uuid = document->project->state->uuid;
+            entry.project_input = document->project->state->input;
             entry.project_revisions = document->project->state->revisions;
+            const auto infos = controller->documents().documents();
+            const auto info = std::find_if(infos.begin(), infos.end(), [&](const DocumentInfo &item) {
+                return item.id == *id;
+            });
+            entry.persistable = info != infos.end() && info->path && info->save_state == DocumentSaveState::saved;
         }
         return entry;
     }
     static bool same_navigation_entry(const NavigationEntry &left, const NavigationEntry &right) {
         return left.document == right.document && left.document_revision == right.document_revision &&
-               left.project_uuid == right.project_uuid && left.project_revisions == right.project_revisions &&
+               left.project_uuid == right.project_uuid && left.project_input == right.project_input &&
+               left.project_revisions == right.project_revisions &&
                left.location == right.location && left.binary_view == right.binary_view;
+    }
+    void restore_persisted_navigation(wxConfigBase &config) {
+        const auto previous_path = config.GetPath();
+        config.SetPath("/Desktop/NavigationHistory");
+        long schema = 0, count = 0, saved_position = 0;
+        if (!config.Read("Schema", &schema) || schema != 1 ||
+            !config.Read("Count", &count) || count < 0 || count > maximum_persisted_navigation_entries) {
+            config.SetPath(previous_path);
+            return;
+        }
+        config.Read("Position", &saved_position);
+        navigation_history.clear();
+        std::size_t restored_position = 0;
+        for (long index = 0; index < count; ++index) {
+            const auto prefix = wxString::Format("Entry%ld", index);
+            wxString uuid_text, input_size_text, input_hash_text, edit_text, bytes_text, decisions_text;
+            wxString location_text;
+            if (!config.Read(prefix + "Uuid", &uuid_text) ||
+                !config.Read(prefix + "InputSize", &input_size_text) ||
+                !config.Read(prefix + "InputHash", &input_hash_text) ||
+                !config.Read(prefix + "EditRevision", &edit_text) ||
+                !config.Read(prefix + "ByteRevision", &bytes_text) ||
+                !config.Read(prefix + "DecisionRevision", &decisions_text) ||
+                !config.Read(prefix + "Location", &location_text)) continue;
+            const auto uuid = decode_recipe_hex(wx_utf8_bytes(uuid_text));
+            const auto input_hash = decode_recipe_hex(wx_utf8_bytes(input_hash_text));
+            const auto encoded_location = decode_recipe_hex(wx_utf8_bytes(location_text));
+            const auto input_size = decode_session_integer(input_size_text);
+            const auto edit = decode_session_integer(edit_text), bytes = decode_session_integer(bytes_text),
+                       decisions = decode_session_integer(decisions_text);
+            long binary_view = -1;
+            if (!config.Read(prefix + "BinaryView", &binary_view) || !uuid || uuid->size() != 16 ||
+                !input_hash || input_hash->size() != 32 || !encoded_location || !input_size ||
+                !edit || !bytes || !decisions || binary_view < -1 || binary_view > 256) continue;
+            auto location = database::decode_location(*encoded_location);
+            if (!location) continue;
+            NavigationEntry entry;
+            entry.document = DocumentId{0}; // Rebound by project UUID and input identity after reopen.
+            entry.document_revision = 0;
+            database::ProjectUuid project_uuid{};
+            std::copy(uuid->begin(), uuid->end(), project_uuid.begin());
+            entry.project_uuid = project_uuid;
+            database::InputIdentity input;
+            input.size = *input_size;
+            std::copy(input_hash->begin(), input_hash->end(), input.sha256.begin());
+            entry.project_input = input;
+            entry.project_revisions = {*edit, *bytes, *decisions};
+            entry.location = std::move(location.value());
+            entry.binary_view = static_cast<int>(binary_view);
+            entry.persistable = true;
+            navigation_history.push_back(std::move(entry));
+            if (index <= saved_position) restored_position = navigation_history.size() - 1;
+        }
+        navigation_position = navigation_history.empty() ? 0 : restored_position;
+        config.SetPath(previous_path);
+    }
+    void save_persisted_navigation(wxConfigBase &config) const {
+        const auto previous_path = config.GetPath();
+        config.SetPath("/Desktop");
+        config.DeleteGroup("NavigationHistory");
+        config.SetPath("NavigationHistory");
+        std::vector<std::pair<const NavigationEntry *, std::vector<std::byte>>> entries;
+        entries.reserve(navigation_history.size());
+        std::size_t saved_position = 0;
+        const auto document_infos = controller->documents().documents();
+        for (std::size_t index = 0; index < navigation_history.size(); ++index) {
+            const auto &entry = navigation_history[index];
+            bool persistable = entry.persistable;
+            if (!persistable && entry.project_uuid && entry.project_input) {
+                const auto info = std::find_if(document_infos.begin(), document_infos.end(),
+                    [&](const DocumentInfo &candidate) { return candidate.id == entry.document; });
+                if (info != document_infos.end() && info->path && info->save_state == DocumentSaveState::saved) {
+                    const auto project = controller->documents().project(entry.document);
+                    persistable = project && project->state && project->state->uuid == entry.project_uuid &&
+                        project->state->input == *entry.project_input &&
+                        project->state->revisions == entry.project_revisions;
+                }
+            }
+            if (!persistable || !entry.project_uuid || !entry.project_input) continue;
+            auto location = database::encode_location(entry.location);
+            if (!location || location.value().size() > 64) continue;
+            entries.emplace_back(&entry, std::move(location.value()));
+            if (index <= navigation_position) saved_position = entries.size() - 1;
+        }
+        if (entries.size() > maximum_persisted_navigation_entries) {
+            const auto removed = entries.size() - maximum_persisted_navigation_entries;
+            entries.erase(entries.begin(), entries.end() - maximum_persisted_navigation_entries);
+            saved_position = saved_position >= removed ? saved_position - removed : 0;
+        }
+        config.Write("Schema", 1L);
+        config.Write("Count", static_cast<long>(entries.size()));
+        config.Write("Position", entries.empty() ? 0L : static_cast<long>(std::min(saved_position, entries.size() - 1)));
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            const auto prefix = wxString::Format("Entry%llu", static_cast<unsigned long long>(index));
+            const auto &entry = *entries[index].first;
+            const auto write_hex = [&](const wxString &key, std::span<const std::byte> value) {
+                const auto encoded = encode_recipe_hex(value);
+                config.Write(prefix + key, wxString::FromUTF8(encoded.data(), encoded.size()));
+            };
+            write_hex("Uuid", *entry.project_uuid);
+            const auto input_size = encode_session_integer(entry.project_input->size);
+            config.Write(prefix + "InputSize", wxString::FromUTF8(input_size.data(), input_size.size()));
+            write_hex("InputHash", entry.project_input->sha256);
+            const auto edit_revision = encode_session_integer(entry.project_revisions.edit);
+            const auto byte_revision = encode_session_integer(entry.project_revisions.bytes);
+            const auto decision_revision = encode_session_integer(entry.project_revisions.decisions);
+            config.Write(prefix + "EditRevision", wxString::FromUTF8(edit_revision.data(), edit_revision.size()));
+            config.Write(prefix + "ByteRevision", wxString::FromUTF8(byte_revision.data(), byte_revision.size()));
+            config.Write(prefix + "DecisionRevision", wxString::FromUTF8(decision_revision.data(), decision_revision.size()));
+            write_hex("Location", entries[index].second);
+            config.Write(prefix + "BinaryView", static_cast<long>(entry.binary_view));
+        }
+        config.SetPath(previous_path);
     }
     void record_navigation_entry(NavigationEntry entry) {
         if (restoring_navigation) return;
@@ -1903,18 +2668,35 @@ struct MainFrame::Impl {
     }
     bool restore_navigation(std::size_t position) {
         if (position >= navigation_history.size()) return false;
-        const auto entry = navigation_history[position];
+        auto entry = navigation_history[position];
         const auto open = controller->documents().documents();
-        if (std::none_of(open.begin(), open.end(), [&](const auto &item) { return item.id == entry.document; }))
+        const bool initially_open = std::any_of(open.begin(), open.end(),
+            [&](const auto &item) { return item.id == entry.document; });
+        if (!initially_open && entry.persistable && entry.project_uuid && entry.project_input) {
+            for (const auto &candidate : open) {
+                if (candidate.uuid != entry.project_uuid) continue;
+                auto project = controller->documents().project(candidate.id);
+                if (!project || !project->state || project->state->uuid != entry.project_uuid ||
+                    project->state->input != *entry.project_input ||
+                    project->state->revisions != entry.project_revisions) continue;
+                entry.document = candidate.id;
+                break;
+            }
+        }
+        const bool rebound = !initially_open;
+        if (rebound && (!entry.document.value ||
+            std::none_of(open.begin(), open.end(), [&](const auto &item) { return item.id == entry.document; })))
             return false;
         restoring_navigation = true;
         controller->activate(entry.document);
         const auto document = controller->documents().active_workspace().current();
-        bool valid = document && document->id == entry.document && document->revision == entry.document_revision;
         auto project = controller->documents().project(entry.document);
+        bool valid = document && document->id == entry.document &&
+                     (rebound || document->revision == entry.document_revision);
         if (valid && entry.project_uuid) {
             valid = project && project->state && project->state->uuid == entry.project_uuid &&
-                    project->state->revisions == entry.project_revisions;
+                    project->state->revisions == entry.project_revisions &&
+                    (!entry.project_input || project->state->input == *entry.project_input);
         }
         if (valid) {
             auto moved = controller->documents().navigate(entry.document, entry.location);
@@ -1922,10 +2704,13 @@ struct MainFrame::Impl {
         }
         restoring_navigation = false;
         if (!valid) return false;
+        const auto restored_binary_view = entry.binary_view;
+        entry.document_revision = document->revision;
+        navigation_history[position] = std::move(entry);
         navigation_position = position;
-        if (entry.binary_view >= 0 && pages && entry.binary_view < static_cast<int>(pages->GetPageCount())) {
+        if (restored_binary_view >= 0 && pages && restored_binary_view < static_cast<int>(pages->GetPageCount())) {
             center->SetSelection(1);
-            pages->SetSelection(entry.binary_view);
+            pages->SetSelection(restored_binary_view);
         }
         changed();
         return true;
@@ -1950,13 +2735,19 @@ struct MainFrame::Impl {
             const auto &entry = navigation_history[i];
             wxString document_label = wxString::Format("Document %llu",
                 static_cast<unsigned long long>(entry.document.value));
+            bool open_document = false;
             for (const auto &document : documents) {
                 if (document.id != entry.document) continue;
+                open_document = true;
                 if (document.path) document_label = wxString(document.path->filename().wstring());
                 else if (auto project = controller->documents().project(document.id);
                          project && project->state && project->state->provenance)
                     document_label = wxString(project->state->provenance->native_path.filename().wstring());
                 break;
+            }
+            if (!open_document && entry.project_uuid) {
+                const auto identity = encode_recipe_hex(*entry.project_uuid);
+                document_label = "Closed project " + wxString::FromUTF8(identity.data(), 8);
             }
             auto label = i == navigation_position ? wxString("* ") : wxString("  ");
             label += document_label + "  " + location_text(entry.location);
@@ -1976,6 +2767,122 @@ struct MainFrame::Impl {
         const auto selected = static_cast<std::size_t>(dialog.GetSelection());
         if (!restore_navigation(selected))
             frame.SetStatusText("That history location is stale or no longer mapped.");
+    }
+    void export_navigation_history() {
+        if (navigation_history.empty()) {
+            frame.SetStatusText("Navigation history is empty.");
+            return;
+        }
+        wxFileDialog picker(&frame, "Export Navigation History", {}, "navigation-history.csv",
+                            "CSV files (*.csv)|*.csv|JSON files (*.json)|*.json|All files (*.*)|*.*",
+                            wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (picker.ShowModal() != wxID_OK) return;
+        const auto csv_field = [](std::string_view value) {
+            std::string encoded;
+            encoded.reserve(value.size() + 2);
+            encoded.push_back('"');
+            for (const char character : value) {
+                if (character == '"') encoded.push_back('"');
+                encoded.push_back(character);
+            }
+            encoded.push_back('"');
+            return encoded;
+        };
+        const auto utf8 = [](const wxString &value) {
+            const auto bytes = value.utf8_str();
+            return bytes ? std::string(bytes.data(), bytes.length()) : std::string{};
+        };
+        const auto json_string = [](std::string_view value) {
+            static constexpr char hex[] = "0123456789abcdef";
+            std::string encoded;
+            encoded.reserve(value.size() + 2);
+            encoded.push_back('"');
+            for (const unsigned char byte : value) {
+                switch (byte) {
+                case '"': encoded += "\\\""; break;
+                case '\\': encoded += "\\\\"; break;
+                case '\b': encoded += "\\b"; break;
+                case '\f': encoded += "\\f"; break;
+                case '\n': encoded += "\\n"; break;
+                case '\r': encoded += "\\r"; break;
+                case '\t': encoded += "\\t"; break;
+                default:
+                    if (byte < 0x20) {
+                        encoded += "\\u00";
+                        encoded.push_back(hex[byte >> 4]);
+                        encoded.push_back(hex[byte & 0x0f]);
+                    } else encoded.push_back(static_cast<char>(byte));
+                }
+            }
+            encoded.push_back('"');
+            return encoded;
+        };
+        const auto documents = controller->documents().documents();
+        const bool json = picker.GetFilterIndex() == 1;
+        std::ostringstream report;
+        if (json)
+            report << "{\"schema\":\"hexlab.navigation-history\",\"version\":1,\"current_index\":"
+                   << navigation_position << ",\"entries\":[";
+        else
+            report << "index,is_current,document_id,document_path,location,binary_view,project_uuid,input_size,input_sha256,"
+                      "edit_revision,byte_revision,decision_revision\r\n";
+        for (std::size_t index = 0; index < navigation_history.size(); ++index) {
+            const auto &entry = navigation_history[index];
+            const auto document = std::find_if(documents.begin(), documents.end(), [&](const DocumentInfo &candidate) {
+                return candidate.id == entry.document;
+            });
+            std::string path;
+            if (document != documents.end() && document->path) {
+                const auto encoded = document->path->generic_u8string();
+                path.assign(reinterpret_cast<const char *>(encoded.data()), encoded.size());
+            }
+            std::string view;
+            if (entry.binary_view >= 0 && pages && entry.binary_view < static_cast<int>(pages->GetPageCount()))
+                view = utf8(pages->GetPageText(static_cast<std::size_t>(entry.binary_view)));
+            const auto uuid = entry.project_uuid ? encode_recipe_hex(*entry.project_uuid) : std::string{};
+            const auto digest = entry.project_input ? encode_recipe_hex(entry.project_input->sha256) : std::string{};
+            if (json) {
+                if (index) report << ',';
+                report << "{\"index\":" << index << ",\"current\":"
+                       << (index == navigation_position ? "true" : "false")
+                       << ",\"document_id\":" << entry.document.value
+                       << ",\"document_path\":" << json_string(path)
+                       << ",\"location\":" << json_string(utf8(location_text(entry.location)))
+                       << ",\"binary_view\":" << json_string(view) << ",\"project\":";
+                if (entry.project_uuid && entry.project_input) {
+                    report << "{\"uuid\":" << json_string(uuid)
+                           << ",\"input_size\":" << entry.project_input->size
+                           << ",\"input_sha256\":" << json_string(digest)
+                           << ",\"edit_revision\":" << entry.project_revisions.edit
+                           << ",\"byte_revision\":" << entry.project_revisions.bytes
+                           << ",\"decision_revision\":" << entry.project_revisions.decisions << '}';
+                } else report << "null";
+                report << '}';
+            } else {
+                report << index << ',' << (index == navigation_position ? "true" : "false") << ','
+                       << entry.document.value << ',' << csv_field(path) << ','
+                       << csv_field(utf8(location_text(entry.location))) << ',' << csv_field(view) << ','
+                       << csv_field(uuid) << ','
+                       << csv_field(entry.project_input ? std::to_string(entry.project_input->size) : std::string{}) << ','
+                       << csv_field(digest) << ','
+                       << csv_field(entry.project_uuid ? std::to_string(entry.project_revisions.edit) : std::string{}) << ','
+                       << csv_field(entry.project_uuid ? std::to_string(entry.project_revisions.bytes) : std::string{}) << ','
+                       << csv_field(entry.project_uuid ? std::to_string(entry.project_revisions.decisions) : std::string{})
+                       << "\r\n";
+            }
+        }
+        if (json) report << "]}\n";
+        auto path = std::filesystem::path(picker.GetPath().ToStdWstring());
+        path.replace_extension(json ? ".json" : ".csv");
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        const auto contents = report.str();
+        if (!file || !file.write(contents.data(), static_cast<std::streamsize>(contents.size())) || !file.flush()) {
+            frame.SetStatusText("Could not write navigation history export.");
+            return;
+        }
+        frame.SetStatusText(text("Exported " + std::to_string(navigation_history.size()) +
+                                 (json ? " navigation history entries as JSON." :
+                                         " navigation history entries as CSV.")));
     }
     void sync() {
         if (debugger) debugger->document_changed();
@@ -2025,14 +2932,16 @@ struct MainFrame::Impl {
             };
             type_symbols->diagnostics_changed = [this, id](std::vector<AnalysisIssueDiagnostic> diagnostics) {
                 if (!id || !analysis_issues) return;
-                analysis_issues->set_type_diagnostics(id, diagnostics);
                 const auto project = controller->documents().project(*id);
+                if (project && project->derived_key)
+                    for (auto &item : diagnostics) item.source_key = project->derived_key;
+                analysis_issues->set_type_diagnostics(id, diagnostics);
                 const auto actor = controller->documents().actor(*id);
-                if (!project || project->mode == database::ProjectMode::read_only || !actor) return;
+                if (!project || project->mode == database::ProjectMode::read_only || !actor || actor->view().untitled) return;
                 std::vector<database::TypeImportDiagnostic> persisted;
                 persisted.reserve(diagnostics.size());
                 for (const auto &item : diagnostics)
-                    persisted.push_back({item.source, item.severity, item.message, item.address, item.function_entry});
+                    persisted.push_back({item.source, item.severity, item.message, item.address, item.function_entry, item.source_key});
                 auto submitted = actor->replace_type_import_diagnostics(std::move(persisted));
                 if (!submitted) {
                     controller->documents().report_error(*id, submitted.error());
@@ -2046,9 +2955,33 @@ struct MainFrame::Impl {
             });
         }
         references->update(id, shown ? shown->project : nullptr, state().selection());
-        if (analysis_issues)
+        if (analysis_issues) {
+            analysis_issues->reviewed_changed = [this, id](std::vector<std::string> keys) {
+                if (!id) return;
+                const auto project = controller->documents().project(*id);
+                const auto actor = controller->documents().actor(*id);
+                if (!project || project->mode == database::ProjectMode::read_only || !actor) return;
+                auto submitted = actor->replace_reviewed_analysis_issue_keys(std::move(keys));
+                if (!submitted) controller->documents().report_error(*id, submitted.error());
+            };
             analysis_issues->update(id, shown ? shown->project : nullptr, state().selection(), shown);
-        pseudocode->diagnostics_changed = [this, id](std::vector<AnalysisIssueDiagnostic> diagnostics) {
+        }
+        pseudocode->diagnostics_changed = [this, id](std::optional<Address> rendered_function, std::vector<AnalysisIssueDiagnostic> diagnostics) {
+            const auto project = id ? controller->documents().project(*id) : nullptr;
+            const auto actor = id ? controller->documents().actor(*id) : nullptr;
+            if (project && project->derived_key) {
+                std::vector<database::TypeImportDiagnostic> persisted;
+                persisted.reserve(diagnostics.size());
+                std::optional<Address> function_entry=rendered_function;
+                for (const auto &item : diagnostics) {
+                    persisted.push_back({"Decompiler", item.severity, item.message, item.address, item.function_entry, project->derived_key});
+                }
+                if (actor && !actor->view().untitled && project->mode != database::ProjectMode::read_only && function_entry) {
+                    auto submitted = actor->upsert_decompiler_diagnostics(*project->derived_key, *function_entry, std::move(persisted));
+                    if (!submitted) controller->documents().report_error(*id, submitted.error());
+                }
+                for (auto &item : diagnostics) item.source_key = project->derived_key;
+            }
             if (analysis_issues) analysis_issues->set_decompiler_diagnostics(id, std::move(diagnostics));
         };
         pseudocode->update_document(id, shown ? shown->project : nullptr, shown ? shown->revision : 0,
@@ -2130,13 +3063,51 @@ struct MainFrame::Impl {
             }
             if (matches) visible->push_back(index);
         }
+        if (macho_objc_sort_column >= 0) {
+            struct SortEntry { std::size_t row; wxString value; };
+            std::vector<SortEntry> sort_entries;
+            sort_entries.reserve(visible->size());
+            for (const auto row : *visible)
+                sort_entries.push_back({row, macho_objc_view_cell((*rows)[row], macho_objc_sort_column,
+                                                                  doc->image.get())});
+            std::stable_sort(sort_entries.begin(), sort_entries.end(), [&](const SortEntry &left,
+                                                                           const SortEntry &right) {
+                const int comparison = left.value.CmpNoCase(right.value);
+                if (comparison != 0)
+                    return macho_objc_sort_ascending ? comparison < 0 : comparison > 0;
+                const int exact_comparison = left.value.Cmp(right.value);
+                if (exact_comparison != 0)
+                    return macho_objc_sort_ascending ? exact_comparison < 0 : exact_comparison > 0;
+                return left.row < right.row;
+            });
+            visible->clear();
+            visible->reserve(sort_entries.size());
+            for (const auto &entry : sort_entries)
+                visible->push_back(entry.row);
+        }
         macho_objc->populate(visible->size(), [doc, rows, visible](std::size_t row, int column) {
             if (row >= visible->size()) return wxString{};
             return macho_objc_view_cell((*rows)[(*visible)[row]], column, doc->image.get());
         });
         macho_objc_visible_rows = visible;
-        if (macho_objc_filter_status)
-            macho_objc_filter_status->SetLabel(wxString::Format("%zu of %zu rows", visible->size(), rows->size()));
+        if (macho_objc_restore_selection) {
+            const auto selected = std::find(visible->begin(), visible->end(), *macho_objc_restore_selection);
+            if (selected != visible->end())
+                macho_objc->select_row(static_cast<std::size_t>(std::distance(visible->begin(), selected)));
+            macho_objc_restore_selection.reset();
+        }
+        if (macho_objc_filter_status) {
+            static constexpr const char *column_names[] = {
+                "Kind", "Owner", "Name", "Address", "Status", "Provenance", "Details"};
+            if (macho_objc_sort_column >= 0 && macho_objc_sort_column < 7) {
+                auto status = wxString::Format("%zu of %zu rows | sorted by ", visible->size(), rows->size());
+                status += wxString::FromUTF8(column_names[macho_objc_sort_column]);
+                status += macho_objc_sort_ascending ? " (ascending)" : " (descending)";
+                macho_objc_filter_status->SetLabel(status);
+            } else {
+                macho_objc_filter_status->SetLabel(wxString::Format("%zu of %zu rows", visible->size(), rows->size()));
+            }
+        }
         if (macho_objc_copy_row)
             macho_objc_copy_row->Enable(macho_objc->selected_row().has_value());
         macho_objc->activate = [this, doc, rows, visible](std::size_t row) {
@@ -2202,7 +3173,15 @@ struct MainFrame::Impl {
             symbol_source_cell = {};
             symbol_source_activate = {};
             visible_symbol_rows.clear();
-            strings->set_document({});
+            visible_import_rows.clear();
+            visible_export_rows.clear();
+            visible_segment_rows.clear();
+            visible_bookmark_rows.clear();
+            if (import_filter_status) import_filter_status->SetLabel("0 of 0 imports");
+            if (export_filter_status) export_filter_status->SetLabel("0 of 0 exports");
+            if (segment_filter_status) segment_filter_status->SetLabel("0 of 0 segments");
+            if (bookmark_filter_status) bookmark_filter_status->SetLabel("0 of 0 bookmarks");
+            strings->set_document({}, false);
             for (auto *table : {candidates, symbols, segments, imports, exports, annotations, bookmarks,
                                 elf_programs, elf_sections, elf_dynamic, elf_tables, macho_metadata, macho_objc}) {
                 table->populate(0, {});
@@ -2210,6 +3189,7 @@ struct MainFrame::Impl {
             }
             show_macho_objc_placeholder();
             index_context_tables({});
+            update_metadata_context({});
             if (pe_view) pe_view->set_document({});
             if (minidump_view) minidump_view->set_document({});
             return;
@@ -2222,47 +3202,21 @@ struct MainFrame::Impl {
             if (row < visible_candidate_items.size())
                 navigate_from_document(doc, visible_candidate_items[row].entry);
         };
-        segments->populate(doc->image->layout().segments.size(), [doc](std::size_t row, int column) {
-            const auto &item = doc->image->layout().segments[row];
-            switch (column) {
-            case 0:
-                return location_text(item.begin, doc->image.get());
-            case 1:
-                return text(item.name);
-            case 2:
-                return wxString::Format("%llu", static_cast<unsigned long long>(item.size));
-            default:
-                return wxString(item.readable ? "R" : "-") + (item.writable ? "W" : "-") +
-                       (item.executable ? "X" : "-");
-            }
-        });
+        render_segment_filter(doc);
         segments->activate = [this, doc](std::size_t row) {
-            if (row < doc->image->layout().segments.size())
-                navigate_from_document(doc, doc->image->layout().segments[row].begin);
+            if (row < visible_segment_rows.size())
+                navigate_from_document(doc, doc->image->layout().segments[visible_segment_rows[row]].begin);
         };
-        strings->set_document(doc);
-        imports->populate(doc->metadata_view().imports.size(), [doc](std::size_t row, int column) {
-            const auto &item = doc->metadata_view().imports[row];
-            return column == 0   ? location_text(item.iat, doc->image.get())
-                   : column == 1 ? text(item.library)
-                   : item.name   ? ([&] {
-                         const auto rendered = hexlab::symbols::demangle_cpp_name(*item.name);
-                         return text(rendered.status == hexlab::symbols::DemangleStatus::demangled
-                                         ? std::string_view(rendered.text) : std::string_view(*item.name));
-                     })()
-                                 : wxString::Format("ordinal %u", *item.ordinal);
-        });
-        imports->activate = [this, doc](std::size_t row) {
-            if (row < doc->metadata_view().imports.size())
-                navigate_from_document(doc, Location{doc->metadata_view().imports[row].iat});
-        };
+        const auto strings_actor = controller->documents().actor(doc->id);
+        strings->set_document(doc, strings_actor && strings_actor->view().untitled);
+        render_import_filter(doc);
         auto export_cell = [doc](std::size_t row, int column) {
             const auto &item = doc->metadata_view().exports[row];
             return column == 0 ? (item.address ? location_text(*item.address, doc->image.get()) : wxString("forwarded"))
                    : column == 1 ? (item.name ? text(*item.name) : wxString::Format("ordinal %u", item.ordinal))
                                  : (item.forwarder ? text(*item.forwarder) : wxString{});
         };
-        exports->populate(doc->metadata_view().exports.size(), export_cell);
+        render_export_filter(doc);
         symbol_source_count = doc->metadata_view().exports.size();
         symbol_source_cell = export_cell;
         auto export_jump = [this, doc](std::size_t row) {
@@ -2273,7 +3227,6 @@ struct MainFrame::Impl {
             else if (item.forwarder)
                 log("Forwarder: " + text(*item.forwarder));
         };
-        exports->activate = export_jump;
         symbol_source_activate = export_jump;
         if (doc->metadata_view().elf) {
             symbol_source_count = doc->metadata_view().elf->symbols.size();
@@ -2483,30 +3436,11 @@ struct MainFrame::Impl {
                     frame.UpdateWindowUI(wxUPDATE_UI_RECURSE);
                 }
             };
-            bookmarks->populate(project->state->user->bookmarks.size(), [project](std::size_t row, int column) {
-                auto &item = project->state->user->bookmarks[row];
-                return column == 0
-                           ? location_text(item.location, project->loaded ? project->loaded->image.get() : nullptr)
-                       : column == 1                              ? text(item.label)
-                       : location_mapped(*project, item.location) ? wxString("mapped")
-                                                                  : wxString("orphaned");
-            });
-            bookmarks->activate = [this, doc, project](std::size_t row) {
-                auto location = project->state->user->bookmarks[row].location;
-                if (location_mapped(*project, location))
-                    frame.Navigate(location);
-                else {
-                    annotation_context = std::pair{doc->id, location};
-                    log("Orphaned bookmark at " + location_text(location));
-                    frame.UpdateWindowUI(wxUPDATE_UI_RECURSE);
-                }
-            };
         } else {
             annotations->populate(0, {});
             annotations->activate = {};
-            bookmarks->populate(0, {});
-            bookmarks->activate = {};
         }
+        render_bookmark_filter(doc);
         index_context_tables(doc);
     }
     void open(bool raw) {
@@ -2540,14 +3474,22 @@ struct MainFrame::Impl {
     void configure() {
         wxDialog dialog(&frame, wxID_ANY, "Analysis options");
         auto *box = new wxBoxSizer(wxVERTICAL);
-        box->Add(new wxStaticText(&dialog, wxID_ANY, "Applies to the next binary opened."), 0, wxALL, 10);
-        wxTextCtrl *fields[3];
-        const char *labels[] = {"Instruction budget", "String record budget", "Minimum string characters"};
+        box->Add(new wxStaticText(&dialog, wxID_ANY,
+            "Analysis budgets apply to the next binary opened. Worker count applies after restarting HexLab."),
+            0, wxALL, 10);
+        wxTextCtrl *fields[4];
+        const char *labels[] = {"Instruction budget", "String record budget", "Minimum string characters",
+                                "Analysis worker count (1–16)"};
         const std::size_t values[] = {options.instruction_budget, options.string_budget, options.min_string_characters};
-        for (int i = 0; i < 3; ++i) {
+        long worker_count = 2;
+        if (auto *config = wxConfigBase::Get(false))
+            config->Read("/Analysis/Workers", &worker_count, 2);
+        for (int i = 0; i < 4; ++i) {
             box->Add(new wxStaticText(&dialog, wxID_ANY, labels[i]), 0, wxLEFT | wxRIGHT, 10);
+            const auto value = i < 3 ? static_cast<unsigned long long>(values[i])
+                                     : static_cast<unsigned long long>(worker_count >= 1 && worker_count <= 16 ? worker_count : 2);
             fields[i] =
-                new wxTextCtrl(&dialog, wxID_ANY, wxString::Format("%llu", static_cast<unsigned long long>(values[i])));
+                new wxTextCtrl(&dialog, wxID_ANY, wxString::Format("%llu", value));
             box->Add(fields[i], 0, wxALL | wxEXPAND, 10);
         }
         auto *error = new wxStaticText(&dialog, wxID_ANY, "");
@@ -2557,8 +3499,8 @@ struct MainFrame::Impl {
         dialog.Bind(
             wxEVT_BUTTON,
             [&](wxCommandEvent &) {
-                std::size_t parsed[3];
-                for (int i = 0; i < 3; ++i) {
+                std::size_t parsed[4];
+                for (int i = 0; i < 4; ++i) {
                     auto number = parse_address(fields[i]->GetValue().ToStdWstring());
                     if (!number || !number.value() || number.value() > SIZE_MAX) {
                         error->SetLabel("Enter positive values that fit this platform.");
@@ -2567,6 +3509,17 @@ struct MainFrame::Impl {
                     }
                     parsed[i] = static_cast<std::size_t>(number.value());
                 }
+                if (parsed[3] > 16) {
+                    error->SetLabel("Analysis worker count must be between 1 and 16.");
+                    dialog.Fit();
+                    return;
+                }
+                auto *config = wxConfigBase::Get();
+                if (!config || !config->Write("/Analysis/Workers", static_cast<long>(parsed[3])) || !config->Flush()) {
+                    error->SetLabel("Could not save the worker count preference.");
+                    dialog.Fit();
+                    return;
+                }
                 options.instruction_budget = parsed[0];
                 options.string_budget = parsed[1];
                 options.min_string_characters = parsed[2];
@@ -2574,6 +3527,82 @@ struct MainFrame::Impl {
             },
             wxID_OK);
         dialog.ShowModal();
+    }
+    void jump_open_documents() {
+        if (closer->closing_window()) return;
+        auto &manager = controller->documents();
+        std::vector<CrossJumpSource> sources;
+        bool omitted_documents = false;
+        for (const auto &entry : manager.documents()) {
+            auto project = manager.project(entry.id);
+            if (entry.save_state == DocumentSaveState::opening || !project || !project->state ||
+                !project->loaded || !project->loaded->image) {
+                omitted_documents = true;
+                continue;
+            }
+            if (sources.size() == cross_jump_document_limit) { omitted_documents = true; continue; }
+            const auto label = entry.path ? wxString(entry.path->filename().wstring()).Left(256) : wxString("Untitled");
+            sources.push_back({entry.id, entry.session, std::move(project),
+                label + wxString::Format(" [document %llu]", static_cast<unsigned long long>(entry.id.value))});
+        }
+        if (sources.empty()) {
+            frame.SetStatusText("No loaded documents are available for name search.");
+            return;
+        }
+        JumpSuggestionsDialog chooser(&frame, {},
+            [sources, omitted_documents](const wxString &query, NamedLocationScope scope, NamedLocationSearchMode mode,
+                                        const std::atomic_bool &cancelled) {
+                auto result = search_cross_document_names(sources, query, scope, mode, &cancelled);
+                if (omitted_documents) {
+                    result.truncated = true;
+                    if (!result.limitation.empty()) result.limitation += "; ";
+                    result.limitation += "some opening/unavailable documents or documents beyond the 128-document cap were omitted";
+                }
+                return result;
+            },
+            [&](const NamedLocationCandidate &candidate) {
+                const auto source_it = std::find_if(sources.begin(), sources.end(), [&](const CrossJumpSource &item) {
+                    return candidate.document == item.id.value;
+                });
+                if (source_it == sources.end()) return wxString("Unavailable document");
+                return source_it->label + " - " + candidate.name + " - " +
+                    location_text(candidate.location, source_it->project->loaded->image.get());
+            }, NamedLocationSearchMode::contains, "Search names in open documents",
+            "Search up to 128 captured open documents. Results show their owning document; choose an exact destination:",
+            true, true);
+        if (chooser.ShowModal() != wxID_OK) return;
+        const auto selected = chooser.selected_candidate();
+        if (!selected || !selected->document || closer->closing_window()) return;
+        const auto source_it = std::find_if(sources.begin(), sources.end(), [&](const CrossJumpSource &item) {
+            return selected->document == item.id.value;
+        });
+        if (source_it == sources.end()) return;
+        const auto open = manager.documents();
+        const auto current = std::find_if(open.begin(), open.end(), [&](const DocumentInfo &item) {
+            return item.id == source_it->id && item.session == source_it->session;
+        });
+        if (current == open.end() || manager.project(source_it->id) != source_it->project) {
+            log("Name-search navigation canceled: the selected document closed or its snapshot changed. Search again.");
+            return;
+        }
+        std::optional<NavigationEntry> previous;
+        if (auto location = state().selection()) previous = current_navigation(*location);
+        // Validate and update the exact destination while it is still inactive;
+        // a bad address must not switch the user into another document.
+        auto moved = manager.navigate(source_it->id, selected->location);
+        if (!moved) { log(text(moved.error().message)); return; }
+        if (previous) record_navigation_entry(std::move(*previous));
+        mark_active_document(source_it->id);
+        controller->activate(source_it->id);
+        if (manager.active_document() != source_it->id || manager.project(source_it->id) != source_it->project ||
+            !shown || shown->id != source_it->id) {
+            log("Name-search destination became unavailable during activation.");
+            return;
+        }
+        pages->SetSelection(std::holds_alternative<Address>(moved.value()) ? 0 : 1);
+        center->SetSelection(1);
+        record_navigation(moved.value());
+        sync();
     }
     void jump() {
         if (!shown)
@@ -2605,14 +3634,14 @@ struct MainFrame::Impl {
         if (dialog.ShowModal() != wxID_OK)
             return;
         if (dialog.mode->GetSelection() == 2) {
-            auto address = parse_segment_address(*shown->image, dialog.value->GetValue().ToStdWstring());
+            auto address = parse_segment_address(*source_document->image, dialog.value->GetValue().ToStdWstring());
             if (address)
                 navigate_from_source(address.value());
             else
                 log(text(address.error().message));
             return;
         }
-        auto space = shown->image->layout().space.id;
+        auto space = source_document->image->layout().space.id;
         if (auto selection = state().selection())
             if (const auto *address = std::get_if<Address>(&*selection))
                 space = address->space;
@@ -2620,9 +3649,11 @@ struct MainFrame::Impl {
         if (dialog.mode->GetSelection() == 0 && !std::wstring_view(input).starts_with(L"va:")) {
             auto requested = dialog.value->GetValue();
             requested.Trim(true).Trim(false);
-            std::vector<std::pair<wxString, Location>> entries = image_symbol_locations(shown->metadata_view());
+            const auto image_entries = image_symbol_locations(source_document->metadata_view());
+            std::vector<std::pair<wxString, Location>> entries = image_entries;
+            std::vector<std::pair<wxString, Location>> annotation_entries, bookmark_entries, function_entries;
             std::vector<NamedLocationCandidate> bounded_entries;
-            for (const auto &segment : shown->image->layout().segments) {
+            for (const auto &segment : source_document->image->layout().segments) {
                 if (segment.name.empty())
                     continue;
                 const Location start{segment.begin};
@@ -2630,16 +3661,18 @@ struct MainFrame::Impl {
                 bounded_entries.push_back({"section:" + label, start, segment.size});
                 bounded_entries.push_back({"segment:" + label, start, segment.size});
             }
-            if (shown->project && shown->project->state && shown->project->state->user) {
-                for (const auto &annotation : shown->project->state->user->annotations)
-                    entries.emplace_back(text(annotation.name), annotation.location);
-                for (const auto &bookmark : shown->project->state->user->bookmarks)
-                    entries.emplace_back(text(bookmark.label), bookmark.location);
-                if (shown->project->functions)
-                    for (const auto &function : shown->project->functions->functions)
+            if (source_project && source_project->state && source_project->state->user) {
+                for (const auto &annotation : source_project->state->user->annotations)
+                    annotation_entries.emplace_back(text(annotation.name), annotation.location);
+                for (const auto &bookmark : source_project->state->user->bookmarks)
+                    bookmark_entries.emplace_back(text(bookmark.label), bookmark.location);
+                if (source_project->functions)
+                    for (const auto &function : source_project->functions->functions)
                         if (function)
-                            entries.emplace_back(text(presentation_name(*shown->project, function->entry)), function->entry);
+                            function_entries.emplace_back(text(presentation_name(*source_project, function->entry)), function->entry);
             }
+            for (const auto *named_entries : {&annotation_entries, &bookmark_entries, &function_entries})
+                entries.insert(entries.end(), named_entries->begin(), named_entries->end());
             const auto match = resolve_named_location_expression(entries, bounded_entries, requested);
             if (match.location) {
                 navigate_from_source(*match.location);
@@ -2649,7 +3682,7 @@ struct MainFrame::Impl {
                 wxArrayString labels;
                 for (const auto &candidate : match.candidates)
                     labels.Add(candidate.name + " — " + location_text(
-                        candidate.location, shown && shown->image ? shown->image.get() : nullptr));
+                        candidate.location, source_document->image.get()));
                 wxSingleChoiceDialog chooser(&frame,
                     "This name refers to more than one location. Choose the destination:",
                     "Ambiguous name: " + requested, labels);
@@ -2660,20 +3693,43 @@ struct MainFrame::Impl {
             }
             const bool address_expression = parse_named_location_expression(requested).has_value() ||
                 parse_address(requested.ToStdWstring()).has_value();
-            const auto suggestions = address_expression
-                ? NamedLocationSearch{} : search_named_locations(entries, bounded_entries, requested);
-            if (!suggestions.candidates.empty()) {
-                wxArrayString labels;
-                for (const auto &candidate : suggestions.candidates)
-                    labels.Add(candidate.name + " — " + location_text(
-                        candidate.location, shown && shown->image ? shown->image.get() : nullptr));
-                const auto prompt = suggestions.truncated
-                    ? "Choose a matching name (showing the first 128 distinct destinations):"
-                    : "Choose a matching name:";
-                wxSingleChoiceDialog chooser(&frame, prompt, "Jump name suggestions: " + requested, labels);
-                if (chooser.ShowModal() == wxID_OK && chooser.GetSelection() >= 0 &&
-                    static_cast<std::size_t>(chooser.GetSelection()) < suggestions.candidates.size())
-                    navigate_from_source(suggestions.candidates[static_cast<std::size_t>(chooser.GetSelection())].location);
+            if (!address_expression && !requested.empty()) {
+                struct NameSearchSources {
+                    std::vector<std::pair<wxString, Location>> all, symbols, annotations, bookmarks, functions;
+                    std::vector<NamedLocationCandidate> sections;
+                    std::vector<std::pair<wxString, Location>> empty_entries;
+                    std::vector<NamedLocationCandidate> empty_bounds;
+                };
+                // Keep the worker's inputs alive after the modal dialog closes.
+                // These vectors are a snapshot of the exact document state that
+                // produced the chooser, and are immutable once captured.
+                auto search_sources = std::make_shared<const NameSearchSources>(NameSearchSources{
+                    std::move(entries), std::move(image_entries), std::move(annotation_entries),
+                    std::move(bookmark_entries), std::move(function_entries), std::move(bounded_entries), {}, {}});
+                JumpSuggestionsDialog chooser(&frame, requested,
+                    [search_sources](const wxString &query, NamedLocationScope scope, NamedLocationSearchMode mode,
+                                     const std::atomic_bool &) {
+                        const auto *selected_entries = &search_sources->all;
+                        const auto *selected_bounds = &search_sources->sections;
+                        switch (scope) {
+                        case NamedLocationScope::all: break;
+                        case NamedLocationScope::symbols: selected_entries = &search_sources->symbols; selected_bounds = &search_sources->empty_bounds; break;
+                        case NamedLocationScope::annotations: selected_entries = &search_sources->annotations; selected_bounds = &search_sources->empty_bounds; break;
+                        case NamedLocationScope::bookmarks: selected_entries = &search_sources->bookmarks; selected_bounds = &search_sources->empty_bounds; break;
+                        case NamedLocationScope::functions: selected_entries = &search_sources->functions; selected_bounds = &search_sources->empty_bounds; break;
+                        case NamedLocationScope::sections:
+                            selected_entries = &search_sources->empty_entries; selected_bounds = &search_sources->sections; break;
+                        }
+                        return search_named_locations(*selected_entries, *selected_bounds, query, 4096, mode);
+                    },
+                    [source_document](const NamedLocationCandidate &candidate) {
+                        return candidate.name + " - " + location_text(candidate.location, source_document->image.get());
+                    }, requested.length() == 1 ? NamedLocationSearchMode::exact : NamedLocationSearchMode::contains,
+                    "Jump name suggestions", "Search this document's captured names, then choose a destination:",
+                    true, true);
+                if (chooser.ShowModal() == wxID_OK)
+                    if (const auto selected = chooser.selected_candidate())
+                        navigate_from_source(selected->location);
                 return;
             }
             if (const auto expression = parse_named_location_expression(requested)) {
@@ -2825,6 +3881,63 @@ struct MainFrame::Impl {
         else log(next ? "No next recovered function in this address space"
                       : "No previous recovered function in this address space");
     }
+    void browse_image_entries() {
+        const auto active_id = controller->documents().active_document();
+        const auto captured = state().current();
+        if (!active_id || !captured || captured->id != *active_id) {
+            frame.SetStatusText("Open a document with mapped image entries first.");
+            return;
+        }
+        const auto image = active_document_image(*captured);
+        if (!image) {
+            frame.SetStatusText("The active document has no loaded image.");
+            return;
+        }
+        const auto &source = image->layout().entries;
+        if (source.empty()) {
+            frame.SetStatusText("This image has no declared entry locations.");
+            return;
+        }
+
+        const auto scanned = std::min(source.size(), maximum_image_entry_scan);
+        const bool scan_truncated = scanned < source.size();
+        std::vector<Address> entries(source.begin(), source.begin() + static_cast<std::ptrdiff_t>(scanned));
+        std::sort(entries.begin(), entries.end(), [](Address left, Address right) {
+            return location_before(Location{left}, Location{right});
+        });
+        entries.erase(std::unique(entries.begin(), entries.end()), entries.end());
+        const auto unique_count = entries.size();
+        const bool choices_truncated = entries.size() > maximum_image_entry_choices;
+        if (choices_truncated) entries.resize(maximum_image_entry_choices);
+
+        wxArrayString choices;
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            choices.Add(wxString::Format("%llu  ", static_cast<unsigned long long>(index + 1)) +
+                        text(format_location(Location{entries[index]}, image.get())));
+        }
+        wxString prompt = "Select a mapped entry location to navigate to it.";
+        if (scan_truncated)
+            prompt += wxString::Format(" Scanned the first %llu of %llu source entries.",
+                static_cast<unsigned long long>(scanned),
+                static_cast<unsigned long long>(source.size()));
+        if (choices_truncated)
+            prompt += wxString::Format(" Showing the first %llu of %llu unique locations.",
+                static_cast<unsigned long long>(maximum_image_entry_choices),
+                static_cast<unsigned long long>(unique_count));
+        wxSingleChoiceDialog dialog(&frame, prompt, "Image Entry Locations", choices);
+        if (dialog.ShowModal() != wxID_OK) return;
+        const auto selected = static_cast<std::size_t>(dialog.GetSelection());
+        if (selected >= entries.size()) return;
+
+        const auto now_active = controller->documents().active_document();
+        const auto now = state().current();
+        if (!now_active || *now_active != *active_id || !now || now->id != captured->id ||
+            now->revision != captured->revision || active_document_image(*now) != image) {
+            frame.SetStatusText("The image changed while choosing an entry; reopen the chooser.");
+            return;
+        }
+        frame.Navigate(Location{entries[selected]});
+    }
     void update_navigation(wxUpdateUIEvent &event) {
         bool enabled = false;
         wxString reason = "Open a document first";
@@ -2837,11 +3950,19 @@ struct MainFrame::Impl {
                  event.GetId() == analysis_options_id)
             enabled = true;
         else if (event.GetId() == cancel_id) {
-            enabled = state().opening() || (id && controller->read_pending(*id));
+            enabled = state().opening() || (id && (controller->read_pending(*id) || controller->backup_pending(*id)));
             reason = "No background work is running";
+        } else if (event.GetId() == cross_document_jump_id) {
+            const auto open = controller->documents().documents();
+            enabled = std::any_of(open.begin(), open.end(), [&](const DocumentInfo &entry) {
+                const auto project = controller->documents().project(entry.id);
+                return project && project->loaded && project->loaded->image;
+            });
+            reason = "No loaded documents are available";
         } else if (event.GetId() == wxID_CLOSE) {
             enabled = id.has_value();
-        } else if (event.GetId() == browse_navigation_history_id) {
+        } else if (event.GetId() == browse_navigation_history_id ||
+                   event.GetId() == export_navigation_history_id) {
             enabled = !navigation_history.empty();
             reason = "Navigation history is empty";
         } else if (document) {
@@ -2849,6 +3970,11 @@ struct MainFrame::Impl {
             case jump_id:
                 enabled = document->image->storage()->size() > 0;
                 reason = "The input contains no bytes";
+                break;
+            case browse_image_entries_id:
+                if (const auto image = active_document_image(*document))
+                    enabled = !image->layout().entries.empty();
+                reason = "The image has no declared entry locations";
                 break;
             case back_id:
                 enabled = !navigation_history.empty() && navigation_position > 0;
@@ -2974,16 +4100,19 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     menus->Append(file, "&File");
     auto *nav = new wxMenu;
     nav->Append(jump_id, "&Jump...\tG");
+    nav->Append(cross_document_jump_id, "Search Names in Open Documents...\tCtrl+Shift+G");
     nav->Append(follow_id, "&Follow Target\tEnter");
     nav->Append(incoming_references_id, "Incoming References\tCtrl+Shift+X");
     nav->Append(outgoing_references_id, "Outgoing References\tCtrl+Alt+X");
     nav->Append(back_id, "&Back\tAlt+Left");
     nav->Append(forward_id, "&Forward\tAlt+Right");
     nav->Append(browse_navigation_history_id, "Browse History...");
+    nav->Append(export_navigation_history_id, "Export History...");
     nav->Append(previous_marker_id, "Previous Annotation / Bookmark\tAlt+Up");
     nav->Append(next_marker_id, "Next Annotation / Bookmark\tAlt+Down");
     nav->Append(previous_function_id, "Previous Function\tCtrl+Alt+Up");
     nav->Append(next_function_id, "Next Function\tCtrl+Alt+Down");
+    nav->Append(browse_image_entries_id, "Browse Image Entries...");
     nav->Append(next_page_id, "Next Listing Page\tCtrl+Down");
     menus->Append(nav, "&Navigate");
     auto *edit = new wxMenu;
@@ -2997,7 +4126,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     edit->Append(find_next_id, "Find &Next\tF3");
     edit->Append(find_previous_id, "Find &Previous\tShift+F3");
     auto *analysis = new wxMenu;
-    analysis->Append(flirt_apply_id, "Scan FLAIR Catalog and Browse Results...");
+    analysis->Append(flirt_apply_id, "Scan FLAIR Catalogs and Browse Results...");
     menus->Append(analysis, "&Analysis");
     auto *view = new wxMenu;
     view->Append(reset_layout_id, "&Reset Layout\tCtrl+Shift+R");
@@ -3071,7 +4200,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     pages->AddPage(ui.pseudocode, "Pseudocode");
     ui.source = new SourceView(pages);
     pages->AddPage(ui.source, "Source");
-    ui.pseudocode->navigate_document = [this](const PseudocodeNavigationToken &token, Location location) {
+    const auto pseudocode_token_current = [this](const PseudocodeNavigationToken &token) {
         const auto id = token.document;
         const auto current = impl_->controller->state().current();
         const auto project = impl_->controller->documents().project(id);
@@ -3079,14 +4208,46 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
             ? project && project->state && project->state->uuid == *token.project_uuid &&
                   project->state->revisions == token.project_revisions
             : !project || !project->state;
-        if (projects().active_document() != id || !current || current->id != id ||
-            current->revision != token.document_revision || !current_project_matches ||
-            impl_->closer->closing_window()) {
+        return projects().active_document() == id && current && current->id == id &&
+            current->revision == token.document_revision && current_project_matches &&
+            !impl_->closer->closing_window();
+    };
+    ui.pseudocode->navigate_document = [this, pseudocode_token_current](
+        const PseudocodeNavigationToken &token, Location location) {
+        if (!pseudocode_token_current(token)) {
             impl_->log("Pseudocode origin navigation was canceled because its document revision is stale.");
             return;
         }
         Navigate(location);
         if (impl_->graph && impl_->graph->canvas) impl_->graph->canvas->reveal_selection();
+    };
+    ui.pseudocode->source_mapping_available = [this, pseudocode_token_current](
+        const PseudocodeNavigationToken &token, Address address) {
+        if (!pseudocode_token_current(token)) return false;
+        const auto current = impl_->controller->state().current();
+        return impl_->source && impl_->source->has_source_mapping(current, address);
+    };
+    ui.pseudocode->open_source_origin = [this, pseudocode_token_current](
+        const PseudocodeNavigationToken &token, Address address) {
+        if (!pseudocode_token_current(token)) {
+            impl_->log("Opening Source at a pseudocode origin was canceled because its document revision is stale.");
+            return;
+        }
+        const auto current = impl_->controller->state().current();
+        if (!impl_->source || !impl_->pages || !impl_->source->has_source_mapping(current, address)) {
+            impl_->log("Opening Source at a pseudocode origin was canceled because no unambiguous source row is available.");
+            return;
+        }
+        Navigate(Location{address});
+        const auto after_navigation = impl_->controller->state().current();
+        if (!pseudocode_token_current(token) || !after_navigation || after_navigation->id != token.document ||
+            after_navigation->revision != token.document_revision ||
+            !impl_->source->has_source_mapping(after_navigation, address)) {
+            impl_->log("Opening Source at a pseudocode origin was canceled because its source mapping became stale.");
+            return;
+        }
+        impl_->source->select(Location{address});
+        impl_->pages->SetSelection(impl_->pages->FindPage(impl_->source));
     };
     const auto synchronize_graph_source = [this](std::shared_ptr<const ProjectGraph> source_graph, Location location) {
         const auto id = impl_->controller->documents().active_document();
@@ -3210,10 +4371,21 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     };
     ui.center->AddPage(pages, "Binary");
     ui.listing->navigate = [this](Location location) { Navigate(location); };
-    ui.strings->comment = [this](Location location) {
+    ui.strings->comment = [this, strings = ui.strings](Location location) {
         const auto id = projects().active_document();
         if (!id) return;
         const auto project = projects().project(*id);
+        const auto actor = projects().actor(*id);
+        if (actor && actor->view().untitled) {
+            const auto existing = strings->standalone_comment(location).value_or(wxString{});
+            wxTextEntryDialog dialog(this,
+                "This note is saved immediately in local workspace preferences for this exact input.",
+                "Standalone string comment", existing, wxOK | wxCANCEL | wxTE_MULTILINE);
+            if (dialog.ShowModal() != wxID_OK) return;
+            if (!strings->set_standalone_comment(location, dialog.GetValue()))
+                impl_->log_to(*id, "Standalone string comment was not saved; it may exceed the local comment limits or the selected string changed.");
+            return;
+        }
         if (!project || !project->state || project->mode == database::ProjectMode::read_only) {
             impl_->log_to(*id, "String comments require a writable project.");
             return;
@@ -3252,7 +4424,9 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         ProjectCommand command = existing == breakpoints.end()
             ? ProjectCommand{SetProjectBreakpoint{address}}
             : ProjectCommand{SetProjectBreakpoint{address, database::ProjectBreakpointKind::software,
-                                                  existing->size, false, true}};
+                                                  existing->size, false, true, existing->condition,
+                                                  existing->logpoint, existing->log_message,
+                                                  existing->ignore_count, existing->one_shot}};
         auto result = impl_->controller->execute(*id, std::move(command));
         if (!result) {
             impl_->controller->documents().report_error(*id, result.error());
@@ -3274,6 +4448,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     auto *symbol_layout = new wxBoxSizer(wxVERTICAL);
     ui.symbol_filter = new wxTextCtrl(symbol_panel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
     ui.symbol_filter->SetName("symbol-filter");
+    ui.symbol_filter->SetMaxLength(2048);
     ui.symbol_filter->SetHint("Filter symbols by address, name, or state");
     ui.symbol_filter_status = new wxStaticText(symbol_panel, wxID_ANY, "0 of 0 symbols");
     ui.symbols = new VirtualTable(symbol_panel, "symbols", {"Address / record", "Symbol", "State / forwarder"});
@@ -3322,11 +4497,88 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         request.analysis_options = doc->project->analysis_options;
         OpenDocument(std::move(request));
     };
-    ui.segments = new VirtualTable(metadata, "segments", {"Address", "Name", "Size", "Permissions"});
+    const auto metadata_context_navigate = [this](std::shared_ptr<const DocumentSnapshot> document,
+                                                  Location cursor, Location destination) {
+        if (!impl_->metadata_context_current(document, cursor)) {
+            impl_->log("Metadata context changed; stale address/file-offset action was canceled.");
+            return;
+        }
+        impl_->navigate_from_document(document, destination);
+    };
+    auto *segments_panel = new wxPanel(metadata);
+    auto *segments_layout = new wxBoxSizer(wxVERTICAL);
+    ui.segment_context = new MetadataContextBar(segments_panel, "segment-context", true);
+    ui.segment_context->navigate = metadata_context_navigate;
+    ui.segment_context->reveal = [this](std::shared_ptr<const DocumentSnapshot> document, Location cursor) {
+        if (!impl_->metadata_context_current(document, cursor)) {
+            impl_->log("Segment context changed; stale reveal action was canceled.");
+            return;
+        }
+        impl_->segment_filter->ChangeValue({});
+        impl_->render_segment_filter(document);
+        impl_->select_context_rows(cursor);
+    };
+    ui.segment_filter = new wxTextCtrl(segments_panel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize,
+        wxTE_PROCESS_ENTER);
+    ui.segment_filter->SetName("segment-filter");
+    ui.segment_filter->SetMaxLength(2048);
+    ui.segment_filter->SetHint("Filter segments by address, name, size, permissions, or backing offset");
+    ui.segment_filter_status = new wxStaticText(segments_panel, wxID_ANY, "0 of 0 segments");
+    ui.segments = new VirtualTable(segments_panel, "segments",
+        {"Address", "Name", "Size", "Permissions", "Backing offset", "File-backed bytes"});
+    segments_layout->Add(ui.segment_context, 0, wxEXPAND);
+    segments_layout->Add(ui.segment_filter, 0, wxEXPAND | wxALL, FromDIP(4));
+    segments_layout->Add(ui.segment_filter_status, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
+    segments_layout->Add(ui.segments, 1, wxEXPAND);
+    segments_panel->SetSizer(segments_layout);
     ui.strings = new StringBrowserView(metadata);
     ui.strings->navigate = [this](Location location) { Navigate(location); };
-    ui.imports = new VirtualTable(metadata, "imports", {"IAT", "Library", "Name / ordinal"});
-    ui.exports = new VirtualTable(metadata, "exports", {"Address", "Name", "Forwarder"});
+    auto *imports_panel = new wxPanel(metadata);
+    auto *imports_layout = new wxBoxSizer(wxVERTICAL);
+    ui.import_filter = new wxTextCtrl(imports_panel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+    ui.import_filter->SetName("import-filter");
+    ui.import_filter->SetMaxLength(2048);
+    ui.import_filter->SetHint("Filter imports: lib:value name:value ordinal:value address:value");
+    ui.import_filter_status = new wxStaticText(imports_panel, wxID_ANY, "0 of 0 imports");
+    ui.imports = new VirtualTable(imports_panel, "imports", {"IAT", "Library", "Name / ordinal"});
+    ui.import_context = new MetadataContextBar(imports_panel, "import-context", true);
+    ui.import_context->navigate = metadata_context_navigate;
+    ui.import_context->reveal = [this](std::shared_ptr<const DocumentSnapshot> document, Location cursor) {
+        if (!impl_->metadata_context_current(document, cursor)) {
+            impl_->log("Import context changed; stale reveal action was canceled.");
+            return;
+        }
+        impl_->import_filter->ChangeValue({});
+        impl_->render_import_filter(document);
+    };
+    imports_layout->Add(ui.import_context, 0, wxEXPAND);
+    imports_layout->Add(ui.import_filter, 0, wxEXPAND | wxALL, FromDIP(4));
+    imports_layout->Add(ui.import_filter_status, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
+    imports_layout->Add(ui.imports, 1, wxEXPAND);
+    imports_panel->SetSizer(imports_layout);
+    auto *exports_panel = new wxPanel(metadata);
+    auto *exports_layout = new wxBoxSizer(wxVERTICAL);
+    ui.export_filter = new wxTextCtrl(exports_panel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+    ui.export_filter->SetName("export-filter");
+    ui.export_filter->SetMaxLength(2048);
+    ui.export_filter->SetHint("Filter exports: name:value ordinal:value address:value forwarder:value");
+    ui.export_filter_status = new wxStaticText(exports_panel, wxID_ANY, "0 of 0 exports");
+    ui.exports = new VirtualTable(exports_panel, "exports", {"Address", "Name", "Forwarder"});
+    ui.export_context = new MetadataContextBar(exports_panel, "export-context", true);
+    ui.export_context->navigate = metadata_context_navigate;
+    ui.export_context->reveal = [this](std::shared_ptr<const DocumentSnapshot> document, Location cursor) {
+        if (!impl_->metadata_context_current(document, cursor)) {
+            impl_->log("Export context changed; stale reveal action was canceled.");
+            return;
+        }
+        impl_->export_filter->ChangeValue({});
+        impl_->render_export_filter(document);
+    };
+    exports_layout->Add(ui.export_context, 0, wxEXPAND);
+    exports_layout->Add(ui.export_filter, 0, wxEXPAND | wxALL, FromDIP(4));
+    exports_layout->Add(ui.export_filter_status, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
+    exports_layout->Add(ui.exports, 1, wxEXPAND);
+    exports_panel->SetSizer(exports_layout);
     ui.elf_programs = new VirtualTable(metadata, "elf-programs", {"Header / program", "File", "Address", "Details"});
     ui.elf_sections = new VirtualTable(metadata, "elf-sections", {"Section", "File", "Type / flags", "Details"});
     ui.elf_dynamic = new VirtualTable(metadata, "elf-dynamic", {"Table", "Tag", "Value / string", "State"});
@@ -3360,6 +4612,24 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.macho_objc = new VirtualTable(metadata, "macho-objc",
                                      {"Kind", "Owner", "Name", "Address", "Status", "Provenance", "Details"});
     ui.macho_objc->SetToolTip("Objective-C runtime records from the bounded scan of the displayed Mach-O snapshot. Activate an addressable row to navigate.");
+    ui.macho_objc->Bind(wxEVT_LIST_COL_CLICK, [this](wxListEvent &event) {
+        const int column = event.GetColumn();
+        if (column < 0 || column >= 7 || !impl_->macho_objc || !impl_->macho_objc_rows ||
+            !impl_->macho_objc_visible_rows)
+            return;
+        const auto selected = impl_->macho_objc->selected_row();
+        if (selected && *selected < impl_->macho_objc_visible_rows->size())
+            impl_->macho_objc_restore_selection = (*impl_->macho_objc_visible_rows)[*selected];
+        else
+            impl_->macho_objc_restore_selection.reset();
+        if (impl_->macho_objc_sort_column == column)
+            impl_->macho_objc_sort_ascending = !impl_->macho_objc_sort_ascending;
+        else {
+            impl_->macho_objc_sort_column = column;
+            impl_->macho_objc_sort_ascending = true;
+        }
+        impl_->display_macho_objc_rows(impl_->macho_objc_source, impl_->macho_objc_rows);
+    });
     ui.macho_objc_filter = new wxTextCtrl(metadata, wxID_ANY);
     ui.macho_objc_filter->SetName("macho-objc-filter");
     ui.macho_objc_filter->SetHint("Filter kind, class, selector, status, provenance, or details");
@@ -3495,6 +4765,10 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.annotations = new VirtualTable(metadata, "annotations", {"Address / offset", "Name", "Comment", "State"});
     auto *bookmark_panel = new wxPanel(metadata);
     auto *bookmark_layout = new wxBoxSizer(wxVERTICAL);
+    ui.bookmark_filter = new wxTextCtrl(bookmark_panel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+    ui.bookmark_filter->SetName("bookmark-filter");
+    ui.bookmark_filter->SetHint("Filter by address, label, or mapped/orphaned state");
+    ui.bookmark_filter_status = new wxStaticText(bookmark_panel, wxID_ANY, "0 of 0 bookmarks");
     ui.bookmarks = new VirtualTable(bookmark_panel, "bookmarks", {"Address / offset", "Label", "State"});
     ui.bookmarks->SetColumnWidth(0, FromDIP(150));
     ui.bookmarks->SetColumnWidth(1, FromDIP(150));
@@ -3504,22 +4778,31 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.bookmark_remove->SetName("bookmark-remove");
     ui.bookmark_rename->Enable(false);
     ui.bookmark_remove->Enable(false);
-    ui.bookmarks->Bind(wxEVT_LIST_ITEM_SELECTED, [table = ui.bookmarks, rename = ui.bookmark_rename,
-                                                  remove = ui.bookmark_remove](wxListEvent &) {
+    auto update_bookmark_actions = [table = ui.bookmarks, rename = ui.bookmark_rename,
+                                    remove = ui.bookmark_remove](wxListEvent &) {
         const bool selected = table->selected_row().has_value();
         rename->Enable(selected);
         remove->Enable(selected);
-    });
+    };
+    ui.bookmarks->Bind(wxEVT_LIST_ITEM_SELECTED, update_bookmark_actions);
+    ui.bookmarks->Bind(wxEVT_LIST_ITEM_DESELECTED, update_bookmark_actions);
     auto *bookmark_actions = new wxBoxSizer(wxHORIZONTAL);
+    bookmark_layout->Add(ui.bookmark_filter, 0, wxEXPAND | wxALL, FromDIP(4));
+    bookmark_layout->Add(ui.bookmark_filter_status, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
     bookmark_actions->Add(ui.bookmark_rename, 0, wxALL, FromDIP(3));
     bookmark_actions->Add(ui.bookmark_remove, 0, wxALL, FromDIP(3));
     bookmark_layout->Add(ui.bookmarks, 1, wxEXPAND);
     bookmark_layout->Add(bookmark_actions, 0, wxALIGN_RIGHT);
     bookmark_panel->SetSizer(bookmark_layout);
-    metadata->AddPage(ui.segments, "Segments");
+    ui.bookmark_filter->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+        impl_->render_bookmark_filter(impl_->shown);
+        impl_->index_context_tables(impl_->shown);
+        impl_->select_context_rows(impl_->state().selection());
+    });
+    metadata->AddPage(segments_panel, "Segments");
     metadata->AddPage(ui.strings, "Strings");
-    metadata->AddPage(ui.imports, "Imports");
-    metadata->AddPage(ui.exports, "Exports");
+    metadata->AddPage(imports_panel, "Imports");
+    metadata->AddPage(exports_panel, "Exports");
     metadata->AddPage(ui.pe_view, "PE");
     metadata->AddPage(ui.minidump_view, "Minidump");
     metadata->AddPage(ui.elf_programs, "ELF headers");
@@ -3534,6 +4817,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     metadata->AddPage(ui.references, "References");
     ui.history_view = new HistoryView(metadata);
     ui.history_view->navigate = [this](Location location) { Navigate(location); };
+    ui.history_view->open_project = [this](std::filesystem::path path) { OpenProject(std::move(path)); };
     metadata->AddPage(ui.history_view, "History");
     ui.analysis_issues = new AnalysisIssuesView(metadata);
     ui.analysis_issues->navigate = [this](Location location) { Navigate(location); };
@@ -3972,7 +5256,14 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
             const auto kind = candidate.kind == database::RecoveryArtifactKind::interrupted_save
                                   ? wxString("Interrupted Save As")
                                   : wxString("Previous project version");
-            choices.Add(kind + ": " + wxString(candidate.path.wstring()));
+            const auto revisions = wxString::Format("edit %llu / bytes %llu / decisions %llu",
+                static_cast<unsigned long long>(candidate.revisions.edit),
+                static_cast<unsigned long long>(candidate.revisions.bytes),
+                static_cast<unsigned long long>(candidate.revisions.decisions));
+            const auto size = wxString::Format("%llu bytes",
+                static_cast<unsigned long long>(candidate.artifact_size));
+            choices.Add(kind + " (" + revisions + ", " + size + "): " +
+                        wxString(candidate.path.wstring()));
         }
         wxSingleChoiceDialog dialog(this, message, "Project recovery", choices);
         if (dialog.ShowModal() == wxID_OK) {
@@ -4015,6 +5306,18 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     });
     ui.symbol_filter->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
         impl_->render_symbol_filter(impl_->shown);
+    });
+    ui.import_filter->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+        impl_->save_project_import_export_filters(impl_->shown);
+        impl_->render_import_filter(impl_->shown);
+    });
+    ui.export_filter->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+        impl_->save_project_import_export_filters(impl_->shown);
+        impl_->render_export_filter(impl_->shown);
+    });
+    ui.segment_filter->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+        impl_->render_segment_filter(impl_->shown);
+        impl_->select_context_rows(impl_->state().selection());
     });
     ui.candidates->Bind(wxEVT_LIST_COL_CLICK, [this](wxListEvent &event) {
         const int column = event.GetColumn();
@@ -4071,10 +5374,18 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     auto bookmark_command = [this](bool remove) {
         auto id = projects().active_document();
         auto project = id ? projects().project(*id) : nullptr;
-        auto row = impl_->bookmarks->selected_row();
-        if (!id || !project || !row || *row >= project->state->user->bookmarks.size())
+        const auto shown = impl_->shown;
+        const auto view_row = impl_->bookmarks->selected_row();
+        if (!id || !project || !project->state || !view_row ||
+            *view_row >= impl_->visible_bookmark_rows.size())
             return;
-        const auto bookmark = project->state->user->bookmarks[*row];
+        if (!shown || shown->id != *id || shown->project != project) {
+            impl_->log_to(*id, "Bookmark action canceled because its displayed project snapshot changed.");
+            return;
+        }
+        const auto row = impl_->visible_bookmark_rows[*view_row];
+        if (row >= project->state->user->bookmarks.size()) return;
+        const auto bookmark = project->state->user->bookmarks[row];
         if (remove) {
             auto result = impl_->controller->execute(*id, BookmarkCommand{bookmark.location, {}, true});
             if (!result)
@@ -4255,16 +5566,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
                             wxFD_OPEN | wxFD_FILE_MUST_EXIST);
         if (picker.ShowModal() != wxID_OK) return;
         const auto path = std::filesystem::path(picker.GetPath().ToStdWstring());
-        auto loaded = load_compare_session(path);
-        if (!loaded) {
-            wxMessageBox(text(loaded.error().message), "Could not open comparison session", wxOK | wxICON_ERROR, this);
-            return;
-        }
-        auto session = std::move(loaded.value());
-        auto *view = new CompareView(this, std::move(session.report), wxString::FromUTF8(session.old_name),
-            wxString::FromUTF8(session.new_name), std::move(session.functions), {}, {},
-            std::move(session.function_body_diffs));
-        view->Show();
+        (void)OpenComparisonSession(path, true);
     }, open_compare_session_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->cancel_compare(); }, compare_cancel_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) {
@@ -4294,12 +5596,14 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     }, cancel_id);
     const int navigation_ids[] = {
         wxID_OPEN, open_raw_id, open_project_id, analysis_options_id, wxID_CLOSE,    cancel_id,    jump_id,
-        follow_id, back_id,     forward_id,      browse_navigation_history_id, previous_marker_id, next_marker_id,
-        previous_function_id, next_function_id,
+        follow_id, back_id,     forward_id,      browse_navigation_history_id, export_navigation_history_id,
+        previous_marker_id, next_marker_id,
+        previous_function_id, next_function_id, browse_image_entries_id, cross_document_jump_id,
         copy_address_id, copy_bytes_id, copy_text_id, next_page_id, incoming_references_id, outgoing_references_id};
     for (int id : navigation_ids)
         Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent &event) { impl_->update_navigation(event); }, id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->jump(); }, jump_id);
+    Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->jump_open_documents(); }, cross_document_jump_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->follow(); }, follow_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->browse_references(true); }, incoming_references_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->browse_references(false); }, outgoing_references_id);
@@ -4319,6 +5623,8 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         forward_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->browse_navigation_history(); },
          browse_navigation_history_id);
+    Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->export_navigation_history(); },
+         export_navigation_history_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &event) {
         impl_->navigate_marker(event.GetId() == next_marker_id);
     }, previous_marker_id);
@@ -4327,6 +5633,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     }, next_marker_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->navigate_function(false); }, previous_function_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->navigate_function(true); }, next_function_id);
+    Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->browse_image_entries(); }, browse_image_entries_id);
     Bind(
         wxEVT_MENU,
         [this](wxCommandEvent &) {
@@ -4409,6 +5716,20 @@ void MainFrame::RestoreDesktopState() {
         const auto previous_path = config->GetPath();
         config->SetPath("/Desktop");
         long x = 0, y = 0, width = 0, height = 0, maximized = 0;
+        impl_->restore_persisted_navigation(*config);
+        wxString imports_filter, exports_filter, segments_filter, symbols_filter;
+        if (config->Read("ImportsFilter", &imports_filter) && imports_filter.length() <= 2048 &&
+            impl_->import_filter)
+            impl_->import_filter->ChangeValue(imports_filter);
+        if (config->Read("ExportsFilter", &exports_filter) && exports_filter.length() <= 2048 &&
+            impl_->export_filter)
+            impl_->export_filter->ChangeValue(exports_filter);
+        if (config->Read("SegmentsFilter", &segments_filter) && segments_filter.length() <= 2048 &&
+            impl_->segment_filter)
+            impl_->segment_filter->ChangeValue(segments_filter);
+        if (config->Read("SymbolsFilter", &symbols_filter) && symbols_filter.length() <= 2048 &&
+            impl_->symbol_filter)
+            impl_->symbol_filter->ChangeValue(symbols_filter);
         const bool have_geometry = config->Read("FrameX", &x) && config->Read("FrameY", &y) &&
             config->Read("FrameWidth", &width) && config->Read("FrameHeight", &height) &&
             width >= 640 && height >= 400 && width <= 16384 && height <= 16384;
@@ -4435,13 +5756,57 @@ void MainFrame::RestoreDesktopState() {
     if (!IsMaximized() && !IsIconized() && GetSize().x > 0 && GetSize().y > 0)
         normal_frame_rect_ = GetRect();
 }
+void MainFrame::TrackComparisonSession(CompareView *view, const std::filesystem::path &path) {
+    if (!view || path.empty()) return;
+    std::erase_if(impl_->comparison_sessions,
+        [](const Impl::PersistedComparisonSession &entry) { return entry.view.get() == nullptr; });
+    for (auto &entry : impl_->comparison_sessions) {
+        if (entry.view.get() == view) {
+            entry.path = path;
+            return;
+        }
+    }
+    if (impl_->comparison_sessions.size() < maximum_restored_comparison_sessions) {
+        Impl::PersistedComparisonSession entry;
+        entry.view = view;
+        entry.path = path;
+        impl_->comparison_sessions.push_back(std::move(entry));
+    }
+}
+
+bool MainFrame::OpenComparisonSession(const std::filesystem::path &path, bool show_error) {
+    auto loaded = load_compare_session(path);
+    if (!loaded) {
+        if (show_error)
+            wxMessageBox(text(loaded.error().message), "Could not open comparison session",
+                         wxOK | wxICON_ERROR, this);
+        return false;
+    }
+    auto session = std::move(loaded.value());
+    auto *view = new CompareView(this, std::move(session.report), wxString::FromUTF8(session.old_name),
+        wxString::FromUTF8(session.new_name), std::move(session.functions), {}, {},
+        std::move(session.function_body_diffs));
+    view->set_session_path(path);
+    TrackComparisonSession(view, path);
+    view->Show();
+    return true;
+}
+
 void MainFrame::RestoreWorkspaceSession() {
     auto *config = wxConfigBase::Get(false);
     if (!config) return;
     const auto previous_path = config->GetPath();
     config->SetPath("/Desktop/Session");
     long count = 0, active = -1;
-    if (!config->Read("Count", &count) || count < 0 || count > maximum_restored_documents) count = 0;
+    if (!config->Read("Count", &count) || count < 0) count = 0;
+    std::uint64_t omitted_on_save = 0;
+    wxString omitted_on_save_text;
+    if (config->Read("OmittedOnSave", &omitted_on_save_text))
+        (void)omitted_on_save_text.ToULongLong(&omitted_on_save);
+    const long saved_document_count = count;
+    const long omitted_document_count = count > maximum_restored_documents
+        ? count - maximum_restored_documents : 0;
+    if (omitted_document_count) count = maximum_restored_documents;
     config->Read("Active", &active);
     std::vector<DocumentId> restored_documents;
     restored_documents.reserve(static_cast<std::size_t>(count));
@@ -4464,12 +5829,20 @@ void MainFrame::RestoreWorkspaceSession() {
             ++skipped;
             continue;
         }
+        const auto documents_before = projects().documents();
         if (kind == "project") {
             // Opening failures are reported by the regular asynchronous open path.
-            config->Read(mode_key, &mode);
-            const auto project_mode = mode == "readonly" ? database::ProjectMode::read_only
-                                      : mode == "collaborative" ? database::ProjectMode::collaborative
-                                                                  : database::ProjectMode::read_write;
+            const bool has_mode = config->Read(mode_key, &mode);
+            database::ProjectMode project_mode = database::ProjectMode::read_write;
+            if (has_mode && !mode.empty()) {
+                if (mode == "readonly") project_mode = database::ProjectMode::read_only;
+                else if (mode == "collaborative") project_mode = database::ProjectMode::collaborative;
+                else if (mode != "readwrite") {
+                    // An unknown persisted mode must not silently become writable.
+                    ++skipped;
+                    continue;
+                }
+            }
             OpenProject(path, project_mode);
         } else if (kind == "binary") {
             wxString recipe_text;
@@ -4497,14 +5870,32 @@ void MainFrame::RestoreWorkspaceSession() {
             request.macho = recipe.value().macho;
             request.pdb_path = recipe.value().pdb_path;
             request.pe_runtime_architecture = recipe.value().pe_runtime_architecture;
+            request.dwarf_supplementary_package_path = recipe.value().dwarf_supplementary_package_path;
             OpenDocument(std::move(request));
         } else {
             ++skipped;
             continue;
         }
         const auto documents = projects().documents();
-        if (!documents.empty()) {
+        if (!documents.empty() && std::none_of(documents_before.begin(), documents_before.end(),
+                [&](const DocumentInfo &document) { return document.id == documents.back().id; })) {
             const auto restored_id = documents.back().id;
+            if (kind == "binary") {
+                impl_->strings->restore_preferences(*config, wxString::Format("Document%ldStrings", index),
+                                                   restored_id, false);
+            } else if (auto actor = projects().actor(restored_id)) {
+                auto read = actor->read_preference("view.strings.v1");
+                if (read) {
+                    if (read.value().result.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+                        auto reply = read.value().result.get();
+                        if (reply && reply.value().preference_value) {
+                            auto project = projects().project(restored_id);
+                            if (project) impl_->strings->restore_project_preference(*reply.value().preference_value,
+                                                                                   restored_id, *project);
+                        }
+                    }
+                }
+            }
             restored_documents.push_back(restored_id);
             if (index == active) {
                 restored_active = restored_id;
@@ -4523,20 +5914,54 @@ void MainFrame::RestoreWorkspaceSession() {
             }
         }
     }
+    long comparison_count = 0;
+    if (!config->Read("ComparisonCount", &comparison_count) || comparison_count < 0 ||
+        comparison_count > maximum_restored_comparison_sessions) {
+        if (comparison_count != 0) ++skipped;
+        comparison_count = 0;
+    }
+    for (long index = 0; index < comparison_count; ++index) {
+        wxString saved;
+        if (!config->Read(wxString::Format("Comparison%ldPath", index), &saved) || saved.empty() ||
+            saved.length() > maximum_persisted_path_characters) {
+            ++skipped;
+            continue;
+        }
+        const std::filesystem::path path(saved.ToStdWstring());
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(path, error) || error || !OpenComparisonSession(path, false))
+            ++skipped;
+    }
     impl_->session_restore_documents = std::move(restored_documents);
     impl_->session_restore_active = restored_active;
     impl_->session_restore_locations = std::move(restored_locations);
     impl_->session_restore_activation_pending = !impl_->session_restore_documents.empty();
     config->SetPath(previous_path);
+    wxString restore_status;
     if (skipped)
-        SetStatusText(wxString::Format("Skipped %llu missing, unreadable, or unsupported saved session item(s)",
-                                       static_cast<unsigned long long>(skipped)), 0);
+        restore_status = wxString::Format("Skipped %llu missing, unreadable, or unsupported saved session item(s)",
+                                          static_cast<unsigned long long>(skipped));
+    if (omitted_on_save) {
+        if (!restore_status.empty()) restore_status += "; ";
+        restore_status += wxString::Format(
+            "The previous session save omitted %llu open document(s) without a durable restore record",
+            static_cast<unsigned long long>(omitted_on_save));
+    }
+    if (omitted_document_count) {
+        if (!restore_status.empty()) restore_status += "; ";
+        restore_status += wxString::Format(
+            "Considered only the first %ld of %ld saved document entries; %ld beyond the %ld-document limit were not attempted",
+            count, saved_document_count, omitted_document_count, maximum_restored_documents);
+    }
+    if (!restore_status.empty()) SetStatusText(restore_status, 0);
 }
 void MainFrame::SaveWorkspaceSession() {
     auto *config = wxConfigBase::Get(false);
     if (!config) return;
     const auto documents = projects().documents();
     struct SavedEntry {
+        DocumentId id{0};
+        std::shared_ptr<const ProjectSnapshot> project;
         std::filesystem::path path;
         wxString kind;
         wxString mode;
@@ -4545,13 +5970,22 @@ void MainFrame::SaveWorkspaceSession() {
     };
     std::vector<SavedEntry> entries;
     entries.reserve(std::min<std::size_t>(documents.size(), maximum_restored_documents));
+    std::size_t omitted_on_save = 0;
     long active = -1;
     const auto active_id = projects().active_document();
     for (const auto &document : documents) {
-        if (!document.uuid || entries.size() == maximum_restored_documents) continue;
+        if (!document.uuid || entries.size() == maximum_restored_documents) {
+            ++omitted_on_save;
+            continue;
+        }
         auto project = projects().project(document.id);
-        if (!project || !project->state) continue;
+        if (!project || !project->state) {
+            ++omitted_on_save;
+            continue;
+        }
         SavedEntry entry;
+        entry.id = document.id;
+        entry.project = project;
         if (document.path && !document.path->empty()) {
             entry.path = *document.path;
             entry.kind = "project";
@@ -4564,14 +5998,20 @@ void MainFrame::SaveWorkspaceSession() {
             entry.mode = "readwrite";
             auto encoded = encode_recipe(project->state->recipe);
             if (!encoded || encoded.value().size() > maximum_persisted_recipe_bytes ||
-                project->state->recipe.plugin)
+                project->state->recipe.plugin) {
+                ++omitted_on_save;
                 continue;
+            }
             const auto recipe_hex = encode_recipe_hex(encoded.value());
             entry.recipe = wxString::FromUTF8(recipe_hex.data(), recipe_hex.size());
         } else {
+            ++omitted_on_save;
             continue;
         }
-        if (entry.path.native().size() > maximum_persisted_path_characters) continue;
+        if (entry.path.native().size() > maximum_persisted_path_characters) {
+            ++omitted_on_save;
+            continue;
+        }
         if (active_id && document.id == *active_id) active = static_cast<long>(entries.size());
         if (const auto selected = projects().selection(document.id)) entry.location = *selected;
         entries.push_back(std::move(entry));
@@ -4580,11 +6020,24 @@ void MainFrame::SaveWorkspaceSession() {
     config->SetPath("/Desktop/Session");
     config->Write("Count", static_cast<long>(entries.size()));
     config->Write("Active", active);
+    config->Write("OmittedOnSave", wxString::Format("%llu",
+        static_cast<unsigned long long>(omitted_on_save)));
     for (std::size_t index = 0; index < entries.size(); ++index) {
         const auto number = static_cast<long>(index);
         config->Write(wxString::Format("Document%ldPath", number), wxString(entries[index].path.wstring()));
         config->Write(wxString::Format("Document%ldKind", number), entries[index].kind);
         config->Write(wxString::Format("Document%ldMode", number), entries[index].mode);
+        if (entries[index].kind == "binary") {
+            impl_->strings->save_preferences(*config, wxString::Format("Document%ldStrings", number),
+                                             entries[index].id, *entries[index].project, false);
+        } else if (auto actor = projects().actor(entries[index].id)) {
+            auto payload = impl_->strings->project_preference_payload(entries[index].id, *entries[index].project);
+            if (!payload.empty()) {
+                auto write = actor->write_preference("view.strings.v1", std::move(payload));
+                if (write && write.value().result.wait_for(std::chrono::seconds(2)) == std::future_status::ready)
+                    (void)write.value().result.get();
+            }
+        }
         config->DeleteEntry(wxString::Format("Document%ldLocationKind", number));
         config->DeleteEntry(wxString::Format("Document%ldLocationSpace", number));
         config->DeleteEntry(wxString::Format("Document%ldLocationOffset", number));
@@ -4605,6 +6058,21 @@ void MainFrame::SaveWorkspaceSession() {
             }
         }
     }
+    std::erase_if(impl_->comparison_sessions,
+        [](const Impl::PersistedComparisonSession &entry) { return entry.view.get() == nullptr; });
+    std::vector<std::filesystem::path> comparison_paths;
+    comparison_paths.reserve(std::min<std::size_t>(impl_->comparison_sessions.size(),
+        static_cast<std::size_t>(maximum_restored_comparison_sessions)));
+    for (const auto &entry : impl_->comparison_sessions) {
+        if (comparison_paths.size() == static_cast<std::size_t>(maximum_restored_comparison_sessions)) break;
+        if (!entry.path.empty() && entry.path.native().size() <= maximum_persisted_path_characters)
+            comparison_paths.push_back(entry.path);
+    }
+    config->Write("ComparisonCount", static_cast<long>(comparison_paths.size()));
+    for (std::size_t index = 0; index < comparison_paths.size(); ++index) {
+        config->Write(wxString::Format("Comparison%ldPath", static_cast<long>(index)),
+                      wxString(comparison_paths[index].wstring()));
+    }
     config->SetPath(previous_path);
     config->Flush();
 }
@@ -4615,17 +6083,29 @@ void MainFrame::SaveDesktopState() {
     auto normal_rect = normal_frame_rect_;
     if (!IsMaximized() && !IsIconized() && GetSize().x > 0 && GetSize().y > 0)
         normal_rect = GetRect();
-    if (normal_rect.width < 640 || normal_rect.height < 400) return;
-    const auto perspective = docking_.SavePerspective();
     const auto previous_path = config->GetPath();
     config->SetPath("/Desktop");
-    config->Write("FrameX", static_cast<long>(normal_rect.x));
-    config->Write("FrameY", static_cast<long>(normal_rect.y));
-    config->Write("FrameWidth", static_cast<long>(normal_rect.width));
-    config->Write("FrameHeight", static_cast<long>(normal_rect.height));
-    config->Write("FrameMaximized", IsMaximized());
-    if (perspective.length() <= 65536)
-        config->Write("AuiPerspective", perspective);
+    if (impl_->import_filter)
+        config->Write("ImportsFilter", impl_->import_filter->GetValue().Left(2048));
+    if (impl_->export_filter)
+        config->Write("ExportsFilter", impl_->export_filter->GetValue().Left(2048));
+    if (impl_->segment_filter)
+        config->Write("SegmentsFilter", impl_->segment_filter->GetValue().Left(2048));
+    if (impl_->symbol_filter) {
+        config->Write("SymbolsFilter", impl_->symbol_filter->GetValue().Left(2048));
+        impl_->save_project_symbol_filter(impl_->shown);
+    }
+    impl_->save_persisted_navigation(*config);
+    if (normal_rect.width >= 640 && normal_rect.height >= 400) {
+        const auto perspective = docking_.SavePerspective();
+        config->Write("FrameX", static_cast<long>(normal_rect.x));
+        config->Write("FrameY", static_cast<long>(normal_rect.y));
+        config->Write("FrameWidth", static_cast<long>(normal_rect.width));
+        config->Write("FrameHeight", static_cast<long>(normal_rect.height));
+        config->Write("FrameMaximized", IsMaximized());
+        if (perspective.length() <= 65536)
+            config->Write("AuiPerspective", perspective);
+    }
     config->SetPath(previous_path);
     config->Flush();
 }

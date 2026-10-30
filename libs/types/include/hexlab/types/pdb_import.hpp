@@ -23,6 +23,10 @@ struct PdbAggregateDeclaration {
     MemberAccess access = MemberAccess::unknown;
     bool is_static = false;
     std::optional<std::uint32_t> introducing_vtable_offset;
+    // LF_VFUNCTAB/LF_VFUNCOFF source type reference and TPI byte provenance.
+    std::uint32_t source_type_index = 0;
+    std::uint32_t source_record_offset = 0;
+    std::optional<std::uint32_t> vfptr_byte_offset;
     // Present for LF_MFUNCTION signatures; the ordinary Type function model
     // stores explicit arguments and calling convention, while these fields
     // retain the implicit this-pointer type and adjustment separately.

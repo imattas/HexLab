@@ -35,3 +35,11 @@ width and the shift amount is in range. Pseudocode models the architectural
 the W form zero-extends its result to the architectural 64-bit destination.
 The operation does not read or write NZCV. Other bitfield and extract forms
 remain outside this slice.
+
+The caller-driven `evaluate_a64_add_sub_register_instruction` evaluates
+shifted-register `ADD`, `ADDS`, `SUB`, and `SUBS` in W/X width. It revalidates
+the encoded instruction and decoded operand/register effects, then applies
+LSL, LSR, or ASR before the fixed-width arithmetic. Flag-setting forms return
+NZCV; non-flag-setting forms do not. Extended-register forms, SP-based forms,
+and unrelated opcodes return no result. Inputs are raw register bits, and the
+caller owns register-state reads and commits.

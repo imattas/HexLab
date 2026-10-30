@@ -15,14 +15,24 @@ name and raw description bytes; SHT_NOTE views are included for relocatable
 objects and deduplicated by exact note file offset. GNU property type 5 entries
 are decoded with ELF-class alignment and target byte order. Every property's
 type, raw payload and source offsets survive, including unknown types; exact
-four-byte values are also exposed as integers. The CLI identifies x86
-FEATURE_1_AND IBT/SHSTK bits and AArch64 FEATURE_1_AND BTI/PAC/GCS bits while
-showing unknown bits and bounded raw prefixes. These are file compatibility
-claims, not proof that instructions or the runtime actually enforce them.
+four-byte values are also exposed as integers. The known x86
+`GNU_PROPERTY_X86_FEATURE_1_AND`, `GNU_PROPERTY_X86_ISA_1_NEEDED`,
+`GNU_PROPERTY_X86_ISA_1_USED`, and AArch64
+`GNU_PROPERTY_AARCH64_FEATURE_1_AND` properties must have exactly four data
+bytes; unknown property types retain their bounded payload without type-specific
+size assumptions. The CLI identifies x86 FEATURE_1_AND IBT/SHSTK bits,
+x86 ISA_1_NEEDED/USED baseline/v2/v3/v4 bits, and AArch64 FEATURE_1_AND
+BTI/PAC/GCS bits while showing unknown bits and bounded raw prefixes. These are
+file compatibility claims, not proof that instructions or the runtime actually
+enforce them.
 Malformed extents and incomplete property headers are rejected within the
 bounded metadata budget. Existing ELF32/ELF64 fixtures include GNU build IDs.
 PT_LOAD access flags retain their ELF meaning during image normalization: PF_X,
 PF_W and PF_R independently set executable, writable and readable permissions.
+Allocated sections with a declared alignment greater than one must have an
+aligned virtual address; section alignment values must also remain zero, one,
+or a power of two. This rejects malformed loaded-section metadata without
+inventing file-offset alignment rules for nonallocated debug sections.
 The ELF image tests exercise all eight combinations for ELF32/ELF64 in both byte
 orders; the existing R|X-only fixtures would not expose an accidental R/X swap.
 Unknown symbol counts, CPU/endian contexts, relocations and runtime-dependent

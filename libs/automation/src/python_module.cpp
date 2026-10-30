@@ -1,13 +1,18 @@
 #include "python_internal.hpp"
 #include "hexlab/automation/api.hpp"
+#include "hexlab/analysis/signatures.hpp"
+#include "hexlab/analysis/flirt.hpp"
+#include "hexlab/analysis/strings.hpp"
 #include "hexlab/loaders/x86_raw_profile.hpp"
 #include "hexlab/processors/format.hpp"
 #include "hexlab/types/types.hpp"
 #include "hexlab/debugger/debugger.hpp"
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <stop_token>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace {
 using namespace hexlab;
@@ -41,6 +46,28 @@ const char* string_encoding_name(StringEncoding encoding){
     case StringEncoding::dos850:return "DOS-850";
     case StringEncoding::iso8859_15:return "ISO-8859-15";
     case StringEncoding::iso8859_9:return "ISO-8859-9";
+    case StringEncoding::dos866:return "DOS-866";
+    case StringEncoding::dos852:return "DOS-852";
+    case StringEncoding::koi8_r:return "KOI8-R";
+    case StringEncoding::koi8_u:return "KOI8-U";
+    case StringEncoding::mac_roman:return "Mac Roman";
+    case StringEncoding::iso8859_1:return "ISO-8859-1";
+    case StringEncoding::iso8859_3:return "ISO-8859-3";
+    case StringEncoding::iso8859_4:return "ISO-8859-4";
+    case StringEncoding::iso8859_6:return "ISO-8859-6";
+    case StringEncoding::iso8859_7:return "ISO-8859-7";
+    case StringEncoding::iso8859_10:return "ISO-8859-10";
+    case StringEncoding::iso8859_13:return "ISO-8859-13";
+    case StringEncoding::iso8859_14:return "ISO-8859-14";
+    case StringEncoding::iso8859_16:return "ISO-8859-16";
+    case StringEncoding::iso8859_8:return "ISO-8859-8";
+    case StringEncoding::iso8859_11:return "ISO-8859-11";
+    case StringEncoding::windows874:return "Windows-874";
+    case StringEncoding::mac_cyrillic:return "Mac Cyrillic";
+    case StringEncoding::ebcdic_cp037:return "EBCDIC CP037";
+    case StringEncoding::ebcdic_cp500:return "EBCDIC CP500";
+    case StringEncoding::ebcdic_cp1047:return "EBCDIC CP1047";
+    case StringEncoding::windows932:return "Windows-932";
     }
     return "unknown";
 }
@@ -111,6 +138,8 @@ types::FunctionConvention function_convention(std::string_view value){
     if(value=="aapcs64")return Convention::aapcs64;
     if(value=="aapcs32")return Convention::aapcs32;
     if(value=="mips_n64")return Convention::mips_n64;
+    if(value=="mips_n32")return Convention::mips_n32;
+    if(value=="aapcs32_vfp")return Convention::aapcs32_vfp;
     invalid("Unknown function calling convention");return Convention::platform_default;
 }
 std::string_view function_convention_name(types::FunctionConvention value){
@@ -127,6 +156,8 @@ std::string_view function_convention_name(types::FunctionConvention value){
     case Convention::aapcs64:return "aapcs64";
     case Convention::aapcs32:return "aapcs32";
     case Convention::mips_n64:return "mips_n64";
+    case Convention::mips_n32:return "mips_n32";
+    case Convention::aapcs32_vfp:return "aapcs32_vfp";
     }
     invalid("Unknown native function calling convention");return "platform_default";
 }
@@ -213,6 +244,15 @@ types::TypePtr type_value(PyObject* object,std::size_t depth=0){
 void set(PyObject* dict,const char* key,PyObject* value){Object owned(value);if(PyDict_SetItemString(dict,key,owned)<0)throw PythonFailure{};}
 void append(PyObject* list,PyObject* value){Object owned(value);if(PyList_Append(list,owned)<0)throw PythonFailure{};}
 PyObject* none(){Py_INCREF(Py_None);return Py_None;}
+PyObject* encode_external(const ExternalIdentity& external){
+    Object record(PyDict_New());
+    set(record,"library",string(external.library));
+    set(record,"name",external.name?string(*external.name):none());
+    set(record,"ordinal",external.ordinal?integer(*external.ordinal):none());
+    set(record,"wasm_function_index",external.wasm_function_index?integer(*external.wasm_function_index):none());
+    set(record,"host_binding",external.host_binding?string(*external.host_binding):none());
+    return record.release();
+}
 PyObject* encode_snapshot(const ProjectSnapshot& snapshot){
     Object out(PyDict_New());
     set(out,"edit_revision",integer(snapshot.state->revisions.edit));
@@ -277,6 +317,14 @@ PyObject* encode_history_page(const database::HistoryPage& page){
         set(item,"applied",PyBool_FromLong(row.applied));append(rows,item.release());
     }
     set(result,"entries",rows.release());return result.release();
+}
+PyObject* encode_history_audit_page(const database::HistoryAuditPage& page){
+    Object result(PyDict_New());set(result,"project_uuid",encode_uuid(page.uuid));
+    set(result,"source_revisions",encode_revisions(page.source_revisions));
+    set(result,"history_cursor",integer(page.history_cursor));set(result,"history_count",integer(page.history_count));
+    set(result,"next_after_step",page.has_more?integer(page.next_after_step):none());
+    set(result,"entries_verified",integer(page.entries_verified));set(result,"delta_bytes",integer(page.delta_bytes));
+    set(result,"has_more",PyBool_FromLong(page.has_more));return result.release();
 }
 PyObject* encode_historical_metadata(const automation::HistoricalState& state){
     const auto& metadata=state.metadata();const auto& user=*metadata.user;
@@ -482,6 +530,74 @@ std::size_t strict_size(PyObject* value,const char* label){
     if(converted>SIZE_MAX)invalid(label);
     return static_cast<std::size_t>(converted);
 }
+class AnalysisProgressBridge {
+public:
+    explicit AnalysisProgressBridge(PyObject* callable):callable_(callable){}
+    AnalysisProgressBridge(const AnalysisProgressBridge&)=delete;
+    ~AnalysisProgressBridge(){Py_XDECREF(error_type_);Py_XDECREF(error_value_);Py_XDECREF(error_traceback_);}
+    bool invoke(std::string_view stage,std::uint64_t completed,std::uint64_t total) noexcept {
+        if(!callable_ || error_type_ || canceled_)return false;
+        const auto state=PyGILState_Ensure();
+        const char* stage_text=stage=="instruction-discovery"?"instruction-discovery":
+            stage=="complete"?"complete":nullptr;
+        if(!stage_text){PyErr_SetString(PyExc_ValueError,"Unknown native analysis progress stage");capture_error();PyGILState_Release(state);return false;}
+        PyObject* value=PyObject_CallFunction(callable_,"sKK",stage_text,
+            static_cast<unsigned long long>(completed),static_cast<unsigned long long>(total));
+        if(!value){capture_error();PyGILState_Release(state);return false;}
+        bool keep_going=true;
+        if(value!=Py_None){
+            const auto truth=PyObject_IsTrue(value);
+            if(truth<0){Py_DECREF(value);capture_error();PyGILState_Release(state);return false;}
+            keep_going=truth!=0;
+        }
+        Py_DECREF(value);
+        canceled_=!keep_going;
+        PyGILState_Release(state);
+        return keep_going;
+    }
+    void restore_exception(){
+        if(!error_type_)return;
+        auto* type=error_type_;auto* value=error_value_;auto* traceback=error_traceback_;
+        error_type_=nullptr;error_value_=nullptr;error_traceback_=nullptr;
+        PyErr_Restore(type,value,traceback);
+        throw PythonFailure{};
+    }
+    bool canceled()const noexcept{return canceled_;}
+    bool enabled()const noexcept{return callable_!=nullptr;}
+private:
+    void capture_error()noexcept{
+        if(!error_type_)PyErr_Fetch(&error_type_,&error_value_,&error_traceback_);
+        canceled_=true;
+    }
+    PyObject* callable_=nullptr; // borrowed for the duration of the synchronous API call
+    PyObject* error_type_=nullptr;PyObject* error_value_=nullptr;PyObject* error_traceback_=nullptr;
+    bool canceled_=false;
+};
+AnalysisOptions analysis_options(Project& project,PyObject* updates,AnalysisProgressBridge& progress){
+    if(!PyDict_Check(updates))invalid("analysis options must be a dictionary");
+    auto options=take(project.snapshot())->analysis_options;
+    options.progress={};
+    auto budget=[](PyObject* value,const char* name,std::size_t maximum){
+        const auto result=strict_size(value,name);
+        if(!result||result>maximum)invalid(name);
+        return result;
+    };
+    Py_ssize_t position=0;PyObject* key=nullptr;PyObject* value=nullptr;
+    while(PyDict_Next(updates,&position,&key,&value)){
+        const auto name=text(key);
+        if(name=="instruction_budget")options.instruction_budget=budget(value,"instruction_budget must be in 1..50000000",50'000'000);
+        else if(name=="string_budget")options.string_budget=budget(value,"string_budget must be in 1..10000000",10'000'000);
+        else if(name=="string_scan_work_budget")options.string_scan_work_budget=budget(value,"string_scan_work_budget must be in 1..500000000",500'000'000);
+        else if(name=="function_budget")options.function_budget=budget(value,"function_budget must be in 1..1000000",1'000'000);
+        else if(name=="block_budget")options.block_budget=budget(value,"block_budget must be in 1..10000000",10'000'000);
+        else if(name=="membership_budget")options.membership_budget=budget(value,"membership_budget must be in 1..100000000",100'000'000);
+        else if(name=="min_string_characters")options.min_string_characters=budget(value,"min_string_characters must be in 1..64",64);
+        else invalid("Unknown analysis option");
+    }
+    if(progress.enabled())
+        options.progress=[&progress](std::string_view stage,std::uint64_t done,std::uint64_t total){return progress.invoke(stage,done,total);};
+    return options;
+}
 debugger::MemorySearchOptions memory_search_options(PyObject* value){
     if(!PyDict_Check(value))invalid("memory search options must be a dictionary");
     static constexpr std::string_view names[]{"ranges","writable","executable","alignment","chunk_size","max_bytes","max_comparisons","max_results","max_read_failures","stop_on_read_failure"};
@@ -535,7 +651,40 @@ PyObject* call_debugger(PyObject*,PyObject* args){return guarded([&]()->PyObject
         return result.release();
     }
     if(method=="launch"){
-        count(values,3);debugger::Target target;target.executable=text(argument(values,0));target.working_directory=text(argument(values,2));auto* argv=argument(values,1);if(!PyList_Check(argv)&&!PyTuple_Check(argv))invalid("debugger arguments must be a sequence of strings");if(PySequence_Size(argv)>4096)invalid("too many debugger arguments");for(Py_ssize_t i=0;i<PySequence_Size(argv);++i){Object value(PySequence_GetItem(argv,i));target.arguments.push_back(text(value));}auto process=without_gil([&]{return session.launch(target);});return encode_process(take(std::move(process)));
+        if(!PyTuple_Check(values))invalid("launch arguments must be a tuple");
+        const auto value_count=PyTuple_Size(values);
+        if(value_count!=3&&value_count!=4)invalid("launch requires executable, arguments, working directory, and optional remote environment");
+        debugger::Target target;target.executable=text(argument(values,0));target.working_directory=text(argument(values,2));
+        auto* argv=argument(values,1);
+        if(!PyList_Check(argv)&&!PyTuple_Check(argv))invalid("debugger arguments must be a sequence of strings");
+        if(PySequence_Size(argv)>4096)invalid("too many debugger arguments");
+        for(Py_ssize_t i=0;i<PySequence_Size(argv);++i){Object value(PySequence_GetItem(argv,i));target.arguments.push_back(text(value));}
+        if(value_count==4&&argument(values,3)!=Py_None){
+            auto* environment=argument(values,3);
+            if(!PyList_Check(environment)&&!PyTuple_Check(environment))invalid("remote environment must be a sequence of (name, value-or-None) pairs");
+            const auto change_count=PySequence_Size(environment);
+            if(change_count<0)throw PythonFailure{};
+            if(change_count>256)invalid("remote environment exceeds 256 changes");
+            std::unordered_set<std::string> names;std::uint64_t total_bytes=0;
+            for(Py_ssize_t i=0;i<change_count;++i){
+                Object item(PySequence_GetItem(environment,i));
+                if(!PyTuple_Check(item)&&!PyList_Check(item))invalid("each remote environment change must be a (name, value-or-None) pair");
+                if(PySequence_Size(item)!=2)invalid("each remote environment change must contain two values");
+                Object name_object(PySequence_GetItem(item,0)),value_object(PySequence_GetItem(item,1));
+                debugger::RemoteEnvironmentChange change;change.name=text(name_object.value);
+                if(value_object.value!=Py_None)change.value=text(value_object.value);
+                if(change.name.empty()||change.name.find('=')!=std::string::npos||change.name.find('\0')!=std::string::npos||
+                   (change.value&&change.value->find('\0')!=std::string::npos))
+                    invalid("remote environment names must be nonempty without '=' or NUL, and values cannot contain NUL");
+                if(change.name.size()>4096||(change.value&&change.value->size()>16*1024))
+                    invalid("remote environment name or value exceeds its byte limit");
+                if(!names.insert(change.name).second)invalid("remote environment repeats a variable name");
+                const auto cost=change.name.size()+(change.value?change.value->size():0);
+                if(cost>64*1024-total_bytes)invalid("remote environment exceeds the 64 KiB byte limit");
+                total_bytes+=cost;target.remote_environment.push_back(std::move(change));
+            }
+        }
+        auto process=without_gil([&]{return session.launch(target);});return encode_process(take(std::move(process)));
     }
     if(method=="attach"){count(values,1);const auto process_id=number(argument(values,0));auto process=without_gil([&]{return session.attach(process_id);});return encode_process(take(std::move(process)));}
     if(method=="connect_remote"){count(values,2);auto port=number32(argument(values,1));if(port==0||port>65535)invalid("remote port must be in 1..65535");const auto host=text(argument(values,0));auto process=without_gil([&]{return session.connect_remote(host,static_cast<std::uint16_t>(port));});return encode_process(take(std::move(process)));}
@@ -681,6 +830,40 @@ PyObject* restore_backup_in_place(PyObject*,PyObject* args){return guarded([&]()
     auto stop=argument(args,3)==Py_None?std::stop_token{}:stop_source(argument(args,3)).get_token();
     return encode_saved_project(take(without_gil([&]{return Project::restore_backup_in_place(backup,target,version,stop);} )));
 });}
+PyObject* inspect_recovery_directory(PyObject*,PyObject* args){return guarded([&]()->PyObject*{
+    count(args,3);const auto directory=path(argument(args,0));const auto version=number32(argument(args,1));
+    auto stop=argument(args,2)==Py_None?std::stop_token{}:stop_source(argument(args,2)).get_token();
+    const auto scan=take(without_gil([&]{return Project::inspect_recovery_directory(directory,version,stop);}));
+    Object result(PyDict_New()),candidates(PyList_New(0)),issues(PyList_New(0));
+    set(result,"visited_entries",integer(scan.visited_entries));
+    set(result,"matching_names",integer(scan.matching_names));
+    set(result,"complete",PyBool_FromLong(scan.complete));
+    set(result,"omitted_candidates",integer(scan.omitted_candidates));
+    set(result,"rejected_entries",integer(scan.rejected_entries));
+    set(result,"omitted_issues",integer(scan.omitted_issues));
+    for(const auto& candidate:scan.candidates){
+        Object item(PyDict_New());
+        set(item,"path",string(path_utf8(candidate.path)));
+        set(item,"uuid",encode_uuid(candidate.uuid));
+        set(item,"kind",string(candidate.kind==database::RecoveryArtifactKind::interrupted_save
+            ? "interrupted-save" : "previous-version"));
+        set(item,"revisions",encode_revisions(candidate.revisions));
+        append(candidates,item.release());
+    }
+    for(const auto& issue:scan.issues){
+        Object item(PyDict_New());set(item,"name",string(issue.name));set(item,"reason",string(issue.reason));
+        append(issues,item.release());
+    }
+    set(result,"candidates",candidates.release());set(result,"issues",issues.release());
+    return result.release();
+});}
+PyObject* restore_recovery_artifact(PyObject*,PyObject* args){return guarded([&]()->PyObject*{
+    count(args,5);const auto artifact=path(argument(args,0)),destination=path(argument(args,1));
+    const auto replace=boolean(argument(args,2));const auto version=number32(argument(args,3));
+    auto stop=argument(args,4)==Py_None?std::stop_token{}:stop_source(argument(args,4)).get_token();
+    return encode_saved_project(take(without_gil([&]{return Project::restore_recovery_artifact(
+        artifact,destination,replace,version,stop);} )));
+});}
 PyObject* call_archive(PyObject*,PyObject* args){return guarded([&]()->PyObject*{
     count(args,3);auto& owner=archive(argument(args,0));const auto method=text(argument(args,1));auto* values=argument(args,2);
     if(method=="summary"){
@@ -688,6 +871,8 @@ PyObject* call_archive(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         set(item,"member_count",integer(row.member_count));set(item,"symbol_count",integer(row.symbol_count));
         set(item,"has_symbol_index",PyBool_FromLong(row.has_symbol_index));
         set(item,"symbol_index_complete",PyBool_FromLong(row.symbol_index_complete));
+        set(item,"thin",PyBool_FromLong(row.thin));
+        set(item,"aix_big",PyBool_FromLong(row.aix_big));
         for(const auto& diagnostic:row.diagnostics)append(diagnostics,string(diagnostic));
         set(item,"diagnostics",diagnostics.release());return item.release();
     }
@@ -695,7 +880,7 @@ PyObject* call_archive(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         count(values,2);const auto rows=take(owner.members(size(argument(values,0)),size(argument(values,1))));Object list(PyList_New(0));
         for(const auto& row:rows){Object item(PyDict_New());set(item,"index",integer(row.index));set(item,"name",string(row.name));
             set(item,"header_offset",integer(row.header_offset.value));set(item,"data_offset",integer(row.data_offset.value));
-            set(item,"size",integer(row.size));const char* kind=row.kind==ArMemberKind::regular?"regular":row.kind==ArMemberKind::symbol_index?"symbol_index":"long_name_table";
+            set(item,"size",integer(row.size));const char* kind=row.kind==ArMemberKind::regular?"regular":row.kind==ArMemberKind::thin_external?"thin_external":row.kind==ArMemberKind::symbol_index?"symbol_index":row.kind==ArMemberKind::member_table?"member_table":"long_name_table";
             set(item,"kind",string(kind));append(list,item.release());}
         return list.release();
     }
@@ -879,6 +1064,14 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         const auto stop=argument(values,3)==Py_None?std::stop_token{}:stop_source(argument(values,3)).get_token();
         auto page=take(without_gil([&]{return p.history(after,amount,expected,stop);}));return encode_history_page(page);
     }
+    if(method=="audit_history"){
+        count(values,5);const auto after=number(argument(values,0));
+        const database::HistoryAuditLimits limits{size(argument(values,1)),size(argument(values,2))};
+        const auto expected=argument(values,3)==Py_None?std::optional<std::uint64_t>{}:number(argument(values,3));
+        const auto stop=argument(values,4)==Py_None?std::stop_token{}:stop_source(argument(values,4)).get_token();
+        auto page=take(without_gil([&]{return p.audit_history(after,limits,expected,stop);}));
+        return encode_history_audit_page(page);
+    }
     if(method=="preview_history"){
         count(values,5);const auto target=number(argument(values,0));
         const database::HistoryPreviewLimits limits{size(argument(values,1)),size(argument(values,2))};
@@ -902,6 +1095,222 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         for(const auto& row:rows)append(list,encode_function(row));
         return list.release();
     }
+    if(method=="recognize_flirt_catalogs"){
+        count(values,3);
+        auto *selection=argument(values,0);
+        if(!PyList_Check(selection)&&!PyTuple_Check(selection))invalid("catalogs must be a list or tuple");
+        const auto selected_count=PySequence_Size(selection);
+        if(selected_count<1||selected_count>256)invalid("catalogs must contain 1 through 256 entries");
+        struct CatalogInput { std::vector<std::byte> bytes; std::string provenance; };
+        std::vector<CatalogInput> inputs;inputs.reserve(static_cast<std::size_t>(selected_count));
+        std::uint64_t aggregate_bytes=0;
+        constexpr std::uint64_t max_catalog_bytes=64u*1024u*1024u;
+        for(Py_ssize_t index=0;index<selected_count;++index){
+            Object item(PySequence_GetItem(selection,index));
+            if(!PyTuple_Check(item)||PyTuple_Size(item)!=2)invalid("each catalog must be a (bytes, provenance) tuple");
+            PyObject *data=PyTuple_GetItem(item,0), *provenance_object=PyTuple_GetItem(item,1);
+            if(!PyBytes_Check(data))invalid("catalog contents must be bytes");
+            char *raw=nullptr;Py_ssize_t raw_size=0;
+            if(PyBytes_AsStringAndSize(data,&raw,&raw_size)<0)throw PythonFailure{};
+            if(raw_size<0||static_cast<std::uint64_t>(raw_size)>max_catalog_bytes-aggregate_bytes)
+                invalid("aggregate catalog bytes exceed 64 MiB");
+            auto provenance=text(provenance_object);
+            if(provenance.size()>256)invalid("catalog provenance exceeds 256 UTF-8 bytes");
+            CatalogInput input;input.bytes.resize(static_cast<std::size_t>(raw_size));
+            if(raw_size)std::memcpy(input.bytes.data(),raw,static_cast<std::size_t>(raw_size));
+            input.provenance=std::move(provenance);aggregate_bytes+=static_cast<std::uint64_t>(raw_size);
+            inputs.push_back(std::move(input));
+        }
+        const auto expected_revision=argument(values,1)==Py_None?std::optional<std::uint64_t>{}:
+            std::optional<std::uint64_t>{strict_unsigned(argument(values,1),"expected_revision must be an unsigned integer, not bool")};
+        const auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();
+        auto recognition=take(without_gil([&]()->Result<FlirtRecognition>{
+            auto initial=p.snapshot();if(!initial)return initial.error();
+            const auto snapshot=initial.value();
+            if(expected_revision&&*expected_revision!=snapshot->state->revisions.edit)
+                return Error{ErrorCode::conflict,"FLAIR query expected a different project edit revision"};
+            if(!snapshot->loaded||!snapshot->loaded->image||!snapshot->effective||!snapshot->functions)
+                return Error{ErrorCode::invalid_argument,"FLAIR recognition requires a loaded image and recovered functions"};
+            std::vector<FlirtCatalog> catalogs;catalogs.reserve(inputs.size());
+            FlirtRecognitionLimits recognition_limits;
+            std::uint64_t inflated_bytes=0,pattern_count=0;
+            const auto &image=*snapshot->loaded->image;
+            for(const auto &input:inputs){
+                if(stop.stop_requested())return Error{ErrorCode::canceled,"FLAIR recognition canceled"};
+                FlirtCatalogLimits catalog_limits;
+                catalog_limits.max_inflated_bytes=static_cast<std::size_t>(
+                    std::max<std::uint64_t>(1,catalog_limits.max_inflated_bytes-inflated_bytes));
+                catalog_limits.max_patterns=static_cast<std::size_t>(std::min<std::uint64_t>(
+                    catalog_limits.max_patterns,recognition_limits.max_patterns-pattern_count));
+                const auto bytes=std::span<const std::byte>(input.bytes);
+                const auto data=std::string_view(input.bytes.empty()?"":reinterpret_cast<const char*>(input.bytes.data()),
+                                                 input.bytes.size());
+                Result<FlirtCatalog> parsed=Error{ErrorCode::unsupported,"Unsupported FLAIR catalog format"};
+                if(data.size()>=6&&data.substr(0,6)=="IDASGN")
+                    parsed=parse_flirt_sig(bytes,input.provenance,catalog_limits,stop);
+                else if(bytes.size()>=2&&bytes[0]==std::byte{0x1f}&&bytes[1]==std::byte{0x8b})
+                    parsed=parse_flirt_pat_gz(bytes,image.layout().architecture,image.layout().mode,
+                                               input.provenance,catalog_limits,stop);
+                else
+                    parsed=parse_flirt_pat(data,image.layout().architecture,image.layout().mode,
+                                            input.provenance,catalog_limits,stop);
+                if(!parsed)return parsed.error();
+                if(parsed.value().inflated_body_bytes>catalog_limits.max_inflated_bytes)
+                    return Error{ErrorCode::resource_limit,"FLAIR catalogs exceed aggregate inflated-byte limit"};
+                if(parsed.value().patterns.size()>recognition_limits.max_patterns-pattern_count)
+                    return Error{ErrorCode::resource_limit,"FLAIR catalogs exceed aggregate pattern limit"};
+                inflated_bytes+=parsed.value().inflated_body_bytes;
+                pattern_count+=parsed.value().patterns.size();
+                catalogs.push_back(std::move(parsed.value()));
+            }
+            auto result=recognize_flirt_catalogs(image,*snapshot->effective,*snapshot->functions,
+                                                  catalogs,recognition_limits,stop);
+            if(!result)return result.error();
+            auto current=p.snapshot();if(!current)return current.error();
+            if(current.value()->state->revisions.edit!=snapshot->state->revisions.edit||
+               current.value()->state->revisions.bytes!=snapshot->state->revisions.bytes)
+                return Error{ErrorCode::conflict,"Project changed during FLAIR recognition"};
+            return result.value();
+        }));
+        Object output(PyDict_New()),functions(PyList_New(0));
+        set(output,"complete",PyBool_FromLong(recognition.complete));
+        set(output,"pattern_candidates",integer(recognition.pattern_candidates));
+        set(output,"comparisons",integer(recognition.comparisons));
+        for(const auto &match:recognition.functions){
+            Object function(PyDict_New()),candidates(PyList_New(0));
+            set(function,"function_id",integer(match.function.value));
+            set(function,"entry",encode(match.entry));
+            set(function,"ambiguous",PyBool_FromLong(match.ambiguous));
+            for(const auto &candidate:match.candidates){
+                Object row(PyDict_New());
+                set(row,"catalog_index",integer(candidate.catalog_index));
+                set(row,"name",string(candidate.name));set(row,"provenance",string(candidate.provenance));
+                set(row,"kind",string(candidate.kind==FlirtSymbolKind::local_name?"local":"public"));
+                set(row,"matching_patterns",integer(candidate.matching_patterns));
+                append(candidates,row.release());
+            }
+            set(function,"candidates",candidates.release());append(functions,function.release());
+        }
+        set(output,"functions",functions.release());return output.release();
+    }
+    if(method=="function_fingerprint_catalog"){
+        count(values,7);
+        auto *selection=argument(values,0);
+        if(!PyList_Check(selection)&&!PyTuple_Check(selection))invalid("function_ids must be a list or tuple");
+        const auto selected_count=PySequence_Size(selection);
+        if(selected_count<1||selected_count>4096)invalid("function_ids must contain 1 through 4,096 IDs");
+        std::vector<FunctionId> ids;ids.reserve(static_cast<std::size_t>(selected_count));
+        for(Py_ssize_t index=0;index<selected_count;++index){
+            Object item(PySequence_GetItem(selection,index));
+            ids.push_back({strict_unsigned(item,"function IDs must be unsigned integers, not bool")});
+        }
+        const auto provenance=text(argument(values,1));
+        const FunctionFingerprintOptions options{
+            strict_size(argument(values,2),"max_instructions must be an unsigned integer, not bool"),
+            strict_size(argument(values,3),"max_blocks must be an unsigned integer, not bool"),
+            strict_size(argument(values,4),"max_token_bytes must be an unsigned integer, not bool")};
+        const auto expected_revision=argument(values,5)==Py_None?std::optional<std::uint64_t>{}:
+            std::optional<std::uint64_t>{strict_unsigned(argument(values,5),"expected_revision must be an unsigned integer, not bool")};
+        const auto stop=argument(values,6)==Py_None?std::stop_token{}:stop_source(argument(values,6)).get_token();
+        auto serialized=take(without_gil([&]()->Result<std::string>{
+            auto source=p.snapshot();if(!source)return source.error();
+            const auto snapshot=source.value();
+            if(expected_revision&&*expected_revision!=snapshot->state->revisions.edit)
+                return Error{ErrorCode::conflict,"Fingerprint selection expected a different project edit revision"};
+            if(!snapshot->loaded||!snapshot->functions||!snapshot->effective)
+                return Error{ErrorCode::invalid_argument,"Fingerprint catalog requires a loaded image and recovered functions"};
+            auto catalog=create_function_fingerprint_catalog(*snapshot->loaded->image,
+                *snapshot->effective,*snapshot->functions,ids,provenance,options,stop);
+            if(!catalog)return catalog.error();
+            auto output=serialize_function_fingerprint_catalog(catalog.value());
+            if(!output)return output.error();
+            auto current=p.snapshot();if(!current)return current.error();
+            if(current.value()->state->revisions.edit!=snapshot->state->revisions.edit||
+               current.value()->state->revisions.bytes!=snapshot->state->revisions.bytes)
+                return Error{ErrorCode::conflict,"Project changed while fingerprint catalog was being created"};
+            return output.value();
+        }));
+        return string(serialized);
+    }
+    if(method=="function_signature_catalog"){
+        count(values,6);
+        auto *selection=argument(values,0);
+        if(!PyList_Check(selection)&&!PyTuple_Check(selection))invalid("function_ids must be a list or tuple");
+        const auto selected_count=PySequence_Size(selection);
+        if(selected_count<1||selected_count>4096)invalid("function_ids must contain 1 through 4,096 IDs");
+        std::vector<FunctionId> ids;ids.reserve(static_cast<std::size_t>(selected_count));
+        for(Py_ssize_t index=0;index<selected_count;++index){
+            Object item(PySequence_GetItem(selection,index));
+            ids.push_back({strict_unsigned(item,"function IDs must be unsigned integers, not bool")});
+        }
+        const auto provenance=text(argument(values,1));
+        const FunctionSignatureOptions options{
+            strict_size(argument(values,2),"max_bytes must be an unsigned integer, not bool"),
+            strict_size(argument(values,3),"min_exact_bytes must be an unsigned integer, not bool")};
+        const auto expected_revision=argument(values,4)==Py_None?std::optional<std::uint64_t>{}:
+            std::optional<std::uint64_t>{strict_unsigned(argument(values,4),"expected_revision must be an unsigned integer, not bool")};
+        const auto stop=argument(values,5)==Py_None?std::stop_token{}:stop_source(argument(values,5)).get_token();
+        auto serialized=take(without_gil([&]()->Result<std::string>{
+            auto source=p.snapshot();if(!source)return source.error();
+            const auto snapshot=source.value();
+            if(expected_revision&&*expected_revision!=snapshot->state->revisions.edit)
+                return Error{ErrorCode::conflict,"Signature selection expected a different project edit revision"};
+            if(!snapshot->loaded||!snapshot->functions||!snapshot->effective)
+                return Error{ErrorCode::invalid_argument,"Signature catalog requires a loaded image and recovered functions"};
+            auto catalog=create_function_signature_catalog(*snapshot->loaded->image,
+                *snapshot->effective,*snapshot->functions,ids,provenance,options,stop);
+            if(!catalog)return catalog.error();
+            auto output=serialize_signature_catalog(catalog.value());
+            if(!output)return output.error();
+            auto current=p.snapshot();if(!current)return current.error();
+            if(current.value()->state->revisions.edit!=snapshot->state->revisions.edit||
+               current.value()->state->revisions.bytes!=snapshot->state->revisions.bytes)
+                return Error{ErrorCode::conflict,"Project changed while signature catalog was being created"};
+            return output.value();
+        }));
+        return string(serialized);
+    }
+    if(method=="recognize_function_signatures"){
+        count(values,3);
+        const auto encoded=text(argument(values,0));
+        const auto expected_revision=argument(values,1)==Py_None?std::optional<std::uint64_t>{}:
+            std::optional<std::uint64_t>{strict_unsigned(argument(values,1),"expected_revision must be an unsigned integer, not bool")};
+        const auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();
+        if(encoded.size()>64u*1024u*1024u)invalid("signature catalog exceeds 64 MiB");
+        auto recognition=take(without_gil([&]()->Result<FunctionSignatureRecognition>{
+            auto source=p.snapshot();if(!source)return source.error();
+            const auto snapshot=source.value();
+            if(expected_revision&&*expected_revision!=snapshot->state->revisions.edit)
+                return Error{ErrorCode::conflict,"Signature query expected a different project edit revision"};
+            if(!snapshot->loaded||!snapshot->functions||!snapshot->effective)
+                return Error{ErrorCode::invalid_argument,"Signature recognition requires a loaded image and recovered functions"};
+            auto catalog=parse_signature_catalog(encoded);if(!catalog)return catalog.error();
+            SignatureLimits limits;limits.max_results=4096;
+            auto result=recognize_function_signatures(*snapshot->loaded->image,*snapshot->effective,
+                *snapshot->functions,catalog.value(),limits,stop);
+            if(!result)return result.error();
+            auto current=p.snapshot();if(!current)return current.error();
+            if(current.value()->state->revisions.edit!=snapshot->state->revisions.edit||
+               current.value()->state->revisions.bytes!=snapshot->state->revisions.bytes)
+                return Error{ErrorCode::conflict,"Project changed during signature recognition"};
+            return result.value();
+        }));
+        Object output(PyDict_New()),functions(PyList_New(0));
+        set(output,"complete",PyBool_FromLong(recognition.complete));
+        set(output,"candidates",integer(recognition.candidates));set(output,"comparisons",integer(recognition.comparisons));
+        for(const auto &match:recognition.functions){
+            Object function(PyDict_New()),candidates(PyList_New(0));
+            set(function,"function_id",integer(match.function.value));set(function,"entry",encode(match.entry));
+            set(function,"ambiguous",PyBool_FromLong(match.ambiguous));
+            for(const auto &candidate:match.candidates){Object row(PyDict_New());
+                set(row,"name",string(candidate.name));set(row,"provenance",string(candidate.provenance));
+                set(row,"catalog_index",integer(candidate.catalog_index));set(row,"definition_index",integer(candidate.definition_index));
+                set(row,"address",encode(candidate.address));set(row,"file_offset",integer(candidate.offset.value));
+                append(candidates,row.release());}
+            set(function,"candidates",candidates.release());append(functions,function.release());
+        }
+        set(output,"functions",functions.release());return output.release();
+    }
     if(method=="function_at"){
         count(values,1);auto row=take(p.function_at(address(argument(values,0))));
         return row?encode_function(*row):none();
@@ -910,6 +1319,20 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         count(values,1);auto rows=take(p.function_owners(address(argument(values,0))));Object list(PyList_New(0));
         for(const auto& row:rows){Object item(PyDict_New());set(item,"id",integer(row.id.value));set(item,"entry",encode(row.entry));append(list,item.release());}
         return list.release();
+    }
+    if(method=="call_graph_model"){
+        count(values,5);const auto target=address(argument(values,0));
+        GraphOptions options;options.call_depth=strict_size(argument(values,1),"call_depth must be an unsigned integer");
+        options.node_budget=strict_size(argument(values,2),"node_budget must be an unsigned integer");
+        options.edge_budget=strict_size(argument(values,3),"edge_budget must be an unsigned integer");
+        if(options.call_depth<1||options.call_depth>4||options.node_budget<1||options.node_budget>1000000||options.edge_budget<1||options.edge_budget>4000000)
+            invalid("Call graph options exceed supported bounds");
+        const auto stop=argument(values,4)==Py_None?std::stop_token{}:stop_source(argument(values,4)).get_token();
+        auto encoded=take(without_gil([&]()->Result<std::string>{
+            auto model=p.call_graph(target,options,stop);if(!model)return model.error();
+            return export_graph_json(*model.value(),stop);
+        }));
+        return string(encoded);
     }
     if(method=="stack_frame"){
         count(values,1);auto row=take(p.stack_frame(address(argument(values,0))));
@@ -923,7 +1346,38 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         for(const auto& row:rows){Object item(PyDict_New());set(item,"offset_from_entry_sp",signed_integer(row.offset_from_entry_sp));
             set(item,"width",integer(row.width));set(item,"access_count",integer(row.access_count));
             set(item,"read",PyBool_FromLong(row.read));set(item,"written",PyBool_FromLong(row.written));
-            set(item,"address_taken",PyBool_FromLong(row.address_taken));append(list,item.release());}
+            set(item,"address_taken",PyBool_FromLong(row.address_taken));
+            set(item,"incoming_argument",PyBool_FromLong(row.incoming_argument));
+            set(item,"outgoing_call_argument_count",integer(row.outgoing_call_argument_count));
+            const char *abi = nullptr;
+            if(row.incoming_argument_abi)switch(*row.incoming_argument_abi){
+                case StackArgumentAbi::x86_32_near_call:abi="x86-32-near-call";break;
+                case StackArgumentAbi::sysv_x86_64:abi="sysv-x86-64";break;
+                case StackArgumentAbi::windows_x64:abi="windows-x64";break;
+                case StackArgumentAbi::aapcs64:abi="aapcs64";break;
+                case StackArgumentAbi::riscv32:abi="riscv32";break;
+                case StackArgumentAbi::riscv64:abi="riscv64";break;
+                case StackArgumentAbi::aapcs32:abi="aapcs32";break;
+                case StackArgumentAbi::mips_o32:abi="mips_o32";break;
+                case StackArgumentAbi::ppc64le_elfv2:abi="ppc64le-elfv2";break;
+                case StackArgumentAbi::x86_32_callee_cleanup:abi="x86-32-callee-cleanup";break;
+                case StackArgumentAbi::mips_n64:abi="mips-n64";break;
+            }
+            set(item,"incoming_argument_abi",abi?Object(PyUnicode_FromString(abi)):none());append(list,item.release());}
+        return list.release();
+    }
+    if(method=="stack_slot_call_arguments"){
+        count(values,4);auto rows=take(p.stack_slot_call_arguments(address(argument(values,0)),size(argument(values,1)),size(argument(values,2)),size(argument(values,3))));Object list(PyList_New(0));
+        for(const auto& row:rows){Object item(PyDict_New());set(item,"push_instruction",encode(row.push_instruction));
+            set(item,"call_instruction",encode(row.call_instruction));
+            set(item,"source_instruction",encode(row.source_instruction));
+            const char *source_kind = row.source_kind==StackCallArgumentSourceKind::x86_push ? "x86-push" :
+                row.source_kind==StackCallArgumentSourceKind::windows_x64_shadow_store ? "windows-x64-shadow-store" :
+                row.source_kind==StackCallArgumentSourceKind::riscv_store ? "riscv-store" :
+                row.source_kind==StackCallArgumentSourceKind::powerpc_store ? "powerpc-store" :
+                row.source_kind==StackCallArgumentSourceKind::mips_store ? "mips-store" :
+                row.source_kind==StackCallArgumentSourceKind::aapcs32_store ? "aapcs32-store" : "aarch64-store";
+            set(item,"source_kind",PyUnicode_FromString(source_kind));append(list,item.release());}
         return list.release();
     }
     if(method=="stack_slot_accesses"){
@@ -980,9 +1434,39 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
             set(item,"writable",PyBool_FromLong(row.writable));set(item,"executable",PyBool_FromLong(row.executable));append(list,item.release());}
         return list.release();
     }
+    if(method=="addresses_for_file_offset"){
+        count(values,1);auto rows=take(p.addresses_for_file_offset(FileOffset{number(argument(values,0))}));
+        Object list(PyList_New(0));for(const auto& row:rows)append(list,encode(Location{row}));return list.release();
+    }
+    if(method=="pe_imports"){
+        count(values,2);auto rows=take(p.pe_imports(size(argument(values,0)),size(argument(values,1))));Object list(PyList_New(0));
+        for(const auto& row:rows){Object item(PyDict_New());set(item,"library",string(row.library));
+            set(item,"name",row.name?string(*row.name):none());set(item,"ordinal",row.ordinal?integer(*row.ordinal):none());
+            set(item,"thunk",encode(Location{row.thunk}));set(item,"iat",encode(Location{row.iat}));
+            set(item,"delay_load",PyBool_FromLong(row.delay_load));append(list,item.release());}
+        return list.release();
+    }
+    if(method=="pe_exports"){
+        count(values,2);auto rows=take(p.pe_exports(size(argument(values,0)),size(argument(values,1))));Object list(PyList_New(0));
+        for(const auto& row:rows){Object item(PyDict_New());set(item,"ordinal",integer(row.ordinal));
+            set(item,"name",row.name?string(*row.name):none());set(item,"address",row.address?encode(Location{*row.address}):none());
+            set(item,"forwarder",row.forwarder?string(*row.forwarder):none());append(list,item.release());}
+        return list.release();
+    }
+    if(method=="elf_dynamic_entries"){
+        count(values,2);auto rows=take(p.elf_dynamic_entries(size(argument(values,0)),size(argument(values,1))));Object list(PyList_New(0));
+        for(const auto& row:rows){Object item(PyDict_New());
+            set(item,"section",row.section?integer(*row.section):none());
+            set(item,"table_file_offset",integer(row.table_file_offset));
+            set(item,"table_address",row.table_address?encode(Location{*row.table_address}):none());
+            set(item,"index",integer(row.index));set(item,"tag",signed_integer(row.tag));
+            set(item,"value",integer(row.value));set(item,"string_value",row.string_value?string(*row.string_value):none());
+            append(list,item.release());}
+        return list.release();
+    }
     if(method=="strings"){
         count(values,2);auto rows=take(p.strings(size(argument(values,0)),size(argument(values,1))));Object list(PyList_New(0));
-        for(const auto& row:rows){Object item(PyDict_New());set(item,"encoding",integer(static_cast<unsigned>(row.encoding)));set(item,"encoding_name",string(string_encoding_name(row.encoding)));set(item,"preview",string(row.preview));
+        for(const auto& row:rows){Object item(PyDict_New());set(item,"encoding",integer(static_cast<unsigned>(row.encoding)));set(item,"encoding_name",string(string_encoding_name(row.encoding)));set(item,"script_hint",string(string_script_name(classify_string_script(row.preview))));set(item,"preview",string(row.preview));
             set(item,"characters",integer(row.characters));set(item,"byte_length",integer(row.byte_length));set(item,"file_offset",encode(Location{row.file_offset}));
             set(item,"address",row.address?encode(Location{*row.address}):none());set(item,"terminated",PyBool_FromLong(row.terminated));append(list,item.release());}
         return list.release();
@@ -991,7 +1475,7 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         count(values,3);auto rows=take(p.references(location(argument(values,0)),size(argument(values,1)),size(argument(values,2))));Object list(PyList_New(0));
         for(const auto& row:rows){Object item(PyDict_New());set(item,"id",integer(row.id.value));set(item,"source",encode(row.source));set(item,"kind",integer(static_cast<unsigned>(row.kind)));set(item,"kind_name",string(reference_kind_name(row.kind)));
             if(const auto* target=std::get_if<Location>(&row.target))set(item,"target",encode(*target));
-            else if(const auto* external=std::get_if<ExternalIdentity>(&row.target)){Object external_record(PyDict_New());set(external_record,"library",string(external->library));set(external_record,"name",external->name?string(*external->name):none());set(item,"target",external_record.release());}
+            else if(const auto* external=std::get_if<ExternalIdentity>(&row.target))set(item,"target",encode_external(*external));
             else {Object unresolved_record(PyDict_New());set(unresolved_record,"unresolved_reason",integer(static_cast<unsigned>(std::get<UnresolvedTarget>(row.target).reason)));set(item,"target",unresolved_record.release());}
             append(list,item.release());}
         return list.release();
@@ -1003,7 +1487,37 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
             Object item(PyDict_New());set(item,"id",integer(row.id.value));set(item,"source",encode(row.source));
             set(item,"kind",integer(static_cast<unsigned>(row.kind)));set(item,"kind_name",string(reference_kind_name(row.kind)));
             if(const auto* target=std::get_if<Location>(&row.target))set(item,"target",encode(*target));
-            else if(const auto* external=std::get_if<ExternalIdentity>(&row.target)){Object record(PyDict_New());set(record,"library",string(external->library));set(record,"name",external->name?string(*external->name):none());set(item,"target",record.release());}
+            else if(const auto* external=std::get_if<ExternalIdentity>(&row.target))set(item,"target",encode_external(*external));
+            else {Object record(PyDict_New());set(record,"unresolved_reason",integer(static_cast<unsigned>(std::get<UnresolvedTarget>(row.target).reason)));set(item,"target",record.release());}
+            append(list,item.release());
+        }
+        set(result,"references",list.release());set(result,"total",integer(page.total));
+        set(result,"next",page.next_offset?integer(*page.next_offset):none());return result.release();
+    }
+    if(method=="incoming_references_range"){
+        count(values,4);auto page=take(p.incoming_references_range(address(argument(values,0)),
+            number(argument(values,1)),size(argument(values,2)),size(argument(values,3))));
+        Object result(PyDict_New()),list(PyList_New(0));
+        for(const auto& row:page.rows){
+            Object item(PyDict_New());set(item,"id",integer(row.id.value));set(item,"source",encode(row.source));
+            set(item,"kind",integer(static_cast<unsigned>(row.kind)));set(item,"kind_name",string(reference_kind_name(row.kind)));
+            if(const auto* target=std::get_if<Location>(&row.target))set(item,"target",encode(*target));
+            else if(const auto* external=std::get_if<ExternalIdentity>(&row.target))set(item,"target",encode_external(*external));
+            else {Object record(PyDict_New());set(record,"unresolved_reason",integer(static_cast<unsigned>(std::get<UnresolvedTarget>(row.target).reason)));set(item,"target",record.release());}
+            append(list,item.release());
+        }
+        set(result,"references",list.release());set(result,"total",integer(page.total));
+        set(result,"next",page.next_offset?integer(*page.next_offset):none());return result.release();
+    }
+    if(method=="outgoing_references_range"){
+        count(values,4);auto page=take(p.outgoing_references_range(address(argument(values,0)),
+            number(argument(values,1)),size(argument(values,2)),size(argument(values,3))));
+        Object result(PyDict_New()),list(PyList_New(0));
+        for(const auto& row:page.rows){
+            Object item(PyDict_New());set(item,"id",integer(row.id.value));set(item,"source",encode(row.source));
+            set(item,"kind",integer(static_cast<unsigned>(row.kind)));set(item,"kind_name",string(reference_kind_name(row.kind)));
+            if(const auto* target=std::get_if<Location>(&row.target))set(item,"target",encode(*target));
+            else if(const auto* external=std::get_if<ExternalIdentity>(&row.target))set(item,"target",encode_external(*external));
             else {Object record(PyDict_New());set(record,"unresolved_reason",integer(static_cast<unsigned>(std::get<UnresolvedTarget>(row.target).reason)));set(item,"target",record.release());}
             append(list,item.release());
         }
@@ -1017,7 +1531,7 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
             Object item(PyDict_New());set(item,"id",integer(row.id.value));set(item,"source",encode(row.source));
             set(item,"kind",integer(static_cast<unsigned>(row.kind)));set(item,"kind_name",string(reference_kind_name(row.kind)));
             if(const auto* target=std::get_if<Location>(&row.target))set(item,"target",encode(*target));
-            else if(const auto* external=std::get_if<ExternalIdentity>(&row.target)){Object record(PyDict_New());set(record,"library",string(external->library));set(record,"name",external->name?string(*external->name):none());set(item,"target",record.release());}
+            else if(const auto* external=std::get_if<ExternalIdentity>(&row.target))set(item,"target",encode_external(*external));
             else {Object record(PyDict_New());set(record,"unresolved_reason",integer(static_cast<unsigned>(std::get<UnresolvedTarget>(row.target).reason)));set(item,"target",record.release());}
             append(list,item.release());
         }
@@ -1025,16 +1539,17 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         set(result,"next",page.next_offset?integer(*page.next_offset):none());return result.release();
     }
     if(method=="search"){
-        count(values,4);
+        count(values,5);
         auto* encoded=argument(values,0);
         if(!PyTuple_Check(encoded) || PyTuple_Size(encoded)<2)invalid("Search query must be a typed tuple");
         const auto kind=text(argument(encoded,0));
         SearchQuery query;
         if(kind=="bytes" && PyTuple_Size(encoded)==2)query=BytePattern{text(argument(encoded,1))};
-        else if(kind=="text" && PyTuple_Size(encoded)==3){
+        else if(kind=="text" && (PyTuple_Size(encoded)==3 || PyTuple_Size(encoded)==4)){
             auto encoding=number32(argument(encoded,2));
-            if(encoding>static_cast<unsigned>(TextEncoding::utf32be))invalid("Unknown text search encoding");
-            query=TextQuery{text(argument(encoded,1)),static_cast<TextEncoding>(encoding)};
+            if(encoding>static_cast<unsigned>(TextEncoding::iso8859_1))invalid("Unknown text search encoding");
+            const bool case_sensitive=PyTuple_Size(encoded)==3 || boolean(argument(encoded,3));
+            query=TextQuery{text(argument(encoded,1)),static_cast<TextEncoding>(encoding),case_sensitive};
         }else if(kind=="immediate" && PyTuple_Size(encoded)==4){
             auto width=number32(argument(encoded,2));
             if(width!=8 && width!=16 && width!=32 && width!=64)invalid("Immediate search width must be8,16,32 or64");
@@ -1044,7 +1559,9 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         SearchLimits limits;limits.max_results=size(argument(values,2));
         auto cursor=search_cursor(argument(values,1));
         const auto stop=argument(values,3)==Py_None?std::stop_token{}:stop_source(argument(values,3)).get_token();
-        auto page=take(without_gil([&]{return p.search(query,std::move(cursor),limits,stop);}));
+        std::optional<Location> start;
+        if(argument(values,4)!=Py_None)start=location(argument(values,4));
+        auto page=take(without_gil([&]{return p.search(query,std::move(cursor),limits,stop,start);}));
         Object result(PyDict_New()),matches(PyList_New(0));
         for(const auto& match:page.matches){
             Object item(PyDict_New()),ranges(PyList_New(0));
@@ -1065,18 +1582,63 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         count(values,0);return encode_snapshot(*take(method=="undo"?p.undo():p.redo()));
     }
     if(method=="analyze"){
+        if(PyTuple_Size(values)==3){
+            auto* updates=argument(values,0);auto* callback=argument(values,1);
+            if(callback!=Py_None&&!PyCallable_Check(callback))invalid("progress must be callable or None");
+            AnalysisProgressBridge progress(callback==Py_None?nullptr:callback);
+            auto options=analysis_options(p,updates,progress);
+            const auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();
+            auto result=without_gil([&]{return p.analyze(options,stop);});
+            progress.restore_exception();
+            return encode_snapshot(*take(std::move(result)));
+        }
         std::stop_token stop;
         if(PyTuple_Size(values)==1)stop=stop_source(argument(values,0)).get_token();
         else count(values,0);
         auto result=without_gil([&]{return p.analyze(stop);});
         return encode_snapshot(*take(std::move(result)));
     }
-    if(method=="save"){count(values,0);return PyBool_FromLong(take(p.save()));}
-    if(method=="save_as"){count(values,1);take(p.save_as(path(argument(values,0))));return none();}
+    if(method=="save"){
+        count(values,1);
+        const auto stop=argument(values,0)==Py_None?std::stop_token{}:stop_source(argument(values,0)).get_token();
+        return PyBool_FromLong(take(without_gil([&]{return p.save(stop);} )));
+    }
+    if(method=="save_as"){
+        count(values,2);const auto destination=path(argument(values,0));
+        const auto stop=argument(values,1)==Py_None?std::stop_token{}:stop_source(argument(values,1)).get_token();
+        take(without_gil([&]{return p.save_as(destination,stop);}));return none();
+    }
     if(method=="backup_to"){
         count(values,3);const auto destination=path(argument(values,0));const auto replace=boolean(argument(values,1));
         auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();
         return encode_saved_project(take(without_gil([&]{return p.backup_to(destination,replace,stop);} )));
+    }
+    if(method=="archive_external_source"){
+        count(values,3);const auto destination=path(argument(values,0));
+        database::SourceArchiveOptions options;options.max_bytes=number(argument(values,1));
+        auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();
+        const auto row=take(without_gil([&]{return p.archive_external_source(destination,options,stop);}));
+        Object result(PyDict_New());set(result,"path",string(path_utf8(row.path)));
+        set(result,"source",string(path_utf8(row.source)));set(result,"project_uuid",encode_uuid(row.uuid));
+        set(result,"input_size",integer(row.input.size));return result.release();
+    }
+    if(method=="verify_source_archive"){
+        count(values,3);const auto archive=path(argument(values,0));const auto max_bytes=number(argument(values,1));
+        auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();
+        auto result=take(without_gil([&]{return p.verify_source_archive(archive,max_bytes,stop);}));
+        Object value(PyDict_New());set(value,"path",string(path_utf8(result.path)));
+        set(value,"project_uuid",encode_uuid(result.project_uuid));set(value,"input_size",integer(result.input.size));
+        set(value,"bytes_verified",integer(result.bytes_verified));return value.release();
+    }
+    if(method=="restore_source_archive"){
+        count(values,4);const auto archive=path(argument(values,0)),output=path(argument(values,1));
+        const auto max_bytes=number(argument(values,2));
+        auto stop=argument(values,3)==Py_None?std::stop_token{}:stop_source(argument(values,3)).get_token();
+        auto result=take(without_gil([&]{return p.restore_source_archive(archive,output,max_bytes,stop);}));
+        Object value(PyDict_New());set(value,"archive_path",string(path_utf8(result.archive_path)));
+        set(value,"restored_path",string(path_utf8(result.restored_path)));
+        set(value,"project_uuid",encode_uuid(result.project_uuid));set(value,"input_size",integer(result.input.size));
+        return value.release();
     }
     if(method=="backup_to_rotating"){
         count(values,3);const auto base=path(argument(values,0));const auto retain=size(argument(values,1));
@@ -1103,20 +1665,26 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         Object result(PyDict_New());set(result,"remaining",integer(row.remaining));set(result,"removed",integer(row.removed));
         set(result,"retention_satisfied",PyBool_FromLong(row.retention_satisfied));return result.release();
     }
-    if(method=="export"){count(values,1);auto receipt=take(p.export_binary(path(argument(values,0))));Object result(PyDict_New());set(result,"bytes",integer(receipt.bytes));set(result,"revision",integer(receipt.revision));return result.release();}
+    if(method=="export"){
+        count(values,2);const auto destination=path(argument(values,0));
+        const auto stop=argument(values,1)==Py_None?std::stop_token{}:stop_source(argument(values,1)).get_token();
+        auto receipt=take(without_gil([&]{return p.export_binary(destination,stop);}));
+        Object result(PyDict_New());set(result,"bytes",integer(receipt.bytes));set(result,"revision",integer(receipt.revision));return result.release();
+    }
     if(method=="rename" || method=="comment"){
         count(values,3);auto at=location(argument(values,0));auto value=text(argument(values,1));auto group=number(argument(values,2));
         ProjectCommand command=method=="rename"?ProjectCommand{Rename{at,std::move(value)}}:ProjectCommand{Comment{at,std::move(value)}};
         return encode_snapshot(*take(p.execute(command,group)));
     }
     if(method=="apply_annotations"){
-        count(values,3);auto* rows=argument(values,0);auto group=number(argument(values,1));
+        count(values,4);auto* rows=argument(values,0);auto group=number(argument(values,1));
         if(!PyList_Check(rows)&&!PyTuple_Check(rows))invalid("Annotation batch must be a list or tuple");
         const auto row_count=PySequence_Size(rows);
         if(row_count<=0 || row_count>static_cast<Py_ssize_t>(automation::maximum_page))
             invalid("Annotation batch must contain 1..4096 rows");
         std::optional<std::uint64_t> expected;
         if(argument(values,2)!=Py_None)expected=number(argument(values,2));
+        std::stop_token stop;if(argument(values,3)!=Py_None)stop=stop_source(argument(values,3)).get_token();
         std::size_t text_bytes=0;
         std::vector<ProjectCommand> commands;commands.reserve(static_cast<std::size_t>(row_count)*2);
         auto checked_text=[&](PyObject* value){
@@ -1126,6 +1694,7 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
             text_bytes+=static_cast<std::size_t>(length);return std::string(data,static_cast<std::size_t>(length));
         };
         for(Py_ssize_t i=0;i<row_count;++i){
+            if(stop.stop_requested())throw NativeFailure{{ErrorCode::canceled,"Annotation batch canceled during validation"}};
             auto* row=sequence_item(rows,i);
             if(!PyTuple_Check(row) || PyTuple_Size(row)<3)invalid("Malformed annotation batch row");
             const auto kind=text(tuple_item(row,0));const auto at=location(tuple_item(row,1));
@@ -1140,7 +1709,8 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
                 commands.emplace_back(BookmarkCommand{at,std::move(label),boolean(tuple_item(row,3))});
             }else invalid("Annotation batch supports rename, comment, and bookmark operations");
         }
-        return encode_snapshot(*take(p.execute_batch(commands,group,expected)));
+        auto result=without_gil([&]{return p.execute_batch(commands,group,expected,stop);});
+        return encode_snapshot(*take(std::move(result)));
     }
     if(method=="apply_batch"){
         count(values,4);auto* rows=argument(values,0);const auto group=number(argument(values,1));
@@ -1312,7 +1882,7 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         for(Py_ssize_t i=0;i<assignment_count;++i){
             Object row(PySequence_GetItem(assignment_rows,i));
             if((!PyTuple_Check(row)&&!PyList_Check(row))||PySequence_Size(row)!=2)invalid("Malformed portable type assignment");
-            command.assignments.push_back({address(sequence_item(row,0)),text(sequence_item(row,1))});
+            command.assignments.push_back({location(sequence_item(row,0)),text(sequence_item(row,1))});
         }
         return encode_snapshot(*take(p.execute(command,number(argument(values,2)))));
     }
@@ -1322,6 +1892,8 @@ PyMethodDef methods[]={
     {"open",open_project,METH_VARARGS,"Open a versioned native project owner."},
     {"open_archive",open_archive,METH_VARARGS,"Open a bounded, read-only archive owner."},
     {"restore_backup_in_place",restore_backup_in_place,METH_VARARGS,"Restore a project backup into an existing project path."},
+    {"inspect_recovery_directory",inspect_recovery_directory,METH_VARARGS,"Read-only bounded inspection of project recovery candidates."},
+    {"restore_recovery_artifact",restore_recovery_artifact,METH_VARARGS,"Restore a validated recovery artifact as an independent project."},
     {"archive_call",call_archive,METH_VARARGS,"Query an archive owner."},
     {"history_call",call_historical_state,METH_VARARGS,"Read an immutable exact-step historical projection."},
     {"create",create_project,METH_VARARGS,"Import input into a real project."},

@@ -74,7 +74,9 @@ wxString macho_metadata_cell(const DocumentSnapshot &doc, const MachOMetadataRow
                                          "EH frame personality",
                                          "LSDA call site",
                                          "LSDA action",
-                                         "LSDA type info"};
+                                         "LSDA type info",
+                                         "Firmware chain start offset",
+                                         "Dyld environment"};
     static_assert(std::size(labels) == static_cast<std::size_t>(MachOMetadataKind::count));
     if (column == 0)
         return wxString(labels[static_cast<std::size_t>(row.kind)]) + " #" + dec(row.index);
@@ -243,6 +245,14 @@ wxString macho_metadata_cell(const DocumentSnapshot &doc, const MachOMetadataRow
                                                   : wxString()) +
                                  (r.non_pointer ? "non-pointer " : "") + state(r.complete);
     }
+    case MachOMetadataKind::chain_start_offset: {
+        const auto &r = m.chain_start_offsets[n];
+        return column == 2 ? field("raw offset", r.raw_offset) + field("format", r.pointer_format)
+                           : field("section", r.section_ordinal) + field("index", r.index) +
+                                 field("coordinate flags", r.coordinate_flags) + at(r.pointer_address) +
+                                 (r.pointer_file_offset ? field("file", r.pointer_file_offset->value) : wxString()) +
+                                 state(r.complete);
+    }
     case MachOMetadataKind::data_in_code_table: {
         const auto &r = m.data_in_code_tables[n];
         return column == 2 ? field("size", r.size) : wxString("declared data-in-code");
@@ -330,6 +340,10 @@ wxString macho_metadata_cell(const DocumentSnapshot &doc, const MachOMetadataRow
         return field("index", r.index) + field("record", r.record_offset) + field("encoding", r.encoding) +
                field("encoded-size", r.encoded_size) + rtti_target_state(r.target_state) +
                 (r.null_pointer ? wxString(" null") : wxString{});
+    }
+    case MachOMetadataKind::dyld_environment: {
+        const auto &r = m.dyld_environments[n];
+        return column == 2 ? preview_text(r.value) : field("string-offset", r.name_offset);
     }
     case MachOMetadataKind::count:
         return {};

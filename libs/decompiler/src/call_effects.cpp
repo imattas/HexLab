@@ -13,7 +13,7 @@ Key key(RegisterOperand reg) {
 }
 bool overlaps(RegisterOperand a, RegisterOperand b) {
     const auto simd = [](RegisterBank bank) {
-        return bank == RegisterBank::xmm || bank == RegisterBank::ymm;
+        return bank == RegisterBank::xmm || bank == RegisterBank::ymm || bank == RegisterBank::zmm;
     };
     if (a.index != b.index || (a.bank != b.bank && !(simd(a.bank) && simd(b.bank)))) return false;
     const unsigned a_begin = a.high_byte ? 8 : 0, b_begin = b.high_byte ? 8 : 0;

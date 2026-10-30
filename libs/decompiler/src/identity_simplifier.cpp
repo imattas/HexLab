@@ -1,6 +1,7 @@
 #include "hexlab/decompiler/decompiler.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <functional>
 #include <map>
@@ -47,6 +48,53 @@ bool pure_bitvector(const ExpressionPtr &expression, unsigned depth = 0) {
         return binary->left && binary->right &&
                pure_bitvector(binary->left, depth + 1) && pure_bitvector(binary->right, depth + 1);
     return false;
+}
+
+// A small total-expression whitelist for select rewrites. In particular,
+// division/remainder, memory, intrinsics, and unknown values are excluded so
+// dropping an unchosen arm cannot hide a fault or observable effect.
+bool total_select_value(const ExpressionPtr &expression, unsigned depth = 0) {
+    if (!expression || depth > 64 || !valid_bitvector(*expression)) return false;
+    if (const auto *reg = std::get_if<RegisterValue>(&expression->value))
+        return reg->version.has_value();
+    if (std::holds_alternative<ConstantValue>(expression->value)) return true;
+    if (const auto *unary = std::get_if<UnaryValue>(&expression->value))
+        return (unary->operation == "neg" || unary->operation == "bitnot" ||
+                unary->operation == "not" || unary->operation == "sext") && unary->operand &&
+               total_select_value(unary->operand, depth + 1);
+    const auto *binary = std::get_if<BinaryValue>(&expression->value);
+    if (!binary || !binary->left || !binary->right) return false;
+    if (binary->operation == "pair")
+        return binary->left->type == expression->type && binary->right->type == expression->type &&
+               total_select_value(binary->left, depth + 1) &&
+               total_select_value(binary->right, depth + 1);
+    if (binary->operation == "select_if") {
+        const auto *alternatives = std::get_if<BinaryValue>(&binary->right->value);
+        return (binary->left->type.kind == TypeKind::integer ||
+                binary->left->type.kind == TypeKind::boolean) &&
+               alternatives && alternatives->operation == "pair" &&
+               binary->right->type == expression->type &&
+               alternatives->left && alternatives->right &&
+               alternatives->left->type == expression->type &&
+               alternatives->right->type == expression->type &&
+               total_select_value(binary->left, depth + 1) &&
+               total_select_value(binary->right, depth + 1);
+    }
+    static constexpr std::array<std::string_view, 21> total_binary_operations{
+        "add", "sub", "mul", "and", "or", "xor", "shl", "shr", "sar",
+        "rotl", "rotr", "eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge"};
+    if (std::find(total_binary_operations.begin(), total_binary_operations.end(), binary->operation) ==
+        total_binary_operations.end()) return false;
+    if (!total_select_value(binary->left, depth + 1) ||
+        !total_select_value(binary->right, depth + 1)) return false;
+    const bool comparison = binary->operation == "eq" || binary->operation == "ne" ||
+        binary->operation == "ult" || binary->operation == "ule" || binary->operation == "ugt" ||
+        binary->operation == "uge" || binary->operation == "slt" || binary->operation == "sle" ||
+        binary->operation == "sgt" || binary->operation == "sge";
+    if (comparison)
+        return expression->type.kind == TypeKind::boolean && expression->type.bits == 1 &&
+               binary->left->type == binary->right->type;
+    return binary->left->type == expression->type && binary->right->type == expression->type;
 }
 
 std::size_t mix_hash(std::size_t seed, std::size_t value) {
@@ -156,6 +204,18 @@ bool structurally_equal(const ExpressionPtr &a, const ExpressionPtr &b) {
                structurally_equal(x->right, y.right);
     }
     return false;
+}
+
+bool bitwise_complements(const ExpressionPtr &a, const ExpressionPtr &b) {
+    if (!a || !b || a->type != b->type || a->type.kind != TypeKind::integer ||
+        !a->type.bits || a->type.bits > 64)
+        return false;
+    const auto is_complement = [](const ExpressionPtr &candidate, const ExpressionPtr &value) {
+        const auto *unary = candidate ? std::get_if<UnaryValue>(&candidate->value) : nullptr;
+        return unary && unary->operation == "bitnot" && unary->operand &&
+               unary->operand->type == value->type && structurally_equal(unary->operand, value);
+    };
+    return is_complement(a, b) || is_complement(b, a);
 }
 
 struct AvailableExpression {
@@ -385,6 +445,20 @@ ExpressionPtr simplify_associative_bitwise(const ExpressionPtr &expression) {
             continue;
         }
 
+        if (type.kind == TypeKind::integer) {
+            const auto complement = std::find_if(terms.begin(), terms.end(), [&](const auto &term) {
+                return term.retained && bitwise_complements(term.value, current);
+            });
+            if (complement != terms.end()) {
+                if (operation != "xor") return constant(operation == "and" ? 0 : all, type);
+                complement->retained = false;
+                constant_value ^= all;
+                ++constants_seen;
+                duplicate_removed = true;
+                continue;
+            }
+        }
+
         const auto hash = expression_hash(current);
         auto &bucket = buckets[hash];
         const auto duplicate = std::find_if(bucket.begin(), bucket.end(), [&](std::size_t index) {
@@ -431,11 +505,461 @@ ExpressionPtr simplify_associative_bitwise(const ExpressionPtr &expression) {
     return operands.front();
 }
 
+// Recombine complementary masked copies without distributing arbitrary
+// expressions. Exact SSA equality and constant masks make both identities
+// direct bit-vector equalities, and purity prevents erasing effects.
+ExpressionPtr simplify_mask_partition(const ExpressionPtr &expression) {
+    const auto *root = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!root || (root->operation != "or" && root->operation != "and") ||
+        !valid_bitvector(*expression) || expression->type.kind != TypeKind::integer ||
+        !root->left || !root->right || !pure_bitvector(root->left) || !pure_bitvector(root->right))
+        return {};
+    const auto inner_operation = root->operation == "or" ? "and" : "or";
+    const auto *left = std::get_if<BinaryValue>(&root->left->value);
+    const auto *right = std::get_if<BinaryValue>(&root->right->value);
+    if (!left || !right || left->operation != inner_operation || right->operation != inner_operation ||
+        root->left->type != expression->type || root->right->type != expression->type ||
+        !left->left || !left->right || !right->left || !right->right)
+        return {};
+    if (left->left->type != expression->type || left->right->type != expression->type ||
+        right->left->type != expression->type || right->right->type != expression->type)
+        return {};
+    const auto split = [&](const BinaryValue &term, ExpressionPtr &value, const ConstantValue *&bits) {
+        const auto *a = std::get_if<ConstantValue>(&term.left->value);
+        const auto *b = std::get_if<ConstantValue>(&term.right->value);
+        if (a && b) return false;
+        if (a) { value = term.right; bits = a; }
+        else if (b) { value = term.left; bits = b; }
+        else return false;
+        return value->type == expression->type && bits->type == expression->type;
+    };
+    ExpressionPtr left_value, right_value;
+    const ConstantValue *left_bits = nullptr, *right_bits = nullptr;
+    if (!split(*left, left_value, left_bits) || !split(*right, right_value, right_bits) ||
+        !pure_bitvector(left_value) || !pure_bitvector(right_value) ||
+        !structurally_equal(left_value, right_value)) return {};
+    const auto combined = root->operation == "or"
+        ? (left_bits->value | right_bits->value) : (left_bits->value & right_bits->value);
+    return std::make_shared<Expression>(Expression{expression->type,
+        BinaryValue{inner_operation, left_value, constant(combined, expression->type)}});
+}
+
+// Clearing from x the bits also present in x & y is subtraction without
+// borrow: every subtracted one is already a set bit in x. XOR has the same
+// result because x & y is a subset of x. Keep the proof structural and
+// fixed-width; no arithmetic is moved across unrelated expressions.
+ExpressionPtr simplify_masked_clear(const ExpressionPtr &expression) {
+    const auto *root = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!root || (root->operation != "sub" && root->operation != "xor") ||
+        expression->type.kind != TypeKind::integer || !valid_bitvector(*expression) ||
+        !root->left || !root->right || root->left->type != expression->type ||
+        root->right->type != expression->type || !pure_bitvector(expression) ||
+        expression_nodes(expression) > 256)
+        return {};
+
+    const auto match = [&](const ExpressionPtr &value, const ExpressionPtr &masked) -> ExpressionPtr {
+        const auto *and_value = masked ? std::get_if<BinaryValue>(&masked->value) : nullptr;
+        if (!and_value || and_value->operation != "and" || !and_value->left || !and_value->right ||
+            masked->type != expression->type || and_value->left->type != expression->type ||
+            and_value->right->type != expression->type)
+            return {};
+        ExpressionPtr other;
+        if (structurally_equal(value, and_value->left)) other = and_value->right;
+        else if (structurally_equal(value, and_value->right)) other = and_value->left;
+        else return {};
+        if (!pure_bitvector(value) || !pure_bitvector(other)) return {};
+        auto inverted = std::make_shared<Expression>(Expression{expression->type,
+            UnaryValue{"bitnot", other}});
+        return std::make_shared<Expression>(Expression{expression->type,
+            BinaryValue{"and", value, std::move(inverted)}});
+    };
+
+    if (root->operation == "sub") return match(root->left, root->right);
+    if (auto simplified = match(root->left, root->right)) return simplified;
+    return match(root->right, root->left);
+}
+
+// Boolean consensus: (x | y) & (x | ~y) == x, and its dual
+// (x & y) | (x & ~y) == x. Keep this deliberately structural: both copies
+// of x and y must be the same pure, versioned SSA expressions, and all
+// operations must have the same fixed-width integer type.
+ExpressionPtr simplify_consensus(const ExpressionPtr &expression) {
+    const auto *root = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!root || !valid_bitvector(*expression) || expression->type.kind != TypeKind::integer ||
+        !root->left || !root->right || !pure_bitvector(root->left) || !pure_bitvector(root->right) ||
+        expression_nodes(expression) > 256)
+        return {};
+    const auto inner_operation = root->operation == "and" ? "or" :
+                                 root->operation == "or" ? "and" : "";
+    if (!*inner_operation) return {};
+    const auto *left = std::get_if<BinaryValue>(&root->left->value);
+    const auto *right = std::get_if<BinaryValue>(&root->right->value);
+    if (!left || !right || left->operation != inner_operation || right->operation != inner_operation ||
+        root->left->type != expression->type || root->right->type != expression->type ||
+        !left->left || !left->right || !right->left || !right->right ||
+        left->left->type != expression->type || left->right->type != expression->type ||
+        right->left->type != expression->type || right->right->type != expression->type)
+        return {};
+    const std::array<ExpressionPtr, 2> a{left->left, left->right};
+    const std::array<ExpressionPtr, 2> b{right->left, right->right};
+    for (std::size_t ai = 0; ai < a.size(); ++ai)
+        for (std::size_t bi = 0; bi < b.size(); ++bi)
+            if (structurally_equal(a[ai], b[bi]) &&
+                bitwise_complements(a[1 - ai], b[1 - bi]) && pure_bitvector(a[ai]))
+                return a[ai];
+    return {};
+}
+
+// A sign-extended one-bit predicate is exactly an all-zero/all-one mask.
+// Therefore (yes & sext(c)) | (no & ~sext(c)) is c ? yes : no. Require the
+// exact same SSA predicate in both masks and total pure arms; do not infer the
+// same property for arbitrary integer masks or zext(bool).
+ExpressionPtr simplify_boolean_mask_select(const ExpressionPtr &expression) {
+    const auto *root = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!root || root->operation != "or" || expression->type.kind != TypeKind::integer ||
+        !valid_bitvector(*expression) || !root->left || !root->right ||
+        expression_nodes(expression) > 256 || !pure_bitvector(expression))
+        return {};
+    const auto *left = std::get_if<BinaryValue>(&root->left->value);
+    const auto *right = std::get_if<BinaryValue>(&root->right->value);
+    if (!left || !right || left->operation != "and" || right->operation != "and" ||
+        root->left->type != expression->type || root->right->type != expression->type ||
+        !left->left || !left->right || !right->left || !right->right)
+        return {};
+
+    struct MaskedValue {
+        ExpressionPtr value;
+        ExpressionPtr predicate;
+        bool inverted = false;
+    };
+    const auto split = [&](const BinaryValue &term) -> std::optional<MaskedValue> {
+        const auto parse_mask = [&](const ExpressionPtr &candidate,
+                                    ExpressionPtr &predicate, bool &inverted) {
+            const auto *unary = candidate ? std::get_if<UnaryValue>(&candidate->value) : nullptr;
+            if (!unary) return false;
+            const ExpressionPtr *extension = nullptr;
+            if (unary->operation == "sext") extension = &candidate;
+            else if (unary->operation == "bitnot" && unary->operand) {
+                const auto *inner = std::get_if<UnaryValue>(&unary->operand->value);
+                if (inner && inner->operation == "sext") {
+                    extension = &unary->operand;
+                    inverted = true;
+                }
+            }
+            if (!extension) return false;
+            const auto *sign_extend = std::get_if<UnaryValue>(&(*extension)->value);
+            if (!sign_extend || !sign_extend->operand || (*extension)->type != expression->type ||
+                sign_extend->operand->type.kind != TypeKind::boolean || sign_extend->operand->type.bits != 1 ||
+                !pure_bitvector(sign_extend->operand))
+                return false;
+            predicate = sign_extend->operand;
+            return true;
+        };
+        ExpressionPtr predicate;
+        bool inverted = false;
+        ExpressionPtr value;
+        if (parse_mask(term.left, predicate, inverted)) value = term.right;
+        else {
+            predicate.reset();
+            inverted = false;
+            if (!parse_mask(term.right, predicate, inverted)) return {};
+            value = term.left;
+        }
+        if (!value || value->type != expression->type || !total_select_value(value)) return {};
+        return MaskedValue{std::move(value), std::move(predicate), inverted};
+    };
+
+    const auto yes_term = split(*left);
+    const auto no_term = split(*right);
+    if (!yes_term || !no_term || yes_term->inverted == no_term->inverted ||
+        !structurally_equal(yes_term->predicate, no_term->predicate))
+        return {};
+    const auto yes = yes_term->inverted ? no_term->value : yes_term->value;
+    const auto no = yes_term->inverted ? yes_term->value : no_term->value;
+    if (yes->type != expression->type || no->type != expression->type) return {};
+    auto alternatives = std::make_shared<Expression>(Expression{expression->type,
+        BinaryValue{"pair", yes, no}});
+    return std::make_shared<Expression>(Expression{expression->type,
+        BinaryValue{"select_if", yes_term->predicate, std::move(alternatives)}});
+}
+
+// Flatten a nested select controlled by the same exact SSA predicate:
+// c ? (c ? a : b) : d == c ? a : d, and its false-arm dual. Total pure
+// bitvectors and exact predicate identity avoid path, alias, and effect guesses.
+ExpressionPtr simplify_nested_select(const ExpressionPtr &expression) {
+    if (!expression || expression_nodes(expression) > 256 ||
+        !total_select_value(expression)) return {};
+    const auto *root = std::get_if<BinaryValue>(&expression->value);
+    const auto *outer = root && root->operation == "select_if" && root->right
+        ? std::get_if<BinaryValue>(&root->right->value) : nullptr;
+    if (!root || root->operation != "select_if" || !root->left || !outer ||
+        outer->operation != "pair" || !outer->left || !outer->right) return {};
+    const auto flatten = [&](const ExpressionPtr &nested_expression, bool true_arm) -> ExpressionPtr {
+        const auto *nested = nested_expression
+            ? std::get_if<BinaryValue>(&nested_expression->value) : nullptr;
+        const auto *choices = nested && nested->operation == "select_if" && nested->right
+            ? std::get_if<BinaryValue>(&nested->right->value) : nullptr;
+        if (!nested || nested->operation != "select_if" ||
+            !structurally_equal(root->left, nested->left) || !choices ||
+            choices->operation != "pair" || !choices->left || !choices->right ||
+            nested_expression->type != expression->type ||
+            nested->right->type != expression->type ||
+            choices->left->type != expression->type || choices->right->type != expression->type)
+            return {};
+        auto yes = true_arm ? choices->left : outer->left;
+        auto no = true_arm ? outer->right : choices->right;
+        auto alternatives = std::make_shared<Expression>(Expression{expression->type,
+            BinaryValue{"pair", std::move(yes), std::move(no)}});
+        return std::make_shared<Expression>(Expression{expression->type,
+            BinaryValue{"select_if", root->left, std::move(alternatives)}});
+    };
+    if (auto flattened = flatten(outer->left, true)) return flattened;
+    return flatten(outer->right, false);
+}
+
+// x - (x & (x - 1)) isolates the least significant set bit. In a fixed-width
+// bitvector this is exactly x & (0 - x), including x == 0 and wraparound.
+ExpressionPtr simplify_lowest_set_bit(const ExpressionPtr &expression) {
+    const auto *root = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!root || root->operation != "sub" || expression->type.kind != TypeKind::integer ||
+        !valid_bitvector(*expression) || !root->left || !root->right ||
+        !pure_bitvector(expression) || expression_nodes(expression) > 256)
+        return {};
+    const auto *masked = std::get_if<BinaryValue>(&root->right->value);
+    if (!masked || masked->operation != "and" || root->right->type != expression->type ||
+        !root->left || root->left->type != expression->type || !masked->left || !masked->right ||
+        masked->left->type != expression->type || masked->right->type != expression->type)
+        return {};
+    const auto matches_decrement = [&](const ExpressionPtr &candidate) {
+        const auto *decrement = candidate ? std::get_if<BinaryValue>(&candidate->value) : nullptr;
+        if (!decrement || decrement->operation != "sub" || !decrement->left || !decrement->right ||
+            decrement->left->type != expression->type || decrement->right->type != expression->type)
+            return false;
+        const auto *one = std::get_if<ConstantValue>(&decrement->right->value);
+        return structurally_equal(root->left, decrement->left) && one && one->type == expression->type &&
+               (one->value & mask(expression->type.bits)) == 1;
+    };
+    if (!structurally_equal(root->left, masked->left) || !matches_decrement(masked->right))
+        if (!structurally_equal(root->left, masked->right) || !matches_decrement(masked->left))
+            return {};
+    auto negated = std::make_shared<Expression>(Expression{expression->type,
+        BinaryValue{"sub", constant(0, expression->type), root->left}});
+    return std::make_shared<Expression>(Expression{expression->type,
+        BinaryValue{"and", root->left, std::move(negated)}});
+}
+
+// For fixed-width integers, x + y = (x ^ y) + 2 * (x & y), modulo the
+// destination width. Rewriting the difference isolates the carry contribution
+// without expanding arbitrary arithmetic expressions.
+ExpressionPtr simplify_add_xor_difference(const ExpressionPtr &expression) {
+    const auto *root = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!root || root->operation != "sub" || expression->type.kind != TypeKind::integer ||
+        !valid_bitvector(*expression) || !root->left || !root->right ||
+        root->left->type != expression->type || root->right->type != expression->type ||
+        !pure_bitvector(expression) || expression_nodes(expression) > 256)
+        return {};
+    const auto *sum = std::get_if<BinaryValue>(&root->left->value);
+    const auto *difference = std::get_if<BinaryValue>(&root->right->value);
+    if (!sum || sum->operation != "add" || !difference || difference->operation != "xor" ||
+        !sum->left || !sum->right || !difference->left || !difference->right ||
+        sum->left->type != expression->type || sum->right->type != expression->type ||
+        difference->left->type != expression->type || difference->right->type != expression->type ||
+        !pure_bitvector(root->left) || !pure_bitvector(root->right))
+        return {};
+    const bool same_order = structurally_equal(sum->left, difference->left) &&
+                            structurally_equal(sum->right, difference->right);
+    const bool reverse_order = structurally_equal(sum->left, difference->right) &&
+                               structurally_equal(sum->right, difference->left);
+    if (!same_order && !reverse_order)
+        return {};
+    auto shared_and = std::make_shared<Expression>(Expression{expression->type,
+        BinaryValue{"and", sum->left, sum->right}});
+    return std::make_shared<Expression>(Expression{expression->type,
+        BinaryValue{"shl", std::move(shared_and), constant(1, expression->type)}});
+}
+
+// Reverse x + y = (x ^ y) + ((x & y) << 1). Recognize the direct
+// two-term carry decomposition, preserving fixed-width modular behavior.
+ExpressionPtr simplify_carry_recombination(const ExpressionPtr &expression) {
+    const auto *root = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!root || root->operation != "add" || expression->type.kind != TypeKind::integer ||
+        !valid_bitvector(*expression) || !root->left || !root->right ||
+        root->left->type != expression->type || root->right->type != expression->type ||
+        !pure_bitvector(expression) || expression_nodes(expression) > 256)
+        return {};
+
+    const auto match = [&](const ExpressionPtr &xor_value, const ExpressionPtr &carry_value)
+        -> ExpressionPtr {
+        const auto *xor_bits = xor_value ? std::get_if<BinaryValue>(&xor_value->value) : nullptr;
+        const auto *shift = carry_value ? std::get_if<BinaryValue>(&carry_value->value) : nullptr;
+        if (!xor_bits || xor_bits->operation != "xor" || !xor_bits->left || !xor_bits->right ||
+            !shift || shift->operation != "shl" || !shift->left || !shift->right ||
+            xor_value->type != expression->type || carry_value->type != expression->type ||
+            xor_bits->left->type != expression->type || xor_bits->right->type != expression->type ||
+            shift->left->type != expression->type || shift->right->type != expression->type)
+            return {};
+        const auto *one = std::get_if<ConstantValue>(&shift->right->value);
+        const auto *and_bits = std::get_if<BinaryValue>(&shift->left->value);
+        if (!one || one->type != expression->type || (one->value & mask(expression->type.bits)) != 1 ||
+            !and_bits || and_bits->operation != "and" || !and_bits->left || !and_bits->right ||
+            and_bits->left->type != expression->type || and_bits->right->type != expression->type)
+            return {};
+        const bool same = structurally_equal(xor_bits->left, and_bits->left) &&
+                          structurally_equal(xor_bits->right, and_bits->right);
+        const bool reversed = structurally_equal(xor_bits->left, and_bits->right) &&
+                              structurally_equal(xor_bits->right, and_bits->left);
+        if (!same && !reversed) return {};
+        return std::make_shared<Expression>(Expression{expression->type,
+            BinaryValue{"add", xor_bits->left, xor_bits->right}});
+    };
+    if (auto value = match(root->left, root->right)) return value;
+    return match(root->right, root->left);
+}
+
+// Cancel a repeated, exact SSA term in fixed-width additive expressions.
+// Because these are integer bit-vectors, all equalities hold modulo 2^width.
+// Structural version matching prevents cancellation across changed values.
+ExpressionPtr simplify_additive_cancellation(const ExpressionPtr &expression) {
+    const auto *root = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!root || (root->operation != "add" && root->operation != "sub") ||
+        expression->type.kind != TypeKind::integer || !valid_bitvector(*expression) ||
+        !root->left || !root->right || root->left->type != expression->type ||
+        root->right->type != expression->type || !pure_bitvector(expression) ||
+        expression_nodes(expression) > 256)
+        return {};
+
+    const auto cancel = [&](const ExpressionPtr &candidate, const ExpressionPtr &other,
+                            std::string_view nested_operation, bool cancel_left) -> ExpressionPtr {
+        const auto *nested = candidate ? std::get_if<BinaryValue>(&candidate->value) : nullptr;
+        if (!nested || nested->operation != nested_operation || !nested->left || !nested->right ||
+            candidate->type != expression->type || nested->left->type != expression->type ||
+            nested->right->type != expression->type || !pure_bitvector(candidate) ||
+            !pure_bitvector(other))
+            return {};
+        const auto &canceled = cancel_left ? nested->left : nested->right;
+        const auto &survivor = cancel_left ? nested->right : nested->left;
+        return structurally_equal(canceled, other) ? survivor : ExpressionPtr{};
+    };
+
+    if (root->operation == "sub") {
+        // (x + y) - x == y; (x + y) - y == x.
+        if (auto value = cancel(root->left, root->right, "add", true)) return value;
+        if (auto value = cancel(root->left, root->right, "add", false)) return value;
+        // x - (x - y) == y.
+        if (auto value = cancel(root->right, root->left, "sub", true)) return value;
+    } else {
+        // (x - y) + y == x; (y - x) + x == y, with add operands
+        // accepted in either order.
+        if (auto value = cancel(root->left, root->right, "sub", false)) return value;
+        if (auto value = cancel(root->right, root->left, "sub", false)) return value;
+    }
+    return {};
+}
+
+ExpressionPtr simplify_rotate_cancellation(const ExpressionPtr &expression) {
+    // Compose adjacent rotations modulo the exact bit width. This handles
+    // cancellation and reduces any pair to at most one pure SSA rotation.
+    const auto *root = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!root || (root->operation != "rotl" && root->operation != "rotr") ||
+        !valid_bitvector(*expression) || !root->left || !root->right ||
+        root->left->type != expression->type || root->right->type != expression->type ||
+        !pure_bitvector(expression) || expression_nodes(expression) > 256)
+        return {};
+    const auto *outer_count = std::get_if<ConstantValue>(&root->right->value);
+    if (!outer_count || outer_count->type != expression->type) return {};
+    const auto width = static_cast<std::int64_t>(expression->type.bits);
+    const auto outer = static_cast<std::int64_t>(outer_count->value % expression->type.bits);
+    const auto *inner = std::get_if<BinaryValue>(&root->left->value);
+    if (!inner || (inner->operation != "rotl" && inner->operation != "rotr") ||
+        !inner->left || !inner->right || inner->left->type != expression->type ||
+        inner->right->type != expression->type)
+        return outer == 0 ? root->left : ExpressionPtr{};
+    const auto *inner_count = std::get_if<ConstantValue>(&inner->right->value);
+    if (!inner_count || inner_count->type != expression->type || !pure_bitvector(inner->left)) return {};
+    const auto inner_amount = static_cast<std::int64_t>(inner_count->value % expression->type.bits);
+    const auto net = (root->operation == "rotl" ? outer : -outer) +
+                     (inner->operation == "rotl" ? inner_amount : -inner_amount);
+    const auto normalized = (net % width + width) % width;
+    if (!normalized) return inner->left;
+    const bool use_left = normalized <= width / 2;
+    const auto amount = static_cast<std::uint64_t>(use_left ? normalized : width - normalized);
+    return std::make_shared<Expression>(Expression{expression->type,
+        BinaryValue{use_left ? "rotl" : "rotr", inner->left,
+                    constant(amount, expression->type)}});
+}
+
+// Compose fixed-count integer shifts only when both encoded counts are
+// canonical, in range, and the source is a pure SSA bitvector. Besides
+// reducing same-direction chains, equal opposite shifts expose the exact
+// retained bit range without relying on signed arithmetic assumptions.
+ExpressionPtr simplify_shift_composition(const ExpressionPtr &expression) {
+    const auto *outer = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!outer || !outer->left || !outer->right || expression->type.kind != TypeKind::integer ||
+        expression->type.bits < 2 || expression->type.bits > 64 ||
+        (outer->operation != "shl" && outer->operation != "shr" && outer->operation != "sar") ||
+        outer->left->type != expression->type || outer->right->type != expression->type ||
+        !pure_bitvector(expression) || expression_nodes(expression) > 256 ||
+        (outer->operation == "sar" && !expression->type.is_signed))
+        return {};
+    const auto *outer_count = std::get_if<ConstantValue>(&outer->right->value);
+    const auto *inner = std::get_if<BinaryValue>(&outer->left->value);
+    if (!outer_count || outer_count->type != expression->type ||
+        outer_count->value != (outer_count->value & mask(expression->type.bits)) ||
+        !inner || !inner->left || !inner->right || inner->left->type != expression->type ||
+        inner->right->type != expression->type)
+        return {};
+    const auto *inner_count = std::get_if<ConstantValue>(&inner->right->value);
+    if (!inner_count || inner_count->type != expression->type ||
+        inner_count->value != (inner_count->value & mask(expression->type.bits)))
+        return {};
+    const auto width = static_cast<std::uint64_t>(expression->type.bits);
+    const auto outer_amount = outer_count->value;
+    const auto inner_amount = inner_count->value;
+    if (outer_amount >= width || inner_amount >= width || !inner_amount || !outer_amount)
+        return {};
+    if ((outer->operation == "shl" && inner->operation == "shl") ||
+        (outer->operation == "shr" && inner->operation == "shr") ||
+        (outer->operation == "sar" && inner->operation == "sar")) {
+        const auto combined = inner_amount + outer_amount;
+        if (outer->operation != "sar" && combined >= width && total_select_value(inner->left))
+            return constant(0, expression->type);
+        if (outer->operation != "sar" && combined >= width) return {};
+        const auto count = outer->operation == "sar" ? std::min(combined, width - 1) : combined;
+        return std::make_shared<Expression>(Expression{expression->type,
+            BinaryValue{outer->operation, inner->left, constant(count, expression->type)}});
+    }
+    if (inner_amount != outer_amount ||
+        !((outer->operation == "shr" && inner->operation == "shl") ||
+          (outer->operation == "shl" && inner->operation == "shr")))
+        return {};
+    const auto kept = outer->operation == "shr"
+        ? mask(static_cast<std::uint16_t>(width - outer_amount))
+        : mask(expression->type.bits) ^ mask(static_cast<std::uint16_t>(outer_amount));
+    return std::make_shared<Expression>(Expression{expression->type,
+        BinaryValue{"and", inner->left, constant(kept, expression->type)}});
+}
+
 ExpressionPtr simplify(const ExpressionPtr &input) {
     if (!input) return {};
     auto result = std::make_shared<Expression>(*input);
     if (auto *unary = std::get_if<UnaryValue>(&result->value)) {
         unary->operand = simplify(unary->operand);
+        if (unary->operation == "bitnot" && unary->operand && result->type.kind == TypeKind::integer &&
+            valid_bitvector(*result) && unary->operand->type == result->type &&
+            pure_bitvector(unary->operand)) {
+            if (const auto *inner = std::get_if<UnaryValue>(&unary->operand->value);
+                inner && inner->operation == "bitnot" && inner->operand &&
+                inner->operand->type == result->type && pure_bitvector(inner->operand))
+                return inner->operand;
+        }
+        if (unary->operation == "neg" && unary->operand && result->type.kind == TypeKind::integer &&
+            valid_bitvector(*result) && unary->operand->type == result->type &&
+            pure_bitvector(unary->operand)) {
+            if (const auto *inner = std::get_if<UnaryValue>(&unary->operand->value);
+                inner && inner->operation == "neg" && inner->operand &&
+                inner->operand->type == result->type && pure_bitvector(inner->operand))
+                return inner->operand;
+        }
         return result;
     }
     auto *binary = std::get_if<BinaryValue>(&result->value);
@@ -445,9 +969,85 @@ ExpressionPtr simplify(const ExpressionPtr &input) {
     const auto &left = binary->left;
     const auto &right = binary->right;
     if (!valid_bitvector(*result) || !left || !right || !valid_bitvector(*left) ||
-        !valid_bitvector(*right) || left->type != result->type || right->type != result->type)
+        !valid_bitvector(*right))
+        return result;
+    if (auto shifted = simplify_shift_composition(result)) return shifted;
+    if (auto select = simplify_nested_select(result)) return select;
+    const bool comparison = binary->operation == "eq" || binary->operation == "ne" ||
+        binary->operation == "ult" || binary->operation == "uge" || binary->operation == "ule" ||
+        binary->operation == "ugt" || binary->operation == "slt" || binary->operation == "sge" ||
+        binary->operation == "sle" || binary->operation == "sgt";
+    if (comparison && left->type == right->type && left->type.bits > 0 && left->type.bits <= 64 &&
+        (left->type.kind == TypeKind::integer || left->type.kind == TypeKind::boolean) &&
+        result->type.kind == TypeKind::boolean && result->type.bits == 1 &&
+        structurally_equal(left, right) &&
+        (std::holds_alternative<ConstantValue>(left->value) ||
+         (std::get_if<RegisterValue>(&left->value) &&
+          std::get<RegisterValue>(left->value).version.has_value()))) {
+        const bool always_true = binary->operation == "eq" || binary->operation == "uge" ||
+            binary->operation == "ule" || binary->operation == "sge" || binary->operation == "sle";
+        return constant(always_true ? 1 : 0, result->type);
+    }
+    if (binary->operation == "udiv" && result->type.kind == TypeKind::integer &&
+        !result->type.is_signed && result->type.bits >= 2 &&
+        left->type == result->type && right->type == result->type &&
+        pure_bitvector(left) && pure_bitvector(right) && expression_nodes(left) <= 254) {
+        const auto *divisor = std::get_if<ConstantValue>(&right->value);
+        const bool canonical_divisor = divisor && divisor->type == result->type &&
+            divisor->value == (divisor->value & mask(result->type.bits));
+        if (canonical_divisor && divisor->value == 1) return left;
+        if (canonical_divisor && std::has_single_bit(divisor->value))
+            return std::make_shared<Expression>(Expression{result->type,
+                BinaryValue{"shr", left, constant(std::countr_zero(divisor->value), result->type)}});
+    }
+    if (binary->operation == "urem" && result->type.kind == TypeKind::integer &&
+        !result->type.is_signed && result->type.bits >= 2 &&
+        left->type == result->type && right->type == result->type &&
+        pure_bitvector(left) && pure_bitvector(right) && expression_nodes(left) <= 254) {
+        const auto *divisor = std::get_if<ConstantValue>(&right->value);
+        const bool canonical_divisor = divisor && divisor->type == result->type &&
+            divisor->value == (divisor->value & mask(result->type.bits));
+        if (canonical_divisor && divisor->value == 1) return constant(0, result->type);
+        if (canonical_divisor && std::has_single_bit(divisor->value))
+            return std::make_shared<Expression>(Expression{result->type,
+                BinaryValue{"and", left, constant(divisor->value - 1, result->type)}});
+    }
+    if (binary->operation == "srem" && result->type.kind == TypeKind::integer &&
+        result->type.is_signed && result->type.bits >= 2 && result->type.bits <= 64 &&
+        left->type == result->type && right->type == result->type &&
+        pure_bitvector(left) && total_select_value(left) && expression_nodes(left) <= 48) {
+        const auto *divisor = std::get_if<ConstantValue>(&right->value);
+        const auto sign_bit = std::uint64_t{1} << (result->type.bits - 1);
+        const bool canonical_divisor = divisor && divisor->type == result->type &&
+            divisor->value == (divisor->value & mask(result->type.bits));
+        if (canonical_divisor && divisor->value != 0 && divisor->value < sign_bit &&
+            std::has_single_bit(divisor->value)) {
+            if (divisor->value == 1) return constant(0, result->type);
+            const auto remainder_mask = divisor->value - 1;
+            auto sign = std::make_shared<Expression>(Expression{result->type,
+                BinaryValue{"sar", left, constant(result->type.bits - 1, result->type)}});
+            auto bias = std::make_shared<Expression>(Expression{result->type,
+                BinaryValue{"and", std::move(sign), constant(remainder_mask, result->type)}});
+            auto adjusted = std::make_shared<Expression>(Expression{result->type,
+                BinaryValue{"add", left, bias}});
+            auto low_bits = std::make_shared<Expression>(Expression{result->type,
+                BinaryValue{"and", std::move(adjusted), constant(remainder_mask, result->type)}});
+            return std::make_shared<Expression>(Expression{result->type,
+                BinaryValue{"sub", std::move(low_bits), std::move(bias)}});
+        }
+    }
+    if (left->type != result->type || right->type != result->type)
         return result;
     if (auto canonical = simplify_associative_bitwise(result)) return canonical;
+    if (auto partition = simplify_mask_partition(result)) return partition;
+    if (auto cleared = simplify_masked_clear(result)) return cleared;
+    if (auto select = simplify_boolean_mask_select(result)) return select;
+    if (auto consensus = simplify_consensus(result)) return consensus;
+    if (auto carry = simplify_add_xor_difference(result)) return carry;
+    if (auto carry = simplify_carry_recombination(result)) return carry;
+    if (auto low_bit = simplify_lowest_set_bit(result)) return low_bit;
+    if (auto additive = simplify_additive_cancellation(result)) return additive;
+    if (auto rotation = simplify_rotate_cancellation(result)) return rotation;
     const auto *lc = std::get_if<ConstantValue>(&left->value);
     const auto *rc = std::get_if<ConstantValue>(&right->value);
     const auto all = mask(result->type.bits);
@@ -491,6 +1091,9 @@ ExpressionPtr simplify(const ExpressionPtr &input) {
         if (structurally_equal(left, right) && pure(left)) return constant(0, result->type);
     } else if (binary->operation == "add" || binary->operation == "sub" ||
                binary->operation == "shl" || binary->operation == "shr" || binary->operation == "sar") {
+        if (binary->operation == "add" && result->type.kind == TypeKind::integer &&
+            bitwise_complements(left, right) && pure_bitvector(left) && pure_bitvector(right))
+            return constant(all, result->type);
         if (rc && !(rc->value & all)) return left;
         if (binary->operation == "add" && lc && !(lc->value & all)) return right;
         if (binary->operation == "shr" && rc) {
@@ -502,6 +1105,21 @@ ExpressionPtr simplify(const ExpressionPtr &input) {
                 amount < result->type.bits && shift->left && shift->left->type == result->type &&
                 pure(shift->left)) {
                 const auto kept = all >> static_cast<unsigned>(amount);
+                return std::make_shared<Expression>(Expression{result->type,
+                    BinaryValue{"and", shift->left, constant(kept, result->type)}});
+            }
+        }
+        if (binary->operation == "shl" && rc && result->type.kind == TypeKind::integer) {
+            const auto *shift = std::get_if<BinaryValue>(&left->value);
+            const auto *shift_amount = shift && shift->operation == "shr" && shift->right
+                ? std::get_if<ConstantValue>(&shift->right->value) : nullptr;
+            const auto amount = rc->value & all;
+            if (shift_amount && shift_amount->type == result->type &&
+                (shift_amount->value & all) == amount && amount > 0 &&
+                amount < result->type.bits && shift->left && shift->left->type == result->type &&
+                pure_bitvector(shift->left)) {
+                const auto cleared_low = (std::uint64_t{1} << static_cast<unsigned>(amount)) - 1;
+                const auto kept = all ^ cleared_low;
                 return std::make_shared<Expression>(Expression{result->type,
                     BinaryValue{"and", shift->left, constant(kept, result->type)}});
             }
@@ -524,6 +1142,15 @@ ExpressionPtr simplify(const ExpressionPtr &input) {
         if (lc && (lc->value & all) == 1) return right;
         if (rc && (rc->value & all) == 1) return left;
         if (result->type.kind == TypeKind::integer) {
+            const auto is_all_ones = [&](const ConstantValue *value) {
+                return value && value->type == result->type && value->value == all;
+            };
+            if (is_all_ones(lc) && pure_bitvector(right))
+                return std::make_shared<Expression>(Expression{result->type,
+                    UnaryValue{"neg", right}});
+            if (is_all_ones(rc) && pure_bitvector(left))
+                return std::make_shared<Expression>(Expression{result->type,
+                    UnaryValue{"neg", left}});
             const auto shift_for = [&](const ConstantValue *value) -> std::optional<unsigned> {
                 if (!value || value->type != result->type) return {};
                 const auto factor = value->value & all;
@@ -538,6 +1165,29 @@ ExpressionPtr simplify(const ExpressionPtr &input) {
             if (const auto amount = shift_for(lc); amount && pure_bitvector(right))
                 return std::make_shared<Expression>(Expression{result->type,
                     BinaryValue{"shl", right, constant(*amount, result->type)}});
+            const auto shift_plus_one_for = [&](const ConstantValue *value) -> std::optional<unsigned> {
+                if (!value || value->type != result->type ||
+                    value->value != (value->value & all)) return {};
+                const auto remainder = value->value - 1;
+                if (!remainder || (remainder & (remainder - 1)) != 0) return {};
+                const auto amount = static_cast<unsigned>(std::countr_zero(remainder));
+                return amount > 0 && amount < result->type.bits
+                    ? std::optional<unsigned>{amount} : std::nullopt;
+            };
+            const auto rewrite_shift_plus_one = [&](const ExpressionPtr &operand, unsigned amount) {
+                auto shifted = std::make_shared<Expression>(Expression{result->type,
+                    BinaryValue{"shl", operand, constant(amount, result->type)}});
+                return std::make_shared<Expression>(Expression{result->type,
+                    BinaryValue{"add", std::move(shifted), operand}});
+            };
+            if (const auto amount = shift_plus_one_for(rc); amount && left->type == result->type &&
+                pure_bitvector(left) &&
+                expression_nodes(left) <= 256)
+                return rewrite_shift_plus_one(left, *amount);
+            if (const auto amount = shift_plus_one_for(lc); amount && right->type == result->type &&
+                pure_bitvector(right) &&
+                expression_nodes(right) <= 256)
+                return rewrite_shift_plus_one(right, *amount);
         }
     }
     if ((binary->operation == "sub" || binary->operation == "xor") &&

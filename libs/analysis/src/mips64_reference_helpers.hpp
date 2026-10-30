@@ -21,7 +21,8 @@ inline std::optional<std::pair<std::uint8_t, Address>> mips64_link_value(
     const bool regimm_link = instruction.opcode == Opcode::mips64_bltzal ||
         instruction.opcode == Opcode::mips64_bgezal || instruction.opcode == Opcode::mips64_bltzall ||
         instruction.opcode == Opcode::mips64_bgezall;
-    const bool jump_link = instruction.opcode == Opcode::mips_jal || instruction.opcode == Opcode::mips_jalr;
+    const bool jump_link = instruction.opcode == Opcode::mips_jal || instruction.opcode == Opcode::mips_jalr ||
+        instruction.opcode == Opcode::mips64_jalr_hb;
     if (!regimm_link && !jump_link)
         return {};
     std::optional<std::uint8_t> destination;

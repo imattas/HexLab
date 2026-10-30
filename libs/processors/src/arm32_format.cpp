@@ -25,6 +25,38 @@ std::string shifted_text(const ArmShiftedRegisterOperand &value) {
 }
 } // namespace
 std::string mnemonic(Opcode opcode, std::uint8_t condition) {
+    if (opcode == Opcode::t32_addw || opcode == Opcode::t32_subw) {
+        static constexpr const char *conditions[]{"eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc",
+                                                   "hi", "ls", "ge", "lt", "gt", "le", "", "?"};
+        return std::string(opcode == Opcode::t32_addw ? "addw" : "subw") + conditions[condition & 15];
+    }
+    if (opcode == Opcode::t32_movw) return "movw";
+    if (opcode == Opcode::t32_movt) return "movt";
+    const char *bitfield_name = opcode == Opcode::arm_sbfx ? "sbfx" :
+        opcode == Opcode::arm_ubfx ? "ubfx" : opcode == Opcode::arm_bfi ? "bfi" :
+        opcode == Opcode::arm_bfc ? "bfc" : nullptr;
+    if (bitfield_name) {
+        static constexpr const char *conditions[]{"eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc",
+                                                   "hi", "ls", "ge", "lt", "gt", "le", "", "?"};
+        return std::string(bitfield_name) + conditions[condition & 15];
+    }
+    const char *saturating_name = opcode == Opcode::arm_qadd ? "qadd" :
+        opcode == Opcode::arm_qsub ? "qsub" : opcode == Opcode::arm_qdadd ? "qdadd" :
+        opcode == Opcode::arm_qdsub ? "qdsub" : nullptr;
+    if (saturating_name) {
+        static constexpr const char *conditions[]{"eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc",
+                                                   "hi", "ls", "ge", "lt", "gt", "le", "", "?"};
+        return std::string(saturating_name) + conditions[condition & 15];
+    }
+    const char *exclusive_name = opcode == Opcode::arm_ldrex ? "ldrex" :
+        opcode == Opcode::arm_ldrexb ? "ldrexb" : opcode == Opcode::arm_ldrexh ? "ldrexh" :
+        opcode == Opcode::arm_strex ? "strex" : opcode == Opcode::arm_strexb ? "strexb" :
+        opcode == Opcode::arm_strexh ? "strexh" : nullptr;
+    if (exclusive_name) {
+        static constexpr const char *conditions[]{"eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc",
+                                                   "hi", "ls", "ge", "lt", "gt", "le", "", "?"};
+        return std::string(exclusive_name) + conditions[condition & 15];
+    }
     const char *multiply_name = nullptr;
     switch (opcode) {
     case Opcode::a32_mul: multiply_name = "mul"; break;
@@ -40,6 +72,31 @@ std::string mnemonic(Opcode opcode, std::uint8_t condition) {
         static constexpr const char *multiply_conditions[]{"eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc",
                                                             "hi", "ls", "ge", "lt", "gt", "le", "", "?"};
         return std::string(multiply_name) + multiply_conditions[condition & 15];
+    }
+    const char *extend_name = nullptr;
+    switch (opcode) {
+    case Opcode::a32_sxtb: extend_name = "sxtb"; break;
+    case Opcode::a32_sxth: extend_name = "sxth"; break;
+    case Opcode::a32_sxtab: extend_name = "sxtab"; break;
+    case Opcode::a32_sxtah: extend_name = "sxtah"; break;
+    case Opcode::a32_uxtb: extend_name = "uxtb"; break;
+    case Opcode::a32_uxth: extend_name = "uxth"; break;
+    case Opcode::a32_uxtab: extend_name = "uxtab"; break;
+    case Opcode::a32_uxtah: extend_name = "uxtah"; break;
+    case Opcode::t32_sxtb16: extend_name = "sxtb16"; break;
+    case Opcode::t32_sxtab16: extend_name = "sxtab16"; break;
+    case Opcode::t32_uxtb16: extend_name = "uxtb16"; break;
+    case Opcode::t32_uxtab16: extend_name = "uxtab16"; break;
+    case Opcode::a32_sxtb16: extend_name = "sxtb16"; break;
+    case Opcode::a32_sxtab16: extend_name = "sxtab16"; break;
+    case Opcode::a32_uxtb16: extend_name = "uxtb16"; break;
+    case Opcode::a32_uxtab16: extend_name = "uxtab16"; break;
+    default: break;
+    }
+    if (extend_name) {
+        static constexpr const char *conditions[]{"eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc",
+                                                   "hi", "ls", "ge", "lt", "gt", "le", "", "?"};
+        return std::string(extend_name) + conditions[condition & 15];
     }
     if (opcode == Opcode::arm_tbb || opcode == Opcode::arm_tbh) {
         static constexpr const char *condition_names[]{"eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc",
@@ -94,7 +151,9 @@ std::string format(const Instruction &i) {
         }
     }
     const bool compare = i.opcode >= Opcode::a32_tst && i.opcode <= Opcode::a32_cmn;
-    const bool data = (i.opcode >= Opcode::a32_and && i.opcode <= Opcode::a32_mvn) || i.opcode == Opcode::t32_mul ||
+    const bool data = (i.opcode >= Opcode::a32_and && i.opcode <= Opcode::a32_mvn) ||
+                      i.opcode == Opcode::t32_addw || i.opcode == Opcode::t32_subw || i.opcode == Opcode::t32_mul ||
+                      i.opcode == Opcode::t32_movw || i.opcode == Opcode::t32_movt ||
                       i.opcode == Opcode::a32_mul || i.opcode == Opcode::a32_mla ||
                       i.opcode == Opcode::a32_mls ||
                       i.opcode == Opcode::a32_umull || i.opcode == Opcode::a32_umlal ||
@@ -113,6 +172,9 @@ std::string format(const Instruction &i) {
         result += "s";
     const auto qualified = mnemonic(i.opcode, unknown ? 14 : i.condition), plain = mnemonic(i.opcode, 14);
     result += qualified.substr(plain.size());
+    if (i.context.mode == ExecutionMode::thumb && i.length == 4 &&
+        (i.opcode == Opcode::a32_add || i.opcode == Opcode::a32_sub))
+        result += ".w";
     const auto short_op = (half >> 6) & 15;
     const bool short_binary =
         narrow && (((half & 0xe000) == 0x2000 && ((half >> 11) & 3) >= 2) ||

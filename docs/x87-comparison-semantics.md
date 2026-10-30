@@ -22,6 +22,26 @@ ZF/PF/CF when the result retires, and clear AF/SF/OF. For an unmasked
 FCOMI/FUCOMI invalid exception, ZF/PF/CF remain unchanged while AF/SF/OF are
 cleared.
 
+All four forms also detect true binary80 denormal operands (exponent zero,
+nonzero significand, explicit integer bit clear). The evaluator sets sticky
+FSW.DE; with DM masked, comparison proceeds normally, and with DM unmasked it
+sets ES/B, suppresses the relation outputs, and marks the operation incomplete.
+For FCOMI/FUCOMI, AF/SF/OF are still cleared on that unmasked exception while
+ZF/PF/CF retain their incoming values. Pseudo-denormals are not treated as
+denormal operands. This handling is limited to the value evaluator; stack-tag
+fault interaction remains caller-owned.
+When an unmasked invalid operand and a denormal operand occur together, this
+helper prioritizes invalid and does not currently report DE; that combined
+exception case remains unsupported.
+
+`evaluate_x87_test` evaluates decoded `FTST` using the same ordered
+comparison rules with positive binary80 zero as the right operand. It returns
+the less/equal/greater/unordered relation and FSW effects, including invalid
+masking, retirement, C0/C2/C3, and C1 clearing. It does not write EFLAGS or
+change the x87 stack. The caller supplies a nonempty ST(0) value and remains
+responsible for stack-underflow handling and any subsequent exception
+delivery.
+
 The evaluator does not convert m32fp/m64fp values, perform arithmetic, model
 exception delivery, track the physical x87 register stack/TOP/tag word, or apply
 the pop side effects of FCOMP/FCOMIP/FUCOMIP. The caller must apply stack changes

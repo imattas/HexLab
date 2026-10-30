@@ -12,12 +12,16 @@
 namespace hexlab {
 enum class DecodeStatus { decoded, unsupported, invalid, truncated };
 enum class FlowKind { fallthrough, call, conditional_branch, jump, ret, trap, switch_dispatch, data };
-enum class RegisterBank { gpr, ip, flags, segment, arm32_gpr, arm64_gpr, arm64_sp, arm64_zero, arm_flags, riscv_gpr, mips_gpr, mos6502, mips_hilo, mips_cp0, x87, ppc_gpr, ppc_cr, ppc_lr, ppc_ctr, xmm, riscv_fpr, riscv_fstatus, mips_fpr, mips_fcsr, cil_stack, ymm, riscv_vpr, riscv_vcsr, cil_continuation, ppc_xer, x87_status, x87_control, x87_tag, arm64_simd, dex_vreg, jvm_local, wasm_stack, mxcsr, zmm, opmask, ppc_fpr, jvm_stack, ppc_fpscr, ppc_vr, wasm_local };
+enum class RegisterBank { gpr, ip, flags, segment, arm32_gpr, arm64_gpr, arm64_sp, arm64_zero, arm_flags, riscv_gpr, mips_gpr, mos6502, mips_hilo, mips_cp0, x87, ppc_gpr, ppc_cr, ppc_lr, ppc_ctr, xmm, riscv_fpr, riscv_fstatus, mips_fpr, mips_fcsr, cil_stack, ymm, riscv_vpr, riscv_vcsr, cil_continuation, ppc_xer, x87_status, x87_control, x87_tag, arm64_simd, dex_vreg, jvm_local, wasm_stack, mxcsr, zmm, opmask, ppc_fpr, jvm_stack, ppc_fpscr, ppc_vr, wasm_local, ppc_crbit, arm32_vfp };
 enum class Opcode {
     mov,
     movzx,
     movsx,
     movsxd,
+    arpl,
+    bound,
+    les,
+    lds,
     lea,
     push,
     pop,
@@ -195,6 +199,8 @@ enum class Opcode {
     cwd,
     cdq,
     cqo,
+    aam,
+    aad,
     // Appended so persisted/cache Opcode ordinals after the A64 block stay unchanged.
     a64_sbfm,
     a64_ubfm,
@@ -241,7 +247,9 @@ enum class Opcode {
     mips64_daddi,
     // Additional PowerPC scalar integer forms; appended to preserve cache IDs.
     ppc_mulli, ppc_subfic, ppc_cmpi, ppc_cmpli,
-    ppc_rlwimi, ppc_rlwimi_dot, ppc_rlwinm, ppc_rlwinm_dot, ppc_rlwnm, ppc_rlwnm_dot
+    ppc_rlwimi, ppc_rlwimi_dot, ppc_rlwinm, ppc_rlwinm_dot, ppc_rlwnm, ppc_rlwnm_dot,
+    // Appended MIPS64 Release 2 hazard-barrier register jumps.
+    mips64_jr_hb, mips64_jalr_hb
     , mips_ldc1, mips_sdc1,
     mips_add_d, mips_sub_d, mips_mul_d, mips_div_d, mips_sqrt_d, mips_abs_d, mips_mov_d, mips_neg_d,
     mips_c_eq_d, mips_c_lt_d, mips_c_le_d,
@@ -411,6 +419,8 @@ enum class Opcode {
     rv_vwsubu_vv, rv_vwsubu_vx, rv_vwsubu_wv, rv_vwsubu_wx,
     // Appended RISC-V Zba scalar address-generation forms.
     rv_sh1add, rv_sh2add, rv_sh3add, rv_add_uw, rv_sh1add_uw, rv_sh2add_uw, rv_sh3add_uw, rv_slli_uw,
+    // RISC-V Zbs single-bit forms; appended to preserve serialized IDs.
+    rv_bclr, rv_bext, rv_binv, rv_bset, rv_bclri, rv_bexti, rv_binvi, rv_bseti,
     // RVV non-accumulating widening integer multiply; appended for ID stability.
     rv_vwmulu_vv, rv_vwmulu_vx, rv_vwmulsu_vv, rv_vwmulsu_vx, rv_vwmul_vv, rv_vwmul_vx,
     // EVEX variable packed shifts; append to preserve persisted opcode IDs.
@@ -446,6 +456,8 @@ enum class Opcode {
     rv_vfrsqrt7_v, rv_vfrec7_v,
     // x86 wide memory compare-exchange; appended to retain persisted IDs.
     cmpxchg8b, cmpxchg16b,
+    // PowerPC conditional trap word/doubleword comparisons.
+    ppc_tw, ppc_td,
     // BMI2 scalar integer operations; append to preserve serialized opcode IDs.
     bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx,
     // MIPS64 REGIMM immediate traps; appended to preserve serialized opcode IDs.
@@ -504,7 +516,154 @@ enum class Opcode {
     // AArch64 extract concatenated registers (EXTR); appended for stable IDs.
     a64_extr,
     // Undocumented NMOS 6502 A-and-X subtract-immediate (AXS/SBX).
-    m6502_axs
+    m6502_axs,
+    // Stable NMOS unofficial load/store combinations.
+    m6502_lax,
+    m6502_sax,
+    // Scalar RISC-V Zbb operations; append to preserve stored opcode IDs.
+    rv_andn, rv_orn, rv_xnor, rv_min, rv_minu, rv_max, rv_maxu, rv_rol, rv_ror, rv_rori,
+    rv_sext_b, rv_sext_h, rv_zext_h, rv_orc_b, rv_rev8, rv_rolw, rv_rorw, rv_roriw,
+    // RVV single-width floating reductions; append to preserve persisted opcode IDs.
+    rv_vfredusum, rv_vfredosum, rv_vfredmin, rv_vfredmax,
+    // x86 carry/direction flag-control family; append to preserve stored IDs.
+    x86_flag_control,
+    // Legacy SSE2 byte shifts of a packed 128-bit register; preserve cache IDs.
+    pslldq, psrldq,
+    // MIPS64 SPECIAL3 byte/halfword shuffle and sign-extension operations.
+    mips64_dsbh, mips64_dshd, mips64_wsbh, mips64_seb, mips64_seh,
+    // Legacy SSSE3 integer operation slice; append to preserve serialized IDs.
+    pmaddubsw, pmulhrsw, psignb, psignw, psignd, pabsb, pabsw, pabsd,
+    // A32 ARMv6 byte/halfword extend and extend-add operations.
+    a32_sxtb, a32_sxth, a32_sxtab, a32_sxtah,
+    a32_uxtb, a32_uxth, a32_uxtab, a32_uxtah,
+    // PowerPC CR logical bit operations; appended to preserve stored IDs.
+    ppc_crand, ppc_crandc, ppc_creqv, ppc_crnand, ppc_crnor, ppc_cror, ppc_crorc, ppc_crxor,
+    // Scalar BMI1 VEX forms; appended to preserve stored opcode IDs.
+    andn, bextr, blsi, blsmsk, blsr,
+    // VEX immediate packed floating shuffles; appended to preserve stored IDs.
+    vshufps, vshufpd,
+    // RVV mask-register logical operations; appended to preserve stored IDs.
+    rv_vmand_mm, rv_vmnand_mm, rv_vmandn_mm, rv_vmxor_mm,
+    rv_vmor_mm, rv_vmnor_mm, rv_vmorn_mm, rv_vmxnor_mm,
+    // AVX2 full-width variable dword permutation; append for ID stability.
+    vpermd,
+    // Legacy SSE packed/scalar floating compare-immediate forms; appended for stable IDs.
+    cmpps, cmppd, cmpss, cmpsd,
+    // PPC64 algebraic word loads; appended to preserve persisted opcode IDs.
+    ppc_lwa, ppc_lwax, ppc_lwaux,
+    // Classic MIPS64 integer moves selected by FCC; preserve stored IDs.
+    mips64_movf, mips64_movt,
+    // Scalar memory byte-order move; appended for persisted ID stability.
+    movbe,
+    // SSE4.2 scalar GPR CRC-32C operation; preserve persisted opcode IDs.
+    crc32,
+    // Classic MIPS32 COP1 conditional copies; append for stored ID stability.
+    mips_movf_s, mips_movt_s, mips_movz_s, mips_movn_s,
+    mips_movf_d, mips_movt_d, mips_movz_d, mips_movn_d,
+    // Intel ADX carry-chain instructions; append to preserve persisted IDs.
+    adcx, adox,
+    // Thumb-2 packed-byte extend and extend-add operations; append for ID stability.
+    t32_sxtb16, t32_sxtab16, t32_uxtb16, t32_uxtab16,
+    // RISC-V Zbc scalar carry-less multiply forms; append to preserve IDs.
+    rv_clmul, rv_clmulh, rv_clmulr,
+    // MIPS64 Release 2 word-width rotate-right aliases; append for stable IDs.
+    mips64_rotr, mips64_rotrv,
+    // SSE MOVMSK variants; appended to preserve persisted opcode values.
+    movmskps, movmskpd,
+    // PowerPC high-word integer multiply forms; append for cache stability.
+    ppc_mulhw, ppc_mulhwu,
+    // AdvSIMD signed/unsigned lane min/max; append for stable opcode IDs.
+    a64_vsmax, a64_vsmin, a64_vumax, a64_vumin,
+    // SSE2 byte-sign extraction; append for persisted opcode stability.
+    pmovmskb,
+    // RISC-V Zicond conditional-zero instructions; append for stable opcode IDs.
+    rv_czero_eqz, rv_czero_nez,
+    // Thumb-2 unflagged 12-bit immediate arithmetic; appended for cache stability.
+    t32_addw, t32_subw,
+    // A32 parallel byte-lane sign/zero extension forms; append for cache stability.
+    a32_sxtb16, a32_sxtab16, a32_uxtb16, a32_uxtab16,
+    // PowerPC scalar population-count operations; append to preserve cache IDs.
+    ppc_popcntw, ppc_popcntd,
+    // AVX2 lane-local dword immediate shuffle; appended to preserve IDs.
+    vpshufd,
+    // RISC-V Ztso fence encoding; append to preserve persisted opcode values.
+    rv_fence_tso,
+    // MIPS32 Release 2 SPECIAL2 low-word multiply; appended for stable IDs.
+    mips_mul,
+    // Thumb-2 wide immediate moves; append to preserve stored opcode IDs.
+    t32_movw, t32_movt,
+    // Legacy SSE2 byte absolute differences; append to preserve stored IDs.
+    psadbw,
+    // EVEX AND-NOT dword/qword forms; append for persisted opcode stability.
+    vpandnd, vpandnq,
+    // AVX-512 VBMI full-vector byte permutation; append for stable IDs.
+    vpermb,
+    // AVX-512 ternary dword/qword logic; append for stored-ID stability.
+    vpternlogd, vpternlogq,
+    // AVX-512 low-qword packed multiplication; append for stable IDs.
+    vpmullq,
+    // AVX-512 signed/unsigned qword min/max; append for stable IDs.
+    vpminsq, vpminuq, vpmaxsq, vpmaxuq,
+    // AVX-512 mask/vector bit conversions; append for stable IDs.
+    vpmovm2b, vpmovm2w, vpmovm2d, vpmovm2q,
+    vpmovb2m, vpmovw2m, vpmovd2m, vpmovq2m,
+    // AVX-512 packed population counts; append for stable IDs.
+    vpopcntb, vpopcntw, vpopcntd, vpopcntq,
+    // PowerPC CR-bit conditional select; appended to preserve opcode IDs.
+    ppc_isel,
+    // PPC overflow-enabled add/subtract forms; append for opcode ID stability.
+    ppc_addo, ppc_addo_dot, ppc_subfo, ppc_subfo_dot,
+    // AVX mask extraction; append to preserve serialized opcode IDs.
+    vmovmskps, vmovmskpd, vpmovmskb,
+    // RISC-V Zbkb scalar pack forms; append for stable opcode IDs.
+    rv_pack, rv_packh, rv_packw,
+    // A64 scalar bit and byte reversal operations; append for stored-ID stability.
+    a64_rbit, a64_rev16, a64_rev32, a64_rev,
+    // x86 processor identification query with implicit EAX/ECX inputs and
+    // EAX/EBX/ECX/EDX outputs; append to preserve persisted opcode IDs.
+    cpuid,
+    // PowerPC scalar per-byte population count; append to preserve stored IDs.
+    ppc_popcntb,
+    // MIPS32 GPR conditional moves; append to preserve stored opcode IDs.
+    mips32_movz, mips32_movn,
+    // PowerPC carry-in add-zero/add-minus-one forms; append for stable IDs.
+    ppc_addze, ppc_addze_dot, ppc_addme, ppc_addme_dot,
+    // Legacy SSE scalar ordered/unordered single-precision comparisons.
+    comiss, ucomiss,
+    // SSE4.1 packed-vector test (appended to preserve serialized opcode IDs).
+    ptest,
+    // Legacy decimal-adjust AL forms; appended to preserve serialized IDs.
+    daa, das,
+    // PowerPC XER-to-CR transfer; appended to preserve serialized IDs.
+    ppc_mcrxr,
+    // AArch64 scalar count-leading-bit operations; append for stable IDs.
+    a64_clz, a64_cls,
+    // SSE2 scalar double comparisons; append to preserve stored opcode IDs.
+    comisd, ucomisd,
+    // NMOS 6502 undocumented AND-then-shift immediate operation.
+    m6502_alr,
+    // SSE4.2 packed signed qword comparison; append to preserve persisted IDs.
+    pcmpgtq,
+    // AArch64 carry arithmetic is appended to preserve persisted opcode IDs.
+    a64_adc, a64_adcs, a64_sbc, a64_sbcs,
+    // NMOS 6502 jam/lockup opcode family; append for persisted ID stability.
+    m6502_kil,
+    // SSSE3/AVX2 128-bit-lane byte alignment; preserve stored opcode IDs.
+    palignr, vpalignr,
+    // RVV mask prefix/index and scalar mask reduction instructions.
+    rv_vcpop_m, rv_vfirst_m, rv_vmsbf_m, rv_vmsof_m, rv_vmsif_m, rv_viota_m, rv_vid_v,
+    // A32/T32 scalar bitfield extract/insert operations; appended for stable IDs.
+    arm_sbfx, arm_ubfx, arm_bfi, arm_bfc,
+    // A32/T32 saturating add/subtract forms; append for stable IDs.
+    arm_qadd, arm_qsub, arm_qdadd, arm_qdsub,
+    // A32/T32 word, byte, and halfword exclusive load/store operations.
+    arm_ldrex, arm_ldrexb, arm_ldrexh, arm_strex, arm_strexb, arm_strexh,
+    // VEX.128/.256 packed-vector test; appended to preserve serialized IDs.
+    vptest,
+    // Appended x86 I/O string instructions; preserve serialized opcode ordinals.
+    x86_ins, x86_outs,
+    // Hardware random/seed instructions; append for persisted opcode stability.
+    rdrand, rdseed
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
@@ -518,7 +677,7 @@ struct EncodedField {
 };
 struct RegisterOperand {
     RegisterBank bank;
-    std::uint8_t index;
+    std::uint16_t index;
     std::uint16_t width;
     bool high_byte;
     bool operator==(const RegisterOperand &) const = default;
@@ -608,6 +767,9 @@ struct ArmInstructionInfo {
     // NZCV bits, in architectural order (N=8, Z=4, C=2, V=1).
     std::uint8_t flags_written = 0;
     bool flags_known = true;
+    // Sticky APSR.Q may be set by a saturating operation; this is separate
+    // from the NZCV register mask because Q is not modeled in that bank.
+    bool q_flag_may_set = false;
     bool writes_pc = false, writeback = false;
     ArmMultipleMode multiple_mode = ArmMultipleMode::ia;
     ThumbITState it_before, it_after;
@@ -645,6 +807,17 @@ struct JvmSwitchTable {
     std::vector<JvmSwitchCase> cases;
     bool operator==(const JvmSwitchTable &) const = default;
 };
+// Published NMOS 6502 instruction timing. Additional cycles are conditional:
+// indexed reads may incur one cycle on a page crossing; a taken branch incurs
+// one cycle and a taken page-crossing branch incurs one further cycle. This
+// describes clock counts, not individual bus transactions.
+struct M6502Timing {
+    std::uint8_t base_cycles = 0;
+    bool page_cross_penalty = false;
+    bool branch_taken_penalty = false;
+    bool branch_page_cross_penalty = false;
+    bool operator==(const M6502Timing &) const = default;
+};
 struct Instruction {
     DecodeContext context;
     Address address{{0}, 0};
@@ -662,6 +835,7 @@ struct Instruction {
     std::optional<Address> direct_target;
     std::optional<DexSwitchTable> dex_switch;
     std::optional<JvmSwitchTable> jvm_switch;
+    std::optional<M6502Timing> m6502_timing;
     std::uint8_t condition = 0;
     // Set for x86 Jcc instructions; condition remains for compatibility with
     // existing architecture-neutral clients.
@@ -685,6 +859,9 @@ struct Instruction {
     std::uint8_t stack_slot_count = 0;
     // x87 stack depth change: +1 pushes a value, -1 pops one value.
     std::int8_t x87_stack_delta = 0;
+    // A waiting x87 instruction observes and delivers a prior unmasked x87
+    // exception before executing. FN-prefixed non-waiting forms do not.
+    bool x87_waiting = false;
     bool lock_prefix = false;
     std::optional<ArmInstructionInfo> arm;
     // Number of architecturally executed instructions after a control transfer
@@ -699,6 +876,8 @@ struct Instruction {
     // Vector operation shape. vector_bits is the architectural register width;
     // vector_element_bits is zero when the operation has no lane interpretation.
     std::uint16_t vector_bits = 0, vector_element_bits = 0;
+    // RVV segmented memory NF value (1 for ordinary single-field transfers).
+    std::uint8_t riscv_vector_segment_fields = 1;
     // Some bytecode formats have variable-width instructions larger than the
     // native instruction-byte buffer. Retain the full encoding only then.
     std::vector<std::byte> extended_bytes;

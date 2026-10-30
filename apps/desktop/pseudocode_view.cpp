@@ -20,9 +20,11 @@
 #include <charconv>
 #include <cctype>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <type_traits>
 
 namespace hexlab::desktop {
@@ -897,16 +899,27 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     find_query_ = new wxTextCtrl(this, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize);
     find_query_->SetName("pseudocode-find-query");
     find_query_->SetMaxLength(256);
+    find_whole_word_ = new wxCheckBox(this, wxID_ANY, "Whole word");
+    find_whole_word_->SetName("pseudocode-find-whole-word");
+    find_whole_word_->SetToolTip("Require identifier boundaries before and after the literal match.");
+    find_all_functions_ = new wxCheckBox(this, wxID_ANY, "All functions");
+    find_all_functions_->SetName("pseudocode-find-all-functions");
+    find_all_functions_->SetToolTip("List matches across recovered functions; selecting one opens its function entry.");
     find_previous_ = new wxButton(this, wxID_ANY, "Previous");
     find_previous_->SetName("pseudocode-find-previous");
     find_next_ = new wxButton(this, wxID_ANY, "Next");
     find_next_->SetName("pseudocode-find-next");
+    find_all_ = new wxButton(this, wxID_ANY, "List matches...");
+    find_all_->SetName("pseudocode-find-all");
     find_status_ = new wxStaticText(this, wxID_ANY, "Rendered function only", wxDefaultPosition,
                                     wxDefaultSize, wxST_ELLIPSIZE_END);
     find_status_->SetName("pseudocode-find-status");
     find_layout->Add(find_query_, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+    find_layout->Add(find_whole_word_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+    find_layout->Add(find_all_functions_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
     find_layout->Add(find_previous_, 0, wxRIGHT, FromDIP(4));
     find_layout->Add(find_next_, 0, wxRIGHT, FromDIP(4));
+    find_layout->Add(find_all_, 0, wxRIGHT, FromDIP(4));
     find_layout->Add(find_status_, 0, wxALIGN_CENTER_VERTICAL);
     layout->Add(status_, 0, wxEXPAND | wxALL, FromDIP(4));
     layout->Add(find_layout, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
@@ -919,6 +932,24 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     source_ = new wxTextCtrl(this, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
                              wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2 | wxHSCROLL);
     source_->SetName("pseudocode-source");
+    source_font_default_size_ = source_->GetFont().GetPointSize();
+    if (source_font_default_size_ <= 0) source_font_default_size_ = 10;
+    auto *font_layout = new wxBoxSizer(wxHORIZONTAL);
+    font_layout->Add(new wxStaticText(this, wxID_ANY, "Pseudocode text size:"), 0,
+                     wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+    source_font_smaller_ = new wxButton(this, wxID_ANY, "A-");
+    source_font_smaller_->SetName("pseudocode-font-smaller");
+    source_font_smaller_->SetToolTip("Decrease pseudocode text size (minimum 6 pt).");
+    source_font_larger_ = new wxButton(this, wxID_ANY, "A+");
+    source_font_larger_->SetName("pseudocode-font-larger");
+    source_font_larger_->SetToolTip("Increase pseudocode text size (maximum 32 pt).");
+    source_font_reset_ = new wxButton(this, wxID_ANY, "Reset");
+    source_font_reset_->SetName("pseudocode-font-reset");
+    source_font_reset_->SetToolTip("Restore the default pseudocode text size.");
+    font_layout->Add(source_font_smaller_, 0, wxRIGHT, FromDIP(4));
+    font_layout->Add(source_font_larger_, 0, wxRIGHT, FromDIP(4));
+    font_layout->Add(source_font_reset_, 0, wxRIGHT, FromDIP(4));
+    layout->Add(font_layout, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
     content->Add(addresses_, 0, wxEXPAND | wxALL, FromDIP(4));
     content->Add(source_, 1, wxEXPAND | wxALL, FromDIP(4));
     layout->Add(content, 1, wxEXPAND);
@@ -937,16 +968,31 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     copy_excerpt_->SetToolTip("Copy selected pseudocode lines with their mapped instruction origins.");
     save_pseudocode_ = new wxButton(this, wxID_ANY, "Save pseudocode...");
     save_pseudocode_->SetName("pseudocode-save");
+    open_source_origin_ = new wxButton(this, wxID_ANY, "Open Source at Origin");
+    open_source_origin_->SetName("pseudocode-open-source-origin");
+    open_source_origin_->SetToolTip("Open the Source page at the selected pseudocode line's validated instruction origin when a source mapping is available.");
+    open_source_origin_->Enable(false);
     variable_status_ = new wxStaticText(this, wxID_ANY, "Select a variable in source or the table",
                                        wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
     variable_status_->SetName("pseudocode-variable-status");
-    for (auto *button : {definition_, previous_use_, next_use_, copy_pseudocode_, copy_excerpt_, save_pseudocode_})
+    for (auto *button : {definition_, previous_use_, next_use_, copy_pseudocode_, copy_excerpt_, save_pseudocode_,
+                         open_source_origin_})
         navigation->Add(button, 0, wxRIGHT, FromDIP(4));
     navigation->Add(variable_status_, 1, wxALIGN_CENTER_VERTICAL);
     layout->Add(navigation, 0, wxEXPAND | wxALL, FromDIP(4));
     auto *stack_panel = new wxBoxSizer(wxVERTICAL);
-    stack_panel->Add(new wxStaticText(this, wxID_ANY, "Stack slots (entry SP relative)"), 0,
-                     wxLEFT | wxRIGHT | wxTOP, FromDIP(4));
+    auto *stack_controls = new wxBoxSizer(wxHORIZONTAL);
+    stack_controls->Add(new wxStaticText(this, wxID_ANY, "Stack slots (entry SP relative)"), 1,
+                        wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT | wxTOP, FromDIP(4));
+    previous_stack_access_ = new wxButton(this, wxID_ANY, "Previous access");
+    previous_stack_access_->SetName("pseudocode-stack-previous-access");
+    previous_stack_access_->Enable(false);
+    next_stack_access_ = new wxButton(this, wxID_ANY, "Next access");
+    next_stack_access_->SetName("pseudocode-stack-next-access");
+    next_stack_access_->Enable(false);
+    stack_controls->Add(previous_stack_access_, 0, wxRIGHT, FromDIP(4));
+    stack_controls->Add(next_stack_access_, 0, wxRIGHT, FromDIP(4));
+    stack_panel->Add(stack_controls, 0, wxEXPAND);
     stack_slots_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxSize(-1, FromDIP(110)),
                                   wxLC_REPORT | wxLC_SINGLE_SEL | wxLC_HRULES);
     stack_slots_->SetName("pseudocode-stack-slots");
@@ -955,10 +1001,18 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     stack_slots_->InsertColumn(2, "Access", wxLIST_FORMAT_LEFT, FromDIP(100));
     stack_slots_->InsertColumn(3, "Sites", wxLIST_FORMAT_LEFT, FromDIP(70));
     stack_slots_->InsertColumn(4, "Local name", wxLIST_FORMAT_LEFT, FromDIP(150));
+    stack_slots_->InsertColumn(5, "ABI role / call", wxLIST_FORMAT_LEFT, FromDIP(190));
     stack_panel->Add(stack_slots_, 1, wxEXPAND | wxALL, FromDIP(4));
     auto *variables_panel = new wxBoxSizer(wxVERTICAL);
-    variables_panel->Add(new wxStaticText(this, wxID_ANY, "Variables (definition sites)"), 0,
-                         wxLEFT | wxRIGHT | wxTOP, FromDIP(4));
+    auto *variables_heading = new wxBoxSizer(wxHORIZONTAL);
+    variables_heading->Add(new wxStaticText(this, wxID_ANY, "Variables (definition sites)"), 1,
+                           wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT | wxTOP, FromDIP(4));
+    copy_variable_ = new wxButton(this, wxID_ANY, "Copy selected variable");
+    copy_variable_->SetName("pseudocode-copy-variable");
+    copy_variable_->SetToolTip("Copy selected variable identity, definition, type, comment, and bounded access sites as TSV.");
+    copy_variable_->Enable(false);
+    variables_heading->Add(copy_variable_, 0, wxLEFT, FromDIP(4));
+    variables_panel->Add(variables_heading, 0, wxEXPAND);
     variables_list_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxSize(-1, FromDIP(110)),
                                      wxLC_REPORT | wxLC_SINGLE_SEL | wxLC_HRULES);
     variables_list_->SetName("pseudocode-variables");
@@ -966,6 +1020,7 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     variables_list_->InsertColumn(1, "Type", wxLIST_FORMAT_LEFT, FromDIP(120));
     variables_list_->InsertColumn(2, "Definition", wxLIST_FORMAT_LEFT, FromDIP(110));
     variables_list_->InsertColumn(3, "SSA / local identity", wxLIST_FORMAT_LEFT, FromDIP(150));
+    variables_list_->InsertColumn(4, "Definition comment", wxLIST_FORMAT_LEFT, FromDIP(200));
     variables_panel->Add(variables_list_, 1, wxEXPAND | wxALL, FromDIP(4));
     auto *data_panels = new wxBoxSizer(wxHORIZONTAL);
     data_panels->Add(stack_panel, 1, wxEXPAND);
@@ -983,12 +1038,16 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     rename_variable_->SetName("pseudocode-rename-variable");
     assign_type_ = new wxButton(this, wxID_ANY, "Assign variable type...");
     assign_type_->SetName("pseudocode-assign-type");
+    comment_variable_ = new wxButton(this, wxID_ANY, "Comment selected variable...");
+    comment_variable_->SetName("pseudocode-comment-variable");
+    comment_variable_->SetToolTip("Store a persistent comment at the unique SSA definition address.");
     editors->Add(rename_function_, 0, wxRIGHT, FromDIP(4));
     editors->Add(rename_local_, 0, wxRIGHT, FromDIP(4));
     editors->Add(comment_local_, 0, wxRIGHT, FromDIP(4));
     editors->Add(edit_comment_, 0);
     editors->Add(rename_variable_, 0, wxLEFT, FromDIP(4));
     editors->Add(assign_type_, 0, wxLEFT, FromDIP(4));
+    editors->Add(comment_variable_, 0, wxLEFT, FromDIP(4));
     layout->Add(editors, 0, wxEXPAND | wxALL, FromDIP(4));
     layout->Add(data_panels, 0, wxEXPAND);
     SetSizer(layout);
@@ -1006,6 +1065,10 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
             project_->mode == database::ProjectMode::read_write && static_cast<bool>(submit_);
         rename_local_->Enable(writable && selected);
         comment_local_->Enable(writable && selected);
+        const bool has_accesses = row >= 0 && static_cast<std::size_t>(row) < stack_access_sites_.size() &&
+            !stack_access_sites_[static_cast<std::size_t>(row)].empty();
+        previous_stack_access_->Enable(has_accesses);
+        next_stack_access_->Enable(has_accesses);
         if (selected) navigate_to(stack_access_rows_[static_cast<std::size_t>(row)]);
     });
     variables_list_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &event) {
@@ -1013,24 +1076,39 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
             static_cast<std::size_t>(event.GetIndex()) < variable_links_.size())
             select_variable(static_cast<std::size_t>(event.GetIndex()), true);
     });
+    copy_variable_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_selected_variable(); });
     rename_function_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { rename_function(); });
     rename_local_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { rename_local(); });
     comment_local_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { comment_local(); });
     edit_comment_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { edit_comment(); });
     rename_variable_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { rename_variable(); });
     assign_type_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { assign_variable_type(); });
+    comment_variable_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { comment_variable(); });
+    previous_stack_access_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_stack_access(false); });
+    next_stack_access_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_stack_access(true); });
     definition_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { go_to_definition(); });
     previous_use_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_occurrence(false); });
     next_use_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_occurrence(true); });
     copy_pseudocode_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_pseudocode(); });
     copy_excerpt_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_addressed_excerpt(); });
     save_pseudocode_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { save_pseudocode(); });
+    open_source_origin_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { open_source_at_origin(); });
     find_previous_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { find_source(false); });
     find_next_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { find_source(true); });
+    find_all_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { list_source_matches(); });
+    find_all_functions_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+        find_status_->SetLabel(find_all_functions_->GetValue()
+            ? "All recovered functions (List matches...)" : "Rendered function only");
+        find_all_->Enable(model_ready_ && !find_query_->GetValue().empty() &&
+            (find_all_functions_->GetValue() || !source_->GetValue().empty()));
+    });
     find_query_->Bind(wxEVT_TEXT, [this](wxCommandEvent &event) {
-        const bool available = model_ready_ && !source_->GetValue().empty() && !find_query_->GetValue().empty();
-        find_previous_->Enable(available);
-        find_next_->Enable(available);
+        const bool query_ready = model_ready_ && !find_query_->GetValue().empty();
+        const bool current_function_ready = query_ready && !source_->GetValue().empty();
+        find_previous_->Enable(current_function_ready);
+        find_next_->Enable(current_function_ready);
+        find_all_->Enable(query_ready &&
+            (find_all_functions_->GetValue() || !source_->GetValue().empty()));
         event.Skip();
     });
     find_query_->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &event) {
@@ -1044,6 +1122,15 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
         }
         event.Skip();
     });
+    source_font_smaller_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        set_source_font_size(source_->GetFont().GetPointSize() - 1);
+    });
+    source_font_larger_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        set_source_font_size(source_->GetFont().GetPointSize() + 1);
+    });
+    source_font_reset_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        set_source_font_size(source_font_default_size_);
+    });
     const auto deferred_selection = [this] {
         const auto id = document_;
         const auto serial = render_serial_;
@@ -1055,6 +1142,22 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     source_->Bind(wxEVT_LEFT_UP, [deferred_selection](wxMouseEvent &event) { event.Skip(); deferred_selection(); });
     source_->Bind(wxEVT_KEY_UP, [deferred_selection](wxKeyEvent &event) { event.Skip(); deferred_selection(); });
     source_->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &event) {
+        if (event.ControlDown() && !event.AltDown()) {
+            const int key = event.GetKeyCode();
+            if (!event.ShiftDown() && (key == '-' || key == WXK_SUBTRACT)) {
+                set_source_font_size(source_->GetFont().GetPointSize() - 1);
+                return;
+            }
+            if ((key == '+' || (key == '=' && event.ShiftDown()) || key == WXK_ADD) &&
+                (event.ShiftDown() || key == WXK_ADD)) {
+                set_source_font_size(source_->GetFont().GetPointSize() + 1);
+                return;
+            }
+            if (!event.ShiftDown() && (key == '0' || key == WXK_NUMPAD0)) {
+                set_source_font_size(source_font_default_size_);
+                return;
+            }
+        }
         if (event.ControlDown() && !event.ShiftDown() && !event.AltDown() &&
             (event.GetKeyCode() == 'F' || event.GetKeyCode() == 'f')) {
             find_query_->SetFocus();
@@ -1080,6 +1183,14 @@ void PseudocodeView::copy_pseudocode() {
     wxTheClipboard->Close();
 }
 
+void PseudocodeView::set_source_font_size(int point_size) {
+    const auto bounded = std::clamp(point_size, 6, 32);
+    auto font = source_->GetFont();
+    if (!font.IsOk() || font.GetPointSize() == bounded) return;
+    font.SetPointSize(bounded);
+    if (source_->SetFont(font)) source_->Refresh();
+}
+
 void PseudocodeView::find_source(bool next) {
     if (!model_ready_ || source_->GetValue().empty()) {
         find_status_->SetLabel("Search unavailable until pseudocode is rendered");
@@ -1103,18 +1214,44 @@ void PseudocodeView::find_source(bool next) {
     source_->GetSelection(&selection_begin, &selection_end);
     const auto cursor = static_cast<std::size_t>(std::clamp<long>(
         next ? selection_end : selection_begin, 0, static_cast<long>(haystack.length())));
+    const auto is_identifier = [](wxUniChar ch) {
+        const auto c = ch.GetValue();
+        return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c >= 128;
+    };
+    const auto whole_word = find_whole_word_->GetValue();
+    const auto matches = [&](std::size_t at) {
+        if (!whole_word) return true;
+        const auto end = at + needle.length();
+        return (at == 0 || !is_identifier(haystack[at - 1])) &&
+               (end == haystack.length() || !is_identifier(haystack[end]));
+    };
+    const auto find_forward = [&](std::size_t start) {
+        auto found = haystack.find(needle, start);
+        while (found != wxString::npos && !matches(found))
+            found = haystack.find(needle, found + 1);
+        return found;
+    };
+    const auto find_backward = [&](std::size_t at_or_before) {
+        auto found = haystack.rfind(needle, at_or_before);
+        while (found != wxString::npos && !matches(found)) {
+            if (found == 0) return wxString::npos;
+            found = haystack.rfind(needle, found - 1);
+        }
+        return found;
+    };
     auto match = wxString::npos;
     bool wrapped = false;
     if (next) {
-        match = haystack.find(needle, cursor);
+        match = find_forward(cursor);
         if (match == wxString::npos) {
-            match = haystack.find(needle, 0);
+            match = find_forward(0);
             wrapped = match != wxString::npos;
         }
     } else {
-        if (cursor > 0) match = haystack.rfind(needle, cursor - 1);
+        if (cursor > 0) match = find_backward(cursor - 1);
         if (match == wxString::npos) {
-            match = haystack.rfind(needle);
+            match = find_backward(haystack.length());
             wrapped = match != wxString::npos;
         }
     }
@@ -1130,6 +1267,313 @@ void PseudocodeView::find_source(bool next) {
     wxString status = wrapped ? "Match found (wrapped)" : "Match found";
     if (truncated) status += "; searched first 1 MiB";
     find_status_->SetLabel(status);
+}
+
+void PseudocodeView::list_source_matches() {
+    if (find_all_functions_->GetValue()) {
+        list_cross_function_matches();
+        return;
+    }
+    if (!model_ready_ || source_->GetValue().empty() || find_query_->GetValue().empty()) return;
+    constexpr std::size_t scan_limit = 1024 * 1024, match_limit = 512, context_limit = 180;
+    const auto value = source_->GetValue();
+    const auto needle = find_query_->GetValue();
+    const auto limit = std::min(value.length(), scan_limit);
+    const auto haystack = value.Left(limit);
+    const auto whole_word = find_whole_word_->GetValue();
+    const auto is_identifier = [](wxUniChar ch) {
+        const auto c = ch.GetValue();
+        return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c >= 128;
+    };
+    struct SearchRow {
+        long begin, end, line;
+        std::optional<Address> origin;
+        wxString context;
+    };
+    std::vector<SearchRow> matches;
+    matches.reserve(match_limit);
+    bool capped = false;
+    std::size_t position = 0, counted = 0;
+    long line = 0, column = 0;
+    const auto advance = [&](std::size_t end) {
+        for (; counted < end; ++counted) {
+            if (value[counted] == '\n') { ++line; column = 0; }
+            else if (value[counted] != '\r') ++column;
+        }
+    };
+    while (position < limit) {
+        const auto found = haystack.find(needle, position);
+        if (found == wxString::npos || needle.length() > limit || found > limit - needle.length()) break;
+        const auto end = found + needle.length();
+        if (whole_word && ((found && is_identifier(value[found - 1])) ||
+                           (end < value.length() && is_identifier(value[end])))) {
+            position = found + 1;
+            continue;
+        }
+        if (matches.size() == match_limit) { capped = true; break; }
+        advance(found);
+        const auto source_line = line;
+        const auto source_column = column;
+        const auto begin_native = source_->XYToPosition(column, line);
+        advance(end);
+        const auto end_native = source_->XYToPosition(column, line);
+        if (begin_native >= 0 && end_native > begin_native) {
+            auto context = source_->GetLineText(source_line);
+            const auto start = source_column > 50 ? static_cast<std::size_t>(source_column - 50) : 0;
+            const auto original_length = context.length();
+            context = context.Mid(start, context_limit);
+            if (start) context.Prepend("...");
+            if (original_length > start + context_limit) context += "...";
+            const auto *origin = source_origin_at(begin_native, end_native);
+            matches.push_back({begin_native, end_native, source_line,
+                               origin ? std::optional<Address>{origin->address} : std::nullopt, std::move(context)});
+        }
+        position = end;
+    }
+    wxString summary = wxString::Format("%zu match(es) listed", matches.size());
+    if (capped) summary += "; 512-match limit reached; refine the query";
+    if (value.length() > limit) summary += "; searched the first 1,048,576 rendered characters";
+    find_status_->SetLabel(summary);
+    if (matches.empty()) return;
+
+    // The modal loop can receive a newer render or switch documents. Native
+    // text positions below belong only to the captured render identity.
+    const auto serial = render_serial_;
+    const auto document = document_;
+    const auto revision = rendered_document_revision_;
+    wxDialog dialog(this, wxID_ANY, "Pseudocode search matches", wxDefaultPosition, wxDefaultSize,
+                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+    auto *layout = new wxBoxSizer(wxVERTICAL);
+    layout->Add(new wxStaticText(&dialog, wxID_ANY, summary), 0, wxALL, FromDIP(8));
+    auto *table = new wxListCtrl(&dialog, wxID_ANY, wxDefaultPosition, FromDIP(wxSize(760, 320)),
+                                 wxLC_REPORT | wxLC_SINGLE_SEL);
+    table->SetName("pseudocode-search-results");
+    table->InsertColumn(0, "Source line", wxLIST_FORMAT_RIGHT, FromDIP(80));
+    table->InsertColumn(1, "Instruction origin", wxLIST_FORMAT_LEFT, FromDIP(160));
+    table->InsertColumn(2, "Context", wxLIST_FORMAT_LEFT, FromDIP(500));
+    for (const auto &match : matches) {
+        const auto row = table->InsertItem(table->GetItemCount(), wxString::Format("%ld", match.line + 1));
+        table->SetItem(row, 1, match.origin ? location_text(*match.origin) : wxString("Unmapped source"));
+        table->SetItem(row, 2, match.context);
+    }
+    layout->Add(table, 1, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(8));
+    layout->Add(dialog.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxALL | wxEXPAND, FromDIP(8));
+    if (auto *accept = dialog.FindWindow(wxID_OK)) accept->SetLabel("Reveal selected match");
+    dialog.SetSizerAndFit(layout);
+    dialog.SetMinSize(dialog.GetSize());
+    dialog.CentreOnParent();
+    table->SetItemState(0, wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED,
+                       wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED);
+    table->Bind(wxEVT_LIST_ITEM_ACTIVATED, [&](wxListEvent &) { dialog.EndModal(wxID_OK); });
+    if (dialog.ShowModal() != wxID_OK) return;
+    if (!model_ready_ || serial != render_serial_ || document != document_ || revision != rendered_document_revision_) {
+        find_status_->SetLabel("Search result canceled because the pseudocode render changed; list matches again");
+        return;
+    }
+    const auto selected = table->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+    if (selected < 0 || static_cast<std::size_t>(selected) >= matches.size()) return;
+    const auto &match = matches[static_cast<std::size_t>(selected)];
+    source_->SetSelection(match.begin, match.end);
+    source_->ShowPosition(match.begin);
+    source_->SetFocus();
+    source_selection_changed();
+    find_status_->SetLabel(wxString::Format("Selected match %ld of %zu%s", selected + 1, matches.size(),
+        match.origin ? "" : "; source line has no instruction origin"));
+}
+
+void PseudocodeView::list_cross_function_matches() {
+    if (!model_ready_ || !owner_ || !owner_->functions || !owner_->loaded ||
+        !owner_->loaded->image || find_query_->GetValue().empty()) {
+        find_status_->SetLabel("Cross-function search needs a current project pseudocode snapshot");
+        return;
+    }
+    constexpr std::size_t function_limit = 256;
+    constexpr std::size_t per_function_instruction_limit = 5000;
+    constexpr std::size_t total_instruction_limit = 50000;
+    constexpr std::size_t rendered_character_limit = 4 * 1024 * 1024;
+    constexpr std::size_t match_limit = 512;
+    constexpr std::size_t context_limit = 180;
+    const auto serial = render_serial_;
+    const auto document = document_;
+    const auto revision = rendered_document_revision_;
+    const auto *snapshot = owner_->functions.get();
+    const auto *project = owner_.get();
+    const auto *image = owner_->loaded->image.get();
+    const auto needle = find_query_->GetValue();
+    const bool whole_word = find_whole_word_->GetValue();
+    struct SearchRow { Address entry; long line; std::size_t occurrence_on_line; wxString name, context; };
+    std::vector<SearchRow> matches;
+    matches.reserve(match_limit);
+    std::map<std::uint64_t, const BasicBlock *> blocks;
+    for (const auto &block : snapshot->blocks)
+        if (block) blocks.emplace(block->id.value, block.get());
+    const auto *jvm_metadata = project->loaded->metadata.jvm ? &*project->loaded->metadata.jvm : nullptr;
+    const auto *wasm_metadata = project->loaded->metadata.wasm ? &*project->loaded->metadata.wasm : nullptr;
+    const auto *dex_metadata = project->loaded->metadata.dex ? &*project->loaded->metadata.dex : nullptr;
+    std::size_t visited = 0, total_instructions = 0, rendered_characters = 0, skipped = 0;
+    bool capped = false;
+    const auto is_identifier = [](wxUniChar ch) {
+        const auto c = ch.GetValue();
+        return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c >= 128;
+    };
+    for (const auto &function : snapshot->functions) {
+        if (!function) continue;
+        if (visited == function_limit || total_instructions >= total_instruction_limit ||
+            rendered_characters >= rendered_character_limit || matches.size() == match_limit) {
+            capped = true;
+            break;
+        }
+        ++visited;
+        std::size_t instruction_count = 0;
+        bool too_large = false;
+        for (const auto block_id : function->blocks) {
+            const auto block = blocks.find(block_id.value);
+            if (block == blocks.end()) continue;
+            const auto count = block->second->instructions.size();
+            if (count > per_function_instruction_limit - instruction_count) {
+                too_large = true;
+                break;
+            }
+            instruction_count += count;
+        }
+        if (too_large || instruction_count > total_instruction_limit - total_instructions) {
+            ++skipped;
+            continue;
+        }
+        total_instructions += instruction_count;
+        const auto prototype = function_prototype_at(project, function->entry);
+        auto lifted = decompiler::lift_function(*function, *snapshot, jvm_metadata, wasm_metadata, dex_metadata);
+        if (!lifted) { ++skipped; continue; }
+        const auto abi = recovery_abi(*function, *snapshot, image, project, prototype);
+        auto calls = decompiler::prepare_call_effects(lifted.value(), abi);
+        if (!calls) { ++skipped; continue; }
+        auto arguments = abi.integer_argument_registers;
+        arguments.insert(arguments.end(), abi.floating_argument_registers.begin(), abi.floating_argument_registers.end());
+        arguments.insert(arguments.end(), abi.vector_argument_registers.begin(), abi.vector_argument_registers.end());
+        auto ssa = decompiler::to_ssa(calls.value(), arguments);
+        if (!ssa) { ++skipped; continue; }
+        auto constants = decompiler::simplify_constants(ssa.value());
+        if (!constants) { ++skipped; continue; }
+        auto simplified = decompiler::simplify_identities(constants.value());
+        if (!simplified) { ++skipped; continue; }
+        auto named = decompiler::recover_stack_variables(simplified.value());
+        const auto &rendered = named ? named.value() : simplified.value();
+        auto recovered_types = decompiler::recover_types(simplified.value(), abi, prototype);
+        const auto local_type_evidence = named
+            ? stack_local_type_evidence(named.value(), project)
+            : std::vector<decompiler::StackLocalTypeEvidence>{};
+        const auto typed = decompiler::format_pseudocode_with_types(
+            rendered, abi, prototype, std::span<const decompiler::StackLocalTypeEvidence>(local_type_evidence));
+        auto source_text = typed ? typed.value() : decompiler::format_structured_pseudocode(rendered).text;
+        render_parameter_names(source_text, imported_parameter_names(
+            *function, project, image->layout().architecture, abi, prototype));
+        std::map<std::string, std::string> local_types, local_names, local_comments;
+        if (recovered_types) for (const auto &variable : recovered_types.value().stack_variables)
+            local_types.emplace(variable.name, recovered_type_text(variable.type, variable.bits));
+        if (named) for (const auto &[name, sites] : stack_access_sites(named.value())) {
+            const auto *annotation = !sites.empty() ? annotation_at(*project, sites.front()) : nullptr;
+            if (annotation && !annotation->name.empty()) local_names.emplace(name, annotation->name);
+            if (annotation && !annotation->comment.empty()) local_comments.emplace(name, annotation->comment);
+        }
+        std::vector<PseudocodeVariableEdit> ignored_variables;
+        source_text = render_user_variables(rendered, std::move(source_text), project, ignored_variables,
+                                            local_types, local_names, local_comments);
+        auto source = text(source_text);
+        const auto remaining = rendered_character_limit - rendered_characters;
+        if (source.length() > remaining) {
+            source = source.Left(remaining);
+            capped = true;
+        }
+        rendered_characters += source.length();
+        std::size_t position = 0, line_start = 0;
+        long line = 1;
+        std::size_t matches_on_line = 0;
+        while (position < source.length()) {
+            const auto found = source.find(needle, position);
+            if (found == wxString::npos || needle.length() > source.length() ||
+                found > source.length() - needle.length()) break;
+            const auto end = found + needle.length();
+            if (whole_word && ((found && is_identifier(source[found - 1])) ||
+                               (end < source.length() && is_identifier(source[end])))) {
+                position = found + 1;
+                continue;
+            }
+            if (matches.size() == match_limit) { capped = true; break; }
+            while (line_start < found) {
+                const auto newline = source.find('\n', line_start);
+                if (newline == wxString::npos || newline >= found) break;
+                line_start = newline + 1;
+                ++line;
+                matches_on_line = 0;
+            }
+            const auto newline = source.find('\n', line_start);
+            const auto line_end = newline == wxString::npos ? source.length() : newline;
+            const auto context_start = found > line_start + 50 ? found - 50 : line_start;
+            auto context = source.Mid(context_start, context_limit);
+            if (context_start > line_start) context.Prepend("...");
+            if (line_end > context_start + context_limit) context += "...";
+            auto name = text(presentation_name(*project, function->entry));
+            if (name.empty()) name = location_text(function->entry, image);
+            matches.push_back({function->entry, line, matches_on_line++, std::move(name), std::move(context)});
+            position = end;
+        }
+        if (capped) break;
+    }
+    wxString summary = wxString::Format("%zu match(es) across %zu recovered function(s)", matches.size(), visited);
+    if (skipped) summary += wxString::Format("; %zu function(s) could not be searched", skipped);
+    if (capped) summary += "; search limit reached; refine the query or function set";
+    find_status_->SetLabel(summary);
+    if (matches.empty()) return;
+
+    wxDialog dialog(this, wxID_ANY, "Cross-function pseudocode matches", wxDefaultPosition, wxDefaultSize,
+                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+    auto *layout = new wxBoxSizer(wxVERTICAL);
+    layout->Add(new wxStaticText(&dialog, wxID_ANY, summary), 0, wxALL, FromDIP(8));
+    auto *table = new wxListCtrl(&dialog, wxID_ANY, wxDefaultPosition, FromDIP(wxSize(920, 360)),
+                                 wxLC_REPORT | wxLC_SINGLE_SEL);
+    table->SetName("pseudocode-cross-function-search-results");
+    table->InsertColumn(0, "Function", wxLIST_FORMAT_LEFT, FromDIP(220));
+    table->InsertColumn(1, "Entry", wxLIST_FORMAT_LEFT, FromDIP(150));
+    table->InsertColumn(2, "Source line", wxLIST_FORMAT_RIGHT, FromDIP(90));
+    table->InsertColumn(3, "Context", wxLIST_FORMAT_LEFT, FromDIP(440));
+    for (const auto &match : matches) {
+        const auto row = table->InsertItem(table->GetItemCount(), match.name);
+        table->SetItem(row, 1, location_text(match.entry));
+        table->SetItem(row, 2, wxString::Format("%ld", match.line));
+        table->SetItem(row, 3, match.context);
+    }
+    layout->Add(table, 1, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(8));
+    layout->Add(dialog.CreateStdDialogButtonSizer(wxOK | wxCANCEL), 0, wxALL | wxEXPAND, FromDIP(8));
+    if (auto *accept = dialog.FindWindow(wxID_OK)) accept->SetLabel("Open function");
+    dialog.SetSizerAndFit(layout);
+    dialog.SetMinSize(dialog.GetSize());
+    dialog.CentreOnParent();
+    table->SetItemState(0, wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED,
+                       wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED);
+    table->Bind(wxEVT_LIST_ITEM_ACTIVATED, [&](wxListEvent &) { dialog.EndModal(wxID_OK); });
+    if (dialog.ShowModal() != wxID_OK) return;
+    if (!model_ready_ || serial != render_serial_ || document != document_ ||
+        revision != rendered_document_revision_ || project != rendered_project_) {
+        find_status_->SetLabel("Search canceled because project pseudocode changed; search again");
+        return;
+    }
+    const auto selected = table->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+    if (selected < 0 || static_cast<std::size_t>(selected) >= matches.size()) return;
+    const auto &match = matches[static_cast<std::size_t>(selected)];
+    const auto token = current_navigation_token();
+    if (!token) return;
+    pending_cross_function_reveal_ = PendingCrossFunctionReveal{
+        *token, match.entry, match.line, match.occurrence_on_line, needle, whole_word};
+    if (rendered_function_ == match.entry) {
+        apply_pending_cross_function_reveal();
+        return;
+    }
+    const auto previous_serial = render_serial_;
+    navigate_to(Location{match.entry});
+    if (pending_cross_function_reveal_ && render_serial_ == previous_serial)
+        pending_cross_function_reveal_.reset();
 }
 
 void PseudocodeView::copy_addressed_excerpt() {
@@ -1212,17 +1656,43 @@ void PseudocodeView::retain_documents(std::span<const DocumentInfo> documents) {
 void PseudocodeView::navigate_to(Location location) {
     if (document_) {
         if (!model_ready_ || !rendered_function_) return;
-        if (navigate_document) {
-            PseudocodeNavigationToken token;
-            token.document = *document_;
-            token.document_revision = rendered_document_revision_;
-            if (rendered_project_ && rendered_project_->state) {
-                token.project_uuid = rendered_project_->state->uuid;
-                token.project_revisions = rendered_project_->state->revisions;
-            }
-            navigate_document(token, location);
-        }
+        if (navigate_document)
+            if (const auto token = current_navigation_token()) navigate_document(*token, location);
     } else if (navigate) navigate(location);
+}
+
+std::optional<PseudocodeNavigationToken> PseudocodeView::current_navigation_token() const {
+    if (!document_ || !model_ready_ || !rendered_function_) return {};
+    PseudocodeNavigationToken token;
+    token.document = *document_;
+    token.document_revision = rendered_document_revision_;
+    if (rendered_project_ && rendered_project_->state) {
+        token.project_uuid = rendered_project_->state->uuid;
+        token.project_revisions = rendered_project_->state->revisions;
+    }
+    return token;
+}
+
+std::optional<Address> PseudocodeView::selected_source_origin() const {
+    if (!model_ready_ || !source_) return {};
+    long begin = 0, end = 0;
+    source_->GetSelection(&begin, &end);
+    const auto *origin = source_origin_at(begin, end);
+    return origin ? std::optional<Address>{origin->address} : std::nullopt;
+}
+
+void PseudocodeView::open_source_at_origin() {
+    const auto origin = selected_source_origin();
+    const auto token = current_navigation_token();
+    if (!origin || !token || !open_source_origin) {
+        status_->SetLabel("Select a pseudocode line with an instruction origin first");
+        return;
+    }
+    if (!source_mapping_available || !source_mapping_available(*token, *origin)) {
+        status_->SetLabel("No unambiguous source mapping is available at this instruction origin");
+        return;
+    }
+    open_source_origin(*token, *origin);
 }
 void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Location> selection, const Image *image,
                             const ProjectSnapshot *project, std::function<void(ProjectCommand)> submit) {
@@ -1235,6 +1705,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
         rendered_project_ == project && rendered_image_ == image && rendered_function_ == match->function->entry) {
         rendered_document_revision_ = document_revision_;
         select_address(match->instruction);
+        apply_pending_cross_function_reveal();
         return;
     }
     remember_source();
@@ -1250,33 +1721,40 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     stack_access_rows_.clear();
     stack_access_sites_.clear();
     stack_access_editable_.clear();
+    previous_stack_access_->Enable(false);
+    next_stack_access_->Enable(false);
     variable_definition_rows_.clear();
     variable_links_.clear();
     addresses_->DeleteAllItems();
     stack_slots_->DeleteAllItems();
     variables_list_->DeleteAllItems();
     source_->ChangeValue({});
+    find_previous_->Enable(false);
+    find_next_->Enable(false);
+    find_all_->Enable(false);
     update_variable_actions();
     if (!snapshot || !address) {
-        if (diagnostics_changed) diagnostics_changed({});
+        pending_cross_function_reveal_.reset();
+        if (diagnostics_changed) diagnostics_changed({}, {});
         status_->SetLabel("Select an address inside a recovered function");
         rename_function_->Enable(false); rename_local_->Enable(false); comment_local_->Enable(false); edit_comment_->Enable(false);
-        rename_variable_->Enable(false); assign_type_->Enable(false);
+        rename_variable_->Enable(false); assign_type_->Enable(false); comment_variable_->Enable(false);
         updating_ = false;
         return;
     }
     if (!match) {
-        if (diagnostics_changed) diagnostics_changed({});
+        pending_cross_function_reveal_.reset();
+        if (diagnostics_changed) diagnostics_changed({}, {});
         status_->SetLabel("No recovered function contains the selected address");
         rename_function_->Enable(false); rename_local_->Enable(false); comment_local_->Enable(false); edit_comment_->Enable(false);
-        rename_variable_->Enable(false); assign_type_->Enable(false);
+        rename_variable_->Enable(false); assign_type_->Enable(false); comment_variable_->Enable(false);
         updating_ = false;
         return;
     }
     function_ = match->function;
     const auto report_decompiler_failure = [&](const std::string &message) {
         if (diagnostics_changed)
-            diagnostics_changed({{"Decompiler", DiagnosticSeverity::error, message, {}, match->function->entry}});
+            diagnostics_changed(match->function->entry, {{"Decompiler", DiagnosticSeverity::error, message, {}, match->function->entry}});
     };
     const bool editable = project_ && project_->state && project_->mode == database::ProjectMode::read_write && submit_;
     rename_function_->Enable(editable);
@@ -1298,6 +1776,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
                                    ? &*project_->loaded->metadata.dex : nullptr;
     auto lifted = decompiler::lift_function(*match->function, *snapshot, jvm_metadata, wasm_metadata, dex_metadata);
     if (!lifted) {
+        pending_cross_function_reveal_.reset();
         report_decompiler_failure(lifted.error().message);
         status_->SetLabel("Could not lift the selected function: " + text(lifted.error().message));
         updating_ = false;
@@ -1518,6 +1997,9 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
         }
         variables_list_->SetItem(row, 1, text(type_name));
         variables_list_->SetItem(row, 2, location_text(variable.definition, image));
+        const auto *annotation = project_ ? annotation_at(*project_, variable.definition) : nullptr;
+        if (annotation && !annotation->comment.empty())
+            variables_list_->SetItem(row, 4, text(annotation->comment));
         const auto read_only_label = variable.function_entry_collision
             ? std::string(" (function entry; read-only)")
             : (variable.editable ? std::string{} : std::string(" (shared instruction origin; read-only)"));
@@ -1622,6 +2104,34 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
             auto local_name = project_ ? text(presentation_name(*project_, access)) : wxString{};
             if (!unique_origin) local_name += " (read-only: ambiguous origin)";
             stack_slots_->SetItem(row, 4, local_name);
+            wxString abi_role;
+            if (slot.incoming_argument) {
+                abi_role = "incoming argument";
+                if (slot.incoming_argument_abi) {
+                    switch (*slot.incoming_argument_abi) {
+                    case StackArgumentAbi::x86_32_near_call: abi_role += " (x86-32 near-call)"; break;
+                    case StackArgumentAbi::sysv_x86_64: abi_role += " (SysV x86-64)"; break;
+                    case StackArgumentAbi::windows_x64: abi_role += " (Windows x64)"; break;
+                    case StackArgumentAbi::aapcs64: abi_role += " (AAPCS64)"; break;
+                    case StackArgumentAbi::riscv32: abi_role += " (RISC-V ILP32)"; break;
+                    case StackArgumentAbi::riscv64: abi_role += " (RISC-V LP64)"; break;
+                    case StackArgumentAbi::aapcs32: abi_role += " (AAPCS32)"; break;
+                    case StackArgumentAbi::mips_o32: abi_role += " (MIPS O32)"; break;
+                    case StackArgumentAbi::ppc64le_elfv2: abi_role += " (PPC64 ELFv2)"; break;
+                    case StackArgumentAbi::x86_32_callee_cleanup: abi_role += " (x86-32 callee-cleanup)"; break;
+                    }
+                }
+            }
+            if (!slot.outgoing_call_arguments.empty()) {
+                const auto &call = slot.outgoing_call_arguments.front().call_instruction;
+                const auto call_label = location_text(call, image);
+                if (!abi_role.empty()) abi_role += "; ";
+                abi_role += "outgoing at " + call_label;
+                if (slot.outgoing_call_arguments.size() > 1)
+                    abi_role += wxString::Format(" (+%llu calls)",
+                        static_cast<unsigned long long>(slot.outgoing_call_arguments.size() - 1));
+            }
+            stack_slots_->SetItem(row, 5, abi_role);
         }
     }
     auto function_label = project_ ? text(presentation_name(*project_, match->function->entry)) : wxString{};
@@ -1635,7 +2145,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
         diagnostics.reserve(lifted.value().diagnostics.size());
         for (const auto &message : lifted.value().diagnostics)
             diagnostics.push_back({"Decompiler", DiagnosticSeverity::warning, message, {}, match->function->entry});
-        diagnostics_changed(std::move(diagnostics));
+        diagnostics_changed(match->function->entry, std::move(diagnostics));
     }
     rendered_snapshot_ = snapshot;
     rendered_project_ = project;
@@ -1643,9 +2153,16 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     rendered_document_revision_ = document_revision_;
     rebuild_source_origins();
     model_ready_ = true;
+    const bool query_ready = !find_query_->GetValue().empty();
+    const bool current_function_ready = query_ready && !source_->GetValue().empty();
+    find_previous_->Enable(current_function_ready);
+    find_next_->Enable(current_function_ready);
+    find_all_->Enable(query_ready &&
+        (find_all_functions_->GetValue() || !source_->GetValue().empty()));
     restore_source();
     updating_ = false;
     select_address(match->instruction);
+    apply_pending_cross_function_reveal();
     update_variable_actions();
 }
 
@@ -1743,6 +2260,71 @@ void PseudocodeView::select_address(Address address) {
     updating_ = was_updating;
     update_variable_actions();
 }
+void PseudocodeView::apply_pending_cross_function_reveal() {
+    if (!pending_cross_function_reveal_) return;
+    const auto pending = *pending_cross_function_reveal_;
+    const bool same_document = document_ && *document_ == pending.token.document;
+    bool same_project = false;
+    if (pending.token.project_uuid) {
+        same_project = rendered_project_ && rendered_project_->state &&
+            rendered_project_->state->uuid == *pending.token.project_uuid &&
+            rendered_project_->state->revisions == pending.token.project_revisions;
+    } else {
+        same_project = !rendered_project_ || !rendered_project_->state;
+    }
+    if (!same_document || !same_project || rendered_function_ != pending.function_entry ||
+        pending.line <= 0 || pending.line > source_->GetNumberOfLines() || pending.needle.empty()) {
+        pending_cross_function_reveal_.reset();
+        return;
+    }
+    const long line_number = pending.line - 1;
+    const auto line = source_->GetLineText(line_number);
+    const auto identifier = [](wxUniChar ch) {
+        const auto c = ch.GetValue();
+        return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c >= 128;
+    };
+    std::size_t position = 0, occurrence = 0;
+    std::optional<std::pair<long, long>> selection;
+    while (position <= line.length()) {
+        const auto found = line.find(pending.needle, position);
+        if (found == wxString::npos) break;
+        const auto end = found + pending.needle.length();
+        if (!pending.whole_word ||
+            ((!found || !identifier(line[found - 1])) &&
+             (end >= line.length() || !identifier(line[end])))) {
+            if (occurrence++ == pending.occurrence_on_line) {
+                const auto begin_position = source_->XYToPosition(static_cast<long>(found), line_number);
+                const auto end_position = source_->XYToPosition(static_cast<long>(end), line_number);
+                if (begin_position >= 0 && end_position > begin_position)
+                    selection = std::pair{begin_position, end_position};
+                break;
+            }
+        }
+        position = found + 1;
+    }
+    bool selected_line_fallback = false;
+    if (!selection) {
+        const auto begin_position = source_->XYToPosition(0, line_number);
+        const auto end_position = source_->XYToPosition(static_cast<long>(line.length()), line_number);
+        if (begin_position >= 0 && end_position > begin_position) {
+            selection = std::pair{begin_position, end_position};
+            selected_line_fallback = true;
+        }
+    }
+    pending_cross_function_reveal_.reset();
+    if (!selection) {
+        find_status_->SetLabel("Cross-function result line is unavailable in the rendered source");
+        return;
+    }
+    source_->SetSelection(selection->first, selection->second);
+    source_->ShowPosition(selection->first);
+    source_->SetFocus();
+    source_selection_changed();
+    find_status_->SetLabel(selected_line_fallback
+        ? "Selected the corresponding rendered source line; the exact query text changed during rendering"
+        : "Selected cross-function match and revealed its instruction origin when available");
+}
 std::vector<std::pair<long, long>> PseudocodeView::variable_occurrences(std::size_t row) const {
     std::vector<std::pair<long, long>> result;
     if (row >= variable_links_.size()) return result;
@@ -1834,6 +2416,7 @@ void PseudocodeView::source_selection_changed() {
     if (const auto *origin = source_origin_at(begin, end); origin) {
         current_instruction_ = origin->address;
         navigate_to(Location{origin->address});
+        update_variable_actions();
     }
 }
 void PseudocodeView::select_variable(std::size_t row, bool follow) {
@@ -1854,21 +2437,30 @@ const PseudocodeVariableEdit *PseudocodeView::editable_variable() const {
 }
 void PseudocodeView::update_variable_actions() {
     const bool pseudocode_available = model_ready_ && !source_->GetValue().empty();
+    const auto origin = selected_source_origin();
+    std::optional<PseudocodeNavigationToken> token;
+    if (origin) token = current_navigation_token();
+    const bool source_available = origin && token && source_mapping_available && open_source_origin &&
+                                  source_mapping_available(*token, *origin);
+    open_source_origin_->Enable(source_available);
     copy_pseudocode_->Enable(pseudocode_available);
     save_pseudocode_->Enable(pseudocode_available);
     const bool search_available = pseudocode_available && !find_query_->GetValue().empty();
     find_previous_->Enable(search_available);
     find_next_->Enable(search_available);
+    find_all_->Enable(search_available);
     long selection_begin = 0, selection_end = 0;
     source_->GetSelection(&selection_begin, &selection_end);
     copy_excerpt_->Enable(pseudocode_available && selection_end > selection_begin);
     const auto *link = model_ready_ && selected_variable_ && *selected_variable_ < variable_links_.size()
                            ? &variable_links_[*selected_variable_] : nullptr;
+    copy_variable_->Enable(link != nullptr);
     definition_->Enable(link != nullptr);
     definition_->SetLabel(link && !link->editable ? "Go to origin" : "Go to definition");
     const bool editable = project_ && project_->state && project_->mode == database::ProjectMode::read_write && submit_ && editable_variable();
     rename_variable_->Enable(editable);
     assign_type_->Enable(editable);
+    comment_variable_->Enable(editable);
     previous_use_->Disable(); next_use_->Disable();
     if (!link) { variable_status_->SetLabel("Select a unique variable in source or the table"); return; }
     long begin = 0, end = 0;
@@ -1882,6 +2474,95 @@ void PseudocodeView::update_variable_actions() {
         variable_status_->SetLabel("Read-only: multiple variables share instruction origin " + location_text(link->address));
     else
         variable_status_->SetLabel(text(link->token) + (link->editable ? " defined at " : " origin ") + location_text(link->address));
+}
+void PseudocodeView::copy_selected_variable() {
+    if (!model_ready_ || !selected_variable_ || *selected_variable_ >= variable_links_.size()) {
+        status_->SetLabel("Select a variable definition before copying it.");
+        return;
+    }
+    constexpr std::size_t byte_limit = 64u * 1024u;
+    constexpr std::size_t access_row_limit = 256;
+    const auto selected = *selected_variable_;
+    const auto &link = variable_links_[selected];
+    const bool editable = link.editable && *link.editable < variables_.size();
+    const auto escape = [](std::string_view value) {
+        static constexpr char digits[] = "0123456789ABCDEF";
+        std::string escaped;
+        escaped.reserve(value.size());
+        for (const unsigned char byte : value) {
+            if (byte == '\\') escaped += "\\\\";
+            else if (byte == '\t') escaped += "\\t";
+            else if (byte == '\r') escaped += "\\r";
+            else if (byte == '\n') escaped += "\\n";
+            else if (byte < 0x20 || byte == 0x7f) {
+                escaped += "\\x";
+                escaped.push_back(digits[byte >> 4]);
+                escaped.push_back(digits[byte & 0x0f]);
+            } else escaped.push_back(static_cast<char>(byte));
+        }
+        return escaped;
+    };
+    std::string output = "Field\tValue\r\n";
+    const auto append = [&](std::string_view field, const wxString &value) {
+        const auto encoded = value.ToUTF8();
+        if (!encoded) return false;
+        std::string row = escape(field) + "\t" +
+            escape(std::string_view(encoded.data(), encoded.length())) + "\r\n";
+        if (row.size() > byte_limit - output.size()) return false;
+        output += row;
+        return true;
+    };
+    const auto row = static_cast<long>(selected);
+    if (!append("Document", wxString::Format("%llu", static_cast<unsigned long long>(document_ ? document_->value : 0))) ||
+        !append("Function entry", rendered_function_ ? location_text(*rendered_function_, rendered_image_) : wxString{}) ||
+        !append("Display name", variables_list_->GetItemText(row, 0)) ||
+        !append("Token", text(link.token)) ||
+        !append("Definition", location_text(link.address, rendered_image_)) ||
+        !append("Type", variables_list_->GetItemText(row, 1)) ||
+        !append("Definition comment", variables_list_->GetItemText(row, 4)) ||
+        !append("Editable", editable ? wxString("yes") : wxString("no"))) {
+        status_->SetLabel("Variable details exceed the 64 KiB TSV clipboard limit or contain invalid UTF-8");
+        return;
+    }
+
+    std::vector<Address> access_sites;
+    if (editable) {
+        access_sites = variables_[*link.editable].access_sites;
+    } else {
+        const auto occurrences = variable_occurrences(selected);
+        std::set<std::pair<std::uint32_t, std::uint64_t>> seen;
+        for (const auto &[begin, end] : occurrences) {
+            if (const auto *origin = source_origin_at(begin, end)) {
+                if (seen.emplace(origin->address.space.value, origin->address.offset).second)
+                    access_sites.push_back(origin->address);
+            }
+        }
+    }
+    const auto emitted = std::min(access_sites.size(), access_row_limit);
+    if (!append("Access site count", wxString::Format("%zu", access_sites.size())) ||
+        !append("Access site rows included", wxString::Format("%zu", emitted))) {
+        status_->SetLabel("Variable details exceed the 64 KiB TSV clipboard limit");
+        return;
+    }
+    for (std::size_t index = 0; index < emitted; ++index) {
+        if (!append("Access site", location_text(access_sites[index], rendered_image_))) {
+            status_->SetLabel("Variable details exceed the 64 KiB TSV clipboard limit; no partial text was copied");
+            return;
+        }
+    }
+    if (emitted < access_sites.size() &&
+        !append("Access sites omitted", wxString::Format("%zu", access_sites.size() - emitted))) {
+        status_->SetLabel("Variable details exceed the 64 KiB TSV clipboard limit; no partial text was copied");
+        return;
+    }
+    if (!wxTheClipboard || !wxTheClipboard->Open()) {
+        status_->SetLabel("The system clipboard is unavailable; variable details were not copied");
+        return;
+    }
+    const bool copied = wxTheClipboard->SetData(new wxTextDataObject(wxString::FromUTF8(output.data(), output.size())));
+    wxTheClipboard->Close();
+    status_->SetLabel(copied ? "Copied selected variable details as TSV" :
+                               "Could not copy selected variable details");
 }
 void PseudocodeView::go_to_definition() {
     if (model_ready_ && selected_variable_ && *selected_variable_ < variable_links_.size())
@@ -1900,8 +2581,37 @@ void PseudocodeView::move_occurrence(bool next) {
         const auto found = std::find_if(occurrences.rbegin(), occurrences.rend(), [&](const auto &range) { return range.second <= begin; });
         if (found != occurrences.rend()) destination = *found;
     }
-    if (destination) { source_->SetSelection(destination->first, destination->second); source_->ShowPosition(destination->first); }
+    if (destination) {
+        source_->SetSelection(destination->first, destination->second);
+        source_->ShowPosition(destination->first);
+        if (const auto *origin = source_origin_at(destination->first, destination->second)) {
+            current_instruction_ = origin->address;
+            navigate_to(Location{origin->address});
+        }
+    }
     update_variable_actions();
+}
+
+void PseudocodeView::move_stack_access(bool next) {
+    const auto row = stack_slots_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+    if (row < 0 || static_cast<std::size_t>(row) >= stack_access_sites_.size()) return;
+    const auto &sites = stack_access_sites_[static_cast<std::size_t>(row)];
+    if (sites.empty()) return;
+    const auto less = [](Address left, Address right) {
+        return std::pair{left.space.value, left.offset} < std::pair{right.space.value, right.offset};
+    };
+    Address target = next ? sites.front() : sites.back();
+    if (current_instruction_) {
+        if (next) {
+            const auto found = std::upper_bound(sites.begin(), sites.end(), *current_instruction_, less);
+            if (found != sites.end()) target = *found;
+        } else {
+            const auto found = std::lower_bound(sites.begin(), sites.end(), *current_instruction_, less);
+            if (found != sites.begin()) target = *std::prev(found);
+        }
+    }
+    current_instruction_ = target;
+    navigate_to(Location{target});
 }
 
 namespace {
@@ -2021,6 +2731,19 @@ void PseudocodeView::assign_variable_type() {
         else
             submit(AssignType{at, found->id, false});
     }
+}
+
+void PseudocodeView::comment_variable() {
+    if (!project_ || !submit_) return;
+    const auto *match = editable_variable();
+    if (!match) return;
+    const auto at = match->definition;
+    const auto submit = submit_;
+    const auto *annotation = annotation_at(*project_, at);
+    const auto value = ask(*this, "Comment pseudocode variable",
+                           "Comment stored at this variable's unique definition address:",
+                           annotation ? text(annotation->comment) : wxString{}, true);
+    if (value) submit(Comment{at, utf8(*value)});
 }
 
 } // namespace hexlab::desktop

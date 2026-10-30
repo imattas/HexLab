@@ -1,5 +1,6 @@
 #include "history_view.hpp"
 #include "project_view.hpp"
+#include "hexlab/image/file_publication.hpp"
 
 #include <wx/sizer.h>
 #include <wx/listctrl.h>
@@ -17,6 +18,8 @@
 #include <future>
 #include <map>
 #include <span>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <thread>
@@ -42,6 +45,32 @@ wxString path_text(const std::filesystem::path& path) {
     const auto encoded = path.generic_u8string();
     return text(std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
 }
+
+std::string json_quote(std::string_view value) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string output;
+    output.reserve(value.size() + 2);
+    output.push_back('"');
+    for (const unsigned char byte : value) {
+        switch (byte) {
+        case '"': output += "\\\""; break;
+        case '\\': output += "\\\\"; break;
+        case '\b': output += "\\b"; break;
+        case '\f': output += "\\f"; break;
+        case '\n': output += "\\n"; break;
+        case '\r': output += "\\r"; break;
+        case '\t': output += "\\t"; break;
+        default:
+            if (byte < 0x20) {
+                output += "\\u00";
+                output.push_back(hex[byte >> 4]);
+                output.push_back(hex[byte & 0xf]);
+            } else output.push_back(static_cast<char>(byte));
+        }
+    }
+    output.push_back('"');
+    return output;
+}
 }
 
 HistoryView::HistoryView(wxWindow* parent) : wxPanel(parent), timer_(this) {
@@ -55,38 +84,78 @@ HistoryView::HistoryView(wxWindow* parent) : wxPanel(parent), timer_(this) {
     next_page_ = new wxButton(this, wxID_ANY, "Load next page");
     initial_state_ = new wxButton(this, wxID_ANY, "Preview initial state");
     compare_previous_ = new wxButton(this, wxID_ANY, "Compare with previous step");
+    compare_current_ = new wxButton(this, wxID_ANY, "Compare with current project");
     audit_ = new wxButton(this, wxID_ANY, "Audit history");
     copy_audit_ = new wxButton(this, wxID_ANY, "Copy audit result");
+    copy_audit_json_ = new wxButton(this, wxID_ANY, "Copy audit JSON");
+    save_audit_ = new wxButton(this, wxID_ANY, "Save audit report...");
     refresh_->SetName("history-refresh");
     next_page_->SetName("history-next-page");
     initial_state_->SetName("history-preview-initial");
     compare_previous_->SetName("history-compare-previous");
+    compare_current_->SetName("history-compare-current");
     audit_->SetName("history-audit");
     copy_audit_->SetName("history-copy-audit");
+    copy_audit_json_->SetName("history-copy-audit-json");
+    save_audit_->SetName("history-save-audit");
     next_page_->Enable(false);
     controls->Add(refresh_, 0, wxRIGHT, FromDIP(4));
     controls->Add(next_page_, 0, wxRIGHT, FromDIP(4));
     controls->Add(initial_state_, 0);
     controls->Add(compare_previous_, 0, wxLEFT, FromDIP(4));
+    controls->Add(compare_current_, 0, wxLEFT, FromDIP(4));
     controls->Add(audit_, 0, wxLEFT, FromDIP(4));
     controls->Add(copy_audit_, 0, wxLEFT, FromDIP(4));
+    controls->Add(copy_audit_json_, 0, wxLEFT, FromDIP(4));
+    controls->Add(save_audit_, 0, wxLEFT, FromDIP(4));
     compare_previous_->Enable(false);
+    compare_current_->Enable(false);
     audit_->Enable(false);
     copy_audit_->Enable(false);
+    copy_audit_json_->Enable(false);
+    save_audit_->Enable(false);
     root->Add(controls, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
+    verify_audit_replay_ = new wxCheckBox(this, wxID_ANY, "Verify applied branch replay after structural audit");
+    verify_audit_replay_->SetName("history-audit-verify-replay");
+    verify_audit_replay_->SetToolTip(
+        "Read-only: reverse the current applied history to step zero and require empty user state. "
+        "Limited to 4096 applied steps and 64 MiB; redo-only steps receive structural audit only.");
+    verify_audit_replay_->Enable(false);
+    root->Add(verify_audit_replay_, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
 
     status_ = new wxStaticText(this, wxID_ANY, "Open a project to inspect its history.");
     status_->SetName("history-status");
     root->Add(status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
+    source_status_ = new wxStaticText(this, wxID_ANY, "Current source integrity: not checked.");
+    source_status_->SetName("history-source-integrity-status");
+    source_status_->SetToolTip("Read-only check of the recorded external source against the input size and SHA-256 pinned in this project. Limited to 256 MiB.");
+    root->Add(source_status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
+
+    auto* filter_row = new wxBoxSizer(wxHORIZONTAL);
+    filter_row->Add(new wxStaticText(this, wxID_ANY, "Filter loaded steps:"), 0,
+                    wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(5));
+    history_filter_ = new wxTextCtrl(this, wxID_ANY, wxEmptyString, wxDefaultPosition,
+                                     wxDefaultSize, wxTE_PROCESS_ENTER);
+    history_filter_->SetName("history-filter");
+    history_filter_->SetHint("step, group, bytes, decisions, metadata, applied, redo");
+    filter_row->Add(history_filter_, 1, wxEXPAND);
+    history_filter_status_ = new wxStaticText(this, wxID_ANY, "0 loaded");
+    history_filter_status_->SetName("history-filter-status");
+    filter_row->Add(history_filter_status_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(5));
+    root->Add(filter_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
 
     auto* save_controls = new wxBoxSizer(wxHORIZONTAL);
     save_copy_ = new wxButton(this, wxID_ANY, "Save selected step as project...");
+    open_copy_ = new wxButton(this, wxID_ANY, "Open saved project");
     cancel_save_ = new wxButton(this, wxID_ANY, "Cancel recovered copy");
     save_copy_->SetName("history-save-copy");
+    open_copy_->SetName("history-open-saved-copy");
     cancel_save_->SetName("history-cancel-save");
     save_copy_->Enable(false);
+    open_copy_->Enable(false);
     cancel_save_->Enable(false);
     save_controls->Add(save_copy_, 0, wxRIGHT, FromDIP(4));
+    save_controls->Add(open_copy_, 0, wxRIGHT, FromDIP(4));
     save_controls->Add(cancel_save_, 0);
     root->Add(save_controls, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
     save_status_ = new wxStaticText(this, wxID_ANY,
@@ -120,13 +189,22 @@ HistoryView::HistoryView(wxWindow* parent) : wxPanel(parent), timer_(this) {
         if (!actor_) return;
         cancel_pending();
         audit_in_progress_ = false;
+        audit_resume_available_ = false;
+        audit_structural_complete_ = false;
+        audit_source_identity_check_ = database::HistorySourceIdentityCheck::not_checked;
+        update_source_status();
+        verify_audit_replay_->Enable(true);
+        audit_next_after_step_ = 0;
         audit_->SetLabel("Audit history");
         audit_report_.clear();
         copy_audit_->Enable(false);
+        copy_audit_json_->Enable(false);
+        save_audit_->Enable(false);
         rows_.clear();
         page_.reset();
         preview_.reset();
         comparison_base_.reset();
+        comparison_current_.reset();
         selected_step_.reset();
         selected_preview_row_.reset();
         render_entries();
@@ -138,6 +216,7 @@ HistoryView::HistoryView(wxWindow* parent) : wxPanel(parent), timer_(this) {
     });
     initial_state_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { request_preview(0); });
     compare_previous_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { compare_with_previous(); });
+    compare_current_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { compare_with_current(); });
     audit_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
         if (audit_in_progress_) stop_audit();
         else begin_audit();
@@ -153,7 +232,86 @@ HistoryView::HistoryView(wxWindow* parent) : wxPanel(parent), timer_(this) {
         status_->SetLabel(copied ? "Copied the last history audit result to the clipboard."
                                  : "Could not copy the last history audit result.");
     });
+    copy_audit_json_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { copy_audit_json(); });
+    save_audit_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+        if (audit_report_.empty() || !project_ || !project_->state) return;
+        const auto captured_actor = actor_;
+        const auto captured_project = project_;
+        const auto captured_uuid = project_->state->uuid;
+        const auto captured_edit = expected_edit_;
+        const auto captured_result = audit_report_;
+        const auto captured_cursor = page_ ? page_->history_cursor : 0;
+        const auto captured_count = page_ ? page_->history_count : 0;
+        const bool captured_replay = audit_verify_replay_;
+        const auto actor_view = captured_actor ? std::optional<ActorView>{captured_actor->view()} : std::nullopt;
+        const auto captured_project_path = actor_view ? actor_view->project_path : std::nullopt;
+        auto protected_paths = captured_project->protected_paths;
+        if (captured_project_path)
+            protected_paths.push_back(*captured_project_path);
+
+        std::string report = "HexLab project history audit report\n";
+        report += "project_uuid: ";
+        constexpr char hex[] = "0123456789abcdef";
+        for (const auto byte : captured_uuid) {
+            const auto value = std::to_integer<unsigned char>(byte);
+            report.push_back(hex[value >> 4]);
+            report.push_back(hex[value & 0x0f]);
+        }
+        report += "\nedit_revision: " + std::to_string(captured_edit);
+        report += "\nhistory_cursor: " + std::to_string(captured_cursor);
+        report += "\nhistory_count: " + std::to_string(captured_count);
+        report += "\napplied_branch_replay_requested: ";
+        report += captured_replay ? "true\n" : "false\n";
+        report += "result: ";
+        const auto encoded = captured_result.ToUTF8();
+        if (encoded) report.append(encoded.data(), encoded.length());
+        report.push_back('\n');
+        if (report.size() > 16 * 1024) {
+            status_->SetLabel("Audit report exceeds the 16 KiB export limit; no file was written.");
+            return;
+        }
+
+        wxFileDialog dialog(this, "Save history audit report", wxEmptyString,
+            "history-audit.txt", "Text report (*.txt)|*.txt",
+            wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (dialog.ShowModal() != wxID_OK) return;
+
+        const auto current_view = captured_actor ? std::optional<ActorView>{captured_actor->view()} : std::nullopt;
+        const bool same_project = actor_ == captured_actor && project_ == captured_project &&
+            expected_edit_ == captured_edit && project_ && project_->state &&
+            project_->state->uuid == captured_uuid && audit_report_ == captured_result && current_view &&
+            page_ && page_->history_cursor == captured_cursor && page_->history_count == captured_count &&
+            audit_verify_replay_ == captured_replay &&
+            current_view->project_path == captured_project_path && current_view->snapshot &&
+            current_view->snapshot->state && current_view->snapshot->state->uuid == captured_uuid &&
+            current_view->snapshot->state->revisions.edit == captured_edit;
+        if (!same_project) {
+            status_->SetLabel("The project or audit result changed while the save dialog was open; no report was written.");
+            return;
+        }
+
+        auto publication = FilePublication::create(std::filesystem::path(dialog.GetPath().ToStdWstring()),
+            ExistingFilePolicy::replace, protected_paths, {});
+        if (!publication) {
+            status_->SetLabel("Could not save the audit report: " + text(publication.error().message));
+            return;
+        }
+        const auto written = publication.value()->append(std::as_bytes(std::span(report.data(), report.size())));
+        if (!written) {
+            status_->SetLabel("Could not save the audit report: " + text(written.error().message));
+            return;
+        }
+        const auto published = publication.value()->publish();
+        if (!published) {
+            status_->SetLabel("Could not save the audit report: " + text(published.error().message));
+            return;
+        }
+        status_->SetLabel(wxString("Saved audit report: ") + dialog.GetPath());
+    });
     save_copy_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { save_selected_history(); });
+    open_copy_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+        if (saved_copy_path_ && open_project) open_project(*saved_copy_path_);
+    });
     cancel_save_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
         if (!history_save_) return;
         history_save_->cancellation.request_stop();
@@ -163,12 +321,15 @@ HistoryView::HistoryView(wxWindow* parent) : wxPanel(parent), timer_(this) {
     entries_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent&) {
         if (audit_in_progress_) return;
         const auto row = entries_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
-        if (row < 0 || static_cast<std::size_t>(row) >= rows_.size()) return;
-        selected_step_ = rows_[static_cast<std::size_t>(row)].step;
+        if (row < 0 || static_cast<std::size_t>(row) >= visible_history_rows_.size()) return;
+        selected_step_ = rows_[visible_history_rows_[static_cast<std::size_t>(row)]].step;
         comparison_base_.reset();
+        comparison_current_.reset();
         compare_previous_->Enable(*selected_step_ > 0);
+        compare_current_->Enable(bool(project_) && !pending_ && !audit_in_progress_);
         request_preview(*selected_step_);
     });
+    history_filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { render_entries(); });
     preview_items_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent&) {
         const auto row = preview_items_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
         if (row < 0 || static_cast<std::size_t>(row) >= preview_rows_.size() ||
@@ -202,18 +363,28 @@ void HistoryView::update(std::optional<DocumentId> id, std::shared_ptr<ProjectAc
         actor_.reset();
         project_.reset();
         document_id_.reset();
+        saved_copy_path_.reset();
         expected_edit_ = 0;
         rows_.clear();
         page_.reset();
         preview_.reset();
         comparison_base_.reset();
+        comparison_current_.reset();
         selected_step_.reset();
         selected_preview_row_.reset();
         audit_in_progress_ = false;
+        audit_resume_available_ = false;
+        audit_structural_complete_ = false;
+        audit_source_identity_check_ = database::HistorySourceIdentityCheck::not_checked;
+        update_source_status();
+        verify_audit_replay_->Enable(false);
         audit_verified_ = 0;
         audit_bytes_ = 0;
+        audit_next_after_step_ = 0;
         audit_report_.clear();
         copy_audit_->Enable(false);
+        copy_audit_json_->Enable(false);
+        save_audit_->Enable(false);
         if (had_project) {
             status_->SetLabel("Open a project to inspect its history.");
             preview_status_->SetLabel("Select a history step to preview it.");
@@ -223,9 +394,11 @@ void HistoryView::update(std::optional<DocumentId> id, std::shared_ptr<ProjectAc
         next_page_->Enable(false);
         initial_state_->Enable(false);
         compare_previous_->Enable(false);
+        compare_current_->Enable(false);
         audit_->Enable(false);
         audit_->SetLabel("Audit history");
         refresh_->Enable(false);
+        open_copy_->Enable(false);
         return;
     }
 
@@ -235,6 +408,8 @@ void HistoryView::update(std::optional<DocumentId> id, std::shared_ptr<ProjectAc
         expected_edit_ != edit_revision;
     project_ = std::move(project);
     if (!changed) return;
+    saved_copy_path_.reset();
+    open_copy_->Enable(false);
 
     cancel_pending();
     actor_ = std::move(actor);
@@ -244,21 +419,33 @@ void HistoryView::update(std::optional<DocumentId> id, std::shared_ptr<ProjectAc
     page_.reset();
     preview_.reset();
     comparison_base_.reset();
+    comparison_current_.reset();
     selected_step_.reset();
     selected_preview_row_.reset();
     audit_in_progress_ = false;
+    audit_resume_available_ = false;
+    audit_structural_complete_ = false;
+    audit_source_identity_check_ = database::HistorySourceIdentityCheck::not_checked;
+    update_source_status();
+    verify_audit_replay_->Enable(true);
     audit_verified_ = 0;
     audit_bytes_ = 0;
+    audit_next_after_step_ = 0;
     audit_report_.clear();
     copy_audit_->Enable(false);
+    copy_audit_json_->Enable(false);
+    save_audit_->Enable(false);
     status_->SetLabel("Loading durable project history…");
     preview_status_->SetLabel("Select a history step to preview it.");
     refresh_->Enable(true);
     initial_state_->Enable(true);
     compare_previous_->Enable(false);
+    compare_current_->Enable(false);
     audit_->Enable(false);
     audit_->SetLabel("Audit history");
     copy_audit_->Enable(false);
+    copy_audit_json_->Enable(false);
+    save_audit_->Enable(false);
     render_entries();
     render_preview();
     request_page(0);
@@ -284,39 +471,166 @@ void HistoryView::request_page(std::uint64_t after_step) {
 void HistoryView::begin_audit() {
     if (!actor_ || !page_ || audit_in_progress_) return;
     cancel_pending();
+    if (!audit_resume_available_) {
+        audit_verified_ = 0;
+        audit_bytes_ = 0;
+        audit_next_after_step_ = 0;
+        audit_structural_complete_ = false;
+        audit_source_identity_check_ = database::HistorySourceIdentityCheck::not_checked;
+        update_source_status();
+        audit_verify_replay_ = verify_audit_replay_->GetValue();
+    }
     audit_in_progress_ = true;
-    audit_verified_ = 0;
-    audit_bytes_ = 0;
+    audit_resume_available_ = false;
     audit_report_.clear();
     copy_audit_->Enable(false);
-    audit_->SetLabel("Cancel audit");
+    copy_audit_json_->Enable(false);
+    save_audit_->Enable(false);
+    verify_audit_replay_->Enable(false);
+    audit_->SetLabel("Pause audit");
     next_page_->Enable(false);
     initial_state_->Enable(false);
     compare_previous_->Enable(false);
+    compare_current_->Enable(false);
     status_->SetLabel("Starting read-only history audit…");
-    request_audit_page(0);
+    if (audit_structural_complete_ && audit_verify_replay_) request_audit_replay();
+    else request_audit_page(audit_next_after_step_);
 }
 
 void HistoryView::stop_audit() {
     if (!audit_in_progress_) return;
     cancel_pending();
     audit_in_progress_ = false;
-    audit_->SetLabel("Audit history");
+    audit_resume_available_ = true;
+    audit_->SetLabel("Resume audit");
     next_page_->Enable(page_ && page_->has_more);
     initial_state_->Enable(bool(actor_));
     compare_previous_->Enable(selected_step_ && *selected_step_ > 0);
-    record_audit_result(wxString::Format("Audit canceled after %llu of %llu steps (%llu delta bytes verified).",
+    compare_current_->Enable(selected_step_.has_value());
+    record_audit_result(wxString::Format("Audit paused after %llu of %llu steps (%llu delta bytes verified); resume continues after step %llu.%s",
         static_cast<unsigned long long>(audit_verified_),
         static_cast<unsigned long long>(page_ ? page_->history_count : 0),
-        static_cast<unsigned long long>(audit_bytes_)));
+        static_cast<unsigned long long>(audit_bytes_),
+        static_cast<unsigned long long>(audit_next_after_step_),
+        audit_structural_complete_ ? " Structural audit passed; applied-branch replay is not complete." : ""));
 }
 
 void HistoryView::record_audit_result(const wxString& report) {
     constexpr std::size_t maximum_report_characters = 4096;
-    audit_report_ = report.length() <= maximum_report_characters
-        ? report : report.Left(maximum_report_characters);
+    wxString complete_report = report;
+    const auto append_source_check = [&](const wxString& detail) {
+        if (!complete_report.empty()) complete_report += "\n";
+        complete_report += "Current external source check: ";
+        complete_report += detail;
+    };
+    switch (audit_source_identity_check_) {
+    case database::HistorySourceIdentityCheck::not_checked:
+        append_source_check("not performed (the first audit page did not complete).");
+        break;
+    case database::HistorySourceIdentityCheck::no_recorded_path:
+        append_source_check("no recorded source path is available.");
+        break;
+    case database::HistorySourceIdentityCheck::unavailable:
+        append_source_check("the recorded source path is unavailable or unreadable.");
+        break;
+    case database::HistorySourceIdentityCheck::over_limit:
+        append_source_check("not performed because the source exceeds the 256 MiB check limit.");
+        break;
+    case database::HistorySourceIdentityCheck::size_mismatch:
+        append_source_check("mismatch: current file size differs from the project's pinned input size.");
+        break;
+    case database::HistorySourceIdentityCheck::digest_mismatch:
+        append_source_check("mismatch: current file SHA-256 differs from the project's pinned input.");
+        break;
+    case database::HistorySourceIdentityCheck::matches:
+        append_source_check("current bytes matched the project's pinned input size and SHA-256 when read. This does not establish historical source integrity.");
+        break;
+    }
+    audit_report_ = complete_report.length() <= maximum_report_characters
+        ? complete_report : complete_report.Left(maximum_report_characters);
     copy_audit_->Enable(!audit_report_.empty());
+    copy_audit_json_->Enable(!audit_report_.empty());
+    save_audit_->Enable(!audit_report_.empty() && project_ && project_->state);
+    verify_audit_replay_->Enable(bool(actor_) && !audit_in_progress_ && !audit_resume_available_);
     status_->SetLabel(audit_report_);
+}
+
+void HistoryView::update_source_status() {
+    wxString detail;
+    switch (audit_source_identity_check_) {
+    case database::HistorySourceIdentityCheck::not_checked:
+        detail = "not checked yet (checked on the first completed audit page)"; break;
+    case database::HistorySourceIdentityCheck::no_recorded_path:
+        detail = "no recorded source path is available"; break;
+    case database::HistorySourceIdentityCheck::unavailable:
+        detail = "recorded source is unavailable or unreadable"; break;
+    case database::HistorySourceIdentityCheck::over_limit:
+        detail = "not checked because the source exceeds 256 MiB"; break;
+    case database::HistorySourceIdentityCheck::size_mismatch:
+        detail = "mismatch: current size differs from the pinned input"; break;
+    case database::HistorySourceIdentityCheck::digest_mismatch:
+        detail = "mismatch: current SHA-256 differs from the pinned input"; break;
+    case database::HistorySourceIdentityCheck::matches:
+        detail = "matches pinned size and SHA-256 for bytes read now"; break;
+    }
+    source_status_->SetLabel("Current source integrity: " + detail + ".");
+}
+
+void HistoryView::copy_audit_json() {
+    if (audit_report_.empty()) return;
+    constexpr std::size_t clipboard_limit = 64 * 1024;
+    const auto report_buffer = audit_report_.utf8_str();
+    const std::string summary = report_buffer.data()
+        ? std::string(report_buffer.data(), report_buffer.length()) : std::string{};
+    const auto source_check = [&]() -> std::string_view {
+        switch (audit_source_identity_check_) {
+        case database::HistorySourceIdentityCheck::not_checked: return "not_checked";
+        case database::HistorySourceIdentityCheck::no_recorded_path: return "no_recorded_path";
+        case database::HistorySourceIdentityCheck::unavailable: return "unavailable";
+        case database::HistorySourceIdentityCheck::over_limit: return "over_limit";
+        case database::HistorySourceIdentityCheck::size_mismatch: return "size_mismatch";
+        case database::HistorySourceIdentityCheck::digest_mismatch: return "digest_mismatch";
+        case database::HistorySourceIdentityCheck::matches: return "matches";
+        }
+        return "unknown";
+    };
+    std::string output = "{\"schema\":\"hexlab.history-audit.v1\",\"project_uuid\":";
+    if (project_ && project_->state) {
+        constexpr char digits[] = "0123456789abcdef";
+        std::string uuid;
+        uuid.reserve(project_->state->uuid.size() * 2);
+        for (const auto byte : project_->state->uuid) {
+            const auto value = std::to_integer<unsigned>(byte);
+            uuid.push_back(digits[value >> 4]);
+            uuid.push_back(digits[value & 0xf]);
+        }
+        output += json_quote(uuid);
+    } else output += "null";
+    output += ",\"edit_revision\":" + std::to_string(expected_edit_);
+    output += ",\"history_cursor\":" + std::to_string(page_ ? page_->history_cursor : 0);
+    output += ",\"history_count\":" + std::to_string(page_ ? page_->history_count : 0);
+    output += ",\"state\":" + json_quote(audit_in_progress_ ? "running" :
+        audit_resume_available_ ? "paused" : "reported");
+    output += ",\"structural_complete\":" + std::string(audit_structural_complete_ ? "true" : "false");
+    output += ",\"applied_branch_replay_requested\":" + std::string(audit_verify_replay_ ? "true" : "false");
+    output += ",\"verified_steps\":" + std::to_string(audit_verified_);
+    output += ",\"verified_delta_bytes\":" + std::to_string(audit_bytes_);
+    output += ",\"next_after_step\":" + std::to_string(audit_next_after_step_);
+    output += ",\"source_identity_check\":" + json_quote(source_check());
+    output += ",\"summary\":" + json_quote(summary) + "}";
+    if (output.size() > clipboard_limit) {
+        status_->SetLabel("History audit JSON exceeds the 64 KiB clipboard limit; no data was copied.");
+        return;
+    }
+    if (!wxTheClipboard || !wxTheClipboard->Open()) {
+        status_->SetLabel("The system clipboard is unavailable; the saved audit result is still available.");
+        return;
+    }
+    const bool copied = wxTheClipboard->SetData(new wxTextDataObject(
+        wxString::FromUTF8(output.data(), output.size())));
+    wxTheClipboard->Close();
+    status_->SetLabel(copied ? "Copied hexlab.history-audit.v1 JSON to the clipboard."
+                             : "Could not copy history audit JSON.");
 }
 
 void HistoryView::request_audit_page(std::uint64_t after_step) {
@@ -325,9 +639,11 @@ void HistoryView::request_audit_page(std::uint64_t after_step) {
     auto submission = actor_->audit_history(expected_edit_, after_step);
     if (!submission) {
         audit_in_progress_ = false;
-        audit_->SetLabel("Audit history");
+        audit_resume_available_ = audit_next_after_step_ > 0;
+        audit_->SetLabel(audit_resume_available_ ? "Resume audit" : "Audit history");
         initial_state_->Enable(bool(actor_));
         compare_previous_->Enable(selected_step_ && *selected_step_ > 0);
+        compare_current_->Enable(selected_step_.has_value());
         record_audit_result(wxString::Format("Audit stopped after %llu of %llu steps: %s",
             static_cast<unsigned long long>(audit_verified_),
             static_cast<unsigned long long>(page_ ? page_->history_count : 0),
@@ -341,9 +657,32 @@ void HistoryView::request_audit_page(std::uint64_t after_step) {
         static_cast<unsigned long long>(page_ ? page_->history_count : 0)));
 }
 
+void HistoryView::request_audit_replay() {
+    if (!actor_ || !audit_in_progress_ || pending_ || !audit_structural_complete_) return;
+    pending_kind_ = PendingKind::audit_replay;
+    auto submission = actor_->preview_history_at(expected_edit_, 0,
+        database::HistoryPreviewLimits{preview_step_budget, preview_payload_budget});
+    if (!submission) {
+        audit_in_progress_ = false;
+        audit_resume_available_ = true;
+        audit_->SetLabel("Resume audit");
+        next_page_->Enable(page_ && page_->has_more);
+        initial_state_->Enable(bool(actor_));
+        compare_previous_->Enable(selected_step_ && *selected_step_ > 0);
+        compare_current_->Enable(selected_step_.has_value());
+        record_audit_result("Structural audit passed; applied-branch replay could not start: " +
+                            text(submission.error().message));
+        return;
+    }
+    pending_expected_edit_ = expected_edit_;
+    pending_ = std::move(submission.value());
+    status_->SetLabel("Structural audit passed; verifying applied-branch replay to empty step zero (4096 steps / 64 MiB)...");
+}
+
 void HistoryView::request_preview(std::uint64_t step) {
     if (!actor_ || audit_in_progress_) return;
     comparison_base_.reset();
+    comparison_current_.reset();
     if (pending_) {
         if (pending_kind_ == PendingKind::page) return;
         cancel_pending();
@@ -366,6 +705,7 @@ void HistoryView::request_preview(std::uint64_t step) {
 void HistoryView::compare_with_previous() {
     if (!actor_ || audit_in_progress_ || !selected_step_ || *selected_step_ == 0 || pending_) return;
     comparison_base_.reset();
+    comparison_current_.reset();
     preview_.reset();
     pending_kind_ = PendingKind::comparison_base;
     auto submission = actor_->preview_history_at(expected_edit_, *selected_step_ - 1,
@@ -376,6 +716,30 @@ void HistoryView::compare_with_previous() {
     preview_status_->SetLabel(wxString::Format("Loading step %llu to compare with step %llu…",
         static_cast<unsigned long long>(*selected_step_ - 1),
         static_cast<unsigned long long>(*selected_step_)));
+    render_preview();
+}
+
+void HistoryView::compare_with_current() {
+    if (!actor_ || !project_ || !project_->state || audit_in_progress_ || !selected_step_ || pending_)
+        return;
+    comparison_base_.reset();
+    comparison_current_ = project_->state;
+    comparison_current_edit_ = expected_edit_;
+    preview_.reset();
+    selected_preview_row_.reset();
+    pending_kind_ = PendingKind::comparison_current;
+    auto submission = actor_->preview_history_at(expected_edit_, *selected_step_,
+        database::HistoryPreviewLimits{preview_step_budget, preview_payload_budget});
+    if (!submission) {
+        comparison_current_.reset();
+        show_error(submission.error());
+        return;
+    }
+    pending_expected_edit_ = expected_edit_;
+    pending_ = std::move(submission.value());
+    preview_status_->SetLabel(wxString::Format("Loading step %llu to compare with current project at edit %llu...",
+        static_cast<unsigned long long>(*selected_step_),
+        static_cast<unsigned long long>(comparison_current_edit_)));
     render_preview();
 }
 
@@ -394,6 +758,8 @@ void HistoryView::save_selected_history() {
         return;
     }
     const auto source = *view.project_path;
+    saved_copy_path_.reset();
+    open_copy_->Enable(false);
     const auto uuid = project_->state->uuid;
     const auto step = *selected_step_;
     std::optional<std::uint64_t> expected = expected_edit_;
@@ -455,6 +821,7 @@ void HistoryView::save_selected_history() {
     try {
         auto work = std::make_shared<HistorySaveWork>();
         work->source = source;
+        work->uuid = uuid;
         work->step = step;
         // The worker owns all native state and never accesses a window. Closing
         // the History page requests cancellation without waiting on the GUI thread.
@@ -495,12 +862,20 @@ void HistoryView::poll_history_save() {
     if (!history_save_ || history_save_->result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) return;
     const auto step = history_save_->step;
     const auto source = history_save_->source;
+    const auto uuid = history_save_->uuid;
     auto result = history_save_->result.get();
     history_save_.reset();
     if (result) {
+        const auto current = actor_ ? std::optional<ActorView>{actor_->view()} : std::nullopt;
+        if (current && current->project_path && *current->project_path == source &&
+            project_ && project_->state && project_->state->uuid == uuid) {
+            saved_copy_path_ = result.value().path;
+            open_copy_->Enable(static_cast<bool>(open_project));
+        }
         save_status_->SetLabel(wxString::Format("Recovered step %llu from ", static_cast<unsigned long long>(step)) +
             path_text(source.filename()) + " saved to " + path_text(result.value().path) +
-            ". Open this independent project with File > Open Project. Source unchanged; undo/redo retained.");
+            (saved_copy_path_ ? ". Choose Open saved project to inspect it. Source unchanged; undo/redo retained."
+                               : ". Source unchanged; undo/redo retained."));
     } else {
         const auto prefix = result.error().code == ErrorCode::canceled ? "Recovered copy canceled: " : "Recovered copy failed: ";
         save_status_->SetLabel(wxString(prefix) + text(result.error().message));
@@ -525,16 +900,24 @@ void HistoryView::poll() {
     pending_.reset();
     if (expected != expected_edit_) return;
     if (!result) {
-        if (kind == PendingKind::audit) {
+        if (kind == PendingKind::audit || kind == PendingKind::audit_replay) {
             audit_in_progress_ = false;
-            audit_->SetLabel("Audit history");
+            const bool conflict = result.error().code == ErrorCode::conflict;
+            audit_resume_available_ = !conflict && (audit_structural_complete_ || audit_next_after_step_ > 0);
+            if (conflict) { audit_structural_complete_ = false; audit_next_after_step_ = 0; }
+            audit_->SetLabel(audit_resume_available_ ? "Resume audit" : "Audit history");
             initial_state_->Enable(bool(actor_));
             compare_previous_->Enable(selected_step_ && *selected_step_ > 0);
-            record_audit_result(wxString::Format("Audit stopped after %llu of %llu steps (%llu delta bytes): %s",
+            compare_current_->Enable(selected_step_.has_value());
+            record_audit_result(wxString::Format("%s stopped at edit %llu after %llu of %llu structural steps (%llu delta bytes): %s",
+                kind == PendingKind::audit_replay ? "Applied-branch replay" : "Audit",
+                static_cast<unsigned long long>(expected_edit_),
                 static_cast<unsigned long long>(audit_verified_),
                 static_cast<unsigned long long>(page_ ? page_->history_count : 0),
                 static_cast<unsigned long long>(audit_bytes_), text(result.error().message)));
         } else {
+            if (kind == PendingKind::comparison_current)
+                comparison_current_.reset();
             show_error(result.error());
         }
         next_page_->Enable(page_ && page_->has_more);
@@ -575,7 +958,8 @@ void HistoryView::poll() {
     if (kind == PendingKind::audit) {
         if (!result.value().history_audit) {
             audit_in_progress_ = false;
-            audit_->SetLabel("Audit history");
+            audit_resume_available_ = audit_next_after_step_ > 0;
+            audit_->SetLabel(audit_resume_available_ ? "Resume audit" : "Audit history");
             initial_state_->Enable(bool(actor_));
             record_audit_result("History audit returned no report.");
             return;
@@ -584,10 +968,17 @@ void HistoryView::poll() {
         if (!project_ || received.uuid != project_->state->uuid ||
             received.source_revisions.edit != expected_edit_) {
             audit_in_progress_ = false;
+            audit_resume_available_ = false;
+            audit_structural_complete_ = false;
+            audit_next_after_step_ = 0;
             audit_->SetLabel("Audit history");
             initial_state_->Enable(bool(actor_));
             record_audit_result("Project identity or revision changed; restart the history audit.");
             return;
+        }
+        if (received.source_identity_check != database::HistorySourceIdentityCheck::not_checked) {
+            audit_source_identity_check_ = received.source_identity_check;
+            update_source_status();
         }
         audit_verified_ += received.entries_verified;
         audit_bytes_ += received.delta_bytes;
@@ -596,17 +987,26 @@ void HistoryView::poll() {
             page_->history_cursor = received.history_cursor;
         }
         if (received.has_more) {
+            audit_next_after_step_ = received.next_after_step;
             status_->SetLabel(wxString::Format("Auditing durable history: %llu of %llu steps verified (%llu delta bytes)…",
                 static_cast<unsigned long long>(audit_verified_),
                 static_cast<unsigned long long>(received.history_count),
                 static_cast<unsigned long long>(audit_bytes_)));
             request_audit_page(received.next_after_step);
         } else {
+            audit_next_after_step_ = received.next_after_step;
+            audit_structural_complete_ = true;
+            if (audit_verify_replay_) {
+                request_audit_replay();
+                return;
+            }
             audit_in_progress_ = false;
+            audit_resume_available_ = false;
             audit_->SetLabel("Audit history");
             next_page_->Enable(page_ && page_->has_more);
             initial_state_->Enable(bool(actor_));
             compare_previous_->Enable(selected_step_ && *selected_step_ > 0);
+            compare_current_->Enable(selected_step_.has_value());
             record_audit_result(wxString::Format("History audit passed: %llu of %llu steps verified; %llu delta bytes checked; cursor %llu.",
                 static_cast<unsigned long long>(audit_verified_),
                 static_cast<unsigned long long>(received.history_count),
@@ -616,7 +1016,43 @@ void HistoryView::poll() {
         return;
     }
 
+    if (kind == PendingKind::audit_replay) {
+        audit_in_progress_ = false;
+        audit_resume_available_ = false;
+        audit_->SetLabel("Audit history");
+        next_page_->Enable(page_ && page_->has_more);
+        initial_state_->Enable(bool(actor_));
+        compare_previous_->Enable(selected_step_ && *selected_step_ > 0);
+        compare_current_->Enable(selected_step_.has_value());
+        if (!result.value().history_preview) {
+            record_audit_result("Structural audit passed; applied-branch replay failed: no projection was returned.");
+            return;
+        }
+        const auto& replay = *result.value().history_preview;
+        if (!project_ || !page_ || replay.uuid != project_->state->uuid ||
+            replay.source_revisions.edit != expected_edit_ || replay.source_cursor != page_->history_cursor ||
+            replay.history_count != page_->history_count || replay.target_step != 0) {
+            audit_structural_complete_ = false;
+            audit_next_after_step_ = 0;
+            record_audit_result("Project identity, revision or history cursor changed; restart the audit and replay verification.");
+            return;
+        }
+        if (!replay.user || *replay.user != database::UserState{}) {
+            record_audit_result("Structural audit passed; applied-branch replay FAILED: step zero did not reconstruct empty user state.");
+            return;
+        }
+        record_audit_result(wxString::Format(
+            "History audit and applied-branch replay passed at edit %llu: %llu of %llu structural steps, %llu audit delta bytes; "
+            "reversed %llu applied steps (%llu replay delta bytes) to empty step zero. Redo-only steps were not replayed.",
+            static_cast<unsigned long long>(expected_edit_), static_cast<unsigned long long>(audit_verified_),
+            static_cast<unsigned long long>(replay.history_count), static_cast<unsigned long long>(audit_bytes_),
+            static_cast<unsigned long long>(replay.replayed_steps), static_cast<unsigned long long>(replay.delta_bytes)));
+        return;
+    }
+
     if (!result.value().history_preview) {
+        if (kind == PendingKind::comparison_current)
+            comparison_current_.reset();
         preview_status_->SetLabel("History preview query returned no projection.");
         return;
     }
@@ -637,6 +1073,17 @@ void HistoryView::poll() {
         preview_status_->SetLabel("Loading selected step to compare…");
         return;
     }
+    if (kind == PendingKind::comparison_current &&
+        (!comparison_current_ || !project_ || !project_->state ||
+         comparison_current_->uuid != project_->state->uuid ||
+         comparison_current_->revisions.edit != comparison_current_edit_ ||
+         project_->state->revisions.edit != comparison_current_edit_ ||
+         received_preview->uuid != comparison_current_->uuid ||
+         received_preview->source_revisions.edit != comparison_current_edit_)) {
+        comparison_current_.reset();
+        preview_status_->SetLabel("Project identity or edit revision changed; refresh the selected step and compare again.");
+        return;
+    }
     preview_ = std::move(received_preview);
     if (!project_ || preview_->uuid != project_->state->uuid ||
         preview_->source_revisions.edit != expected_edit_) {
@@ -654,8 +1101,19 @@ void HistoryView::poll() {
 
 void HistoryView::render_entries() {
     entries_->clear_selection();
-    entries_->populate(rows_.size(), [this](std::size_t row, int column) {
-        const auto& entry = rows_[row];
+    visible_history_rows_.clear();
+    const auto query = history_filter_->GetValue().Lower();
+    for (std::size_t i = 0; i < rows_.size(); ++i) {
+        const auto& entry = rows_[i];
+        const auto searchable = wxString::Format("%llu %llu ",
+            static_cast<unsigned long long>(entry.step),
+            static_cast<unsigned long long>(entry.group_id)) + change_text(entry) +
+            (entry.applied ? " Applied" : " Redo");
+        if (query.empty() || searchable.Lower().Find(query) != wxNOT_FOUND)
+            visible_history_rows_.push_back(i);
+    }
+    entries_->populate(visible_history_rows_.size(), [this](std::size_t row, int column) {
+        const auto& entry = rows_[visible_history_rows_[row]];
         switch (column) {
         case 0: return wxString::Format("%llu", static_cast<unsigned long long>(entry.step));
         case 1: return wxString::Format("%llu", static_cast<unsigned long long>(entry.group_id));
@@ -663,6 +1121,10 @@ void HistoryView::render_entries() {
         default: return entry.applied ? wxString("Applied") : wxString("Redo");
         }
     });
+    history_filter_status_->SetLabel(query.empty()
+        ? wxString::Format("%llu loaded", static_cast<unsigned long long>(rows_.size()))
+        : wxString::Format("%llu / %llu match", static_cast<unsigned long long>(visible_history_rows_.size()),
+                           static_cast<unsigned long long>(rows_.size())));
     if (rows_.empty() && page_ && page_->history_count == 0)
         status_->SetLabel("This project has no durable history entries.");
 }
@@ -748,8 +1210,11 @@ void HistoryView::render_preview() {
         static_cast<unsigned long long>(state.decisions.references.size()),
         static_cast<unsigned long long>(state.debug_variables.size()),
         static_cast<unsigned long long>(state.patches.size())));
-    if (comparison_base_ && comparison_base_->user) {
-        const auto& before = *comparison_base_->user;
+    const auto *comparison_state = comparison_base_ && comparison_base_->user
+        ? comparison_base_->user.get()
+        : comparison_current_ && comparison_current_->user ? comparison_current_->user.get() : nullptr;
+    if (comparison_state) {
+        const auto& before = *comparison_state;
         constexpr std::size_t max_detail_rows = 512;
         std::size_t detail_rows = 0;
         bool details_truncated = false;
@@ -929,10 +1394,12 @@ void HistoryView::render_preview() {
             add("History delta", {}, "Additional row changes omitted",
                 wxString::Format("The detailed comparison reached its %llu-row display limit.",
                     static_cast<unsigned long long>(max_detail_rows)));
+        const auto comparison_target = comparison_current_
+            ? wxString::Format("current project edit %llu", static_cast<unsigned long long>(comparison_current_edit_))
+            : wxString::Format("step %llu", static_cast<unsigned long long>(comparison_base_->target_step));
         preview_status_->SetLabel(wxString::Format(
-            "Step %llu compared with %llu. Detailed rows show additions, removals, and edits; collection totals remain summarized below. Displayed detail is capped at %llu rows.",
-            static_cast<unsigned long long>(preview_->target_step),
-            static_cast<unsigned long long>(comparison_base_->target_step),
+            "Step %llu compared with %s. Detailed rows show additions, removals, and edits; collection totals remain summarized below. Displayed detail is capped at %llu rows.",
+            static_cast<unsigned long long>(preview_->target_step), comparison_target,
             static_cast<unsigned long long>(max_detail_rows)));
     }
     preview_items_->populate(preview_rows_.size(), [this](std::size_t row, int column) {

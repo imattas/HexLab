@@ -1,14 +1,26 @@
 # DWARF supplementary type references
 
 ELF import resolves `DW_FORM_ref_sup4` and `DW_FORM_ref_sup8` type references
-through `ElfLoadOptions::dwarf_supplementary_package`. Both forms encode an
+through `ElfLoadOptions::dwarf_supplementary_package`, which accepts either a
+supplementary ELF with ordinary `.debug_info`/`.debug_abbrev` sections or a DWP
+with CU/TU indexes. Top-level `load_image` also discovers a local supplementary
+ELF or DWP when its input is a `FileStorage`: the validated application
+`.debug_sup` filename must be a basename, the candidate must be a regular file
+in the same canonical directory, and its size must not exceed 64 MiB. Direct
+`load_elf` callers continue to supply source storage or a resolver themselves.
+Both forms encode an
 absolute `.debug_info.dwo` offset in the explicitly selected supplementary
 object; their 4-byte and 8-byte widths are independent of the referring unit's
 DWARF32/DWARF64 format. The application must carry a version-5 `.debug_sup`
 descriptor with `is_supplementary=0` and a nonempty checksum. The selected ELF
 must have the same class and byte order, and its supplementary `.debug_sup`
-descriptor must carry the exact matching checksum. No embedded filename is
-opened.
+descriptor must carry the exact matching checksum. Discovery never accepts
+absolute or directory-bearing filename hints, follows no candidate outside
+the primary file's directory, and still applies the source identity checks
+below before publishing imported types. For a direct supplementary ELF, the
+reference offset must identify an imported type DIE in its bounded
+`.debug_info` section. For a DWP, exactly one CU/TU INFO contribution must own
+the offset before the bounded contribution resolver is invoked.
 
 The selected package may contain a version-5 CU index, a version-5 TU index,
 or both. A CU-only package is sufficient for a reference to an imported type
@@ -52,3 +64,17 @@ checks its shared supplementary request and reported-byte/encoded-type budgets
 for both forms, including cached resolutions. Cancellation and failed imports
 publish no partial import result. Automatic discovery and unsupported
 type/location/range forms remain explicit limits.
+
+Standalone split-DWO import can use the same bounded type-reference path.
+`import_elf_dwo` and `make_elf_dwo_resolver` accept an optional
+`DwarfSupplementaryIdentity` and `DwarfSupplementaryTypeResolver`. The caller
+must provide the exact application object's DWARF v5 `.debug_sup` identity and
+a resolver that verifies the selected supplementary object's checksum and the
+requested DIE offset before returning a type. The importer validates the
+identity echo, exact target offset, nonempty type, cancellation, and the
+existing request/byte limits. This applies to type-valued `DW_FORM_ref_sup4`
+and `DW_FORM_ref_sup8` references in DWO units. It does not discover or open
+the `.dwo` or supplementary paths from debug metadata; callers retain exact
+storage selection and identity responsibility. Split-DWO imports without
+these optional arguments keep the existing unsupported result for
+`DW_FORM_ref_sup`.

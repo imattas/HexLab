@@ -1,9 +1,15 @@
 #pragma once
 
+#include "ranked_name_match.hpp"
 #include "hexlab/core/location.hpp"
 #include "hexlab/image/metadata.hpp"
+#include "hexlab/symbols/demangle.hpp"
 #include "hexlab/workspace/navigation.hpp"
 #include <algorithm>
+#include <set>
+#include <map>
+#include <iterator>
+#include <tuple>
 #include <wx/string.h>
 #include <optional>
 #include <string_view>
@@ -17,6 +23,9 @@ struct NamedLocationCandidate {
     // Section/segment expressions are accepted only while the relative
     // displacement remains inside the containing mapped extent.
     std::optional<std::uint64_t> relative_extent;
+    // Only cross-document searches set this owner. Location alone is not a
+    // unique destination when multiple documents share an address range.
+    std::optional<std::uint64_t> document;
 };
 
 struct NamedLocationMatch {
@@ -34,7 +43,10 @@ struct NamedLocationExpression {
 struct NamedLocationSearch {
     std::vector<NamedLocationCandidate> candidates;
     bool truncated = false;
+    wxString limitation;
 };
+enum class NamedLocationSearchMode { contains, prefix, exact, fuzzy };
+enum class NamedLocationScope { all, symbols, annotations, bookmarks, functions, sections };
 
 inline std::optional<NamedLocationExpression> parse_named_location_expression(const wxString &input) {
     wxString trimmed = input;
@@ -61,8 +73,11 @@ inline std::optional<NamedLocationExpression> parse_named_location_expression(co
 inline std::vector<std::pair<wxString, Location>> image_symbol_locations(const ImageMetadata &metadata) {
     std::vector<std::pair<wxString, Location>> entries;
     const auto append = [&](std::string_view name, Address address) {
-        if (!name.empty())
-            entries.emplace_back(wxString::FromUTF8(name.data(), name.size()), Location{address});
+        if (name.empty()) return;
+        entries.emplace_back(wxString::FromUTF8(name.data(), name.size()), Location{address});
+        const auto rendered = symbols::demangle_cpp_name(name);
+        if (rendered.status == symbols::DemangleStatus::demangled && rendered.text != name)
+            entries.emplace_back(wxString::FromUTF8(rendered.text.data(), rendered.text.size()), Location{address});
     };
     for (const auto &symbol : metadata.exports) {
         if (symbol.address) {
@@ -88,7 +103,9 @@ inline std::vector<std::pair<wxString, Location>> image_symbol_locations(const I
         // become jumps to a fabricated zero address.
         if (metadata.elf->dwarf_info)
             for (const auto &symbol : metadata.elf->dwarf_info->symbols)
-                if (symbol.kind == symbols::SymbolKind::function && !symbol.ranges.empty())
+                if (symbol.kind == symbols::SymbolKind::entry_point)
+                    append(symbol.name, Address{AddressSpaceId{}, symbol.address});
+                else if (symbol.kind == symbols::SymbolKind::function && !symbol.ranges.empty())
                     append(symbol.name, Address{AddressSpaceId{}, symbol.ranges.front().begin});
     }
     if (metadata.macho) {
@@ -194,32 +211,135 @@ inline NamedLocationMatch resolve_named_location_expression(
     return match;
 }
 
+inline NamedLocationSearch search_ranked_named_locations(
+    const std::vector<std::pair<wxString, Location>>& entries,
+    const std::vector<NamedLocationCandidate>& bounded_entries,
+    const wxString& requested, std::size_t limit) {
+    NamedLocationSearch result;
+    auto needle = requested;
+    needle.Trim(true).Trim(false).MakeLower();
+    if (needle.length() < 2 || needle.length() > 256 || !limit) return result;
+    limit = std::min<std::size_t>(limit, 4096);
+    using Key = std::tuple<std::size_t, std::uint32_t, std::uint64_t>;
+    const auto key = [](const Location& location) -> Key {
+        if (const auto* address = std::get_if<Address>(&location))
+            return {location.index(), address->space.value, address->offset};
+        return {location.index(), 0, std::get<FileOffset>(location).value};
+    };
+    struct Ranked {
+        std::array<std::size_t, 4> rank;
+        wxString folded;
+        NamedLocationCandidate candidate;
+        Key destination;
+    };
+    const auto less = [](const Ranked& left, const Ranked& right) {
+        if (left.rank != right.rank) return left.rank < right.rank;
+        if (left.folded != right.folded) return left.folded < right.folded;
+        if (left.candidate.name != right.candidate.name) return left.candidate.name < right.candidate.name;
+        return left.destination < right.destination;
+    };
+    std::set<Ranked, decltype(less)> ranked(less);
+    std::map<Key, decltype(ranked)::iterator> destinations;
+    constexpr std::size_t record_limit = 50000, character_limit = 2 * 1024 * 1024, name_limit = 2048;
+    std::size_t examined = 0, characters = 0, work = 2 * 1024 * 1024;
+    bool stopped = false, skipped = false;
+    const auto add = [&](const wxString& name, const Location& location) {
+        if (++examined > record_limit || name.length() > character_limit - characters) {
+            stopped = true; result.truncated = true;
+            result.limitation = "partial ranked search: source budget reached; narrow the name-source scope";
+            return;
+        }
+        if (name.length() > name_limit) { skipped = true; return; }
+        characters += name.length();
+        if (name.empty()) return;
+        auto folded = name.Lower();
+        bool exhausted = false;
+        const auto rank = ranked_name_match(folded, needle, work, exhausted);
+        if (exhausted) {
+            stopped = true; result.truncated = true;
+            result.limitation = "partial ranked search: comparison budget reached; narrow the name-source scope";
+            return;
+        }
+        if (!rank) return;
+        const auto destination = key(location);
+        Ranked row{*rank, std::move(folded), {name, location, {}}, destination};
+        if (const auto found = destinations.find(destination); found != destinations.end()) {
+            if (!less(row, *found->second)) return;
+            ranked.erase(found->second); destinations.erase(found);
+        } else if (ranked.size() == limit) {
+            result.truncated = true;
+            const auto worst = std::prev(ranked.end());
+            if (!less(row, *worst)) return;
+            destinations.erase(worst->destination); ranked.erase(worst);
+        }
+        const auto inserted = ranked.insert(std::move(row)).first;
+        destinations.emplace(destination, inserted);
+    };
+    for (const auto& [name, location] : entries) { add(name, location); if (stopped) break; }
+    if (!stopped) for (const auto& candidate : bounded_entries) {
+        add(candidate.name, candidate.location); if (stopped) break;
+    }
+    if (skipped) {
+        result.truncated = true;
+        if (!result.limitation.empty()) result.limitation += "; ";
+        result.limitation += "names over 2048 characters omitted";
+    }
+    if (result.truncated && result.limitation.empty())
+        result.limitation = "ranked destination limit reached; showing best matches in the scanned sources";
+    result.candidates.reserve(ranked.size());
+    for (const auto& row : ranked) result.candidates.push_back(row.candidate);
+    return result;
+}
+
 inline NamedLocationSearch search_named_locations(
     const std::vector<std::pair<wxString, Location>> &entries,
     const std::vector<NamedLocationCandidate> &bounded_entries,
-    const wxString &requested, std::size_t limit = 128) {
+    const wxString &requested, std::size_t limit = 128,
+    NamedLocationSearchMode mode = NamedLocationSearchMode::contains) {
+    if (mode == NamedLocationSearchMode::fuzzy)
+        return search_ranked_named_locations(entries, bounded_entries, requested, limit);
     NamedLocationSearch result;
     wxString needle = requested;
     needle.Trim(true).Trim(false);
     needle.MakeLower();
-    if (needle.length() < 2 || !limit)
+    if (needle.length() < (mode == NamedLocationSearchMode::exact ? 1u : 2u) || !limit)
         return result;
+
+    const auto less_location = [](const Location &left, const Location &right) {
+        if (left.index() != right.index()) return left.index() < right.index();
+        if (const auto *address = std::get_if<Address>(&left)) {
+            const auto &other = std::get<Address>(right);
+            if (address->space.value != other.space.value) return address->space.value < other.space.value;
+            return address->offset < other.offset;
+        }
+        return std::get<FileOffset>(left).value < std::get<FileOffset>(right).value;
+    };
+    std::set<Location, decltype(less_location)> destinations(less_location);
 
     const auto add = [&](const wxString &name, const Location &location) {
         if (name.empty()) return;
         wxString folded = name;
         folded.MakeLower();
-        if (folded.Find(needle) == wxNOT_FOUND) return;
-        if (std::any_of(result.candidates.begin(), result.candidates.end(),
-                [&](const auto &candidate) { return candidate.location == location; })) return;
+        const bool matches = mode == NamedLocationSearchMode::exact ? folded == needle
+            : mode == NamedLocationSearchMode::prefix ? folded.StartsWith(needle)
+            : folded.Find(needle) != wxNOT_FOUND;
+        if (!matches || destinations.contains(location)) return;
         if (result.candidates.size() == limit) {
             result.truncated = true;
             return;
         }
+        destinations.insert(location);
         result.candidates.push_back({name, location, {}});
     };
-    for (const auto &[name, location] : entries) add(name, location);
-    for (const auto &candidate : bounded_entries) add(candidate.name, candidate.location);
+    for (const auto &[name, location] : entries) {
+        add(name, location);
+        if (result.truncated) break;
+    }
+    if (!result.truncated)
+        for (const auto &candidate : bounded_entries) {
+            add(candidate.name, candidate.location);
+            if (result.truncated) break;
+        }
     std::sort(result.candidates.begin(), result.candidates.end(), [](const auto &left, const auto &right) {
         wxString left_folded = left.name, right_folded = right.name;
         left_folded.MakeLower(); right_folded.MakeLower();
