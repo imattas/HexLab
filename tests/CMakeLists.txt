@@ -542,6 +542,12 @@ add_test(NAME project_cli COMMAND "${CMAKE_COMMAND}"
   "-DFIXTURES=${CMAKE_CURRENT_BINARY_DIR}/project-cli-fixtures/$<CONFIG>"
   -P "${CMAKE_CURRENT_SOURCE_DIR}/project_cli_tests.cmake")
 set_tests_properties(project_cli PROPERTIES TIMEOUT 120)
+add_test(NAME project_recovery_cli COMMAND "${CMAKE_COMMAND}"
+  "-DCLI=$<TARGET_FILE:hexlab_cli>"
+  "-DINPUT=${PROJECT_SOURCE_DIR}/tests/fixtures/archive-single-member.a"
+  "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/project-recovery-cli/$<CONFIG>"
+  -P "${CMAKE_CURRENT_SOURCE_DIR}/project_recovery_cli_tests.cmake")
+set_tests_properties(project_recovery_cli PROPERTIES TIMEOUT 30)
 if(HEXLAB_BUILD_DESKTOP AND HEXLAB_ENABLE_GUI_TESTS)
   add_executable(hexlab_desktop_macho_tests WIN32 desktop_macho_tests.cpp)
   target_include_directories(hexlab_desktop_macho_tests PRIVATE "${PROJECT_SOURCE_DIR}/apps/desktop" "${PROJECT_SOURCE_DIR}/libs/workspace/src")

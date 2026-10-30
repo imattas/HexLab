@@ -951,11 +951,13 @@ Result<SavedProject> ProjectStore::restore_backup_in_place(const std::filesystem
 Result<SavedProject> ProjectStore::recover_candidate_in_place(
         const ProjectRecoveryCandidate& candidate,const std::filesystem::path& target,
         std::stop_token stop){
-    if(candidate.kind!=RecoveryArtifactKind::previous_version)
-        return Error{ErrorCode::invalid_argument,
-                     "In-place recovery accepts only retained previous-version artifacts"};
+    if(candidate.kind!=RecoveryArtifactKind::previous_version &&
+       candidate.kind!=RecoveryArtifactKind::interrupted_save)
+        return Error{ErrorCode::invalid_argument,"In-place recovery requires a validated recovery artifact"};
     const auto filename=candidate.path.filename().u8string();
-    if(!filename.starts_with(u8".hexlab-previous-")||!filename.ends_with(u8".tmp"))
+    const auto expected_prefix=candidate.kind==RecoveryArtifactKind::interrupted_save
+        ?u8".hexlab-save-":u8".hexlab-previous-";
+    if(!filename.starts_with(expected_prefix)||!filename.ends_with(u8".tmp"))
         return Error{ErrorCode::invalid_argument,"Recovery artifact name does not match its kind"};
     return restore_backup_in_place_checked(candidate.path,target,&candidate,stop);
 }

@@ -511,8 +511,9 @@ int run_recovery_restore_in_place(const project_detail::Arguments &args, std::os
         return !candidate_error && discovered == requested;
     });
     require(found != candidates.end(), "Path is not a fully validated HexLab recovery artifact");
-    require(found->kind == database::RecoveryArtifactKind::previous_version,
-            "In-place recovery requires a retained previous-version artifact");
+    require(found->kind == database::RecoveryArtifactKind::previous_version ||
+            found->kind == database::RecoveryArtifactKind::interrupted_save,
+            "In-place recovery requires a validated recovery artifact");
     const auto restored = take(database::ProjectStore::recover_candidate_in_place(*found, args.output, {}));
     if (args.recovery_json) {
         out << "{\"schema_version\":1,\"restored\":true,\"path\":"
@@ -1098,7 +1099,7 @@ void project_usage(std::ostream &out) {
            "recovery list: read-only scan for validated artifacts; rejected matching names include bounded reasons; a project path scans its directory\n"
            "  --inspect-wal adds bounded read-only diagnostics for matching project/staging WAL sidecars; never associates or replays them\n"
            "recovery restore: revalidates an artifact and publishes an independent project copy; --json emits the published path and UUID; source artifact stays intact\n"
-           "recovery restore-in-place: restores a validated previous-version artifact over its same-UUID target; close connections first, target must be reopened, source is retained\n"
+           "recovery restore-in-place: restores a validated interrupted-save or previous-version artifact over its same-UUID target; close connections first, target must be reopened, source is retained\n"
            "recovery inspect-wal: reads WAL bytes without SQLite; checks header, salts, checksums, commit markers; diagnostic only; exit 3 means invalid, truncated, empty or budget-limited\n"
            "integrity: read-only SQLite integrity and foreign-key check against a revision-pinned snapshot; exit 3 means inconsistent or issue output capped\n"
            "schema: read-only schema compatibility probe; never migrates; exit 3 means newer than this build\n"

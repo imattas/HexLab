@@ -170,7 +170,7 @@ current project must be rolled back in place:
 hexlab_cli project recovery restore-in-place .\projects\.hexlab-previous-abc.tmp --target .\projects\sample.hxproj --json
 ```
 
-This operation accepts only a validated `previous-version` candidate. The
+This operation accepts a validated `interrupted-save` or `previous-version` candidate. The
 database layer rechecks the candidate UUID, discovered revisions, exact file
 size, and SHA-256, and requires the candidate and target to represent the same
 project identity. It
