@@ -158,12 +158,16 @@ distinct files. Module CodeView records are matched only by an exact RSDS
 GUID+age; NB10 timestamps are not treated as PDB identities. One global PDB may
 bind every module row with the same exact identity. Bound module metadata records
 the selected path, binding state, diagnostic, symbol count and bounded DBI
-symbol rows. Symbol offsets remain section-relative because Minidump module
-records do not contain the original PE section table. A missing or mismatched
-sidecar is never presented as a match, and a truncated search is reported.
+symbol rows. It also retains bounded C13 source rows with path/checksum identity,
+section-relative offsets, contribution bounds, line/column data, statement flags,
+and PDB module provenance. Symbol and source-line offsets remain section-relative
+because Minidump module records do not contain the original PE section table.
+A missing or mismatched sidecar is never presented as a match, and a truncated
+search is reported. Source-line parse/retention failures have a separate
+diagnostic and do not discard successfully matched symbols.
 Selected candidate paths are persisted in the durable recipe so reopening the
 project does not silently rerank adjacent files. The CLI and Minidump desktop
-view show each module's binding state and retained symbol count.
+view show each module's binding state and retained symbol/source-line counts.
 
 Thread and exception register contexts use the SystemInfo architecture and
 require a matching architecture family in `ContextFlags`. Unknown architectures

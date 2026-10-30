@@ -101,7 +101,7 @@ MinidumpView::MinidumpView(wxWindow *parent) : wxPanel(parent) {
     status_ = new wxStaticText(this, wxID_ANY, "No Minidump metadata");
     status_->SetName("minidump-status");
     modules_ = new VirtualTable(this, "minidump-modules",
-        {"Module", "Base / size", "PDB binding", "Bound sidecar", "Symbols"});
+        {"Module", "Base / size", "PDB binding", "Bound sidecar", "Symbols", "Source lines"});
     modules_->SetMinSize(FromDIP(wxSize(-1, 100)));
     contexts_ = new VirtualTable(this, "minidump-contexts",
         {"Record", "Thread", "Thread name", "Context status", "Architecture", "Context file / size", "Requested / decoded", "Stack / exception address"});
@@ -216,10 +216,12 @@ void MinidumpView::set_document(std::shared_ptr<const DocumentSnapshot> document
         case 3: return clipped(module.bound_pdb_path);
         case 4: return decimal(module.pdb_symbol_count) +
             (module.pdb_symbols_complete ? " (complete)" : module.pdb_symbol_count ? " (bounded)" : "");
+        case 5: return decimal(module.pdb_source_line_count) +
+            (module.pdb_source_lines_complete ? " (complete)" : module.pdb_source_line_count ? " (bounded)" : "");
         }
         return wxString{};
     });
-    modules_->fit_columns({0, 1, 2, 3, 4});
+    modules_->fit_columns({0, 1, 2, 3, 4, 5});
     repeated_handle_rows_.clear();
     if (dump->handle_operations) {
         const auto &list = *dump->handle_operations;
