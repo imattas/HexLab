@@ -194,6 +194,55 @@ struct JvmIntegerArithmeticResult {
     bool operator==(const JvmIntegerArithmeticResult &) const = default;
 };
 
+// Evaluate JVM wrapping integer arithmetic and bitwise operations from raw
+// stack bits. Binary operations consume lhs then rhs; negation uses lhs only.
+// Results are returned as exact 32- or 64-bit JVM stack patterns.
+inline std::optional<std::uint64_t> evaluate_jvm_integer_arithmetic_instruction(
+    const Instruction &instruction, std::uint64_t lhs_bits,
+    std::optional<std::uint64_t> rhs_bits = std::nullopt) noexcept {
+    if (instruction.context.architecture != Architecture::jvm || instruction.context.mode != ExecutionMode::jvm ||
+        instruction.opcode != Opcode::jvm || instruction.flow != FlowKind::fallthrough ||
+        !instruction.operands.empty() || !instruction.access.empty() || instruction.memory_read ||
+        instruction.memory_write || instruction.length != 1)
+        return std::nullopt;
+    const auto &name = instruction.mnemonic_override;
+    const bool wide = name == "ladd" || name == "lsub" || name == "lmul" || name == "lneg" ||
+        name == "land" || name == "lor" || name == "lxor" || name == "lshl" ||
+        name == "lshr" || name == "lushr";
+    const bool shift = name == "ishl" || name == "ishr" || name == "iushr" ||
+        name == "lshl" || name == "lshr" || name == "lushr";
+    const bool unary = name == "ineg" || name == "lneg";
+    if (name != "iadd" && name != "ladd" && name != "isub" && name != "lsub" &&
+        name != "imul" && name != "lmul" && name != "ineg" && name != "lneg" &&
+        name != "iand" && name != "land" && name != "ior" && name != "lor" &&
+        name != "ixor" && name != "lxor" && name != "ishl" && name != "ishr" &&
+        name != "iushr" && name != "lshl" && name != "lshr" && name != "lushr")
+        return std::nullopt;
+    if (unary == rhs_bits.has_value()) return std::nullopt;
+    const auto mask = wide ? UINT64_MAX : UINT64_C(0xffffffff);
+    const auto lhs = lhs_bits & mask;
+    const auto rhs = rhs_bits.value_or(0) & mask;
+    if (shift) {
+        const auto count = static_cast<unsigned>(rhs & (wide ? UINT64_C(0x3f) : UINT64_C(0x1f)));
+        if (name == "ishl" || name == "lshl") return (lhs << count) & mask;
+        if (name == "iushr" || name == "lushr") return lhs >> count;
+        if (count == 0) return lhs;
+        const auto width = wide ? 64u : 32u;
+        auto result = lhs >> count;
+        const auto sign_bit = UINT64_C(1) << (width - 1);
+        if (lhs & sign_bit)
+            result |= mask & ~((UINT64_C(1) << (width - count)) - 1);
+        return result & mask;
+    }
+    if (name == "ineg" || name == "lneg") return (UINT64_C(0) - lhs) & mask;
+    if (name == "iadd" || name == "ladd") return (lhs + rhs) & mask;
+    if (name == "isub" || name == "lsub") return (lhs - rhs) & mask;
+    if (name == "imul" || name == "lmul") return (lhs * rhs) & mask;
+    if (name == "iand" || name == "land") return lhs & rhs;
+    if (name == "ior" || name == "lor") return lhs | rhs;
+    return lhs ^ rhs;
+}
+
 // Evaluate decoded JVM idiv/irem/ldiv/lrem from raw stack operand bits.
 // Divide-by-zero is reported explicitly; MIN_VALUE/-1 follows JVM wrap rules.
 inline std::optional<JvmIntegerArithmeticResult> evaluate_jvm_integer_divide_instruction(
