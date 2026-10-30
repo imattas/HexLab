@@ -18,5 +18,14 @@ sign bit for arithmetic right shifts. The helper validates that the input is
 one of the six operand-free JVM shift bytecodes. Stack pops and pushes and
 runtime value sampling remain caller-owned.
 
+The broader `evaluate_jvm_integer_arithmetic_instruction` helper also accepts
+these six shift instructions. Supply the value as `lhs_bits` and the JVM int
+distance as `rhs_bits`; `ishl`/`lshl` shift left, `ishr`/`lshr` replicate the
+sign bit, and `iushr`/`lushr` shift in zeroes. The helper masks counts to five
+bits for int values and six bits for long values, even when the supplied
+distance has other high bits set. This same helper evaluates wrapping add,
+subtract, multiply, negate, and/or/xor operations; all results are raw stack
+bit patterns, with int results zero-extended to 64 bits.
+
 This covers scalar bytecode shift semantics only. It does not add whole-method
 bytecode verification or claim execution of class code.
