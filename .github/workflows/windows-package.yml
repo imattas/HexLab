@@ -22,8 +22,12 @@ jobs:
           submodules: recursive
       - name: Configure desktop distribution
         run: cmake --preset windows-desktop
+      - name: Build Release applications and test targets
+        run: cmake --build --preset windows-desktop --config Release --parallel 4
       - name: Build Release multi-file ZIP
         run: cmake --build --preset windows-desktop --config Release --target package --parallel 4
+      - name: Run Release test suite and package archive check
+        run: ctest --test-dir out/build/windows-desktop -C Release --output-on-failure
       - name: Write SHA-256 checksum
         shell: pwsh
         run: |

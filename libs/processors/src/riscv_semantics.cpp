@@ -172,6 +172,90 @@ std::optional<RiscvCsrPrivilegeCheck> check_riscv_csr_privilege(
         static_cast<unsigned>(current_privilege) >= static_cast<unsigned>(required)};
 }
 
+std::optional<RiscvFcsrResult> evaluate_riscv_fcsr_instruction(
+    const RiscvInstruction &instruction, unsigned xlen, RiscvFcsrState state,
+    std::uint64_t source_value) noexcept {
+    if (state.fflags > 0x1fu || state.frm > 7u ||
+        (xlen != 32 && xlen != 64) || instruction.operands.size() != 3)
+        return {};
+    const auto *csr = std::get_if<RiscvImmediate>(&instruction.operands[1]);
+    if (!csr || csr->value < 1 || csr->value > 3 || csr->is_signed || csr->encoded_width != 12)
+        return {};
+
+    std::uint64_t old_value = 0;
+    switch (csr->value) {
+    case 1: old_value = state.fflags; break;
+    case 2: old_value = state.frm; break;
+    case 3: old_value = static_cast<std::uint64_t>(state.fflags) |
+                         (static_cast<std::uint64_t>(state.frm) << 5); break;
+    default: return {};
+    }
+    const auto operation = evaluate_riscv_csr_instruction(instruction, xlen, old_value, source_value);
+    if (!operation) return {};
+
+    RiscvFcsrResult result{};
+    result.rd_value = operation->rd_value;
+    result.state = state;
+    result.writes_rd = operation->writes_rd;
+    result.writes_state = operation->writes_csr;
+    if (!result.writes_state) return result;
+    switch (csr->value) {
+    case 1:
+        result.state.fflags = static_cast<std::uint8_t>(operation->csr_value & 0x1fu);
+        break;
+    case 2:
+        result.state.frm = static_cast<std::uint8_t>(operation->csr_value & 7u);
+        break;
+    case 3:
+        result.state.fflags = static_cast<std::uint8_t>(operation->csr_value & 0x1fu);
+        result.state.frm = static_cast<std::uint8_t>((operation->csr_value >> 5) & 7u);
+        break;
+    default: return {};
+    }
+    return result;
+}
+
+std::optional<RiscvFcsrState> accrue_riscv_fflags(
+    RiscvFcsrState state, std::uint8_t raised_flags) noexcept {
+    if (state.fflags > 0x1fu || state.frm > 7u || (raised_flags & ~0x1fu) != 0)
+        return {};
+    state.fflags = static_cast<std::uint8_t>(state.fflags | raised_flags);
+    return state;
+}
+
+std::optional<std::uint8_t> resolve_riscv_rounding_mode(
+    const RiscvInstruction &instruction, std::uint8_t frm) noexcept {
+    if (frm > 7u || !instruction.rounding_mode || *instruction.rounding_mode > 7u)
+        return {};
+    const auto encoded = *instruction.rounding_mode;
+    if (encoded <= 4u)
+        return instruction.reads_frm ? std::optional<std::uint8_t>{} : encoded;
+    if (encoded != 7u || !instruction.reads_frm || frm > 4u)
+        return {};
+    return frm;
+}
+
+std::optional<std::uint32_t> read_riscv_f32_register_value(
+    unsigned flen, std::uint64_t register_bits) noexcept {
+    if (flen == 32) {
+        if (register_bits >> 32) return {};
+        return static_cast<std::uint32_t>(register_bits);
+    }
+    if (flen != 64) return {};
+    if ((register_bits >> 32) != UINT32_MAX)
+        return UINT32_C(0x7fc00000); // canonical quiet NaN for an unboxed value
+    return static_cast<std::uint32_t>(register_bits);
+}
+
+std::optional<std::uint64_t> write_riscv_f32_register_value(
+    unsigned flen, std::uint64_t binary32_bits) noexcept {
+    if (binary32_bits >> 32) return {};
+    if (flen == 32) return binary32_bits;
+    if (flen == 64)
+        return UINT64_C(0xffffffff00000000) | binary32_bits;
+    return {};
+}
+
 std::optional<std::uint64_t> evaluate_riscv_m_operation(RiscvOpcode opcode, unsigned xlen, std::uint64_t lhs,
                                                         std::uint64_t rhs) noexcept {
     if (xlen != 32 && xlen != 64)

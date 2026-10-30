@@ -451,6 +451,8 @@ Result<JvmModulePathWorkspace> link_jvm_path_workspace(std::span<const JvmPathRo
             const bool directory = std::filesystem::is_directory(status);
             if (!directory && !std::filesystem::is_regular_file(status))
                 return Error{ErrorCode::invalid_argument, "JVM path root is neither a directory nor a regular archive"};
+            if (directory && !root.archive_volumes.empty())
+                return Error{ErrorCode::invalid_argument, "JVM split archive volumes cannot be attached to a directory root"};
             if (directory) {
                 auto listing = enumerate_directory(root.path, limits.max_files - total_files, stop);
                 if (!listing) return listing.error();
@@ -512,16 +514,41 @@ Result<JvmModulePathWorkspace> link_jvm_path_workspace(std::span<const JvmPathRo
                     }
                 }
             } else {
-                const auto size = std::filesystem::file_size(root.path, ec);
-                if (ec) return Error{ErrorCode::io, "cannot get JVM archive size: " + ec.message()};
-                if (size > limits.max_file_bytes) return Error{ErrorCode::resource_limit, "JVM archive exceeds its configured byte limit"};
-                auto total = account(size, total_input, limits.max_total_input_bytes, "input"); if (!total) return total.error();
+                const std::vector<std::filesystem::path> volume_paths = root.archive_volumes.empty()
+                    ? std::vector<std::filesystem::path>{root.path} : root.archive_volumes;
+                if (volume_paths.size() > limits.archive.max_volumes)
+                    return Error{ErrorCode::resource_limit, "JVM split archive exceeds its configured volume limit"};
+                if (!root.archive_volumes.empty()) {
+                    const auto named_final = std::filesystem::absolute(root.path, ec).lexically_normal();
+                    if (ec) return Error{ErrorCode::io, "cannot resolve JVM split archive final-volume path: " + ec.message()};
+                    const auto supplied_final = std::filesystem::absolute(volume_paths.back(), ec).lexically_normal();
+                    if (ec) return Error{ErrorCode::io, "cannot resolve JVM split archive volume path: " + ec.message()};
+                    if (named_final != supplied_final)
+                        return Error{ErrorCode::invalid_argument, "JVM split archive root path must name the final supplied volume"};
+                }
+                std::vector<std::shared_ptr<const ByteStorage>> archive_volumes;
+                archive_volumes.reserve(volume_paths.size());
+                for (const auto &volume_path : volume_paths) {
+                    if (stop.stop_requested()) return Error{ErrorCode::canceled, "JVM split archive loading canceled"};
+                    const auto volume_status = std::filesystem::symlink_status(volume_path, ec);
+                    if (ec) return Error{ErrorCode::io, "cannot inspect JVM archive volume: " + ec.message()};
+                    if (std::filesystem::is_symlink(volume_status) || !std::filesystem::is_regular_file(volume_status))
+                        return Error{ErrorCode::invalid_argument, "JVM archive volumes must be regular non-symlink files"};
+                    const auto size = std::filesystem::file_size(volume_path, ec);
+                    if (ec) return Error{ErrorCode::io, "cannot get JVM archive volume size: " + ec.message()};
+                    if (size > limits.max_file_bytes)
+                        return Error{ErrorCode::resource_limit, "JVM archive volume exceeds its configured byte limit"};
+                    auto total = account(size, total_input, limits.max_total_input_bytes, "input");
+                    if (!total) return total.error();
+                    auto file = FileStorage::open(volume_path); if (!file) return file.error();
+                    if (file.value()->size() != size)
+                        return Error{ErrorCode::io, "JVM archive volume changed while being inventoried"};
+                    archive_volumes.push_back(std::move(file.value()));
+                }
                 if (total_files >= limits.max_files) return Error{ErrorCode::resource_limit, "JVM path exceeds its file-count limit"};
-                auto file = FileStorage::open(root.path); if (!file) return file.error();
-                if (file.value()->size() != size) return Error{ErrorCode::io, "JVM archive changed while being inventoried"};
                 auto jar_limits = limits.archive;
-                jar_limits.max_archive_bytes = std::min(jar_limits.max_archive_bytes, limits.max_file_bytes);
-                auto archive = read_jar_archive(*file.value(), stop, jar_limits); if (!archive) return archive.error();
+                jar_limits.max_archive_bytes = std::min(jar_limits.max_archive_bytes, limits.max_total_input_bytes);
+                auto archive = read_jar_archive(archive_volumes, stop, jar_limits); if (!archive) return archive.error();
                 if (archive.value().members.size() > limits.max_files - total_files) return Error{ErrorCode::resource_limit, "JVM path exceeds its file-count limit"};
                 total_files += archive.value().members.size();
                 root_result.files = static_cast<std::size_t>(std::count_if(archive.value().members.begin(), archive.value().members.end(),

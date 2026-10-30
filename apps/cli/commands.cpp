@@ -368,7 +368,7 @@ void usage(std::ostream &out) {
            "       hexlab_cli dex load-container <path> [--json]  (parse every DEX 041 member)\n\n"
            "       hexlab_cli dex apk <path> [--json]  (load Android APK multidex entries)\n\n"
            "       hexlab_cli dex vdex <path> [--json]  (inventory Android VDEX 027 sections and DEX members)\n\n"
-           "       hexlab_cli jvm module-path [--release <feature>] [--module-path <dir-or-jar>]... [--class-path <dir-or-jar>]...\n\n"
+           "       hexlab_cli jvm module-path [--release <feature>] [--archive-volume <path>]... [--module-path <dir-or-jar>]... [--class-path <dir-or-jar>]...\n\n"
            "       hexlab_cli macho chained-targets <image> [--shared-cache-base <address>] [--cache-level-base <0..3> <address>]...\n"
            "       hexlab_cli firmware inspect <path> --format ihex|srec|uefi|uefi-capsule\n"
            "       hexlab_cli firmware inspect <path> --fit-offset <file-offset> --format fit\n\n"
@@ -2446,7 +2446,7 @@ int jvm_module_path_command(std::span<const std::wstring_view> args, std::ostrea
     using project_detail::Failure;
     using project_detail::take;
     if (args.empty() || (args.size() == 1 && args[0] == L"--help")) {
-        out << "Usage: hexlab_cli jvm module-path [--release <feature>] [--module-path <dir-or-jar>]... [--class-path <dir-or-jar>]...\n"
+        out << "Usage: hexlab_cli jvm module-path [--release <feature>] [--archive-volume <path>]... [--module-path <dir-or-jar>]... [--class-path <dir-or-jar>]...\n"
                "       hexlab_cli jvm module-path [roots...] [--root-module <name>]... [--lookup-class <binary-name>]\n"
                "Roots are processed in option order; manifest Class-Path references use only supplied roots.\n";
         return 0;
@@ -2456,6 +2456,7 @@ int jvm_module_path_command(std::span<const std::wstring_view> args, std::ostrea
         std::vector<JvmPathRoot> roots;
         std::vector<std::string> lookup_classes;
         std::vector<std::string> configuration_roots;
+        std::vector<std::filesystem::path> pending_archive_volumes;
         std::optional<std::uint16_t> target_release;
         for (std::size_t i = 1; i < args.size(); ++i) {
             if (args[i] == L"--release") {
@@ -2484,13 +2485,25 @@ int jvm_module_path_command(std::span<const std::wstring_view> args, std::ostrea
                 configuration_roots.push_back(wide_to_utf8(args[i]));
                 continue;
             }
+            if (args[i] == L"--archive-volume") {
+                if (++i >= args.size()) argument_error("--archive-volume requires one earlier split archive volume path");
+                if (pending_archive_volumes.size() >= 255) argument_error("At most 255 earlier split archive volumes are accepted per root");
+                pending_archive_volumes.push_back(path_from_wide(args[i]));
+                continue;
+            }
             JvmPathRootKind kind;
             if (args[i] == L"--module-path") kind = JvmPathRootKind::module_path;
             else if (args[i] == L"--class-path") kind = JvmPathRootKind::class_path;
             else argument_error("Expected --module-path or --class-path followed by a directory or JAR");
             if (++i >= args.size()) argument_error("JVM path option requires a directory or archive path");
             roots.push_back({path_from_wide(args[i]), kind});
+            if (!pending_archive_volumes.empty()) {
+                roots.back().archive_volumes = std::move(pending_archive_volumes);
+                roots.back().archive_volumes.push_back(roots.back().path);
+                pending_archive_volumes.clear();
+            }
         }
+        if (!pending_archive_volumes.empty()) argument_error("--archive-volume paths must be followed by the final --module-path or --class-path archive root");
         if (roots.empty()) argument_error("jvm module-path requires at least one ordered root");
         JvmModulePathLimits limits;
         limits.target_release = target_release;

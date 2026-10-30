@@ -4,7 +4,9 @@
 feeds their class and module metadata through `link_jvm_metadata_workspace`.
 Roots are passed in caller order. A directory is traversed recursively without
 following symlinks; regular files are sorted by generic relative path before
-processing. A regular file root is read as one bounded ZIP/JAR archive.
+processing. A regular file root is read as one bounded ZIP/JAR archive. Split
+ZIP/JAR roots can provide their complete disk sequence explicitly; the loader
+does not search sibling filenames or infer missing disks.
 
 Every module-path root must contain a root `module-info.class` with a valid
 `Module` attribute. A descriptor-less module-path root is returned with
@@ -26,7 +28,19 @@ const std::array roots{
     JvmPathRoot{std::filesystem::path("classes"), JvmPathRootKind::class_path},
 };
 auto workspace = link_jvm_path_workspace(roots, stop_token);
+
+JvmPathRoot split_class_path{std::filesystem::path("lib/app.zip"), JvmPathRootKind::class_path};
+split_class_path.archive_volumes = {"lib/app.z01", "lib/app.z02", "lib/app.zip"};
+auto split_workspace = link_jvm_path_workspace(std::span(&split_class_path, 1), stop_token);
 ```
+
+For a split root, `archive_volumes` lists every disk in ZIP order, starting
+with disk zero and ending with the same path stored in `JvmPathRoot::path`.
+Every volume must be a regular non-symlink file and is charged against both
+the per-file and aggregate input limits. The ZIP reader validates disk numbers,
+central-directory locations, and member extents across the supplied disks.
+This supports explicit split class-path and module-path archives while keeping
+filesystem discovery under caller control.
 
 Roots are retained in the supplied order. Files within each directory are
 visited by sorted generic relative path. Module records retain descriptor scan
@@ -86,19 +100,22 @@ The CLI exposes the resolver as:
 ```text
 hexlab_cli jvm module-path --module-path app-modules --module-path lib/dependency.jar --class-path classes
 hexlab_cli jvm module-path --class-path app.jar --class-path lib/dependency.jar --lookup-class com.example.Main
+hexlab_cli jvm module-path --archive-volume lib/app.z01 --archive-volume lib/app.z02 --class-path lib/app.zip --lookup-class com.example.Main
 ```
 
-Repeat either option; roots are consumed in the exact option order. The command
+Repeat either root option; roots are consumed in the exact option order.
+`--archive-volume` paths immediately before a root are earlier disks; the
+following root archive is the final disk. The command
 prints graph totals and bounded samples: 256 roots, modules, and edges; 128
 class-ownership and package rows; 256 service rows; and 64 cycle rows. Package
 owners are shown by module name, up to eight names per package. Omitted row
 counts are printed. It also shows up to 256 class-path search-order roots and
 manifest references. Repeat `--lookup-class` for up to 64 bounded queries; each
 prints the selected root/resource, classpath module owner, and up to 16
-shadowed definitions. JAR volume sets use the existing separate `jar` command.
+shadowed definitions.
 
 The defaults bound a workspace to 256 roots, 100,000 enumerated files/member
-rows, 50,000 classes, 128 MiB per file/archive, 2 GiB aggregate filesystem
+rows, 50,000 classes, 128 MiB per disk/file, 2 GiB aggregate filesystem
 input bytes, 512 MiB aggregate class bytes, 16 MiB service text, and 65,536
 non-empty service provider rows. ZIP parsing also uses `JarLimits`: at most
 100,000 members, 128 MiB per member, and 4 GiB aggregate uncompressed bytes per

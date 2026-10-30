@@ -1,4 +1,11 @@
-# HexLab
+# HexLab 0.1.0
+
+HexLab 0.1.0 is the first public development release. Download platform
+packages from the [GitHub release page](https://github.com/imattas/HexLab/releases/tag/v0.1.0).
+This release makes the current workbench installable and reviewable; it is an
+early-stage reverse-engineering tool, not feature-complete IDA Pro parity.
+
+See [the changelog](CHANGELOG.md) for release highlights and known limits.
 
 A C++20 and wxWidgets reverse-engineering suite under development. Its shared engines and desktop/headless CLI handle raw images, PE, ELF, Mach-O, Windows minidumps, firmware, managed metadata, and archives; processor coverage includes x86-16/32/64 (including selected x87 and SSE2/scalar SIMD slices), A32/Thumb, AArch64, PowerPC PPC32/PPC64 integer and selected scalar floating-point instructions, MIPS32/MIPS64 little-endian subsets, and RV64I/M/C subsets. Projects persist analysis facts, annotations, type definitions and assignments, histories, bookmarks, and derived caches. Analysis includes function/control-flow and call graphs, cross-references, UTF-8/16/32 string candidates, stack slots, switch tables, bounded versioned multi-entry signature catalogs with explicit ambiguous matches, CFG-aware binary comparison, and exact binary export. ABI classification covers recursive aggregates for SysV AMD64, Windows x64, and x86 cdecl; the application also has bounded DWARF v4/v5 and PDB import with decoded location expressions and persistent DWARF parameters/locals, a typed decompiler with register SSA, conservative C-like structuring, and editable names/types for uniquely mapped pseudocode values; native Win32/Linux x86-64 debugging plus GDB Remote Serial Protocol over TCP with target XML register descriptions and selected Linux AVX-512 registers; bounded live-context unwinding for PE AMD64/ARM64 and runtime evaluation of linked Mach-O compact-unwind recipes; and a versioned plugin ABI with loaded-plugin capability dependency checks.
 

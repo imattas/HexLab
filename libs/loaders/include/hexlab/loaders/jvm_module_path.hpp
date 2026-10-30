@@ -16,6 +16,10 @@ enum class JvmPathRootKind : std::uint8_t { module_path, class_path };
 struct JvmPathRoot {
     std::filesystem::path path;
     JvmPathRootKind kind = JvmPathRootKind::module_path;
+    // Optional complete ZIP disk sequence for a split JAR/ZIP root, ordered
+    // from disk zero through the final disk. When present, path names the final
+    // volume and every volume is an explicit caller input.
+    std::vector<std::filesystem::path> archive_volumes;
 };
 enum class JvmPathRootStatus : std::uint8_t { linked, missing_module_descriptor };
 struct JvmPathRootResult {
