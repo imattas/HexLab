@@ -287,7 +287,7 @@ inline std::optional<std::uint64_t> evaluate_x86_sahf_instruction(const Instruct
     return evaluate_x86_sahf(flags, ah) & x86_semantics_detail::mask_for(written_flags->width);
 }
 
-// Evaluate CLC/STC/CMC and CLD/STD against the prior whole FLAGS value.
+// Evaluate CLC/STC/CMC, CLI/STI, and CLD/STD against the prior whole FLAGS value.
 // The decoder retains the specific mnemonic as an override on the shared
 // x86 semantic opcode so the operation remains visible to formatters.
 inline std::optional<std::uint64_t> evaluate_x86_flag_control_instruction(
@@ -304,10 +304,13 @@ inline std::optional<std::uint64_t> evaluate_x86_flag_control_instruction(
         return std::nullopt;
 
     constexpr std::uint64_t carry = 1u;
+    constexpr std::uint64_t interrupt_enable = 1u << 9;
     constexpr std::uint64_t direction = 1u << 10;
     if (instruction.mnemonic_override == "clc") flags &= ~carry;
     else if (instruction.mnemonic_override == "stc") flags |= carry;
     else if (instruction.mnemonic_override == "cmc") flags ^= carry;
+    else if (instruction.mnemonic_override == "cli") flags &= ~interrupt_enable;
+    else if (instruction.mnemonic_override == "sti") flags |= interrupt_enable;
     else if (instruction.mnemonic_override == "cld") flags &= ~direction;
     else if (instruction.mnemonic_override == "std") flags |= direction;
     else return std::nullopt;

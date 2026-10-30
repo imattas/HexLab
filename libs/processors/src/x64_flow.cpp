@@ -74,7 +74,8 @@ bool stack_flow(State &s, std::uint8_t opcode, bool extended) {
             return false;
         return true;
     }
-    if (opcode == 0xf5 || opcode == 0xf8 || opcode == 0xf9 || opcode == 0xfc || opcode == 0xfd) {
+    if (opcode == 0xf5 || opcode == 0xf8 || opcode == 0xf9 || opcode == 0xfa || opcode == 0xfb ||
+        opcode == 0xfc || opcode == 0xfd) {
         // These instructions replace one bit of the FLAGS value. Keep the
         // unaffected bits as an explicit input to the whole-register model.
         s.i.opcode = Opcode::x86_flag_control;
@@ -82,6 +83,8 @@ bool stack_flow(State &s, std::uint8_t opcode, bool extended) {
         case 0xf5: s.i.mnemonic_override = "cmc"; break;
         case 0xf8: s.i.mnemonic_override = "clc"; break;
         case 0xf9: s.i.mnemonic_override = "stc"; break;
+        case 0xfa: s.i.mnemonic_override = "cli"; break;
+        case 0xfb: s.i.mnemonic_override = "sti"; break;
         case 0xfc: s.i.mnemonic_override = "cld"; break;
         case 0xfd: s.i.mnemonic_override = "std"; break;
         }
