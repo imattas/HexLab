@@ -84,6 +84,16 @@ Their bounded type grammar covers the same scalar, pointer, reference, array,
 and named types as function signatures, with the encoded top-level `const`,
 `volatile`, and `const volatile` qualifiers. Unsupported trailing type
 qualifiers and malformed or truncated encodings preserve the original symbol.
+Microsoft pooled string-literal names (`??_C`) render the literal's encoded
+bytes with safe C-style escapes and report the ABI byte length. The bounded
+decoder supports narrow and 16-bit wide literals, all rebased-byte escape
+forms, and the standard 128-byte encoded-prefix limit. If the mangled spelling
+contains only a prefix, the display marks it as truncated; it does not invent
+the missing suffix. The CRC field is retained only as an integrity field in
+the mangling and is not verified, since truncated names do not contain all
+bytes required to recompute it. Invalid escape sequences, missing delimiters,
+odd wide-string lengths, and oversized encodings preserve the raw spelling.
+
 Common overloaded
 operators are rendered from their Microsoft operator codes, including arithmetic,
 comparisons, shifts, logical/bitwise operators, indexing, calls, comma,
