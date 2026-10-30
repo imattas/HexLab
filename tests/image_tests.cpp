@@ -2,9 +2,11 @@
 #include "support/checks.hpp"
 #include "support/fixture_files.hpp"
 #include <limits>
+#ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#endif
 
 using namespace hexlab;
 using namespace hexlab_test;
@@ -21,6 +23,7 @@ void storage_tests() {
     auto view = storage->read_at({1}, 2).value();
     storage.reset();
     check(view.bytes[0] == std::byte{0x22} && view.bytes[1] == std::byte{0x33}, "view owns input lifetime");
+#ifdef _WIN32
     auto writer = CreateFileW(fixture.path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     check(writer == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION, "view prevents external write and truncate");
@@ -30,6 +33,7 @@ void storage_tests() {
                          nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     check(writer != INVALID_HANDLE_VALUE, "last view releases native handles");
     if (writer != INVALID_HANDLE_VALUE) CloseHandle(writer);
+#endif
     check(FileStorage::open(fixture.path.parent_path()).error().code == ErrorCode::io, "directory is not input file");
     check(FileStorage::open(fixture.path.parent_path()/"absent.fixture").error().code == ErrorCode::io, "missing input diagnostic");
 }

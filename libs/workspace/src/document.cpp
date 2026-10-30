@@ -2,6 +2,7 @@
 #include "hexlab/workspace/open_recipe.hpp"
 #include "hexlab/loaders/recipe.hpp"
 #include "hexlab/workspace/project.hpp"
+#include <algorithm>
 
 namespace hexlab {
 const StringScan& DocumentSnapshot::strings()const noexcept {if(project && project->strings)return *project->strings;return analysis?analysis->strings:inspection_strings;}
