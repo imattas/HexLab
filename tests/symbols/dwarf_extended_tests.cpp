@@ -159,13 +159,13 @@ int main(){
     auto name_form=std::search(supplementary_abbrev.begin(),supplementary_abbrev.end(),base_name_abbrev.begin(),base_name_abbrev.end());assert(name_form!=supplementary_abbrev.end());*(name_form+4)=0x1d;
     for(unsigned i=0;i<4;++i)supplementary_info[19+i]=0;
     std::vector<std::uint8_t> supplementary_strings{'s','u','p','p','l','e','m','e','n','t','a','r','y','-','i','n','t',0};
-    auto supplementary_import=import_dwarf({"supplementary.o",supplementary_info,supplementary_abbrev,{},{},{},{},{},supplementary_strings});
+    DwarfSections supplementary_sections;supplementary_sections.source_id="supplementary.o";supplementary_sections.info=supplementary_info;supplementary_sections.abbrev=supplementary_abbrev;supplementary_sections.supplementary_strings=supplementary_strings;auto supplementary_import=import_dwarf(supplementary_sections);
     assert(supplementary_import);
     assert(supplementary_import.value().types.size()==1&&supplementary_import.value().types[0].source_name=="supplementary-int");
     auto missing_supplementary=import_dwarf({"missing-supplementary.o",supplementary_info,supplementary_abbrev,{},{},{},{},{}});
     assert(!missing_supplementary&&missing_supplementary.error().code==ErrorCode::unsupported);
     supplementary_info[19]=0xff;
-    auto bad_supplementary=import_dwarf({"bad-supplementary.o",supplementary_info,supplementary_abbrev,{},{},{},{},{},supplementary_strings});
+    supplementary_sections.source_id="bad-supplementary.o";auto bad_supplementary=import_dwarf(supplementary_sections);
     assert(!bad_supplementary&&bad_supplementary.error().code==ErrorCode::malformed);
     // ref_sup4 is delegated to an explicit resolver and its echoed identity
     // (including checksum) must match the bounded .debug_sup descriptor.

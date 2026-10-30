@@ -1,4 +1,5 @@
 #include "elf_internal.hpp"
+#include <algorithm>
 #include <bit>
 #include <string_view>
 

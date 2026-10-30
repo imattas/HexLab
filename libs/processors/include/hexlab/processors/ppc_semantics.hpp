@@ -140,6 +140,15 @@ HEXLAB_PROCESSORS_EXPORT std::optional<PpcCarryArithmeticResult>
 evaluate_ppc_addze_addme_instruction(const Instruction &instruction,
                                     std::uint64_t source, std::uint32_t xer) noexcept;
 
+// Evaluate decoded ADDC/ADDE/SUBFC/SUBFE carry arithmetic, including Rc
+// forms. Both GPR sources and the pre-instruction XER value are supplied by
+// the caller; CA is updated in the returned XER value.
+HEXLAB_PROCESSORS_EXPORT std::optional<PpcCarryArithmeticResult>
+evaluate_ppc_carry_binary_instruction(const Instruction &instruction,
+                                      std::uint64_t source_a,
+                                      std::uint64_t source_b,
+                                      std::uint32_t xer) noexcept;
+
 struct PpcNegateResult {
     std::uint64_t value = 0;
     std::optional<std::uint8_t> cr0;

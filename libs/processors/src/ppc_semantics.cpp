@@ -582,6 +582,84 @@ evaluate_ppc_addze_addme_instruction(const Instruction &instruction,
     return PpcCarryArithmeticResult{value, xer_after, cr0};
 }
 
+std::optional<PpcCarryArithmeticResult>
+evaluate_ppc_carry_binary_instruction(const Instruction &instruction,
+                                      std::uint64_t source_a,
+                                      std::uint64_t source_b,
+                                      std::uint32_t xer) noexcept {
+    const bool ppc32 = instruction.context.architecture == Architecture::powerpc &&
+                       instruction.context.mode == ExecutionMode::ppc32;
+    const bool ppc64 = instruction.context.architecture == Architecture::powerpc &&
+                       instruction.context.mode == ExecutionMode::ppc64;
+    if ((!ppc32 && !ppc64) || instruction.flow != FlowKind::fallthrough ||
+        instruction.length != 4 || instruction.operands.size() != 3 || instruction.access.size() != 3 ||
+        instruction.access[0] != OperandAccess::write || instruction.access[1] != OperandAccess::read ||
+        instruction.access[2] != OperandAccess::read || instruction.memory_read || instruction.memory_write)
+        return {};
+    bool uses_carry_in = false;
+    bool subtract = false;
+    switch (instruction.opcode) {
+    case Opcode::ppc_addc: break;
+    case Opcode::ppc_adde: uses_carry_in = true; break;
+    case Opcode::ppc_subfc: subtract = true; break;
+    case Opcode::ppc_subfe: uses_carry_in = true; subtract = true; break;
+    default: return {};
+    }
+    const auto width = static_cast<std::uint16_t>(ppc32 ? 32 : 64);
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *input_a = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    const auto *input_b = std::get_if<RegisterOperand>(&instruction.operands[2]);
+    if (!destination || !input_a || !input_b || destination->bank != RegisterBank::ppc_gpr ||
+        input_a->bank != RegisterBank::ppc_gpr || input_b->bank != RegisterBank::ppc_gpr ||
+        destination->width != width || input_a->width != width || input_b->width != width ||
+        destination->index >= 32 || input_a->index >= 32 || input_b->index >= 32 ||
+        destination->high_byte || input_a->high_byte || input_b->high_byte)
+        return {};
+    const RegisterOperand xer_reg{RegisterBank::ppc_xer, 0, 32, false};
+    const RegisterOperand cr0_reg{RegisterBank::ppc_cr, 0, 4, false};
+    const auto has = [](const auto &registers, RegisterOperand reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    const bool record = has(instruction.register_writes, cr0_reg);
+    if (!has(instruction.register_reads, *input_a) || !has(instruction.register_reads, *input_b) ||
+        has(instruction.register_reads, xer_reg) != uses_carry_in ||
+        !has(instruction.register_writes, *destination) || !has(instruction.register_writes, xer_reg))
+        return {};
+
+    constexpr std::uint32_t xer_so = UINT32_C(1) << 31;
+    constexpr std::uint32_t xer_ca = UINT32_C(1) << 29;
+    const bool carry_in = (xer & xer_ca) != 0;
+    const auto mask = ppc32 ? UINT64_C(0xffffffff) : UINT64_MAX;
+    source_a &= mask;
+    source_b &= mask;
+    std::uint64_t value = 0;
+    bool carry_out = false;
+    if (!subtract) {
+        const auto partial = source_a + source_b;
+        const bool carry_first = ppc32 ? partial > mask : partial < source_a;
+        value = partial + static_cast<std::uint64_t>(carry_in);
+        const bool carry_second = carry_in && (ppc32 ? value > mask : value < partial);
+        carry_out = carry_first || carry_second;
+    } else {
+        // SUBFC computes RB - RA and sets CA when the subtraction borrows
+        // nowhere. SUBFE subtracts (1-CA) as the incoming borrow.
+        const bool borrow = uses_carry_in && !carry_in;
+        carry_out = borrow ? source_b > source_a : source_b >= source_a;
+        value = source_b - source_a - static_cast<std::uint64_t>(borrow);
+    }
+    value &= mask;
+    const auto xer_after = (xer & ~xer_ca) | (carry_out ? xer_ca : 0u);
+    std::optional<std::uint8_t> cr0;
+    if (record) {
+        const auto signed_value = ppc32
+            ? static_cast<std::int64_t>(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(value)))
+            : std::bit_cast<std::int64_t>(value);
+        const auto relation = signed_value < 0 ? 0x8u : signed_value > 0 ? 0x4u : 0x2u;
+        cr0 = static_cast<std::uint8_t>(relation | ((xer & xer_so) ? 1u : 0u));
+    }
+    return PpcCarryArithmeticResult{value, xer_after, cr0};
+}
+
 std::optional<PpcNegateResult>
 evaluate_ppc_negate_instruction(const Instruction &instruction,
                                 std::uint64_t source, bool xer_so) noexcept {

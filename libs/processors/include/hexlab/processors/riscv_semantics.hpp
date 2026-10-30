@@ -58,6 +58,53 @@ HEXLAB_PROCESSORS_EXPORT std::optional<RiscvCsrPrivilegeCheck>
 check_riscv_csr_privilege(const RiscvInstruction &instruction, unsigned xlen,
                           RiscvPrivilegeMode current_privilege) noexcept;
 
+// The user floating-point control/status state uses the low five accrued
+// exception bits and the three-bit dynamic rounding mode. Values 5..7 are
+// retained because software may write reserved frm encodings; consumers must
+// reject them when an instruction actually requests dynamic rounding.
+struct RiscvFcsrState {
+    std::uint8_t fflags = 0;
+    std::uint8_t frm = 0;
+    bool operator==(const RiscvFcsrState &) const = default;
+};
+
+struct RiscvFcsrResult {
+    std::uint64_t rd_value = 0;
+    RiscvFcsrState state{};
+    bool writes_rd = false;
+    bool writes_state = false;
+    bool operator==(const RiscvFcsrResult &) const = default;
+};
+
+// Evaluate decoded Zicsr operations against the standard fflags (0x001), frm
+// (0x002), and fcsr (0x003) aliases. Reserved high bits are read as zero and
+// ignored on writes. This models the register values only; privilege, extension
+// enablement, and trap delivery remain caller responsibilities.
+HEXLAB_PROCESSORS_EXPORT std::optional<RiscvFcsrResult>
+evaluate_riscv_fcsr_instruction(const RiscvInstruction &instruction, unsigned xlen,
+                                RiscvFcsrState state, std::uint64_t source_value) noexcept;
+
+// Merge exception flags from one completed operation into accrued fflags.
+// Returns empty if either state or input contains bits outside the five
+// architectural exception flags.
+HEXLAB_PROCESSORS_EXPORT std::optional<RiscvFcsrState>
+accrue_riscv_fflags(RiscvFcsrState state, std::uint8_t raised_flags) noexcept;
+
+// Resolve an instruction's encoded rounding field. Static modes 0..4 are
+// returned directly; encoded mode 7 reads frm and succeeds only when frm is
+// 0..4. Reserved encodings and inconsistent decoder metadata return empty.
+HEXLAB_PROCESSORS_EXPORT std::optional<std::uint8_t>
+resolve_riscv_rounding_mode(const RiscvInstruction &instruction,
+                            std::uint8_t frm) noexcept;
+
+// Read and write a binary32 value in an architectural FPR. FLEN=64 requires
+// NaN-boxed upper bits on read (otherwise the value is canonical qNaN) and
+// writes all-one upper bits; FLEN=32 uses the low word directly.
+HEXLAB_PROCESSORS_EXPORT std::optional<std::uint32_t>
+read_riscv_f32_register_value(unsigned flen, std::uint64_t register_bits) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<std::uint64_t>
+write_riscv_f32_register_value(unsigned flen, std::uint64_t binary32_bits) noexcept;
+
 // Evaluate RV32/RV64 integer branch predicates from raw GPR values. The
 // instruction adapter validates decoded branch operands and treats x0 as zero.
 HEXLAB_PROCESSORS_EXPORT std::optional<bool>
