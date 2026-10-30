@@ -1703,27 +1703,25 @@ class Project:
         return self._call("bookmark", _location(location), label, remove, group)
 
     def apply_annotations(self, rows, *, group=0, expected_revision=None, merge="replace", return_report=False, cancel=None):
-        """Atomically import a bounded batch of names, comments, and bookmarks.
+        """Atomically import names, comments, and bookmarks through native planning.
 
-        Each row is a mapping with ``location`` and any of ``name``,
-        ``comment``, or ``bookmark``. A ``None`` bookmark removes the current
-        bookmark; a string sets its label. All operations are validated against
-        one projected state and committed as one persistent history step.
-        Capture ``snapshot()['edit_revision']`` while planning and pass it as
-        ``expected_revision`` to reject a stale manifest. ``merge='replace'``
-        applies provided fields (the default); ``merge='preserve'`` fills only
-        empty name/comment fields and absent bookmarks. Preserve mode requires
-        a complete snapshot of no more than 4096 existing annotations and
-        bookmarks, so it never treats truncated state as absent.
-        When ``return_report=True``, return a mapping containing the resulting
-        ``snapshot``, per-field ``applied`` and ``skipped`` counts, the pinned
-        ``expected_revision``, the resulting ``result_revision``, the number
-        of ``planned_edits``, and whether the project revision changed in
-        ``committed``. A preserve-mode no-op reports the same revision before
-        and after and ``committed=False``. The default return value remains
-        the snapshot for compatibility. ``cancel`` may be a CancellationToken;
-        cancellation stops bounded planning and native validation before the
-        atomic commit.
+        Rows contain ``location`` and at least one of ``name``, ``comment``, or
+        ``bookmark``. An empty name/comment clears the field; a None bookmark
+        removes it. Replace applies supplied fields in row order. Preserve fills
+        empty fields and absent bookmarks, skipping removals and name collisions
+        in the same address space. The first nonempty field for a location wins
+        in preserve mode. Native planning reads up to 65536 existing annotation
+        rows and 65536 bookmarks, independently of the truncated Python snapshot.
+
+        Limits are 4096 rows, 4096 supplied fields, and 16 MiB UTF-8 text. Every
+        supplied text field is validated, including fields preserve would skip.
+        Selected edits validate against one projected state and commit as one
+        persistent history step. A stale expected_revision or any validation
+        failure leaves the entire project unchanged. Cancellation is cooperative.
+
+        return_report=True returns snapshot, applied/skipped field counts,
+        planned_edits, expected_revision, result_revision, and committed. A
+        preserve no-op returns the unchanged snapshot with committed=False.
         """
         if cancel is None:
             cancel = globals().get("_hexlab_console_cancellation_token")
@@ -1731,48 +1729,16 @@ class Project:
             raise TypeError("cancel must be a CancellationToken")
         if merge not in ("replace", "preserve"):
             raise ValueError("merge must be 'replace' or 'preserve'")
-        current = None
-        existing_annotations = {}
-        existing_bookmarks = set()
-        existing_names = {}
-        pending_annotations = {}
-        pending_bookmarks = set()
-        if merge == "preserve":
-            current = self.snapshot()
-            if expected_revision is None:
-                expected_revision = current["edit_revision"]
-            annotation_rows = current["annotations"]
-            bookmark_rows = current["bookmarks"]
-            if (current["annotation_count"] > len(annotation_rows) or
-                    current["bookmark_count"] > len(bookmark_rows)):
-                raise ValueError("merge='preserve' requires at most 4096 existing annotations and bookmarks")
-
-            def key_of(location):
-                if isinstance(location, Address):
-                    return ("va", location.space, location.offset)
-                if isinstance(location, FileOffset):
-                    return ("file", location.offset)
-                if isinstance(location, tuple) and location:
-                    return location
-                raise ValueError("project snapshot contains an unsupported annotation location")
-
-            for annotation in annotation_rows:
-                key = key_of(annotation["location"])
-                existing_annotations[key] = annotation
-                if key[0] == "va" and annotation["name"]:
-                    existing_names[(key[1], annotation["name"])] = key
-            for bookmark in bookmark_rows:
-                existing_bookmarks.add(key_of(bookmark["location"]))
-        commands = []
-        text_bytes = 0
-        row_count = 0
-        skipped_fields = 0
+        _unsigned(group, "group")
+        if expected_revision is not None:
+            _unsigned(expected_revision, "expected_revision")
+        planned = []
+        text_bytes = fields = 0
         allowed = {"location", "name", "comment", "bookmark"}
         for row in rows:
             if cancel is not None and cancel.cancelled:
                 raise AnalysisCancelled("annotation import canceled during planning")
-            row_count += 1
-            if row_count > 4096:
+            if len(planned) >= 4096:
                 raise ValueError("annotation import requires at most 4096 rows")
             if not isinstance(row, dict) or "location" not in row:
                 raise TypeError("each annotation row must be a mapping with location")
@@ -1781,100 +1747,35 @@ class Project:
             unknown = set(row) - allowed
             if unknown:
                 raise ValueError("unknown annotation fields: " + ", ".join(sorted(unknown)))
+            if len(row) == 1:
+                raise ValueError("annotation import row has no fields")
             location = _location(row["location"])
-            location_key = location
-            row_commands = []
             for field in ("name", "comment", "bookmark"):
                 if field not in row:
                     continue
+                fields += 1
+                if fields > 4096:
+                    raise ValueError("annotation import exceeds 4096 supplied fields")
                 value = row[field]
                 if field == "bookmark" and value is None:
-                    row_commands.append(("bookmark", location, "", True))
-                else:
-                    if not isinstance(value, str):
-                        raise TypeError(field + " must be text" + (" or None" if field == "bookmark" else ""))
-                    text_bytes += len(value.encode("utf-8"))
-                    if text_bytes > 16 * 1024 * 1024:
-                        raise ValueError("annotation import text exceeds 16 MiB")
-                    if field == "bookmark":
-                        row_commands.append(("bookmark", location, value, False))
-                    else:
-                        row_commands.append((field, location, value))
-                if len(commands) + len(row_commands) > 4096:
-                    raise ValueError("annotation import expands to more than 4096 edits")
-            if merge == "preserve":
-                current_annotation = existing_annotations.get(location_key, {})
-                pending_fields = pending_annotations.setdefault(location_key, set())
-                for command in row_commands:
-                    field, _, value, *extra = command
-                    if field == "bookmark":
-                        if location_key in existing_bookmarks or location_key in pending_bookmarks or extra[0]:
-                            skipped_fields += 1
-                            continue
-                    elif current_annotation.get(field):
-                        skipped_fields += 1
-                        continue
-                    elif field in pending_fields:
-                        skipped_fields += 1
-                        continue
-                    elif value == "":
-                        skipped_fields += 1
-                        continue
-                    elif field == "name" and isinstance(row["location"], Address):
-                        previous = existing_names.get((row["location"].space, value))
-                        if previous is not None and previous != location_key:
-                            skipped_fields += 1
-                            continue
-                    commands.append(command)
-                    if field == "bookmark":
-                        pending_bookmarks.add(location_key)
-                    else:
-                        pending_fields.add(field)
-                        if field == "name" and isinstance(row["location"], Address):
-                            existing_names[(row["location"].space, value)] = location_key
-            else:
-                commands.extend(row_commands)
-            if len(commands) > 4096:
-                raise ValueError("annotation import expands to more than 4096 edits")
-        if row_count == 0:
+                    continue
+                if not isinstance(value, str):
+                    raise TypeError(field + " must be text" + (" or None" if field == "bookmark" else ""))
+                text_bytes += len(value.encode("utf-8"))
+                if text_bytes > 16 * 1024 * 1024:
+                    raise ValueError("annotation import text exceeds 16 MiB")
+            planned.append((location, row.get("name"), row.get("comment"),
+                            "bookmark" in row, row.get("bookmark")))
+        if not planned:
             raise ValueError("annotation import requires at least one row")
-        if not commands and merge == "preserve":
-            if cancel is not None and cancel.cancelled:
-                raise AnalysisCancelled("annotation import canceled")
-            if expected_revision is None:
-                expected_revision = current["edit_revision"]
-            _unsigned(expected_revision, "expected_revision")
-            if expected_revision != current["edit_revision"]:
-                raise ValueError("expected_revision does not match the preserve snapshot")
-            if return_report:
-                return {"snapshot": current, "applied": 0, "skipped": skipped_fields,
-                        "expected_revision": expected_revision,
-                        "result_revision": current["edit_revision"],
-                        "planned_edits": 0, "committed": False}
-            return current
-        if not commands:
-            raise ValueError("annotation import contains no edits")
-        if len(commands) > 4096:
-            raise ValueError("annotation import expands to more than 4096 edits")
-        if expected_revision is None:
-            expected_revision = self.snapshot()["edit_revision"]
-        _unsigned(expected_revision, "expected_revision")
-        if (merge == "preserve" and
-                expected_revision != current["edit_revision"]):
-            raise ValueError("expected_revision does not match the preserve snapshot")
         try:
-            result = self._call("apply_annotations", commands, group, expected_revision,
-                                None if cancel is None else cancel._handle)
+            result = self._call("import_annotation_rows", planned, merge, group,
+                                expected_revision, None if cancel is None else cancel._handle)
         except Error as error:
             if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
                 raise AnalysisCancelled("annotation import canceled") from None
             raise
-        if return_report:
-            result_revision = result["edit_revision"]
-            return {"snapshot": result, "applied": len(commands), "skipped": skipped_fields,
-                    "expected_revision": expected_revision, "result_revision": result_revision,
-                    "planned_edits": len(commands), "committed": result_revision != expected_revision}
-        return result
+        return result if return_report else result["snapshot"]
 
     def export_annotations_csv(self, path, *, cancel=None):
         """Atomically export a bounded CSV of names, comments, and bookmarks.

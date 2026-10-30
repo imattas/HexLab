@@ -1050,6 +1050,61 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
         return Error{ErrorCode::resource_limit, "DEX class definitions exceed 250,000"};
     std::vector<DexClassDefinition> decoded_classes;
     decoded_classes.reserve(class_count);
+    struct DexLocalHierarchy {
+        std::optional<std::uint32_t> superclass;
+        std::vector<std::uint32_t> interfaces;
+    };
+    std::unordered_map<std::uint32_t, DexLocalHierarchy> local_hierarchy;
+    std::uint64_t hierarchy_walk_steps = 0;
+    std::unordered_map<std::string_view, std::uint32_t> type_id_lookup;
+    type_id_lookup.reserve(types.size());
+    for (std::uint32_t i = 0; i < types.size(); ++i) type_id_lookup.emplace(types[i], i);
+    enum class Assignability : std::uint8_t { yes, no, unresolved };
+    const std::function<Assignability(std::uint32_t, std::uint32_t)> reference_assignability =
+      [&](std::uint32_t actual, std::uint32_t expected) {
+        if (actual == expected) return Assignability::yes;
+        if (actual >= types.size() || expected >= types.size()) return Assignability::unresolved;
+        const auto &source = types[actual];
+        const auto &target = types[expected];
+        if (target == "Ljava/lang/Object;" && !source.empty() &&
+            (source.front() == 'L' || source.front() == '[')) return Assignability::yes;
+        if (!source.empty() && source.front() == '[') {
+            if (target == "Ljava/lang/Object;" || target == "Ljava/lang/Cloneable;" ||
+                target == "Ljava/io/Serializable;") return Assignability::yes;
+            if (target.empty() || target.front() != '[') return Assignability::no;
+            const auto source_component = type_id_lookup.find(std::string_view(source).substr(1));
+            const auto target_component = type_id_lookup.find(std::string_view(target).substr(1));
+            if (source_component == type_id_lookup.end() || target_component == type_id_lookup.end())
+                return Assignability::unresolved;
+            const auto &sc = types[source_component->second];
+            const auto &tc = types[target_component->second];
+            if (sc.empty() || tc.empty()) return Assignability::unresolved;
+            const bool sr = sc.front() == 'L' || sc.front() == '[';
+            const bool tr = tc.front() == 'L' || tc.front() == '[';
+            if (!sr || !tr) return sc == tc ? Assignability::yes : Assignability::no;
+            // Array component covariance is recursively reduced by one dimension.
+            return reference_assignability(source_component->second, target_component->second);
+        }
+        if (!source.empty() && source.front() == 'L' && !target.empty() && target.front() == 'L') {
+            std::vector<std::uint32_t> pending{actual};
+            std::unordered_set<std::uint32_t> visited;
+            visited.reserve(64);
+            bool unresolved = false;
+            while (!pending.empty() && visited.size() < 4096 && hierarchy_walk_steps < 1'000'000) {
+                const auto current = pending.back(); pending.pop_back();
+                if (current == expected) return Assignability::yes;
+                if (!visited.insert(current).second) continue;
+                ++hierarchy_walk_steps;
+                const auto found = local_hierarchy.find(current);
+                if (found == local_hierarchy.end()) { unresolved = true; continue; }
+                if (found->second.superclass) pending.push_back(*found->second.superclass);
+                pending.insert(pending.end(), found->second.interfaces.begin(), found->second.interfaces.end());
+            }
+            if (!pending.empty()) unresolved = true;
+            return unresolved ? Assignability::unresolved : Assignability::no;
+        }
+        return Assignability::no;
+    };
     std::uint64_t total_class_model_bytes = 0, total_class_interfaces = 0, total_class_members = 0;
     const auto account_class_model_bytes = [&](std::uint64_t amount) {
         constexpr std::uint64_t max_class_model_bytes = 64ull * 1024 * 1024;
@@ -1108,6 +1163,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                 class_definition.interface_indices.push_back(type);
             }
         }
+        local_hierarchy[class_type] = {class_definition.superclass_index, class_definition.interface_indices};
         if (total_class_model_bytes > 64ull * 1024 * 1024 - sizeof(DexClassDefinition))
             return Error{ErrorCode::resource_limit, "DEX class metadata exceeds 64 MiB"};
         total_class_model_bytes += sizeof(DexClassDefinition);
@@ -1653,10 +1709,24 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         unknown, conflict, zero, int32, float32, scalar32, reference, wide_low, wide_high,
                         wide_int_low, wide_int_high, wide_float_low, wide_float_high
                     };
-                    using TypeState = std::vector<RegType>;
+                    struct TypeState {
+                        std::vector<RegType> categories;
+                        std::vector<std::uint32_t> references;
+                        TypeState() = default;
+                        TypeState(std::size_t count, RegType initial)
+                            : categories(count, initial), references(count, UINT32_MAX) {}
+                        std::size_t size() const { return categories.size(); }
+                        RegType &operator[](std::size_t index) { return categories[index]; }
+                        RegType operator[](std::size_t index) const { return categories[index]; }
+                        bool operator==(const TypeState &) const = default;
+                    };
                     std::unordered_map<std::uint32_t, TypeState> incoming_states;
                     std::deque<std::uint32_t> type_work;
                     TypeState initial(registers, RegType::unknown);
+                    const auto type_id_for = [&](std::string_view descriptor) -> std::uint32_t {
+                        const auto found = type_id_lookup.find(descriptor);
+                        return found == type_id_lookup.end() ? UINT32_MAX : found->second;
+                    };
                     const auto merge_type = [](RegType a, RegType b) {
                         if (a == b) return a;
                         if (a == RegType::conflict || b == RegType::conflict) return RegType::conflict;
@@ -1695,8 +1765,10 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                     for (const auto parameter_type : prototype.parameters)
                         prototype_words += types[parameter_type] == "J" || types[parameter_type] == "D" ? 2u : 1u;
                     std::uint32_t parameter_register = registers - ins;
-                    if (ins == prototype_words + 1 && parameter_register < registers)
-                        initial[parameter_register++] = RegType::reference;
+                    if (ins == prototype_words + 1 && parameter_register < registers) {
+                        initial[parameter_register] = RegType::reference;
+                        initial.references[parameter_register++] = methods[method_idx].owner;
+                    }
                     for (const auto parameter_type : prototype.parameters) {
                         const auto type = descriptor_type(types[parameter_type]);
                         if (type == RegType::wide_int_low || type == RegType::wide_float_low) {
@@ -1709,7 +1781,9 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         } else {
                             if (parameter_register >= registers)
                                 return Error{ErrorCode::malformed, "DEX verifier method parameters exceed the register file"};
-                            initial[parameter_register++] = type;
+                            initial[parameter_register] = type;
+                            if (type == RegType::reference) initial.references[parameter_register] = parameter_type;
+                            ++parameter_register;
                         }
                     }
                     incoming_states.emplace(0, initial);
@@ -1749,7 +1823,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         const auto reg4a = (first >> 8) & 0xf;
                         const auto reg4b = (first >> 12) & 0xf;
                         const auto set_type = [&](std::uint32_t reg, RegType type) {
-                            if (reg < state.size()) state[reg] = type;
+                            if (reg < state.size()) { state[reg] = type; state.references[reg] = UINT32_MAX; }
                         };
                         const auto expect_type = [&](std::uint32_t reg, RegType expected) {
                             if (reg >= before.size()) return false;
@@ -1784,6 +1858,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 set_type(reg + 1, type == RegType::wide_int_low
                                     ? RegType::wide_int_high : RegType::wide_float_high);
                             } else set_type(reg, type);
+                            if (type == RegType::reference && reg < state.size())
+                                state.references[reg] = type_id_for(descriptor);
                         };
                         // Unsupported writes invalidate only their register
                         // facts, preventing stale values from crossing them.
@@ -1823,8 +1899,12 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         } else if (opcode >= 0x16 && opcode <= 0x19) {
                             set_type(reg8, RegType::wide_low);
                             set_type(reg8 + 1, RegType::wide_high);
-                        } else if (opcode == 0x1a || opcode == 0x1b || opcode == 0x1c || opcode == 0x22) {
-                            set_type(reg8, RegType::reference);
+                        } else if (opcode == 0x1a || opcode == 0x1b) {
+                            set_descriptor(reg8, "Ljava/lang/String;");
+                        } else if (opcode == 0x1c) {
+                            set_descriptor(reg8, "Ljava/lang/Class;");
+                        } else if (opcode == 0x22) {
+                            set_descriptor(reg8, types[word(1)]);
                         } else if (opcode >= 0x01 && opcode <= 0x03) {
                             const auto destination = opcode == 0x01 ? reg4a : opcode == 0x02 ? reg8 : word(1);
                             const auto source = opcode == 0x01 ? reg4b : opcode == 0x02 ? word(1) : word(2);
@@ -1853,22 +1933,26 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             if (!expect_type(source, RegType::reference))
                                 return Error{ErrorCode::malformed, "DEX move-object source is not a reference"};
                             set_type(destination, before[source]);
+                            if (before[source] == RegType::reference)
+                                state.references[destination] = before.references[source];
                         } else if (opcode >= 0x0a && opcode <= 0x0c && move_result_descriptors.contains(offset)) {
                             set_descriptor(reg8, move_result_descriptors.at(offset));
                         } else if (opcode == 0x0b) {
                             set_type(reg8, RegType::wide_low);
                             set_type(reg8 + 1, RegType::wide_high);
                         } else if (opcode == 0x0c || opcode == 0xfe || opcode == 0xff) {
-                            set_type(reg8, RegType::reference);
+                            if (opcode == 0x0c) set_type(reg8, RegType::reference);
+                            else set_descriptor(reg8, opcode == 0xfe ? "Ljava/lang/invoke/MethodHandle;" :
+                                "Ljava/lang/invoke/MethodType;");
                         } else if (opcode == 0x0d) {
-                            set_type(reg8, RegType::reference);
+                            set_descriptor(reg8, "Ljava/lang/Throwable;");
                         } else if (opcode == 0x1d || opcode == 0x1e || opcode == 0x27) {
                             if (!expect_type(reg8, RegType::reference))
                                 return Error{ErrorCode::malformed, "DEX monitor or throw operand is not a reference"};
                         } else if (opcode == 0x1f) {
                             if (!expect_type(reg8, RegType::reference))
                                 return Error{ErrorCode::malformed, "DEX check-cast operand is not a reference"};
-                            set_type(reg8, RegType::reference);
+                            set_descriptor(reg8, types[word(1)]);
                         } else if (opcode == 0x20) {
                             if (!expect_type(reg4b, RegType::reference))
                                 return Error{ErrorCode::malformed, "DEX instance-of operand is not a reference"};
@@ -1880,7 +1964,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         } else if (opcode == 0x23) {
                             if (!expect_type(reg4b, RegType::int32))
                                 return Error{ErrorCode::malformed, "DEX new-array size is not an integer"};
-                            set_type(reg4a, RegType::reference);
+                            set_descriptor(reg4a, types[word(1)]);
                         } else if (opcode == 0x26) {
                             if (!expect_type(reg8, RegType::reference))
                                 return Error{ErrorCode::malformed, "DEX fill-array-data operand is not a reference"};
@@ -1982,13 +2066,20 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                    opcode == 0xfa || opcode == 0xfb || opcode == 0xfc || opcode == 0xfd) {
                             std::optional<std::uint32_t> proto_index;
                             bool receiver = false;
+                            std::optional<std::uint32_t> receiver_owner;
                             if (opcode >= 0x6e && opcode <= 0x72) {
                                 const auto method_index = word(1);
-                                if (method_index < methods.size()) proto_index = methods[method_index].proto;
+                                if (method_index < methods.size()) {
+                                    proto_index = methods[method_index].proto;
+                                    receiver_owner = methods[method_index].owner;
+                                }
                                 receiver = opcode != 0x71;
                             } else if (opcode >= 0x74 && opcode <= 0x78) {
                                 const auto method_index = word(1);
-                                if (method_index < methods.size()) proto_index = methods[method_index].proto;
+                                if (method_index < methods.size()) {
+                                    proto_index = methods[method_index].proto;
+                                    receiver_owner = methods[method_index].owner;
+                                }
                                 receiver = opcode != 0x77;
                             } else if (opcode == 0xfa || opcode == 0xfb) {
                                 proto_index = word(3);
@@ -2017,8 +2108,19 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 };
                                 std::uint32_t word_index = 0;
                                 if (receiver) {
-                                    if (!expect_type(argument_reg(word_index++), RegType::reference))
+                                    const auto receiver_reg = argument_reg(word_index++);
+                                    if (!expect_type(receiver_reg, RegType::reference))
                                         return Error{ErrorCode::malformed, "DEX invoke receiver is not a reference"};
+                                    if (before[receiver_reg] == RegType::reference && receiver_owner &&
+                                        before.references[receiver_reg] != UINT32_MAX) {
+                                        const auto relation = reference_assignability(
+                                            before.references[receiver_reg], *receiver_owner);
+                                        if (relation == Assignability::no)
+                                            return Error{ErrorCode::malformed,
+                                                "DEX invoke receiver is not assignable to the method owner"};
+                                        if (relation == Assignability::unresolved)
+                                            state.references[receiver_reg] = UINT32_MAX;
+                                    }
                                 }
                                 for (const auto parameter_type : protos[*proto_index].parameters) {
                                     const auto &descriptor = types[parameter_type];
@@ -2116,8 +2218,24 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             if (inserted) { type_work.push_back(successor); continue; }
                             bool changed = false;
                             for (std::size_t reg = 0; reg < state.size(); ++reg) {
-                                const auto merged = merge_type(target->second[reg], state[reg]);
+                                const auto old = target->second[reg];
+                                const auto incoming = state[reg];
+                                const auto merged = merge_type(old, incoming);
                                 if (merged != target->second[reg]) { target->second[reg] = merged; changed = true; }
+                                auto merged_reference = UINT32_MAX;
+                                if (merged == RegType::reference) {
+                                    if (old == RegType::reference && incoming == RegType::reference &&
+                                        target->second.references[reg] == state.references[reg])
+                                        merged_reference = target->second.references[reg];
+                                    else if (old == RegType::zero && incoming == RegType::reference)
+                                        merged_reference = state.references[reg];
+                                    else if (incoming == RegType::zero && old == RegType::reference)
+                                        merged_reference = target->second.references[reg];
+                                }
+                                if (target->second.references[reg] != merged_reference) {
+                                    target->second.references[reg] = merged_reference;
+                                    changed = true;
+                                }
                             }
                             if (changed) type_work.push_back(successor);
                         }

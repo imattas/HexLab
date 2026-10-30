@@ -444,6 +444,8 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
             stream_linux_cpu_info, stream_linux_lsb_release, stream_linux_cmd_line,
             stream_linux_environ, stream_linux_auxv, stream_linux_maps};
         constexpr std::size_t max_linux_text_capture = 1024u * 1024u;
+        constexpr std::size_t max_linux_string_records = 4096;
+        constexpr std::size_t max_linux_string_record_bytes = 32768;
         for (const auto type : linux_text_stream_types) {
             if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump loading canceled"};
             auto row = stream(type);
@@ -462,6 +464,42 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                 auto bytes = read(*storage, row->rva, retained);
                 if (!bytes) return bytes.error();
                 parsed.captured_bytes.assign(bytes.value().bytes.begin(), bytes.value().bytes.end());
+            }
+            if (type == stream_linux_cmd_line || type == stream_linux_environ) {
+                parsed.nul_separated_records_complete = !parsed.truncated;
+                std::size_t cursor = 0;
+                while (cursor < parsed.captured_bytes.size()) {
+                    if (stop.stop_requested())
+                        return Error{ErrorCode::canceled, "Minidump Linux NUL-separated stream parsing canceled"};
+                    const auto begin = cursor;
+                    while (cursor < parsed.captured_bytes.size() &&
+                           parsed.captured_bytes[cursor] != std::byte{}) ++cursor;
+                    if (cursor == parsed.captured_bytes.size()) {
+                        // Retain complete records only; the source bytes still
+                        // preserve this final unterminated prefix verbatim.
+                        parsed.nul_separated_records_complete = false;
+                        break;
+                    }
+                    const auto length = cursor - begin;
+                    ++cursor; // consume the NUL delimiter
+                    if (length > max_linux_string_record_bytes ||
+                        parsed.nul_separated_records.size() >= max_linux_string_records) {
+                        parsed.nul_separated_records_complete = false;
+                        if (length > max_linux_string_record_bytes) continue;
+                        break;
+                    }
+                    const auto record_cost = sizeof(MinidumpLinuxStringRecord) + length;
+                    if (record_cost > max_metadata_bytes - std::min<std::uint64_t>(budget, max_metadata_bytes))
+                        return Error{ErrorCode::resource_limit, "Minidump Linux string records exceed metadata byte budget"};
+                    const auto *text = reinterpret_cast<const char *>(parsed.captured_bytes.data() + begin);
+                    parsed.nul_separated_records.push_back({std::string(text, length),
+                        FileOffset{std::uint64_t{row->rva} + begin}});
+                    budget += record_cost;
+                }
+                if (!parsed.nul_separated_records_complete)
+                    metadata.diagnostics.emplace_back(type == stream_linux_cmd_line
+                        ? "Minidump Linux command-line stream is truncated, unterminated, or exceeds record limits; raw bytes remain available"
+                        : "Minidump Linux environment stream is truncated, unterminated, or exceeds record limits; raw bytes remain available");
             }
             if (type == stream_linux_maps) {
                 std::size_t cursor = 0;

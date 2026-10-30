@@ -1716,6 +1716,31 @@ Result<RemoteFileStat> Client::stat_remote_file_path(std::string_view path,
         return Error{ErrorCode::unsupported, "remote does not support vFile:" + std::string(operation)};
     return parse_remote_file_stat(response.value(), "vFile:" + std::string(operation));
 }
+Result<std::vector<std::byte>> Client::read_remote_symlink(std::string_view path,
+    std::size_t maximum_size, std::stop_token stop) {
+    if (path.empty() || path.size() > 16 * 1024 || path.find('\0') != std::string_view::npos)
+        return Error{ErrorCode::invalid_argument, "RSP symlink path must contain 1..16384 non-NUL bytes"};
+    if (maximum_size == 0 || maximum_size > 1024 * 1024)
+        return Error{ErrorCode::invalid_argument, "RSP symlink target limit must be 1 byte to 1 MiB"};
+    const auto command = "vFile:readlink:" + encode_hex(std::as_bytes(std::span(path.data(), path.size())));
+    if (command.size() > max_packet_ || command.size() > peer_packet_size_)
+        return Error{ErrorCode::resource_limit, "RSP vFile:readlink request exceeds the negotiated packet limit"};
+    auto response = transact(command, stop);
+    if (!response) return response.error();
+    if (response.value().empty()) return Error{ErrorCode::unsupported, "remote does not support vFile:readlink"};
+    auto parsed = parse_file_io_reply(response.value());
+    if (!parsed) return parsed.error();
+    if (parsed.value().result < 0)
+        return Error{ErrorCode::io, "remote vFile:readlink failed with errno " +
+            std::to_string(parsed.value().error_number.value_or(0))};
+    const auto size = static_cast<std::uint64_t>(parsed.value().result);
+    if (size > maximum_size)
+        return Error{ErrorCode::resource_limit, "remote symlink target exceeds the requested byte limit"};
+    if (!parsed.value().has_attachment || parsed.value().attachment.size() != size)
+        return Error{ErrorCode::malformed, "RSP vFile:readlink result and binary attachment disagree"};
+    const auto bytes = std::as_bytes(std::span(parsed.value().attachment.data(), parsed.value().attachment.size()));
+    return std::vector<std::byte>(bytes.begin(), bytes.end());
+}
 Status Client::write_remote_file_range(std::string_view path, std::uint64_t offset,
     std::span<const std::byte> bytes, std::uint64_t flags, std::uint64_t mode, std::stop_token stop) {
     if (path.empty() || path.size() > 16 * 1024 || path.find('\0') != std::string_view::npos ||

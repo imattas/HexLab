@@ -1661,18 +1661,31 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                     : nullptr;
                 const bool store_access = memory && memory_index < instruction.access.size() &&
                     instruction.access[memory_index] == OperandAccess::write;
-                if (store_access && memory->base && memory->base->bank == RegisterBank::arm64_sp &&
+                FlowValue base_depth;
+                if (memory && memory->base) {
+                    if (memory->base->bank == RegisterBank::arm64_sp)
+                        base_depth = state.stack_depth;
+                    else if (memory->base->bank == RegisterBank::arm64_gpr && memory->base->index == 29 &&
+                             state.arm64_frame_pointer)
+                        base_depth = state.frame_depth;
+                    else if (memory->base->bank == RegisterBank::arm64_gpr &&
+                             memory->base->index < state.arm64_stack_alias_depths.size())
+                        base_depth = state.arm64_stack_alias_depths[memory->base->index];
+                }
+                if (store_access && base_depth.known && state.stack_depth.known &&
                     !memory->index && !memory->ip_relative && !memory->writeback && !memory->post_index &&
-                    memory->address_width == 64 && memory->data_width > 0 && memory->data_width % 8 == 0 &&
-                    memory->displacement >= 0 && state.stack_depth.known) {
+                    memory->address_width == 64 && memory->data_width > 0 && memory->data_width % 8 == 0) {
                     const auto width = memory->data_width;
                     const auto element_bytes = static_cast<std::int64_t>(width / 8);
                     const auto count = pair_store ? 2 : 1;
                     for (int element = 0; element < count; ++element) {
                         std::int64_t displacement = memory->displacement;
                         std::int64_t offset = 0;
+                        std::int64_t current_sp_displacement = 0;
                         if ((element && !add_checked(displacement, element_bytes, displacement)) ||
-                            !subtract_checked(displacement, state.stack_depth.value, offset)) {
+                            !subtract_checked(displacement, base_depth.value, offset) ||
+                            !add_checked(offset, state.stack_depth.value, current_sp_displacement) ||
+                            current_sp_displacement < 0) {
                             pending_arm64_stores.clear();
                             break;
                         }

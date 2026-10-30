@@ -50,6 +50,7 @@ constexpr std::uint32_t section_guid_defined = 0x02;
 constexpr std::uint32_t section_disposable = 0x03;
 constexpr std::uint32_t section_version = 0x14;
 constexpr std::uint32_t section_user_interface = 0x15;
+constexpr std::uint32_t section_firmware_volume_image = 0x17;
 constexpr std::uint32_t section_freeform_subtype_guid = 0x18;
 constexpr std::uint32_t section_raw = 0x19;
 constexpr std::uint8_t section_dxe_depex = 0x13, section_pei_depex = 0x1b, section_mm_depex = 0x1c;
@@ -1709,6 +1710,44 @@ Result<std::vector<UefiFirmwareVolume>> parse_uefi_firmware_volumes(
     }
     if (result.empty())
         return Error{ErrorCode::unsupported, "No valid PI firmware volume with FFS2 or FFS3 was found"};
+
+    // Preserve the standard FV_IMAGE containment relation in the public
+    // inventory. The scanner already validates every candidate independently;
+    // this pass only links validated file-space children back to their owning
+    // section and never treats arbitrary embedded signatures as volumes.
+    // Volumes are appended in source-offset order, so lower_bound keeps this
+    // bounded by the number of actual contained candidates rather than doing a
+    // full volume cross-product for every section.
+    constexpr std::size_t max_embedded_volume_links = 1'000'000;
+    std::size_t embedded_volume_links = 0;
+    for (std::size_t parent_index = 0; parent_index < result.size(); ++parent_index) {
+        auto &parent = result[parent_index];
+        for (auto &file : parent.files) {
+            for (auto &section : file.sections) {
+                if (section.type != section_firmware_volume_image ||
+                    section.offset_space != UefiSectionOffsetSpace::file ||
+                    section.payload_size == 0 ||
+                    section.payload_offset > std::numeric_limits<std::uint64_t>::max() - section.payload_size)
+                    continue;
+                const auto payload_end = section.payload_offset + section.payload_size;
+                auto child = std::lower_bound(result.begin(), result.end(), section.payload_offset,
+                    [](const UefiFirmwareVolume &candidate, std::uint64_t offset) {
+                        return candidate.file_offset < offset;
+                    });
+                for (; child != result.end() && child->file_offset < payload_end; ++child) {
+                    if (child->length > std::numeric_limits<std::uint64_t>::max() - child->file_offset ||
+                        child->file_offset + child->length > payload_end)
+                        continue;
+                    if (embedded_volume_links == max_embedded_volume_links)
+                        return Error{ErrorCode::resource_limit,
+                            "UEFI embedded firmware-volume relationship limit exceeded"};
+                    section.embedded_volume_indices.push_back(
+                        static_cast<std::size_t>(std::distance(result.begin(), child)));
+                    ++embedded_volume_links;
+                }
+            }
+        }
+    }
     return result;
 } catch (const std::bad_alloc &) {
     return Error{ErrorCode::resource_limit, "Cannot allocate UEFI firmware volume metadata"};

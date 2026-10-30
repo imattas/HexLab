@@ -908,6 +908,22 @@ Result<RemoteFileInfo> DebugSession::stat_remote_file(
         return Error{ErrorCode::canceled, "remote file metadata inspection canceled before it started"};
     return impl_->backend->stat_remote_file(path, follow_symlinks, cancellation);
 }
+Result<std::vector<std::byte>> DebugSession::read_remote_symlink(
+    std::string_view path, std::size_t maximum_size, std::stop_token cancellation) {
+    if (!impl_->backend || !impl_->process || impl_->state == SessionState::idle ||
+        impl_->state == SessionState::detached || impl_->state == SessionState::faulted)
+        return invalid_state("remote symlink inspection");
+    if (path.empty() || path.size() > 16 * 1024 || path.find('\0') != std::string_view::npos)
+        return Error{ErrorCode::invalid_argument, "remote symlink path must contain 1 to 16384 non-NUL bytes"};
+    if (maximum_size == 0 || maximum_size > 1024 * 1024)
+        return Error{ErrorCode::invalid_argument, "remote symlink target limit must be between 1 byte and 1 MiB"};
+    if (cancellation.stop_requested())
+        return Error{ErrorCode::canceled, "remote symlink inspection canceled before it started"};
+    auto result = impl_->backend->read_remote_symlink(path, maximum_size, cancellation);
+    if (result && result.value().size() > maximum_size)
+        return Error{ErrorCode::resource_limit, "backend returned more bytes than the remote symlink limit"};
+    return result;
+}
 Result<std::vector<std::byte>> DebugSession::run_remote_monitor_command(
     std::string_view command, std::stop_token cancellation) {
     if (!impl_->backend || !impl_->process || impl_->state != SessionState::stopped)

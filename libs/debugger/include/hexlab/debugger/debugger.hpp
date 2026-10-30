@@ -326,6 +326,9 @@ public:
     virtual Result<RemoteFileInfo> stat_remote_file(std::string_view, bool, std::stop_token = {}) {
         return Error{ErrorCode::unsupported, "remote file metadata inspection is not supported by this backend"};
     }
+    virtual Result<std::vector<std::byte>> read_remote_symlink(std::string_view, std::size_t, std::stop_token = {}) {
+        return Error{ErrorCode::unsupported, "remote symlink inspection is not supported by this backend"};
+    }
 };
 
 class HEXLAB_DEBUGGER_EXPORT DebugSession {
@@ -416,6 +419,9 @@ public:
     // follow_symlinks selects vFile:stat vs vFile:lstat; native backends return unsupported.
     Result<RemoteFileInfo> stat_remote_file(std::string_view path, bool follow_symlinks = true,
         std::stop_token cancellation = {});
+    // Returns the raw target bytes of a remote symbolic link; native backends return unsupported.
+    Result<std::vector<std::byte>> read_remote_symlink(std::string_view path,
+        std::size_t maximum_size = 16 * 1024, std::stop_token cancellation = {});
     // Sends a bounded RSP qRcmd command while stopped and returns its captured
     // target-console output bytes. Native backends report unsupported.
     Result<std::vector<std::byte>> run_remote_monitor_command(std::string_view command,

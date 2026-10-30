@@ -199,6 +199,17 @@ itself. The wrapper bounds paths to 16 KiB, rejects NUL bytes, and honors
 cancellation before the request. Native backends and remote stubs without the
 corresponding `vFile` operation return `unsupported`.
 
+`rsp::Client::read_remote_symlink(path, maximum_size)` and
+`DebugSession::read_remote_symlink` use Host I/O `vFile:readlink` to retrieve a
+symbolic link's target as raw target bytes. The path is hex-encoded, must contain
+1..16 KiB of non-NUL bytes, and the target defaults to a 16 KiB cap (the API
+allows up to 1 MiB). The returned byte count must exactly match the binary
+attachment and stay within the caller's limit; remote errno, unsupported
+packets, malformed replies, and cancellation remain distinct errors. The
+operation does not resolve or normalize the returned path, and callers should
+interpret it using the remote host's path rules. Native backends report
+unsupported. See the [GDB Host I/O packet reference](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Host-I_002fO-Packets.html).
+
 `rsp::Client::write_remote_file_range(path, offset, bytes, flags, mode)` writes
 remote file data through `vFile:open`, binary `vFile:pwrite` chunks, and
 `vFile:close`. The caller supplies target-specific open flags and creation mode

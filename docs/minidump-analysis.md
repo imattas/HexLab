@@ -35,7 +35,18 @@ Breakpad Linux streams `MD_LINUX_CPU_INFO` (0x47670003), `MD_LINUX_LSB_RELEASE`
 and `MD_LINUX_MAPS` (0x47670009) retain a byte-for-byte prefix of at most 1 MiB
 per stream, with declared size and source file offset. The CLI shows an escaped
 96-byte preview; NUL separators and platform-specific content are preserved.
-Oversized streams are marked truncated. `MD_LINUX_MAPS` additionally parses
+Oversized streams are marked truncated. `MD_LINUX_CMD_LINE` and
+`MD_LINUX_ENVIRON` also expose NUL-delimited records in source order, each with
+its starting file offset. Empty records between delimiters are retained (an
+empty command-line record represents an empty argument); a trailing
+unterminated prefix remains only in the raw bytes and marks the structured
+record list incomplete. Parsing is capped at 4,096 records of at most 32 KiB
+each and charges retained record objects and bytes to the shared 64 MiB
+metadata budget. Truncation, an unterminated record, or a record limit marks
+the list incomplete and adds a diagnostic without discarding raw bytes.
+Command-line and environment entries remain raw strings; HexLab does not
+interpret shell quoting or split environment entries into names and values.
+`MD_LINUX_MAPS` additionally parses
 valid `/proc/<pid>/maps` lines into virtual start/end, permissions, file offset,
 device major/minor, inode, optional raw path, and line source offset. Rows are
 bounded to 131,072 and 4,096 bytes per line, and must be sorted without

@@ -129,6 +129,19 @@ std::optional<std::uint64_t> decode_session_integer(const wxString &value) {
     if (parsed.ec != std::errc{} || parsed.ptr != end) return std::nullopt;
     return decoded;
 }
+wxString encode_session_view(int index) {
+    static constexpr std::array<const char *, 5> names{
+        "disassembly", "bytes", "graph", "pseudocode", "source"};
+    return index >= 0 && static_cast<std::size_t>(index) < names.size()
+        ? wxString(names[static_cast<std::size_t>(index)]) : wxString{};
+}
+std::optional<int> decode_session_view(const wxString &name) {
+    static constexpr std::array<const char *, 5> names{
+        "disassembly", "bytes", "graph", "pseudocode", "source"};
+    for (std::size_t index = 0; index < names.size(); ++index)
+        if (name == names[index]) return static_cast<int>(index);
+    return std::nullopt;
+}
 std::string wx_utf8_bytes(const wxString &value) {
     const auto encoded = value.utf8_str();
     return encoded ? std::string(encoded.data(), encoded.length()) : std::string{};
@@ -840,6 +853,8 @@ struct MainFrame::Impl {
     std::vector<DocumentId> session_restore_documents;
     std::optional<DocumentId> session_restore_active;
     std::map<std::uint64_t, Location> session_restore_locations;
+    std::map<std::uint64_t, int> document_page_views;
+    std::optional<DocumentId> page_view_owner;
     struct PersistedComparisonSession {
         wxWeakRef<CompareView> view;
         std::filesystem::path path;
@@ -2269,6 +2284,18 @@ struct MainFrame::Impl {
             closer->progress();
         auto &manager = controller->documents();
         tabs->update(manager);
+        if (const auto active = manager.active_document()) {
+            if (page_view_owner != active) {
+                const auto view = document_page_views.find(active->value);
+                const int selection = view != document_page_views.end() && pages && view->second >= 0 &&
+                    view->second < static_cast<int>(pages->GetPageCount()) ? view->second : 0;
+                if (pages && pages->GetSelection() != selection)
+                    pages->ChangeSelection(static_cast<std::size_t>(selection));
+                page_view_owner = active;
+            }
+        } else {
+            page_view_owner.reset();
+        }
         if (session_restore_activation_pending) {
             const auto entries = manager.documents();
             const bool still_opening = std::any_of(entries.begin(), entries.end(), [this](const DocumentInfo &entry) {
@@ -4200,6 +4227,13 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     pages->AddPage(ui.pseudocode, "Pseudocode");
     ui.source = new SourceView(pages);
     pages->AddPage(ui.source, "Source");
+    pages->Bind(wxEVT_NOTEBOOK_PAGE_CHANGED, [this](wxBookCtrlEvent &event) {
+        if (event.GetSelection() >= 0) {
+            if (const auto active = impl_->controller->documents().active_document())
+                impl_->document_page_views.insert_or_assign(active->value, event.GetSelection());
+        }
+        event.Skip();
+    });
     const auto pseudocode_token_current = [this](const PseudocodeNavigationToken &token) {
         const auto id = token.document;
         const auto current = impl_->controller->state().current();
@@ -5912,6 +5946,10 @@ void MainFrame::RestoreWorkspaceSession() {
                     restored_locations.insert_or_assign(restored_id.value,
                         Location{Address{AddressSpaceId{static_cast<std::uint32_t>(*space)}, *offset}});
             }
+            wxString saved_view;
+            if (config->Read(wxString::Format("Document%ldView", index), &saved_view))
+                if (const auto view = decode_session_view(saved_view))
+                    impl_->document_page_views.insert_or_assign(restored_id.value, *view);
         }
     }
     long comparison_count = 0;
@@ -5935,6 +5973,7 @@ void MainFrame::RestoreWorkspaceSession() {
     impl_->session_restore_documents = std::move(restored_documents);
     impl_->session_restore_active = restored_active;
     impl_->session_restore_locations = std::move(restored_locations);
+    impl_->page_view_owner.reset();
     impl_->session_restore_activation_pending = !impl_->session_restore_documents.empty();
     config->SetPath(previous_path);
     wxString restore_status;
@@ -5967,6 +6006,7 @@ void MainFrame::SaveWorkspaceSession() {
         wxString mode;
         wxString recipe;
         std::optional<Location> location;
+        int view = 0;
     };
     std::vector<SavedEntry> entries;
     entries.reserve(std::min<std::size_t>(documents.size(), maximum_restored_documents));
@@ -6014,6 +6054,11 @@ void MainFrame::SaveWorkspaceSession() {
         }
         if (active_id && document.id == *active_id) active = static_cast<long>(entries.size());
         if (const auto selected = projects().selection(document.id)) entry.location = *selected;
+        if (active_id && document.id == *active_id && impl_->pages)
+            entry.view = static_cast<int>(impl_->pages->GetSelection());
+        else if (const auto view = impl_->document_page_views.find(document.id.value);
+                 view != impl_->document_page_views.end())
+            entry.view = view->second;
         entries.push_back(std::move(entry));
     }
     const auto previous_path = config->GetPath();
@@ -6027,6 +6072,10 @@ void MainFrame::SaveWorkspaceSession() {
         config->Write(wxString::Format("Document%ldPath", number), wxString(entries[index].path.wstring()));
         config->Write(wxString::Format("Document%ldKind", number), entries[index].kind);
         config->Write(wxString::Format("Document%ldMode", number), entries[index].mode);
+        const auto view_key = wxString::Format("Document%ldView", number);
+        const auto saved_view = encode_session_view(entries[index].view);
+        if (saved_view.empty()) config->DeleteEntry(view_key);
+        else config->Write(view_key, saved_view);
         if (entries[index].kind == "binary") {
             impl_->strings->save_preferences(*config, wxString::Format("Document%ldStrings", number),
                                              entries[index].id, *entries[index].project, false);

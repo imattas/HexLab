@@ -838,37 +838,107 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     using LocalVariableKey=std::tuple<std::uint16_t,std::uint16_t,std::uint16_t,std::uint16_t,std::uint16_t>;
     std::unordered_map<const JvmCode *,std::set<LocalVariableKey>> local_variable_entries_seen;
     std::unordered_map<const JvmCode *,std::set<LocalVariableKey>> local_variable_type_entries_seen;
-    std::function<Result<std::string>(unsigned)> annotation_value;
-    annotation_value=[&](unsigned depth)->Result<std::string>{
+    struct ParsedAnnotationValue { std::string text; JvmAnnotationValue encoded; };
+    constexpr std::size_t max_annotation_text=16*1024*1024;
+    std::size_t annotation_text_bytes=0,annotation_value_nodes=0;
+    const auto charge_annotation_text=[&](std::size_t size){
+        if(size>max_annotation_text-annotation_text_bytes)return false;
+        annotation_text_bytes+=size;return true;
+    };
+    const auto annotation_descriptor_ok=[](std::string_view value){
+        return !value.empty()&&value.front()=='L'&&valid_field_descriptor(value);
+    };
+    const auto annotation_name_ok=[](std::string_view value){
+        return valid_unqualified_member_name(value)&&value.find_first_of("<>")==std::string_view::npos;
+    };
+    std::function<Result<ParsedAnnotationValue>(unsigned)> annotation_value;
+    annotation_value=[&](unsigned depth)->Result<ParsedAnnotationValue>{
+        if(stop.stop_requested())return Error{ErrorCode::canceled,"annotation value parsing canceled"};
         if(depth>64)return Error{ErrorCode::resource_limit,"annotation nesting exceeds 64 levels"};
-        std::uint8_t tag=0;if(!r.u1(tag))return malformed("truncated annotation element_value");
-        const auto constant=[&](std::uint16_t ix,std::uint8_t expected)->Result<std::string>{
-            if(!ix||ix>=md.constant_pool.size()||md.constant_pool[ix].tag!=expected)return malformed("annotation element has a constant-pool entry of the wrong kind");
-            return std::to_string(ix);
+        if(annotation_value_nodes>=65536)return Error{ErrorCode::resource_limit,"annotation value trees exceed 65536 nodes"};
+        ++annotation_value_nodes;
+        ParsedAnnotationValue parsed;auto &node=parsed.encoded;node.file_begin={r.p};
+        if(!r.u1(node.tag))return malformed("truncated annotation element_value");
+        const auto tag=node.tag;
+        const auto constant_ok=[&](std::uint16_t ix,std::uint8_t expected){
+            return ix&&ix<md.constant_pool.size()&&md.constant_pool[ix].tag==expected;
         };
+        const auto append=[&](std::string_view text){
+            if(!charge_annotation_text(text.size()))return false;
+            parsed.text.append(text);return true;
+        };
+        const auto text_limit=[](){return Error{ErrorCode::resource_limit,"annotation decoded text exceeds 16 MiB"};};
         if(tag=='B'||tag=='C'||tag=='I'||tag=='S'||tag=='Z'||tag=='D'||tag=='F'||tag=='J'){
-            std::uint16_t ix=0;if(!r.u2(ix))return malformed("truncated annotation constant element");
-            const auto expected=(tag=='D'?6:tag=='F'?4:tag=='J'?5:3);auto value=constant(ix,expected);if(!value)return value.error();
-            return std::string("const(")+char(tag)+":"+value.value()+")";
-        }
-        if(tag=='s'){std::uint16_t ix=0;if(!r.u2(ix))return malformed("truncated annotation string element");auto value=constant(ix,1);if(!value)return value.error();return "string#"+value.value();}
-        if(tag=='e'){std::uint16_t type=0,name=0;if(!r.u2(type)||!r.u2(name))return malformed("truncated annotation enum element");auto t=utf8(type),n=utf8(name);if(!t)return t.error();if(!n)return n.error();return "enum("+t.value()+"#"+n.value()+")";}
-        if(tag=='c'){std::uint16_t ix=0;if(!r.u2(ix))return malformed("truncated annotation class element");auto value=utf8(ix);if(!value)return value.error();return "class("+value.value()+")";}
-        if(tag=='@'){
-            std::uint16_t type=0,pairs=0;if(!r.u2(type)||!r.u2(pairs))return malformed("truncated nested annotation element");auto descriptor=utf8(type);if(!descriptor)return descriptor.error();
+            if(!r.u2(node.constant_pool_index))return malformed("truncated annotation constant element");
+            const auto expected=(tag=='D'?6:tag=='F'?4:tag=='J'?5:3);
+            if(!constant_ok(node.constant_pool_index,static_cast<std::uint8_t>(expected)))return malformed("annotation element has a constant-pool entry of the wrong kind");
+            if(!append(std::string("const(")+char(tag)+":"+std::to_string(node.constant_pool_index)+")"))return text_limit();
+        }else if(tag=='s'){
+            if(!r.u2(node.constant_pool_index))return malformed("truncated annotation string element");
+            if(!constant_ok(node.constant_pool_index,1))return malformed("annotation string does not reference CONSTANT_Utf8");
+            if(!append("string#"+std::to_string(node.constant_pool_index)))return text_limit();
+        }else if(tag=='e'){
+            if(!r.u2(node.constant_pool_index)||!r.u2(node.enum_name_index))return malformed("truncated annotation enum element");
+            auto type=utf8(node.constant_pool_index),name=utf8(node.enum_name_index);if(!type)return type.error();if(!name)return name.error();
+            if(!annotation_descriptor_ok(type.value())||!valid_unqualified_member_name(name.value()))return malformed("invalid annotation enum descriptor or constant name");
+            if(!append("enum(")||!append(type.value())||!append("#")||!append(name.value())||!append(")"))return text_limit();
+        }else if(tag=='c'){
+            if(!r.u2(node.constant_pool_index))return malformed("truncated annotation class element");
+            auto descriptor=utf8(node.constant_pool_index);if(!descriptor)return descriptor.error();
+            if(descriptor.value()!="V"&&!valid_field_descriptor(descriptor.value()))return malformed("annotation class literal has an invalid return descriptor");
+            if(!append("class(")||!append(descriptor.value())||!append(")"))return text_limit();
+        }else if(tag=='@'){
+            std::uint16_t pairs=0;
+            if(!r.u2(node.constant_pool_index)||!r.u2(pairs))return malformed("truncated nested annotation element");
+            auto descriptor=utf8(node.constant_pool_index);if(!descriptor)return descriptor.error();
+            if(!annotation_descriptor_ok(descriptor.value()))return malformed("nested annotation has an invalid object descriptor");
             if(pairs>65536-annotation_items)return Error{ErrorCode::resource_limit,"annotation metadata exceeds 65536 elements"};annotation_items+=pairs;
-            std::string result="annotation("+descriptor.value();for(unsigned i=0;i<pairs;++i){std::uint16_t name=0;if(!r.u2(name))return malformed("truncated nested annotation element name");auto n=utf8(name);if(!n)return n.error();auto v=annotation_value(depth+1);if(!v)return v.error();result+=";"+n.value()+"="+v.value();}return result+")";
-        }
-        if(tag=='['){std::uint16_t count=0;if(!r.u2(count))return malformed("truncated annotation array element");if(count>65536-annotation_items)return Error{ErrorCode::resource_limit,"annotation metadata exceeds 65536 elements"};annotation_items+=count;std::string result="[";for(unsigned i=0;i<count;++i){auto value=annotation_value(depth+1);if(!value)return value.error();if(i)result+=",";result+=value.value();}return result+"]";}
-        return malformed("invalid annotation element_value tag");
+            node.children.reserve(pairs);node.element_name_indices.reserve(pairs);
+            if(!append("annotation(")||!append(descriptor.value()))return text_limit();
+            std::unordered_set<std::string> element_names;
+            for(unsigned i=0;i<pairs;++i){
+                std::uint16_t name=0;if(!r.u2(name))return malformed("truncated nested annotation element name");
+                auto resolved=utf8(name);if(!resolved)return resolved.error();
+                if(!annotation_name_ok(resolved.value())||!element_names.insert(resolved.value()).second)return malformed("invalid or duplicate nested annotation element name");
+                if(!append(";")||!append(resolved.value())||!append("="))return text_limit();
+                auto value=annotation_value(depth+1);if(!value)return value.error();
+                if(!append(value.value().text))return text_limit();
+                node.element_name_indices.push_back(name);node.children.push_back(std::move(value.value().encoded));
+            }
+            if(!append(")"))return text_limit();
+        }else if(tag=='['){
+            std::uint16_t count=0;if(!r.u2(count))return malformed("truncated annotation array element");
+            if(count>65536-annotation_items)return Error{ErrorCode::resource_limit,"annotation metadata exceeds 65536 elements"};annotation_items+=count;
+            node.children.reserve(count);if(!append("["))return text_limit();
+            for(unsigned i=0;i<count;++i){
+                auto value=annotation_value(depth+1);if(!value)return value.error();
+                if((i&&!append(","))||!append(value.value().text))return text_limit();
+                node.children.push_back(std::move(value.value().encoded));
+            }
+            if(!append("]"))return text_limit();
+        }else return malformed("invalid annotation element_value tag");
+        node.byte_size=static_cast<std::uint32_t>(r.p-node.file_begin.value);
+        return parsed;
     };
     const auto read_one_annotation=[&]()->Result<JvmAnnotation>{
-        JvmAnnotation annotation;std::uint16_t type=0,pairs=0;
+        if(stop.stop_requested())return Error{ErrorCode::canceled,"annotation declaration parsing canceled"};
+        JvmAnnotation annotation;annotation.file_begin={r.p};std::uint16_t type=0,pairs=0;
         if(!r.u2(type)||!r.u2(pairs))return malformed("truncated annotation declaration");
         auto descriptor=utf8(type);if(!descriptor)return descriptor.error();
+        if(!annotation_descriptor_ok(descriptor.value()))return malformed("annotation declaration has an invalid object descriptor");
+        if(!charge_annotation_text(descriptor.value().size()))return Error{ErrorCode::resource_limit,"annotation decoded text exceeds 16 MiB"};
         if(pairs>65536-annotation_items)return Error{ErrorCode::resource_limit,"annotation metadata exceeds 65536 elements"};
         annotation_items+=pairs;annotation.descriptor=std::move(descriptor.value());annotation.elements.reserve(pairs);
-        for(unsigned j=0;j<pairs;++j){std::uint16_t name=0;if(!r.u2(name))return malformed("truncated annotation element name");auto element_name=utf8(name);if(!element_name)return element_name.error();auto value=annotation_value(0);if(!value)return value.error();annotation.elements.push_back({std::move(element_name.value()),std::move(value.value())});}
+        annotation.type_index=type;std::unordered_set<std::string> element_names;
+        for(unsigned j=0;j<pairs;++j){
+            std::uint16_t name=0;if(!r.u2(name))return malformed("truncated annotation element name");
+            auto element_name=utf8(name);if(!element_name)return element_name.error();
+            if(!annotation_name_ok(element_name.value())||!element_names.insert(element_name.value()).second)return malformed("invalid or duplicate annotation element name");
+            if(!charge_annotation_text(element_name.value().size()))return Error{ErrorCode::resource_limit,"annotation decoded text exceeds 16 MiB"};
+            auto value=annotation_value(0);if(!value)return value.error();
+            annotation.elements.push_back({std::move(element_name.value()),std::move(value.value().text),std::move(value.value().encoded),name});
+        }
+        annotation.byte_size=static_cast<std::uint32_t>(r.p-annotation.file_begin.value);
         return annotation;
     };
     const auto read_annotations=[&](std::vector<JvmAnnotation> &out)->Result<bool>{
@@ -943,6 +1013,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 }
                 member->constant_value=std::move(value);
             }else if(an.value()=="RuntimeVisibleAnnotations"||an.value()=="RuntimeInvisibleAnnotations"){
+                if(major<49)return malformed("annotation attributes require class-file version 49 or newer");
                 if(code_owner)return malformed("declaration annotation attribute appears inside Code");
                 if(!class_level&&!member&&!record_component)return malformed("annotation attribute has no declaration owner");
                 const bool visible=an.value()=="RuntimeVisibleAnnotations";
@@ -1010,6 +1081,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                     auto annotation=read_one_annotation();if(!annotation)return annotation.error();item.annotation=std::move(annotation.value());target.push_back(std::move(item));
                 }
             }else if(an.value()=="RuntimeVisibleParameterAnnotations"||an.value()=="RuntimeInvisibleParameterAnnotations"){
+                if(major<49)return malformed("parameter annotation attributes require class-file version 49 or newer");
                 if(class_level||!member||!method||code_owner)return malformed("parameter annotation attribute appears outside a method declaration");
                 const bool visible=an.value()=="RuntimeVisibleParameterAnnotations";
                 auto &owners=visible?visible_parameter_annotations_seen:invisible_parameter_annotations_seen;
@@ -1019,6 +1091,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 for(auto &parameter:parsed){auto result=read_annotations(parameter);if(!result)return result.error();}
                 (visible?member->visible_parameter_annotations:member->invisible_parameter_annotations)=std::move(parsed);
             }else if(an.value()=="AnnotationDefault"){
+                if(major<49)return malformed("AnnotationDefault requires class-file version 49 or newer");
                 if(class_level||!member||!method||code_owner)return malformed("AnnotationDefault appears outside a method declaration");
                 if((md.access_flags&0x2000u)==0)return malformed("AnnotationDefault appears on a method outside an annotation interface");
                 if(!annotation_defaults_seen.insert(member).second)return malformed("duplicate AnnotationDefault attribute");
@@ -1027,23 +1100,28 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                     return malformed("AnnotationDefault method must have no parameters and a valid method descriptor");
                 const auto result_descriptor=std::string_view(member->descriptor).substr(close+1);
                 if(result_descriptor.empty()||result_descriptor=="V")return malformed("AnnotationDefault method must return an annotation element type");
+                const auto component=result_descriptor.front()=='['?result_descriptor.substr(1):result_descriptor;
+                if(component.empty()||component.front()=='['||!valid_field_descriptor(component))
+                    return malformed("AnnotationDefault return type must be a scalar annotation element or one-dimensional array");
                 auto value=annotation_value(0);if(!value)return value.error();
-                const auto &encoded=value.value();
-                bool compatible=false;
-                if(result_descriptor.size()==1){
-                    const auto tag=static_cast<char>(result_descriptor.front());
-                    compatible=(tag=='B'||tag=='C'||tag=='D'||tag=='F'||tag=='I'||tag=='J'||tag=='S'||tag=='Z')&&
-                        encoded.size()>=7&&encoded.starts_with("const(")&&encoded[6]==tag;
-                }else if(result_descriptor=="Ljava/lang/String;")compatible=encoded.starts_with("string#");
-                else if(result_descriptor=="Ljava/lang/Class;")compatible=encoded.starts_with("class(");
-                else if(result_descriptor.front()=='[')compatible=encoded.starts_with("[");
-                else if(result_descriptor.front()=='L'){
-                    const auto enum_prefix="enum("+std::string(result_descriptor)+"#";
-                    const auto annotation_prefix="annotation("+std::string(result_descriptor);
-                    compatible=encoded.starts_with(enum_prefix)||encoded.starts_with(annotation_prefix);
-                }
-                if(!compatible)return malformed("AnnotationDefault value kind does not match its method return descriptor");
-                member->annotation_default=std::move(value.value());
+                std::function<bool(const JvmAnnotationValue&,std::string_view)> compatible;
+                compatible=[&](const JvmAnnotationValue& node,std::string_view descriptor){
+                    if(stop.stop_requested())return false;
+                    if(descriptor.front()=='['){
+                        if(node.tag!='[')return false;
+                        for(const auto& child:node.children)if(!compatible(child,descriptor.substr(1)))return false;
+                        return true;
+                    }
+                    if(descriptor.size()==1)return node.tag==static_cast<std::uint8_t>(descriptor.front());
+                    if(descriptor=="Ljava/lang/String;")return node.tag=='s';
+                    if(descriptor=="Ljava/lang/Class;")return node.tag=='c';
+                    return (node.tag=='e'||node.tag=='@')&&md.constant_pool[node.constant_pool_index].text==descriptor;
+                };
+                const auto matches=compatible(value.value().encoded,result_descriptor);
+                if(stop.stop_requested())return Error{ErrorCode::canceled,"annotation default validation canceled"};
+                if(!matches)return malformed("AnnotationDefault value kind or array element does not match its method return descriptor");
+                member->annotation_default=std::move(value.value().text);
+                member->annotation_default_value=std::move(value.value().encoded);
             }else if(an.value()=="StackMapTable"){
                 if(!code_owner||!member)return malformed("StackMapTable appears outside a Code attribute");
                 if(code_owner->stack_map_table)return malformed("duplicate StackMapTable attribute");

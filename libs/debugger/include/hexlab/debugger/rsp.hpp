@@ -200,6 +200,9 @@ public:
     // vFile:lstat. Paths are hex-encoded and bounded by the negotiated packet size.
     Result<RemoteFileStat> stat_remote_file_path(std::string_view path,
         bool follow_symlinks = true, std::stop_token = {});
+    // Reads the target bytes of a symbolic link through vFile:readlink.
+    Result<std::vector<std::byte>> read_remote_symlink(std::string_view path,
+        std::size_t maximum_size = 16 * 1024, std::stop_token = {});
     // Writes a bounded byte range through vFile:open/pwrite/close. Open flags
     // and mode use the remote host's conventions (RSP does not normalize them).
     Status write_remote_file_range(std::string_view path, std::uint64_t offset,

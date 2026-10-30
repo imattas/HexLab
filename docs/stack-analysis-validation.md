@@ -327,12 +327,14 @@ left unattributed.
 
 AArch64 outgoing stack-slot provenance records direct, write-only SP-relative
 `STR`/`STRB`/`STRH`/`STP` stores followed by a direct same-block `BL`. The
-store must use a known SP relation, nonnegative displacement from current SP,
-and no index or writeback. Stores are discarded across other memory traffic,
-SP changes, or control-flow/call boundaries. Pair stores contribute each
-element slot, both linked to the single `STP` source and `BL`. This is bounded
-evidence for stack slots prepared for a direct call; it does not infer register
-arguments or classify arbitrary frame stores as ABI arguments.
+store may use SP, an established x29 frame relation, or a tracked temporary
+derived from the stack, and its effective address must be at or above the
+current SP. Indexed, writeback, post-indexed, and unknown-base stores are not
+captured. Stores are discarded across other memory traffic, SP changes, or
+control-flow/call boundaries. Pair stores contribute each element slot, both
+linked to the single `STP` source and `BL`. This is bounded evidence for stack
+slots prepared for a direct call; it does not infer register arguments or
+classify arbitrary frame stores as ABI arguments.
 
 For a PE-selected Windows x64 ABI, direct write-only stores through RSP into
 the 32-byte shadow area are linked to a following same-block call when the

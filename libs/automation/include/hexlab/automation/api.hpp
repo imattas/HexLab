@@ -176,6 +176,23 @@ struct DebugLocationRangeInfo {
     std::uint64_t begin = 0, end = 0;
     std::size_t expression_size = 0, operation_count = 0;
 };
+enum class AnnotationMerge { replace, preserve };
+struct AnnotationBookmarkImport {
+    std::string label;
+    bool remove = false;
+};
+struct AnnotationImportRow {
+    Location location;
+    std::optional<std::string> name, comment;
+    std::optional<AnnotationBookmarkImport> bookmark;
+};
+inline constexpr std::size_t maximum_annotation_import_existing_rows = 65536;
+struct AnnotationImportResult {
+    std::shared_ptr<const ProjectSnapshot> snapshot;
+    std::uint64_t expected_revision = 0, result_revision = 0;
+    std::size_t applied = 0, skipped = 0;
+    bool committed = false;
+};
 // Synchronous, thread-affine project ownership. Use a dedicated worker when
 // embedding in a UI. This source API follows HexLab's rebuilt-consumer DLL ABI.
 class Project {
@@ -283,6 +300,13 @@ public:
     HEXLAB_AUTOMATION_EXPORT Result<std::shared_ptr<const ProjectSnapshot>> execute_batch(
         const std::vector<ProjectCommand>&, std::uint64_t group=0,
         std::optional<std::uint64_t> expected_edit_revision={}, std::stop_token={});
+    // Plan names/comments/bookmarks from the full native snapshot, then validate
+    // every selected edit against projected state and commit one history step.
+    // Bounds: 4096 rows/fields, 16 MiB incoming text; preserve examines at most
+    // 65536 existing annotation rows and 65536 existing bookmark rows.
+    HEXLAB_AUTOMATION_EXPORT Result<AnnotationImportResult> import_annotations(
+        std::span<const AnnotationImportRow>, AnnotationMerge = AnnotationMerge::replace,
+        std::uint64_t group=0, std::optional<std::uint64_t> expected_revision={}, std::stop_token={});
     HEXLAB_AUTOMATION_EXPORT Result<std::shared_ptr<const ProjectSnapshot>> patch(
         Location, std::vector<std::byte>, std::uint64_t expected_edit_revision,
         std::uint64_t group=0, std::stop_token={});

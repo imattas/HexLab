@@ -1270,15 +1270,36 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
         std::size_t provider_ids_reported = 0;
         constexpr std::size_t max_reported_provider_ids = 100000;
         bool depth_limited = false;
+        struct GraphDiagnostics {
+            std::size_t unresolved = 0, weak_unresolved = 0, ambiguous = 0;
+            std::size_t partial_search = 0, unsupported_paths = 0, escaped_paths = 0;
+            std::size_t filesystem_errors = 0, incompatible_providers = 0;
+            std::size_t depth_limited_rows = 0, cycles = 0, already_expanded = 0;
+        } diagnostics;
         std::function<void(std::size_t, std::size_t)> visit = [&](std::size_t current, std::size_t depth) {
             color[current] = 1;
             ++expanded;
             if (graph[current].empty())
                 out << std::string((depth + 1) * 2, ' ') << "(no dependency names in parsed metadata)\n";
             for (const auto &edge : graph[current]) {
+                const bool partial_search = edge.discovery &&
+                    (edge.discovery->unsupported_paths || edge.discovery->escaped_paths ||
+                     edge.discovery->filesystem_errors || edge.discovery->inherited_path_context_conflict);
+                if (partial_search) ++diagnostics.partial_search;
+                if (edge.discovery) {
+                    diagnostics.unsupported_paths += edge.discovery->unsupported_paths;
+                    diagnostics.escaped_paths += edge.discovery->escaped_paths;
+                    diagnostics.filesystem_errors += edge.discovery->filesystem_errors;
+                }
+                diagnostics.incompatible_providers += edge.incompatible_pe_providers;
+                if (edge.discovery) diagnostics.incompatible_providers += edge.discovery->incompatible_files;
+                if ((edge.discovery && edge.discovery->depth_limited) ||
+                    (edge.providers && edge.providers->size() == 1 && depth + 1 >= max_graph_depth))
+                    ++diagnostics.depth_limited_rows;
                 out << std::string((depth + 1) * 2, ' ') << edge.name;
                 if (edge.soname_alias_match) out << " (DT_SONAME alias)";
-                if (edge.discovery && (edge.discovery->unsupported_paths || edge.discovery->filesystem_errors ||
+                if (edge.discovery && (edge.discovery->unsupported_paths || edge.discovery->escaped_paths ||
+                                       edge.discovery->filesystem_errors ||
                                        edge.discovery->inherited_path_context_conflict))
                     out << " (partial search" << (edge.discovery->dependency_kind.empty() ? "" : ", " + edge.discovery->dependency_kind)
                         << ": " << edge.discovery->unsupported_paths << " unsupported paths, "
@@ -1289,6 +1310,9 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
                         << ")";
                 out << " -> ";
                 if (!edge.providers || edge.providers->empty()) {
+                    ++diagnostics.unresolved;
+                    if (discover && edge.discovery && edge.discovery->weak_dependency)
+                        ++diagnostics.weak_unresolved;
                     out << (discover ? (edge.discovery && edge.discovery->weak_dependency
                         ? "unresolved weak dependency (no discovered provider)" : "unresolved (no discovered provider)")
                         : "unresolved (not supplied)");
@@ -1307,6 +1331,7 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
                     continue;
                 }
                 if (edge.providers->size() != 1) {
+                    ++diagnostics.ambiguous;
                     out << "ambiguous:";
                     const auto remaining = max_reported_provider_ids - provider_ids_reported;
                     const auto count = (std::min)(edge.providers->size(), remaining);
@@ -1321,10 +1346,12 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
                 const auto provider = edge.providers->front();
                 out << "[" << provider << "] " << path_text(modules[provider].path);
                 if (color[provider] == 1) {
+                    ++diagnostics.cycles;
                     out << " (cycle)\n";
                     continue;
                 }
                 if (color[provider] == 2) {
+                    ++diagnostics.already_expanded;
                     out << " (already expanded)\n";
                     continue;
                 }
@@ -1342,6 +1369,15 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
         out << "Expanded " << expanded << " of " << modules.size()
             << (discover ? " graph modules; " : " supplied modules; ")
             << edge_count << " dependency rows.\n";
+        out << "Graph edge diagnostics (bounded by " << max_graph_edges << " rows): unresolved "
+            << diagnostics.unresolved << " (weak " << diagnostics.weak_unresolved << "), ambiguous "
+            << diagnostics.ambiguous << ", partial-search " << diagnostics.partial_search
+            << " (unsupported paths " << diagnostics.unsupported_paths << ", sysroot escapes "
+            << diagnostics.escaped_paths << ", filesystem errors " << diagnostics.filesystem_errors
+            << "), incompatible providers " << diagnostics.incompatible_providers
+            << ", depth-limited rows " << diagnostics.depth_limited_rows
+            << ", cycles " << diagnostics.cycles << ", already expanded "
+            << diagnostics.already_expanded << ".\n";
         if (expanded < modules.size()) {
             out << (discover ? "Some graph modules were not expanded because they are unreachable or ambiguous from the root"
                              : "Some supplied modules were not expanded because they are unreachable from the root");
