@@ -156,6 +156,8 @@ unknown values, and unversioned registers are excluded. This handles true-arm
 and false-arm nesting without inferring predicate equivalence across CFG paths.
 See [`docs/decompiler-opaque-predicates.md`](../../docs/decompiler-opaque-predicates.md).
 
+It also simplifies `x | (~x & y)` to `x | y` and `x & (~x | y)` to `x & y` for matching, fixed-width integer bitvectors. This rewrite requires structurally identical total pure SSA expressions and excludes operations that may be undefined or trapping, so it does not discard poison-producing computations.
+
 `eliminate_dead_code` removes unused SSA assignments and phi nodes when their
 right-hand sides use registers/constants and a whitelist of total integer or
 Boolean bit-vector operations. Potentially trapping division/remainder,
