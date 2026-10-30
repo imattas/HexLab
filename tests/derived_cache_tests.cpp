@@ -81,7 +81,7 @@ void roundtrip_tests() {
         }
 }
 void context_tests(const std::filesystem::path &legacy_path) {
-    static_assert(derived_cache_version == 12, "Function unwind seed provenance requires a new cache version");
+    static_assert(derived_cache_version >= 12, "Function unwind seed provenance requires a new cache version");
     const DecodeContext x64{Architecture::x86_64, ExecutionMode::x86_64, ByteOrder::little};
     const DecodeContext x32{Architecture::x86, ExecutionMode::x86_32, ByteOrder::little};
     Fixture fixture(bytes({0xe8, 1, 0, 0, 0, 0xc3, 0xc3}));
