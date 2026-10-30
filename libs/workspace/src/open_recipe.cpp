@@ -10,6 +10,19 @@ namespace hexlab {
 Result<LoadRecipe> resolve_open_recipe(const OpenRequest &request, std::stop_token stop) {
     if (stop.stop_requested())
         return Error{ErrorCode::canceled, "Opening canceled"};
+    if (request.resolved_recipe) {
+        if (request.format != Format::automatic && request.format != request.resolved_recipe->format)
+            return Error{ErrorCode::invalid_argument, "Resolved load recipe conflicts with requested format"};
+        if (request.raw || request.x86_profile_path || request.arm_profile_path || request.macho ||
+            request.pe_runtime_architecture || request.pdb_path || !request.pdb_search_paths.empty() ||
+            request.dwarf_supplementary_package_path)
+            return Error{ErrorCode::invalid_argument, "Resolved load recipe cannot be combined with loader overrides"};
+        auto encoded = encode_recipe(*request.resolved_recipe);
+        if (!encoded) return encoded.error();
+        auto decoded = decode_recipe(encoded.value());
+        if (!decoded) return decoded.error();
+        return std::move(decoded.value());
+    }
     if (request.format != Format::automatic && request.format != Format::raw && request.format != Format::pe &&
         request.format != Format::elf && request.format != Format::macho &&
         request.format != Format::intel_hex && request.format != Format::s_record && request.format != Format::wasm && request.format != Format::dex && request.format != Format::jvm && request.format != Format::minidump)

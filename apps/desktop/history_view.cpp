@@ -126,6 +126,10 @@ HistoryView::HistoryView(wxWindow* parent) : wxPanel(parent), timer_(this) {
     status_ = new wxStaticText(this, wxID_ANY, "Open a project to inspect its history.");
     status_->SetName("history-status");
     root->Add(status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
+    audit_status_ = new wxStaticText(this, wxID_ANY, "History audit: not run for this project revision.");
+    audit_status_->SetName("history-audit-status");
+    audit_status_->SetToolTip("Persistent status for the read-only history audit, including structural progress and optional applied-branch replay.");
+    root->Add(audit_status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
     source_status_ = new wxStaticText(this, wxID_ANY, "Current source integrity: not checked.");
     source_status_->SetName("history-source-integrity-status");
     source_status_->SetToolTip("Read-only check of the recorded external source against the input size and SHA-256 pinned in this project. Limited to 256 MiB.");
@@ -197,6 +201,7 @@ HistoryView::HistoryView(wxWindow* parent) : wxPanel(parent), timer_(this) {
         audit_next_after_step_ = 0;
         audit_->SetLabel("Audit history");
         audit_report_.clear();
+        set_audit_status("History audit: not run for this project revision.");
         copy_audit_->Enable(false);
         copy_audit_json_->Enable(false);
         save_audit_->Enable(false);
@@ -382,6 +387,7 @@ void HistoryView::update(std::optional<DocumentId> id, std::shared_ptr<ProjectAc
         audit_bytes_ = 0;
         audit_next_after_step_ = 0;
         audit_report_.clear();
+        set_audit_status("History audit: not run for this project revision.");
         copy_audit_->Enable(false);
         copy_audit_json_->Enable(false);
         save_audit_->Enable(false);
@@ -432,6 +438,7 @@ void HistoryView::update(std::optional<DocumentId> id, std::shared_ptr<ProjectAc
     audit_bytes_ = 0;
     audit_next_after_step_ = 0;
     audit_report_.clear();
+    set_audit_status("History audit: not run for this project revision.");
     copy_audit_->Enable(false);
     copy_audit_json_->Enable(false);
     save_audit_->Enable(false);
@@ -493,6 +500,8 @@ void HistoryView::begin_audit() {
     compare_previous_->Enable(false);
     compare_current_->Enable(false);
     status_->SetLabel("Starting read-only history audit…");
+    set_audit_status(wxString::Format("History audit running at edit %llu: starting structural verification.",
+        static_cast<unsigned long long>(expected_edit_)));
     if (audit_structural_complete_ && audit_verify_replay_) request_audit_replay();
     else request_audit_page(audit_next_after_step_);
 }
@@ -553,6 +562,13 @@ void HistoryView::record_audit_result(const wxString& report) {
     save_audit_->Enable(!audit_report_.empty() && project_ && project_->state);
     verify_audit_replay_->Enable(bool(actor_) && !audit_in_progress_ && !audit_resume_available_);
     status_->SetLabel(audit_report_);
+    set_audit_status(audit_report_);
+}
+
+void HistoryView::set_audit_status(const wxString& detail) {
+    audit_status_->SetLabel(detail.StartsWith("History audit:") ? detail : "History audit: " + detail);
+    audit_status_->Wrap(std::max(FromDIP(320), GetClientSize().GetWidth() - FromDIP(10)));
+    Layout();
 }
 
 void HistoryView::update_source_status() {
@@ -655,6 +671,12 @@ void HistoryView::request_audit_page(std::uint64_t after_step) {
     status_->SetLabel(wxString::Format("Auditing durable history: %llu of %llu steps verified…",
         static_cast<unsigned long long>(audit_verified_),
         static_cast<unsigned long long>(page_ ? page_->history_count : 0)));
+    set_audit_status(wxString::Format("Running structural verification at edit %llu: %llu of %llu steps verified; %llu delta bytes checked; next step after %llu.",
+        static_cast<unsigned long long>(expected_edit_),
+        static_cast<unsigned long long>(audit_verified_),
+        static_cast<unsigned long long>(page_ ? page_->history_count : 0),
+        static_cast<unsigned long long>(audit_bytes_),
+        static_cast<unsigned long long>(after_step)));
 }
 
 void HistoryView::request_audit_replay() {
@@ -677,6 +699,10 @@ void HistoryView::request_audit_replay() {
     pending_expected_edit_ = expected_edit_;
     pending_ = std::move(submission.value());
     status_->SetLabel("Structural audit passed; verifying applied-branch replay to empty step zero (4096 steps / 64 MiB)...");
+    set_audit_status(wxString::Format("Structural verification passed at edit %llu (%llu steps, %llu delta bytes); running applied-branch replay to empty step zero (4096 steps / 64 MiB).",
+        static_cast<unsigned long long>(expected_edit_),
+        static_cast<unsigned long long>(audit_verified_),
+        static_cast<unsigned long long>(audit_bytes_)));
 }
 
 void HistoryView::request_preview(std::uint64_t step) {
@@ -992,6 +1018,12 @@ void HistoryView::poll() {
                 static_cast<unsigned long long>(audit_verified_),
                 static_cast<unsigned long long>(received.history_count),
                 static_cast<unsigned long long>(audit_bytes_)));
+            set_audit_status(wxString::Format("Running structural verification at edit %llu: %llu of %llu steps verified; %llu delta bytes checked; next step after %llu.",
+                static_cast<unsigned long long>(expected_edit_),
+                static_cast<unsigned long long>(audit_verified_),
+                static_cast<unsigned long long>(received.history_count),
+                static_cast<unsigned long long>(audit_bytes_),
+                static_cast<unsigned long long>(received.next_after_step)));
             request_audit_page(received.next_after_step);
         } else {
             audit_next_after_step_ = received.next_after_step;

@@ -5893,18 +5893,22 @@ void MainFrame::RestoreWorkspaceSession() {
                 continue;
             }
             auto recipe = decode_recipe(*bytes);
-            if (!recipe || recipe.value().plugin) {
+            if (!recipe) {
                 ++skipped;
                 continue;
             }
             OpenRequest request;
             request.path = path;
-            request.format = recipe.value().format;
-            request.raw = recipe.value().raw;
-            request.macho = recipe.value().macho;
-            request.pdb_path = recipe.value().pdb_path;
-            request.pe_runtime_architecture = recipe.value().pe_runtime_architecture;
-            request.dwarf_supplementary_package_path = recipe.value().dwarf_supplementary_package_path;
+            if (recipe.value().plugin) {
+                request.resolved_recipe = std::move(recipe.value());
+            } else {
+                request.format = recipe.value().format;
+                request.raw = recipe.value().raw;
+                request.macho = recipe.value().macho;
+                request.pdb_path = recipe.value().pdb_path;
+                request.pe_runtime_architecture = recipe.value().pe_runtime_architecture;
+                request.dwarf_supplementary_package_path = recipe.value().dwarf_supplementary_package_path;
+            }
             OpenDocument(std::move(request));
         } else {
             ++skipped;
@@ -6037,8 +6041,7 @@ void MainFrame::SaveWorkspaceSession() {
             entry.kind = "binary";
             entry.mode = "readwrite";
             auto encoded = encode_recipe(project->state->recipe);
-            if (!encoded || encoded.value().size() > maximum_persisted_recipe_bytes ||
-                project->state->recipe.plugin) {
+            if (!encoded || encoded.value().size() > maximum_persisted_recipe_bytes) {
                 ++omitted_on_save;
                 continue;
             }
